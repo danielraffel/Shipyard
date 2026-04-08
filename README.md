@@ -187,65 +187,164 @@ up, ran the build, and reported the result.
 
 ## How Targets Work
 
-Every target in your config is a real machine, not an abstract label:
+A target is a real machine where your code gets validated. You name them
+whatever you want and can have as many as you need:
 
-| Target label | What it means | How Shipyard reaches it |
-|-------------|---------------|------------------------|
-| `mac` | Your Mac | Runs commands directly (local) |
-| `ubuntu` | Your Ubuntu VM | Connects via SSH, sends code as a git bundle |
-| `windows` | Your Windows VM | Connects via SSH, runs PowerShell commands |
-| `cloud-linux` | A Namespace runner | Dispatches a GitHub Actions workflow |
+| Target name | Platform | Backend | What it is |
+|------------|----------|---------|------------|
+| `mac` | macos-arm64 | local | Your Apple Silicon Mac |
+| `mac-intel` | macos-x64 | local | Your Intel Mac (if you have one) |
+| `ubuntu` | linux-x64 | ssh | Ubuntu VM running on your Mac |
+| `ubuntu-arm` | linux-arm64 | ssh | ARM64 Linux server |
+| `windows` | windows-x64 | ssh | Windows VM running on your Mac |
+| `cloud-linux` | linux-x64 | cloud | A Namespace runner |
 
-When a target is unreachable, Shipyard walks a fallback chain:
+You don't need all of these. Use what matches your project — one target
+is fine, six is fine. Add more any time with `shipyard targets add`.
+
+### What happens when a machine is down
+
+Each target can have a fallback chain. When the primary is unreachable,
+Shipyard tries the next option automatically:
 
 ```
-1. Try SSH → unreachable
-2. Try booting the VM (UTM) → boot, wait for SSH
-3. Try cloud (Namespace) → dispatch GitHub Actions
-4. Try cloud (GitHub-hosted) → last resort
+1. Try SSH to your VM → unreachable (VM is off)
+2. Boot the VM via UTM → wait for SSH to come up → success
+3. If that also fails → dispatch to Namespace cloud runners
+4. If cloud fails too → dispatch to GitHub-hosted runners (last resort)
 ```
 
 The chain is configurable per target. You can skip VMs, skip cloud, or make
-cloud the primary. The default is: local first, VM fallback, cloud last resort.
+cloud the primary. Most people use: local first, VM fallback, cloud last
+resort.
+
+### What Shipyard checks on setup
+
+`shipyard doctor` checks what you have and tells you what's missing:
+
+```
+$ shipyard doctor
+
+  Core:
+    ✓ git 2.44.0
+    ✓ ssh (OpenSSH 9.7)
+
+  Cloud providers:
+    ✓ gh 2.62.0 (authenticated as danielraffel)
+    ✗ nsc — not installed
+      → Install with: brew install namespace-cli
+
+  SSH targets:
+    ✓ ubuntu — reachable (847ms)
+    ✗ windows — unreachable
+      → Check: ssh win
+
+  Overall: ready (1 optional item missing)
+```
+
+If something is missing, Shipyard tells you exactly what to install and how.
+In the future, `shipyard doctor --fix` will offer to install missing tools
+for you.
 
 ---
 
-## How It Works With Agents
+## Agent Integration
 
-Every command supports `--json` for structured output. AI agents (Claude Code,
-Codex) call the same CLI humans use and parse the JSON result.
+Shipyard works with any AI coding agent that can run shell commands. Every
+command supports `--json` for structured output — agents parse the result
+and decide what to do next.
 
-### Two modes you can drop in
+### The "set it and forget it" flow
 
-**Mode 1: CI on push, manual merge** (default) —
-Validation runs when you push. You review and merge yourself.
+The most powerful setup: you tell your agent to work on a task, and it
+automatically validates and merges when done. No manual CI checks. No
+manual merges. You come back and it's on main.
 
-**Mode 2: CI on push, auto-merge on green** —
-Validation runs. When all platforms pass, the PR is merged automatically.
+Here's how it works in practice:
 
+1. You: "Implement the reverb effect and ship it"
+2. Agent writes code, commits to a feature branch
+3. Agent runs `shipyard ship --json` which:
+   - Pushes the branch
+   - Creates a PR
+   - Validates on all configured platforms (Mac + VMs + cloud)
+   - If all green, merges to main automatically
+4. You come back, it's merged
+
+This is how Pulp (the project Shipyard was extracted from) operates daily.
+
+### Setting up auto-merge for Claude Code
+
+Add this skill file to your project. Claude will use it whenever it needs
+to commit, validate, or merge code:
+
+**`.claude/skills/ci.md`:**
+
+```markdown
+---
+name: ci
+description: Cross-platform CI via Shipyard — validates and ships code
 ---
 
-## Claude Code Integration
+## After finishing work
 
-Shipyard ships integration files you drop into your project. Pick what fits.
+When your work is complete and ready to merge:
 
-### Option A: CLAUDE.md snippet (simplest)
+1. Commit changes to the current feature branch
+2. Run: shipyard ship --json
+3. This pushes, creates a PR, validates on all platforms, and merges on green
+4. If validation fails, read the logs, fix the issue, and run ship again
 
-Add to your `CLAUDE.md`:
+## To validate without merging
+
+    shipyard run --json
+
+## To check status
+
+    shipyard status --json
+
+## Rules
+- Never push directly to main — always use shipyard ship
+- If a target fails, fix and re-run before merging
+- All configured platforms must be green before merge
+```
+
+### Setting up auto-merge for Codex
+
+Add to your `AGENTS.md`:
 
 ```markdown
 ## CI
 
-This project uses Shipyard for cross-platform CI.
-
-Before merging: `shipyard run` — wait for all targets green.
-To ship: `shipyard ship` — creates PR, validates, merges on green.
-Status: `shipyard status` / `shipyard evidence` / `shipyard logs <id>`
+After completing work, validate and merge:
+- Run `shipyard ship` to push, create a PR, validate, and merge on green
+- If validation fails, check `shipyard logs <id> --target <name>` for details
+- Never push directly to main
 ```
 
-### Option B: Agent hook (automated CI after push)
+### Merging to develop instead of main
 
-Add to `.claude/settings.json`:
+If you want agents to merge to a `develop` branch instead (less risky for
+shared projects), just change the skill:
+
+```markdown
+## After finishing work
+
+    shipyard ship --base develop --json
+```
+
+You can even have both flows — agents merge to `develop` automatically, and
+you manually promote `develop` to `main` when you're ready:
+
+```bash
+git checkout develop
+shipyard ship --base main    # validate develop, merge to main
+```
+
+### Automated CI hook (optional)
+
+If you want CI to trigger automatically after every push (not just when
+shipping), add a hook to `.claude/settings.json`:
 
 ```json
 {
@@ -253,84 +352,106 @@ Add to `.claude/settings.json`:
     "PostToolUse": [
       {
         "matcher": "Bash",
-        "command": "if echo \"$TOOL_INPUT\" | grep -q 'git push'; then echo '[Shipyard] CI triggered'; shipyard run --json 2>/dev/null || true; fi"
+        "command": "if echo \"$TOOL_INPUT\" | grep -q 'git push'; then shipyard run --json 2>/dev/null || true; fi"
       }
     ]
   }
 }
 ```
 
-### Option C: Merge-on-green agent (fully automated)
-
-Add `.claude/agents/ci.md`:
-
-```markdown
----
-name: ci
-description: Runs cross-platform CI validation and merges on green
-tools: [Bash, Read]
 ---
 
-When asked to ship, land, or merge code:
-1. Ensure changes are on a feature branch (never main)
-2. Run: shipyard ship --json
-3. If all targets pass, the PR is merged automatically
-4. If any target fails, report the failure and suggest fixes
+## Workflow Scenarios
 
-When asked to check CI: shipyard status --json
-When asked about evidence: shipyard evidence --json
-```
+### Scenario: You finished a feature and want to merge
 
----
-
-## Workflow Examples
-
-### Feature branch → CI → merge
+You've been working on a feature branch. Everything looks good. Time to
+validate across platforms and merge.
 
 ```
-$ shipyard run                    # validate on all platforms
-  mac = pass, ubuntu = pass, windows = pass
+$ shipyard run
+  mac     = pass  (local, 3m12s)
+  ubuntu  = pass  (ssh, 5m30s)
+  windows = pass  (ssh, 4m18s)
+  All green.
 
-$ shipyard ship                   # create PR, merge on green
-  PR #42 → All green → Merged to main
+$ shipyard ship
+  PR #42 created → Validated → Merged to main
 ```
 
-### CI fails → fix → re-run just the failed target
+Or in one step: `shipyard ship` does the validation and merge together.
+
+### Scenario: CI fails on one platform
+
+You ran validation and Windows failed. You don't want to re-validate
+macOS and Linux (they already passed) — just fix and re-run Windows.
 
 ```
 $ shipyard run
   mac = pass, ubuntu = pass, windows = FAIL
 
 $ shipyard logs sy-001 --target windows
-  MSVC error C2065: 'M_PI' undeclared...
+  MSVC error C2065: 'M_PI' undeclared in reverb.cpp:42
 
 # Fix the issue, commit
-$ shipyard run --targets windows   # only re-validate Windows
+$ shipyard run --targets windows
   windows = pass
 
-$ shipyard ship                    # now merge
+$ shipyard ship
+  PR #42 → Merged
 ```
 
-### Queue management
+Shipyard remembers the evidence from the previous run. When you re-run
+just Windows and it passes, all three platforms now have green evidence
+for this SHA.
+
+### Scenario: Multiple agents working in parallel
+
+You have two agents working in separate worktrees — one on reverb,
+one on delay. Both need CI, and your machine has one Windows VM.
+
+Shipyard's queue handles this automatically. The first agent's run starts
+immediately. The second agent's run queues behind it. When the first
+finishes, the second starts.
 
 ```
-$ shipyard queue                   # see what's queued
-  Running: sy-001 feature/reverb @ abc1234 [normal]
-  Pending: sy-002 feature/delay  @ def5678 [low]
+Agent 1 (worktree: ~/Code/my-plugin-reverb):
+  shipyard ship → queued → running → PR #42 merged
 
-$ shipyard bump sy-002 high        # move it up in priority
-$ shipyard cancel sy-001           # cancel the running job
+Agent 2 (worktree: ~/Code/my-plugin-delay):
+  shipyard ship → queued → waiting → running → PR #43 merged
 ```
 
-### Fully automated (agent does everything)
+No collisions. No manual coordination. The queue is machine-global.
+
+### Scenario: You want to prioritize one job over another
+
+Two jobs are queued. The delay feature is urgent. Bump it up.
 
 ```
-You: "Ship the reverb feature to main"
+$ shipyard queue
+  Running: sy-001 feature/reverb  [normal]
+  Pending: sy-002 feature/delay   [low]
 
-Agent:
-  → shipyard ship --json
-  → mac = pass, ubuntu = pass, windows = pass
-  → PR #42 merged. All 3 platforms passed.
+$ shipyard bump sy-002 high
+  Bumped sy-002 to high
+```
+
+When the current job finishes, the high-priority job runs next.
+
+### Scenario: You want to merge to develop, not main
+
+Your team uses a develop branch as a staging area. Ship to develop first,
+promote to main later when stable.
+
+```
+$ shipyard ship --base develop
+  PR #44 → Validated → Merged to develop
+
+# Later, when develop is stable:
+$ git checkout develop
+$ shipyard ship --base main
+  PR #45 → Validated → Merged to main
 ```
 
 ---
@@ -360,17 +481,22 @@ git clone https://github.com/danielraffel/Shipyard.git
 cd Shipyard
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+pytest                         # verify everything works
 ```
 
-This installs Shipyard in editable mode so you can modify and test it locally.
+### Requirements
 
-## Requirements
+You don't need everything — just what matches your setup:
 
-- git
-- `gh` CLI for GitHub integration (`brew install gh`)
-- `nsc` CLI for Namespace cloud runners (optional — `brew install namespace-cli`)
-- SSH access to any remote VMs you want to validate on
-- UTM, Parallels, or Tart for local VM management (optional)
+| Tool | Required? | What it's for | Install |
+|------|-----------|---------------|---------|
+| git | Yes | Version control | Pre-installed on macOS |
+| `gh` | Yes (for PRs) | GitHub integration | `brew install gh` |
+| `ssh` | For remote targets | Connect to VMs | Pre-installed on macOS |
+| `nsc` | For Namespace | Cloud runners | `brew install namespace-cli` |
+| UTM / Parallels | For VM fallback | Auto-boot VMs | `brew install --cask utm` |
+
+`shipyard doctor` checks all of this and tells you what's missing.
 
 ---
 
@@ -379,7 +505,7 @@ This installs Shipyard in editable mode so you can modify and test it locally.
 ```bash
 # Setup
 shipyard init                  # configure project
-shipyard doctor                # check environment
+shipyard doctor                # check environment + suggest fixes
 shipyard targets               # show targets + reachability
 
 # Validate
