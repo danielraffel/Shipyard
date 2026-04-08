@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Shipyard installer — downloads the correct binary for your platform.
 
-REPO="danielraffel/shipyard"
+REPO="danielraffel/Shipyard"
 INSTALL_DIR="${HOME}/.local/bin"
 
 # Detect OS
