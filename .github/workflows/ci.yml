@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      runner_provider:
+        description: "Runner provider"
+        required: false
+        default: "namespace"
+        type: choice
+        options:
+          - github-hosted
+          - namespace
+
+jobs:
+  resolve-runners:
+    runs-on: ubuntu-latest
+    outputs:
+      linux: ${{ steps.resolve.outputs.linux }}
+      macos: ${{ steps.resolve.outputs.macos }}
+      windows: ${{ steps.resolve.outputs.windows }}
+    steps:
+      - id: resolve
+        run: |
+          PROVIDER="${{ inputs.runner_provider || 'namespace' }}"
+          if [ "$PROVIDER" = "namespace" ]; then
+            echo "linux=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT"
+            echo "macos=\"macos-15\"" >> "$GITHUB_OUTPUT"
+            echo "windows=\"namespace-profile-generouscorp-windows\"" >> "$GITHUB_OUTPUT"
+          else
+            echo "linux=\"ubuntu-latest\"" >> "$GITHUB_OUTPUT"
+            echo "macos=\"macos-15\"" >> "$GITHUB_OUTPUT"
+            echo "windows=\"windows-latest\"" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    needs: resolve-runners
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: linux
+            name: Linux (x64)
+            runs_on: ${{ needs.resolve-runners.outputs.linux }}
+          - key: macos
+            name: macOS (ARM64)
+            runs_on: ${{ needs.resolve-runners.outputs.macos }}
+          - key: windows
+            name: Windows (x64)
+            runs_on: ${{ needs.resolve-runners.outputs.windows }}
+    name: ${{ matrix.name }}
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install .[dev]
+
+      - name: Run tests
+        run: pytest
+
+      - name: Lint
+        run: ruff check src/
+
+      - name: Type check
+        if: runner.os != 'Windows'
+        run: mypy src/

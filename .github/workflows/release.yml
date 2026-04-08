@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      runner_provider:
+        description: "Runner provider"
+        required: false
+        default: "namespace"
+        type: choice
+        options:
+          - github-hosted
+          - namespace
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-runners:
+    runs-on: ubuntu-latest
+    outputs:
+      linux: ${{ steps.resolve.outputs.linux }}
+      linux_arm: ${{ steps.resolve.outputs.linux_arm }}
+      macos_arm: ${{ steps.resolve.outputs.macos_arm }}
+      macos_x64: ${{ steps.resolve.outputs.macos_x64 }}
+      windows: ${{ steps.resolve.outputs.windows }}
+    steps:
+      - id: resolve
+        run: |
+          PROVIDER="${{ inputs.runner_provider || 'namespace' }}"
+          if [ "$PROVIDER" = "namespace" ]; then
+            echo "linux=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT"
+            echo "linux_arm=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT"
+            echo "macos_arm=\"namespace-profile-generouscorp-macos\"" >> "$GITHUB_OUTPUT"
+            echo "macos_x64=\"macos-13\"" >> "$GITHUB_OUTPUT"
+            echo "windows=\"namespace-profile-generouscorp-windows\"" >> "$GITHUB_OUTPUT"
+          else
+            echo "linux=\"ubuntu-latest\"" >> "$GITHUB_OUTPUT"
+            echo "linux_arm=\"ubuntu-24.04-arm\"" >> "$GITHUB_OUTPUT"
+            echo "macos_arm=\"macos-15\"" >> "$GITHUB_OUTPUT"
+            echo "macos_x64=\"macos-13\"" >> "$GITHUB_OUTPUT"
+            echo "windows=\"windows-latest\"" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve-runners
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            artifact: shipyard-macos-arm64
+            runs_on: ${{ needs.resolve-runners.outputs.macos_arm }}
+          - target: macos-x64
+            artifact: shipyard-macos-x64
+            runs_on: ${{ needs.resolve-runners.outputs.macos_x64 }}
+          - target: windows-x64
+            artifact: shipyard-windows-x64
+            runs_on: ${{ needs.resolve-runners.outputs.windows }}
+          - target: linux-x64
+            artifact: shipyard-linux-x64
+            runs_on: ${{ needs.resolve-runners.outputs.linux }}
+          - target: linux-arm64
+            artifact: shipyard-linux-arm64
+            runs_on: ${{ needs.resolve-runners.outputs.linux_arm }}
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install .[dev] pyinstaller
+
+      - name: Build binary
+        run: pyinstaller --onefile --name ${{ matrix.artifact }} src/shipyard/cli.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f | while read f; do
+            cp "$f" release/
+          done
+          cd release && sha256sum * > checksums.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

@@ -1,0 +1,25 @@
+[project]
+name = "shipyard"
+platforms = [
+    "macos",
+    "linux",
+    "windows",
+]
+type = "python-uv"
+
+[validation.default]
+install = "uv sync"
+build = "uv run python -m build"
+test = "uv run pytest"
+
+[targets.mac]
+backend = "local"
+platform = "macos-arm64"
+
+[targets.ubuntu]
+platform = "linux-x64"
+backend = "cloud"
+
+[targets.windows]
+platform = "windows-x64"
+backend = "cloud"
