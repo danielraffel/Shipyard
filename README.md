@@ -29,7 +29,7 @@ runs your build and test commands, and tells you what passed. When a machine
 is unreachable, Shipyard automatically tries the next one in the chain —
 boot the VM, or dispatch to cloud runners.
 
-When everything is green, `shipyard ship` creates a PR and merges it.
+When everything is green, `shipyard ship` can create a PR and merges it.
 
 ## What It Doesn't Do
 
