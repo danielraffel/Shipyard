@@ -1,8 +1,7 @@
 # Shipyard
 
-Cross-platform CI from your machine. Validate commits on local VMs, SSH hosts,
-and cloud runners — with one config file, automatic failover, and structured
-output for AI agents.
+Cross-platform CI from your machine. Local VMs, SSH hosts, cloud runners —
+one config, automatic failover, and structured output for AI agents.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/danielraffel/Shipyard/main/install.sh | sh
@@ -13,29 +12,39 @@ shipyard run         # validates on every platform you configured
 
 ---
 
-## What It Does
+## Who This Is For
 
-You have a Mac. Maybe you have a Windows VM and a Linux VM running on it.
-Maybe you have cloud runner accounts on Namespace or GitHub. Shipyard
-coordinates all of them to validate your code before you merge.
+**You're running AI agents across worktrees and want automated validation
+and merging.** Your agent finishes work, Shipyard validates it on every
+platform, and merges the PR — without you babysitting the process.
 
-- **Local builds** run directly on your Mac — fast, no network needed
-- **Remote builds** run on your VMs over SSH — real Windows and Linux or maybe on a Proxmox server
-- **Cloud builds** dispatch to Namespace or GitHub Actions — fallback when
-  your VMs are off, or when you need neutral hardware
+**You're building something that needs to work on more than one platform**
+and you don't want to maintain heavyweight CI infrastructure. You have a Mac.
+Maybe a VM or two. Maybe a Namespace account. You just want to know if your
+code builds everywhere before you merge, and you want that to be a single
+command.
 
-When you run `shipyard run`, it delivers the exact commit to each machine,
-runs your build and test commands, and tells you what passed. When a machine
-is unreachable, Shipyard automatically tries the next one in the chain —
-boot the VM, or dispatch to cloud runners.
+**You want to switch between local-only and cloud validation depending on
+the day.** Some days you want fast local-only checks. Other days you need
+the full cross-platform proof. Shipyard lets you switch between setups
+without editing config files.
 
-When everything is green, `shipyard ship` can create a PR and merge it.
+## How It Works
 
-## What It Doesn't Do
+- **Local builds** run directly on your Mac — fast, no network
+- **Remote builds** run on your VMs over SSH — real Windows, real Linux
+- **Cloud builds** dispatch to Namespace or GitHub Actions — for when VMs
+  are off or you need neutral hardware
 
-Shipyard is not a CI service, not a build system, not a workflow engine. It
-calls your build commands and cares about one thing: did they pass on every
-platform?
+`shipyard run` delivers the exact commit to each machine, runs your build
+and test commands, and reports what passed. If a machine is unreachable,
+Shipyard can try the next option automatically — boot a VM, or dispatch
+to cloud. Or it just reports unreachable and stops. You choose.
+
+`shipyard ship` validates and then creates a PR and merges it.
+
+Shipyard is not a CI service, not a build system, not a workflow engine.
+It calls your build commands and cares about one thing: did they pass?
 
 ---
 
@@ -528,3 +537,98 @@ shipyard bump <id> high        # reprioritize a pending job
 shipyard cancel <id>           # cancel a job
 shipyard cleanup --apply       # prune old logs and artifacts
 ```
+
+---
+
+## Profiles
+
+Once you're comfortable with Shipyard, profiles let you switch between
+different setups with one command.
+
+### The problem they solve
+
+Some days you want local-only validation (fast, free). Other days you need
+the full cross-platform proof (Mac + Windows + Linux via cloud). Editing
+your config every time is annoying.
+
+### Define profiles once
+
+```toml
+# .shipyard/config.toml
+
+[profiles.local]
+# Just your Mac. Fast. Free. No network.
+targets = ["mac"]
+
+[profiles.normal]
+# Mac local + cloud for Windows and Linux
+targets = ["mac", "ubuntu-cloud", "windows-cloud"]
+
+[profiles.full]
+# Mac local + VMs with cloud fallback for everything
+targets = ["mac", "ubuntu", "windows"]
+```
+
+### Switch instantly
+
+```bash
+$ shipyard config use local          # just my Mac
+$ shipyard config use normal         # Mac + Namespace cloud
+$ shipyard config use full           # Mac + VMs + cloud fallback
+```
+
+### See what's active
+
+```bash
+$ shipyard config profiles
+
+  local     mac                                          ← active
+  normal    mac, ubuntu-cloud, windows-cloud
+  full      mac, ubuntu, windows (+fallback)
+
+$ shipyard targets
+
+  Profile: local
+
+  mac              local        macos-arm64      reachable
+
+  (ubuntu and windows are disabled in this profile)
+```
+
+### Global vs project profiles
+
+Profiles work at both levels:
+
+- **Global** (`~/.config/shipyard/config.toml`) — your default setups, shared
+  across all projects. Define `local`, `normal`, `full` here once.
+- **Project** (`.shipyard/config.toml`) — project-specific profiles that
+  override or extend global ones. A project that needs ARM Linux testing
+  can add a `release` profile with extra targets.
+
+Switch profiles globally or per-project. `shipyard status` always shows
+which profile is active and exactly where each target will run.
+
+### Fallback is opt-in
+
+By default, if a target is unreachable, it just reports unreachable. No
+automatic VM booting, no cloud dispatch. You add fallback chains only if
+you want them:
+
+```toml
+# No fallback — unreachable means unreachable
+[targets.ubuntu]
+backend = "ssh"
+host = "ubuntu"
+
+# With fallback — tries VM, then cloud
+[targets.ubuntu]
+backend = "ssh"
+host = "ubuntu"
+fallback = [
+    { type = "vm", vm_name = "Ubuntu 24.04" },
+    { type = "cloud", provider = "namespace" },
+]
+```
+
+This keeps things predictable. You always know exactly what Shipyard will
+do because you configured it.
