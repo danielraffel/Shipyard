@@ -7,9 +7,9 @@ Jobs are ordered by priority (high first) then FIFO.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -154,7 +154,10 @@ class Queue:
 
 
 class _DrainLock:
-    """File-based exclusive lock for drain ownership."""
+    """File-based exclusive lock for drain ownership.
+
+    Uses fcntl on POSIX, msvcrt on Windows.
+    """
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -164,7 +167,12 @@ class _DrainLock:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR)
         try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             # Write our PID for debugging
             os.ftruncate(self._fd, 0)
             os.write(self._fd, f"{os.getpid()}\n".encode())
@@ -176,7 +184,15 @@ class _DrainLock:
 
     def release(self) -> None:
         if self._fd is not None:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            if sys.platform == "win32":
+                import msvcrt
+                try:
+                    msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
             os.close(self._fd)
             self._fd = None
 
