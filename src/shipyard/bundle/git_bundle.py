@@ -75,6 +75,7 @@ def upload_bundle(
     host: str,
     remote_path: str,
     ssh_options: Sequence[str] = (),
+    timeout: int = 1800,
 ) -> BundleResult:
     """Upload a bundle file to a remote host via SCP.
 
@@ -83,6 +84,12 @@ def upload_bundle(
         host: SSH host (user@host or alias).
         remote_path: Destination path on the remote host.
         ssh_options: Additional SSH/SCP options (e.g. ["-o", "StrictHostKeyChecking=no"]).
+        timeout: scp timeout in seconds. Defaults to 30 minutes to
+            accommodate large repos over slow links (e.g. Pulp's
+            ~100MB bundle to a Windows VM). Callers with known
+            small bundles can pass a shorter timeout; 5 minutes was
+            the previous default and turned out to be too
+            aggressive for real workloads.
 
     Returns:
         BundleResult indicating success or failure.
@@ -104,7 +111,7 @@ def upload_bundle(
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=timeout,
         )
         if result.returncode != 0:
             return BundleResult(
