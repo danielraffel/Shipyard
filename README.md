@@ -1,7 +1,8 @@
 # Shipyard
 
-Cross-platform CI from your machine. Local VMs, SSH hosts, cloud runners —
-one config, automatic failover, and structured output for AI agents.
+Cross-platform CI for projects that build and test. Validate your app,
+plugin, or library on local VMs, SSH hosts, and cloud runners — with one
+config, automatic failover, and structured output for AI agents.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/danielraffel/Shipyard/main/install.sh | sh
@@ -37,6 +38,19 @@ It calls your build commands and cares about one thing: did they pass?
 ---
 
 ## Examples
+
+### What your project needs
+
+Shipyard runs your existing build and test commands on each platform. It
+assumes your project already has:
+
+- A build system (CMake, Xcode, Cargo, npm, Gradle, Swift, etc.)
+- Test commands that exit 0 on success and non-zero on failure
+
+If your project builds and has tests, Shipyard can validate it. If it
+doesn't have tests yet, Shipyard still validates that the build succeeds.
+
+---
 
 ### Scenario 1: You're building a macOS and iOS app
 
