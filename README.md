@@ -21,7 +21,11 @@ If something fails, the agent should read the logs, fix the issue, and retry. No
 
 Shipyard makes this reliable. Agents commit; Shipyard coordinates validation across platforms; code lands on main  only when all targets are green.
 
-It also handles cross-platform validation across local VMs and cloud runners, without requiring you to maintain CI infrastructure.
+You test with what you already have: your Mac, a UTM or Parallels VM for
+Windows and Linux, maybe a Namespace or GitHub Actions account for cloud
+runners. Shipyard ties them together — you don't need to set up Jenkins,
+maintain a self-hosted runner fleet, or write workflow YAML. Just point it
+at your machines and go.
 
 ## How It Works
 
