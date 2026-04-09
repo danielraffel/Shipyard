@@ -275,12 +275,22 @@ def _apply_bundle_windows(
     repo_path: str,
     ssh_options: list[str],
 ) -> _ApplyResult:
-    """Apply a git bundle on a remote Windows host via PowerShell."""
+    """Apply a git bundle on a remote Windows host via PowerShell.
+
+    Fetches bundle refs into a Shipyard-owned namespace rather
+    than `refs/*`. The naive `+refs/*:refs/*` mapping fails with
+    "refusing to fetch into branch <name> checked out at <path>"
+    whenever the remote worktree happens to have the bundled
+    branch checked out. The namespaced destination is never a
+    checked-out ref, so git accepts the fetch unconditionally.
+    """
     ps_cmd = (
         f"cd '{repo_path}'; "
         f"git bundle verify '{bundle_path}'; "
         f"if ($LASTEXITCODE -ne 0) {{ exit 1 }}; "
-        f"git fetch '{bundle_path}' '+refs/*:refs/*'; "
+        f"git fetch '{bundle_path}' "
+        f"'+refs/heads/*:refs/shipyard-bundles/heads/*' "
+        f"'+refs/tags/*:refs/shipyard-bundles/tags/*'; "
         f"if ($LASTEXITCODE -ne 0) {{ exit 1 }}"
     )
 

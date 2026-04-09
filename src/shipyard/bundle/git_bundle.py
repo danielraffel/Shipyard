@@ -131,8 +131,18 @@ def apply_bundle(
 ) -> BundleResult:
     """Apply a git bundle on a remote host via SSH.
 
-    Fetches all refs from the bundle into the remote repo, then checks out
-    the desired state.
+    Fetches bundle refs into a Shipyard-owned namespace
+    (`refs/shipyard-bundles/*`) rather than `refs/*`. The naive
+    `+refs/*:refs/*` mapping fails with "refusing to fetch into
+    branch <name> checked out at <path>" whenever the remote
+    worktree happens to have the bundled branch checked out —
+    which is extremely common on a long-lived validation VM. The
+    namespaced destination is never a checked-out ref, so git
+    accepts the fetch unconditionally.
+
+    The validation layer walks `refs/shipyard-bundles/*` to find
+    the exact SHA; the remote checkout will be done separately by
+    the executor's per-target logic.
 
     Args:
         host: SSH host (user@host or alias).
@@ -146,7 +156,9 @@ def apply_bundle(
     remote_cmd = (
         f"cd {repo_path} && "
         f"git bundle verify {bundle_path} && "
-        f"git fetch {bundle_path} '+refs/*:refs/*'"
+        f"git fetch {bundle_path} "
+        f"'+refs/heads/*:refs/shipyard-bundles/heads/*' "
+        f"'+refs/tags/*:refs/shipyard-bundles/tags/*'"
     )
 
     cmd: list[str] = ["ssh"]
