@@ -73,6 +73,17 @@ class TargetResult:
     runner_profile: str | None = None
     # Error detail
     error_message: str | None = None
+    # Validation contract violation. When the project declares
+    # required contract markers in `[validation.contract]`, the
+    # executor records which markers were seen and which were missing.
+    # If `enforce = true` and any required marker is missing, the
+    # status is forced to FAIL and `contract_violation` carries a
+    # human-readable explanation. When `enforce = false`, missing
+    # markers are recorded here as a warning but the status is
+    # unchanged.
+    contract_markers_seen: tuple[str, ...] = ()
+    contract_markers_missing: tuple[str, ...] = ()
+    contract_violation: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -129,6 +140,12 @@ class TargetResult:
             d["runner_profile"] = self.runner_profile
         if self.error_message:
             d["error_message"] = self.error_message
+        if self.contract_markers_seen:
+            d["contract_markers_seen"] = list(self.contract_markers_seen)
+        if self.contract_markers_missing:
+            d["contract_markers_missing"] = list(self.contract_markers_missing)
+        if self.contract_violation:
+            d["contract_violation"] = self.contract_violation
         return d
 
 

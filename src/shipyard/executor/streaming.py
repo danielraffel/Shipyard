@@ -32,6 +32,18 @@ class StreamingCommandResult:
     duration_secs: float
     last_output_at: datetime | None
     phase: str | None
+    # Contract markers seen during the run. A "contract marker" is a
+    # specific string the validation script is required to emit at
+    # least once for the run to be considered authentic. The streaming
+    # layer records every marker from `required_contract_markers` that
+    # appears in the output; the caller can then check whether all
+    # required markers were observed and treat a missing marker as a
+    # contract violation regardless of process exit code.
+    #
+    # Markers are matched as substrings (not regexes) against each
+    # decoded output line, so the validation script can emit them
+    # anywhere in a line, not just at line start.
+    contract_markers_seen: tuple[str, ...] = ()
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -49,8 +61,16 @@ def run_streaming_command(
     heartbeat_interval_secs: float = 30.0,
     stuck_idle_secs: float = 90.0,
     progress_callback: ProgressCallback | None = None,
+    required_contract_markers: tuple[str, ...] | list[str] | None = None,
 ) -> StreamingCommandResult:
-    """Run a command while streaming output to disk and progress callbacks."""
+    """Run a command while streaming output to disk and progress callbacks.
+
+    `required_contract_markers` is an optional list of substring markers
+    the streaming layer should watch for in the command's output. Each
+    seen marker is recorded in the result's `contract_markers_seen`
+    field. The caller decides what to do about missing markers — the
+    streaming layer never fails the process based on contract.
+    """
     started_at = datetime.now(timezone.utc)
     start_time = time.monotonic()
     log_file = Path(log_path) if log_path else None
@@ -77,6 +97,11 @@ def run_streaming_command(
     last_output_at: datetime | None = None
     last_output_monotonic = start_time
     current_phase = phase
+    # Track which contract markers have appeared. Use a list (not a
+    # set) so the order of first occurrence is preserved for
+    # diagnostic output.
+    markers_to_watch = tuple(required_contract_markers or ())
+    seen_markers: list[str] = []
 
     try:
         mode = "a" if append else "w"
@@ -119,6 +144,14 @@ def run_streaming_command(
                 if marker_phase:
                     current_phase = marker_phase
 
+                # Contract marker tracking. Match as substring against
+                # the decoded line so the validation script can emit
+                # the marker as part of a longer status message.
+                if markers_to_watch:
+                    for marker in markers_to_watch:
+                        if marker in decoded and marker not in seen_markers:
+                            seen_markers.append(marker)
+
                 last_output_at = datetime.now(timezone.utc)
                 last_output_monotonic = time.monotonic()
                 if progress_callback:
@@ -147,6 +180,7 @@ def run_streaming_command(
         duration_secs=time.monotonic() - start_time,
         last_output_at=last_output_at,
         phase=current_phase,
+        contract_markers_seen=tuple(seen_markers),
     )
 
 

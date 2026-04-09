@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Any
 
 from shipyard.core.job import TargetResult, TargetStatus
+from shipyard.executor.contract import (
+    evaluate_contract,
+    required_markers,
+)
 from shipyard.executor.streaming import ProgressCallback, run_streaming_command
 
 STAGES = ("setup", "configure", "build", "test")
@@ -55,11 +59,18 @@ class LocalExecutor:
         log_file = Path(log_path)
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
+        # Validation contract — optional per project. If declared in
+        # `[validation.contract]`, it gets passed to the streaming
+        # layer (so markers are recorded) and to the result evaluator
+        # (so missing markers can flip status to FAIL).
+        contract_config = validation_config.get("contract") if validation_config else None
+
         # Single command mode
         if "command" in validation_config:
             return self._run_single(
                 validation_config["command"], target_name, platform,
                 target_config, log_file, started_at, start_time, progress_callback,
+                contract_config=contract_config,
             )
 
         # Stage-aware mode
@@ -75,6 +86,7 @@ class LocalExecutor:
         return self._run_stages(
             stages, target_name, platform, target_config,
             log_file, started_at, start_time, progress_callback,
+            contract_config=contract_config,
         )
 
     def _run_single(
@@ -82,6 +94,7 @@ class LocalExecutor:
         target_config: dict[str, Any], log_file: Path,
         started_at: datetime, start_time: float,
         progress_callback: ProgressCallback | None,
+        contract_config: dict[str, Any] | None = None,
     ) -> TargetResult:
         try:
             result = run_streaming_command(
@@ -91,8 +104,12 @@ class LocalExecutor:
                 log_path=str(log_file),
                 timeout=target_config.get("timeout_secs", 1800),
                 progress_callback=progress_callback,
+                required_contract_markers=required_markers(contract_config),
             )
             status = TargetStatus.PASS if result.returncode == 0 else TargetStatus.FAIL
+            evaluation = evaluate_contract(contract_config, result.contract_markers_seen)
+            if evaluation.should_force_fail and status == TargetStatus.PASS:
+                status = TargetStatus.FAIL
             return TargetResult(
                 target_name=target_name, platform=platform,
                 status=status, backend="local", duration_secs=result.duration_secs,
@@ -100,6 +117,9 @@ class LocalExecutor:
                 log_path=str(log_file),
                 phase=result.phase,
                 last_output_at=result.last_output_at,
+                contract_markers_seen=evaluation.seen,
+                contract_markers_missing=evaluation.missing,
+                contract_violation=evaluation.message,
             )
         except subprocess.TimeoutExpired:
             return TargetResult(
@@ -122,10 +142,16 @@ class LocalExecutor:
         platform: str, target_config: dict[str, Any], log_file: Path,
         started_at: datetime, start_time: float,
         progress_callback: ProgressCallback | None,
+        contract_config: dict[str, Any] | None = None,
     ) -> TargetResult:
         """Run validation as separate stages. Stop at first failure."""
         failed_stage = None
         last_output_at: datetime | None = None
+        # Accumulate contract markers seen across every stage. The
+        # contract is evaluated once at the end of the run, so a
+        # marker emitted in any stage counts.
+        all_seen_markers: list[str] = []
+        contract_markers_to_watch = required_markers(contract_config)
 
         try:
             log_file.write_text("")
@@ -147,6 +173,7 @@ class LocalExecutor:
                     timeout=target_config.get("timeout_secs", 1800),
                     phase=stage_name,
                     progress_callback=progress_callback,
+                    required_contract_markers=contract_markers_to_watch,
                 )
 
                 _ = StageResult(
@@ -155,6 +182,9 @@ class LocalExecutor:
                     duration_secs=time.monotonic() - stage_start,
                 )
                 last_output_at = result.last_output_at
+                for marker in result.contract_markers_seen:
+                    if marker not in all_seen_markers:
+                        all_seen_markers.append(marker)
 
                 if result.returncode != 0:
                     failed_stage = stage_name
@@ -177,6 +207,8 @@ class LocalExecutor:
             )
 
         elapsed = time.monotonic() - start_time
+        evaluation = evaluate_contract(contract_config, tuple(all_seen_markers))
+
         if failed_stage:
             error_msg = f"Stage '{failed_stage}' failed"
             return TargetResult(
@@ -187,16 +219,30 @@ class LocalExecutor:
                 log_path=str(log_file), error_message=error_msg,
                 phase=failed_stage,
                 last_output_at=last_output_at,
+                contract_markers_seen=evaluation.seen,
+                contract_markers_missing=evaluation.missing,
+                contract_violation=evaluation.message,
             )
+
+        # All stages passed by exit code. Now check the contract — a
+        # missing required marker can flip the status to FAIL even
+        # though every stage exited 0.
+        final_status = TargetStatus.PASS
+        if evaluation.should_force_fail:
+            final_status = TargetStatus.FAIL
 
         return TargetResult(
             target_name=target_name, platform=platform,
-            status=TargetStatus.PASS, backend="local",
+            status=final_status, backend="local",
             duration_secs=elapsed, started_at=started_at,
             completed_at=datetime.now(timezone.utc),
             log_path=str(log_file),
             phase=stages[-1][0] if stages else None,
             last_output_at=last_output_at,
+            error_message=evaluation.message if final_status == TargetStatus.FAIL else None,
+            contract_markers_seen=evaluation.seen,
+            contract_markers_missing=evaluation.missing,
+            contract_violation=evaluation.message,
         )
 
     def probe(self, target_config: dict[str, Any]) -> bool:
