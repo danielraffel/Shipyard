@@ -210,9 +210,9 @@ Shipyard tries the next option automatically:
 4. If cloud fails too → dispatch to GitHub-hosted runners (last resort)
 ```
 
-The chain is configurable per target. You can skip VMs, skip cloud, or make
-cloud the primary. Most people use: local first, VM fallback, cloud last
-resort.
+The chain is configurable per target. You can skip VMs, skip cloud, 
+or make cloud the primary. An indie developer just having a play with
+a project might use: local first, VM fallback, cloud last resort.
 
 ### What Shipyard checks on setup
 
@@ -457,7 +457,7 @@ $ shipyard ship --base main
 ### Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/danielraffel/Shipyard/main/install.sh | sh
+curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
 ```
 
 Downloads a standalone binary for your platform. No runtime needed.
