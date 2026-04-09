@@ -5,7 +5,7 @@ plugin, or library on local VMs, SSH hosts, and cloud runners — with one
 config, automatic failover, and structured output for AI agents.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/danielraffel/Shipyard/main/install.sh | sh
+curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
 cd my-project
 shipyard init        # detects your project, probes your machines
 shipyard run         # validates on every platform you configured
@@ -266,10 +266,9 @@ command supports `--json` for structured output — agents parse the result
 and decide what to do next.
 
 ### The "set it and forget it" flow
-
-The most powerful setup: you tell your agent to work on a task, and it
-automatically validates and merges when done. No manual CI checks. No
-manual merges. You come back and it's on main.
+The most powerful setup: assign a task to an agent, and it validates and merges
+automatically. No manual CI checks or manual merges. If it’s green,
+it’s auto-merged to main.
 
 Here's how it works in practice:
 
@@ -374,7 +373,7 @@ shipping), add a hook to `.claude/settings.json`:
 
 ## Workflow Scenarios
 
-### Scenario: You finished a feature and want to merge
+### Scenario 1: You finished a feature and want to merge
 
 You've been working on a feature branch. Everything looks good. Time to
 validate across platforms and merge.
@@ -392,7 +391,7 @@ $ shipyard ship
 
 Or in one step: `shipyard ship` does the validation and merge together.
 
-### Scenario: CI fails on one platform
+### Scenario 2: CI fails on one platform
 
 You ran validation and Windows failed. You don't want to re-validate
 macOS and Linux (they already passed) — just fix and re-run Windows.
@@ -416,7 +415,7 @@ Shipyard remembers the evidence from the previous run. When you re-run
 just Windows and it passes, all three platforms now have green evidence
 for this SHA.
 
-### Scenario: Multiple agents working in parallel
+### Scenario 3: Multiple agents working in parallel
 
 You have two agents working in separate worktrees — one on reverb,
 one on delay. Both need CI, and your machine has one Windows VM.
@@ -435,7 +434,7 @@ Agent 2 (worktree: ~/Code/my-plugin-delay):
 
 No collisions. No manual coordination. The queue is machine-global.
 
-### Scenario: You want to prioritize one job over another
+### Scenario 4: You want to prioritize one job over another
 
 Two jobs are queued. The delay feature is urgent. Bump it up.
 
@@ -450,7 +449,7 @@ $ shipyard bump sy-002 high
 
 When the current job finishes, the high-priority job runs next.
 
-### Scenario: You want to merge to develop, not main
+### Scenario 5: You want to merge to develop, not main
 
 Your team uses a develop branch as a staging area. Ship to develop first,
 promote to main later when stable.
