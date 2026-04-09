@@ -58,10 +58,23 @@ branch, the pending job for the old SHA is automatically replaced — but
 narrower reruns (just one failing target) and different validation modes
 (smoke vs full) coexist without interfering.
 
+**Fail-fast across targets.** If Mac fails, Shipyard stops immediately —
+it doesn't waste time running Windows and Linux when you already know
+you need to fix something. Remaining targets are marked as skipped. When
+you want to run everything regardless (to see the full picture), use
+`--continue`.
+
 **Targeted re-runs.** If Windows fails but Mac and Linux passed, re-run just
 Windows. Shipyard keeps the evidence from the earlier run. When the re-run
 passes, all three platforms now have green evidence for this SHA — you don't
 re-validate what already passed.
+
+**Stage-aware resume.** If your build succeeded but tests failed, you don't
+need to rebuild from scratch. Use `--resume-from test` to skip configure and
+build, running only the test stage. This works because Shipyard runs
+validation in stages (configure → build → test) and tracks which stage
+failed — so both you and your agent know exactly what broke and where to
+pick up.
 
 **Failover that knows the difference.** If a target is unreachable, Shipyard
 walks your fallback chain (boot VM → try cloud → try GitHub-hosted). But if

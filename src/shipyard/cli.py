@@ -16,7 +16,7 @@ import click
 from shipyard import __version__
 from shipyard.core.config import Config
 from shipyard.core.evidence import EvidenceStore
-from shipyard.core.job import Job, JobStatus, ValidationMode
+from shipyard.core.job import Job, JobStatus, TargetResult, TargetStatus, ValidationMode
 from shipyard.core.queue import Queue
 from shipyard.executor.local import LocalExecutor
 from shipyard.output.human import (
@@ -82,8 +82,16 @@ def main(ctx: click.Context, json_mode: bool) -> None:
 @main.command()
 @click.option("--targets", "-t", help="Comma-separated target names")
 @click.option("--smoke", is_flag=True, help="Fast smoke validation")
+@click.option(
+    "--fail-fast/--continue", "fail_fast", default=True,
+    help="Stop after first target failure (default) or run all",
+)
+@click.option(
+    "--resume-from", type=click.Choice(["configure", "build", "test"]),
+    help="Resume from a stage (skip earlier stages that already passed)",
+)
 @click.pass_obj
-def run(ctx: Context, targets: str | None, smoke: bool) -> None:
+def run(ctx: Context, targets: str | None, smoke: bool, fail_fast: bool, resume_from: str | None) -> None:
     """Validate current HEAD on configured targets."""
     config = ctx.config
     mode = ValidationMode.SMOKE if smoke else ValidationMode.FULL
@@ -119,8 +127,21 @@ def run(ctx: Context, targets: str | None, smoke: bool) -> None:
 
     executor = LocalExecutor()
     validation_config = _resolve_validation(config, mode)
+    had_failure = False
 
     for name in job.target_names:
+        # Fail-fast: skip remaining targets after a failure
+        if had_failure and fail_fast:
+            job = job.with_result(TargetResult(
+                target_name=name,
+                platform=config.targets.get(name, {}).get("platform", "unknown"),
+                status=TargetStatus.CANCELLED,
+                backend="skipped",
+                error_message="Skipped (earlier target failed, --fail-fast)",
+            ))
+            ctx.queue.update(job)
+            continue
+
         target_config = config.targets.get(name, {})
         target_config["name"] = name
 
@@ -132,9 +153,13 @@ def run(ctx: Context, targets: str | None, smoke: bool) -> None:
             target_config=target_config,
             validation_config=_resolve_target_validation(config, name, validation_config),
             log_path=log_path,
+            resume_from=resume_from,
         )
         job = job.with_result(result)
         ctx.queue.update(job)
+
+        if not result.passed:
+            had_failure = True
 
         if not ctx.json_mode:
             render_job(job)
