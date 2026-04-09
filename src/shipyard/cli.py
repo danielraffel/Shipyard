@@ -387,6 +387,13 @@ def doctor(ctx: Context) -> None:
     cloud["nsc"] = _check_command("nsc", "version")
     checks["Cloud providers"] = cloud
 
+    # Governance drift — best-effort. If the repo can't be detected
+    # or gh isn't authenticated, this section is skipped silently
+    # rather than blocking the whole doctor command.
+    governance_section = _check_governance_drift(ctx.config)
+    if governance_section:
+        checks["Governance"] = governance_section
+
     ready = all(
         info.get("ok", False)
         for info in core.values()
@@ -396,6 +403,81 @@ def doctor(ctx: Context) -> None:
         ctx.output("doctor", {"ready": ready, "checks": checks})
     else:
         render_doctor(checks, ready)
+
+
+def _check_governance_drift(config: Config) -> dict[str, Any] | None:
+    """Produce a doctor section reporting governance drift.
+
+    Returns None if the repo cannot be detected or the user has not
+    declared a governance section. Never raises — any failure is
+    translated into a single diagnostic entry so doctor stays
+    informative even when gh auth is missing.
+    """
+    from shipyard.governance import (
+        build_status,
+        detect_repo_from_remote,
+        load_governance_config,
+    )
+
+    section: dict[str, Any] = {}
+    try:
+        governance = load_governance_config(config)
+    except ValueError as exc:
+        return {"config": {"ok": False, "detail": f"Config error: {exc}"}}
+
+    # Only probe GitHub if the user has explicitly declared a profile.
+    # Without a profile, governance is opt-out and doctor shouldn't
+    # second-guess the choice.
+    declared_profile = config.get("project.profile")
+    if not declared_profile:
+        return None
+
+    repo = detect_repo_from_remote()
+    if repo is None:
+        return {"profile": {
+            "ok": True,
+            "detail": f"declared={declared_profile}; no github remote detected",
+        }}
+
+    try:
+        status = build_status(
+            repo=repo, governance=governance, branches=("main",),
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostic path
+        return {"profile": {
+            "ok": False,
+            "detail": f"could not fetch live state: {exc}",
+        }}
+
+    # Profile / drift summary line
+    if status.has_drift:
+        drifted_fields = [
+            f"{r.branch}:{e.field_name}"
+            for r in status.reports
+            for e in r.drifted_entries
+        ]
+        section["main"] = {
+            "ok": False,
+            "detail": f"drift on {', '.join(drifted_fields[:3])}"
+                     + ("..." if len(drifted_fields) > 3 else "")
+                     + " — run: shipyard governance apply",
+        }
+    else:
+        section["main"] = {
+            "ok": True,
+            "detail": f"aligned with {declared_profile} profile",
+        }
+
+    # Honest immutable-releases line — per Part 12 spec, never claim
+    # a state Shipyard cannot verify on personal repos.
+    section["immutable_releases"] = {
+        "ok": True,  # info-only
+        "detail": (
+            "GitHub does not expose the repo-level setting via API. "
+            f"Verify at https://github.com/{repo.slug}/settings"
+        ),
+    }
+    return section
 
 
 @main.command(name="init")
@@ -414,6 +496,207 @@ def init_cmd(ctx: Context, discover_only: bool) -> None:
         render_message("Detected config (not written):")
         import json as _json
         render_message(_json.dumps(config.to_dict(), indent=2))
+
+
+# ── governance commands ────────────────────────────────────────────────
+
+
+@main.group()
+def governance() -> None:
+    """Manage branch protection and governance profiles."""
+
+
+@governance.command("status")
+@click.option(
+    "--branch", "-b", multiple=True,
+    help="Override which branches to check (repeatable). Default: main.",
+)
+@click.pass_obj
+def governance_status(ctx: Context, branch: tuple[str, ...]) -> None:
+    """Report declared-vs-live governance drift per branch."""
+    from shipyard.governance import (
+        build_status,
+        detect_repo_from_remote,
+        format_status_text,
+        load_governance_config,
+    )
+
+    gov = load_governance_config(ctx.config)
+    repo = detect_repo_from_remote()
+    if repo is None:
+        render_error("Could not detect repo from git remote. Is this a GitHub repo?")
+        sys.exit(1)
+
+    branches = branch or ("main",)
+    status = build_status(repo=repo, governance=gov, branches=branches)
+
+    if ctx.json_mode:
+        ctx.output("governance.status", {
+            "repo": repo.slug,
+            "profile": status.profile_name,
+            "has_drift": status.has_drift,
+            "reports": [
+                {
+                    "branch": r.branch,
+                    "live_unprotected": r.live_unprotected,
+                    "drifted_fields": [e.field_name for e in r.drifted_entries],
+                    "deviated_fields": [e.field_name for e in r.deviated_entries],
+                }
+                for r in status.reports
+            ],
+            "errors": list(status.errors),
+        })
+    else:
+        render_message(format_status_text(status))
+
+    if status.has_drift or status.has_errors:
+        sys.exit(1)
+
+
+@governance.command("apply")
+@click.option(
+    "--branch", "-b", multiple=True,
+    help="Override which branches to apply to (repeatable). Default: main.",
+)
+@click.option("--dry-run", is_flag=True, help="Show what would change without writing")
+@click.pass_obj
+def governance_apply(ctx: Context, branch: tuple[str, ...], dry_run: bool) -> None:
+    """Apply declared governance rules to live state (idempotent)."""
+    from shipyard.governance import (
+        build_apply_plan,
+        build_status,
+        detect_repo_from_remote,
+        execute_apply_plan,
+        load_governance_config,
+        resolve_branch_rules,
+    )
+
+    gov = load_governance_config(ctx.config)
+    repo = detect_repo_from_remote()
+    if repo is None:
+        render_error("Could not detect repo from git remote.")
+        sys.exit(1)
+
+    branches = branch or ("main",)
+    status = build_status(repo=repo, governance=gov, branches=branches)
+
+    results = []
+    for report in status.reports:
+        declared = resolve_branch_rules(gov, report.branch)
+        plan = build_apply_plan(
+            repo=repo,
+            branch=report.branch,
+            declared_rules=declared,
+            drift_report=report,
+        )
+        result = execute_apply_plan(plan, dry_run=dry_run)
+        results.append(result)
+
+    any_changes = any(r.executed or (dry_run and not r.plan.is_noop) for r in results)
+    any_errors = any(r.error_message for r in results) or status.has_errors
+
+    if ctx.json_mode:
+        ctx.output("governance.apply", {
+            "repo": repo.slug,
+            "dry_run": dry_run,
+            "changed": any_changes,
+            "results": [
+                {
+                    "branch": r.plan.branch,
+                    "action": r.plan.action.value,
+                    "executed": r.executed,
+                    "error": r.error_message,
+                }
+                for r in results
+            ],
+        })
+    else:
+        if not results:
+            render_message("No branches to apply to.", style="dim")
+        for result in results:
+            branch_name = result.plan.branch
+            action = result.plan.action.value
+            if result.error_message:
+                render_message(
+                    f"  ✗ {branch_name}: {action} failed — {result.error_message}",
+                    style="bold red",
+                )
+            elif result.plan.is_noop:
+                render_message(f"  ✓ {branch_name}: already aligned (no changes)")
+            elif dry_run:
+                drifted = [e.field_name for e in result.plan.drift_report.drifted_entries]
+                render_message(
+                    f"  → {branch_name}: would {action}"
+                    + (f" (fields: {', '.join(drifted)})" if drifted else "")
+                )
+            else:
+                render_message(f"  ✓ {branch_name}: {action} applied", style="green")
+        # Manual followups, printed every time per Part 12 spec
+        if results:
+            render_message("")
+            render_message("Manual followups (Shipyard cannot apply these via API):")
+            for followup in results[0].plan.manual_followups:
+                render_message(f"  ⚠ {followup}")
+
+    if any_errors:
+        sys.exit(1)
+
+
+@governance.command("diff")
+@click.option("--branch", "-b", multiple=True, help="Branches to check")
+@click.pass_obj
+def governance_diff(ctx: Context, branch: tuple[str, ...]) -> None:
+    """Show what `governance apply` would change, without applying."""
+    # Delegate to governance_apply with --dry-run by calling the same
+    # logic in-place.
+    from shipyard.governance import (
+        build_apply_plan,
+        build_status,
+        detect_repo_from_remote,
+        load_governance_config,
+        resolve_branch_rules,
+    )
+
+    gov = load_governance_config(ctx.config)
+    repo = detect_repo_from_remote()
+    if repo is None:
+        render_error("Could not detect repo from git remote.")
+        sys.exit(1)
+
+    branches = branch or ("main",)
+    status = build_status(repo=repo, governance=gov, branches=branches)
+
+    any_drift = False
+    for report in status.reports:
+        declared = resolve_branch_rules(gov, report.branch)
+        plan = build_apply_plan(
+            repo=repo, branch=report.branch,
+            declared_rules=declared, drift_report=report,
+        )
+        if plan.is_noop:
+            render_message(f"  ✓ {report.branch}: no changes")
+            continue
+        any_drift = True
+        drifted = report.drifted_entries
+        if report.live_unprotected:
+            render_message(
+                f"  + {report.branch}: create protection "
+                f"({len(report.entries)} fields)",
+                style="yellow",
+            )
+        else:
+            render_message(
+                f"  ~ {report.branch}: update {len(drifted)} field(s)",
+                style="yellow",
+            )
+            for entry in drifted:
+                render_message(
+                    f"      {entry.field_name}: "
+                    f"{entry.live_value!r} → {entry.declared_value!r}"
+                )
+    if any_drift:
+        render_message("")
+        render_message("Run: shipyard governance apply")
 
 
 @main.group()
