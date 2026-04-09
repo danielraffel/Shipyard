@@ -1709,16 +1709,42 @@ def _resolve_validation(config: Config, mode: ValidationMode) -> dict[str, Any]:
 def _resolve_target_validation(
     config: Config, target_name: str, base: dict[str, Any]
 ) -> dict[str, Any]:
-    """Merge target-specific and platform-specific overrides into base validation."""
+    """Merge target-specific and platform-specific overrides into base validation.
+
+    Platform overrides are read from two locations for backwards
+    compatibility:
+      1. `base["overrides"][<platform_os>]` — nested inside the
+         already-resolved mode subtable (e.g.
+         `[validation.default.overrides.windows]`). This is how
+         Pulp declares its Windows-specific build commands.
+      2. `config.validation["overrides"][<platform_os>]` — at the
+         top of the validation block. Older shape, still supported
+         for projects that want a single override list for every
+         mode.
+
+    The nested form wins if both are declared, so per-mode
+    overrides can replace top-level ones.
+    """
     result = dict(base)
 
-    # Platform override
     target_config = config.targets.get(target_name, {})
     platform = target_config.get("platform", "")
     platform_os = platform.split("-")[0] if platform else ""
-    overrides = config.validation.get("overrides", {})
-    if platform_os in overrides:
-        result.update(overrides[platform_os])
+
+    # Top-level overrides (legacy shape)
+    top_overrides = config.validation.get("overrides", {})
+    if isinstance(top_overrides, dict) and platform_os in top_overrides:
+        result.update(top_overrides[platform_os])
+
+    # Mode-nested overrides (preferred shape — matches Pulp's config)
+    nested_overrides = base.get("overrides", {})
+    if isinstance(nested_overrides, dict) and platform_os in nested_overrides:
+        result.update(nested_overrides[platform_os])
+
+    # The `overrides` key has now been applied; strip it so it
+    # doesn't leak into the downstream validation_config as if it
+    # were a stage command.
+    result.pop("overrides", None)
 
     # Target-specific override
     target_validation = target_config.get("validation", {})

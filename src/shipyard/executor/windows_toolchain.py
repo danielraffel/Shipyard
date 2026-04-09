@@ -64,7 +64,26 @@ def wrap_powershell_with_host_mutex(
     # Escape single quotes in the mutex name so it can be dropped into
     # a PowerShell single-quoted string literal safely.
     safe_mutex = mutex_name.replace("'", "''")
+    # The wrapper does two things PowerShell won't do on its own:
+    #   1. `$ErrorActionPreference = 'Stop'` elevates any
+    #      command-not-found or cmdlet error to a terminating
+    #      exception, so we can CATCH them instead of silently
+    #      continuing to the next statement (PowerShell's default
+    #      behavior for "setup.sh is not a recognized command" is
+    #      to continue, which masks real failures).
+    #   2. `$__ShipyardExit` starts at 1. If the body reaches its
+    #      own `$LASTEXITCODE` assignment we overwrite with the
+    #      body's actual exit code; if it throws before that, the
+    #      catch block sets `$__ShipyardExit = 1` explicitly and
+    #      writes the exception to stderr. Either way, the final
+    #      `exit $__ShipyardExit` ALWAYS runs with an explicit
+    #      non-null code. This closes the false-green hole where a
+    #      PS exception in the body caused the wrapper to fall
+    #      through and exit 0 — the exact class of bug that made
+    #      Stage 1 attempt 5 report "pass in 0.9s" against Pulp.
     return f"""
+$ErrorActionPreference = 'Stop'
+$__ShipyardExit = 1
 $MutexName = '{safe_mutex}'
 $Mutex = New-Object System.Threading.Mutex($false, $MutexName)
 $LockAcquired = $false
@@ -84,8 +103,17 @@ try {{
         $LockAcquired = $true
     }}
 
-    {ps_body}
-    $__ShipyardExit = $LASTEXITCODE
+    try {{
+        {ps_body}
+        $__ShipyardExit = $LASTEXITCODE
+        if ($null -eq $__ShipyardExit) {{
+            $__ShipyardExit = 0
+        }}
+    }} catch {{
+        Write-Error ("Shipyard body raised: " + $_.Exception.Message)
+        Write-Error ($_.ScriptStackTrace)
+        $__ShipyardExit = 1
+    }}
 }} finally {{
     if ($LockAcquired) {{
         try {{
@@ -95,9 +123,7 @@ try {{
     }}
     $Mutex.Dispose()
 }}
-if ($null -ne $__ShipyardExit) {{
-    exit $__ShipyardExit
-}}
+exit $__ShipyardExit
 """.strip()
 
 
