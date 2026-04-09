@@ -48,7 +48,15 @@ class CloudExecutor:
         validation_config: dict[str, Any],
         log_path: str,
         progress_callback: ProgressCallback | None = None,
+        resume_from: str | None = None,  # accepted for API symmetry
+        mode: str = "default",            # accepted for API symmetry
     ) -> TargetResult:
+        # CloudExecutor does not yet implement stage-aware resume
+        # or prepared-state reuse — those are still local-only
+        # capabilities. The parameters are accepted so the CLI
+        # dispatch path can pass the same kwargs to every backend
+        # without raising TypeError.
+        del resume_from, mode
         target_name = target_config.get("name", "cloud")
         platform = target_config.get("platform", "unknown")
         started_at = datetime.now(timezone.utc)

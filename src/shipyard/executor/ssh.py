@@ -31,7 +31,15 @@ class SSHExecutor:
         validation_config: dict[str, Any],
         log_path: str,
         progress_callback: ProgressCallback | None = None,
+        resume_from: str | None = None,  # accepted for API symmetry
+        mode: str = "default",            # accepted for API symmetry
     ) -> TargetResult:
+        # `resume_from` and `mode` are accepted but not yet
+        # implemented on the SSH executor — stage-aware resume and
+        # prepared-state reuse are still local-only features. The
+        # parameters are present so the CLI dispatch path can pass
+        # the same kwargs to every backend without TypeError.
+        del resume_from, mode
         target_name = target_config.get("name", "ssh")
         platform = target_config.get("platform", "unknown")
         start_time = time.monotonic()
