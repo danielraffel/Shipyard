@@ -39,6 +39,11 @@ from shipyard.governance.profiles import (
     profile_for_name,
     solo_profile,
 )
+from shipyard.governance.snapshot import (
+    SNAPSHOT_SCHEMA_VERSION,
+    GovernanceSnapshot,
+    build_snapshot,
+)
 from shipyard.governance.status import (
     GovernanceStatus,
     build_status,
@@ -46,6 +51,7 @@ from shipyard.governance.status import (
 )
 
 __all__ = [
+    "SNAPSHOT_SCHEMA_VERSION",
     "ApplyAction",
     "ApplyPlan",
     "ApplyResult",
@@ -55,11 +61,13 @@ __all__ = [
     "DriftStatus",
     "GovernanceApiError",
     "GovernanceConfig",
+    "GovernanceSnapshot",
     "GovernanceStatus",
     "Profile",
     "ProfileName",
     "RepoRef",
     "build_apply_plan",
+    "build_snapshot",
     "build_status",
     "compute_drift",
     "detect_repo_from_remote",

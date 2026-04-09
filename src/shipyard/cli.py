@@ -571,14 +571,32 @@ def governance_status(ctx: Context, branch: tuple[str, ...]) -> None:
     help="Override which branches to apply to (repeatable). Default: main.",
 )
 @click.option("--dry-run", is_flag=True, help="Show what would change without writing")
+@click.option(
+    "--from", "from_path",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Apply rules from a snapshot file instead of the project config",
+)
 @click.pass_obj
-def governance_apply(ctx: Context, branch: tuple[str, ...], dry_run: bool) -> None:
-    """Apply declared governance rules to live state (idempotent)."""
+def governance_apply(
+    ctx: Context,
+    branch: tuple[str, ...],
+    dry_run: bool,
+    from_path: str | None,
+) -> None:
+    """Apply declared governance rules to live state (idempotent).
+
+    When --from is given, the snapshot file is the source of
+    truth instead of `.shipyard/config.toml` + profile defaults.
+    This is the disaster-recovery path: re-apply a known-good
+    state captured via `governance export`.
+    """
     from shipyard.governance import (
         build_apply_plan,
         build_status,
+        compute_drift,
         detect_repo_from_remote,
         execute_apply_plan,
+        get_branch_protection,
         load_governance_config,
         resolve_branch_rules,
     )
@@ -590,6 +608,63 @@ def governance_apply(ctx: Context, branch: tuple[str, ...], dry_run: bool) -> No
         sys.exit(1)
 
     branches = branch or ("main",)
+
+    # ── Snapshot path ──────────────────────────────────────────
+    if from_path:
+        from pathlib import Path
+
+        from shipyard.governance.snapshot import GovernanceSnapshot
+
+        try:
+            snapshot = GovernanceSnapshot.from_toml(Path(from_path).read_text())
+        except ValueError as exc:
+            render_error(f"Could not parse snapshot: {exc}")
+            sys.exit(1)
+
+        # Refuse to apply a snapshot to a different repo — the repo
+        # slug is recorded at export time specifically so a copy-
+        # paste accident can't silently reconfigure the wrong repo.
+        if snapshot.repo_slug != repo.slug:
+            render_error(
+                f"Snapshot is for '{snapshot.repo_slug}' but current repo is "
+                f"'{repo.slug}'. Refusing to apply."
+            )
+            sys.exit(1)
+
+        results: list[Any] = []
+        errors: list[str] = []
+        snapshot_branches = branches or tuple(snapshot.branches.keys())
+        for branch_name in snapshot_branches:
+            if branch_name not in snapshot.branches:
+                errors.append(f"{branch_name}: not in snapshot")
+                continue
+            declared = snapshot.branches[branch_name]
+            from shipyard.governance.github import GovernanceApiError
+            try:
+                live = get_branch_protection(repo, branch_name)
+            except GovernanceApiError as exc:
+                errors.append(f"{branch_name}: {exc}")
+                continue
+            report = compute_drift(
+                branch=branch_name,
+                profile_rules=declared,
+                declared_rules=declared,
+                live_rules=live,
+            )
+            plan = build_apply_plan(
+                repo=repo,
+                branch=branch_name,
+                declared_rules=declared,
+                drift_report=report,
+            )
+            results.append(execute_apply_plan(plan, dry_run=dry_run))
+
+        _render_apply_results(ctx, results, errors, dry_run=dry_run, from_snapshot=True)
+        if errors or any(r.error_message for r in results):
+            sys.exit(1)
+        return
+
+    # ── Profile/config path ────────────────────────────────────
     status = build_status(repo=repo, governance=gov, branches=branches)
 
     results = []
@@ -604,13 +679,32 @@ def governance_apply(ctx: Context, branch: tuple[str, ...], dry_run: bool) -> No
         result = execute_apply_plan(plan, dry_run=dry_run)
         results.append(result)
 
-    any_changes = any(r.executed or (dry_run and not r.plan.is_noop) for r in results)
+    _render_apply_results(
+        ctx, results, list(status.errors), dry_run=dry_run, from_snapshot=False,
+    )
+
     any_errors = any(r.error_message for r in results) or status.has_errors
+    if any_errors:
+        sys.exit(1)
+
+
+def _render_apply_results(
+    ctx: Context,
+    results: list[Any],
+    errors: list[str],
+    *,
+    dry_run: bool,
+    from_snapshot: bool,
+) -> None:
+    """Shared apply-output renderer for both the config and snapshot paths."""
+    any_changes = any(
+        r.executed or (dry_run and not r.plan.is_noop) for r in results
+    )
 
     if ctx.json_mode:
         ctx.output("governance.apply", {
-            "repo": repo.slug,
             "dry_run": dry_run,
+            "from_snapshot": from_snapshot,
             "changed": any_changes,
             "results": [
                 {
@@ -621,37 +715,40 @@ def governance_apply(ctx: Context, branch: tuple[str, ...], dry_run: bool) -> No
                 }
                 for r in results
             ],
+            "errors": errors,
         })
-    else:
-        if not results:
-            render_message("No branches to apply to.", style="dim")
-        for result in results:
-            branch_name = result.plan.branch
-            action = result.plan.action.value
-            if result.error_message:
-                render_message(
-                    f"  ✗ {branch_name}: {action} failed — {result.error_message}",
-                    style="bold red",
-                )
-            elif result.plan.is_noop:
-                render_message(f"  ✓ {branch_name}: already aligned (no changes)")
-            elif dry_run:
-                drifted = [e.field_name for e in result.plan.drift_report.drifted_entries]
-                render_message(
-                    f"  → {branch_name}: would {action}"
-                    + (f" (fields: {', '.join(drifted)})" if drifted else "")
-                )
-            else:
-                render_message(f"  ✓ {branch_name}: {action} applied", style="green")
-        # Manual followups, printed every time per Part 12 spec
-        if results:
-            render_message("")
-            render_message("Manual followups (Shipyard cannot apply these via API):")
-            for followup in results[0].plan.manual_followups:
-                render_message(f"  ⚠ {followup}")
+        return
 
-    if any_errors:
-        sys.exit(1)
+    if not results and not errors:
+        render_message("No branches to apply to.", style="dim")
+    for result in results:
+        branch_name = result.plan.branch
+        action = result.plan.action.value
+        if result.error_message:
+            render_message(
+                f"  ✗ {branch_name}: {action} failed — {result.error_message}",
+                style="bold red",
+            )
+        elif result.plan.is_noop:
+            render_message(f"  ✓ {branch_name}: already aligned (no changes)")
+        elif dry_run:
+            drifted = [e.field_name for e in result.plan.drift_report.drifted_entries]
+            render_message(
+                f"  → {branch_name}: would {action}"
+                + (f" (fields: {', '.join(drifted)})" if drifted else "")
+            )
+        else:
+            render_message(f"  ✓ {branch_name}: {action} applied", style="green")
+
+    for err in errors:
+        render_message(f"  ! {err}", style="yellow")
+
+    # Manual followups, printed every time per Part 12 spec
+    if results:
+        render_message("")
+        render_message("Manual followups (Shipyard cannot apply these via API):")
+        for followup in results[0].plan.manual_followups:
+            render_message(f"  ⚠ {followup}")
 
 
 @governance.command("diff")
@@ -721,6 +818,235 @@ def governance_diff(ctx: Context, branch: tuple[str, ...]) -> None:
         for err in status.errors:
             render_message(f"  ! {err}")
         sys.exit(1)
+
+
+@governance.command("export")
+@click.option(
+    "--branch", "-b", multiple=True,
+    help="Branches to snapshot (repeatable). Default: main.",
+)
+@click.option(
+    "--output", "-o",
+    type=click.Path(dir_okay=False),
+    help="Write snapshot to file instead of stdout",
+)
+@click.pass_obj
+def governance_export(
+    ctx: Context,
+    branch: tuple[str, ...],
+    output: str | None,
+) -> None:
+    """Snapshot live GitHub governance state to TOML.
+
+    The snapshot is check-in-able and can be fed back to
+    `governance apply --from <file>` for disaster recovery or
+    audit-trail diffing.
+    """
+    from pathlib import Path
+
+    from shipyard.governance import (
+        detect_repo_from_remote,
+        get_branch_protection,
+    )
+    from shipyard.governance.github import GovernanceApiError
+    from shipyard.governance.snapshot import build_snapshot
+
+    repo = detect_repo_from_remote()
+    if repo is None:
+        render_error("Could not detect repo from git remote.")
+        sys.exit(1)
+
+    branches = branch or ("main",)
+    live_branches: dict[str, Any] = {}
+    errors: list[str] = []
+    for branch_name in branches:
+        try:
+            rules = get_branch_protection(repo, branch_name)
+        except GovernanceApiError as exc:
+            errors.append(f"{branch_name}: {exc}")
+            continue
+        if rules is None:
+            errors.append(f"{branch_name}: no protection set")
+            continue
+        live_branches[branch_name] = rules
+
+    if errors:
+        for err in errors:
+            render_error(err)
+        sys.exit(1)
+
+    snapshot = build_snapshot(repo=repo, live_branches=live_branches)
+    toml_text = snapshot.to_toml()
+
+    if output:
+        Path(output).write_text(toml_text)
+        render_message(
+            f"Wrote snapshot for {repo.slug} to {output}", style="green",
+        )
+    else:
+        # Stream straight to stdout so users can pipe to a file.
+        click.echo(toml_text, nl=False)
+
+
+@governance.command("use")
+@click.argument("profile_name", type=click.Choice(["solo", "multi", "custom"]))
+@click.option("--yes", "-y", is_flag=True, help="Skip the interactive prompt")
+@click.option("--dry-run", is_flag=True, help="Show the diff without applying")
+@click.pass_obj
+def governance_use(
+    ctx: Context,
+    profile_name: str,
+    yes: bool,
+    dry_run: bool,
+) -> None:
+    """Switch governance profile + apply (interactive).
+
+    Updates `[project].profile` in `.shipyard/config.toml`, then
+    runs the existing apply path. Any explicit overrides in
+    `[branch_protection.*]` are preserved.
+    """
+    if ctx.config.project_dir is None:
+        render_error(
+            "No .shipyard/config.toml found. Run `shipyard init` first."
+        )
+        sys.exit(1)
+
+    config_path = ctx.config.project_dir / "config.toml"
+    if not config_path.exists():
+        render_error(f"Config file not found: {config_path}")
+        sys.exit(1)
+
+    current_profile = str(ctx.config.get("project.profile", "solo"))
+    if current_profile == profile_name and not dry_run:
+        render_message(
+            f"Already on profile '{profile_name}'. Running apply to verify live state…",
+        )
+
+    # Show the diff that would land if we switched
+    from shipyard.governance import (
+        build_apply_plan,
+        build_status,
+        detect_repo_from_remote,
+        load_governance_config,
+        profile_for_name,
+        resolve_branch_rules,
+    )
+
+    repo = detect_repo_from_remote()
+    if repo is None:
+        render_error("Could not detect repo from git remote.")
+        sys.exit(1)
+
+    # Clone the config dict, flip the profile, re-resolve
+    hypothetical_data = dict(ctx.config.data)
+    hypothetical_project = dict(hypothetical_data.get("project", {}))
+    hypothetical_project["profile"] = profile_name
+    hypothetical_data["project"] = hypothetical_project
+    hypothetical_config = Config(data=hypothetical_data)
+    hypothetical_gov = load_governance_config(hypothetical_config)
+
+    # Use the hypothetical profile for the preview
+    required = hypothetical_gov.required_status_checks
+    profile_for_name(profile_name, required_status_checks=required)
+
+    status = build_status(
+        repo=repo, governance=hypothetical_gov, branches=("main",),
+    )
+    any_change = False
+    render_message(f"Switching profile: {current_profile} → {profile_name}")
+    render_message("")
+    for report in status.reports:
+        if report.has_drift:
+            any_change = True
+            declared = resolve_branch_rules(hypothetical_gov, report.branch)
+            plan = build_apply_plan(
+                repo=repo, branch=report.branch,
+                declared_rules=declared, drift_report=report,
+            )
+            drifted = [e.field_name for e in report.drifted_entries]
+            render_message(
+                f"  {report.branch}: would {plan.action.value} "
+                f"({len(drifted)} field(s): {', '.join(drifted)})"
+            )
+        else:
+            render_message(f"  {report.branch}: no changes")
+
+    if dry_run:
+        return
+
+    if any_change and not yes:
+        render_message("")
+        click.confirm("Apply these changes?", abort=True)
+
+    # Rewrite the project config file with the new profile
+    _rewrite_profile_in_config(config_path, profile_name)
+    render_message(
+        f"Updated {config_path} → profile = \"{profile_name}\"",
+        style="green",
+    )
+
+    # And run apply using the updated config
+    ctx._config = None  # force reload on next access
+    from shipyard.governance import (
+        build_apply_plan as _bap,
+    )
+    from shipyard.governance import (
+        execute_apply_plan as _eap,
+    )
+    reloaded_gov = load_governance_config(ctx.config)
+    status2 = build_status(repo=repo, governance=reloaded_gov, branches=("main",))
+    results = []
+    for report in status2.reports:
+        declared = resolve_branch_rules(reloaded_gov, report.branch)
+        plan = _bap(
+            repo=repo, branch=report.branch,
+            declared_rules=declared, drift_report=report,
+        )
+        results.append(_eap(plan, dry_run=False))
+    _render_apply_results(
+        ctx, results, list(status2.errors), dry_run=False, from_snapshot=False,
+    )
+    if any(r.error_message for r in results) or status2.has_errors:
+        sys.exit(1)
+
+
+def _rewrite_profile_in_config(config_path: Path, new_profile: str) -> None:
+    """Idempotently set `[project].profile = new_profile` in a TOML file.
+
+    Uses line-level rewriting rather than a full TOML round-trip so
+    comments and ordering in the user's config are preserved.
+    """
+    text = config_path.read_text()
+    lines = text.splitlines(keepends=True)
+    in_project_section = False
+    replaced = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_project_section = stripped == "[project]"
+            out.append(line)
+            continue
+        if in_project_section and stripped.startswith("profile"):
+            # Preserve the leading whitespace
+            leading = line[: len(line) - len(line.lstrip())]
+            out.append(f'{leading}profile   = "{new_profile}"\n')
+            replaced = True
+            continue
+        out.append(line)
+
+    if not replaced:
+        # Project section exists but no profile line — append one
+        # right after the [project] header.
+        final: list[str] = []
+        for line in out:
+            final.append(line)
+            if line.strip() == "[project]":
+                final.append(f'profile   = "{new_profile}"\n')
+                replaced = True
+        out = final
+
+    config_path.write_text("".join(out))
 
 
 @main.group()
