@@ -15,6 +15,8 @@ from typing import Any
 
 from shipyard.bundle.git_bundle import apply_bundle, create_bundle, upload_bundle
 from shipyard.core.job import TargetResult, TargetStatus
+from shipyard.executor.streaming import ProgressCallback, run_streaming_command
+from shipyard.failover.retry import SSHPermanentError, SSHTransientError, is_transient, retry_ssh
 
 
 class SSHExecutor:
@@ -27,6 +29,48 @@ class SSHExecutor:
         target_config: dict[str, Any],
         validation_config: dict[str, Any],
         log_path: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> TargetResult:
+        target_name = target_config.get("name", "ssh")
+        platform = target_config.get("platform", "unknown")
+        start_time = time.monotonic()
+        log_file = Path(log_path)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        @retry_ssh
+        def _run() -> TargetResult:
+            result = self._validate_once(
+                sha=sha,
+                branch=branch,
+                target_config=target_config,
+                validation_config=validation_config,
+                log_path=log_path,
+                progress_callback=progress_callback,
+            )
+            if result.status == TargetStatus.ERROR and result.error_message and is_transient(result.error_message):
+                raise RuntimeError(result.error_message)
+            return result
+
+        try:
+            return _run()
+        except (SSHTransientError, SSHPermanentError) as exc:
+            return _error_result(
+                target_name,
+                platform,
+                datetime.now(timezone.utc),
+                start_time,
+                str(log_file),
+                str(exc),
+            )
+
+    def _validate_once(
+        self,
+        sha: str,
+        branch: str,
+        target_config: dict[str, Any],
+        validation_config: dict[str, Any],
+        log_path: str,
+        progress_callback: ProgressCallback | None = None,
     ) -> TargetResult:
         target_name = target_config.get("name", "ssh")
         platform = target_config.get("platform", "unknown")
@@ -92,26 +136,31 @@ class SSHExecutor:
         ssh_cmd = ["ssh"] + list(ssh_options) + [host, command]
 
         try:
-            with open(log_file, "w") as log:
-                result = subprocess.run(
-                    ssh_cmd,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    timeout=target_config.get("timeout_secs", 1800),
-                )
+            result = run_streaming_command(
+                ssh_cmd,
+                log_path=str(log_file),
+                timeout=target_config.get("timeout_secs", 1800),
+                progress_callback=progress_callback,
+            )
 
-            elapsed = time.monotonic() - start_time
             status = TargetStatus.PASS if result.returncode == 0 else TargetStatus.FAIL
+            error_message = None
+            if result.returncode == 255:
+                status = TargetStatus.ERROR
+                error_message = _extract_ssh_error(result.output) or "SSH transport failed"
 
             return TargetResult(
                 target_name=target_name,
                 platform=platform,
                 status=status,
                 backend="ssh",
-                duration_secs=elapsed,
+                duration_secs=result.duration_secs,
                 started_at=started_at,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=result.completed_at,
                 log_path=str(log_file),
+                phase=result.phase,
+                last_output_at=result.last_output_at,
+                error_message=error_message,
             )
 
         except subprocess.TimeoutExpired:
@@ -182,7 +231,7 @@ def _build_remote_command(
         for step in ("setup", "configure", "build", "test"):
             cmd = validation_config.get(step)
             if cmd:
-                parts.append(cmd)
+                parts.append(f"printf '__SHIPYARD_PHASE__:{step}\\n' && {cmd}")
         if not parts:
             return None
         validate_cmd = " && ".join(parts)
@@ -210,3 +259,10 @@ def _error_result(
         log_path=log_path,
         error_message=message,
     )
+
+
+def _extract_ssh_error(output: str) -> str | None:
+    for line in reversed(output.splitlines()):
+        if line.strip():
+            return line.strip()
+    return None

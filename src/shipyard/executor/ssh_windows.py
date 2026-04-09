@@ -15,6 +15,7 @@ from typing import Any
 
 from shipyard.bundle.git_bundle import create_bundle, upload_bundle
 from shipyard.core.job import TargetResult, TargetStatus
+from shipyard.executor.streaming import ProgressCallback, run_streaming_command
 
 
 class SSHWindowsExecutor:
@@ -27,6 +28,7 @@ class SSHWindowsExecutor:
         target_config: dict[str, Any],
         validation_config: dict[str, Any],
         log_path: str,
+        progress_callback: ProgressCallback | None = None,
     ) -> TargetResult:
         target_name = target_config.get("name", "windows")
         platform = target_config.get("platform", "windows-x64")
@@ -98,26 +100,31 @@ class SSHWindowsExecutor:
         )
 
         try:
-            with open(log_file, "w") as log:
-                result = subprocess.run(
-                    ssh_cmd,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    timeout=target_config.get("timeout_secs", 1800),
-                )
+            result = run_streaming_command(
+                ssh_cmd,
+                log_path=str(log_file),
+                timeout=target_config.get("timeout_secs", 1800),
+                progress_callback=progress_callback,
+            )
 
-            elapsed = time.monotonic() - start_time
             status = TargetStatus.PASS if result.returncode == 0 else TargetStatus.FAIL
+            error_message = None
+            if result.returncode == 255:
+                status = TargetStatus.ERROR
+                error_message = _extract_ssh_error(result.output) or "SSH transport failed"
 
             return TargetResult(
                 target_name=target_name,
                 platform=platform,
                 status=status,
                 backend="ssh-windows",
-                duration_secs=elapsed,
+                duration_secs=result.duration_secs,
                 started_at=started_at,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=result.completed_at,
                 log_path=str(log_file),
+                phase=result.phase,
+                last_output_at=result.last_output_at,
+                error_message=error_message,
             )
 
         except subprocess.TimeoutExpired:
@@ -236,7 +243,7 @@ def _build_remote_command(
         for step in ("setup", "configure", "build", "test"):
             cmd = validation_config.get(step)
             if cmd:
-                parts.append(cmd)
+                parts.append(f"Write-Output '__SHIPYARD_PHASE__:{step}'; {cmd}")
         if not parts:
             return None
         # Chain with PowerShell error checking
@@ -270,3 +277,10 @@ def _error_result(
         log_path=log_path,
         error_message=message,
     )
+
+
+def _extract_ssh_error(output: str) -> str | None:
+    for line in reversed(output.splitlines()):
+        if line.strip():
+            return line.strip()
+    return None

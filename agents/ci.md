@@ -1,6 +1,6 @@
 ---
 name: ci
-description: Validates code on all platforms and merges on green. Manages queue and profiles.
+description: Validates code on all platforms and merges on green. Manages queue and cloud dispatch.
 model: sonnet
 color: green
 tools:
@@ -32,7 +32,7 @@ If asked to merge to develop (not main):
 
 - Queue and active runs: `shipyard status --json`
 - What passed: `shipyard evidence --json`
-- Where things run: `shipyard targets --json`
+- Cloud routing defaults: `shipyard cloud defaults --json`
 - All jobs: `shipyard queue --json`
 
 ## Manage queue
@@ -40,13 +40,20 @@ If asked to merge to develop (not main):
 - Bump priority: `shipyard bump <job_id> high`
 - Cancel: `shipyard cancel <job_id>`
 
-## Switch profiles
+## Adjust configuration
 
-When asked to "go local", "switch to cloud", or change setup:
-- `shipyard config use local` — Mac only
-- `shipyard config use normal` — Mac + cloud
-- `shipyard config use full` — Mac + VMs + cloud fallback
-- Check current: `shipyard config profiles`
+There is no `shipyard config` subcommand yet.
+
+When asked to change setup, inspect and edit:
+
+- `.shipyard/config.toml` for shared project targets and validation settings
+- `.shipyard.local/config.toml` for machine-local hosts, paths, and overrides
+
+After a config change, verify with:
+
+- `shipyard doctor --json`
+- `shipyard cloud defaults --json` if cloud dispatch is involved
+- `shipyard status --json` after the next run starts
 
 ## Rules
 

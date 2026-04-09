@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from shipyard.core.job import TargetResult, TargetStatus
+from shipyard.executor.streaming import ProgressCallback, run_streaming_command
 
 STAGES = ("setup", "configure", "build", "test")
 
@@ -44,6 +45,7 @@ class LocalExecutor:
         validation_config: dict[str, Any],
         log_path: str,
         resume_from: str | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> TargetResult:
         target_name = target_config.get("name", "local")
         platform = target_config.get("platform", "unknown")
@@ -57,7 +59,7 @@ class LocalExecutor:
         if "command" in validation_config:
             return self._run_single(
                 validation_config["command"], target_name, platform,
-                target_config, log_file, started_at, start_time,
+                target_config, log_file, started_at, start_time, progress_callback,
             )
 
         # Stage-aware mode
@@ -72,28 +74,32 @@ class LocalExecutor:
 
         return self._run_stages(
             stages, target_name, platform, target_config,
-            log_file, started_at, start_time,
+            log_file, started_at, start_time, progress_callback,
         )
 
     def _run_single(
         self, command: str, target_name: str, platform: str,
         target_config: dict[str, Any], log_file: Path,
         started_at: datetime, start_time: float,
+        progress_callback: ProgressCallback | None,
     ) -> TargetResult:
         try:
-            with open(log_file, "w") as log:
-                result = subprocess.run(
-                    command, shell=True, cwd=target_config.get("cwd"),
-                    stdout=log, stderr=subprocess.STDOUT,
-                    timeout=target_config.get("timeout_secs", 1800),
-                )
-            elapsed = time.monotonic() - start_time
+            result = run_streaming_command(
+                command,
+                shell=True,
+                cwd=target_config.get("cwd"),
+                log_path=str(log_file),
+                timeout=target_config.get("timeout_secs", 1800),
+                progress_callback=progress_callback,
+            )
             status = TargetStatus.PASS if result.returncode == 0 else TargetStatus.FAIL
             return TargetResult(
                 target_name=target_name, platform=platform,
-                status=status, backend="local", duration_secs=elapsed,
-                started_at=started_at, completed_at=datetime.now(timezone.utc),
+                status=status, backend="local", duration_secs=result.duration_secs,
+                started_at=started_at, completed_at=result.completed_at,
                 log_path=str(log_file),
+                phase=result.phase,
+                last_output_at=result.last_output_at,
             )
         except subprocess.TimeoutExpired:
             return TargetResult(
@@ -115,34 +121,44 @@ class LocalExecutor:
         self, stages: list[tuple[str, str]], target_name: str,
         platform: str, target_config: dict[str, Any], log_file: Path,
         started_at: datetime, start_time: float,
+        progress_callback: ProgressCallback | None,
     ) -> TargetResult:
         """Run validation as separate stages. Stop at first failure."""
         failed_stage = None
-        stage_results: list[StageResult] = []
+        last_output_at: datetime | None = None
 
         try:
-            with open(log_file, "w") as log:
-                for stage_name, command in stages:
-                    stage_start = time.monotonic()
+            log_file.write_text("")
+            for stage_name, command in stages:
+                stage_start = time.monotonic()
+                with open(log_file, "a", encoding="utf-8") as log:
                     log.write(f"\n=== {stage_name} ===\n")
                     log.flush()
 
-                    result = subprocess.run(
-                        command, shell=True, cwd=target_config.get("cwd"),
-                        stdout=log, stderr=subprocess.STDOUT,
-                        timeout=target_config.get("timeout_secs", 1800),
-                    )
+                if progress_callback:
+                    progress_callback({"phase": stage_name})
 
-                    sr = StageResult(
-                        stage=stage_name,
-                        success=result.returncode == 0,
-                        duration_secs=time.monotonic() - stage_start,
-                    )
-                    stage_results.append(sr)
+                result = run_streaming_command(
+                    command,
+                    shell=True,
+                    cwd=target_config.get("cwd"),
+                    log_path=str(log_file),
+                    append=True,
+                    timeout=target_config.get("timeout_secs", 1800),
+                    phase=stage_name,
+                    progress_callback=progress_callback,
+                )
 
-                    if result.returncode != 0:
-                        failed_stage = stage_name
-                        break
+                _ = StageResult(
+                    stage=stage_name,
+                    success=result.returncode == 0,
+                    duration_secs=time.monotonic() - stage_start,
+                )
+                last_output_at = result.last_output_at
+
+                if result.returncode != 0:
+                    failed_stage = stage_name
+                    break
 
         except subprocess.TimeoutExpired:
             return TargetResult(
@@ -169,6 +185,8 @@ class LocalExecutor:
                 duration_secs=elapsed, started_at=started_at,
                 completed_at=datetime.now(timezone.utc),
                 log_path=str(log_file), error_message=error_msg,
+                phase=failed_stage,
+                last_output_at=last_output_at,
             )
 
         return TargetResult(
@@ -177,6 +195,8 @@ class LocalExecutor:
             duration_secs=elapsed, started_at=started_at,
             completed_at=datetime.now(timezone.utc),
             log_path=str(log_file),
+            phase=stages[-1][0] if stages else None,
+            last_output_at=last_output_at,
         )
 
     def probe(self, target_config: dict[str, Any]) -> bool:

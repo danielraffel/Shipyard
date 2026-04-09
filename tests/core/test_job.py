@@ -186,3 +186,16 @@ class TestTargetResult:
         assert d["primary_backend"] == "ssh"
         assert d["failover_reason"] == "ssh_unreachable"
         assert d["provider"] == "namespace"
+
+    def test_with_updates_records_progress_fields(self) -> None:
+        r = TargetResult(
+            target_name="mac",
+            platform="macos-arm64",
+            status=TargetStatus.RUNNING,
+            backend="local",
+        ).with_updates(phase="build", quiet_for_secs=12.4, liveness="quiet")
+
+        d = r.to_dict()
+        assert d["phase"] == "build"
+        assert d["quiet_for_secs"] == 12.4
+        assert d["liveness"] == "quiet"

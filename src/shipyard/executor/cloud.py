@@ -12,9 +12,12 @@ import json
 import subprocess
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from shipyard.core.job import TargetResult, TargetStatus
+
+if TYPE_CHECKING:
+    from shipyard.executor.streaming import ProgressCallback
 
 # How long to wait between poll attempts (seconds)
 _POLL_INTERVAL = 15
@@ -44,6 +47,7 @@ class CloudExecutor:
         target_config: dict[str, Any],
         validation_config: dict[str, Any],
         log_path: str,
+        progress_callback: ProgressCallback | None = None,
     ) -> TargetResult:
         target_name = target_config.get("name", "cloud")
         platform = target_config.get("platform", "unknown")
@@ -71,6 +75,7 @@ class CloudExecutor:
         # Dispatch the workflow
         try:
             self._dispatch_workflow(branch, inputs)
+            _emit_progress(progress_callback, phase="dispatch")
         except subprocess.CalledProcessError as exc:
             return TargetResult(
                 target_name=target_name,
@@ -87,6 +92,7 @@ class CloudExecutor:
         # Wait for the run to appear and get its ID
         try:
             run_id = self._wait_for_run(branch)
+            _emit_progress(progress_callback, phase="queued")
         except TimeoutError as exc:
             return TargetResult(
                 target_name=target_name,
@@ -103,7 +109,7 @@ class CloudExecutor:
 
         # Poll for completion
         try:
-            conclusion = self._poll_run(run_id)
+            conclusion = self._poll_run(run_id, progress_callback=progress_callback)
         except subprocess.CalledProcessError as exc:
             return TargetResult(
                 target_name=target_name,
@@ -190,7 +196,12 @@ class CloudExecutor:
             f"Workflow run did not appear within {self.dispatch_settle_secs}s"
         )
 
-    def _poll_run(self, run_id: str) -> str:
+    def _poll_run(
+        self,
+        run_id: str,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> str:
         """Poll a workflow run until it completes. Returns the conclusion."""
         while True:
             cmd: list[str] = [
@@ -201,8 +212,27 @@ class CloudExecutor:
 
             result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
             data = json.loads(result.stdout)
+            _emit_progress(
+                progress_callback,
+                phase=str(data.get("status") or "poll"),
+            )
 
             if data.get("status") == "completed":
                 return data.get("conclusion", "failure")
 
             time.sleep(self.poll_interval)
+
+
+def _emit_progress(progress_callback: ProgressCallback | None, *, phase: str) -> None:
+    if progress_callback is None:
+        return
+    now = datetime.now(timezone.utc)
+    progress_callback(
+        {
+            "phase": phase,
+            "last_output_at": now,
+            "last_heartbeat_at": now,
+            "quiet_for_secs": 0.0,
+            "liveness": "active",
+        }
+    )

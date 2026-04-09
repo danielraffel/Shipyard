@@ -7,7 +7,7 @@ Jobs are immutable once created — state transitions produce new instances.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -61,6 +61,11 @@ class TargetResult:
     started_at: datetime | None = None
     completed_at: datetime | None = None
     log_path: str | None = None
+    phase: str | None = None
+    last_output_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    quiet_for_secs: float | None = None
+    liveness: str | None = None
     # Failover provenance
     primary_backend: str | None = None
     failover_reason: str | None = None
@@ -72,6 +77,10 @@ class TargetResult:
     @property
     def passed(self) -> bool:
         return self.status == TargetStatus.PASS
+
+    def with_updates(self, **kwargs: Any) -> TargetResult:
+        """Return a copy with the provided fields updated."""
+        return replace(self, **kwargs)
 
     @property
     def is_terminal(self) -> bool:
@@ -100,6 +109,16 @@ class TargetResult:
             d["completed_at"] = self.completed_at.isoformat()
         if self.log_path:
             d["log_path"] = self.log_path
+        if self.phase:
+            d["phase"] = self.phase
+        if self.last_output_at:
+            d["last_output_at"] = self.last_output_at.isoformat()
+        if self.last_heartbeat_at:
+            d["last_heartbeat_at"] = self.last_heartbeat_at.isoformat()
+        if self.quiet_for_secs is not None:
+            d["quiet_for_secs"] = round(self.quiet_for_secs, 1)
+        if self.liveness:
+            d["liveness"] = self.liveness
         if self.primary_backend:
             d["primary_backend"] = self.primary_backend
         if self.failover_reason:

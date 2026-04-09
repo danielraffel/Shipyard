@@ -9,8 +9,14 @@ Run the full ship flow: push to remote, create or find a PR, validate on all req
 shipyard ship --json
 ```
 
+If the repo needs to override preflight for a one-off run:
+```bash
+shipyard ship --allow-root-mismatch --allow-unreachable-targets --json
+```
+
 Parse the JSON output. Report:
 - PR number and URL
+- Preflight warnings when present
 - Validation status per platform (passing, missing, failing)
 - Whether the merge happened or what is still needed
 

@@ -60,6 +60,7 @@ class FallbackChain:
         target_config: dict[str, Any],
         validation_config: dict[str, Any],
         log_path: str,
+        **kwargs: Any,
     ) -> TargetResult:
         """Try each backend in order until one succeeds or all fail.
 
@@ -103,8 +104,11 @@ class FallbackChain:
                 )
                 continue
 
+            # Merge backend-specific config into the target before probing or validating.
+            merged_config = {**target_config, **backend_def}
+
             # Probe before attempting validation
-            if not executor.probe(target_config):
+            if not executor.probe(merged_config):
                 logger.info(
                     "Backend '%s' probe failed, trying next",
                     _backend_label(backend_def),
@@ -123,15 +127,13 @@ class FallbackChain:
             # Build per-attempt log path
             attempt_log = f"{log_path}.attempt-{i}" if i > 0 else log_path
 
-            # Merge backend-specific config into target_config
-            merged_config = {**target_config, **backend_def}
-
             result = executor.validate(
                 sha=job_sha,
                 branch=job_branch,
                 target_config=merged_config,
                 validation_config=validation_config,
                 log_path=attempt_log,
+                **kwargs,
             )
 
             # Test failures are authoritative — don't retry
@@ -204,4 +206,6 @@ def _backend_label(backend_def: dict[str, Any]) -> str:
         return f"cloud:{backend_def.get('provider', '?')}"
     if btype == "ssh":
         return f"ssh:{backend_def.get('host', '?')}"
+    if btype in {"ssh-windows", "ssh_windows"}:
+        return f"ssh-windows:{backend_def.get('host', '?')}"
     return btype

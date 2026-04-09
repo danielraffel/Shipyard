@@ -12,6 +12,7 @@ shipyard status --json
 Parse the JSON output. Report:
 - Queue state: pending jobs, running jobs, recent completions
 - Active run details if one is in progress
+- Active target phase/liveness details when present
 - Target health: which targets are configured and reachable
 
 Keep the summary concise. Highlight any issues (unreachable targets, failed recent runs).

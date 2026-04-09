@@ -228,6 +228,15 @@ def _job_from_dict(d: dict[str, Any]) -> Job:
                 started_at=datetime.fromisoformat(rd["started_at"]) if rd.get("started_at") else None,
                 completed_at=datetime.fromisoformat(rd["completed_at"]) if rd.get("completed_at") else None,
                 log_path=rd.get("log_path"),
+                phase=rd.get("phase"),
+                last_output_at=datetime.fromisoformat(rd["last_output_at"]) if rd.get("last_output_at") else None,
+                last_heartbeat_at=(
+                    datetime.fromisoformat(rd["last_heartbeat_at"])
+                    if rd.get("last_heartbeat_at")
+                    else None
+                ),
+                quiet_for_secs=rd.get("quiet_for_secs"),
+                liveness=rd.get("liveness"),
                 primary_backend=rd.get("primary_backend"),
                 failover_reason=rd.get("failover_reason"),
                 provider=rd.get("provider"),

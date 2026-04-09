@@ -1,6 +1,6 @@
 ---
 name: ci
-description: Cross-platform CI coordination with Shipyard — validates, ships, manages queue, switches profiles
+description: Cross-platform CI coordination with Shipyard — validates, ships, manages queue, and runs cloud workflows
 ---
 
 # CI Operations with Shipyard
@@ -18,15 +18,15 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Ship to develop instead of main | `shipyard ship --base develop --json` |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
-| Show targets and reachability | `shipyard targets --json` |
 | Show run logs | `shipyard logs <job_id> --json` |
 | Show logs for one target | `shipyard logs <job_id> --target windows` |
 | Check merge readiness | `shipyard evidence --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
 | Cancel a job | `shipyard cancel <job_id>` |
-| Switch profile | `shipyard config use <profile>` |
-| List profiles | `shipyard config profiles` |
-| Show config | `shipyard config show` |
+| List cloud workflows | `shipyard cloud workflows --json` |
+| Show cloud defaults | `shipyard cloud defaults --json` |
+| Dispatch a cloud workflow | `shipyard cloud run build --json` |
+| Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
 | Clean up artifacts | `shipyard cleanup --apply` |
 
@@ -40,17 +40,6 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 
 Shipyard refuses to merge unless every required platform has passing evidence
 for the exact HEAD SHA.
-
-## Profiles
-
-Profiles control which targets are active. Switch without editing config:
-
-- `shipyard config use local` — Mac only, no VMs or cloud
-- `shipyard config use normal` — Mac + cloud (Namespace)
-- `shipyard config use full` — Mac + VMs + cloud fallback
-
-Check which profile is active: `shipyard config profiles`
-See where things will run: `shipyard targets --json`
 
 ## Queue management
 
@@ -77,14 +66,19 @@ platform = "linux-x64"
 
 # Optional fallback chain
 fallback = [
-    { type = "vm", vm_name = "Ubuntu 24.04" },
-    { type = "cloud", provider = "namespace" },
+    { type = "cloud", provider = "namespace", repository = "owner/repo", workflow = "build" },
 ]
 ```
+
+There is no `shipyard config` or `shipyard targets` subcommand yet. Inspect
+target definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml`,
+and use `shipyard status --json` for live target state.
 
 ## Troubleshooting
 
 - `shipyard doctor --json` — checks git, ssh, gh, nsc are installed
-- `shipyard targets --json` — shows which targets are reachable
+- `shipyard status --json` — shows configured targets, queue state, and live target status
 - `shipyard logs <id> --target <name>` — full log for a failed target
 - If a target is unreachable with no fallback, it reports unreachable
+- `shipyard run --allow-unreachable-targets --json` — override preflight if you intentionally want to queue anyway
+- `shipyard cloud defaults --json` — inspect the current cloud workflow/provider dispatch plan

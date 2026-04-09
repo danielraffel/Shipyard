@@ -108,6 +108,12 @@ def render_status(
             if result:
                 status = _style_status(result.status.value)
                 extra = f"  ({result.backend}"
+                if result.phase:
+                    extra += f", phase={result.phase}"
+                if result.liveness:
+                    extra += f", liveness={result.liveness}"
+                if result.quiet_for_secs is not None:
+                    extra += f", idle={int(result.quiet_for_secs)}s"
                 if result.duration_secs:
                     extra += f", {_format_duration(result.duration_secs)}"
                 extra += ")"

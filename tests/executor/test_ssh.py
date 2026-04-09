@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import MagicMock, mock_open, patch
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from shipyard.core.job import TargetStatus
 from shipyard.executor.ssh import SSHExecutor
 from shipyard.executor.ssh_windows import SSHWindowsExecutor
+from shipyard.executor.streaming import StreamingCommandResult
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +44,19 @@ def _windows_target_config(
 
 def _validation_config(command: str = "make test") -> dict:
     return {"command": command}
+
+
+def _streaming_result(returncode: int = 0, output: str = "") -> StreamingCommandResult:
+    now = datetime.now(timezone.utc)
+    return StreamingCommandResult(
+        returncode=returncode,
+        output=output,
+        started_at=now,
+        completed_at=now,
+        duration_secs=1.0,
+        last_output_at=now if output else None,
+        phase="test" if output else None,
+    )
 
 
 def _mock_bundle_success():
@@ -140,7 +155,7 @@ class TestSSHExecutorValidate:
 
         patches = _mock_bundle_success()
         with patches[0], patches[1], patches[2], \
-             patch("subprocess.run", return_value=mock_result):
+             patch("shipyard.executor.ssh.run_streaming_command", return_value=_streaming_result(0, "ok")):
             result = executor.validate(
                 sha="abc123",
                 branch="main",
@@ -156,11 +171,9 @@ class TestSSHExecutorValidate:
     def test_validate_fail(self, tmp_path) -> None:
         executor = SSHExecutor()
         log_path = str(tmp_path / "log.txt")
-        mock_result = MagicMock(returncode=1)
-
         patches = _mock_bundle_success()
         with patches[0], patches[1], patches[2], \
-             patch("subprocess.run", return_value=mock_result):
+             patch("shipyard.executor.ssh.run_streaming_command", return_value=_streaming_result(1, "failed")):
             result = executor.validate(
                 sha="abc123",
                 branch="main",
@@ -198,7 +211,10 @@ class TestSSHExecutorValidate:
 
         patches = _mock_bundle_success()
         with patches[0], patches[1], patches[2], \
-             patch("subprocess.run", side_effect=subprocess.TimeoutExpired("ssh", 1800)):
+             patch(
+                 "shipyard.executor.ssh.run_streaming_command",
+                 side_effect=subprocess.TimeoutExpired("ssh", 1800),
+             ):
             result = executor.validate(
                 sha="abc123",
                 branch="main",
@@ -230,11 +246,12 @@ class TestSSHExecutorValidate:
     def test_validate_uses_step_commands(self, tmp_path) -> None:
         executor = SSHExecutor()
         log_path = str(tmp_path / "log.txt")
-        mock_result = MagicMock(returncode=0)
-
         patches = _mock_bundle_success()
         with patches[0], patches[1], patches[2], \
-             patch("subprocess.run", return_value=mock_result) as mock_run:
+             patch(
+                 "shipyard.executor.ssh.run_streaming_command",
+                 return_value=_streaming_result(0, "ok"),
+             ) as mock_run:
             executor.validate(
                 sha="abc123",
                 branch="main",
@@ -246,7 +263,9 @@ class TestSSHExecutorValidate:
             # The SSH command should include the chained build + test
             ssh_cmd = mock_run.call_args[0][0]
             remote_cmd = ssh_cmd[-1]
-            assert "make && make test" in remote_cmd
+            assert "__SHIPYARD_PHASE__:build" in remote_cmd
+            assert "__SHIPYARD_PHASE__:test" in remote_cmd
+            assert "make test" in remote_cmd
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +297,6 @@ class TestSSHWindowsExecutorValidate:
     def test_validate_pass(self, tmp_path) -> None:
         executor = SSHWindowsExecutor()
         log_path = str(tmp_path / "log.txt")
-        mock_result = MagicMock(returncode=0)
-
         from shipyard.bundle.git_bundle import BundleResult
 
         with patch(
@@ -291,7 +308,10 @@ class TestSSHWindowsExecutorValidate:
         ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),
-        ), patch("subprocess.run", return_value=mock_result):
+        ), patch(
+            "shipyard.executor.ssh_windows.run_streaming_command",
+            return_value=_streaming_result(0, "ok"),
+        ):
             result = executor.validate(
                 sha="abc123",
                 branch="main",
@@ -306,8 +326,6 @@ class TestSSHWindowsExecutorValidate:
     def test_validate_fail(self, tmp_path) -> None:
         executor = SSHWindowsExecutor()
         log_path = str(tmp_path / "log.txt")
-        mock_result = MagicMock(returncode=1)
-
         from shipyard.bundle.git_bundle import BundleResult
 
         with patch(
@@ -319,7 +337,10 @@ class TestSSHWindowsExecutorValidate:
         ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),
-        ), patch("subprocess.run", return_value=mock_result):
+        ), patch(
+            "shipyard.executor.ssh_windows.run_streaming_command",
+            return_value=_streaming_result(1, "failed"),
+        ):
             result = executor.validate(
                 sha="abc123",
                 branch="main",
@@ -333,8 +354,6 @@ class TestSSHWindowsExecutorValidate:
     def test_validate_uses_powershell(self, tmp_path) -> None:
         executor = SSHWindowsExecutor()
         log_path = str(tmp_path / "log.txt")
-        mock_result = MagicMock(returncode=0)
-
         from shipyard.bundle.git_bundle import BundleResult
 
         with patch(
@@ -346,7 +365,10 @@ class TestSSHWindowsExecutorValidate:
         ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),
-        ), patch("subprocess.run", return_value=mock_result) as mock_run:
+        ), patch(
+            "shipyard.executor.ssh_windows.run_streaming_command",
+            return_value=_streaming_result(0, "ok"),
+        ) as mock_run:
             executor.validate(
                 sha="abc123",
                 branch="main",

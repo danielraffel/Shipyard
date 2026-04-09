@@ -19,8 +19,14 @@ For smoke (fast) validation:
 shipyard run --smoke --json
 ```
 
+If a repo intentionally needs to bypass preflight:
+```bash
+shipyard run --allow-root-mismatch --allow-unreachable-targets --json
+```
+
 Parse the JSON output. Report:
 - Job ID and branch/SHA being validated
+- Preflight warnings when present
 - Per-target status (pass/fail/error) with duration
 - Overall result (all green or which targets failed)
 
