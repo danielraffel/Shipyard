@@ -6,13 +6,10 @@ import subprocess
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from shipyard.core.job import TargetStatus
 from shipyard.executor.ssh import SSHExecutor
 from shipyard.executor.ssh_windows import SSHWindowsExecutor
 from shipyard.executor.streaming import StreamingCommandResult
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -33,11 +30,16 @@ def _windows_target_config(
     name: str = "windows",
     **extra: object,
 ) -> dict:
+    # `windows_vs_detect` defaults to True in production, but tests
+    # that don't exercise toolchain detection disable it so they
+    # don't shell out to a real `ssh <host>` during unit runs.
     return {
         "host": host,
         "platform": platform,
         "name": name,
         "repo_path": "C:\\repo",
+        "windows_vs_detect": False,
+        "windows_host_mutex": False,
         **extra,
     }
 
@@ -151,7 +153,6 @@ class TestSSHExecutorValidate:
     def test_validate_pass(self, tmp_path) -> None:
         executor = SSHExecutor()
         log_path = str(tmp_path / "log.txt")
-        mock_result = MagicMock(returncode=0)
 
         patches = _mock_bundle_success()
         with patches[0], patches[1], patches[2], \
@@ -380,3 +381,163 @@ class TestSSHWindowsExecutorValidate:
             ssh_cmd = mock_run.call_args[0][0]
             assert "powershell" in ssh_cmd
             assert "-Command" in ssh_cmd
+
+    def test_validate_host_mutex_default_wraps_command(self, tmp_path) -> None:
+        """When windows_host_mutex is not explicitly disabled, the command is wrapped."""
+        executor = SSHWindowsExecutor()
+        log_path = str(tmp_path / "log.txt")
+        from shipyard.bundle.git_bundle import BundleResult
+
+        # Enable the mutex but keep VS detection disabled so no real
+        # SSH call is made.
+        target = _windows_target_config(
+            windows_vs_detect=False,
+            windows_host_mutex=True,
+        )
+
+        with patch(
+            "shipyard.executor.ssh_windows.create_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows.upload_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows._apply_bundle_windows",
+            return_value=type("R", (), {"success": True, "message": "ok"})(),
+        ), patch(
+            "shipyard.executor.ssh_windows.run_streaming_command",
+            return_value=_streaming_result(0, "ok"),
+        ) as mock_run:
+            executor.validate(
+                sha="abc123",
+                branch="main",
+                target_config=target,
+                validation_config=_validation_config(),
+                log_path=log_path,
+            )
+
+            ssh_cmd = mock_run.call_args[0][0]
+            # The last argument is the PowerShell command string.
+            ps = ssh_cmd[-1]
+            assert "System.Threading.Mutex" in ps
+            assert "Global\\ShipyardValidate" in ps
+
+    def test_validate_host_mutex_custom_name(self, tmp_path) -> None:
+        executor = SSHWindowsExecutor()
+        log_path = str(tmp_path / "log.txt")
+        from shipyard.bundle.git_bundle import BundleResult
+
+        target = _windows_target_config(
+            windows_vs_detect=False,
+            windows_host_mutex=True,
+            windows_host_mutex_name="Global\\MyCustomLock",
+        )
+
+        with patch(
+            "shipyard.executor.ssh_windows.create_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows.upload_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows._apply_bundle_windows",
+            return_value=type("R", (), {"success": True, "message": "ok"})(),
+        ), patch(
+            "shipyard.executor.ssh_windows.run_streaming_command",
+            return_value=_streaming_result(0, "ok"),
+        ) as mock_run:
+            executor.validate(
+                sha="abc123",
+                branch="main",
+                target_config=target,
+                validation_config=_validation_config(),
+                log_path=log_path,
+            )
+            ps = mock_run.call_args[0][0][-1]
+            assert "Global\\MyCustomLock" in ps
+            assert "Global\\ShipyardValidate" not in ps
+
+    def test_validate_vs_detection_injects_env_vars(self, tmp_path) -> None:
+        """Detected toolchain is exported to the remote command as env vars."""
+        from shipyard.executor.windows_toolchain import VsToolchain
+
+        executor = SSHWindowsExecutor()
+        log_path = str(tmp_path / "log.txt")
+        from shipyard.bundle.git_bundle import BundleResult
+
+        target = _windows_target_config(
+            windows_vs_detect=True,
+            windows_host_mutex=False,
+        )
+
+        with patch(
+            "shipyard.executor.ssh_windows.detect_vs_toolchain",
+            return_value=VsToolchain(
+                cmake_platform="ARM64",
+                cmake_generator_instance="C:/VS/2022/Community",
+            ),
+        ), patch(
+            "shipyard.executor.ssh_windows.create_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows.upload_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows._apply_bundle_windows",
+            return_value=type("R", (), {"success": True, "message": "ok"})(),
+        ), patch(
+            "shipyard.executor.ssh_windows.run_streaming_command",
+            return_value=_streaming_result(0, "ok"),
+        ) as mock_run:
+            executor.validate(
+                sha="abc123",
+                branch="main",
+                target_config=target,
+                validation_config=_validation_config(),
+                log_path=log_path,
+            )
+            ps = mock_run.call_args[0][0][-1]
+            assert "$env:SHIPYARD_CMAKE_PLATFORM = 'ARM64'" in ps
+            assert "C:/VS/2022/Community" in ps
+
+    def test_validate_vs_detection_cache_reuses_result(self, tmp_path) -> None:
+        """The toolchain is detected once per host and cached on the executor."""
+        from shipyard.executor.windows_toolchain import VsToolchain
+
+        executor = SSHWindowsExecutor()
+        log_path = str(tmp_path / "log.txt")
+        from shipyard.bundle.git_bundle import BundleResult
+
+        target = _windows_target_config(
+            windows_vs_detect=True,
+            windows_host_mutex=False,
+        )
+
+        with patch(
+            "shipyard.executor.ssh_windows.detect_vs_toolchain",
+            return_value=VsToolchain(
+                cmake_platform="x64",
+                cmake_generator_instance="C:/VS/2022/BuildTools",
+            ),
+        ) as mock_detect, patch(
+            "shipyard.executor.ssh_windows.create_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows.upload_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows._apply_bundle_windows",
+            return_value=type("R", (), {"success": True, "message": "ok"})(),
+        ), patch(
+            "shipyard.executor.ssh_windows.run_streaming_command",
+            return_value=_streaming_result(0, "ok"),
+        ):
+            for _ in range(3):
+                executor.validate(
+                    sha="abc123",
+                    branch="main",
+                    target_config=target,
+                    validation_config=_validation_config(),
+                    log_path=log_path,
+                )
+            assert mock_detect.call_count == 1

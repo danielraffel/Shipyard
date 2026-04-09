@@ -17,10 +17,23 @@ from shipyard.bundle.git_bundle import create_bundle, upload_bundle
 from shipyard.core.job import TargetResult, TargetStatus
 from shipyard.executor.contract import evaluate_contract, required_markers
 from shipyard.executor.streaming import ProgressCallback, run_streaming_command
+from shipyard.executor.windows_toolchain import (
+    DEFAULT_MUTEX_NAME,
+    VsToolchain,
+    detect_vs_toolchain,
+    toolchain_env_exports,
+    wrap_powershell_with_host_mutex,
+)
 
 
 class SSHWindowsExecutor:
     """Execute validation commands on a remote Windows host via SSH + PowerShell."""
+
+    def __init__(self) -> None:
+        # Cache of detected VS toolchains keyed by host. Detection
+        # shells out to vswhere, which is slow enough (~1s) that we
+        # only want to do it once per Shipyard invocation per host.
+        self._vs_toolchain_cache: dict[str, VsToolchain | None] = {}
 
     def validate(
         self,
@@ -88,12 +101,33 @@ class SSHWindowsExecutor:
                     f"Bundle apply failed: {apply_result.message}",
                 )
 
-        # Step 2: Checkout the SHA and run validation via PowerShell
-        command = _build_remote_command(sha, remote_repo, validation_config)
+        # Step 2: Resolve the Visual Studio toolchain (once per host,
+        # cached) so stages can reference $env:SHIPYARD_CMAKE_PLATFORM
+        # and $env:SHIPYARD_CMAKE_GENERATOR_INSTANCE. This matches
+        # Pulp's local_ci.py behavior for hosts with multiple VS
+        # installations or ARM64 Windows. Detection is best-effort:
+        # a None result just means CMake falls back to its defaults.
+        toolchain = self._get_vs_toolchain(host, ssh_options, target_config)
+
+        # Step 3: Build the remote PowerShell command: env exports +
+        # checkout + validate. If the target opts into a host mutex,
+        # wrap the whole thing in a Mutex block so concurrent runs
+        # against the same Windows host queue up instead of racing.
+        command = _build_remote_command(
+            sha, remote_repo, validation_config, toolchain=toolchain,
+        )
         if not command:
             return _error_result(
                 target_name, platform, started_at, start_time,
                 str(log_file), "No validation command configured",
+            )
+
+        if _host_mutex_enabled(target_config):
+            command = wrap_powershell_with_host_mutex(
+                command,
+                mutex_name=target_config.get(
+                    "windows_host_mutex_name", DEFAULT_MUTEX_NAME,
+                ),
             )
 
         ssh_cmd = (
@@ -158,6 +192,26 @@ class SSHWindowsExecutor:
                 target_name, platform, started_at, start_time,
                 str(log_file), str(exc),
             )
+
+    def _get_vs_toolchain(
+        self,
+        host: str,
+        ssh_options: list[str],
+        target_config: dict[str, Any],
+    ) -> VsToolchain | None:
+        """Return the cached or freshly-detected VS toolchain for a host.
+
+        Respects `windows_vs_detect = false` in the target config to
+        opt out entirely. Detection failures are cached as None so a
+        missing vswhere doesn't re-probe on every run.
+        """
+        if target_config.get("windows_vs_detect", True) is False:
+            return None
+        if host in self._vs_toolchain_cache:
+            return self._vs_toolchain_cache[host]
+        toolchain = detect_vs_toolchain(host, ssh_options)
+        self._vs_toolchain_cache[host] = toolchain
+        return toolchain
 
     def probe(self, target_config: dict[str, Any]) -> bool:
         """Check SSH reachability with a PowerShell echo command."""
@@ -243,10 +297,14 @@ def _build_remote_command(
     sha: str,
     remote_repo: str,
     validation_config: dict[str, Any],
+    *,
+    toolchain: VsToolchain | None = None,
 ) -> str | None:
     """Build the remote PowerShell command: cd + checkout + validate.
 
     Uses semicolons for PowerShell command chaining with $LASTEXITCODE checks.
+    When `toolchain` is provided, the resolved CMake platform and generator
+    instance are exported as env vars so stages can reference them.
     """
     if "command" in validation_config:
         validate_cmd = validation_config["command"]
@@ -262,11 +320,24 @@ def _build_remote_command(
         validate_cmd = "; if ($LASTEXITCODE -ne 0) { exit 1 }; ".join(parts)
 
     return (
+        f"{toolchain_env_exports(toolchain)}; "
         f"cd '{remote_repo}'; "
         f"git checkout --force {sha}; "
         f"if ($LASTEXITCODE -ne 0) {{ exit 1 }}; "
         f"{validate_cmd}"
     )
+
+
+def _host_mutex_enabled(target_config: dict[str, Any]) -> bool:
+    """Read the host-mutex opt-in from the target config.
+
+    Default: True. Concurrent validation runs on a Windows host share
+    a checked-out repo and a locked VS install, so serializing by
+    default prevents hard-to-diagnose flaky failures. Projects that
+    use per-job worktrees can disable it with
+    `windows_host_mutex = false` in the target config.
+    """
+    return target_config.get("windows_host_mutex", True) is not False
 
 
 def _error_result(
