@@ -261,119 +261,96 @@ for you.
 
 ## Agent Integration
 
-Shipyard works with any AI coding agent that can run shell commands. Every
-command supports `--json` for structured output — agents parse the result
-and decide what to do next.
+### `shipyard init` handles this for you
 
-### The "set it and forget it" flow
-The most powerful setup: assign a task to an agent, and it validates and merges
-automatically. No manual CI checks or manual merges. If it’s green,
-it’s auto-merged to main.
+When you run `shipyard init`, it detects whether you’re using Claude Code
+or Codex and offers to set up agent integration automatically:
 
-Here's how it works in practice:
+```
+$ shipyard init
+
+  ...detecting project, configuring targets...
+
+  Agent setup:
+    Found: Claude Code (.claude/ directory detected)
+
+    How should your agent handle merging?
+      [1] Auto-merge — agent validates and merges to main automatically
+      [2] Auto-merge to develop — agent merges to develop, you promote to main
+      [3] Validate only — agent runs CI, you click merge manually
+      [4] Skip agent setup
+
+  Choice [1]: 1
+
+  → Writing .claude/skills/ci.md
+  → Adding CI instructions to CLAUDE.md
+
+  Done. Your agent will now validate and merge automatically.
+```
+
+You don’t need to copy files or edit configs. Init writes the right files
+for your choice. You can re-run `shipyard init` later to change the setup.
+
+### How it works after setup
+
+Once configured, your agent handles CI end-to-end:
 
 1. You: "Implement the reverb effect and ship it"
 2. Agent writes code, commits to a feature branch
-3. Agent runs `shipyard ship --json` which:
+3. Agent runs `shipyard ship` which:
    - Pushes the branch
    - Creates a PR
-   - Validates on all configured platforms (Mac + VMs + cloud)
-   - If all green, merges to main automatically
-4. You come back, it's merged
+   - Validates on all configured platforms
+   - If all green, merges automatically
+4. You come back, it’s on main
 
-This is how Pulp (the project Shipyard was extracted from) operates daily.
+This is how [Pulp](https://github.com/danielraffel/pulp) (the project
+Shipyard was extracted from) operates daily.
 
-### Setting up auto-merge for Claude Code
+### If you prefer manual merging
 
-Add this skill file to your project. Claude will use it whenever it needs
-to commit, validate, or merge code:
-
-**`.claude/skills/ci.md`:**
-
-```markdown
----
-name: ci
-description: Cross-platform CI via Shipyard — validates and ships code
----
-
-## After finishing work
-
-When your work is complete and ready to merge:
-
-1. Commit changes to the current feature branch
-2. Run: shipyard ship --json
-3. This pushes, creates a PR, validates on all platforms, and merges on green
-4. If validation fails, read the logs, fix the issue, and run ship again
-
-## To validate without merging
-
-    shipyard run --json
-
-## To check status
-
-    shipyard status --json
-
-## Rules
-- Never push directly to main — always use shipyard ship
-- If a target fails, fix and re-run before merging
-- All configured platforms must be green before merge
-```
-
-### Setting up auto-merge for Codex
-
-Add to your `AGENTS.md`:
-
-```markdown
-## CI
-
-After completing work, validate and merge:
-- Run `shipyard ship` to push, create a PR, validate, and merge on green
-- If validation fails, check `shipyard logs <id> --target <name>` for details
-- Never push directly to main
-```
+Option 3 during init sets up "validate only" — the agent runs
+`shipyard run` to validate, but doesn’t merge. You review the PR and
+click squash-and-merge yourself. You still get cross-platform validation
+without giving up control over what lands on main.
 
 ### Merging to develop instead of main
 
-If you want agents to merge to a `develop` branch instead (less risky for
-shared projects), just change the skill:
-
-```markdown
-## After finishing work
-
-    shipyard ship --base develop --json
-```
-
-You can even have both flows — agents merge to `develop` automatically, and
-you manually promote `develop` to `main` when you're ready:
+Option 2 during init sets up a develop branch flow. Agents merge to
+`develop` automatically. You promote `develop` to `main` when ready:
 
 ```bash
 git checkout develop
 shipyard ship --base main    # validate develop, merge to main
 ```
 
-### Automated CI hook (optional)
+### What init writes
 
-If you want CI to trigger automatically after every push (not just when
-shipping), add a hook to `.claude/settings.json`:
+Depending on your choice, init creates:
 
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "command": "if echo \"$TOOL_INPUT\" | grep -q 'git push'; then shipyard run --json 2>/dev/null || true; fi"
-      }
-    ]
-  }
-}
-```
+| File | What it does |
+|------|-------------|
+| `.claude/skills/ci.md` | Teaches Claude how to validate and ship |
+| `CLAUDE.md` addition | CI instructions for Claude |
+| `AGENTS.md` addition | CI instructions for Codex |
+
+These are standard files in your repo. You can edit them, version them,
+or delete them. Nothing hidden.
 
 ---
 
 ## Workflow Scenarios
 
-### Scenario 1: You finished a feature and want to merge
+<details>
+<summary><strong>CLI workflows for manual use and troubleshooting</strong></summary>
+
+<br>
+
+Most of the time your agent handles CI automatically. These scenarios are
+for when you want to run things manually, debug a failure, or manage the
+queue.
+
+### You finished a feature and want to merge
 
 You've been working on a feature branch. Everything looks good. Time to
 validate across platforms and merge.
@@ -391,7 +368,7 @@ $ shipyard ship
 
 Or in one step: `shipyard ship` does the validation and merge together.
 
-### Scenario 2: CI fails on one platform
+### CI fails on one platform
 
 You ran validation and Windows failed. You don't want to re-validate
 macOS and Linux (they already passed) — just fix and re-run Windows.
@@ -415,7 +392,7 @@ Shipyard remembers the evidence from the previous run. When you re-run
 just Windows and it passes, all three platforms now have green evidence
 for this SHA.
 
-### Scenario 3: Multiple agents working in parallel
+### Multiple agents working in parallel
 
 You have two agents working in separate worktrees — one on reverb,
 one on delay. Both need CI, and your machine has one Windows VM.
@@ -434,7 +411,7 @@ Agent 2 (worktree: ~/Code/my-plugin-delay):
 
 No collisions. No manual coordination. The queue is machine-global.
 
-### Scenario 4: You want to prioritize one job over another
+### Prioritizing one job over another
 
 Two jobs are queued. The delay feature is urgent. Bump it up.
 
@@ -449,7 +426,7 @@ $ shipyard bump sy-002 high
 
 When the current job finishes, the high-priority job runs next.
 
-### Scenario 5: You want to merge to develop, not main
+### Merging to develop, not main
 
 Your team uses a develop branch as a staging area. Ship to develop first,
 promote to main later when stable.
@@ -464,9 +441,49 @@ $ shipyard ship --base main
   PR #45 → Validated → Merged to main
 ```
 
+</details>
+
 ---
 
 ## Install
+
+### For Claude Code users (recommended)
+
+Install the Shipyard plugin. It gives you natural language CI commands
+and will prompt to install the CLI binary if it's not already on your
+machine.
+
+**Step 1:** Add the Shipyard marketplace to `~/.claude/settings.json`:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "shipyard": {
+      "source": {
+        "source": "github",
+        "repo": "danielraffel/Shipyard"
+      }
+    }
+  }
+}
+```
+
+**Step 2:** Install the plugin in Claude Code:
+
+```
+/plugin install shipyard@shipyard
+```
+
+**Step 3:** Set up your project:
+
+```
+/shipyard:init
+```
+
+The plugin uses the CLI under the hood. If the `shipyard` binary isn't
+installed, the plugin will detect that and offer to install it for you.
+
+### For Codex / CLI users
 
 ### Quick start
 
