@@ -98,10 +98,13 @@ versioned schema (`schema_version: 1`). Agents parse the output directly —
 no screen-scraping, no fragile regex. The schema version increments when the
 format changes, so agents can check compatibility.
 
-**Profiles for instant switching.** Define `local`, `normal`, and `full`
-profiles once. Switch with `shipyard config use local` — no config editing.
-Each profile activates a different set of targets. Global profiles work
-across all projects; project profiles override for specific needs.
+**Target profiles for instant switching.** Define `local`, `normal`, and
+`full` profiles once. Switch with `shipyard config use local` — no config
+editing. Each profile activates a different set of targets. Global profiles
+work across all projects; project profiles override for specific needs.
+(See *Security & Governance Profiles* below for the separate set of
+profiles that control branch protection, release flow, and reviewer
+requirements.)
 
 **Merge only when proven.** `shipyard ship` refuses to merge unless every
 required platform has passing evidence for the exact HEAD SHA. It checks
@@ -111,6 +114,118 @@ clear breakdown of what's passing, missing, and failing.
 **Operational cleanup.** Logs, bundles, and results don't grow forever.
 `shipyard cleanup` shows what can be reclaimed (dry-run by default). The
 queue automatically trims to the 25 most recent completed jobs.
+
+---
+
+## Security & Governance Profiles
+
+Shipyard manages a project's GitHub-side governance settings —
+branch protection on `main`, tag protection on release tags, default
+workflow token permissions, release approval gates — declaratively from
+`.shipyard/config.toml`. Pick a profile, run `shipyard governance apply`,
+and the live GitHub state matches the profile. Drift between the declared
+config and the live state is reported by `shipyard governance status`.
+
+### Pick a profile
+
+```toml
+# .shipyard/config.toml
+[project]
+profile = "solo"   # one of: solo, multi, custom
+```
+
+The two presets cover the most common shapes: a single maintainer who
+takes occasional third-party PRs, and a multi-contributor team with real
+review requirements. `custom` lets you declare every knob explicitly.
+
+### What each profile sets
+
+| Setting | `solo` | `multi` | Why the difference |
+|---|---|---|---|
+| Branch protection: require PR | ✅ | ✅ | Catches stray pushes either way |
+| Branch protection: required status checks | ✅ (configured) | ✅ (configured) | The whole point of CI |
+| Branch protection: strict status checks | ❌ | ✅ | Solo doesn't need rebase coordination |
+| Branch protection: required reviews | 0 | 1 | Solo can't review their own PR |
+| Branch protection: enforce on admins | ❌ | ✅ | Solo needs a 3 AM hotfix path |
+| Branch protection: dismiss stale reviews | ❌ | ✅ | Force re-review on rebase in multi |
+| Tag protection: forbid update / delete / force | ✅ | ✅ | Trivy-style attack prevention |
+| Tag protection: forbid creation by non-admins | ❌ | ✅ | Solo creates release tags directly |
+| Default workflow token | read | read | Both — pure win, zero friction |
+| Forbid sensitive branch patterns | ❌ | ✅ | Solo has no co-maintainers to coordinate disclosure with |
+| Release approval gate | `off` (or `auto`) | `manual` | Solo doesn't gain from approving themselves |
+| Sigstore release attestations | ✅ | ✅ | Free, no friction, helps downstream verifiers |
+| Immutable releases | ✅ | ✅ | Free, no friction |
+| Action SHA pinning (Renovate) | ✅ | ✅ | Same — managed by Renovate |
+| `zizmor` workflow lint in CI | ✅ | ✅ | Same — runs automatically |
+| Renovate cooldown (third-party / first-party days) | 3 / 0 | 3 / 0 | Same |
+
+The pattern: **anything that's an "attacker-side" guardrail is on for
+both profiles** (free security), and **anything that's a "process
+correctness" guardrail varies** (solo doesn't gain from rules that
+exist to coordinate multiple humans).
+
+### Commands
+
+```bash
+shipyard governance status         # show current matrix vs profile vs live GitHub state
+shipyard governance use solo       # switch profile + apply
+shipyard governance use multi      # switch profile + apply
+shipyard governance diff           # what `apply` would change
+shipyard governance apply          # bring live GitHub state in line with config
+shipyard governance apply --create develop/foo
+                                   # create branch + apply matching protection in one command
+```
+
+`status` is the rollup view that shows where things stand without
+clicking through six GitHub settings pages. `use` is the one-command
+profile switch. `diff` is the dry-run before any mutation. `apply` is
+the idempotent apply. `apply --create <branch>` is the new-branch
+flow that creates the branch from `main` and applies the matching
+governance rules in one shot — branches never exist in an unprotected
+state.
+
+### Inspired by Astral
+
+The governance profiles, the action SHA pinning workflow, the tag
+protection, immutable releases, default read-only workflow tokens, and
+the deployment approval pattern all follow practices documented in
+[Astral's open-source security post](https://astral.sh/blog/open-source-security-at-astral).
+Astral built and maintains uv, Ruff, and ty — millions of developers
+depend on those tools, so they had to figure out the security baseline
+for cross-platform Python tooling under real attacker pressure. The
+post is the canonical reference for *why* each of these settings
+matters, and Shipyard packages the *how* into a one-command profile
+switch so you don't have to figure it out from first principles.
+
+Pulp ([github.com/danielraffel/pulp](https://github.com/danielraffel/pulp))
+is the first project to adopt Shipyard's governance profile system.
+Pulp runs on the `solo` profile because it has a single maintainer
+today; the same `.shipyard/config.toml` would gain a `[project] profile
+= "multi"` line and a `shipyard governance use multi` invocation if it
+ever grew co-maintainers, with no other config changes.
+
+### What ships in which Shipyard release
+
+| Feature | Status |
+|---|---|
+| Multi-backend executor dispatch (local / SSH / Windows-SSH / cloud) | ✅ v0.1.2 |
+| Submission preflight + reachability probe | ✅ v0.1.2 |
+| Cloud commands (`workflows`, `defaults`, `run`, `status`) | ✅ v0.1.2 |
+| Streaming progress + heartbeats + phase markers | ✅ v0.1.2 |
+| Validation contract markers (configurable, enforced) | 🚧 Phase 5 (v0.1.3) |
+| Prepared-state reuse on warm validation | 🚧 Phase 5 (v0.1.3) |
+| Windows host mutex + VS instance auto-detection | 🚧 Phase 5 (v0.1.3) |
+| SSH unreachable → Namespace cloud auto-failover | 🚧 Phase 5 (v0.1.3) |
+| `shipyard governance status / use / diff / apply` | 🚧 Phase 6 (v0.1.4) |
+| `shipyard governance apply --create <branch>` | 🚧 Phase 6 (v0.1.4) |
+| Awaiting-approval surface in `shipyard ship --watch` | 🚧 Phase 6 (v0.1.4) |
+| Sigstore attestations on Shipyard's own releases | 🚧 Planned |
+| zizmor in Shipyard's own CI | 🚧 Planned |
+
+The currently-shipped feature set is enough to dogfood Shipyard against
+a real project today. The Phase 5 / Phase 6 work closes the remaining
+capability gaps with feature-complete `local_ci.py` and adds the
+governance profile system.
 
 ---
 
