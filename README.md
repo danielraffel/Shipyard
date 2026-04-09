@@ -1,3 +1,5 @@
+[Blog post about Shipyard](https://danielraffel.me/2026/04/09/shipyard-is-a-cross-platform-ci-orchestration-layer-that-coordinates-validation-for-ai-agents-working-across-parallel-worktrees/)
+
 # Shipyard
 
 Shipyard is a cross-platform CI orchestration layer for projects that already build and test. It validates the exact commit across local machines, VMs, SSH hosts, and cloud runners, then gives AI agents structured results they can use to fix failures, retry, and merge only when everything is green.
