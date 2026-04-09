@@ -41,6 +41,62 @@ to cloud. Or it just reports unreachable and stops. You choose.
 Shipyard is not a [CI service](https://en.wikipedia.org/wiki/Continuous_integration), not a [build system](https://en.wikipedia.org/wiki/Build_automation), not a [workflow engine](https://en.wikipedia.org/wiki/Workflow_engine).
 It calls your build commands and cares about one thing: did they pass?
 
+## What Makes It Different
+
+**Exact-SHA validation.** Every target validates the specific commit you
+queued, not whatever happens to be checked out. Code is delivered to remote
+machines via git bundles — no git credentials needed on the target. Evidence
+records bind proof to the exact SHA, so stale results from a prior commit
+can't satisfy a merge gate.
+
+**Smart queue for parallel agents.** Multiple agents working in different
+worktrees share one machine-global queue. Jobs are prioritized (high/normal/low)
+and scheduled FIFO within priority. When you push a new commit to the same
+branch, the pending job for the old SHA is automatically replaced — but
+narrower reruns (just one failing target) and different validation modes
+(smoke vs full) coexist without interfering.
+
+**Targeted re-runs.** If Windows fails but Mac and Linux passed, re-run just
+Windows. Shipyard keeps the evidence from the earlier run. When the re-run
+passes, all three platforms now have green evidence for this SHA — you don't
+re-validate what already passed.
+
+**Failover that knows the difference.** If a target is unreachable, Shipyard
+walks your fallback chain (boot VM → try cloud → try GitHub-hosted). But if
+your code genuinely fails a test, there's no fallback — a real test failure
+is authoritative. The result always records exactly which backend produced it,
+so you know whether proof came from your local Mac or a Namespace runner.
+
+**Transient failure retry.** SSH connections drop. Shipyard recognizes 9
+transient SSH error patterns (connection reset, timeout, kex failure) and
+retries with exponential backoff before triggering fallback. Permanent errors
+like `Permission denied` fail immediately — no wasted retries.
+
+**22 ecosystem detectors.** `shipyard init` recognizes CMake, Swift, Xcode,
+Rust, Go, Node.js (pnpm > bun > yarn > npm), Python (uv > poetry > pip),
+Gradle, Maven, .NET, Flutter, Dart, Deno, Ruby, Elixir, PHP — and infers
+the right build and test commands. For polyglot repos, it detects all
+ecosystems with family deduplication (one Node detector, not four).
+
+**Structured JSON on every command.** Every command supports `--json` with a
+versioned schema (`schema_version: 1`). Agents parse the output directly —
+no screen-scraping, no fragile regex. The schema version increments when the
+format changes, so agents can check compatibility.
+
+**Profiles for instant switching.** Define `local`, `normal`, and `full`
+profiles once. Switch with `shipyard config use local` — no config editing.
+Each profile activates a different set of targets. Global profiles work
+across all projects; project profiles override for specific needs.
+
+**Merge only when proven.** `shipyard ship` refuses to merge unless every
+required platform has passing evidence for the exact HEAD SHA. It checks
+per-platform, so one missing or failing platform blocks the merge with a
+clear breakdown of what's passing, missing, and failing.
+
+**Operational cleanup.** Logs, bundles, and results don't grow forever.
+`shipyard cleanup` shows what can be reclaimed (dry-run by default). The
+queue automatically trims to the 25 most recent completed jobs.
+
 ---
 
 ## Examples
