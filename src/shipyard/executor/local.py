@@ -19,6 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from shipyard.core.job import TargetResult, TargetStatus
+from shipyard.core.prepared_state import (
+    PreparedStateRecord,
+    PreparedStateStore,
+    filter_stages_by_prepared_state,
+    hash_stage_commands,
+)
 from shipyard.executor.contract import (
     evaluate_contract,
     required_markers,
@@ -41,6 +47,16 @@ class StageResult:
 class LocalExecutor:
     """Execute validation commands locally via subprocess."""
 
+    def __init__(
+        self,
+        prepared_state_store: PreparedStateStore | None = None,
+    ) -> None:
+        # Optional store for warm-rerun stage skipping. When None,
+        # prepared-state reuse is disabled regardless of project config.
+        # Callers (cli.py / dispatch.py) supply this; tests construct
+        # the executor without it for fresh-state semantics.
+        self._prepared_state_store = prepared_state_store
+
     def validate(
         self,
         sha: str,
@@ -50,6 +66,7 @@ class LocalExecutor:
         log_path: str,
         resume_from: str | None = None,
         progress_callback: ProgressCallback | None = None,
+        mode: str = "default",
     ) -> TargetResult:
         target_name = target_config.get("name", "local")
         platform = target_config.get("platform", "unknown")
@@ -87,6 +104,9 @@ class LocalExecutor:
             stages, target_name, platform, target_config,
             log_file, started_at, start_time, progress_callback,
             contract_config=contract_config,
+            sha=sha,
+            mode=mode,
+            prepared_state_enabled=_prepared_state_enabled(validation_config),
         )
 
     def _run_single(
@@ -143,8 +163,18 @@ class LocalExecutor:
         started_at: datetime, start_time: float,
         progress_callback: ProgressCallback | None,
         contract_config: dict[str, Any] | None = None,
+        sha: str = "",
+        mode: str = "default",
+        prepared_state_enabled: bool = False,
     ) -> TargetResult:
-        """Run validation as separate stages. Stop at first failure."""
+        """Run validation as separate stages. Stop at first failure.
+
+        When `prepared_state_enabled` is True and a PreparedStateStore
+        is wired up, stages that previously passed for the exact
+        (sha, target, mode) tuple are skipped. The store is updated
+        after each stage so partial progress is preserved across
+        re-runs even on a failed pipeline.
+        """
         failed_stage = None
         last_output_at: datetime | None = None
         # Accumulate contract markers seen across every stage. The
@@ -153,8 +183,40 @@ class LocalExecutor:
         all_seen_markers: list[str] = []
         contract_markers_to_watch = required_markers(contract_config)
 
+        # ── Prepared-state filtering ────────────────────────────────
+        # If the project opts into prepared-state reuse and the
+        # executor was constructed with a store, consult the store to
+        # see whether earlier stages already passed for this exact
+        # (sha, target, mode). The hash of the current stage commands
+        # is part of the cache key — editing a build command in
+        # config invalidates the cached state automatically.
+        store = self._prepared_state_store if prepared_state_enabled else None
+        config_hash = hash_stage_commands(stages)
+        prepared_skipped: list[str] = []
+        record: PreparedStateRecord | None = None
+        if store is not None and sha:
+            record = store.get(sha=sha, target=target_name, mode=mode)
+            if record is not None and record.config_hash != config_hash:
+                # Config changed since the last run for this SHA —
+                # invalidate the cached state and start fresh.
+                store.delete(sha=sha, target=target_name, mode=mode)
+                record = None
+            stages_to_run, prepared_skipped = filter_stages_by_prepared_state(
+                stages, record, current_config_hash=config_hash,
+            )
+            if prepared_skipped:
+                stages = stages_to_run
+
         try:
             log_file.write_text("")
+            if prepared_skipped:
+                with open(log_file, "a", encoding="utf-8") as log:
+                    log.write(
+                        "=== prepared-state-reuse: skipped "
+                        f"{len(prepared_skipped)} stage(s) "
+                        f"({', '.join(prepared_skipped)}) for sha={sha} "
+                        f"target={target_name} mode={mode} ===\n"
+                    )
             for stage_name, command in stages:
                 stage_start = time.monotonic()
                 with open(log_file, "a", encoding="utf-8") as log:
@@ -185,6 +247,21 @@ class LocalExecutor:
                 for marker in result.contract_markers_seen:
                     if marker not in all_seen_markers:
                         all_seen_markers.append(marker)
+
+                # Record this stage's outcome in the prepared-state
+                # cache so a subsequent run on the same SHA can skip
+                # everything that just passed.
+                if store is not None and sha:
+                    if record is None:
+                        record = PreparedStateRecord(
+                            sha=sha, target=target_name, mode=mode,
+                            config_hash=config_hash,
+                        )
+                    record.mark(
+                        stage_name,
+                        "pass" if result.returncode == 0 else "fail",
+                    )
+                    store.save(record)
 
                 if result.returncode != 0:
                     failed_stage = stage_name
@@ -275,3 +352,20 @@ def _get_stages(
         stages.append((stage_name, cmd))
 
     return stages
+
+
+def _prepared_state_enabled(validation_config: dict[str, Any] | None) -> bool:
+    """Read the prepared-state opt-in from `[validation.prepared_state]`.
+
+    Default: False. Projects that want warm-rerun stage skipping must
+    declare it explicitly:
+
+        [validation.prepared_state]
+        enabled = true
+    """
+    if not validation_config:
+        return False
+    section = validation_config.get("prepared_state")
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("enabled", False))
