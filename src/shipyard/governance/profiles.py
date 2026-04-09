@@ -64,7 +64,12 @@ class BranchProtectionRules:
     allow_force_push: bool = False
     allow_deletions: bool = False
     require_linear_history: bool = False
-    required_conversation_resolution: bool = True
+    # Off by default — forcing conversation resolution on a solo
+    # project is self-friction (nobody else is leaving comments), and
+    # the planning doc's solo/multi table intentionally doesn't list
+    # this knob as one of the distinguishing defaults. Multi projects
+    # that want it can override to True explicitly.
+    required_conversation_resolution: bool = False
 
     def with_overrides(self, **overrides: object) -> BranchProtectionRules:
         """Return a copy with the given fields replaced.
@@ -115,7 +120,7 @@ def solo_profile(
             allow_force_push=False,
             allow_deletions=False,
             require_linear_history=False,
-            required_conversation_resolution=True,
+            required_conversation_resolution=False,
         ),
     )
 

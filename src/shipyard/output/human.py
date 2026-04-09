@@ -181,7 +181,7 @@ def render_doctor(checks: dict[str, Any], ready: bool) -> None:
         for name, info in items.items():
             ok = info.get("ok", False)
             icon = "[green]\u2713[/]" if ok else "[red]\u2717[/]"
-            detail = info.get("version", info.get("error", ""))
+            detail = info.get("version", info.get("error", info.get("detail", "")))
             extra = ""
             if info.get("user"):
                 extra = f" (as {info['user']})"

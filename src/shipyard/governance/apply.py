@@ -84,7 +84,7 @@ def build_apply_plan(
     else:
         action = ApplyAction.NOOP
 
-    manual_followups = _collect_manual_followups()
+    manual_followups = _collect_manual_followups(repo)
 
     return ApplyPlan(
         repo=repo,
@@ -127,7 +127,7 @@ def execute_apply_plan(
     return ApplyResult(plan=plan, executed=True, error_message=None)
 
 
-def _collect_manual_followups() -> tuple[str, ...]:
+def _collect_manual_followups(repo: RepoRef) -> tuple[str, ...]:
     """Manual followups Shipyard cannot apply via API.
 
     For v0.1.4 this is just the immutable-releases checkbox. Future
@@ -141,6 +141,6 @@ def _collect_manual_followups() -> tuple[str, ...]:
     """
     return (
         "Immutable releases: verify the 'Immutable releases' checkbox "
-        "is enabled at https://github.com/<owner>/<repo>/settings. "
+        f"is enabled at https://github.com/{repo.slug}/settings. "
         "Shipyard cannot read this setting via API on personal repos.",
     )

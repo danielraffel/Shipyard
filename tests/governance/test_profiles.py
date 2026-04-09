@@ -39,7 +39,10 @@ def test_solo_profile_defaults() -> None:
     assert rules.allow_force_push is False
     assert rules.allow_deletions is False
     assert rules.require_linear_history is False
-    assert rules.required_conversation_resolution is True
+    # Off for solo by design — conversation resolution has no value
+    # on a single-maintainer project and is pure self-friction. Multi
+    # profile keeps it on.
+    assert rules.required_conversation_resolution is False
 
 
 def test_solo_profile_applies_required_status_checks() -> None:
