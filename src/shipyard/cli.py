@@ -1049,6 +1049,193 @@ def _rewrite_profile_in_config(config_path: Path, new_profile: str) -> None:
     config_path.write_text("".join(out))
 
 
+def _should_auto_create_base(base: str, flag: bool | None) -> bool:
+    """Decide whether `ship --base <x>` should auto-create-base.
+
+    Explicit --auto-create-base/--no-auto-create-base wins. When
+    the flag is unset, default to on for `develop/*` and
+    `release/*` patterns (the two cases where the planning doc
+    explicitly wants auto-creation) and off for everything else.
+    """
+    if flag is not None:
+        return flag
+    return base.startswith("develop/") or base.startswith("release/")
+
+
+def _maybe_auto_create_base_branch(ctx: Context, base: str) -> None:
+    """If `base` does not exist on origin, create it + apply its rules.
+
+    Best-effort: on any failure this prints a warning and returns.
+    The caller still tries to push and create the PR, which will
+    surface any hard failure from git/gh in the normal path rather
+    than stopping ship() early on a transient API hiccup.
+    """
+    from shipyard.governance import (
+        detect_repo_from_remote,
+        load_governance_config,
+        resolve_branch_rules,
+    )
+    from shipyard.governance.branch_create import (
+        BranchCreateStatus,
+        create_branch_and_apply_rules,
+    )
+
+    # Cheap check first: does the branch already exist on the remote?
+    check = subprocess.run(
+        ["git", "ls-remote", "--exit-code", "--heads", "origin", base],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if check.returncode == 0:
+        return  # Branch already exists, nothing to do
+
+    # Branch is missing — try to create + protect it.
+    repo = detect_repo_from_remote()
+    if repo is None:
+        render_message(
+            f"warning: --base {base} does not exist on origin and the "
+            f"repo could not be detected from the git remote; skipping "
+            f"auto-create-base.",
+            style="bold yellow",
+        )
+        return
+
+    gov = load_governance_config(ctx.config)
+    rules = resolve_branch_rules(gov, base)
+    render_message(f"Creating base branch '{base}' from 'main' + applying governance rules…")
+    result = create_branch_and_apply_rules(
+        repo=repo, branch=base, base_branch="main", rules=rules,
+    )
+    if result.status == BranchCreateStatus.RULES_APPLIED or result.status == BranchCreateStatus.CREATED:
+        render_message(f"  ✓ {result.message}", style="green")
+    elif result.status == BranchCreateStatus.ALREADY_EXISTS:
+        render_message(f"  ℹ {result.message}")
+    else:
+        render_message(f"  ✗ {result.message}", style="bold red")
+        render_message(
+            "continuing with ship flow anyway; fix the branch protection "
+            "with `shipyard branch apply` after the PR is opened",
+            style="yellow",
+        )
+
+
+# ── branch commands ───────────────────────────────────────────────────
+
+
+@main.group()
+def branch() -> None:
+    """Manage branch protection for individual branches."""
+
+
+@branch.command("apply")
+@click.option(
+    "--create", "create_name",
+    help="Create the branch from --base if it doesn't exist, then apply rules",
+)
+@click.option(
+    "--base", "base_branch",
+    default="main",
+    help="Base branch to create from when --create is given (default: main)",
+)
+@click.argument("target_branch", required=False)
+@click.pass_obj
+def branch_apply(
+    ctx: Context,
+    create_name: str | None,
+    base_branch: str,
+    target_branch: str | None,
+) -> None:
+    """Apply declared governance rules to a single branch.
+
+    Two modes:
+
+      shipyard branch apply <name>
+          Apply rules to an existing branch (same as
+          `governance apply --branch <name>`, provided here for
+          symmetry with the create flow).
+
+      shipyard branch apply --create develop/foo
+          Create `develop/foo` from --base (default: main) and
+          apply the matching `[branch_protection."<glob>"]` rules
+          in one shot. Prevents the "new branch is unprotected
+          until someone runs apply later" failure mode.
+    """
+    from shipyard.governance import (
+        detect_repo_from_remote,
+        load_governance_config,
+        resolve_branch_rules,
+    )
+    from shipyard.governance.branch_create import (
+        BranchCreateStatus,
+        create_branch_and_apply_rules,
+    )
+
+    repo = detect_repo_from_remote()
+    if repo is None:
+        render_error("Could not detect repo from git remote.")
+        sys.exit(1)
+
+    # Figure out which branch we're acting on
+    name_arg = create_name or target_branch
+    if not name_arg:
+        render_error("Specify a branch name (positional) or --create <name>")
+        sys.exit(1)
+
+    gov = load_governance_config(ctx.config)
+    rules = resolve_branch_rules(gov, name_arg)
+
+    if create_name:
+        result = create_branch_and_apply_rules(
+            repo=repo,
+            branch=create_name,
+            base_branch=base_branch,
+            rules=rules,
+        )
+        if ctx.json_mode:
+            ctx.output("branch.apply", {
+                "branch": result.branch,
+                "status": result.status.value,
+                "message": result.message,
+                "ok": result.ok,
+            })
+        else:
+            if result.status == BranchCreateStatus.RULES_APPLIED or result.status == BranchCreateStatus.CREATED:
+                render_message(f"  ✓ {result.message}", style="green")
+            elif result.status == BranchCreateStatus.ALREADY_EXISTS:
+                render_message(f"  ℹ {result.message}", style="yellow")
+            else:
+                render_message(f"  ✗ {result.message}", style="bold red")
+        if not result.ok:
+            sys.exit(1)
+        return
+
+    # Existing-branch apply path — delegate to the governance
+    # apply flow for a single branch.
+    from shipyard.governance import (
+        build_apply_plan,
+        build_status,
+        execute_apply_plan,
+    )
+
+    status = build_status(
+        repo=repo, governance=gov, branches=(name_arg,),
+    )
+    results = []
+    for report in status.reports:
+        declared = resolve_branch_rules(gov, report.branch)
+        plan = build_apply_plan(
+            repo=repo, branch=report.branch,
+            declared_rules=declared, drift_report=report,
+        )
+        results.append(execute_apply_plan(plan, dry_run=False))
+    _render_apply_results(
+        ctx, results, list(status.errors), dry_run=False, from_snapshot=False,
+    )
+    if any(r.error_message for r in results) or status.has_errors:
+        sys.exit(1)
+
+
 @main.group()
 def cloud() -> None:
     """Dispatch and inspect GitHub Actions workflows."""
@@ -1303,8 +1490,24 @@ def cloud_status(ctx: Context, identifier: str | None, limit: int, refresh: bool
     is_flag=True,
     help="Queue the run even if no backend is reachable for one or more targets",
 )
+@click.option(
+    "--auto-create-base/--no-auto-create-base",
+    default=None,
+    help=(
+        "If the --base branch does not exist on the remote, create it from "
+        "main and apply matching branch_protection rules before opening the "
+        "PR. Default: on for develop/* and release/* patterns; off for "
+        "everything else."
+    ),
+)
 @click.pass_obj
-def ship(ctx: Context, base: str, allow_root_mismatch: bool, allow_unreachable_targets: bool) -> None:
+def ship(
+    ctx: Context,
+    base: str,
+    allow_root_mismatch: bool,
+    allow_unreachable_targets: bool,
+    auto_create_base: bool | None,
+) -> None:
     """Branch -> PR -> validate -> merge on green."""
     from shipyard.ship.pr import create_pr, find_pr_for_branch, merge_pr
 
@@ -1316,6 +1519,15 @@ def ship(ctx: Context, base: str, allow_root_mismatch: bool, allow_unreachable_t
     if branch == base:
         render_error(f"Already on {base}. Switch to a feature branch first.")
         sys.exit(1)
+
+    # ── Auto-create missing base branch ─────────────────────────
+    # If the user is shipping into a `develop/*` or `release/*`
+    # branch that doesn't exist yet, create it from main and apply
+    # its matching governance rules before opening the PR. This
+    # closes the "new develop branch exists unprotected until
+    # someone remembers to run branch apply" gap.
+    if _should_auto_create_base(base, auto_create_base):
+        _maybe_auto_create_base_branch(ctx, base)
 
     # Push branch
     subprocess.run(["git", "push", "-u", "origin", branch], capture_output=True)
