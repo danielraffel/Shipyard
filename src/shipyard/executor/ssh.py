@@ -115,6 +115,7 @@ class SSHExecutor:
                 host=host,
                 remote_path=remote_bundle,
                 ssh_options=ssh_options,
+                timeout=int(target_config.get("bundle_upload_timeout_secs", 1800)),
             )
             if not upload_result.success:
                 return _error_result(
