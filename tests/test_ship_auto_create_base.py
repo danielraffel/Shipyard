@@ -41,3 +41,43 @@ def test_explicit_false_overrides_default_on() -> None:
 
 def test_explicit_false_for_main_stays_false() -> None:
     assert _should_auto_create_base("main", False) is False
+
+
+# ── JSON mode suppresses human output in auto-create helper ────────────
+
+
+def test_auto_create_base_respects_json_mode(capsys) -> None:
+    """When ctx.json_mode is True, the helper must not emit human text.
+
+    Codex flagged that `_maybe_auto_create_base_branch` called
+    `render_message` unconditionally, which would interleave
+    human progress lines with the final JSON envelope and break
+    `shipyard ship --json` for machine consumers.
+    """
+    import subprocess
+    from unittest.mock import patch
+
+    from shipyard.cli import _maybe_auto_create_base_branch
+
+    class FakeCtx:
+        json_mode = True
+        config = None  # not touched in the paths under test
+
+    # Short-circuit the helper via ls-remote returning "not found"
+    # (code 2), then have detect_repo_from_remote return None. That
+    # path would normally call render_message; the json_mode guard
+    # must suppress it.
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=2, stdout="", stderr="",
+        )
+
+    with patch("subprocess.run", side_effect=fake_run), patch(
+        "shipyard.governance.detect_repo_from_remote",
+        return_value=None,
+    ):
+        _maybe_auto_create_base_branch(FakeCtx(), "develop/foo")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""

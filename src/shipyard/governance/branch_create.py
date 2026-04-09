@@ -65,6 +65,12 @@ def create_branch_on_remote(
 ) -> BranchCreateResult:
     """Create `branch` from `base_branch` on origin, idempotently.
 
+    Always resolves the base SHA from the remote via `ls-remote`,
+    not from the local `refs/remotes/origin/<base>` tracking ref.
+    That tracking ref can be absent (shallow/single-branch clones)
+    or stale (long-lived worktrees), both of which would make a
+    local-ref-based push either fail or create the wrong commit.
+
     If the branch already exists on the remote, returns
     `ALREADY_EXISTS` — callers can then fall through to apply rules
     without re-creating. If git fails (network, auth, invalid ref),
@@ -97,15 +103,49 @@ def create_branch_on_remote(
             ),
         )
 
-    # Create the branch from the base on origin. Use refspec syntax
-    # so no local branch is needed — this works even from a
-    # detached HEAD or a different checkout.
+    # Resolve the remote base SHA directly. This does NOT rely on
+    # `refs/remotes/origin/<base>` being present locally — shallow
+    # or single-branch clones won't have that ref at all, and stale
+    # long-lived worktrees can have it pointing at an older commit.
+    base_lookup = subprocess.run(
+        [git_command, "ls-remote", "--exit-code", "origin", f"refs/heads/{base_branch}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if base_lookup.returncode != 0:
+        return BranchCreateResult(
+            branch=branch,
+            status=BranchCreateStatus.GIT_FAILED,
+            message=(
+                f"ls-remote failed to resolve base branch '{base_branch}': "
+                f"{(base_lookup.stderr or '').strip() or 'no detail'}"
+            ),
+        )
+
+    # Output is `<sha>\trefs/heads/<base_branch>` on the first line.
+    first_line = (base_lookup.stdout or "").strip().splitlines()
+    if not first_line:
+        return BranchCreateResult(
+            branch=branch,
+            status=BranchCreateStatus.GIT_FAILED,
+            message=(
+                f"ls-remote returned no SHA for origin/{base_branch} — "
+                f"does the base branch exist on the remote?"
+            ),
+        )
+    base_sha = first_line[0].split(None, 1)[0]
+
+    # Push the resolved SHA as the new branch. Using the raw SHA as
+    # the push source avoids any dependency on local refs — git
+    # sends the commit if the remote doesn't have it, and creates
+    # the branch ref pointing at it.
     push = subprocess.run(
         [
             git_command,
             "push",
             "origin",
-            f"refs/remotes/origin/{base_branch}:refs/heads/{branch}",
+            f"{base_sha}:refs/heads/{branch}",
         ],
         capture_output=True,
         text=True,
@@ -116,7 +156,8 @@ def create_branch_on_remote(
             branch=branch,
             status=BranchCreateStatus.GIT_FAILED,
             message=(
-                f"git push failed creating {branch} from {base_branch}: "
+                f"git push failed creating {branch} from {base_branch} "
+                f"({base_sha[:8]}): "
                 f"{(push.stderr or '').strip() or 'no detail'}"
             ),
         )
@@ -124,7 +165,10 @@ def create_branch_on_remote(
     return BranchCreateResult(
         branch=branch,
         status=BranchCreateStatus.CREATED,
-        message=f"Created '{branch}' from '{base_branch}' on origin",
+        message=(
+            f"Created '{branch}' from '{base_branch}' "
+            f"({base_sha[:8]}) on origin"
+        ),
     )
 
 

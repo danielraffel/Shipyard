@@ -50,7 +50,16 @@ class SSHWindowsExecutor:
         validation_config: dict[str, Any],
         log_path: str,
         progress_callback: ProgressCallback | None = None,
+        resume_from: str | None = None,  # accepted for API symmetry
+        mode: str = "default",            # accepted for API symmetry
     ) -> TargetResult:
+        # `resume_from` and `mode` are accepted for API symmetry
+        # with LocalExecutor but not yet implemented here — the
+        # Windows SSH executor builds the remote command in one
+        # pass. Dropping them silently avoids a TypeError from the
+        # CLI dispatch path, which passes the same kwargs to every
+        # backend.
+        del resume_from, mode
         target_name = target_config.get("name", "windows")
         platform = target_config.get("platform", "windows-x64")
         host = target_config["host"]

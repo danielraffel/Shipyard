@@ -1080,6 +1080,14 @@ def _maybe_auto_create_base_branch(ctx: Context, base: str) -> None:
         create_branch_and_apply_rules,
     )
 
+    # In JSON mode, suppress human diagnostic output so the final
+    # `ship` envelope is the only thing on stdout. Machine consumers
+    # get valid JSON start-to-finish; human callers see the
+    # progress messages as before.
+    def _human(msg: str, style: str = "") -> None:
+        if not ctx.json_mode:
+            render_message(msg, style=style)
+
     # Cheap check first: does the branch already exist on the remote?
     check = subprocess.run(
         ["git", "ls-remote", "--exit-code", "--heads", "origin", base],
@@ -1093,7 +1101,7 @@ def _maybe_auto_create_base_branch(ctx: Context, base: str) -> None:
     # Branch is missing — try to create + protect it.
     repo = detect_repo_from_remote()
     if repo is None:
-        render_message(
+        _human(
             f"warning: --base {base} does not exist on origin and the "
             f"repo could not be detected from the git remote; skipping "
             f"auto-create-base.",
@@ -1103,17 +1111,17 @@ def _maybe_auto_create_base_branch(ctx: Context, base: str) -> None:
 
     gov = load_governance_config(ctx.config)
     rules = resolve_branch_rules(gov, base)
-    render_message(f"Creating base branch '{base}' from 'main' + applying governance rules…")
+    _human(f"Creating base branch '{base}' from 'main' + applying governance rules…")
     result = create_branch_and_apply_rules(
         repo=repo, branch=base, base_branch="main", rules=rules,
     )
     if result.status == BranchCreateStatus.RULES_APPLIED or result.status == BranchCreateStatus.CREATED:
-        render_message(f"  ✓ {result.message}", style="green")
+        _human(f"  ✓ {result.message}", style="green")
     elif result.status == BranchCreateStatus.ALREADY_EXISTS:
-        render_message(f"  ℹ {result.message}")
+        _human(f"  ℹ {result.message}")
     else:
-        render_message(f"  ✗ {result.message}", style="bold red")
-        render_message(
+        _human(f"  ✗ {result.message}", style="bold red")
+        _human(
             "continuing with ship flow anyway; fix the branch protection "
             "with `shipyard branch apply` after the PR is opened",
             style="yellow",

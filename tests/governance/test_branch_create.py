@@ -53,10 +53,12 @@ def test_create_branch_fresh_creation() -> None:
 
     def fake_run(cmd, *args, **kwargs):
         run_calls.append(cmd)
-        if "ls-remote" in cmd:
-            return _fail(2)  # not found
+        if "ls-remote" in cmd and "develop/foo" in cmd:
+            return _fail(2)  # target branch not found
+        if "ls-remote" in cmd and "refs/heads/main" in cmd:
+            return _ok(stdout="abc123def456\trefs/heads/main\n")
         if "push" in cmd:
-            return _ok(stderr="* [new branch] refs/heads/develop/foo -> refs/heads/develop/foo")
+            return _ok(stderr="* [new branch] refs/heads/develop/foo")
         return _ok()
 
     with patch("subprocess.run", side_effect=fake_run):
@@ -65,15 +67,87 @@ def test_create_branch_fresh_creation() -> None:
         )
     assert result.status == BranchCreateStatus.CREATED
     assert "develop/foo" in result.message
-    # Two git calls: ls-remote and push
-    assert len(run_calls) == 2
-    assert "push" in run_calls[1]
+    # Three git calls: exists-check, base-sha lookup, push
+    assert len(run_calls) == 3
+    assert "push" in run_calls[2]
+
+
+def test_create_branch_pushes_sha_not_local_ref() -> None:
+    """The push source must be the resolved SHA from ls-remote, not a local ref.
+
+    Codex flagged that using `refs/remotes/origin/<base>` as the
+    push source makes the command fail on shallow/single-branch
+    clones (no tracking ref) and can create from a stale commit
+    in long-lived worktrees.
+    """
+    push_cmd_seen: list = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if "ls-remote" in cmd and "develop/foo" in cmd:
+            return _fail(2)
+        if "ls-remote" in cmd and "refs/heads/main" in cmd:
+            return _ok(stdout="deadbeefcafe1234\trefs/heads/main\n")
+        if "push" in cmd:
+            push_cmd_seen.append(list(cmd))
+            return _ok()
+        return _ok()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = create_branch_on_remote(
+            branch="develop/foo", base_branch="main",
+        )
+    assert result.status == BranchCreateStatus.CREATED
+    assert len(push_cmd_seen) == 1
+    # The refspec source must be the concrete SHA, not a local ref
+    refspec = push_cmd_seen[0][-1]
+    assert refspec == "deadbeefcafe1234:refs/heads/develop/foo"
+    # And it must NOT reference the local tracking ref at all
+    for arg in push_cmd_seen[0]:
+        assert "refs/remotes/origin" not in arg
+
+
+def test_create_branch_base_lookup_empty_output() -> None:
+    """Empty ls-remote output for the base branch returns GIT_FAILED, not crash."""
+
+    def fake_run(cmd, *args, **kwargs):
+        if "ls-remote" in cmd and "develop/foo" in cmd:
+            return _fail(2)
+        if "ls-remote" in cmd and "refs/heads/main" in cmd:
+            return _ok(stdout="")
+        return _ok()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = create_branch_on_remote(
+            branch="develop/foo", base_branch="main",
+        )
+    assert result.status == BranchCreateStatus.GIT_FAILED
+    assert "no SHA" in result.message or "does the base branch exist" in result.message
+
+
+def test_create_branch_base_lookup_fails() -> None:
+    """A failing base-branch lookup returns GIT_FAILED with detail."""
+
+    def fake_run(cmd, *args, **kwargs):
+        if "ls-remote" in cmd and "develop/foo" in cmd:
+            return _fail(2)
+        if "ls-remote" in cmd and "refs/heads/main" in cmd:
+            return _fail(128, stderr="fatal: Authentication failed")
+        return _ok()
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = create_branch_on_remote(
+            branch="develop/foo", base_branch="main",
+        )
+    assert result.status == BranchCreateStatus.GIT_FAILED
+    assert "Authentication failed" in result.message
 
 
 def test_create_branch_push_fails() -> None:
     def fake_run(cmd, *args, **kwargs):
-        if "ls-remote" in cmd:
+        if "ls-remote" in cmd and "develop/foo" in cmd:
             return _fail(2)
+        if "ls-remote" in cmd and "refs/heads/main" in cmd:
+            return _ok(stdout="abc\trefs/heads/main\n")
         if "push" in cmd:
             return _fail(128, stderr="fatal: remote error")
         return _ok()
@@ -99,8 +173,10 @@ def test_create_branch_ls_remote_unexpected_failure() -> None:
 
 def test_full_flow_creates_and_applies() -> None:
     def fake_run(cmd, *args, **kwargs):
-        if "ls-remote" in cmd:
+        if "ls-remote" in cmd and "develop/foo" in cmd:
             return _fail(2)
+        if "ls-remote" in cmd and "refs/heads/main" in cmd:
+            return _ok(stdout="abc\trefs/heads/main\n")
         if "push" in cmd:
             return _ok()
         return _ok()
@@ -142,8 +218,10 @@ def test_full_flow_rules_failure_leaves_branch_in_place() -> None:
     """A rules PUT failure must NOT delete the freshly-created branch."""
 
     def fake_run(cmd, *args, **kwargs):
-        if "ls-remote" in cmd:
+        if "ls-remote" in cmd and "develop/foo" in cmd:
             return _fail(2)
+        if "ls-remote" in cmd and "refs/heads/main" in cmd:
+            return _ok(stdout="abc\trefs/heads/main\n")
         return _ok()
 
     with patch("subprocess.run", side_effect=fake_run), patch(
