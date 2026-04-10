@@ -8,7 +8,10 @@ from unittest.mock import MagicMock, patch
 
 from shipyard.core.job import TargetStatus
 from shipyard.executor.ssh import SSHExecutor
-from shipyard.executor.ssh_windows import SSHWindowsExecutor
+from shipyard.executor.ssh_windows import (
+    SSHWindowsExecutor,
+    decode_encoded_ssh_argv,
+)
 from shipyard.executor.streaming import StreamingCommandResult
 
 # ---------------------------------------------------------------------------
@@ -380,7 +383,14 @@ class TestSSHWindowsExecutorValidate:
 
             ssh_cmd = mock_run.call_args[0][0]
             assert "powershell" in ssh_cmd
-            assert "-Command" in ssh_cmd
+            # The command must be sent via -EncodedCommand, not
+            # -Command, because Windows OpenSSH's cmd.exe shell
+            # interprets newlines in -Command arguments as command
+            # separators and silently drops every line after the
+            # first. -EncodedCommand bypasses cmd.exe parsing.
+            assert "-EncodedCommand" in ssh_cmd
+            assert "-Command" not in ssh_cmd
+            assert "-NoProfile" in ssh_cmd
 
     def test_validate_host_mutex_default_wraps_command(self, tmp_path) -> None:
         """When windows_host_mutex is not explicitly disabled, the command is wrapped."""
@@ -417,8 +427,10 @@ class TestSSHWindowsExecutorValidate:
             )
 
             ssh_cmd = mock_run.call_args[0][0]
-            # The last argument is the PowerShell command string.
-            ps = ssh_cmd[-1]
+            # The PS script is base64-encoded inside -EncodedCommand;
+            # decode before asserting against the source.
+            ps = decode_encoded_ssh_argv(ssh_cmd)
+            assert ps is not None
             assert "System.Threading.Mutex" in ps
             assert "Global\\ShipyardValidate" in ps
 
@@ -453,7 +465,8 @@ class TestSSHWindowsExecutorValidate:
                 validation_config=_validation_config(),
                 log_path=log_path,
             )
-            ps = mock_run.call_args[0][0][-1]
+            ps = decode_encoded_ssh_argv(mock_run.call_args[0][0])
+            assert ps is not None
             assert "Global\\MyCustomLock" in ps
             assert "Global\\ShipyardValidate" not in ps
 
@@ -496,7 +509,8 @@ class TestSSHWindowsExecutorValidate:
                 validation_config=_validation_config(),
                 log_path=log_path,
             )
-            ps = mock_run.call_args[0][0][-1]
+            ps = decode_encoded_ssh_argv(mock_run.call_args[0][0])
+            assert ps is not None
             assert "$env:SHIPYARD_CMAKE_PLATFORM = 'ARM64'" in ps
             assert "C:/VS/2022/Community" in ps
 

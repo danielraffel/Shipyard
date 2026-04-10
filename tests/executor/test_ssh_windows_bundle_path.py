@@ -48,12 +48,15 @@ def test_apply_command_uses_home_for_relative_path() -> None:
     """A relative bundle path must be resolved via Join-Path $HOME."""
     from unittest.mock import patch
 
-    from shipyard.executor.ssh_windows import _apply_bundle_windows
+    from shipyard.executor.ssh_windows import (
+        _apply_bundle_windows,
+        decode_encoded_ssh_argv,
+    )
 
-    captured: list[str] = []
+    captured: list[list[str]] = []
 
     def fake_run(cmd, *args, **kwargs):
-        captured.append(cmd[-1])  # last arg is the PS command string
+        captured.append(list(cmd))
         import subprocess
         return subprocess.CompletedProcess(
             args=cmd, returncode=0, stdout="", stderr="",
@@ -68,7 +71,11 @@ def test_apply_command_uses_home_for_relative_path() -> None:
         )
 
     assert len(captured) == 1
-    ps_cmd = captured[0]
+    # Bundle apply now also goes through -EncodedCommand for the
+    # same multi-line-drop reason the main validate path does.
+    assert "-EncodedCommand" in captured[0]
+    ps_cmd = decode_encoded_ssh_argv(captured[0])
+    assert ps_cmd is not None
     assert "Join-Path $HOME 'shipyard.bundle'" in ps_cmd
     assert "$Bundle = " in ps_cmd
 
@@ -77,12 +84,15 @@ def test_apply_command_uses_literal_absolute_path() -> None:
     """An absolute bundle path is used verbatim, not wrapped in Join-Path."""
     from unittest.mock import patch
 
-    from shipyard.executor.ssh_windows import _apply_bundle_windows
+    from shipyard.executor.ssh_windows import (
+        _apply_bundle_windows,
+        decode_encoded_ssh_argv,
+    )
 
-    captured: list[str] = []
+    captured: list[list[str]] = []
 
     def fake_run(cmd, *args, **kwargs):
-        captured.append(cmd[-1])
+        captured.append(list(cmd))
         import subprocess
         return subprocess.CompletedProcess(
             args=cmd, returncode=0, stdout="", stderr="",
@@ -96,6 +106,7 @@ def test_apply_command_uses_literal_absolute_path() -> None:
             ssh_options=[],
         )
 
-    ps_cmd = captured[0]
+    ps_cmd = decode_encoded_ssh_argv(captured[0])
+    assert ps_cmd is not None
     assert "'C:\\Users\\me\\my.bundle'" in ps_cmd
     assert "Join-Path" not in ps_cmd
