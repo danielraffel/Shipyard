@@ -2,10 +2,22 @@
 
 Same bundle-based delivery as the POSIX SSH executor, but uses PowerShell
 semantics for remote commands and Windows-style paths.
+
+Multi-line PowerShell scripts are always sent via ``-EncodedCommand`` with
+a base64-encoded UTF-16LE payload rather than ``-Command <raw script>``.
+The naive ``-Command`` path silently drops every line after the first when
+the script reaches PowerShell through Windows OpenSSH's cmd.exe default
+shell — each newline is interpreted by cmd.exe as a command separator.
+A 60-line mutex wrapper would run only its first line (a silent
+``$ErrorActionPreference = 'Stop'`` assignment), exit 0, and return an
+empty stdout buffer. Shipyard then reported the target as ``pass`` in
+0.9 seconds with an empty log: a silent false-green. ``-EncodedCommand``
+bypasses cmd.exe entirely because the payload is a single argv token.
 """
 
 from __future__ import annotations
 
+import base64
 import subprocess
 import tempfile
 import time
@@ -156,7 +168,9 @@ class SSHWindowsExecutor:
             )
 
         ssh_cmd = (
-            ["ssh"] + list(ssh_options) + [host, "powershell", "-Command", command]
+            ["ssh"]
+            + list(ssh_options)
+            + _powershell_encoded_argv(host, command)
         )
 
         contract_config = validation_config.get("contract") if validation_config else None
@@ -304,6 +318,75 @@ def _ps_single_quote(value: str) -> str:
     return value.replace("'", "''")
 
 
+def _encode_powershell_command(script: str) -> str:
+    """Encode a PowerShell script for `powershell -EncodedCommand`.
+
+    PowerShell expects a base64-encoded UTF-16LE byte sequence. This
+    is the standard, well-documented way to send a multi-line script
+    through any transport (cmd.exe, ssh, anything else) that might
+    interpret newlines as command separators.
+    """
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
+def _decode_powershell_command(encoded: str) -> str:
+    """Inverse of `_encode_powershell_command`.
+
+    Used by tests so they can assert against the original PS source
+    instead of opaque base64. Not used at runtime.
+    """
+    return base64.b64decode(encoded).decode("utf-16-le")
+
+
+def decode_encoded_ssh_argv(ssh_argv: list[str]) -> str | None:
+    """Public helper: decode the `-EncodedCommand` payload from an ssh argv.
+
+    Returns the original PowerShell script if `ssh_argv` contains
+    `-EncodedCommand <payload>`, else None. Tests can use this to
+    assert against the original PS source after the executor packs
+    it through `_powershell_encoded_argv`.
+    """
+    try:
+        idx = ssh_argv.index("-EncodedCommand")
+    except ValueError:
+        return None
+    if idx + 1 >= len(ssh_argv):
+        return None
+    return _decode_powershell_command(ssh_argv[idx + 1])
+
+
+def _powershell_encoded_argv(host: str, script: str) -> list[str]:
+    """Build the `[host, powershell, ...]` tail of an ssh argv.
+
+    Always uses `-NoProfile` (skip user profile, faster startup) and
+    `-EncodedCommand` (avoids the multi-line drop bug below). Both
+    `validate()` and `_apply_bundle_windows()` route through this so
+    every PowerShell-over-SSH call goes through the same hardened
+    surface.
+
+    History: an earlier version sent the script via
+    `powershell -Command <raw>`. That worked for single-line
+    scripts but silently dropped every line after the first when
+    the script reached PowerShell through Windows OpenSSH's
+    cmd.exe shell, because cmd.exe interprets newlines as command
+    separators. The 60+-line mutex wrapper would run only its
+    first line (a silent `$ErrorActionPreference = 'Stop'`
+    assignment), exit 0, and produce zero stdout — which Shipyard
+    reported as `pass`. False-greens are the worst class of CI
+    bug; `-EncodedCommand` makes the bug structurally impossible.
+    """
+    return [
+        host,
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-OutputFormat",
+        "Text",
+        "-EncodedCommand",
+        _encode_powershell_command(script),
+    ]
+
+
 def _apply_bundle_windows(
     host: str,
     bundle_path: str,
@@ -354,7 +437,7 @@ def _apply_bundle_windows(
         f"if ($LASTEXITCODE -ne 0) {{ exit 1 }}"
     )
 
-    cmd = ["ssh"] + list(ssh_options) + [host, "powershell", "-Command", ps_cmd]
+    cmd = ["ssh"] + list(ssh_options) + _powershell_encoded_argv(host, ps_cmd)
 
     try:
         result = subprocess.run(

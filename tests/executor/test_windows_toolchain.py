@@ -199,3 +199,36 @@ def test_detect_returns_none_when_both_fields_empty() -> None:
     stdout = '{"platform":"","generator_instance":""}\n'
     with patch("subprocess.run", return_value=_mock_run(stdout=stdout)):
         assert detect_vs_toolchain("host", []) is None
+
+
+def test_detect_uses_encoded_command_not_stdin() -> None:
+    """The detect script must travel via -EncodedCommand, not -Command -.
+
+    Regression test: an earlier version used `powershell -Command -` +
+    stdin, which silently failed on Windows because PowerShell parses
+    stdin line-by-line and the detect script has multi-line `function`
+    and `try { ... } catch { ... }` blocks. The result was rc=0 with
+    empty stdout — silently masked by `detect_vs_toolchain` falling
+    back to None and the executor using CMake defaults. The bug was
+    invisible until the broader Windows false-green investigation
+    surfaced it.
+    """
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured.append(list(cmd))
+        # `input=` must NOT be passed — the script travels in argv.
+        assert "input" not in kwargs, (
+            "detect_vs_toolchain must not pipe the script via stdin; "
+            "PowerShell -Command - parses stdin line-by-line and "
+            "silently drops multi-line constructs."
+        )
+        return _mock_run(stdout='{"platform":"x64","generator_instance":"C:/VS"}\n')
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = detect_vs_toolchain("host", [])
+
+    assert len(captured) == 1
+    assert "-EncodedCommand" in captured[0]
+    assert "-Command" not in captured[0]
+    assert result is not None

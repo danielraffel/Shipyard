@@ -194,19 +194,31 @@ def detect_vs_toolchain(
     not "error" — Windows hosts without multiple VS installations work
     fine without this hint.
     """
+    # Send the script via -EncodedCommand (base64 UTF-16LE) rather than
+    # `-Command -` + stdin. The stdin path looks reasonable but is
+    # silently broken on Windows: PowerShell's `-Command -` reads each
+    # input line as a separate command, so multi-line constructs like
+    # `try { ... } catch { ... }`, function definitions, and `& { ... }`
+    # script blocks get parsed wrong and produce zero stdout — which
+    # this function then interpreted as "no toolchain detected" and
+    # silently fell back to CMake defaults. Empirically verified
+    # against a real Windows host: `-Command -` returns rc=0 with empty
+    # stdout for the same script that `-EncodedCommand` runs cleanly.
+    import base64
+
+    encoded = base64.b64encode(_VS_DETECT_SCRIPT.encode("utf-16-le")).decode("ascii")
     cmd = [
         "ssh",
         *list(ssh_options),
         host,
         "powershell",
         "-NoProfile",
-        "-Command",
-        "-",
+        "-EncodedCommand",
+        encoded,
     ]
     try:
         run = subprocess.run(
             cmd,
-            input=_VS_DETECT_SCRIPT,
             capture_output=True,
             text=True,
             timeout=timeout,
