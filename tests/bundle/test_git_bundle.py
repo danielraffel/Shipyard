@@ -90,8 +90,10 @@ class TestUploadBundle:
         assert result.success
         assert result.path == "/tmp/test.bundle"
         cmd = mock_run.call_args[0][0]
-        assert cmd[0] == "scp"
-        assert f"ubuntu:/tmp/test.bundle" in " ".join(cmd)
+        # Upload uses ssh+cat instead of scp to avoid SFTP hang
+        assert cmd[0] == "ssh"
+        assert "ubuntu" in cmd
+        assert "cat > /tmp/test.bundle" in " ".join(cmd)
 
     def test_upload_file_not_found(self, tmp_path: Path) -> None:
         result = upload_bundle(

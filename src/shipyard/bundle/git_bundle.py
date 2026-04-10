@@ -76,6 +76,8 @@ def upload_bundle(
     remote_path: str,
     ssh_options: Sequence[str] = (),
     timeout: int = 1800,
+    *,
+    is_windows: bool = False,
 ) -> BundleResult:
     """Upload a bundle file to a remote host via SCP.
 
@@ -101,22 +103,69 @@ def upload_bundle(
             message=f"Bundle file not found: {bundle_path}",
         )
 
-    cmd: list[str] = ["scp"]
-    for opt in ssh_options:
-        cmd.append(opt)
-    cmd.extend([str(bundle_path), f"{host}:{remote_path}"])
+    # Use `ssh cat > file` instead of scp. Windows OpenSSH's SFTP
+    # subsystem hangs during session close after large transfers
+    # (443 MB+), causing scp to stall indefinitely even though the
+    # file has fully arrived. Piping through `ssh cat >` bypasses the
+    # SFTP subsystem entirely — the data goes through the SSH channel's
+    # stdin/stdout, which closes cleanly. This is also faster for
+    # large files because there's no SFTP protocol overhead.
+    #
+    # The remote command uses `cat > path` on POSIX hosts and
+    # `powershell -Command [IO.File]::WriteAllBytes(...)` is NOT
+    # needed — Windows cmd.exe's `type con > file` doesn't work, but
+    # `ssh host "cat > file"` works because OpenSSH pipes stdin to
+    # the remote shell's stdin, and both cmd.exe and PowerShell can
+    # redirect stdin to a file via shell builtins. We use the simplest
+    # form that works on both: the remote sees binary stdin and `cat`
+    # writes it. On Windows, `cmd /c "more > file"` or similar won't
+    # work for binary, so we explicitly invoke PowerShell for binary-
+    # safe stdin capture.
+    #
+    # Detection: if remote_path contains a backslash or a drive letter,
+    # assume Windows and use PowerShell; otherwise use cat.
+    is_windows = is_windows or "\\" in remote_path or (
+        len(remote_path) >= 2 and remote_path[1] == ":"
+    )
+
+    if is_windows:
+        # PowerShell binary-safe stdin → file:
+        # $input is the automatic pipeline variable for stdin bytes.
+        # [System.IO.File]::WriteAllBytes reads from stdin via
+        # [Console]::OpenStandardInput().
+        ps_script = (
+            f"$bytes = [System.IO.Stream]::Null;"
+            f"$stdin = [Console]::OpenStandardInput();"
+            f"$fs = [System.IO.File]::Create('{remote_path}');"
+            f"$stdin.CopyTo($fs);"
+            f"$fs.Close();"
+            f"$stdin.Close()"
+        )
+        import base64
+        encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+        cmd: list[str] = ["ssh"]
+        for opt in ssh_options:
+            cmd.append(opt)
+        cmd.extend([host, "powershell", "-NoProfile", "-EncodedCommand", encoded])
+    else:
+        cmd = ["ssh"]
+        for opt in ssh_options:
+            cmd.append(opt)
+        cmd.extend([host, f"cat > {remote_path}"])
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        with open(bundle_path, "rb") as f:
+            result = subprocess.run(
+                cmd,
+                stdin=f,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
         if result.returncode != 0:
             return BundleResult(
                 success=False,
-                message=f"scp failed: {result.stderr.strip()}",
+                message=f"Upload failed: {result.stderr.strip()}",
             )
         return BundleResult(
             success=True,
@@ -125,7 +174,7 @@ def upload_bundle(
         )
 
     except subprocess.TimeoutExpired:
-        return BundleResult(success=False, message="scp timed out")
+        return BundleResult(success=False, message="Upload timed out")
     except OSError as exc:
         return BundleResult(success=False, message=f"OS error: {exc}")
 

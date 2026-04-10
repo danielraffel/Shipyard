@@ -46,13 +46,77 @@ class Queue:
             self._load()
 
     def _load(self) -> None:
-        """Load queue state from disk."""
+        """Load queue state from disk, recovering stale jobs.
+
+        Any job in RUNNING state is checked for a live process. If
+        no process is alive for the job (the ship/run command that
+        owned it crashed, was killed, or the SSH session dropped),
+        the job is marked COMPLETED with an error status. This
+        prevents ghost "running" entries from blocking the queue
+        after a crash.
+        """
         if self._queue_file.exists():
             data = json.loads(self._queue_file.read_text())
             self._jobs = [_job_from_dict(d) for d in data.get("jobs", [])]
         else:
             self._jobs = []
+
+        # Reconcile stale running jobs — if no process holds the
+        # drain lock, any "running" job is orphaned.
+        stale_running = [
+            j for j in self._jobs if j.status == JobStatus.RUNNING
+        ]
+        if stale_running and not self._is_drain_active():
+            from datetime import datetime, timezone
+
+            from shipyard.core.job import TargetStatus
+
+            for job in stale_running:
+                job.status = JobStatus.COMPLETED
+                job.completed_at = datetime.now(timezone.utc)
+                # Mark incomplete targets as error
+                for name in job.target_names:
+                    if name not in job.results:
+                        from shipyard.core.job import TargetResult
+
+                        job.results[name] = TargetResult(
+                            target_name=name,
+                            platform="unknown",
+                            status=TargetStatus.ERROR,
+                            backend="unknown",
+                            error_message=(
+                                "Process died mid-validation; "
+                                "job recovered on startup"
+                            ),
+                        )
+            self._save()
+
         self._loaded = True
+
+    def _is_drain_active(self) -> bool:
+        """Check if any process holds the drain lock (non-blocking)."""
+        if not self._lock_file.exists():
+            return False
+        try:
+            fd = os.open(str(self._lock_file), os.O_RDWR)
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                # Lock acquired + released → nobody holds it → stale
+                return False
+            except OSError:
+                # Lock held by another process → drain is active
+                return True
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
 
     def _save(self) -> None:
         """Write queue state to disk."""
