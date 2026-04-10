@@ -67,19 +67,20 @@ class Queue:
             j for j in self._jobs if j.status == JobStatus.RUNNING
         ]
         if stale_running and not self._is_drain_active():
+            import dataclasses
             from datetime import datetime, timezone
 
-            from shipyard.core.job import TargetStatus
+            from shipyard.core.job import TargetResult, TargetStatus
 
-            for job in stale_running:
-                job.status = JobStatus.COMPLETED
-                job.completed_at = datetime.now(timezone.utc)
-                # Mark incomplete targets as error
+            now = datetime.now(timezone.utc)
+            for i, job in enumerate(self._jobs):
+                if job.status != JobStatus.RUNNING:
+                    continue
+                # Build error results for incomplete targets
+                new_results = dict(job.results)
                 for name in job.target_names:
-                    if name not in job.results:
-                        from shipyard.core.job import TargetResult
-
-                        job.results[name] = TargetResult(
+                    if name not in new_results:
+                        new_results[name] = TargetResult(
                             target_name=name,
                             platform="unknown",
                             status=TargetStatus.ERROR,
@@ -89,6 +90,13 @@ class Queue:
                                 "job recovered on startup"
                             ),
                         )
+                # Replace the frozen job with an updated copy
+                self._jobs[i] = dataclasses.replace(
+                    job,
+                    status=JobStatus.COMPLETED,
+                    completed_at=now,
+                    results=new_results,
+                )
             self._save()
 
         self._loaded = True
