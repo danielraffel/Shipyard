@@ -1,0 +1,70 @@
+{
+  "$schema": "./versioning.schema.json",
+  "schema_version": 1,
+  "_comment": "Shipyard-specific versioning gate config. Same schema as pulp's tools/scripts/versioning.json — enables the same scripts (scripts/version_bump_check.py, scripts/skill_sync_check.py) to run against Shipyard unchanged. Two surfaces: CLI (pyproject.toml + __init__.py) and Claude plugin (.claude-plugin/plugin.json). Per RELEASING.md the two versions are intentionally decoupled — the gate just ensures each moves when its own surface moves.",
+
+  "surfaces": {
+    "cli": {
+      "label": "Shipyard CLI",
+      "version_files": [
+        { "path": "pyproject.toml", "kind": "pyproject_version" },
+        { "path": "src/shipyard/__init__.py", "kind": "python_dunder_version" }
+      ],
+      "trigger_paths": [
+        "src/shipyard/**/*.py",
+        "src/shipyard/**/*.pyi"
+      ],
+      "public_api_paths": [
+        "src/shipyard/cli/**/*.py",
+        "src/shipyard/config/**/*.py",
+        "src/shipyard/__init__.py"
+      ],
+      "internal_only_paths": [
+        "src/shipyard/runners/**",
+        "src/shipyard/_internal/**"
+      ],
+      "changelog": "CHANGELOG.md"
+    },
+
+    "plugin": {
+      "label": "Shipyard Claude plugin",
+      "version_files": [
+        { "path": ".claude-plugin/plugin.json", "kind": "json_field", "field": "version" }
+      ],
+      "trigger_paths": [
+        ".claude-plugin/**",
+        "commands/**",
+        "skills/**",
+        "agents/**",
+        "hooks/**"
+      ],
+      "public_api_paths": [
+        ".claude-plugin/plugin.json",
+        "commands/**"
+      ],
+      "internal_only_paths": [
+        "hooks/*.sh"
+      ]
+    }
+  },
+
+  "skills": {
+    "skills_dir": "skills",
+    "path_map": "scripts/skill_path_map.json"
+  },
+
+  "generated_globs": [
+    "dist/**",
+    "build/**",
+    "*.egg-info/**",
+    "**/*.generated.*",
+    "uv.lock",
+    "node_modules/**"
+  ],
+
+  "trailers": {
+    "version_bump": "Version-Bump",
+    "skill_update": "Skill-Update",
+    "release": "Release"
+  }
+}

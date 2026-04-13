@@ -1,20 +1,24 @@
 # Releasing Shipyard
 
-## When to release
+## Default path: automatic on merge
 
-Release a new version when `src/shipyard/` changes (new commands, bug fixes,
-behavior changes). You don't need a release for:
+Normal releases are automatic. You don't call any script.
 
-- README edits
-- Plugin file changes (commands/, skills/, agents/, hooks/)
-- Config file changes (.shipyard/)
-- Planning docs
+1. Open a PR via `shipyard pr` (or `shipyard ship`).
+2. CI runs `.github/workflows/version-skill-check.yml`, which confirms the right bump(s) are present via `scripts/version_bump_check.py` + `scripts/skill_sync_check.py`. Merge on green.
+3. On push to `main`, `.github/workflows/auto-release.yml` diffs `pyproject.toml`'s version against the previous push. If it moved, the workflow creates a `v<x.y.z>` tag.
+4. The existing tag-triggered `release.yml` builds binaries on 5 platforms and publishes the GitHub Release.
 
-Plugin files are delivered from the Git repo, not from the binary.
+Plugin-version bumps (`.claude-plugin/plugin.json`) are intentionally **not** tagged — plugin files are delivered from git, not from the binary. Bumping the plugin version still requires a PR and goes through the same gate, but it doesn't cut a binary release.
 
-## How to release
+## When to go manual
 
-One command:
+Only when the automatic flow is genuinely unavailable:
+
+- The auto-release workflow is disabled or broken.
+- An emergency hotfix needs direct tag control (rare — prefer a PR even for hotfixes).
+
+### Manual fallback
 
 ```bash
 ./scripts/release.sh patch    # 0.1.0 → 0.1.1 (bug fixes)
@@ -25,6 +29,7 @@ One command:
 
 The script:
 
+0. Runs `scripts/version_bump_check.py --mode=report` and refuses to tag if the required bumps aren't present. `RELEASE_SKIP_VERSION_CHECK=1` bypasses this for emergencies; log a reason in the commit trailer.
 1. Bumps the version in `pyproject.toml`, `__init__.py`, and plugin manifests
 2. Commits the version bump
 3. Tags the commit (`v0.1.1`)

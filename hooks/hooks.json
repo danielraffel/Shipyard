@@ -10,5 +10,17 @@
         }
       ]
     }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Edit|Write",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/version-skill-hint.sh",
+          "timeout": 3000
+        }
+      ]
+    }
   ]
 }

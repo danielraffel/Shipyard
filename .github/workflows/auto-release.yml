@@ -1,0 +1,118 @@
+name: Auto-Release on CLI Version Bump
+
+# Shipyard mirror of pulp's auto-release workflow. On every push to main,
+# diff pyproject.toml's project.version against the previous push range.
+# If it moved, create the matching v<x.y.z> tag; the existing tag-triggered
+# release.yml workflow then builds + publishes the 5-platform binaries.
+#
+# Plugin-version bumps (.claude-plugin/plugin.json) are intentionally NOT
+# tagged: per RELEASING.md, plugin files are delivered from git, not from
+# the binary, so there is no binary release to cut for plugin-only
+# changes. See planning/ralph-prompt-shipyard-versioning.md § Open
+# Question 4 for the decision.
+#
+# Safety properties match pulp's workflow: concurrency group, idempotent-
+# strict tagging (fails loudly on mismatched existing tags), Release: skip
+# trailer suppression, revert detection.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    name: Tag CLI version bumps
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Skip on trailer or revert
+        id: guard
+        shell: bash
+        run: |
+          subject=$(git log -1 --format=%s HEAD)
+          body=$(git log -1 --format=%B HEAD)
+          if echo "$body" | git interpret-trailers --parse | grep -iq '^release: skip'; then
+              echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [[ "$subject" =~ ^[Rr]evert ]]; then
+              echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if echo "$body" | git interpret-trailers --parse | grep -iq '^revert-of:'; then
+              echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+
+      - name: Read pyproject version at before/after
+        id: versions
+        if: steps.guard.outputs.skip == '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          before='${{ github.event.before }}'
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              before="HEAD~1"
+          fi
+
+          extract_pyproject_version() {
+              local ref="$1"
+              git show "${ref}:pyproject.toml" 2>/dev/null \
+                | python3 -c 'import sys, re; m = re.search(r"^\s*version\s*=\s*\"([^\"]+)\"", sys.stdin.read(), re.M); print(m.group(1) if m else "")'
+          }
+
+          v_before=$(extract_pyproject_version "$before" || true)
+          v_after=$(extract_pyproject_version HEAD || true)
+
+          echo "before=$v_before" >> "$GITHUB_OUTPUT"
+          echo "after=$v_after"   >> "$GITHUB_OUTPUT"
+          echo "pyproject version: $v_before -> $v_after"
+
+      - name: Create tag if CLI version moved
+        if: steps.guard.outputs.skip == '0'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          V_BEFORE: ${{ steps.versions.outputs.before }}
+          V_AFTER: ${{ steps.versions.outputs.after }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$V_AFTER" ] || [ "$V_BEFORE" = "$V_AFTER" ]; then
+              echo "CLI version unchanged — no tagging."
+              exit 0
+          fi
+
+          # The tag-triggered release.yml expects tags of the form v<x.y.z>.
+          tag="v${V_AFTER}"
+
+          git config user.name  "shipyard-release-bot"
+          git config user.email "shipyard-release-bot@users.noreply.github.com"
+
+          # Idempotent-strict: if tag already exists at HEAD, no-op; at a
+          # different SHA, fail loudly. Never overwrite.
+          if git ls-remote --tags origin "$tag" | grep -q .; then
+              remote_sha=$(git ls-remote --tags origin "$tag" | awk '{print $1}')
+              local_sha=$(git rev-parse HEAD)
+              if [ "$remote_sha" = "$local_sha" ]; then
+                  echo "tag $tag already at $local_sha — no-op"
+                  exit 0
+              fi
+              echo "ERROR: tag $tag exists at $remote_sha but HEAD is $local_sha" >&2
+              echo "Manual reconciliation required." >&2
+              exit 1
+          fi
+
+          git tag -a "$tag" -m "Release $tag (automated by auto-release.yml)"
+          git push origin "$tag"
+          echo "created $tag"

@@ -82,3 +82,28 @@ and use `shipyard status --json` for live target state.
 - If a target is unreachable with no fallback, it reports unreachable
 - `shipyard run --allow-unreachable-targets --json` — override preflight if you intentionally want to queue anyway
 - `shipyard cloud defaults --json` — inspect the current cloud workflow/provider dispatch plan
+
+## Shipping a PR (the `shipyard pr` path)
+
+When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or "push it" — run the PR orchestration path (currently `shipyard ship` with the versioning gates; a dedicated `shipyard pr` wrapper is planned to match pulp's `pulp pr`).
+
+The orchestration, in order:
+
+1. `scripts/skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without a `SKILL.md` update or a `Skill-Update:` trailer on the tip commit.
+2. `scripts/version_bump_check.py --mode=apply` — rewrites `pyproject.toml` + `src/shipyard/__init__.py` for CLI-surface bumps and `.claude-plugin/plugin.json` for plugin-surface bumps. The two version streams are independent per `RELEASING.md`.
+3. `git commit` + `gh pr create` + `shipyard ship`.
+4. On merge, `.github/workflows/auto-release.yml` tags the CLI bump as `v<x.y.z>`. The existing tag-triggered `release.yml` builds the 5-platform binaries and publishes the GitHub Release.
+
+Never run `gh pr create` + release separately. Never run the Python gate scripts by hand.
+
+## Bypass trailers (tip commit)
+
+| Gate          | Trailer                                                      |
+|---------------|--------------------------------------------------------------|
+| Version bump  | `Version-Bump: <surface>=<patch\|minor\|major\|skip> reason="..."` |
+| Skill update  | `Skill-Update: skip skill=<name> reason="..."`              |
+| Auto-release  | `Release: skip reason="..."`                                 |
+
+**Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `src/shipyard/cli/**`, `src/shipyard/runners/**`, or `src/shipyard/config/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.
+
+**Manual release fallback:** `./scripts/release.sh` still exists for emergencies but is no longer the happy path. Normal releases flow through `shipyard pr` → merge → auto-release workflow.

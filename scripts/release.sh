@@ -1,7 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# Release a new version of Shipyard.
+# Release a new version of Shipyard — MANUAL FALLBACK PATH.
+#
+# The default release flow is: open a PR via `shipyard pr` (or
+# `shipyard ship`), let CI validate + merge, and let
+# .github/workflows/auto-release.yml create the tag on push to main. The
+# existing tag-triggered release.yml then builds and publishes.
+#
+# This script is the break-glass path when the automatic flow is
+# unavailable (e.g. the auto-release workflow is disabled, or an
+# emergency hotfix needs direct tag control).
 #
 # Usage:
 #   ./scripts/release.sh patch    # 0.1.0 → 0.1.1
@@ -9,20 +18,36 @@ set -euo pipefail
 #   ./scripts/release.sh major    # 0.1.0 → 1.0.0
 #   ./scripts/release.sh 0.3.0    # explicit version
 #
-# This script:
-#   1. Bumps the version in pyproject.toml and __init__.py
-#   2. Commits the version bump
-#   3. Tags the commit
-#   4. Pushes the tag (which triggers the release workflow)
-#
-# The release workflow builds binaries on 5 platforms and publishes
-# a GitHub Release automatically.
+# Steps:
+#   0. Pre-release version-bump gate (fails fast if bumps are missing)
+#   1. Bump pyproject.toml and __init__.py
+#   2. Commit the bump
+#   3. Tag and push — triggers release.yml binary build
 
 BUMP="${1:-}"
 
 if [ -z "$BUMP" ]; then
   echo "Usage: ./scripts/release.sh <patch|minor|major|X.Y.Z>"
   exit 1
+fi
+
+# ── Pre-release version-bump gate ───────────────────────────────────────
+# Refuse to release when version_bump_check would fail against
+# origin/main. Set RELEASE_SKIP_VERSION_CHECK=1 with a logged reason to
+# bypass (rare — only when this script is being used precisely because
+# the automatic path refused to tag).
+if [ "${RELEASE_SKIP_VERSION_CHECK:-0}" != "1" ]; then
+  if [ -x "scripts/version_bump_check.py" ] && [ -f "scripts/versioning.json" ]; then
+    echo "▸ Pre-release version-bump gate..."
+    if ! python3 scripts/version_bump_check.py \
+           --base origin/main \
+           --config scripts/versioning.json \
+           --mode=report; then
+      echo "release.sh: version_bump_check failed — fix the bump or rerun with" >&2
+      echo "            RELEASE_SKIP_VERSION_CHECK=1 and a commit trailer reason." >&2
+      exit 1
+    fi
+  fi
 fi
 
 # Get current version from pyproject.toml

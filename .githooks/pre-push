@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Shipyard pre-push hook (agent-agnostic).
+#
+# Runs the versioning + skill-sync gates against origin/main before pushing.
+# Advisory by default — warnings print but don't block. Set
+# SHIPYARD_ENFORCE_PREPUSH=1 to upgrade warnings to hard errors (CI does this).
+#
+# Install once via scripts/install-githooks.sh:
+#   git config core.hooksPath .githooks
+#
+# Single-push emergency bypass:
+#   SHIPYARD_SKIP_PREPUSH=1 git push
+
+set -u
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+cd "$ROOT" || exit 0
+
+if [ "${SHIPYARD_SKIP_PREPUSH:-0}" = "1" ]; then
+    echo "[pre-push] SHIPYARD_SKIP_PREPUSH=1 — skipping gates." >&2
+    exit 0
+fi
+
+PYTHON="${PYTHON:-python3}"
+VBC="$ROOT/scripts/version_bump_check.py"
+SSC="$ROOT/scripts/skill_sync_check.py"
+CFG="$ROOT/scripts/versioning.json"
+
+if [ ! -f "$VBC" ] || [ ! -f "$SSC" ] || [ ! -f "$CFG" ]; then
+    exit 0  # pre-versioning checkout; no-op
+fi
+
+BASE="${SHIPYARD_PREPUSH_BASE:-origin/main}"
+fail=0
+
+"$PYTHON" "$SSC" --base "$BASE" --config "$CFG" --mode=report
+case $? in
+    0) ;;
+    1) fail=1 ;;
+    *) echo "[pre-push] skill_sync_check: internal error" >&2 ;;
+esac
+
+"$PYTHON" "$VBC" --base "$BASE" --config "$CFG" --mode=report
+case $? in
+    0) ;;
+    1) fail=1 ;;
+    *) echo "[pre-push] version_bump_check: internal error" >&2 ;;
+esac
+
+if [ "$fail" = "0" ]; then
+    echo "[pre-push] gates clean." >&2
+    exit 0
+fi
+
+if [ "${SHIPYARD_ENFORCE_PREPUSH:-0}" = "1" ]; then
+    echo "[pre-push] SHIPYARD_ENFORCE_PREPUSH=1 — blocking push due to gate failures above." >&2
+    exit 1
+fi
+
+echo "[pre-push] warnings above are advisory (export SHIPYARD_ENFORCE_PREPUSH=1 to block)." >&2
+exit 0

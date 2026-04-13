@@ -1,0 +1,55 @@
+name: Versioning & Skill-Sync
+
+# Authoritative gate for Shipyard's versioning/skill-sync policy.
+# Mirrors the pulp-side workflow — same scripts, Shipyard-specific config.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: version-skill-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version-skill-check:
+    runs-on: ubuntu-latest
+    name: Enforce version & skill sync
+
+    env:
+      SHIPYARD_ENFORCE_PREPUSH: "1"
+
+    steps:
+      - name: Checkout PR head with full history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve diff base
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=origin/${{ github.base_ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=origin/main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skill-sync check
+        run: |
+          python3 scripts/skill_sync_check.py \
+              --base "${{ steps.base.outputs.ref }}" \
+              --config scripts/versioning.json \
+              --mode=report
+
+      - name: Version-bump check
+        run: |
+          python3 scripts/version_bump_check.py \
+              --base "${{ steps.base.outputs.ref }}" \
+              --config scripts/versioning.json \
+              --mode=report
