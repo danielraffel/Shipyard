@@ -1713,37 +1713,49 @@ def pr(
     click.echo("▸ Version-bump " + ("apply" if apply_bumps else "report"))
     mode = "apply" if apply_bumps else "report"
 
-    # Record the currently-staged set BEFORE running version_bump_check so we
-    # can isolate the files it stages. Otherwise any unrelated staged changes
-    # the user had in progress would sweep into the "chore: bump" commit
-    # (Codex P1 on PR #36).
-    staged_before = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "-z"],
+    # Ask version_bump_check itself which files it edited. Parsing its
+    # "Edited files:" stdout is robust to files that were ALSO pre-staged
+    # by the user — a simple pre/post index-set diff drops those. Users
+    # with unrelated pre-staged work keep that work in the index; only the
+    # bump-touched files go into the chore: commit, even if the user had
+    # e.g. plugin.json staged for their own reason.
+    vbc_run = subprocess.run(
+        [python, str(vbc), "--base", f"origin/{base}", "--config", str(cfg), f"--mode={mode}"],
         capture_output=True,
         text=True,
     )
-    pre_set = {p for p in staged_before.stdout.split("\x00") if p}
-
-    rc = subprocess.call(
-        [python, str(vbc), "--base", f"origin/{base}", "--config", str(cfg), f"--mode={mode}"]
-    )
-    if rc != 0:
+    # Stream the script's output so the user still sees it.
+    if vbc_run.stdout:
+        click.echo(vbc_run.stdout, nl=False)
+    if vbc_run.stderr:
+        click.echo(vbc_run.stderr, nl=False, err=True)
+    if vbc_run.returncode != 0:
         render_error("version-bump gate failed; fix the bump and retry.")
-        sys.exit(rc)
+        sys.exit(vbc_run.returncode)
 
-    staged_after = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "-z"],
-        capture_output=True,
-        text=True,
-    )
-    post_set = {p for p in staged_after.stdout.split("\x00") if p}
-    bumped_files = sorted(post_set - pre_set)
+    # Parse the "Edited files:" section. Lines after that header until a
+    # blank line or the next `[` surface report begin with two spaces and
+    # a path.
+    bumped_files: list[str] = []
+    in_edited_block = False
+    for line in vbc_run.stdout.splitlines():
+        if line.startswith("Edited files:"):
+            in_edited_block = True
+            continue
+        if in_edited_block:
+            if line.startswith("  ") and line.strip():
+                bumped_files.append(line.strip())
+            else:
+                break
 
     if bumped_files:
         click.echo(f"▸ Committing version bump(s) — {len(bumped_files)} file(s)")
-        # Commit only the files version_bump_check added. Anything the user
-        # had staged before is left in the index for them to commit (or
-        # reset) separately.
+        # `--only -- <paths>` commits exactly those paths' current working-
+        # tree state. If a file was pre-staged by the user with unrelated
+        # changes, this captures the post-bump content (their changes +
+        # the bump), which is the right semantics: the file's on-disk
+        # state is now "user edit + bump", and committing it together
+        # prevents shipping a split-brain bump.
         subprocess.check_call(
             [
                 "git",
