@@ -85,7 +85,7 @@ and use `shipyard status --json` for live target state.
 
 ## Shipping a PR (the `shipyard pr` path)
 
-When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or "push it" — run the PR orchestration path (currently `shipyard ship` with the versioning gates; a dedicated `shipyard pr` wrapper is planned to match pulp's `pulp pr`).
+When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or "push it" — run `shipyard pr` (or the `/pr` slash command — see `commands/pr.md`). It wraps `shipyard ship` with the versioning gates: skill-sync check, version-bump apply, and a `chore: bump versions` commit before handing off to the push/PR/validate/merge flow.
 
 The orchestration, in order:
 
