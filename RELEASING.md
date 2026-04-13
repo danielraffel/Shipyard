@@ -1,5 +1,32 @@
 # Releasing Shipyard
 
+## One-time setup: `RELEASE_BOT_TOKEN` secret
+
+The auto-release workflow needs a fine-grained PAT to push tags so that downstream `release.yml` actually fires. **Without this secret, auto-release silently degrades**: tags are still created via `GITHUB_TOKEN`, but GitHub Actions deliberately does not chain workflows from `GITHUB_TOKEN`-pushed tags (anti-infinite-loop safety), so `release.yml` never runs and no binaries ship.
+
+Run `shipyard doctor` to check whether the secret is configured. If it shows `RELEASE_BOT_TOKEN: missing`, set it up:
+
+1. **Generate the token.** github.com → top-right avatar → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token.
+2. **Token name:** `shipyard-release-bot` (or any descriptive name).
+3. **Expiration:** 1 year (mark your calendar to renew).
+4. **Resource owner:** the org or user that owns this repo.
+5. **Repository access:** Only select repositories → this repo only.
+6. **Permissions** (Repository permissions section): **Contents: Read and write**. Leave everything else at the default.
+7. **Generate**, copy the token (starts with `github_pat_…`).
+8. **Add to repo secrets:** github.com/<owner>/<repo>/settings/secrets/actions → New repository secret. Name: `RELEASE_BOT_TOKEN`. Value: paste the token.
+
+That's it — no code change needed. The workflow already reads `${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}`. `shipyard doctor` will then report `RELEASE_BOT_TOKEN: configured`.
+
+### What if you can't or don't want to set the secret?
+
+The chain still works but requires one manual step per release:
+
+```bash
+gh workflow run release.yml --ref v<x.y.z>
+```
+
+Run that after the auto-tag appears. The release workflow will pick up the existing tag and publish the binaries. (Pulp's first auto-released tag, `v0.4.0`, used this fallback before its `RELEASE_BOT_TOKEN` was provisioned.)
+
 ## Default path: automatic on merge
 
 Normal releases are automatic. You don't call any script.

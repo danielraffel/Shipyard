@@ -23,6 +23,7 @@ from shipyard.core.evidence import EvidenceStore
 from shipyard.core.job import Job, JobStatus, TargetResult, TargetStatus, ValidationMode
 from shipyard.core.queue import Queue
 from shipyard.executor.dispatch import ExecutorDispatcher
+from shipyard.governance.github import detect_repo_from_remote
 from shipyard.output.human import (
     console,
     render_doctor,
@@ -392,11 +393,24 @@ def doctor(ctx: Context) -> None:
     if governance_section:
         checks["Governance"] = governance_section
 
+    # Release-bot token check — informational. The auto-release workflow
+    # falls back to GITHUB_TOKEN when RELEASE_BOT_TOKEN isn't set, but
+    # tags pushed by GITHUB_TOKEN don't trigger downstream workflows
+    # (GitHub anti-infinite-loop safety), so the binary release pipeline
+    # silently never fires. Surfacing this in doctor is the cheapest way
+    # to keep new contributors out of that trap.
+    release_token_section = _check_release_bot_token()
+    if release_token_section:
+        checks["Release pipeline"] = release_token_section
+
     # Ready = core tools healthy AND (no governance section declared
     # OR every governance check is ok). Informational entries (the
     # immutable-releases line) set `ok=True` specifically because
     # they can't lie — they report what the API exposes and nothing
     # more — so they're allowed to contribute to the ready rollup.
+    # The release-token section is informational only — a missing
+    # bot token doesn't break shipyard run/ship, it only breaks the
+    # auto-release tag chain — so we DON'T include it in `ready`.
     ready = all(info.get("ok", False) for info in core.values()) and all(
         info.get("ok", False) for info in (governance_section or {}).values()
     )
@@ -405,6 +419,68 @@ def doctor(ctx: Context) -> None:
         ctx.output("doctor", {"ready": ready, "checks": checks})
     else:
         render_doctor(checks, ready)
+
+
+def _check_release_bot_token() -> dict[str, Any] | None:
+    """Probe whether RELEASE_BOT_TOKEN is configured on the active repo.
+
+    Returns None when the repo can't be detected or `gh` can't read the
+    secret list (no auth, missing scope) — silent skip rather than
+    blocking the rest of doctor. When the secret is present, returns ok=True
+    with a short note. When it's missing, returns ok=False with the exact
+    setup pointer so the user has zero ambiguity about what to do.
+    """
+    repo = detect_repo_from_remote()
+    if repo is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo.slug}/actions/secrets",
+             "--jq", ".secrets[].name"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+
+    if result.returncode != 0:
+        # gh missing, not authed, or no actions:read scope. Keep silent;
+        # `gh` health is already covered by the Cloud providers section.
+        return None
+
+    secrets = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    if "RELEASE_BOT_TOKEN" in secrets:
+        return {
+            "RELEASE_BOT_TOKEN": {
+                "ok": True,
+                "version": "configured",
+                "note": (
+                    "auto-release.yml will use this for tag pushes; "
+                    "downstream release.yml fires on its own."
+                ),
+            }
+        }
+
+    # Missing — produce a doctor entry whose `note` is the actual fix
+    # recipe so the user doesn't need to context-switch into docs.
+    return {
+        "RELEASE_BOT_TOKEN": {
+            "ok": False,
+            "version": "missing",
+            "note": (
+                "Auto-release will fall back to GITHUB_TOKEN; tag pushes "
+                "won't trigger release.yml. Fix: github.com → Settings → "
+                "Developer settings → Personal access tokens → Fine-grained "
+                "tokens → Generate. Repo access: only " + repo.slug
+                + ". Permission: Contents=Read and write. Then "
+                f"github.com/{repo.slug}/settings/secrets/actions → New "
+                "repository secret named RELEASE_BOT_TOKEN. See RELEASING.md "
+                "for the full walkthrough."
+            ),
+        }
+    }
 
 
 def _check_governance_drift(config: Config) -> dict[str, Any] | None:
@@ -1697,6 +1773,21 @@ def pr(
         sys.exit(2)
 
     python = shutil.which("python3") or "python3"
+
+    # Best-effort heads-up if the auto-release chain isn't wired up. We
+    # don't block the PR — the gate scripts and the merge are unaffected
+    # — but warning here is the cheapest way to surface the trap *before*
+    # the user wonders why no GitHub Release appeared on merge. Run
+    # `shipyard doctor` for the same check + the fix recipe.
+    token_section = _check_release_bot_token()
+    if token_section and not token_section.get("RELEASE_BOT_TOKEN", {}).get("ok", True):
+        click.secho(
+            "▸ Heads-up: RELEASE_BOT_TOKEN secret is missing on this repo.\n"
+            "         Auto-release will tag but the binary release workflow won't fire.\n"
+            "         See `shipyard doctor` for the one-time setup steps.",
+            fg="yellow",
+            err=True,
+        )
 
     click.echo("▸ Skill-sync check")
     rc = subprocess.call(
