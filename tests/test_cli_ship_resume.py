@@ -146,34 +146,35 @@ class TestDetectRepoSlug:
         assert _detect_repo_slug_or_empty() == ""
 
 
-class TestShipStateCommand:
-    """Smoke-test the `ship-state` subcommand group via Click's runner."""
+class TestShipStateCommandSmoke:
+    """Smoke-test the ship-state subcommand group with a pinned state dir.
 
-    def test_list_empty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Redirect state dir so tests never hit the real user-local dir.
-        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-        runner = CliRunner()
+    These tests pin `Context.ship_state` to a tmp-path store so they
+    never read or write the user's real Shipyard state dir (which
+    differs per-OS and does not honor XDG on macOS).
+    """
+
+    def _runner_with_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> CliRunner:
+        store = ShipStateStore(path=tmp_path / "ship")
+        monkeypatch.setattr(
+            "shipyard.cli.Context.ship_state",
+            property(lambda self: store),
+        )
+        return CliRunner()
+
+    def test_list_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner = self._runner_with_store(tmp_path, monkeypatch)
         result = runner.invoke(main, ["ship-state", "list"])
         assert result.exit_code == 0, result.output
         assert "No active ship state." in result.output
 
-    def test_show_missing_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-        runner = CliRunner()
-        result = runner.invoke(main, ["ship-state", "show", "42"])
-        assert result.exit_code == 1
-
-    def test_list_shows_saved_state(
+    def test_show_missing_fails(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Save a state directly at the location the CLI will look.
-        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-        # The CLI resolves state_dir under ~/.local/state/shipyard on Linux
-        # or ~/Library/Application Support/shipyard on macOS. Override
-        # SHIPYARD_STATE_DIR if the project supports it; otherwise skip.
-        # We instead invoke with a temp --state-dir-equivalent via the
-        # config loader: write a state file at the actual resolved path.
-        runner = CliRunner()
-        # Just assert the list command renders cleanly without error.
-        result = runner.invoke(main, ["ship-state", "list"])
-        assert result.exit_code == 0
+        runner = self._runner_with_store(tmp_path, monkeypatch)
+        result = runner.invoke(main, ["ship-state", "show", "4242"])
+        assert result.exit_code == 1
