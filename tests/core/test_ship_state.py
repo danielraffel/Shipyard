@@ -151,15 +151,32 @@ class TestShipState:
 
     def test_roundtrip_preserves_all_fields(self) -> None:
         state = _make_state()
+        state.pr_url = "https://github.com/danielraffel/pulp/pull/224"
+        state.pr_title = "Fix ARA controller"
+        state.commit_subject = "ara: out-of-line destructor"
         state.upsert_run(_make_run())
         state.update_evidence("macos", "pass")
         restored = ShipState.from_dict(state.to_dict())
         assert restored.pr == state.pr
         assert restored.head_sha == state.head_sha
         assert restored.policy_signature == state.policy_signature
+        assert restored.pr_url == state.pr_url
+        assert restored.pr_title == state.pr_title
+        assert restored.commit_subject == state.commit_subject
         assert len(restored.dispatched_runs) == 1
         assert restored.evidence_snapshot == {"macos": "pass"}
         assert restored.schema_version == SCHEMA_VERSION
+
+    def test_legacy_files_without_pr_context_load(self) -> None:
+        # A state file written by an earlier Shipyard version without
+        # the human-context fields must still deserialize cleanly.
+        data = _make_state().to_dict()
+        for field_name in ("pr_url", "pr_title", "commit_subject"):
+            data.pop(field_name, None)
+        restored = ShipState.from_dict(data)
+        assert restored.pr_url == ""
+        assert restored.pr_title == ""
+        assert restored.commit_subject == ""
 
 
 class TestShipStateStore:

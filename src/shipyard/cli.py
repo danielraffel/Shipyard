@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1712,7 +1712,24 @@ def ship(
             base_branch=base,
             head_sha=sha,
             policy_signature=policy_sig,
+            pr_url=_pr_url(repo_slug, pr_info.number),
+            pr_title=getattr(pr_info, "title", "") or "",
+            commit_subject=_git_commit_subject(sha),
         )
+        ship_state_store.save(existing_state)
+    else:
+        # Refresh human-context fields on every invocation so
+        # force-push / title edits are reflected without a new attempt.
+        existing_state.pr_url = (
+            existing_state.pr_url or _pr_url(repo_slug, pr_info.number)
+        )
+        existing_state.pr_title = (
+            getattr(pr_info, "title", "") or existing_state.pr_title
+        )
+        existing_state.commit_subject = (
+            _git_commit_subject(sha) or existing_state.commit_subject
+        )
+        existing_state.touch()
         ship_state_store.save(existing_state)
 
     dispatcher = _make_dispatcher(config)
@@ -1871,13 +1888,11 @@ def _pr_is_closed(pr: int) -> bool:
 
 def _preview_ship_state_prune(store: ShipStateStore) -> dict[str, Any]:
     """Dry-run preview of what `store.prune()` would remove."""
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-
-    now = _dt.now(_tz.utc)
-    archive_cutoff = now - _td(days=30)
+    now = datetime.now(timezone.utc)
+    archive_cutoff = now - timedelta(days=30)
     would_archived: list[str] = []
     for archive_path in store.list_archived():
-        mtime = _dt.fromtimestamp(archive_path.stat().st_mtime, tz=_tz.utc)
+        mtime = datetime.fromtimestamp(archive_path.stat().st_mtime, tz=timezone.utc)
         if mtime <= archive_cutoff:
             would_archived.append(archive_path.name)
     # We don't hit `gh` in dry-run — just show what the age filter
@@ -1914,10 +1929,14 @@ def ship_state_list(ctx: Context) -> None:
     for s in states:
         age = now - s.updated_at
         age_s = f"{int(age.total_seconds() // 60)}m"
+        title = s.pr_title or s.commit_subject or "(no title)"
+        # Keep one line per PR — agents pipe this into a grep.
         render_message(
             f"PR #{s.pr}  sha={s.head_sha[:12]}  attempt={s.attempt}  "
-            f"runs={len(s.dispatched_runs)}  age={age_s}"
+            f"runs={len(s.dispatched_runs)}  age={age_s}  {title}"
         )
+        if s.pr_url:
+            render_message(f"    {s.pr_url}", style="dim")
 
 
 @ship_state_group.command("show")
@@ -1933,6 +1952,12 @@ def ship_state_show(ctx: Context, pr: int) -> None:
         ctx.output("ship-state:show", state.to_dict())
         return
     render_message(f"PR #{state.pr}  attempt {state.attempt}")
+    if state.pr_title:
+        render_message(f"  title:          {state.pr_title}")
+    if state.pr_url:
+        render_message(f"  url:            {state.pr_url}")
+    if state.commit_subject:
+        render_message(f"  commit:         {state.commit_subject}")
     render_message(f"  repo:           {state.repo}")
     render_message(f"  branch:         {state.branch} -> {state.base_branch}")
     render_message(f"  head_sha:       {state.head_sha}")
@@ -2378,18 +2403,79 @@ def _record_evidence(ctx: Context, job: Job) -> None:
 def _update_ship_state_from_job(
     ctx: Context, ship_state: ShipState, job: Job
 ) -> None:
-    """Mirror the job's per-target outcomes into the ship state snapshot.
+    """Mirror the job's per-target outcomes into the ship state.
 
-    Keeps the ship state file in sync with what EvidenceStore just
-    recorded, so `list-stale` and `status --pr` can report the
-    current picture without re-reading the evidence index.
+    Writes both an evidence snapshot (target -> "pass"/"fail") and
+    a DispatchedRun per terminal target so a future resume can see
+    which run IDs it was tracking.
     """
+    now = datetime.now(timezone.utc)
+    cloud_runs_by_platform = _cloud_runs_by_platform(ctx, job.sha)
     for name, result in job.results.items():
-        if result.is_terminal:
-            ship_state.update_evidence(
-                name, "pass" if result.passed else "fail"
+        if not result.is_terminal:
+            continue
+        ship_state.update_evidence(
+            name, "pass" if result.passed else "fail"
+        )
+        provider = result.provider or result.primary_backend or result.backend or "unknown"
+        run_id = cloud_runs_by_platform.get(result.platform) or job.id
+        ship_state.upsert_run(
+            DispatchedRun(
+                target=name,
+                provider=provider,
+                run_id=str(run_id),
+                status="completed" if result.passed else "failed",
+                started_at=result.started_at or now,
+                updated_at=result.completed_at or now,
+                attempt=ship_state.attempt,
             )
+        )
     ctx.ship_state.save(ship_state)
+
+
+def _cloud_runs_by_platform(ctx: Context, sha: str) -> dict[str, str]:
+    """Best-effort map of platform -> cloud run_id for this SHA.
+
+    The CloudRecordStore is keyed by dispatch_id, not SHA, so scan
+    the recent history for records matching this requested_ref or
+    head SHA. Missing entries simply mean "no cloud dispatch" for
+    that platform and the caller falls back to Shipyard's job id.
+    """
+    try:
+        records = ctx.cloud_records.list(limit=40)
+    except Exception:
+        return {}
+    mapping: dict[str, str] = {}
+    for record in records:
+        if record.run_id is None:
+            continue
+        # A cloud record's dispatch_fields often carries the
+        # platform / target hint. Best-effort; absence is fine.
+        platform = record.dispatch_fields.get("platform") or record.dispatch_fields.get("target")
+        if platform and platform not in mapping:
+            mapping[platform] = str(record.run_id)
+    return mapping
+
+
+def _pr_url(repo_slug: str, pr_number: int) -> str:
+    if not repo_slug or not pr_number:
+        return ""
+    return f"https://github.com/{repo_slug}/pull/{pr_number}"
+
+
+def _git_commit_subject(sha: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%s", sha],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
 
 
 def _detect_repo_slug_or_empty() -> str:

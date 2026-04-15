@@ -118,6 +118,11 @@ class ShipState:
     events happen (dispatch, poll update, evidence record, merge).
     Callers should save through ShipStateStore after every
     significant update so a crash loses at most one event.
+
+    Human-context fields (`pr_url`, `pr_title`, `commit_subject`)
+    are best-effort metadata so that `shipyard ship-state list` and
+    `show` are self-describing — the operator doesn't have to
+    remember what PR #42 was about to decide whether to resume it.
     """
 
     pr: int
@@ -126,6 +131,9 @@ class ShipState:
     base_branch: str
     head_sha: str
     policy_signature: str
+    pr_url: str = ""
+    pr_title: str = ""
+    commit_subject: str = ""
     dispatched_runs: list[DispatchedRun] = field(default_factory=list)
     evidence_snapshot: dict[str, str] = field(default_factory=dict)
     attempt: int = 1
@@ -176,6 +184,9 @@ class ShipState:
             "base_branch": self.base_branch,
             "head_sha": self.head_sha,
             "policy_signature": self.policy_signature,
+            "pr_url": self.pr_url,
+            "pr_title": self.pr_title,
+            "commit_subject": self.commit_subject,
             "dispatched_runs": [r.to_dict() for r in self.dispatched_runs],
             "evidence_snapshot": dict(self.evidence_snapshot),
             "attempt": self.attempt,
@@ -192,6 +203,9 @@ class ShipState:
             base_branch=d["base_branch"],
             head_sha=d["head_sha"],
             policy_signature=d.get("policy_signature", ""),
+            pr_url=d.get("pr_url", ""),
+            pr_title=d.get("pr_title", ""),
+            commit_subject=d.get("commit_subject", ""),
             dispatched_runs=[
                 DispatchedRun.from_dict(r)
                 for r in d.get("dispatched_runs", [])
