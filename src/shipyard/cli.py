@@ -2394,8 +2394,16 @@ def _update_ship_state_from_job(
 
 def _detect_repo_slug_or_empty() -> str:
     """Best-effort `owner/repo` slug from the git origin; empty string on miss."""
-    slug = detect_repo_from_remote()
-    return slug or ""
+    try:
+        ref = detect_repo_from_remote()
+    except Exception:
+        return ""
+    if ref is None:
+        return ""
+    slug = getattr(ref, "slug", None)
+    if slug:
+        return slug
+    return str(ref) if ref else ""
 
 
 def _required_platforms_for_config(config: Config) -> list[str]:

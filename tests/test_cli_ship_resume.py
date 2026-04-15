@@ -109,6 +109,43 @@ class TestPreviewPrune:
         assert preview["deleted_active"] == []
 
 
+class TestDetectRepoSlug:
+    def test_returns_slug_from_reporef(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from dataclasses import dataclass
+
+        from shipyard.cli import _detect_repo_slug_or_empty
+
+        @dataclass
+        class _Ref:
+            @property
+            def slug(self) -> str:
+                return "owner/repo"
+
+        monkeypatch.setattr(
+            "shipyard.cli.detect_repo_from_remote", lambda: _Ref()
+        )
+        assert _detect_repo_slug_or_empty() == "owner/repo"
+
+    def test_empty_on_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from shipyard.cli import _detect_repo_slug_or_empty
+
+        monkeypatch.setattr(
+            "shipyard.cli.detect_repo_from_remote", lambda: None
+        )
+        assert _detect_repo_slug_or_empty() == ""
+
+    def test_empty_on_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from shipyard.cli import _detect_repo_slug_or_empty
+
+        def _raise() -> None:
+            raise RuntimeError("git missing")
+
+        monkeypatch.setattr(
+            "shipyard.cli.detect_repo_from_remote", _raise
+        )
+        assert _detect_repo_slug_or_empty() == ""
+
+
 class TestShipStateCommand:
     """Smoke-test the `ship-state` subcommand group via Click's runner."""
 
