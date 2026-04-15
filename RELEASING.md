@@ -13,9 +13,22 @@ Run `shipyard doctor` to check whether the secret is configured. If it shows `RE
 5. **Repository access:** *Only select repositories* → include **every repo** that will use this same token as `RELEASE_BOT_TOKEN`. Fine-grained PATs are strictly scoped to the listed repos — if you later reuse the same PAT as `RELEASE_BOT_TOKEN` on a second repo (e.g. a consumer project that has its own auto-release), `actions/checkout@v5` will fail on that second repo with `fatal: could not read Username` because the token has no permissions there. Safest: list every consumer repo up front, or create a separate PAT per repo.
 6. **Permissions** (Repository permissions section): **Contents: Read and write** is required. **Metadata: Read-only** is auto-added (required baseline). Optional: **Workflows: Read and write** only if you plan to commit changes to `.github/workflows/*` under this token — Shipyard's auto-release only pushes tags, so it's not required.
 7. **Generate**, copy the token (starts with `github_pat_…`). The token is shown once and cannot be retrieved later.
-8. **Add to repo secrets:** github.com/<owner>/<repo>/settings/secrets/actions → New repository secret. Name: `RELEASE_BOT_TOKEN`. Value: paste the token. Repeat on every repo listed in step 5 that should use this token.
+8. **Add to repo secrets, on every consumer repo.** The PAT's "Selected repositories" list only authorizes the token to *operate against* those repos; you still have to store the token *value* as a secret named `RELEASE_BOT_TOKEN` on each repo separately. The fastest way is one `gh` command per repo:
 
-**If auto-release was already failing with `could not read Username`,** the PAT is almost certainly a fine-grained one missing that repo in its "Selected repositories" list. Edit the existing token at https://github.com/settings/personal-access-tokens, add the repo, save — no secret rotation needed; the stored token value stays valid.
+   ```sh
+   # Paste the token once, then Ctrl-D, for each repo:
+   gh secret set RELEASE_BOT_TOKEN --repo <owner>/<repo-A>
+   gh secret set RELEASE_BOT_TOKEN --repo <owner>/<repo-B>
+   ```
+
+   Or via the web UI: github.com/<owner>/<repo>/settings/secrets/actions → **New repository secret** → name `RELEASE_BOT_TOKEN`, paste value.
+
+**If auto-release is failing with `fatal: could not read Username`,** there are two independent causes to check:
+
+1. **PAT scope:** edit the existing token at https://github.com/settings/personal-access-tokens → add the failing repo to **Selected repositories** → **Update**. No secret re-set needed; the stored value stays valid.
+2. **Secret value drift:** the `RELEASE_BOT_TOKEN` secret on this repo holds a *different* token than the one you expanded in step 1. This happens when the secret was seeded from an earlier PAT that was later revoked or replaced. Re-run `gh secret set RELEASE_BOT_TOKEN --repo <owner>/<repo>` with the current token value.
+
+Both can be true at once. Verify by checking the timestamp of the secret (`gh secret list --repo <owner>/<repo>`) against the last token regeneration time on https://github.com/settings/personal-access-tokens.
 
 That's it — no code change needed. The workflow already reads `${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}`. `shipyard doctor` will then report `RELEASE_BOT_TOKEN: configured`.
 
