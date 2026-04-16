@@ -59,6 +59,8 @@ class TestCloudRunRequireSHA:
     def test_mismatch_exits_nonzero(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from types import SimpleNamespace
+
         from click.testing import CliRunner
 
         from shipyard.cli import main
@@ -75,7 +77,7 @@ class TestCloudRunRequireSHA:
             joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
             if "rev-parse" in joined:
                 R.stdout = expected + "\n"
-            elif "gh api" in joined or "repos/" in joined:
+            elif "repos/" in joined:
                 R.stdout = remote + "\n"
             return R
 
@@ -85,7 +87,7 @@ class TestCloudRunRequireSHA:
         )
         monkeypatch.setattr(
             "shipyard.cli._detect_repo_slug_or_empty",
-            lambda: "owner/repo",
+            lambda: "origin-owner/origin-repo",
         )
         monkeypatch.setattr(
             "shipyard.cli.discover_workflows",
@@ -95,6 +97,23 @@ class TestCloudRunRequireSHA:
             "shipyard.cli.default_workflow_key",
             lambda cfg, workflows: "build",
         )
+        # SHA check now runs AFTER plan resolution (#54 P1) so the
+        # dispatch-repo (not origin) is validated. Plan mock supplies
+        # plan.repository + plan.ref as the comparison source.
+        fake_plan = SimpleNamespace(
+            repository="dispatch-owner/dispatch-repo",
+            ref="feature/foo",
+            workflow=SimpleNamespace(
+                key="build", file="build.yml", name="Build"
+            ),
+            provider="github-hosted",
+            dispatch_fields={},
+            to_dict=lambda: {},
+        )
+        monkeypatch.setattr(
+            "shipyard.cli.resolve_cloud_dispatch_plan",
+            lambda **kw: fake_plan,
+        )
 
         runner = CliRunner()
         result = runner.invoke(
@@ -103,3 +122,4 @@ class TestCloudRunRequireSHA:
         )
         assert result.exit_code == 1
         assert "Stale dispatch refused" in result.output
+        assert "dispatch-owner/dispatch-repo" in result.output

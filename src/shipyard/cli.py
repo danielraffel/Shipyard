@@ -533,12 +533,19 @@ def _check_release_chain() -> dict[str, Any] | None:
     Returns a doctor-shaped section keyed `release_chain`. The
     dispatched workflow itself exits cleanly when no version moved,
     so a conclusion of "success" here is proof that actions/checkout
-    accepted the token — which is exactly the failure mode we want
-    to catch before a real release attempt hits it.
+    accepted *some* token — we also check that the PAT is actually
+    present to avoid reporting "checkout-ok" when auto-release.yml
+    silently fell back to GITHUB_TOKEN (#52 P2).
     """
     slug = _detect_repo_slug_or_empty()
     if not slug:
         return None
+    # Establish whether RELEASE_BOT_TOKEN is present *before* dispatch.
+    # The workflow's `${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}`
+    # fallback means a missing PAT still produces a "success" workflow
+    # run — success alone isn't proof the bot token works.
+    token_section = _check_release_bot_token() or {}
+    secret_ok = token_section.get("RELEASE_BOT_TOKEN", {}).get("ok") is True
     try:
         conclusion = verify_token(slug)
     except ReleaseBotError as exc:
@@ -550,13 +557,27 @@ def _check_release_chain() -> dict[str, Any] | None:
             }
         }
     if conclusion == "success":
+        if secret_ok:
+            return {
+                "release_chain": {
+                    "ok": True,
+                    "version": "checkout-ok",
+                    "detail": (
+                        "auto-release.yml dispatched and completed; "
+                        "actions/checkout accepted RELEASE_BOT_TOKEN."
+                    ),
+                }
+            }
         return {
             "release_chain": {
-                "ok": True,
-                "version": "checkout-ok",
+                "ok": False,
+                "version": "fallback-token",
                 "detail": (
-                    "auto-release.yml dispatched and completed; "
-                    "actions/checkout accepted RELEASE_BOT_TOKEN."
+                    "auto-release.yml succeeded but RELEASE_BOT_TOKEN is "
+                    "missing — checkout used the GITHUB_TOKEN fallback. "
+                    "Tag pushes from that token won't trigger release.yml, "
+                    "so binary releases still won't ship. Set the secret "
+                    "via `shipyard release-bot setup`."
                 ),
             }
         }
@@ -1521,32 +1542,11 @@ def cloud_run(
         render_error("Not in a git repository")
         sys.exit(1)
 
-    if require_sha is not None:
-        expected = _resolve_expected_sha(require_sha)
-        if not expected:
-            render_error(
-                f"Could not resolve --require-sha value '{require_sha}'. "
-                "Pass an explicit 40-char SHA or 'HEAD'."
-            )
-            sys.exit(1)
-        repo_slug = _detect_repo_slug_or_empty()
-        if not repo_slug:
-            render_error("--require-sha needs a detectable git remote.")
-            sys.exit(1)
-        remote_sha = _remote_ref_sha(repo_slug, resolved_ref)
-        if remote_sha is None:
-            render_error(
-                f"Could not read remote SHA for {repo_slug}@{resolved_ref}."
-            )
-            sys.exit(1)
-        if remote_sha != expected:
-            render_error(
-                f"Stale dispatch refused: expected {expected[:12]} but "
-                f"{repo_slug}@{resolved_ref} is at {remote_sha[:12]}. "
-                "Push the expected commit, or re-run without --require-sha."
-            )
-            sys.exit(1)
-
+    # We intentionally defer the --require-sha SHA comparison until
+    # AFTER plan resolution so we can check the dispatch repository
+    # — which may differ from the local origin (e.g., dispatching a
+    # consumer-project workflow from a fork clone). Resolving the
+    # plan here so the check uses plan.repository is #54 P1's fix.
     try:
         plan = resolve_cloud_dispatch_plan(
             config=ctx.config,
@@ -1562,6 +1562,39 @@ def cloud_run(
     except ValueError as exc:
         render_error(str(exc))
         sys.exit(1)
+
+    if require_sha is not None:
+        expected = _resolve_expected_sha(require_sha)
+        if not expected:
+            render_error(
+                f"Could not resolve --require-sha value '{require_sha}'. "
+                "Pass an explicit 40-char SHA or 'HEAD'."
+            )
+            sys.exit(1)
+        # Compare against the dispatch repository — NOT the local
+        # origin (#54 P1). A consumer project running shipyard can
+        # dispatch workflows to a different GitHub repo than the one
+        # it's checked out from; validating against origin would be
+        # checking unrelated history.
+        dispatch_repo = plan.repository or _detect_repo_slug_or_empty()
+        if not dispatch_repo:
+            render_error(
+                "--require-sha couldn't determine the dispatch repository."
+            )
+            sys.exit(1)
+        remote_sha = _remote_ref_sha(dispatch_repo, plan.ref)
+        if remote_sha is None:
+            render_error(
+                f"Could not read remote SHA for {dispatch_repo}@{plan.ref}."
+            )
+            sys.exit(1)
+        if remote_sha != expected:
+            render_error(
+                f"Stale dispatch refused: expected {expected[:12]} but "
+                f"{dispatch_repo}@{plan.ref} is at {remote_sha[:12]}. "
+                "Push the expected commit, or re-run without --require-sha."
+            )
+            sys.exit(1)
 
     dispatch_id = ctx.cloud_records.new_dispatch_id()
     record = CloudRunRecord(
@@ -2149,8 +2182,9 @@ def release_bot_setup(
     if state.secret_present and not reconfigure and not paste:
         render_message(
             "RELEASE_BOT_TOKEN is already set. Pass --reconfigure to "
-            "replace the stored value, or --verify-only to run a "
-            "checkout probe against the current secret.",
+            "replace the stored value, or run `shipyard doctor "
+            "--release-chain` to probe the current secret with a real "
+            "actions/checkout step.",
             style="dim",
         )
         return
