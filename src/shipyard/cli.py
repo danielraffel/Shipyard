@@ -3098,8 +3098,15 @@ def _strip_conflicting_trailer(message: str, new_trailer: str) -> str:
     sub-key (surface or skill name) from the new trailer and strip
     any existing line whose Key matches AND whose sub-key matches.
 
+    Matching is on exact token boundaries (#60 P2): a substring
+    match on `skill=ci` would also strip `skill=ci-tools`, so we
+    tokenize each candidate line and compare the skill= / surface=
+    value as a whole word.
+
     Unrelated trailers are left alone.
     """
+    import re
+
     if ":" not in new_trailer:
         return message
     key, payload = new_trailer.split(":", 1)
@@ -3109,22 +3116,33 @@ def _strip_conflicting_trailer(message: str, new_trailer: str) -> str:
     if key == "Version-Bump" and "=" in payload:
         # `sdk=skip reason="..."` -> surface = "sdk"
         target = payload.split("=", 1)[0].strip()
-        pattern_prefix = f"{key}: {target}="
     elif key == "Skill-Update" and "skill=" in payload:
         # `skip skill=ci reason="..."` -> skill name after "skill="
         after = payload.split("skill=", 1)[1]
-        target = after.split(None, 1)[0].rstrip(',')
-        pattern_prefix = f"{key}:"  # match any Skill-Update line; we
-        # still filter below by presence of `skill=<target>`
+        target = after.split(None, 1)[0].rstrip(",")
     else:
         return message
+    if not target:
+        return message
+
+    # Match `target` as a whole token: `\b` alone is insufficient
+    # because `-` is a word boundary for `\b`, so `skill=ci\b` would
+    # match `skill=ci-tools`. We require the next character to be
+    # neither a word char nor a hyphen (surface/skill names often
+    # contain hyphens, e.g. `sdk-core`, `ci-tools`).
+    escaped = re.escape(target)
+    if key == "Version-Bump":
+        conflict = re.compile(
+            rf"^Version-Bump:\s*{escaped}(?![\w-])\s*="
+        )
+    else:  # Skill-Update
+        conflict = re.compile(
+            rf"^Skill-Update:.*\bskill={escaped}(?![\w-])"
+        )
 
     kept_lines: list[str] = []
     for line in message.splitlines():
-        if key == "Version-Bump" and line.startswith(pattern_prefix):
-            continue
-        if key == "Skill-Update" and line.startswith(pattern_prefix) \
-                and f"skill={target}" in line:
+        if conflict.search(line):
             continue
         kept_lines.append(line)
     stripped = "\n".join(kept_lines)

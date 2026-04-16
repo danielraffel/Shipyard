@@ -183,6 +183,42 @@ class TestAppendTrailers:
         assert 'skill=api' in body
         assert 'skill=ci' in body
 
+    def test_prefix_match_does_not_strip_longer_skill_name(
+        self, tmp_repo: Path
+    ) -> None:
+        # #60 P2: `skill=ci` as a substring would wrongly strip
+        # `skill=ci-tools`. We require word-boundary matching.
+        subprocess.check_call(
+            ["git", "commit", "--allow-empty", "-m",
+             "seed\n\nSkill-Update: skip skill=ci-tools reason=\"keep me\""],
+            cwd=tmp_repo,
+        )
+        _append_trailers_to_tip(
+            ['Skill-Update: skip skill=ci reason="new"']
+        )
+        body = _tip_body()
+        # The longer-named skill's trailer must survive.
+        assert 'skill=ci-tools reason="keep me"' in body
+        # The new ci trailer must be present.
+        assert 'skill=ci reason="new"' in body
+
+    def test_prefix_match_does_not_strip_longer_surface_name(
+        self, tmp_repo: Path
+    ) -> None:
+        # Same boundary issue for Version-Bump: `sdk=` must not
+        # match `sdk-core=`.
+        subprocess.check_call(
+            ["git", "commit", "--allow-empty", "-m",
+             "seed\n\nVersion-Bump: sdk-core=patch reason=\"keep\""],
+            cwd=tmp_repo,
+        )
+        _append_trailers_to_tip(
+            ['Version-Bump: sdk=skip reason="new"']
+        )
+        body = _tip_body()
+        assert 'Version-Bump: sdk-core=patch reason="keep"' in body
+        assert 'Version-Bump: sdk=skip reason="new"' in body
+
 
 class TestPrFlagWiring:
     """Prove the flags reach _append_trailers_to_tip with correctly-formed trailer strings."""
