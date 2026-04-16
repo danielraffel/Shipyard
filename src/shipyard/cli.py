@@ -1485,6 +1485,18 @@ def cloud_defaults(ctx: Context) -> None:
 @click.option("--linux-runner-selector", help="Linux runner selector override")
 @click.option("--windows-runner-selector", help="Windows runner selector override")
 @click.option("--macos-runner-selector", help="macOS runner selector override")
+@click.option(
+    "--require-sha",
+    default=None,
+    metavar="SHA",
+    help=(
+        "Refuse to dispatch unless the remote ref currently resolves to "
+        "this SHA. Guards against dispatching before a local force-push "
+        "has propagated — the dispatched workflow runs against GitHub's "
+        "view of the branch, not yours. Pass 'HEAD' to require the "
+        "current local HEAD."
+    ),
+)
 @click.pass_obj
 def cloud_run(
     ctx: Context,
@@ -1496,6 +1508,7 @@ def cloud_run(
     linux_runner_selector: str | None,
     windows_runner_selector: str | None,
     macos_runner_selector: str | None,
+    require_sha: str | None,
 ) -> None:
     workflows = discover_workflows()
     workflow_key = workflow_key or default_workflow_key(ctx.config, workflows)
@@ -1507,6 +1520,32 @@ def cloud_run(
     if not resolved_ref:
         render_error("Not in a git repository")
         sys.exit(1)
+
+    if require_sha is not None:
+        expected = _resolve_expected_sha(require_sha)
+        if not expected:
+            render_error(
+                f"Could not resolve --require-sha value '{require_sha}'. "
+                "Pass an explicit 40-char SHA or 'HEAD'."
+            )
+            sys.exit(1)
+        repo_slug = _detect_repo_slug_or_empty()
+        if not repo_slug:
+            render_error("--require-sha needs a detectable git remote.")
+            sys.exit(1)
+        remote_sha = _remote_ref_sha(repo_slug, resolved_ref)
+        if remote_sha is None:
+            render_error(
+                f"Could not read remote SHA for {repo_slug}@{resolved_ref}."
+            )
+            sys.exit(1)
+        if remote_sha != expected:
+            render_error(
+                f"Stale dispatch refused: expected {expected[:12]} but "
+                f"{repo_slug}@{resolved_ref} is at {remote_sha[:12]}. "
+                "Push the expected commit, or re-run without --require-sha."
+            )
+            sys.exit(1)
 
     try:
         plan = resolve_cloud_dispatch_plan(
@@ -2769,6 +2808,56 @@ def _git_commit_subject(sha: str) -> str:
     if result.returncode != 0:
         return ""
     return result.stdout.strip()
+
+
+def _resolve_expected_sha(value: str) -> str | None:
+    """Map --require-sha input to a full 40-char SHA.
+
+    - "HEAD" → the current local HEAD
+    - 40-char hex → returned as-is (no verification against the repo;
+      the remote comparison is the check that matters)
+    - anything else → None (caller errors out)
+    """
+    if value.upper() == "HEAD":
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+    lowered = value.strip().lower()
+    if len(lowered) == 40 and all(c in "0123456789abcdef" for c in lowered):
+        return lowered
+    return None
+
+
+def _remote_ref_sha(repo_slug: str, ref: str) -> str | None:
+    """Return the current commit SHA for `ref` on the remote, or None.
+
+    Uses `gh api repos/:slug/commits/:ref --jq .sha`. Refuses to
+    fall back to local data — the whole point of --require-sha is
+    to compare against what GitHub will use when it dispatches.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo_slug}/commits/{ref}",
+             "--jq", ".sha"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip().lower()
+    return sha if len(sha) == 40 else None
 
 
 def _detect_repo_slug_or_empty() -> str:

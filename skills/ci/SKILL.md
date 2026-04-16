@@ -34,6 +34,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | List cloud workflows | `shipyard cloud workflows --json` |
 | Show cloud defaults | `shipyard cloud defaults --json` |
 | Dispatch a cloud workflow | `shipyard cloud run build --json` |
+| Dispatch only if remote matches HEAD | `shipyard cloud run build --require-sha HEAD --json` |
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
 | Clean up artifacts | `shipyard cleanup --apply` |
