@@ -22,7 +22,7 @@ import os
 import subprocess
 import urllib.parse
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 # ── Data types ─────────────────────────────────────────────────────────────
@@ -285,7 +285,14 @@ def verify_token(repo_slug: str, *, workflow_file: str = "auto-release.yml") -> 
     "no version bump," but actions/checkout having succeeded is
     proof the PAT works. We report the workflow-level conclusion
     and let the caller interpret it.
+
+    Correctness note (#51 P1): we record the timestamp just before
+    `gh workflow run` returns and only accept a run whose createdAt
+    is strictly after that mark. Otherwise a pre-existing completed
+    run would satisfy the poll immediately and produce a stale
+    verdict.
     """
+    dispatch_mark = datetime.now(timezone.utc)
     try:
         dispatch = subprocess.run(
             ["gh", "workflow", "run", workflow_file, "--repo", repo_slug,
@@ -306,12 +313,14 @@ def verify_token(repo_slug: str, *, workflow_file: str = "auto-release.yml") -> 
             or "The workflow may not accept workflow_dispatch.",
         )
 
-    # `gh workflow run` doesn't return a run id; poll for the most
-    # recent run on this workflow+ref until it's not "queued".
+    # Poll for a completed run whose createdAt is strictly newer
+    # than the dispatch mark. Stale completed runs are ignored.
     for _ in range(30):  # ~5 min @ 10s
         latest = _last_workflow_run(repo_slug, workflow_file)
         if latest and latest.get("status") == "completed":
-            return latest.get("conclusion") or "unknown"
+            created = _parse_ts(latest.get("createdAt"))
+            if created is not None and created >= dispatch_mark:
+                return latest.get("conclusion") or "unknown"
         import time
 
         time.sleep(10)

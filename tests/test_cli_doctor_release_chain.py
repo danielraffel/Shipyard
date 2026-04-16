@@ -88,3 +88,22 @@ class TestDoctorReleaseChain:
         )
         result = runner.invoke(main, ["doctor", "--release-chain"])
         assert result.exit_code in (0, 1)
+
+    def test_workflow_success_but_secret_missing_reports_fallback(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Reproduces #52 P2: auto-release.yml's `secrets.X || GITHUB_TOKEN`
+        # fallback means a "success" conclusion does NOT prove the PAT
+        # works. When the secret is absent we must say so.
+        _patch(
+            monkeypatch,
+            _detect_repo_slug_or_empty=lambda: "owner/repo",
+            _check_release_bot_token=lambda: {
+                "RELEASE_BOT_TOKEN": {"ok": False, "version": "missing"}
+            },
+            verify_token=lambda slug, **kw: "success",
+        )
+        result = runner.invoke(main, ["--json", "doctor", "--release-chain"])
+        assert result.exit_code in (0, 1)
+        assert "fallback-token" in result.output
+        assert "GITHUB_TOKEN fallback" in result.output
