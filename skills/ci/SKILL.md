@@ -45,6 +45,25 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Environment check | `shipyard doctor --json` |
 | Clean up artifacts | `shipyard cleanup --apply` |
 
+## Mid-flight runner retargeting
+
+When a provider change would be valuable *during* an in-flight PR drain — e.g., you notice halfway through shipping 10 PRs that Namespace macOS is faster than GitHub-hosted — use `shipyard cloud retarget`:
+
+```sh
+# Preview first (dry-run by default):
+shipyard cloud retarget --pr 224 --target macos --provider namespace
+
+# Apply when the plan looks right:
+shipyard cloud retarget --pr 224 --target macos --provider namespace --apply
+```
+
+What it does:
+1. Finds the PR's latest workflow run.
+2. Cancels the **one job** matching `--target` on the old provider (substring match on the job name, e.g. `macos` matches `macOS (ARM64) [github-hosted]`).
+3. Dispatches a fresh workflow run with the new provider.
+
+**Known limitation (read before running):** step 3 starts a new workflow run, so targets other than the one you retargeted will also re-run in that new run. Their *prior* pass/fail statuses persist on the PR's check rollup, and pulp-style `resolve-provider` matrix workflows reuse caches — so the net effect is "flip the lane" without losing ground on the other lanes, even though they technically re-execute.
+
 ## Ship workflow (the main flow)
 
 1. Work on a feature branch. Commit your changes.

@@ -53,6 +53,44 @@ next `shipyard ship` invocation continues from the same dispatched run
 IDs. SHA or merge-policy drift refuses the resume — re-run with
 `--no-resume` to discard. See `docs/ship-resume.md`.
 
+### Unattended merge + live watch (v0.8.0+)
+
+Two commands that decouple the usual "ship, park, merge" loop so an agent
+doesn't have to stay alive for the full cycle:
+
+- `shipyard watch [--pr <n>]` — live-tails the ship state. NDJSON events
+  under `--json`. Exits 0 pass / 1 fail / 2 not-found / 3 in-flight /
+  130 SIGINT.
+- `shipyard auto-merge <pr>` — cron-friendly one-shot: inspect state,
+  merge if all green, idempotent on re-run. Pair with `shipyard ship` on
+  the dispatch side and a cron/systemd timer / GH Actions schedule on
+  the merge side.
+
+### Release-bot setup
+
+`shipyard release-bot setup` is the guided path for wiring up
+`RELEASE_BOT_TOKEN` on a fresh consumer repo. Detects current state,
+opens a pre-filled PAT creation URL, stores the secret via stdin-piped
+`gh secret set`, then dispatches a workflow run to prove
+`actions/checkout` accepts the token. `shipyard release-bot status` for
+diagnosis; `shipyard doctor --release-chain` for the live probe.
+
+### Mid-flight runner switch
+
+`shipyard cloud retarget --pr <n> --target <lane> --provider <prov>`
+switches one in-flight lane (e.g. macOS local → Namespace) without
+tearing down the other target jobs on the PR. Dry-run by default; add
+`--apply` to execute.
+
+### Trailer shortcuts
+
+`shipyard pr --skip-bump <surface> --bump-reason "..."` and
+`--skip-skill-update <skill> --skill-reason "..."` auto-append the
+matching `Version-Bump:` / `Skill-Update:` trailer onto the tip commit
+before the gates run. Refuses when the index is dirty (would fold in
+staged changes) and replaces stale per-surface/per-skill trailers
+rather than stacking them.
+
 ### Bypass trailers (tip commit, never PR body)
 
 | Gate          | Trailer                                                      |
