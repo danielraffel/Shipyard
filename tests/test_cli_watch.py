@@ -131,12 +131,37 @@ class TestWatchCli:
     def test_active_ship_for_branch_auto_detected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Terminal success → exit 0 under --no-follow.
         runner, store = self._runner_with_store(tmp_path, monkeypatch)
         store.save(_state(pr=77, evidence={"macos": "pass", "linux": "pass"}))
         monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")
         result = runner.invoke(main, ["watch", "--no-follow"])
         assert result.exit_code == 0, result.output
         assert "PR #77" in result.output
+
+    def test_missing_pr_exits_2_not_0(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #62 P1: --pr that has no state file must NOT exit 0; that
+        # would let automation treat typos as successful completion.
+        runner, _ = self._runner_with_store(tmp_path, monkeypatch)
+        monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")
+        result = runner.invoke(main, ["watch", "--pr", "9999", "--no-follow"])
+        assert result.exit_code == 2, result.output
+        assert "no ship state found" in result.output.lower()
+
+    def test_non_terminal_nofollow_exits_3_not_0(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #62 P2: --no-follow on an in-flight ship must produce a
+        # distinct exit code from terminal success so callers can
+        # tell "keep polling" apart from "all done".
+        runner, store = self._runner_with_store(tmp_path, monkeypatch)
+        store.save(_state(pr=88, evidence={"macos": "pending"}))
+        monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")
+        result = runner.invoke(main, ["watch", "--no-follow"])
+        assert result.exit_code == 3, result.output
+        assert "PR #88" in result.output
 
     def test_terminal_failure_exits_1(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -152,13 +177,14 @@ class TestWatchCli:
     def test_explicit_pr_overrides_auto_detect(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Explicit --pr wins over current-branch detection. This
+        # state has a single passing target — terminal success.
         runner, store = self._runner_with_store(tmp_path, monkeypatch)
         store.save(_state(pr=10, evidence={"macos": "pass"}))
         monkeypatch.setattr(
             "shipyard.cli._git_branch", lambda: "unrelated"
         )
         result = runner.invoke(main, ["watch", "--pr", "10", "--no-follow"])
-        # pending state → exit 0 after one render with --no-follow.
         assert result.exit_code == 0
         assert "PR #10" in result.output
 

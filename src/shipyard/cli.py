@@ -2409,7 +2409,12 @@ def watch(
     Exit codes:
       0 — ship reached terminal success (all required targets pass)
       1 — ship reached terminal failure (at least one target failed)
-      2 — no active ship to watch
+      2 — no active ship to watch (no state for branch, or --pr
+          pointed at a PR that has no state, or state was archived
+          before we ever observed it)
+      3 — --no-follow and the ship is still in flight (non-terminal
+          snapshot; distinct from terminal success so scripts can
+          distinguish "keep polling" from "done")
       130 — interrupted by SIGINT
     """
     target_pr = pr if pr is not None else _active_pr_for_current_branch(ctx)
@@ -2431,12 +2436,36 @@ def watch(
         sys.exit(2)
 
     last_signature: str | None = None
+    observed_any_state = False  # distinguishes "never existed" from
+    # "saw it then it went away" (#62 P1).
     import time as _time
 
     try:
         while True:
             state = ctx.ship_state.get(target_pr)
             if state is None:
+                if not observed_any_state:
+                    # We never saw a state for this PR — typo, wrong
+                    # repo, or a PR that was never shipped. Exit 2
+                    # rather than 0 so automation can't mistake
+                    # "nothing found" for "done".
+                    if ctx.json_mode:
+                        ctx.output(
+                            "watch",
+                            {
+                                "event": "pr-not-found",
+                                "pr": target_pr,
+                            },
+                        )
+                    else:
+                        render_message(
+                            f"PR #{target_pr}: no ship state found "
+                            "(typo, wrong repo, or never shipped).",
+                            style="dim",
+                        )
+                    sys.exit(2)
+                # We did see state earlier; now it's archived
+                # (merge / discard / prune). That's a clean exit.
                 if ctx.json_mode:
                     ctx.output(
                         "watch",
@@ -2453,6 +2482,7 @@ def watch(
                     )
                 sys.exit(0)
 
+            observed_any_state = True
             signature = _watch_signature(state)
             if signature != last_signature:
                 _emit_watch_event(ctx, state)
@@ -2463,7 +2493,10 @@ def watch(
                 sys.exit(0 if terminal else 1)
 
             if not follow:
-                return
+                # Non-terminal snapshot under --no-follow. Exit 3 so
+                # callers can distinguish "still in flight" from
+                # "terminal success" (#62 P2).
+                sys.exit(3)
             _time.sleep(max(1.0, interval))
     except KeyboardInterrupt:
         sys.exit(130)
