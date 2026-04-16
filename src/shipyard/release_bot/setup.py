@@ -22,7 +22,7 @@ import os
 import subprocess
 import urllib.parse
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 # ── Data types ─────────────────────────────────────────────────────────────
@@ -286,23 +286,18 @@ def verify_token(repo_slug: str, *, workflow_file: str = "auto-release.yml") -> 
     proof the PAT works. We report the workflow-level conclusion
     and let the caller interpret it.
 
-    Correctness note (#51 P1): we record the timestamp just before
-    `gh workflow run` returns and only accept a run whose createdAt
-    is strictly after that mark. Otherwise a pre-existing completed
-    run would satisfy the poll immediately and produce a stale
-    verdict.
+    Correctness note (history): #51 P1 originally fixed a stale-run
+    read by comparing `createdAt` against a dispatch timestamp.
+    #55 P1 fixed a same-second false-negative by flooring to second
+    precision. #56 P1 then caught the residual case where two runs
+    share a second — the comparison can't distinguish them.
 
-    Precision note (#55 P1): GitHub's `createdAt` field is reported
-    at second precision, so we floor the dispatch mark to the same
-    resolution before comparing. Without this, a run created in the
-    same wall-clock second as `dispatch_mark` would have a
-    parsed-microsecond value of zero and would appear "older" than
-    the mark, causing the poll to time out on a run that in fact
-    succeeded.
+    Final approach: track the highest existing run ID (databaseId)
+    *before* dispatch, and only accept a completed run whose ID is
+    strictly greater. Run IDs are monotonically increasing within a
+    repo, so this is immune to timestamp aliasing entirely.
     """
-    # Floor to second precision to match `gh`'s createdAt resolution.
-    raw_mark = datetime.now(timezone.utc)
-    dispatch_mark = raw_mark.replace(microsecond=0)
+    baseline_id = _last_workflow_run_id(repo_slug, workflow_file)
     try:
         dispatch = subprocess.run(
             ["gh", "workflow", "run", workflow_file, "--repo", repo_slug,
@@ -323,13 +318,21 @@ def verify_token(repo_slug: str, *, workflow_file: str = "auto-release.yml") -> 
             or "The workflow may not accept workflow_dispatch.",
         )
 
-    # Poll for a completed run whose createdAt is strictly newer
-    # than the dispatch mark. Stale completed runs are ignored.
+    # Poll for a completed run whose databaseId is strictly greater
+    # than the pre-dispatch baseline. Run IDs are monotonically
+    # increasing so this is unambiguous even when two runs share a
+    # second, and survives GitHub's list-ordering quirks.
     for _ in range(30):  # ~5 min @ 10s
         latest = _last_workflow_run(repo_slug, workflow_file)
         if latest and latest.get("status") == "completed":
-            created = _parse_ts(latest.get("createdAt"))
-            if created is not None and created >= dispatch_mark:
+            latest_id = latest.get("databaseId")
+            try:
+                latest_id_int = int(latest_id) if latest_id is not None else None
+            except (TypeError, ValueError):
+                latest_id_int = None
+            if latest_id_int is not None and (
+                baseline_id is None or latest_id_int > baseline_id
+            ):
                 return latest.get("conclusion") or "unknown"
         import time
 
@@ -338,6 +341,24 @@ def verify_token(repo_slug: str, *, workflow_file: str = "auto-release.yml") -> 
         "Verification workflow didn't complete in 5 min.",
         "Check Actions tab manually.",
     )
+
+
+def _last_workflow_run_id(
+    repo_slug: str, workflow_file: str
+) -> int | None:
+    """Return the databaseId of the most recent run for this workflow.
+
+    None if `gh` is unavailable, the workflow has no runs yet, or
+    the response is unparseable.
+    """
+    latest = _last_workflow_run(repo_slug, workflow_file)
+    if not latest:
+        return None
+    raw = latest.get("databaseId")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Internals ──────────────────────────────────────────────────────────────

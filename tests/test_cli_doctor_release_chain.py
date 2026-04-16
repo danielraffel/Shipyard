@@ -111,9 +111,12 @@ class TestDoctorReleaseChain:
     def test_workflow_success_with_unknown_secret_state(
         self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Reproduces #55 P2: when _check_release_bot_token returns
-        # None (secret listing unreadable — auth/scope issues), we
-        # must NOT cry "fallback-token" — we honestly don't know.
+        # Reproduces #55 P2 + #56 P2: when _check_release_bot_token
+        # returns None (secret listing unreadable — auth/scope),
+        # we must NOT cry "fallback-token" and we must surface the
+        # uncertainty in `version` (not only `detail`) so it shows
+        # up in human doctor output where render_doctor() prefers
+        # `version` to `detail`.
         _patch(
             monkeypatch,
             _detect_repo_slug_or_empty=lambda: "owner/repo",
@@ -122,7 +125,8 @@ class TestDoctorReleaseChain:
         )
         result = runner.invoke(main, ["--json", "doctor", "--release-chain"])
         assert result.exit_code in (0, 1)
-        assert "checkout-ok" in result.output
+        # `version` is the human-visible field.
+        assert "checkout-ok-unverified" in result.output
         assert "fallback-token" not in result.output
-        # And we call out the caveat so the signal isn't lost.
-        assert "Could not probe" in result.output
+        # And ok=False because we didn't verify the PAT specifically.
+        assert '"ok": false' in result.output

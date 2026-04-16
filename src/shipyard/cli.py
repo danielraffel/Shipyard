@@ -594,18 +594,21 @@ def _check_release_chain() -> dict[str, Any] | None:
                 }
             }
         # secret_state == "unknown": the workflow succeeded but we
-        # couldn't probe the secret. Report checkout-ok with a
-        # caveat so the signal isn't lost, but don't claim we
-        # verified the PAT specifically.
+        # couldn't probe the secret. Use a distinct `version` string
+        # so the human doctor output (which prefers version to
+        # detail) surfaces the uncertainty rather than reading as a
+        # clean green check (#56 P2). ok=False because we can't
+        # honestly rubber-stamp an unverified PAT.
         return {
             "release_chain": {
-                "ok": True,
-                "version": "checkout-ok",
+                "ok": False,
+                "version": "checkout-ok-unverified",
                 "detail": (
-                    "auto-release.yml dispatched and completed; "
-                    "actions/checkout accepted the configured token. "
-                    "(Could not probe which token — gh secret listing "
-                    "unavailable in this environment.)"
+                    "auto-release.yml dispatched and completed, but we "
+                    "could not probe whether RELEASE_BOT_TOKEN or the "
+                    "GITHUB_TOKEN fallback was used — gh secret listing "
+                    "unavailable in this environment. Re-run with "
+                    "authenticated gh to get a definitive verdict."
                 ),
             }
         }
