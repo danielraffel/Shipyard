@@ -128,57 +128,107 @@ class TestReleaseBotError:
         assert e.detail == ""
 
 
-class TestVerifyTokenDispatchMarkPrecision:
-    """Regression: #55 P1 — createdAt is second-precision; dispatch_mark
-    must be floored to match or same-second runs get ignored."""
+class TestVerifyTokenRunIdCorrelation:
+    """Regression: #51 P1 → #55 P1 → #56 P1.
 
-    def test_same_second_run_is_accepted(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from datetime import datetime, timezone
+    Cycling through timestamp-based novelty checks kept exposing
+    subtler aliasing bugs (microseconds, same-second collisions).
+    Final fix: correlate on databaseId — monotonically increasing —
+    and require the polled run's ID to be strictly greater than a
+    pre-dispatch baseline. These tests assert that invariant.
+    """
 
+    def _stub_dispatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from shipyard.release_bot import setup as sut
 
-        # Fixed "now" so the test is deterministic. Pick a moment
-        # with non-zero microseconds to exercise the flooring path.
-        fixed_now = datetime(2026, 4, 16, 12, 0, 0, 500_000, tzinfo=timezone.utc)
-
-        # Subclass datetime so fromisoformat etc. still work — only
-        # `now` is overridden for determinism.
-        class FakeDT(datetime):
-            @classmethod
-            def now(cls, tz=None):  # type: ignore[override]
-                return fixed_now
-
-        monkeypatch.setattr(sut, "datetime", FakeDT)
-
-        def fake_dispatch(cmd, *a, **kw):
+        def fake_run(cmd, *a, **kw):
             class R:
                 returncode = 0
                 stderr = ""
                 stdout = ""
             return R
 
-        monkeypatch.setattr(sut.subprocess, "run", fake_dispatch)
+        monkeypatch.setattr(sut.subprocess, "run", fake_run)
         monkeypatch.setattr(sut, "_default_branch", lambda slug: "main")
 
-        # The simulated "new run" has createdAt at the same wall-clock
-        # second, but microsecond 0 — i.e., strictly less than the
-        # microsecond-precision dispatch_mark would have been. With
-        # the fix, flooring dispatch_mark to 12:00:00.000000 makes
-        # the comparison accept this run.
-        run_created_same_second = datetime(
-            2026, 4, 16, 12, 0, 0, 0, tzinfo=timezone.utc
-        )
+    def test_stale_same_second_run_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Baseline exists (ID 100). Subsequent poll still shows ID 100
+        # (new run not surfaced yet). verify_token must NOT return —
+        # it should keep polling until a strictly-higher ID appears.
+        from shipyard.release_bot import setup as sut
+
+        self._stub_dispatch(monkeypatch)
+
+        call_count = {"n": 0}
 
         def fake_last_run(slug, workflow):
-            return {
-                "status": "completed",
-                "conclusion": "success",
-                "createdAt": run_created_same_second.isoformat(),
-            }
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Pre-dispatch baseline call.
+                return {"databaseId": 100, "status": "completed",
+                        "conclusion": "success"}
+            if call_count["n"] <= 3:
+                # First two polls still show the stale run.
+                return {"databaseId": 100, "status": "completed",
+                        "conclusion": "failure"}
+            # New run finally surfaces.
+            return {"databaseId": 101, "status": "completed",
+                    "conclusion": "success"}
 
         monkeypatch.setattr(sut, "_last_workflow_run", fake_last_run)
+        import time as real_time
+        monkeypatch.setattr(real_time, "sleep", lambda s: None)
 
         conclusion = sut.verify_token("owner/repo")
         assert conclusion == "success"
+        # Baseline + stale-stall (×2) + fresh, at minimum.
+        assert call_count["n"] >= 4
+
+    def test_fresh_run_with_higher_id_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from shipyard.release_bot import setup as sut
+
+        self._stub_dispatch(monkeypatch)
+
+        call_count = {"n": 0}
+
+        def fake_last_run(slug, workflow):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return {"databaseId": 50, "status": "completed",
+                        "conclusion": "failure"}
+            return {"databaseId": 51, "status": "completed",
+                    "conclusion": "success"}
+
+        monkeypatch.setattr(sut, "_last_workflow_run", fake_last_run)
+        import time as real_time
+        monkeypatch.setattr(real_time, "sleep", lambda s: None)
+
+        assert sut.verify_token("owner/repo") == "success"
+
+    def test_no_prior_run_accepts_first_completed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Fresh repo — no baseline. verify_token should accept the
+        # first completed run it sees (any valid ID is > None baseline).
+        from shipyard.release_bot import setup as sut
+
+        self._stub_dispatch(monkeypatch)
+
+        call_count = {"n": 0}
+
+        def fake_last_run(slug, workflow):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return None  # baseline: no prior run exists
+            return {"databaseId": 1, "status": "completed",
+                    "conclusion": "success"}
+
+        monkeypatch.setattr(sut, "_last_workflow_run", fake_last_run)
+        import time as real_time
+        monkeypatch.setattr(real_time, "sleep", lambda s: None)
+
+        assert sut.verify_token("owner/repo") == "success"
