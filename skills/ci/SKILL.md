@@ -23,6 +23,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` |
 | Configure RELEASE_BOT_TOKEN | `shipyard release-bot setup` (guided) |
 | Re-paste token after rotation | `shipyard release-bot setup --paste` |
+| Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
 | Show run logs | `shipyard logs <job_id> --json` |

@@ -392,8 +392,18 @@ def queue_cmd(ctx: Context) -> None:
 
 
 @main.command()
+@click.option(
+    "--release-chain",
+    is_flag=True,
+    help=(
+        "Additionally dispatch auto-release.yml to verify the release-bot "
+        "token actually works at actions/checkout. Catches PAT-scope and "
+        "secret-drift failures before a real release attempt. Adds ~3-5 "
+        "minutes to the run."
+    ),
+)
 @click.pass_obj
-def doctor(ctx: Context) -> None:
+def doctor(ctx: Context, release_chain: bool) -> None:
     """Check environment, dependencies, and targets."""
     checks: dict[str, dict[str, Any]] = {}
 
@@ -425,6 +435,11 @@ def doctor(ctx: Context) -> None:
     release_token_section = _check_release_bot_token()
     if release_token_section:
         checks["Release pipeline"] = release_token_section
+
+    if release_chain:
+        chain_section = _check_release_chain()
+        if chain_section:
+            checks.setdefault("Release pipeline", {}).update(chain_section)
 
     # Ready = core tools healthy AND (no governance section declared
     # OR every governance check is ok). Informational entries (the
@@ -507,6 +522,54 @@ def _check_release_bot_token() -> dict[str, Any] | None:
                 f"Contents=Read and write. Then github.com/{repo.slug}/settings/"
                 f"secrets/actions → New repository secret named RELEASE_BOT_TOKEN. "
                 f"See RELEASING.md for the full walkthrough."
+            ),
+        }
+    }
+
+
+def _check_release_chain() -> dict[str, Any] | None:
+    """Probe the release-bot token by dispatching auto-release.yml.
+
+    Returns a doctor-shaped section keyed `release_chain`. The
+    dispatched workflow itself exits cleanly when no version moved,
+    so a conclusion of "success" here is proof that actions/checkout
+    accepted the token — which is exactly the failure mode we want
+    to catch before a real release attempt hits it.
+    """
+    slug = _detect_repo_slug_or_empty()
+    if not slug:
+        return None
+    try:
+        conclusion = verify_token(slug)
+    except ReleaseBotError as exc:
+        return {
+            "release_chain": {
+                "ok": False,
+                "version": "dispatch-failed",
+                "detail": exc.message + (f" {exc.detail}" if exc.detail else ""),
+            }
+        }
+    if conclusion == "success":
+        return {
+            "release_chain": {
+                "ok": True,
+                "version": "checkout-ok",
+                "detail": (
+                    "auto-release.yml dispatched and completed; "
+                    "actions/checkout accepted RELEASE_BOT_TOKEN."
+                ),
+            }
+        }
+    return {
+        "release_chain": {
+            "ok": False,
+            "version": conclusion,
+            "detail": (
+                "auto-release.yml did not conclude success. Most likely: "
+                "the stored token's PAT scope excludes this repo, or the "
+                "stored value drifted. Run `shipyard release-bot status` "
+                "for a non-destructive diagnosis; `shipyard release-bot "
+                "setup --reconfigure` to re-paste."
             ),
         }
     }
