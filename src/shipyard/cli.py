@@ -42,6 +42,16 @@ from shipyard.output.human import (
 from shipyard.output.json_output import render_json
 from shipyard.output.schema import OutputEnvelope
 from shipyard.preflight import run_submission_preflight
+from shipyard.release_bot.setup import (
+    ReleaseBotError,
+    describe_state,
+    detect_state,
+    open_browser,
+    plan_setup,
+    render_pat_creation_url,
+    set_secret,
+    verify_token,
+)
 
 
 class Context:
@@ -1904,6 +1914,226 @@ def _preview_ship_state_prune(store: ShipStateStore) -> dict[str, Any]:
         "total": len(would_archived),
         "note": "Active-file pruning is only computed during --apply.",
     }
+
+
+@main.group(name="release-bot")
+def release_bot_group() -> None:
+    """Guided RELEASE_BOT_TOKEN provisioning and diagnosis."""
+
+
+@release_bot_group.command("status")
+@click.option(
+    "--siblings",
+    "siblings",
+    multiple=True,
+    metavar="OWNER/REPO",
+    help=(
+        "Other repos to probe for RELEASE_BOT_TOKEN (multi). Surfaces "
+        "whether a shared PAT is already in use so setup can recommend "
+        "expanding it instead of cutting a new one."
+    ),
+)
+@click.pass_obj
+def release_bot_status(ctx: Context, siblings: tuple[str, ...]) -> None:
+    """Report RELEASE_BOT_TOKEN presence, drift, and recent failures.
+
+    Never prints the secret value. Safe to run in CI logs.
+    """
+    slug = _detect_repo_slug_or_empty()
+    if not slug:
+        render_error("Can't detect owner/repo from git remote.")
+        sys.exit(1)
+    state = detect_state(slug, known_repos_hint=list(siblings))
+    if ctx.json_mode:
+        ctx.output(
+            "release-bot:status",
+            {
+                "repo": state.repo_slug,
+                "secret_present": state.secret_present,
+                "secret_updated_at": (
+                    state.secret_updated_at.isoformat()
+                    if state.secret_updated_at
+                    else None
+                ),
+                "last_auto_release_conclusion": state.last_auto_release_conclusion,
+                "last_auto_release_error_signature": state.last_auto_release_error_signature,
+                "other_repos_with_secret": list(state.other_repos_with_secret),
+            },
+        )
+        return
+    for line in describe_state(state):
+        render_message(line)
+    if (
+        state.last_auto_release_error_signature == "auth"
+        and state.secret_present
+    ):
+        render_message("")
+        render_message(
+            "Diagnosis: the stored token is being rejected by actions/checkout.",
+            style="bold yellow",
+        )
+        render_message(
+            "Either the PAT doesn't list this repo under 'Selected "
+            "repositories', or the stored secret value is stale (drifted "
+            "from the PAT you later edited). Run `shipyard release-bot "
+            "setup --reconfigure` to fix.",
+        )
+
+
+@release_bot_group.command("setup")
+@click.option(
+    "--shared-name",
+    default=None,
+    help=(
+        "Use this PAT name instead of the per-project default. Pick one "
+        "name for every Shipyard consumer repo to rotate a single token."
+    ),
+)
+@click.option(
+    "--paste",
+    is_flag=True,
+    help=(
+        "Skip the wizard and just paste a token value you already have. "
+        "Useful when you regenerated a PAT elsewhere and want to sync the "
+        "secret on this repo."
+    ),
+)
+@click.option(
+    "--siblings",
+    multiple=True,
+    metavar="OWNER/REPO",
+    help="Probe these repos for an existing RELEASE_BOT_TOKEN.",
+)
+@click.option(
+    "--verify/--no-verify",
+    default=True,
+    help=(
+        "Dispatch a workflow run after setting the secret to confirm "
+        "actions/checkout accepts it. Defaults on."
+    ),
+)
+@click.option(
+    "--reconfigure",
+    is_flag=True,
+    help="Treat the secret as unset even if present (forces a re-paste).",
+)
+@click.pass_obj
+def release_bot_setup(
+    ctx: Context,
+    shared_name: str | None,
+    paste: bool,
+    siblings: tuple[str, ...],
+    verify: bool,
+    reconfigure: bool,
+) -> None:
+    """Walk through RELEASE_BOT_TOKEN setup with a live verification step.
+
+    Honest about what it can't do: Shipyard cannot create a
+    fine-grained PAT for you — GitHub has no such API. The wizard
+    opens the right URL with scope hints pre-filled, prompts for
+    the generated token via stdin, stores it as a secret, and then
+    dispatches a workflow run to prove actions/checkout accepts it.
+    """
+    slug = _detect_repo_slug_or_empty()
+    if not slug:
+        render_error("Can't detect owner/repo from git remote.")
+        sys.exit(1)
+
+    state = detect_state(slug, known_repos_hint=list(siblings))
+    for line in describe_state(state):
+        render_message(line)
+    render_message("")
+
+    if state.secret_present and not reconfigure and not paste:
+        render_message(
+            "RELEASE_BOT_TOKEN is already set. Pass --reconfigure to "
+            "replace the stored value, or --verify-only to run a "
+            "checkout probe against the current secret.",
+            style="dim",
+        )
+        return
+
+    plan = plan_setup(state, shared_name=shared_name)
+    if not paste:
+        owner, repo = slug.split("/", 1)
+        pat_url = render_pat_creation_url(
+            owner=owner, pat_name=plan.suggested_pat_name, repo=repo
+        )
+        render_message(f"Recommended PAT name: {plan.suggested_pat_name}")
+        render_message(f"Rationale: {plan.reasoning}", style="dim")
+        render_message("")
+        render_message("Open this URL to create (or edit) the PAT:")
+        render_message(f"  {pat_url}")
+        render_message("")
+        render_message("Required repository permissions:")
+        render_message("  - Contents: Read and write")
+        render_message("  - Metadata: Read-only (auto-added)")
+        render_message(
+            "  - Workflows: Read and write (only if the bot will commit "
+            "changes under .github/workflows)"
+        )
+        render_message(
+            "Include every Shipyard consumer repo under "
+            "'Only select repositories' — fine-grained PATs are strict.",
+            style="dim",
+        )
+        if open_browser(pat_url):
+            render_message("(browser opened)", style="dim")
+
+    render_message("")
+    token = click.prompt(
+        "Paste the token (input hidden)", hide_input=True, default="",
+        show_default=False,
+    ).strip()
+    if not token:
+        render_error("Empty token. Aborting.")
+        sys.exit(1)
+
+    try:
+        set_secret(slug, token)
+    except ReleaseBotError as exc:
+        render_error(exc.message)
+        if exc.detail:
+            render_message(exc.detail, style="dim")
+        sys.exit(1)
+    render_message(
+        f"✓ Stored RELEASE_BOT_TOKEN on {slug}.", style="bold green"
+    )
+
+    if not verify:
+        return
+
+    render_message("Dispatching auto-release.yml to verify checkout…")
+    try:
+        conclusion = verify_token(slug)
+    except ReleaseBotError as exc:
+        render_message(
+            f"Verification dispatch failed: {exc.message}",
+            style="bold yellow",
+        )
+        if exc.detail:
+            render_message(exc.detail, style="dim")
+        render_message(
+            "The secret is stored. Verify manually with "
+            "`shipyard release-bot status` after your next push to main."
+        )
+        return
+
+    if conclusion == "success":
+        render_message(
+            "✓ actions/checkout accepted the token.",
+            style="bold green",
+        )
+    else:
+        render_message(
+            f"Verification workflow concluded: {conclusion}.",
+            style="bold yellow",
+        )
+        render_message(
+            "Re-run `shipyard release-bot status` to inspect the "
+            "failure signature — the common case is a PAT scope that "
+            "excludes this repo.",
+        )
 
 
 @main.group(name="ship-state")

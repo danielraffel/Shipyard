@@ -20,6 +20,9 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Force-restart a stale ship | `shipyard ship --no-resume --json` |
 | List in-flight ship states | `shipyard ship-state list --json` |
 | Inspect one PR's ship state | `shipyard ship-state show <pr> --json` |
+| Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` |
+| Configure RELEASE_BOT_TOKEN | `shipyard release-bot setup` (guided) |
+| Re-paste token after rotation | `shipyard release-bot setup --paste` |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
 | Show run logs | `shipyard logs <job_id> --json` |

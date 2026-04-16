@@ -1,5 +1,20 @@
 # Releasing Shipyard
 
+## Quick path: `shipyard release-bot setup`
+
+The guided command is the primary way to wire up `RELEASE_BOT_TOKEN` — it detects current state, recommends the right PAT path (fresh per-project PAT vs reusing one you already have), opens the pre-filled creation URL, stores the secret via `gh secret set`, and then dispatches a real workflow run to prove `actions/checkout` accepts it. One command replaces the manual steps below.
+
+```sh
+shipyard release-bot status                # what's configured, is it rejected?
+shipyard release-bot setup                 # guided wizard
+shipyard release-bot setup --paste         # skip wizard; just (re-)paste a token
+shipyard release-bot setup --reconfigure   # replace existing secret value
+shipyard release-bot setup --shared-name shipyard-release-bot  # one PAT across repos
+shipyard release-bot setup --siblings other/repo --siblings other/repo2  # hint existing peers
+```
+
+If the wizard can't run (headless, no `gh`, etc.), the manual steps below remain the fallback.
+
 ## One-time setup: `RELEASE_BOT_TOKEN` secret
 
 The auto-release workflow needs a fine-grained PAT to push tags so that downstream `release.yml` actually fires. **Without this secret, auto-release silently degrades**: tags are still created via `GITHUB_TOKEN`, but GitHub Actions deliberately does not chain workflows from `GITHUB_TOKEN`-pushed tags (anti-infinite-loop safety), so `release.yml` never runs and no binaries ship.
