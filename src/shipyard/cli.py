@@ -1702,6 +1702,307 @@ def cloud_run(
         render_message(f"url: {record.url}")
 
 
+@cloud.command("retarget")
+@click.option("--pr", type=int, required=True, help="PR number")
+@click.option(
+    "--target",
+    required=True,
+    help=(
+        "Target/job name to retarget. Matched against the job name "
+        "in the workflow run (case-insensitive substring)."
+    ),
+)
+@click.option(
+    "--provider",
+    required=True,
+    help="New runner provider (e.g. namespace, github-hosted).",
+)
+@click.option(
+    "--workflow",
+    default=None,
+    help="Workflow key (default: the same default `cloud run` uses).",
+)
+@click.option(
+    "--dry-run/--apply",
+    "dry_run",
+    default=True,
+    help=(
+        "Dry-run by default. Shows the job that would be cancelled "
+        "and the dispatch that would be issued. --apply executes."
+    ),
+)
+@click.pass_obj
+def cloud_retarget(
+    ctx: Context,
+    pr: int,
+    target: str,
+    provider: str,
+    workflow: str | None,
+    dry_run: bool,
+) -> None:
+    """Move one target on an in-flight PR to a new runner provider.
+
+    Mid-batch provider switching: say you discover ten minutes into
+    a ten-PR drain that Namespace macOS is much faster than
+    GitHub-hosted. You want to flip the mac lane without tearing
+    down every PR's Linux/Windows jobs that already passed.
+
+    What this command does:
+      1. Find the latest workflow run for this PR.
+      2. Locate a job whose name matches --target (substring, case-
+         insensitive). Cancel that specific job.
+      3. Dispatch a new workflow_dispatch with `runner_provider=
+         <provider>`, which starts a fresh run against the same ref.
+
+    Known limitation: step 3 starts a NEW workflow run. If the
+    target workflow doesn't support a per-target filter input
+    (`only_target`, `targets`, …), the other targets will also
+    re-run in that fresh workflow — but their PRIOR runs' pass/
+    fail status is preserved on the PR's check rollup. Pulp-style
+    workflows with a `resolve-provider` matrix step are the ideal
+    case: each target is a separate job keyed on provider, so the
+    new run can reuse cached artifacts and the old targets'
+    statuses persist.
+
+    Scope by workflow via --workflow. Dry-run by default.
+    """
+
+    workflows = discover_workflows()
+    workflow_key = workflow or default_workflow_key(ctx.config, workflows)
+    if not workflow_key:
+        render_error("No workflows discovered")
+        sys.exit(1)
+
+    # Resolve the PR's head ref and the dispatch repository.
+    repo_slug = _detect_repo_slug_or_empty()
+    if not repo_slug:
+        render_error("Can't detect owner/repo from git remote.")
+        sys.exit(1)
+
+    pr_state = _pr_fetch(repo_slug, pr)
+    if pr_state is None:
+        render_error(f"PR #{pr}: could not fetch state via gh.")
+        sys.exit(1)
+    head_ref = pr_state.get("headRefName")
+    if not head_ref:
+        render_error(f"PR #{pr}: no headRefName in gh response.")
+        sys.exit(1)
+
+    # Find the latest run for this workflow on the PR's branch.
+    run_info = _latest_workflow_run_for_branch(
+        repo_slug, workflow_key_to_file(workflows, workflow_key),
+        head_ref,
+    )
+    if run_info is None:
+        render_error(
+            f"No workflow runs found for {workflow_key} on {head_ref}. "
+            "Dispatch first, then retarget."
+        )
+        sys.exit(1)
+
+    matching_jobs = _find_matching_jobs(
+        repo_slug, int(run_info["databaseId"]), target
+    )
+    if not matching_jobs:
+        render_error(
+            f"No jobs matching '{target}' in run "
+            f"{run_info['databaseId']}."
+        )
+        sys.exit(1)
+
+    if ctx.json_mode:
+        ctx.output(
+            "cloud.retarget",
+            {
+                "event": "plan",
+                "pr": pr,
+                "head_ref": head_ref,
+                "repo": repo_slug,
+                "workflow_key": workflow_key,
+                "run_id": run_info["databaseId"],
+                "matching_jobs": [
+                    {"id": j["databaseId"], "name": j["name"]}
+                    for j in matching_jobs
+                ],
+                "new_provider": provider,
+                "dry_run": dry_run,
+            },
+        )
+    else:
+        render_message(
+            f"Retarget plan for PR #{pr} ({repo_slug}):"
+        )
+        render_message(f"  workflow:    {workflow_key}")
+        render_message(f"  ref:         {head_ref}")
+        render_message(f"  prior run:   {run_info['databaseId']}")
+        render_message(f"  target:      {target}")
+        render_message(f"  new provider: {provider}")
+        render_message(
+            f"  matching jobs ({len(matching_jobs)}):"
+        )
+        for j in matching_jobs:
+            render_message(f"    - {j['name']} (job id {j['databaseId']})")
+
+    if dry_run:
+        if not ctx.json_mode:
+            render_message(
+                "\nDry-run. Re-run with --apply to cancel + redispatch.",
+                style="dim",
+            )
+        return
+
+    # Cancel matching jobs. gh supports `gh api -X POST /repos/:owner/
+    # :repo/actions/jobs/:job_id/cancel` (not all PATs have scope).
+    cancelled: list[int] = []
+    for j in matching_jobs:
+        ok = _cancel_workflow_job(repo_slug, int(j["databaseId"]))
+        if ok:
+            cancelled.append(int(j["databaseId"]))
+    if not cancelled:
+        render_error(
+            "Couldn't cancel the matching job(s). Your gh token may "
+            "lack `actions:write` scope. Cancel manually in the UI, "
+            "then re-run this with --apply to redispatch."
+        )
+        sys.exit(1)
+
+    # Dispatch a new workflow_dispatch with the requested provider.
+    try:
+        plan = resolve_cloud_dispatch_plan(
+            config=ctx.config,
+            workflows=workflows,
+            workflow_key=workflow_key,
+            ref=head_ref,
+            provider_override=provider,
+        )
+    except ValueError as exc:
+        render_error(f"Could not plan dispatch: {exc}")
+        sys.exit(1)
+
+    try:
+        workflow_dispatch(
+            repository=plan.repository,
+            workflow_file=plan.workflow.file,
+            ref=plan.ref,
+            fields=plan.dispatch_fields,
+        )
+    except (subprocess.CalledProcessError, TimeoutError) as exc:
+        render_error(f"workflow_dispatch failed: {exc}")
+        sys.exit(1)
+
+    if ctx.json_mode:
+        ctx.output(
+            "cloud.retarget",
+            {
+                "event": "applied",
+                "pr": pr,
+                "cancelled_job_ids": cancelled,
+                "new_dispatch": plan.to_dict(),
+            },
+        )
+    else:
+        render_message(
+            f"✓ Cancelled {len(cancelled)} job(s); dispatched fresh "
+            f"run with provider={provider}.",
+            style="bold green",
+        )
+
+
+def _pr_fetch(repo_slug: str, pr: int) -> dict[str, Any] | None:
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", str(pr), "--repo", repo_slug,
+             "--json", "headRefName,number,state"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    import json as _json
+
+    try:
+        return _json.loads(result.stdout)
+    except _json.JSONDecodeError:
+        return None
+
+
+def workflow_key_to_file(
+    workflows: dict[str, Any], workflow_key: str
+) -> str:
+    wf = workflows.get(workflow_key)
+    if wf is None:
+        raise click.ClickException(
+            f"Unknown workflow key: {workflow_key}"
+        )
+    return getattr(wf, "file", None) or f"{workflow_key}.yml"
+
+
+def _latest_workflow_run_for_branch(
+    repo_slug: str, workflow_file: str, branch: str
+) -> dict[str, Any] | None:
+    try:
+        result = subprocess.run(
+            ["gh", "run", "list", "--repo", repo_slug,
+             "--workflow", workflow_file, "--branch", branch,
+             "--limit", "1",
+             "--json", "databaseId,status,conclusion,createdAt"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    import json as _json
+
+    try:
+        arr = _json.loads(result.stdout)
+    except _json.JSONDecodeError:
+        return None
+    return arr[0] if arr else None
+
+
+def _find_matching_jobs(
+    repo_slug: str, run_id: int, target: str
+) -> list[dict[str, Any]]:
+    try:
+        result = subprocess.run(
+            ["gh", "run", "view", str(run_id), "--repo", repo_slug,
+             "--json", "jobs"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    if result.returncode != 0:
+        return []
+    import json as _json
+
+    try:
+        data = _json.loads(result.stdout)
+    except _json.JSONDecodeError:
+        return []
+    jobs = data.get("jobs", [])
+    needle = target.lower()
+    return [
+        j for j in jobs
+        if needle in (j.get("name") or "").lower()
+        and j.get("status") in ("queued", "in_progress")
+    ]
+
+
+def _cancel_workflow_job(repo_slug: str, job_id: int) -> bool:
+    """Cancel a single job. Returns True on success, False on any failure."""
+    try:
+        result = subprocess.run(
+            ["gh", "api", "-X", "POST",
+             f"repos/{repo_slug}/actions/jobs/{job_id}/cancel"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+    return result.returncode == 0
+
+
 @cloud.command("status")
 @click.argument("identifier", required=False)
 @click.option("--limit", default=10, show_default=True, help="Number of records to show")

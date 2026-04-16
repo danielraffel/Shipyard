@@ -38,6 +38,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Show cloud defaults | `shipyard cloud defaults --json` |
 | Dispatch a cloud workflow | `shipyard cloud run build --json` |
 | Dispatch only if remote matches HEAD | `shipyard cloud run build --require-sha HEAD --json` |
+| Retarget one lane on an in-flight PR | `shipyard cloud retarget --pr <n> --target macos --provider namespace` (dry-run; add `--apply`) |
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
