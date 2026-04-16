@@ -2370,6 +2370,159 @@ def ship_state_show(ctx: Context, pr: int) -> None:
     render_message(f"  updated_at:     {state.updated_at.isoformat()}")
 
 
+@main.command(name="auto-merge")
+@click.argument("pr", type=int)
+@click.option(
+    "--merge-method",
+    type=click.Choice(["merge", "squash", "rebase"]),
+    default="squash",
+    show_default=True,
+    help="gh pr merge method.",
+)
+@click.option(
+    "--delete-branch/--no-delete-branch",
+    default=True,
+    help="Delete the head branch on successful merge. Default on.",
+)
+@click.option(
+    "--admin/--no-admin",
+    default=False,
+    help=(
+        "Pass --admin to `gh pr merge` to bypass required-review "
+        "protections. Off by default. Use only when the ship state "
+        "already represents full merge evidence."
+    ),
+)
+@click.pass_obj
+def auto_merge(
+    ctx: Context,
+    pr: int,
+    merge_method: str,
+    delete_branch: bool,
+    admin: bool,
+) -> None:
+    """One-shot: merge a PR if all ship-state targets are green.
+
+    Unlike `shipyard ship`, this does NOT dispatch anything — it
+    only *observes* the ship state and acts. Designed for cron /
+    systemd timer / GitHub Actions schedule / anywhere you want an
+    agent-agnostic merge daemon. Idempotent: running it repeatedly
+    while the PR is still in flight is safe and cheap.
+
+    Exit codes:
+      0 — merged (or already merged — we treat that as success so
+          a cron job doesn't alarm when it re-runs after a prior
+          success)
+      1 — ship state shows at least one target failed
+      2 — no ship state for this PR (typo / never shipped)
+      3 — ship is still in flight (retry later)
+
+    Typical cron use:
+
+        */10 * * * * cd /repo && shipyard auto-merge 224 || true
+
+    Recommended pairing:
+      • `shipyard ship --no-wait` (future) or `shipyard cloud run
+        build <branch>` on the CI side to dispatch work.
+      • This command on the merge side, unattended.
+
+    Combined, these decouple dispatch from merge: one agent kicks
+    the validation, a cron / systemd timer lands the PR when
+    green. No need for an always-on conductor to follow every ship.
+    """
+    from shipyard.ship.pr import merge_pr
+
+    state = ctx.ship_state.get(pr)
+    if state is None:
+        if ctx.json_mode:
+            ctx.output(
+                "auto-merge",
+                {"event": "pr-not-found", "pr": pr},
+            )
+        else:
+            render_message(
+                f"PR #{pr}: no ship state found (typo / never shipped).",
+                style="dim",
+            )
+        sys.exit(2)
+
+    verdict = _ship_terminal_verdict(state)
+    if verdict is None:
+        # Still in flight. Surface the current picture and exit 3
+        # so the cron caller knows to retry.
+        if ctx.json_mode:
+            ctx.output(
+                "auto-merge",
+                {
+                    "event": "in-flight",
+                    "pr": pr,
+                    "evidence": dict(state.evidence_snapshot),
+                },
+            )
+        else:
+            render_message(
+                f"PR #{pr}: ship still in flight — "
+                f"evidence {dict(state.evidence_snapshot)}.",
+                style="dim",
+            )
+        sys.exit(3)
+
+    if verdict is False:
+        # A target failed. Loud exit so the cron log grep catches it.
+        failing = [
+            t for t, v in state.evidence_snapshot.items() if v != "pass"
+        ]
+        if ctx.json_mode:
+            ctx.output(
+                "auto-merge",
+                {
+                    "event": "target-failed",
+                    "pr": pr,
+                    "failing_targets": failing,
+                    "evidence": dict(state.evidence_snapshot),
+                },
+            )
+        else:
+            render_error(
+                f"PR #{pr}: refusing to merge — targets failed: "
+                f"{', '.join(failing)}"
+            )
+        sys.exit(1)
+
+    # All green. Attempt the merge.
+    try:
+        merged = merge_pr(
+            pr,
+            method=merge_method,
+            delete_branch=delete_branch,
+            admin=admin,
+        )
+    except TypeError:
+        # Back-compat: older merge_pr signatures didn't accept the
+        # method/admin/delete_branch kwargs. Fall back to the
+        # default shape rather than crashing.
+        merged = merge_pr(pr)
+
+    if ctx.json_mode:
+        ctx.output(
+            "auto-merge",
+            {
+                "event": "merged" if merged else "merge-failed",
+                "pr": pr,
+            },
+        )
+    elif merged:
+        render_message(f"PR #{pr}: merged.", style="bold green")
+    else:
+        render_error(f"PR #{pr}: merge attempt failed.")
+
+    # Archive the state on success so re-runs exit cleanly (PR not
+    # found) rather than re-merging.
+    if merged:
+        ctx.ship_state.archive(pr)
+    sys.exit(0 if merged else 1)
+
+
 @main.command()
 @click.option(
     "--pr",

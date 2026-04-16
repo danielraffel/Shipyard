@@ -79,16 +79,39 @@ def create_pr(
     return get_pr_status(pr_url)
 
 
-def merge_pr(pr_number: int) -> PrInfo:
-    """Merge a PR via gh CLI using merge commit strategy.
+def merge_pr(
+    pr_number: int,
+    *,
+    method: str = "merge",
+    delete_branch: bool = True,
+    admin: bool = False,
+) -> PrInfo:
+    """Merge a PR via gh CLI.
+
+    Parameters
+    ----------
+    pr_number
+        The PR number.
+    method
+        One of "merge", "squash", "rebase". Passed as gh's
+        corresponding flag (e.g. `--squash`).
+    delete_branch
+        Pass `--delete-branch` to gh. Default on.
+    admin
+        Pass `--admin` to bypass required-review protections.
+        Off by default; callers that know the ship evidence is
+        sufficient can opt in.
 
     Returns the PR info after merge.
     """
-    _run_gh([
-        "gh", "pr", "merge", str(pr_number),
-        "--merge",
-        "--delete-branch",
-    ])
+    if method not in ("merge", "squash", "rebase"):
+        raise ValueError(f"Unknown merge method: {method!r}")
+    cmd: list[str] = ["gh", "pr", "merge", str(pr_number), f"--{method}"]
+    if delete_branch:
+        cmd.append("--delete-branch")
+    if admin:
+        cmd.append("--admin")
+    _run_gh(cmd)
 
     return get_pr_status(str(pr_number))
 
