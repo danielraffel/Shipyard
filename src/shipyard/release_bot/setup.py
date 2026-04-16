@@ -291,8 +291,18 @@ def verify_token(repo_slug: str, *, workflow_file: str = "auto-release.yml") -> 
     is strictly after that mark. Otherwise a pre-existing completed
     run would satisfy the poll immediately and produce a stale
     verdict.
+
+    Precision note (#55 P1): GitHub's `createdAt` field is reported
+    at second precision, so we floor the dispatch mark to the same
+    resolution before comparing. Without this, a run created in the
+    same wall-clock second as `dispatch_mark` would have a
+    parsed-microsecond value of zero and would appear "older" than
+    the mark, causing the poll to time out on a run that in fact
+    succeeded.
     """
-    dispatch_mark = datetime.now(timezone.utc)
+    # Floor to second precision to match `gh`'s createdAt resolution.
+    raw_mark = datetime.now(timezone.utc)
+    dispatch_mark = raw_mark.replace(microsecond=0)
     try:
         dispatch = subprocess.run(
             ["gh", "workflow", "run", workflow_file, "--repo", repo_slug,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import urllib.parse
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from shipyard.release_bot.setup import (
     ReleaseBotError,
@@ -16,6 +17,9 @@ from shipyard.release_bot.setup import (
     plan_setup,
     render_pat_creation_url,
 )
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _state(**overrides):
@@ -122,3 +126,59 @@ class TestReleaseBotError:
     def test_detail_defaults_empty(self) -> None:
         e = ReleaseBotError("only msg")
         assert e.detail == ""
+
+
+class TestVerifyTokenDispatchMarkPrecision:
+    """Regression: #55 P1 — createdAt is second-precision; dispatch_mark
+    must be floored to match or same-second runs get ignored."""
+
+    def test_same_second_run_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datetime import datetime, timezone
+
+        from shipyard.release_bot import setup as sut
+
+        # Fixed "now" so the test is deterministic. Pick a moment
+        # with non-zero microseconds to exercise the flooring path.
+        fixed_now = datetime(2026, 4, 16, 12, 0, 0, 500_000, tzinfo=timezone.utc)
+
+        # Subclass datetime so fromisoformat etc. still work — only
+        # `now` is overridden for determinism.
+        class FakeDT(datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return fixed_now
+
+        monkeypatch.setattr(sut, "datetime", FakeDT)
+
+        def fake_dispatch(cmd, *a, **kw):
+            class R:
+                returncode = 0
+                stderr = ""
+                stdout = ""
+            return R
+
+        monkeypatch.setattr(sut.subprocess, "run", fake_dispatch)
+        monkeypatch.setattr(sut, "_default_branch", lambda slug: "main")
+
+        # The simulated "new run" has createdAt at the same wall-clock
+        # second, but microsecond 0 — i.e., strictly less than the
+        # microsecond-precision dispatch_mark would have been. With
+        # the fix, flooring dispatch_mark to 12:00:00.000000 makes
+        # the comparison accept this run.
+        run_created_same_second = datetime(
+            2026, 4, 16, 12, 0, 0, 0, tzinfo=timezone.utc
+        )
+
+        def fake_last_run(slug, workflow):
+            return {
+                "status": "completed",
+                "conclusion": "success",
+                "createdAt": run_created_same_second.isoformat(),
+            }
+
+        monkeypatch.setattr(sut, "_last_workflow_run", fake_last_run)
+
+        conclusion = sut.verify_token("owner/repo")
+        assert conclusion == "success"

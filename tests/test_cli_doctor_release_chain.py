@@ -107,3 +107,22 @@ class TestDoctorReleaseChain:
         assert result.exit_code in (0, 1)
         assert "fallback-token" in result.output
         assert "GITHUB_TOKEN fallback" in result.output
+
+    def test_workflow_success_with_unknown_secret_state(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Reproduces #55 P2: when _check_release_bot_token returns
+        # None (secret listing unreadable — auth/scope issues), we
+        # must NOT cry "fallback-token" — we honestly don't know.
+        _patch(
+            monkeypatch,
+            _detect_repo_slug_or_empty=lambda: "owner/repo",
+            _check_release_bot_token=lambda: None,
+            verify_token=lambda slug, **kw: "success",
+        )
+        result = runner.invoke(main, ["--json", "doctor", "--release-chain"])
+        assert result.exit_code in (0, 1)
+        assert "checkout-ok" in result.output
+        assert "fallback-token" not in result.output
+        # And we call out the caveat so the signal isn't lost.
+        assert "Could not probe" in result.output

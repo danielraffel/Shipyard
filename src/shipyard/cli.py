@@ -544,8 +544,19 @@ def _check_release_chain() -> dict[str, Any] | None:
     # The workflow's `${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}`
     # fallback means a missing PAT still produces a "success" workflow
     # run — success alone isn't proof the bot token works.
-    token_section = _check_release_bot_token() or {}
-    secret_ok = token_section.get("RELEASE_BOT_TOKEN", {}).get("ok") is True
+    #
+    # Three-state logic (#55 P2): _check_release_bot_token() returns
+    # None when the secret listing is unreadable (auth/scope issues),
+    # not when the secret is missing. Those two cases must be handled
+    # distinctly — we can't cry "fallback-token" when we honestly
+    # don't know what the repo's secret state is.
+    token_section = _check_release_bot_token()
+    if token_section is None:
+        secret_state = "unknown"
+    elif token_section.get("RELEASE_BOT_TOKEN", {}).get("ok") is True:
+        secret_state = "present"
+    else:
+        secret_state = "missing"
     try:
         conclusion = verify_token(slug)
     except ReleaseBotError as exc:
@@ -557,7 +568,7 @@ def _check_release_chain() -> dict[str, Any] | None:
             }
         }
     if conclusion == "success":
-        if secret_ok:
+        if secret_state == "present":
             return {
                 "release_chain": {
                     "ok": True,
@@ -568,16 +579,33 @@ def _check_release_chain() -> dict[str, Any] | None:
                     ),
                 }
             }
+        if secret_state == "missing":
+            return {
+                "release_chain": {
+                    "ok": False,
+                    "version": "fallback-token",
+                    "detail": (
+                        "auto-release.yml succeeded but RELEASE_BOT_TOKEN is "
+                        "missing — checkout used the GITHUB_TOKEN fallback. "
+                        "Tag pushes from that token won't trigger "
+                        "release.yml, so binary releases still won't ship. "
+                        "Set the secret via `shipyard release-bot setup`."
+                    ),
+                }
+            }
+        # secret_state == "unknown": the workflow succeeded but we
+        # couldn't probe the secret. Report checkout-ok with a
+        # caveat so the signal isn't lost, but don't claim we
+        # verified the PAT specifically.
         return {
             "release_chain": {
-                "ok": False,
-                "version": "fallback-token",
+                "ok": True,
+                "version": "checkout-ok",
                 "detail": (
-                    "auto-release.yml succeeded but RELEASE_BOT_TOKEN is "
-                    "missing — checkout used the GITHUB_TOKEN fallback. "
-                    "Tag pushes from that token won't trigger release.yml, "
-                    "so binary releases still won't ship. Set the secret "
-                    "via `shipyard release-bot setup`."
+                    "auto-release.yml dispatched and completed; "
+                    "actions/checkout accepted the configured token. "
+                    "(Could not probe which token — gh secret listing "
+                    "unavailable in this environment.)"
                 ),
             }
         }
