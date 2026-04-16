@@ -102,6 +102,87 @@ class TestAppendTrailers:
         with pytest.raises(_TrailerAmendError):
             _append_trailers_to_tip(['Version-Bump: sdk=skip reason="x"'])
 
+    def test_dirty_index_refuses(self, tmp_repo: Path) -> None:
+        # #59 P1: staged changes would be folded into the amend.
+        # We must refuse rather than surprise.
+        (tmp_repo / "b.txt").write_text("b\n")
+        subprocess.check_call(["git", "add", "b.txt"], cwd=tmp_repo)
+        with pytest.raises(_TrailerAmendError) as exc:
+            _append_trailers_to_tip(['Version-Bump: sdk=skip reason="x"'])
+        assert "staged" in str(exc.value).lower()
+        # And the index is still intact for the user to deal with.
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=tmp_repo,
+        )
+        assert result.returncode != 0
+
+    def test_replaces_stale_version_bump_same_surface(
+        self, tmp_repo: Path
+    ) -> None:
+        # #59 P2: if HEAD already has Version-Bump: sdk=patch, adding
+        # Version-Bump: sdk=skip must REPLACE the old line, not stack.
+        # Otherwise scripts/version_bump_check.py's first-match logic
+        # would pick up the stale value.
+        subprocess.check_call(
+            ["git", "commit", "--allow-empty", "-m",
+             "seed\n\nVersion-Bump: sdk=patch reason=\"old\""],
+            cwd=tmp_repo,
+        )
+        _append_trailers_to_tip(['Version-Bump: sdk=skip reason="new"'])
+        body = _tip_body()
+        # Stale one gone.
+        assert 'Version-Bump: sdk=patch' not in body
+        # New one present.
+        assert 'Version-Bump: sdk=skip reason="new"' in body
+        # Only one Version-Bump line for sdk.
+        assert body.count("Version-Bump: sdk") == 1
+
+    def test_keeps_version_bump_for_different_surface(
+        self, tmp_repo: Path
+    ) -> None:
+        # Strip should NOT touch a Version-Bump for a different surface.
+        subprocess.check_call(
+            ["git", "commit", "--allow-empty", "-m",
+             "seed\n\nVersion-Bump: cli=minor reason=\"feat\""],
+            cwd=tmp_repo,
+        )
+        _append_trailers_to_tip(['Version-Bump: sdk=skip reason="docs"'])
+        body = _tip_body()
+        assert 'Version-Bump: cli=minor reason="feat"' in body
+        assert 'Version-Bump: sdk=skip reason="docs"' in body
+
+    def test_replaces_stale_skill_update_same_skill(
+        self, tmp_repo: Path
+    ) -> None:
+        subprocess.check_call(
+            ["git", "commit", "--allow-empty", "-m",
+             "seed\n\nSkill-Update: skip skill=ci reason=\"old\""],
+            cwd=tmp_repo,
+        )
+        _append_trailers_to_tip(
+            ['Skill-Update: skip skill=ci reason="new"']
+        )
+        body = _tip_body()
+        assert 'reason="old"' not in body
+        assert 'reason="new"' in body
+        assert body.count("Skill-Update: skip skill=ci") == 1
+
+    def test_keeps_skill_update_for_different_skill(
+        self, tmp_repo: Path
+    ) -> None:
+        subprocess.check_call(
+            ["git", "commit", "--allow-empty", "-m",
+             "seed\n\nSkill-Update: skip skill=api reason=\"x\""],
+            cwd=tmp_repo,
+        )
+        _append_trailers_to_tip(
+            ['Skill-Update: skip skill=ci reason="y"']
+        )
+        body = _tip_body()
+        assert 'skill=api' in body
+        assert 'skill=ci' in body
+
 
 class TestPrFlagWiring:
     """Prove the flags reach _append_trailers_to_tip with correctly-formed trailer strings."""

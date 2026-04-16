@@ -3002,10 +3002,39 @@ def _append_trailers_to_tip(trailers: list[str]) -> list[str]:
     """Amend HEAD to carry each trailer line (if not already present).
 
     Returns the subset of trailers that were actually added.
-    Skips trailers that already appear verbatim in the commit body.
-    Amends with `git commit --amend -m <new-msg>` — preserves the
-    working tree and staged index. Never pushes.
+
+    Safety properties (#59 P1/P2):
+    1. Refuses to run when the index has staged changes.
+       `git commit --amend` without --only picks up whatever is
+       staged, so letting this proceed with a dirty index would
+       silently fold unrelated staged work into the amended tip
+       commit. We fail fast and tell the user to unstage.
+    2. For Version-Bump trailers we strip any existing trailer
+       naming the same surface before appending the new one, so
+       `--skip-bump sdk` replaces a prior `Version-Bump: sdk=patch`
+       instead of racing it. version_bump_check's surface_trailer_
+       override returns the first match — a stale one would win.
+       Same logic for Skill-Update: replace per-skill rather than
+       stack.
     """
+    # Guard 1: refuse when the index is dirty.
+    try:
+        idx_check = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            capture_output=True,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError) as exc:
+        raise _TrailerAmendError(
+            "Couldn't probe git index — is this a git repo?"
+        ) from exc
+    if idx_check.returncode != 0:
+        raise _TrailerAmendError(
+            "Refusing to amend: staged changes would be folded into "
+            "the tip commit. Commit, unstage (git reset), or stash "
+            "them first, then re-run `shipyard pr` with the shortcut "
+            "flags."
+        )
+
     try:
         current = subprocess.check_output(
             ["git", "log", "-1", "--format=%B"], text=True,
@@ -3022,6 +3051,9 @@ def _append_trailers_to_tip(trailers: list[str]) -> list[str]:
     for trailer in trailers:
         if trailer in new_msg:
             continue
+        # Strip any stale trailer for the same (key, target) —
+        # `Version-Bump: sdk=*` or `Skill-Update: skill=<name>`.
+        new_msg = _strip_conflicting_trailer(new_msg, trailer)
         try:
             new_msg = subprocess.check_output(
                 ["git", "interpret-trailers",
@@ -3041,7 +3073,8 @@ def _append_trailers_to_tip(trailers: list[str]) -> list[str]:
 
     # --allow-empty so an amend whose only change is the message
     # succeeds even when the prior commit's tree was already empty.
-    # Without it, git refuses with "doing so would make it empty."
+    # --only HEAD with no pathspec would require one; the index-
+    # guard above ensures we're safe without it.
     try:
         subprocess.check_call(
             ["git", "commit", "--amend", "--allow-empty", "-m", new_msg],
@@ -3053,6 +3086,52 @@ def _append_trailers_to_tip(trailers: list[str]) -> list[str]:
             "without the trailer shortcut flags."
         ) from exc
     return added
+
+
+def _strip_conflicting_trailer(message: str, new_trailer: str) -> str:
+    """Remove an existing trailer that conflicts with `new_trailer`.
+
+    Trailers are key: value lines near the end of a commit message.
+    `new_trailer` has the form `<Key>: <payload>` where payload
+    starts with either `<surface>=...` (Version-Bump) or `skip
+    skill=<name> ...` (Skill-Update). We identify the distinguishing
+    sub-key (surface or skill name) from the new trailer and strip
+    any existing line whose Key matches AND whose sub-key matches.
+
+    Unrelated trailers are left alone.
+    """
+    if ":" not in new_trailer:
+        return message
+    key, payload = new_trailer.split(":", 1)
+    key = key.strip()
+    payload = payload.strip()
+    target: str | None = None
+    if key == "Version-Bump" and "=" in payload:
+        # `sdk=skip reason="..."` -> surface = "sdk"
+        target = payload.split("=", 1)[0].strip()
+        pattern_prefix = f"{key}: {target}="
+    elif key == "Skill-Update" and "skill=" in payload:
+        # `skip skill=ci reason="..."` -> skill name after "skill="
+        after = payload.split("skill=", 1)[1]
+        target = after.split(None, 1)[0].rstrip(',')
+        pattern_prefix = f"{key}:"  # match any Skill-Update line; we
+        # still filter below by presence of `skill=<target>`
+    else:
+        return message
+
+    kept_lines: list[str] = []
+    for line in message.splitlines():
+        if key == "Version-Bump" and line.startswith(pattern_prefix):
+            continue
+        if key == "Skill-Update" and line.startswith(pattern_prefix) \
+                and f"skill={target}" in line:
+            continue
+        kept_lines.append(line)
+    stripped = "\n".join(kept_lines)
+    # Preserve trailing newline shape from the original message.
+    if message.endswith("\n") and not stripped.endswith("\n"):
+        stripped += "\n"
+    return stripped
 
 
 def _detect_repo_slug_or_empty() -> str:
