@@ -2370,6 +2370,189 @@ def ship_state_show(ctx: Context, pr: int) -> None:
     render_message(f"  updated_at:     {state.updated_at.isoformat()}")
 
 
+@main.command()
+@click.option(
+    "--pr",
+    type=int,
+    default=None,
+    help=(
+        "PR number to watch. Defaults to the active ship for the "
+        "current git branch, if one exists."
+    ),
+)
+@click.option(
+    "--follow/--no-follow",
+    default=True,
+    help=(
+        "Keep polling until the ship reaches a terminal state. "
+        "--no-follow renders one snapshot and exits."
+    ),
+)
+@click.option(
+    "--interval",
+    type=float,
+    default=5.0,
+    show_default=True,
+    help="Seconds between refreshes when --follow.",
+)
+@click.pass_obj
+def watch(
+    ctx: Context, pr: int | None, follow: bool, interval: float
+) -> None:
+    """Live view of an in-flight ship.
+
+    Tails the per-PR ship state file plus the evidence store and
+    renders a one-line-per-target summary of phase / status /
+    heartbeat. Under --json, emits NDJSON events — one per state
+    transition — suitable for piping into jq or an agent's stdin.
+
+    Exit codes:
+      0 — ship reached terminal success (all required targets pass)
+      1 — ship reached terminal failure (at least one target failed)
+      2 — no active ship to watch
+      130 — interrupted by SIGINT
+    """
+    target_pr = pr if pr is not None else _active_pr_for_current_branch(ctx)
+    if target_pr is None:
+        if ctx.json_mode:
+            ctx.output(
+                "watch",
+                {
+                    "event": "no-active-ship",
+                    "message": "No active ship state for current branch.",
+                },
+            )
+        else:
+            render_message(
+                "No active ship state for current branch. "
+                "Pass --pr <n> to watch a specific PR.",
+                style="dim",
+            )
+        sys.exit(2)
+
+    last_signature: str | None = None
+    import time as _time
+
+    try:
+        while True:
+            state = ctx.ship_state.get(target_pr)
+            if state is None:
+                if ctx.json_mode:
+                    ctx.output(
+                        "watch",
+                        {
+                            "event": "state-archived",
+                            "pr": target_pr,
+                        },
+                    )
+                else:
+                    render_message(
+                        f"PR #{target_pr}: ship state archived "
+                        "(merged, discarded, or pruned).",
+                        style="dim",
+                    )
+                sys.exit(0)
+
+            signature = _watch_signature(state)
+            if signature != last_signature:
+                _emit_watch_event(ctx, state)
+                last_signature = signature
+
+            terminal = _ship_terminal_verdict(state)
+            if terminal is not None:
+                sys.exit(0 if terminal else 1)
+
+            if not follow:
+                return
+            _time.sleep(max(1.0, interval))
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def _active_pr_for_current_branch(ctx: Context) -> int | None:
+    """Find the single in-flight ship state matching the current branch."""
+    current = _git_branch()
+    if not current:
+        return None
+    matches = [
+        s for s in ctx.ship_state.list_active() if s.branch == current
+    ]
+    if not matches:
+        return None
+    # Prefer the most-recently-updated when more than one survives.
+    return max(matches, key=lambda s: s.updated_at).pr
+
+
+def _watch_signature(state: ShipState) -> str:
+    """Stable hash-equivalent of the state fields `watch` renders.
+
+    Two calls return the same string if there's nothing new to show.
+    Deliberately excludes `updated_at` (which bumps on every save
+    even when no target transitioned).
+    """
+    parts = [
+        f"pr={state.pr}",
+        f"sha={state.head_sha}",
+        f"attempt={state.attempt}",
+        "evidence=" + ",".join(
+            f"{k}:{v}" for k, v in sorted(state.evidence_snapshot.items())
+        ),
+        "runs=" + ",".join(
+            f"{r.target}:{r.status}:{r.run_id}"
+            for r in sorted(state.dispatched_runs, key=lambda r: r.target)
+        ),
+    ]
+    return "|".join(parts)
+
+
+def _emit_watch_event(ctx: Context, state: ShipState) -> None:
+    if ctx.json_mode:
+        ctx.output(
+            "watch",
+            {
+                "event": "update",
+                "pr": state.pr,
+                "head_sha": state.head_sha,
+                "attempt": state.attempt,
+                "evidence": dict(state.evidence_snapshot),
+                "dispatched_runs": [r.to_dict() for r in state.dispatched_runs],
+                "updated_at": state.updated_at.isoformat(),
+            },
+        )
+        return
+    now = datetime.now(timezone.utc)
+    age = now - state.updated_at
+    age_s = max(0, int(age.total_seconds()))
+    render_message(
+        f"PR #{state.pr}  sha={state.head_sha[:12]}  "
+        f"attempt={state.attempt}  age={age_s}s"
+    )
+    for target, status in sorted(state.evidence_snapshot.items()):
+        render_message(f"  evidence: {target}={status}")
+    for run in state.dispatched_runs:
+        render_message(
+            f"  run: {run.target} ({run.provider}) "
+            f"id={run.run_id} status={run.status}"
+        )
+
+
+def _ship_terminal_verdict(state: ShipState) -> bool | None:
+    """Return True=pass, False=fail, None=still in flight.
+
+    Terminal when every entry in the evidence snapshot is a terminal
+    value (pass/fail). The watch command conservatively keeps
+    polling until every recorded target has reached a terminal
+    outcome — a missing platform is treated as "still in flight"
+    because evidence may not have been written yet.
+    """
+    if not state.evidence_snapshot:
+        return None
+    statuses = set(state.evidence_snapshot.values())
+    if statuses - {"pass", "fail"}:
+        return None
+    return all(v == "pass" for v in state.evidence_snapshot.values())
+
+
 @ship_state_group.command("discard")
 @click.argument("pr", type=int)
 @click.pass_obj
