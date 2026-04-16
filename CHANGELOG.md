@@ -4,6 +4,8 @@ All notable user-facing changes to the Shipyard CLI are recorded here.
 Plugin changes track in `.claude-plugin/plugin.json`; the two surfaces
 are independently versioned.
 
+## [0.5.0]
+
 ## [0.4.0]
 
 ## [0.3.0] — 2026-04-15
