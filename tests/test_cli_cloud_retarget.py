@@ -364,6 +364,95 @@ class TestRetargetCli:
         assert result.exit_code == 1
         assert "No jobs matching" in result.output
 
+    def test_dispatch_ref_matches_dispatch_repo_head(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #67 P1: if the local checkout's branch differs from the
+        # PR's actual head ref on the dispatch repo, the dispatch
+        # must target the dispatch-repo head ref — NOT the local
+        # branch we probed as a hint.
+        from types import SimpleNamespace
+
+        captured: dict[str, Any] = {"plan_refs": [], "dispatch_ref": None}
+
+        monkeypatch.setattr(
+            "shipyard.cli._detect_repo_slug_or_empty",
+            lambda: "owner/repo",
+        )
+        monkeypatch.setattr("shipyard.cli._git_branch", lambda: "local-branch")
+        monkeypatch.setattr(
+            "shipyard.cli.discover_workflows",
+            lambda: {"build": SimpleNamespace(file="build.yml")},
+        )
+        monkeypatch.setattr(
+            "shipyard.cli.default_workflow_key",
+            lambda cfg, workflows: "build",
+        )
+
+        # Local origin returns a DIFFERENT branch than the dispatch
+        # repo's actual PR head. The dispatch repo has the truth.
+        def fake_pr_fetch(repo: str, pr: int) -> dict[str, Any]:
+            if repo == "owner/repo":
+                return {"headRefName": "local-branch"}
+            return {"headRefName": "dispatch-repo-branch"}
+
+        monkeypatch.setattr("shipyard.cli._pr_fetch", fake_pr_fetch)
+        monkeypatch.setattr(
+            "shipyard.cli._latest_workflow_run_for_branch",
+            lambda repo, file, branch: {"databaseId": 555},
+        )
+        monkeypatch.setattr(
+            "shipyard.cli._find_matching_jobs",
+            lambda repo, run_id, target: [
+                {"databaseId": 777, "name": "macOS"},
+            ],
+        )
+        monkeypatch.setattr(
+            "shipyard.cli._cancel_workflow_job",
+            lambda repo, job_id: True,
+        )
+
+        def fake_resolve(**kw: Any) -> Any:
+            captured["plan_refs"].append(kw.get("ref"))
+            return SimpleNamespace(
+                repository="upstream/repo",
+                ref=kw.get("ref"),
+                workflow=SimpleNamespace(
+                    key="build", file="build.yml", name="Build"
+                ),
+                provider="namespace",
+                dispatch_fields={},
+                to_dict=lambda: {},
+            )
+
+        monkeypatch.setattr(
+            "shipyard.cli.resolve_cloud_dispatch_plan", fake_resolve
+        )
+
+        def fake_dispatch(**kw: Any) -> None:
+            captured["dispatch_ref"] = kw.get("ref")
+
+        monkeypatch.setattr("shipyard.cli.workflow_dispatch", fake_dispatch)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "cloud", "retarget",
+                "--pr", "10",
+                "--target", "macos",
+                "--provider", "namespace",
+                "--apply",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # First resolve used the local hint; second used the
+        # authoritative dispatch-repo head ref.
+        assert "local-branch" in captured["plan_refs"]
+        assert "dispatch-repo-branch" in captured["plan_refs"]
+        # The actual dispatch targets the dispatch-repo branch.
+        assert captured["dispatch_ref"] == "dispatch-repo-branch"
+
     def test_cross_repo_uses_dispatch_repo_for_lookups(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

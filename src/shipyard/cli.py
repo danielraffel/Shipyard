@@ -1773,26 +1773,29 @@ def cloud_retarget(
         render_error("No workflows discovered")
         sys.exit(1)
 
-    # Resolve the dispatch plan FIRST so `plan.repository` can drive
-    # every subsequent gh call (PR lookup, run discovery, job
-    # cancellation). The earlier implementation used the local git
-    # origin for lookups and `plan.repository` only for dispatch —
-    # in cross-repo setups (consumer projects whose workflows live
-    # in a sibling repo) that would query/cancel in one repo while
-    # dispatching in another. #66 P1.
+    # Two-phase plan resolution (#67 P1):
+    # Phase A — resolve a placeholder plan just to learn which repo
+    #   to dispatch against. The ref is a best-effort hint from the
+    #   local checkout; we do NOT trust it for the actual dispatch.
+    # Phase B — after we fetch the PR's true headRefName from the
+    #   dispatch repo, re-resolve the plan with that authoritative
+    #   ref so `plan.ref` matches the branch whose jobs we
+    #   cancelled. Without this, cross-repo/fork callers could
+    #   cancel jobs on the right branch but dispatch against the
+    #   wrong one (often the local branch or literal "HEAD").
     local_slug = _detect_repo_slug_or_empty()
-    head_ref_hint: str | None = None
+    provisional_ref = _git_branch() or "HEAD"
     if local_slug:
-        pr_state = _pr_fetch(local_slug, pr)
-        if pr_state is not None:
-            head_ref_hint = pr_state.get("headRefName")
+        probe = _pr_fetch(local_slug, pr)
+        if probe is not None:
+            provisional_ref = probe.get("headRefName") or provisional_ref
 
     try:
         plan = resolve_cloud_dispatch_plan(
             config=ctx.config,
             workflows=workflows,
             workflow_key=workflow_key,
-            ref=head_ref_hint or _git_branch() or "HEAD",
+            ref=provisional_ref,
             provider_override=provider,
         )
     except ValueError as exc:
@@ -1807,9 +1810,9 @@ def cloud_retarget(
         )
         sys.exit(1)
 
-    # Re-fetch the PR against the dispatch repo to resolve the
-    # correct head ref (covers the case where the caller is running
-    # from a fork whose remote name differs from the dispatch repo).
+    # Fetch the PR against the dispatch repo to resolve the
+    # authoritative head ref — the branch whose jobs we'll cancel
+    # and which the fresh dispatch must target.
     pr_state = _pr_fetch(dispatch_repo, pr)
     if pr_state is None:
         render_error(
@@ -1820,6 +1823,21 @@ def cloud_retarget(
     if not head_ref:
         render_error(f"PR #{pr}: no headRefName in gh response.")
         sys.exit(1)
+
+    # Re-resolve the plan with the authoritative head_ref so
+    # plan.ref lines up with the branch we're operating on.
+    if head_ref != provisional_ref:
+        try:
+            plan = resolve_cloud_dispatch_plan(
+                config=ctx.config,
+                workflows=workflows,
+                workflow_key=workflow_key,
+                ref=head_ref,
+                provider_override=provider,
+            )
+        except ValueError as exc:
+            render_error(f"Could not re-plan with dispatch-repo ref: {exc}")
+            sys.exit(1)
 
     # Find the latest run for this workflow on the PR's branch, in
     # the dispatch repo.
