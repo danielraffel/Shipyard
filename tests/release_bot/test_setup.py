@@ -151,6 +151,18 @@ class TestVerifyTokenRunIdCorrelation:
         monkeypatch.setattr(sut.subprocess, "run", fake_run)
         monkeypatch.setattr(sut, "_default_branch", lambda slug: "main")
 
+    def _stub_baseline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        baseline: tuple[bool, int | None],
+    ) -> None:
+        from shipyard.release_bot import setup as sut
+
+        monkeypatch.setattr(
+            sut, "_fetch_baseline_run_id",
+            lambda slug, workflow: baseline,
+        )
+
     def test_stale_same_second_run_is_ignored(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -160,16 +172,13 @@ class TestVerifyTokenRunIdCorrelation:
         from shipyard.release_bot import setup as sut
 
         self._stub_dispatch(monkeypatch)
+        self._stub_baseline(monkeypatch, (True, 100))
 
         call_count = {"n": 0}
 
         def fake_last_run(slug, workflow):
             call_count["n"] += 1
-            if call_count["n"] == 1:
-                # Pre-dispatch baseline call.
-                return {"databaseId": 100, "status": "completed",
-                        "conclusion": "success"}
-            if call_count["n"] <= 3:
+            if call_count["n"] <= 2:
                 # First two polls still show the stale run.
                 return {"databaseId": 100, "status": "completed",
                         "conclusion": "failure"}
@@ -183,8 +192,7 @@ class TestVerifyTokenRunIdCorrelation:
 
         conclusion = sut.verify_token("owner/repo")
         assert conclusion == "success"
-        # Baseline + stale-stall (×2) + fresh, at minimum.
-        assert call_count["n"] >= 4
+        assert call_count["n"] >= 3  # two stalls + fresh
 
     def test_fresh_run_with_higher_id_accepted(
         self, monkeypatch: pytest.MonkeyPatch
@@ -192,18 +200,15 @@ class TestVerifyTokenRunIdCorrelation:
         from shipyard.release_bot import setup as sut
 
         self._stub_dispatch(monkeypatch)
+        self._stub_baseline(monkeypatch, (True, 50))
 
-        call_count = {"n": 0}
-
-        def fake_last_run(slug, workflow):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                return {"databaseId": 50, "status": "completed",
-                        "conclusion": "failure"}
-            return {"databaseId": 51, "status": "completed",
-                    "conclusion": "success"}
-
-        monkeypatch.setattr(sut, "_last_workflow_run", fake_last_run)
+        monkeypatch.setattr(
+            sut, "_last_workflow_run",
+            lambda slug, workflow: {
+                "databaseId": 51, "status": "completed",
+                "conclusion": "success",
+            },
+        )
         import time as real_time
         monkeypatch.setattr(real_time, "sleep", lambda s: None)
 
@@ -213,22 +218,45 @@ class TestVerifyTokenRunIdCorrelation:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Fresh repo — no baseline. verify_token should accept the
-        # first completed run it sees (any valid ID is > None baseline).
+        # first completed run it sees.
         from shipyard.release_bot import setup as sut
 
         self._stub_dispatch(monkeypatch)
+        self._stub_baseline(monkeypatch, (True, None))
 
-        call_count = {"n": 0}
-
-        def fake_last_run(slug, workflow):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                return None  # baseline: no prior run exists
-            return {"databaseId": 1, "status": "completed",
-                    "conclusion": "success"}
-
-        monkeypatch.setattr(sut, "_last_workflow_run", fake_last_run)
+        monkeypatch.setattr(
+            sut, "_last_workflow_run",
+            lambda slug, workflow: {
+                "databaseId": 1, "status": "completed",
+                "conclusion": "success",
+            },
+        )
         import time as real_time
         monkeypatch.setattr(real_time, "sleep", lambda s: None)
 
         assert sut.verify_token("owner/repo") == "success"
+
+    def test_baseline_probe_failure_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Reproduces #57 P1: when the pre-dispatch baseline probe
+        # fails (gh missing/unparseable), verify_token must refuse
+        # rather than fall through to `baseline_id is None → accept
+        # anything` which would surface stale runs as verdicts.
+        from shipyard.release_bot import setup as sut
+
+        self._stub_dispatch(monkeypatch)
+        self._stub_baseline(monkeypatch, (False, None))
+
+        def must_not_run(*a, **kw):
+            raise AssertionError(
+                "poll loop should not be reached when baseline probe failed"
+            )
+
+        monkeypatch.setattr(sut, "_last_workflow_run", must_not_run)
+
+        import pytest
+
+        with pytest.raises(ReleaseBotError) as exc:
+            sut.verify_token("owner/repo")
+        assert "baseline" in str(exc.value).lower()

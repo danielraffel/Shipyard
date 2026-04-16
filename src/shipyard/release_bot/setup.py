@@ -296,8 +296,23 @@ def verify_token(repo_slug: str, *, workflow_file: str = "auto-release.yml") -> 
     *before* dispatch, and only accept a completed run whose ID is
     strictly greater. Run IDs are monotonically increasing within a
     repo, so this is immune to timestamp aliasing entirely.
+
+    Baseline integrity (#57 P1): the baseline probe must distinguish
+    "no prior runs exist" (safe — any dispatched run's ID will be
+    strictly greater) from "couldn't query `gh run list`" (unsafe —
+    we'd accept any ID the next poll surfaces, including stale ones).
+    `_fetch_baseline_run_id` returns a (ok, id) tuple so these two
+    cases are separated; on query failure we refuse to verify.
     """
-    baseline_id = _last_workflow_run_id(repo_slug, workflow_file)
+    baseline_ok, baseline_id = _fetch_baseline_run_id(
+        repo_slug, workflow_file
+    )
+    if not baseline_ok:
+        raise ReleaseBotError(
+            "Couldn't establish a run-ID baseline before dispatch.",
+            "gh run list failed or was unparseable; verify_token can't "
+            "correlate novelty without it. Retry once gh is reachable.",
+        )
     try:
         dispatch = subprocess.run(
             ["gh", "workflow", "run", workflow_file, "--repo", repo_slug,
@@ -343,22 +358,46 @@ def verify_token(repo_slug: str, *, workflow_file: str = "auto-release.yml") -> 
     )
 
 
-def _last_workflow_run_id(
+def _fetch_baseline_run_id(
     repo_slug: str, workflow_file: str
-) -> int | None:
-    """Return the databaseId of the most recent run for this workflow.
+) -> tuple[bool, int | None]:
+    """Return (probe_succeeded, latest_run_id) for novelty correlation.
 
-    None if `gh` is unavailable, the workflow has no runs yet, or
-    the response is unparseable.
+    Distinguishes three outcomes that verify_token must handle
+    differently:
+      (True,  None) — probe succeeded, workflow has no prior runs.
+                      Any dispatched run's ID will be > None.
+      (True,  N)    — probe succeeded, latest prior run is N.
+                      Accept only runs with ID > N.
+      (False, None) — probe itself failed (gh unavailable, auth,
+                      unparseable). Caller must refuse to verify;
+                      without a reliable baseline a stale run
+                      could be mistaken for the dispatched one.
     """
-    latest = _last_workflow_run(repo_slug, workflow_file)
-    if not latest:
-        return None
-    raw = latest.get("databaseId")
     try:
-        return int(raw) if raw is not None else None
+        result = subprocess.run(
+            ["gh", "run", "list", "--workflow", workflow_file,
+             "--repo", repo_slug, "--limit", "1",
+             "--json", "databaseId,status,conclusion,createdAt"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return (False, None)
+    if result.returncode != 0:
+        return (False, None)
+    try:
+        arr = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return (False, None)
+    if not arr:
+        return (True, None)  # genuinely no prior runs
+    raw = arr[0].get("databaseId")
+    try:
+        return (True, int(raw)) if raw is not None else (True, None)
     except (TypeError, ValueError):
-        return None
+        return (False, None)
 
 
 # ── Internals ──────────────────────────────────────────────────────────────
