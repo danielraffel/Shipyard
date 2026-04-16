@@ -2413,12 +2413,50 @@ def ship_state_discard(ctx: Context, pr: int) -> None:
     is_flag=True,
     help="Forwarded to `shipyard ship`.",
 )
+@click.option(
+    "--skip-bump",
+    metavar="SURFACE",
+    multiple=True,
+    help=(
+        "Shorthand: write a `Version-Bump: <surface>=skip reason=…` "
+        "trailer onto the tip commit instead of remembering the exact "
+        "format. Pair with --bump-reason. Repeatable for multiple "
+        "surfaces. Amends the tip commit (not pushed yet)."
+    ),
+)
+@click.option(
+    "--bump-reason",
+    default=None,
+    help="Reason string used with --skip-bump. Required when --skip-bump is set.",
+)
+@click.option(
+    "--skip-skill-update",
+    metavar="SKILL",
+    multiple=True,
+    help=(
+        "Shorthand: write a `Skill-Update: skip skill=<name> reason=…` "
+        "trailer onto the tip commit. Pair with --skill-reason. "
+        "Repeatable."
+    ),
+)
+@click.option(
+    "--skill-reason",
+    default=None,
+    help=(
+        "Reason string used with --skip-skill-update. Required when "
+        "--skip-skill-update is set."
+    ),
+)
 @click.pass_context
 def pr(
     ctx: click.Context,
     base: str,
     apply_bumps: bool,
     allow_unreachable_targets: bool,
+    skip_bump: tuple[str, ...],
+    bump_reason: str | None,
+    skip_skill_update: tuple[str, ...],
+    skill_reason: str | None,
 ) -> None:
     """One-shot push-a-PR: skill-sync + version-bump + ship.
 
@@ -2431,6 +2469,34 @@ def pr(
         4. invokes `shipyard ship` for push + PR + validate + merge
     """
     import shutil
+
+    # Trailer shortcuts: materialize Version-Bump / Skill-Update trailers
+    # onto the tip commit *before* gate scripts run, since those scripts
+    # read trailers off HEAD to decide whether a skip is authorized.
+    if skip_bump and not bump_reason:
+        render_error("--skip-bump requires --bump-reason \"...\".")
+        sys.exit(2)
+    if skip_skill_update and not skill_reason:
+        render_error("--skip-skill-update requires --skill-reason \"...\".")
+        sys.exit(2)
+    trailers_to_add: list[str] = []
+    for surface in skip_bump:
+        trailers_to_add.append(
+            f'Version-Bump: {surface}=skip reason="{bump_reason}"'
+        )
+    for skill in skip_skill_update:
+        trailers_to_add.append(
+            f'Skill-Update: skip skill={skill} reason="{skill_reason}"'
+        )
+    if trailers_to_add:
+        try:
+            added = _append_trailers_to_tip(trailers_to_add)
+        except _TrailerAmendError as exc:
+            render_error(str(exc))
+            sys.exit(2)
+        if added:
+            for line in added:
+                click.echo(f"▸ Added trailer: {line}")
 
     repo_root = subprocess.check_output(
         ["git", "rev-parse", "--show-toplevel"], text=True
@@ -2923,6 +2989,70 @@ def _remote_ref_sha(repo_slug: str, ref: str) -> str | None:
         return None
     sha = result.stdout.strip().lower()
     return sha if len(sha) == 40 else None
+
+
+class _TrailerAmendError(Exception):
+    """Raised when the tip commit can't be amended with a trailer.
+
+    Message is already user-friendly — the CLI renders str(exc) directly.
+    """
+
+
+def _append_trailers_to_tip(trailers: list[str]) -> list[str]:
+    """Amend HEAD to carry each trailer line (if not already present).
+
+    Returns the subset of trailers that were actually added.
+    Skips trailers that already appear verbatim in the commit body.
+    Amends with `git commit --amend -m <new-msg>` — preserves the
+    working tree and staged index. Never pushes.
+    """
+    try:
+        current = subprocess.check_output(
+            ["git", "log", "-1", "--format=%B"], text=True,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise _TrailerAmendError(
+            "Couldn't read tip commit message (is this a git repo "
+            "with at least one commit?)."
+        ) from exc
+
+    new_msg = current
+    added: list[str] = []
+    for trailer in trailers:
+        if trailer in new_msg:
+            continue
+        try:
+            new_msg = subprocess.check_output(
+                ["git", "interpret-trailers",
+                 "--if-exists", "addIfDifferent",
+                 "--trailer", trailer],
+                input=new_msg, text=True, stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise _TrailerAmendError(
+                f"git interpret-trailers rejected trailer '{trailer}'. "
+                "Check the trailer format."
+            ) from exc
+        added.append(trailer)
+
+    if not added:
+        return []
+
+    # --allow-empty so an amend whose only change is the message
+    # succeeds even when the prior commit's tree was already empty.
+    # Without it, git refuses with "doing so would make it empty."
+    try:
+        subprocess.check_call(
+            ["git", "commit", "--amend", "--allow-empty", "-m", new_msg],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise _TrailerAmendError(
+            "git commit --amend failed. Commit manually or re-run "
+            "without the trailer shortcut flags."
+        ) from exc
+    return added
 
 
 def _detect_repo_slug_or_empty() -> str:
