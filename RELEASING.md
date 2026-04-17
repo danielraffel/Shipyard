@@ -72,6 +72,28 @@ Normal releases are automatic. You don't call any script.
 
 Plugin-version bumps (`.claude-plugin/plugin.json`) are intentionally **not** tagged — plugin files are delivered from git, not from the binary. Bumping the plugin version still requires a PR and goes through the same gate, but it doesn't cut a binary release.
 
+## Patch-level auto-bumps (rollup gap fix)
+
+By default the version-bump gate only auto-applies **minor** and **major** verdicts. Patch-level changes (internal fixes, Codex-review cleanups) land as "patch-suggested" — advisory only. In a run of fix-only PRs, nothing gets auto-released until a minor-class change happens to merge.
+
+Enable per-surface auto-patch-apply in `scripts/versioning.json`:
+
+```jsonc
+{
+  "surfaces": {
+    "cli": {
+      "auto_apply_patch": true    // fix-only PRs now bump + release
+    }
+  }
+}
+```
+
+When true, `apply_bumps()` treats patch verdicts like minor/major: rewrites the version files, commits, pushes. The tag-release chain fires normally.
+
+When false (default), `shipyard doctor` surfaces the drift: latest `vN.N.N` tag vs count of CLI-surface commits since that tag on main. At or above the threshold (default 3) it reports `tag_drift` as not-ok so maintainers know to bump before the gap widens. Shipyard's own repo has `auto_apply_patch: true` on `cli`; the plugin surface stays off (git-delivered, no binary).
+
+See issue #70 for the design discussion.
+
 ## When to go manual
 
 Only when the automatic flow is genuinely unavailable:

@@ -436,6 +436,13 @@ def doctor(ctx: Context, release_chain: bool) -> None:
     if release_token_section:
         checks["Release pipeline"] = release_token_section
 
+    # Tag drift — surfaces the #70 rollup gap. Always best-effort;
+    # silently skipped outside a git repo or when no vN.N.N tag
+    # exists yet.
+    drift_section = _check_tag_drift()
+    if drift_section:
+        checks.setdefault("Release pipeline", {}).update(drift_section)
+
     if release_chain:
         chain_section = _check_release_chain()
         if chain_section:
@@ -522,6 +529,80 @@ def _check_release_bot_token() -> dict[str, Any] | None:
                 f"Contents=Read and write. Then github.com/{repo.slug}/settings/"
                 f"secrets/actions → New repository secret named RELEASE_BOT_TOKEN. "
                 f"See RELEASING.md for the full walkthrough."
+            ),
+        }
+    }
+
+
+def _check_tag_drift(
+    *, warn_threshold: int = 3
+) -> dict[str, Any] | None:
+    """Count CLI-surface commits on HEAD since the latest vN.N.N tag.
+
+    Reports `no-drift` when count == 0, `tag-drift` (ok=False) when
+    count >= warn_threshold. Between 1 and threshold-1 returns a
+    quiet informational entry. Returns None if git calls fail (not
+    a git repo, no tags, etc.) so doctor stays non-blocking.
+
+    Closes the rollup-gap half of #70: even when auto_apply_patch
+    is off (or the gate was bypassed for other reasons), maintainers
+    see the drift explicitly rather than finding it via "why is
+    production still on the old version?".
+    """
+    try:
+        latest_tag = subprocess.run(
+            ["git", "describe", "--tags", "--abbrev=0",
+             "--match", "v[0-9]*"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if latest_tag.returncode != 0 or not latest_tag.stdout.strip():
+        return None
+    tag = latest_tag.stdout.strip()
+    try:
+        count_out = subprocess.run(
+            ["git", "rev-list", "--count",
+             f"{tag}..HEAD", "--", "src/shipyard/"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if count_out.returncode != 0:
+        return None
+    try:
+        count = int(count_out.stdout.strip())
+    except ValueError:
+        return None
+
+    if count == 0:
+        return {
+            "tag_drift": {
+                "ok": True,
+                "version": f"up-to-date ({tag})",
+                "detail": "No CLI-surface commits since the latest tag.",
+            }
+        }
+    if count < warn_threshold:
+        return {
+            "tag_drift": {
+                "ok": True,
+                "version": f"{count} commit(s) ahead of {tag}",
+                "detail": (
+                    "A release would pick up these changes. Under threshold "
+                    f"({warn_threshold}), so advisory only."
+                ),
+            }
+        }
+    return {
+        "tag_drift": {
+            "ok": False,
+            "version": f"{count} commits ahead of {tag}",
+            "detail": (
+                "User-visible changes have accumulated without a release. "
+                "Either bump via `shipyard pr`, or enable `auto_apply_patch` "
+                "in scripts/versioning.json for the CLI surface so future "
+                "fix-only PRs auto-bump patch. See issue #70."
             ),
         }
     }

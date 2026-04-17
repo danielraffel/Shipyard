@@ -37,8 +37,10 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # ── Types ───────────────────────────────────────────────────────────────
 
@@ -63,6 +65,12 @@ class Surface:
     public_api_paths: list[str] = field(default_factory=list)
     internal_only_paths: list[str] = field(default_factory=list)
     changelog: str | None = None
+    # When True, `apply_bumps()` auto-applies patch-level verdicts
+    # in addition to minor/major. Default False preserves the
+    # advisory-patch behavior for projects that want manual control
+    # over when a patch release is cut. See issue #70 for the
+    # rollup-gap discussion this flag addresses.
+    auto_apply_patch: bool = False
 
 
 @dataclass
@@ -228,6 +236,7 @@ def load_config(path: Path) -> Config:
             public_api_paths=entry.get("public_api_paths", []),
             internal_only_paths=entry.get("internal_only_paths", []),
             changelog=entry.get("changelog"),
+            auto_apply_patch=bool(entry.get("auto_apply_patch", False)),
         ))
     trailers = data.get("trailers") or {}
     return Config(
@@ -618,10 +627,19 @@ def apply_bumps(
     base: str,
     repo: Path,
 ) -> list[str]:
-    """Write new versions for surfaces that need a bump and aren't already bumped."""
+    """Write new versions for surfaces that need a bump and aren't already bumped.
+
+    By default skips "patch" verdicts (advisory only). When a
+    surface sets `auto_apply_patch: true` in versioning.json, patch
+    verdicts are also written — closes the rollup gap where fix-
+    only PRs accumulated on main without triggering a release.
+    See issue #70.
+    """
     edited: list[str] = []
     for v in verdicts:
-        if v.final_level in ("none", "patch"):
+        if v.final_level == "none":
+            continue
+        if v.final_level == "patch" and not v.surface.auto_apply_patch:
             continue
         # Skip if ALL version files are already at the target; otherwise
         # apply to every file (keeps plugin.json and marketplace.json in
