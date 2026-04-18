@@ -17,9 +17,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Pinned so upgrading shipyard doesn't accidentally drift consumers.
-# Bumped in the same PR as the CLI minor that introduces the hook.
-DEFAULT_SHIPYARD_VERSION = "0.9.0"
+from shipyard import __version__
+
+# Pin to whichever shipyard version is generating the file. Re-running
+# `shipyard release-bot hook install` after upgrading the local CLI
+# rewrites the workflow with the new version — explicit re-install is
+# the upgrade path, not silent drift.
+DEFAULT_SHIPYARD_VERSION = __version__
 
 INSTALL_URL = "https://generouscorp.com/Shipyard/install.sh"
 
@@ -82,7 +86,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "{o.install_url}" | SHIPYARD_VERSION="$SHIPYARD_VERSION" sh
+          # Pipe to bash, not sh — install.sh uses `set -o pipefail`,
+          # which dash (Ubuntu's /bin/sh) doesn't support. Caught
+          # dogfooding shipyard's own first post-tag-sync run.
+          curl -fsSL "{o.install_url}" | SHIPYARD_VERSION="$SHIPYARD_VERSION" bash
           shipyard --version
 
       - name: Run post-tag docs sync

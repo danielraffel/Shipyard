@@ -20,7 +20,7 @@ permissions:
   contents: write
 
 env:
-  SHIPYARD_VERSION: "0.9.0"
+  SHIPYARD_VERSION: "0.10.0"
 
 jobs:
   sync:
@@ -43,7 +43,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "https://generouscorp.com/Shipyard/install.sh" | SHIPYARD_VERSION="$SHIPYARD_VERSION" sh
+          # Pipe to bash, not sh — install.sh uses `set -o pipefail`,
+          # which dash (Ubuntu's /bin/sh) doesn't support.
+          curl -fsSL "https://generouscorp.com/Shipyard/install.sh" | SHIPYARD_VERSION="$SHIPYARD_VERSION" bash
           shipyard --version
 
       - name: Run post-tag docs sync

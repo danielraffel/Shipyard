@@ -54,3 +54,32 @@ def test_render_stable_line_count() -> None:
     # If this trips legitimately, bump the number and note the change.
     assert body.count("\n") > 20
     assert body.count("\n") < 60
+
+
+def test_install_step_pipes_to_bash_not_sh() -> None:
+    """Regression guard: install.sh uses `set -o pipefail`, which dash
+    (Ubuntu's /bin/sh) rejects. The install pipe MUST end in `bash`.
+    """
+    body = render_workflow()
+    assert "| SHIPYARD_VERSION=" in body
+    assert " bash\n" in body
+    # No bare ` sh\n` in the install line — would silently regress.
+    install_lines = [
+        line for line in body.splitlines() if "SHIPYARD_VERSION=" in line and "curl" in line
+    ]
+    assert install_lines, "install line not found in rendered workflow"
+    for line in install_lines:
+        assert line.rstrip().endswith("bash"), (
+            f"install pipe must end in bash, got: {line!r}"
+        )
+
+
+def test_default_shipyard_version_tracks_package_version() -> None:
+    """Avoids the chicken-and-egg where a stale hardcoded version
+    pins consumers to a previous (possibly broken) shipyard release.
+    """
+    from shipyard import __version__
+
+    from shipyard.changelog.workflow import DEFAULT_SHIPYARD_VERSION
+
+    assert DEFAULT_SHIPYARD_VERSION == __version__

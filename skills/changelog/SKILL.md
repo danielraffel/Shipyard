@@ -66,6 +66,12 @@ Exit codes: `0` clean, `1` drift, `2` config missing / tag missing.
 - **Hook only** — point `command` at your own script, keep shipyard's rebase-retry + trailer plumbing.
 - **Generator only** — run `shipyard changelog regenerate` from your own workflow if you don't want shipyard to own the committing side.
 
+## Workflow-file upgrades are explicit
+
+The shipped `.github/workflows/post-tag-sync.yml` pins `SHIPYARD_VERSION` to whatever shipyard rendered it. Re-run `shipyard release-bot hook install` after upgrading the local CLI to refresh the pin — otherwise the workflow keeps installing the older version even after you upgrade. Pinning is intentional (consumer protection from drift); explicit re-install is the upgrade path.
+
+The install step pipes to `bash`, not `sh` — `dash` (Ubuntu's `/bin/sh`) rejects `set -o pipefail` used by the install script. Tests guard this.
+
 ## Skill-sync gotcha
 
 Anything under `src/shipyard/changelog/**` or `commands/changelog.md` touches this skill's path map. Update this file in the same PR, or pass `--skip-skill-update changelog --skill-reason "..."` to `shipyard pr` (only when the change is genuinely mechanical).
