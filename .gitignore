@@ -34,5 +34,8 @@ Thumbs.db
 # Shipyard local state
 .shipyard.local/
 
+# Shipyard changelog backup (created by `shipyard changelog init`)
+CHANGELOG.md.pre-shipyard.bak
+
 # PyInstaller
 *.spec

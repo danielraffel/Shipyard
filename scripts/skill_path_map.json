@@ -17,6 +17,12 @@
         ".github/workflows/**",
         "scripts/release.sh"
       ]
+    },
+    "changelog": {
+      "paths": [
+        "src/shipyard/changelog/**",
+        "commands/changelog.md"
+      ]
     }
   }
 }

@@ -26,6 +26,10 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` |
 | Configure RELEASE_BOT_TOKEN | `shipyard release-bot setup` (guided) |
 | Re-paste token after rotation | `shipyard release-bot setup --paste` |
+| Opt in to post-release docs sync | `shipyard changelog init` then `shipyard release-bot hook install` |
+| Regenerate CHANGELOG.md from tags | `shipyard changelog regenerate` |
+| CI drift gate for CHANGELOG.md | `shipyard changelog check` |
+| Run the post-tag hook locally | `shipyard release-bot hook run --tag v0.9.0` |
 | Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |

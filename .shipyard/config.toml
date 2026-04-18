@@ -12,3 +12,31 @@ command = "pip install -e '.[dev]' && pytest && ruff check src/"
 [targets.mac]
 backend = "local"
 platform = "macos-arm64"
+
+[release.changelog]
+enabled    = true
+path       = "CHANGELOG.md"
+repo_url   = "https://github.com/danielraffel/Shipyard"
+tag_filter = "v*"
+product    = "Shipyard"
+skip_commit_patterns = [
+  "^chore: bump",
+  "^chore\\(release\\):",
+  "^bump .*to v?\\d+\\.\\d+\\.\\d+$",
+]
+
+[release.post_tag_hook]
+enabled              = true
+command              = "shipyard changelog regenerate"
+watch                = ["CHANGELOG.md"]
+trailers = [
+  'Version-Bump: sdk=skip reason="docs-only automated regeneration"',
+  'Skill-Update: skip skill=ci reason="no workflow shape change"',
+  'Release: skip reason="bot commit; prevent recursive auto-release"',
+]
+only_for_tag_pattern = "v*"
+max_push_attempts    = 5
+
+[release.post_tag_hook.bot_identity]
+name  = "shipyard-release-bot"
+email = "shipyard-release-bot@users.noreply.github.com"

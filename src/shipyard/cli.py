@@ -4386,5 +4386,518 @@ def config_use(ctx: Context, profile_name: str) -> None:
         )
 
 
+# ── changelog / post-release docs sync ──────────────────────────────
+
+
+@main.group(name="changelog")
+def changelog_group() -> None:
+    """Generate and check CHANGELOG.md from git tags.
+
+    Opt-in via ``[release.changelog]`` in ``.shipyard/config.toml``. An
+    absent section means ``shipyard changelog`` refuses to touch the file.
+    """
+
+
+def _load_changelog_cfg(ctx: Context) -> Any:
+    """Shared loader — returns the ChangelogConfig or exits on missing/disabled."""
+    from shipyard.changelog.generator import load_changelog_config
+
+    cfg = load_changelog_config(ctx.config)
+    if not cfg.enabled:
+        if ctx.json_mode:
+            ctx.output(
+                "changelog:error",
+                {
+                    "error": "disabled",
+                    "message": (
+                        "No [release.changelog] section in .shipyard/config.toml, "
+                        "or `enabled = false`. Run `shipyard changelog init` to "
+                        "opt in."
+                    ),
+                },
+            )
+        else:
+            render_error(
+                "No [release.changelog] section enabled in .shipyard/config.toml."
+            )
+            render_message(
+                "Run `shipyard changelog init` to opt in.",
+                style="dim",
+            )
+        sys.exit(2)
+    if not cfg.repo_url:
+        if ctx.json_mode:
+            ctx.output(
+                "changelog:error",
+                {
+                    "error": "missing_repo_url",
+                    "message": "release.changelog.repo_url is required",
+                },
+            )
+        else:
+            render_error(
+                "release.changelog.repo_url is required — set it in "
+                ".shipyard/config.toml."
+            )
+        sys.exit(2)
+    return cfg
+
+
+@changelog_group.command("regenerate")
+@click.option("--check", is_flag=True, help="Exit 1 if the file is out of date.")
+@click.option(
+    "--release-notes",
+    "release_notes_tag",
+    metavar="TAG",
+    default=None,
+    help="Print release notes for TAG to stdout instead of writing the file.",
+)
+@click.option(
+    "--stdout",
+    is_flag=True,
+    help="Write the rendered CHANGELOG to stdout instead of the configured path.",
+)
+@click.pass_obj
+def changelog_regenerate(
+    ctx: Context,
+    check: bool,
+    release_notes_tag: str | None,
+    stdout: bool,
+) -> None:
+    """Rebuild CHANGELOG.md from the configured tag graph.
+
+    With ``--check`` the file is compared to the rendered output; exit 1
+    on drift so CI can catch stale docs. With ``--release-notes TAG`` the
+    per-release markdown is printed to stdout for release-page bodies.
+    """
+    from shipyard.changelog.generator import (
+        build_entries,
+        changelog_path,
+        render_changelog,
+        render_release_notes,
+    )
+
+    cfg = _load_changelog_cfg(ctx)
+    entries = build_entries(cfg)
+
+    if release_notes_tag:
+        by_tag = {e.tag: e for e in entries}
+        target = by_tag.get(release_notes_tag)
+        if not target:
+            if ctx.json_mode:
+                ctx.output(
+                    "changelog:release-notes",
+                    {"tag": release_notes_tag, "error": "not_found"},
+                )
+            else:
+                render_error(
+                    f"No tag {release_notes_tag!r} with user-visible merges."
+                )
+            sys.exit(2)
+        idx = entries.index(target)
+        prev = entries[idx + 1] if idx + 1 < len(entries) else None
+        notes = render_release_notes(target, prev, cfg)
+        sys.stdout.write(notes)
+        return
+
+    rendered = render_changelog(entries, cfg)
+    path = changelog_path(cfg)
+
+    if stdout:
+        sys.stdout.write(rendered)
+        return
+
+    current = path.read_text() if path.exists() else ""
+    drift = current != rendered
+
+    if check:
+        if drift:
+            if ctx.json_mode:
+                ctx.output(
+                    "changelog:check",
+                    {
+                        "path": str(path),
+                        "drift": True,
+                        "versions": len(entries),
+                    },
+                )
+            else:
+                render_error(
+                    f"{path} is out of date. "
+                    f"Run `shipyard changelog regenerate` to regenerate."
+                )
+            sys.exit(1)
+        if ctx.json_mode:
+            ctx.output(
+                "changelog:check",
+                {"path": str(path), "drift": False, "versions": len(entries)},
+            )
+        else:
+            render_message(f"{path} is in sync ({len(entries)} versions).")
+        return
+
+    path.write_text(rendered)
+    if ctx.json_mode:
+        ctx.output(
+            "changelog:regenerate",
+            {
+                "path": str(path),
+                "versions": len(entries),
+                "drift_before": drift,
+            },
+        )
+    else:
+        render_message(f"Wrote {path} ({len(entries)} versions).")
+
+
+@changelog_group.command("check")
+@click.pass_context
+def changelog_check(click_ctx: click.Context) -> None:
+    """Alias for ``shipyard changelog regenerate --check``."""
+    click_ctx.invoke(changelog_regenerate, check=True, release_notes_tag=None, stdout=False)
+
+
+@changelog_group.command("init")
+@click.option(
+    "--product",
+    default=None,
+    help="Human-facing product name (defaults to project.name or directory name).",
+)
+@click.option(
+    "--repo-url",
+    default=None,
+    help="GitHub repo URL. Auto-detected from `origin` if omitted.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite an existing [release.changelog] section.",
+)
+@click.pass_obj
+def changelog_init(
+    ctx: Context,
+    product: str | None,
+    repo_url: str | None,
+    force: bool,
+) -> None:
+    """Scaffold ``[release.changelog]`` + ``[release.post_tag_hook]`` stubs.
+
+    Writes to ``.shipyard/config.toml`` (creating it if absent). If
+    ``CHANGELOG.md`` already exists, prints a warning: shipyard will
+    overwrite it on the next regen.
+    """
+    import shutil as _shutil
+
+    cwd = Path.cwd()
+    project_dir = cwd / ".shipyard"
+    project_dir.mkdir(exist_ok=True)
+    cfg_path = project_dir / "config.toml"
+
+    resolved_repo = repo_url or _detect_repo_url_or_empty()
+    resolved_product = product or ctx.config.get("project.name") or cwd.name
+
+    section_marker = "[release.changelog]"
+    existing_text = cfg_path.read_text() if cfg_path.exists() else ""
+    if section_marker in existing_text and not force:
+        if ctx.json_mode:
+            ctx.output(
+                "changelog:init",
+                {
+                    "path": str(cfg_path),
+                    "status": "already_configured",
+                },
+            )
+        else:
+            render_message(
+                f"[release.changelog] already present in {cfg_path}. "
+                "Pass --force to overwrite."
+            )
+        return
+
+    changelog_exists = (cwd / "CHANGELOG.md").exists()
+
+    stub = (
+        "\n"
+        "[release.changelog]\n"
+        "enabled    = true\n"
+        f'path       = "CHANGELOG.md"\n'
+        f'repo_url   = "{resolved_repo}"\n'
+        f'tag_filter = "v*"\n'
+        f'product    = "{resolved_product}"\n'
+        "skip_commit_patterns = [\n"
+        '  "^chore: bump",\n'
+        '  "^chore\\\\(release\\\\):",\n'
+        '  "^bump .*to v?\\\\d+\\\\.\\\\d+\\\\.\\\\d+$",\n'
+        "]\n"
+        "\n"
+        "[release.post_tag_hook]\n"
+        "enabled              = true\n"
+        'command              = "shipyard changelog regenerate"\n'
+        'watch                = ["CHANGELOG.md"]\n'
+        "trailers = [\n"
+        "  'Version-Bump: sdk=skip reason=\"docs-only automated regeneration\"',\n"
+        "  'Skill-Update: skip skill=ci reason=\"no workflow shape change\"',\n"
+        "  'Release: skip reason=\"bot commit; prevent recursive auto-release\"',\n"
+        "]\n"
+        'only_for_tag_pattern = "v*"\n'
+        "max_push_attempts    = 5\n"
+        "\n"
+        "[release.post_tag_hook.bot_identity]\n"
+        'name  = "shipyard-release-bot"\n'
+        'email = "shipyard-release-bot@users.noreply.github.com"\n'
+    )
+
+    if force and section_marker in existing_text:
+        # Strip any existing release.* sections and re-append cleanly.
+        existing_text = _strip_release_sections(existing_text)
+
+    new_text = (existing_text.rstrip() + "\n" if existing_text.strip() else "") + stub
+    # Back up any existing CHANGELOG so the "shipyard owns this now" flip
+    # never destroys hand-maintained content silently.
+    backup_path: Path | None = None
+    if changelog_exists:
+        backup_path = cwd / "CHANGELOG.md.pre-shipyard.bak"
+        if not backup_path.exists():
+            _shutil.copy2(cwd / "CHANGELOG.md", backup_path)
+
+    cfg_path.write_text(new_text)
+
+    if ctx.json_mode:
+        ctx.output(
+            "changelog:init",
+            {
+                "path": str(cfg_path),
+                "status": "written",
+                "existing_changelog": changelog_exists,
+                "changelog_backup": str(backup_path) if backup_path else None,
+                "repo_url": resolved_repo,
+                "product": resolved_product,
+            },
+        )
+        return
+
+    render_message(f"Wrote {cfg_path}", style="green")
+    if changelog_exists:
+        render_message("")
+        render_message(
+            "Heads up: CHANGELOG.md already exists. Shipyard will "
+            "overwrite it on the next `shipyard changelog regenerate` run.",
+            style="bold yellow",
+        )
+        if backup_path:
+            render_message(
+                f"Backed up existing file to {backup_path} so you can "
+                "hand-merge anything that matters.",
+                style="dim",
+            )
+    render_message("")
+    render_message("Next steps:", style="bold")
+    render_message("  1. shipyard changelog regenerate")
+    render_message("  2. shipyard release-bot hook install")
+
+
+def _strip_release_sections(toml_text: str) -> str:
+    """Remove any ``[release.*]`` sections from a TOML document string."""
+    lines = toml_text.splitlines(keepends=True)
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[release.") or stripped == "[release]":
+            skipping = True
+            continue
+        if skipping:
+            if stripped.startswith("[") and stripped.endswith("]") and not stripped.startswith("[release"):
+                skipping = False
+                out.append(line)
+            # else: keep skipping
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def _detect_repo_url_or_empty() -> str:
+    """Read ``origin`` URL from git and return an ``https://github.com/...`` form."""
+    try:
+        url = subprocess.check_output(
+            ["git", "config", "--get", "remote.origin.url"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return ""
+    if url.startswith("git@github.com:"):
+        slug = url.removeprefix("git@github.com:").removesuffix(".git")
+        return f"https://github.com/{slug}"
+    if url.startswith("https://github.com/"):
+        return url.removesuffix(".git")
+    return url
+
+
+# ── release-bot hook subgroup ───────────────────────────────────────
+
+
+@release_bot_group.group(name="hook")
+def release_bot_hook_group() -> None:
+    """Install and run the post-tag docs-sync workflow."""
+
+
+@release_bot_hook_group.command("install")
+@click.option(
+    "--tag-pattern",
+    default=None,
+    help="Glob of tags that should trigger the workflow (default `v*`).",
+)
+@click.option(
+    "--shipyard-version",
+    default=None,
+    help="Pinned shipyard version the workflow curls in. Defaults to the current CLI version.",
+)
+@click.pass_obj
+def release_bot_hook_install(
+    ctx: Context,
+    tag_pattern: str | None,
+    shipyard_version: str | None,
+) -> None:
+    """Drop ``.github/workflows/post-tag-sync.yml`` into the consumer repo.
+
+    Shipyard owns this file end-to-end — re-running overwrites it in
+    place. Uninstall is a plain ``rm`` (no subcommand yet; the file
+    name is deliberate).
+    """
+    from shipyard.changelog.workflow import (
+        DEFAULT_SHIPYARD_VERSION,
+        WorkflowOptions,
+        render_workflow,
+    )
+
+    opts = WorkflowOptions(
+        tag_pattern=tag_pattern or "v*",
+        shipyard_version=shipyard_version or __version__ or DEFAULT_SHIPYARD_VERSION,
+    )
+    body = render_workflow(opts)
+
+    workflows_dir = Path.cwd() / ".github" / "workflows"
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    target = workflows_dir / "post-tag-sync.yml"
+    existed = target.exists()
+    target.write_text(body)
+
+    if ctx.json_mode:
+        ctx.output(
+            "release-bot:hook:install",
+            {
+                "path": str(target),
+                "overwrote": existed,
+                "shipyard_version": opts.shipyard_version,
+                "tag_pattern": opts.tag_pattern,
+            },
+        )
+        return
+
+    verb = "Overwrote" if existed else "Wrote"
+    render_message(f"{verb} {target}", style="green")
+    render_message(
+        f"  - fires on tag push matching {opts.tag_pattern!r}",
+        style="dim",
+    )
+    render_message(
+        f"  - installs shipyard {opts.shipyard_version} before running the hook",
+        style="dim",
+    )
+
+
+@release_bot_hook_group.command("run")
+@click.option(
+    "--tag",
+    "tag",
+    default=None,
+    help="Tag to sync. If omitted, reads $GITHUB_REF (strips refs/tags/).",
+)
+@click.pass_obj
+def release_bot_hook_run(ctx: Context, tag: str | None) -> None:
+    """Execute the configured ``[release.post_tag_hook]`` for a tag."""
+    import os as _os
+
+    from shipyard.changelog.hook import load_hook_config, run_hook
+
+    cfg = load_hook_config(ctx.config)
+    if not cfg.enabled:
+        if ctx.json_mode:
+            ctx.output(
+                "release-bot:hook:run",
+                {
+                    "tag": tag or "",
+                    "ran_command": False,
+                    "command_exit": 0,
+                    "watched_diffed": [],
+                    "committed": False,
+                    "pushed": False,
+                    "attempts": 0,
+                    "skipped_reason": "hook disabled in config",
+                    "error": None,
+                },
+            )
+        else:
+            render_message(
+                "No [release.post_tag_hook] enabled. "
+                "Run `shipyard changelog init` to opt in.",
+                style="dim",
+            )
+        return
+
+    resolved_tag = tag
+    if not resolved_tag:
+        ref = _os.environ.get("GITHUB_REF", "")
+        if ref.startswith("refs/tags/"):
+            resolved_tag = ref.removeprefix("refs/tags/")
+    if not resolved_tag:
+        render_error("--tag is required (or set GITHUB_REF=refs/tags/<tag>).")
+        sys.exit(2)
+
+    result = run_hook(cfg, resolved_tag)
+
+    payload = {
+        "tag": resolved_tag,
+        "ran_command": result.ran_command,
+        "command_exit": result.command_exit,
+        "watched_diffed": result.watched_diffed,
+        "committed": result.committed,
+        "pushed": result.pushed,
+        "attempts": result.attempts,
+        "skipped_reason": result.skipped_reason,
+        "error": result.error,
+    }
+
+    if ctx.json_mode:
+        ctx.output("release-bot:hook:run", payload)
+    else:
+        if result.skipped_reason:
+            render_message(f"skipped: {result.skipped_reason}", style="dim")
+        elif result.error:
+            render_error(f"hook failed: {result.error}")
+        elif not result.committed:
+            render_message(
+                f"Watched files in sync for {resolved_tag}; nothing to commit.",
+                style="dim",
+            )
+        elif result.pushed:
+            render_message(
+                f"Pushed docs sync commit for {resolved_tag} "
+                f"({len(result.watched_diffed)} files, {result.attempts} attempt(s)).",
+                style="green",
+            )
+        else:
+            render_message(
+                f"Committed docs sync for {resolved_tag} but did not push.",
+                style="yellow",
+            )
+
+    # Exit code semantics: best-effort. Errors do NOT roll back the
+    # tag, but we still want CI to light up red so humans notice.
+    if result.error and not ctx.json_mode:
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()

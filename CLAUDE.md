@@ -75,6 +75,31 @@ opens a pre-filled PAT creation URL, stores the secret via stdin-piped
 `actions/checkout` accepts the token. `shipyard release-bot status` for
 diagnosis; `shipyard doctor --release-chain` for the live probe.
 
+### Post-release docs sync (v0.9.0+)
+
+`shipyard changelog` + `shipyard release-bot hook` close the "tag
+landed but CHANGELOG stayed stale" gap. Opt-in via
+`[release.changelog]` and `[release.post_tag_hook]` in
+`.shipyard/config.toml`; absent sections are a no-op.
+
+- `shipyard changelog init` scaffolds both sections and backs up any
+  existing CHANGELOG.md to `CHANGELOG.md.pre-shipyard.bak` (shipyard
+  owns the file after opt-in).
+- `shipyard changelog regenerate` walks the tag graph and writes
+  `CHANGELOG.md`. `--check` is a drift gate (exit 1). `--release-notes
+  <TAG>` prints per-release markdown for `softprops/action-gh-release`
+  bodies.
+- `shipyard release-bot hook install` drops
+  `.github/workflows/post-tag-sync.yml`. Shipyard owns the file — re-
+  install overwrites; uninstall is a plain `rm`. The workflow installs
+  shipyard via `curl … install.sh | sh` (pinned) and runs `shipyard
+  release-bot hook run`.
+
+Agents should invoke `/shipyard:changelog regenerate` when a release
+just landed and the commit-back didn't fire, or `/shipyard:changelog
+check` when CI flags drift. See `docs/post-release-sync.md` for the
+full flow + pulp migration notes.
+
 ### Mid-flight runner switch
 
 `shipyard cloud retarget --pr <n> --target <lane> --provider <prov>`
