@@ -9,6 +9,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
      docs/post-release-sync.md for the full end-to-end flow. -->
 
 <a id="v080"></a>
+## [0.10.0]
+
 ## [0.8.0] - 2026-04-17
 
 - chore/bump 0.8.0 ([#69](https://github.com/danielraffel/Shipyard/pull/69))

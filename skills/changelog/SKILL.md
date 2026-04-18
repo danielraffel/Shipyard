@@ -47,6 +47,7 @@ Exit codes: `0` clean, `1` drift, `2` config missing / tag missing.
 | `product` | Name in the CHANGELOG header "All notable changes to `{product}`…". | project name |
 | `skip_commit_patterns` | Subjects dropped from entries (regex list, case-insensitive). | chore/release bumps |
 | `title` | H1 text. | `Changelog` |
+| `header_comment` | Full `<!-- … -->` block emitted between intro and first entry. Default omits the block — keeps shipyard-identifying text out of the rendered file. Migrating off another generator? Set this to the previous header verbatim for byte-identity. | `None` |
 
 ## Config reference — `[release.post_tag_hook]`
 
