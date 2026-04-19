@@ -3448,7 +3448,7 @@ def watch(
                 sys.exit(0)
 
             observed_any_state = True
-            signature = _watch_signature(state)
+            signature = _watch_event_signature(ctx, state)
             if signature != last_signature:
                 _emit_watch_event(ctx, state)
                 last_signature = signature
@@ -3532,16 +3532,7 @@ def _style(text: str, style: str, *, enabled: bool) -> str:
 
 
 def _run_symbol(status: str, liveness: str | None) -> tuple[str, str]:
-    """Return (symbol, rich-style) for a dispatched run status.
-
-    Symbols:
-      ✓  pass / completed success
-      ✗  fail / failure
-      ⋯  in flight (running / queued / pending)
-      ·  queued (dim)
-    Liveness overrides in-flight to yellow when running, dim when
-    queued.
-    """
+    """Return (symbol, rich-style) for a dispatched run status."""
     s = status.lower()
     if s in {"pass", "success", "completed", "completed_success"}:
         return ("\u2713", "bold green")
@@ -3551,7 +3542,6 @@ def _run_symbol(status: str, liveness: str | None) -> tuple[str, str]:
         return ("\u2717", "dim")
     if s in {"queued", "pending", "waiting"}:
         return ("\u00b7", "dim")
-    # Default: in flight.
     style = "yellow"
     if liveness == "stuck":
         style = "bold magenta"
@@ -3570,14 +3560,6 @@ def _evidence_symbol(status: str) -> tuple[str, str]:
 def _heartbeat_age_label(
     run: DispatchedRun, now: datetime, stale_secs: float
 ) -> tuple[str, bool]:
-    """Return ("12s_ago" / "-", is_stale) for a dispatched run.
-
-    `is_stale` is True when the heartbeat is older than
-    `stale_secs` — aligns with the FallbackChain eviction threshold
-    (#84) so watch and the chain agree on "this runner went silent".
-    Terminal runs return ("-", False) — the "last_seen" column is
-    only meaningful while the run is live.
-    """
     terminal = run.status.lower() in {
         "pass", "success", "completed", "completed_success",
         "fail", "failed", "failure", "completed_failure",
@@ -3601,17 +3583,10 @@ def _heartbeat_age_label(
 
 
 def _run_elapsed_secs(run: DispatchedRun, now: datetime) -> int:
-    """Seconds between run.started_at and now, bounded at 0."""
     return max(0, int((now - run.started_at).total_seconds()))
 
 
 def _progress_summary(state: ShipState) -> tuple[int, int, int]:
-    """Return (complete, in_flight, total) across dispatched runs.
-
-    "Complete" = any terminal status (pass/fail/cancelled). "In
-    flight" = everything else. Used for the progress summary line
-    in watch output.
-    """
     total = len(state.dispatched_runs)
     complete = 0
     in_flight = 0
@@ -3628,9 +3603,34 @@ def _progress_summary(state: ShipState) -> tuple[int, int, int]:
     return (complete, in_flight, total)
 
 
+def _watch_event_signature(ctx: Context, state: ShipState) -> str:
+    """Signature that folds in reused_from annotations (see #88)."""
+    base = _watch_signature(state)
+    try:
+        records = ctx.evidence.get_branch(state.branch)
+    except Exception:  # noqa: BLE001
+        records = {}
+    reuse_parts = sorted(
+        f"{t}:{rec.reused_from[:12]}"
+        for t, rec in records.items()
+        if rec.reused_from and rec.sha == state.head_sha
+    )
+    return base + "|reused=" + ",".join(reuse_parts)
+
+
 def _emit_watch_event(ctx: Context, state: ShipState) -> None:
     now = datetime.now(timezone.utc)
     stale_secs = _watch_stale_threshold()
+
+    # Cross-reference the evidence store so we can surface reused lanes (#88).
+    reuse_map: dict[str, str] = {}
+    try:
+        branch_records = ctx.evidence.get_branch(state.branch)
+    except Exception:  # noqa: BLE001 — evidence store is best-effort
+        branch_records = {}
+    for target, rec in branch_records.items():
+        if rec.sha == state.head_sha and rec.reused_from:
+            reuse_map[target] = rec.reused_from
 
     if ctx.json_mode:
         dispatched: list[dict[str, Any]] = []
@@ -3638,6 +3638,15 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
             entry = run.to_dict()
             entry["elapsed_seconds"] = _run_elapsed_secs(run, now)
             dispatched.append(entry)
+        evidence_out: dict[str, dict[str, Any] | str] = {}
+        for target, status in state.evidence_snapshot.items():
+            if target in reuse_map and status == "pass":
+                evidence_out[target] = {
+                    "status": "reused",
+                    "reused_from": reuse_map[target],
+                }
+            else:
+                evidence_out[target] = status
         ctx.output(
             "watch",
             {
@@ -3645,7 +3654,7 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
                 "pr": state.pr,
                 "head_sha": state.head_sha,
                 "attempt": state.attempt,
-                "evidence": dict(state.evidence_snapshot),
+                "evidence": evidence_out,
                 "dispatched_runs": dispatched,
                 "updated_at": state.updated_at.isoformat(),
             },
@@ -3672,11 +3681,20 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
             f"  {complete}/{total} targets complete \u00b7 {in_flight} in flight"
         )
 
+    # Evidence rendering, reuse-aware.
     for target, status in sorted(state.evidence_snapshot.items()):
-        sym, style = _evidence_symbol(status)
-        render_message(
-            f"  {_style(sym, style, enabled=color)} evidence: {target}={status}"
-        )
+        if target in reuse_map and status == "pass":
+            short = reuse_map[target][:7]
+            sym, style = _evidence_symbol("pass")
+            render_message(
+                f"  {_style(sym, style, enabled=color)} evidence: "
+                f"{target}=reused (from {short})"
+            )
+        else:
+            sym, style = _evidence_symbol(status)
+            render_message(
+                f"  {_style(sym, style, enabled=color)} evidence: {target}={status}"
+            )
 
     for run in state.dispatched_runs:
         elapsed = _run_elapsed_secs(run, now)
@@ -4143,6 +4161,28 @@ def _execute_job(
         target_config["name"] = name
         log_path = str(config.state_dir / "logs" / job.id / f"{name}.log")
         backend_name = dispatcher.backend_name(target_config)
+        resolved_validation = _resolve_target_validation(
+            config, name, validation_config
+        )
+
+        # Cross-PR evidence reuse (opt-in via the target's
+        # ``reuse_if_paths_unchanged`` glob list). When the diff since
+        # an ancestor SHA does not touch any path the target cares
+        # about, we borrow that ancestor's PASS evidence instead of
+        # dispatching. See ``shipyard.ship.reuse``.
+        reuse_result = _maybe_reuse_evidence(
+            ctx=ctx,
+            job=job,
+            target_name=name,
+            target_config=target_config,
+            validation_config=resolved_validation,
+        )
+        if reuse_result is not None:
+            job = job.with_result(reuse_result)
+            ctx.queue.update(job)
+            if not ctx.json_mode:
+                render_job(job)
+            continue
 
         running = TargetResult(
             target_name=name,
@@ -4181,7 +4221,7 @@ def _execute_job(
             sha=job.sha,
             branch=job.branch,
             target_config=target_config,
-            validation_config=_resolve_target_validation(config, name, validation_config),
+            validation_config=resolved_validation,
             log_path=log_path,
             progress_callback=progress_callback,
             resume_from=resume_from,
@@ -4203,26 +4243,84 @@ def _execute_job(
     return job
 
 
+def _maybe_reuse_evidence(
+    *,
+    ctx: Context,
+    job: Job,
+    target_name: str,
+    target_config: dict[str, Any],
+    validation_config: dict[str, Any],
+) -> TargetResult | None:
+    """Return a synthetic reuse :class:`TargetResult` or ``None``.
+
+    ``None`` means "dispatch normally". When a result is returned,
+    ``status`` is always PASS and ``reused_from`` carries the
+    ancestor SHA the evidence was borrowed from. The caller should
+    skip dispatch and let the standard evidence-record path write
+    the synthetic PASS.
+    """
+    from shipyard.ship.reuse import evaluate_reuse
+
+    decision = evaluate_reuse(
+        target_name=target_name,
+        target_config=target_config,
+        validation_config=validation_config,
+        head_sha=job.sha,
+        evidence_store=ctx.evidence,
+    )
+    if not decision.reused:
+        return None
+
+    assert decision.ancestor_sha is not None  # narrows type for mypy
+    now = datetime.now(timezone.utc)
+    return TargetResult(
+        target_name=target_name,
+        platform=target_config.get("platform", "unknown"),
+        status=TargetStatus.PASS,
+        backend="reused",
+        started_at=now,
+        completed_at=now,
+        duration_secs=0.0,
+        reused_from=decision.ancestor_sha,
+    )
+
+
 def _record_evidence(ctx: Context, job: Job) -> None:
     from shipyard.core.evidence import EvidenceRecord
+    from shipyard.ship.reuse import compute_validation_signature
+
+    # Resolve the validation config once so the signature we write on
+    # each record reflects the same config the dispatcher just ran.
+    # A reuse decision on a future PR compares these fingerprints.
+    validation_base = _resolve_validation(ctx.config, job.mode)
 
     for name, result in job.results.items():
-        if result.is_terminal:
-            ctx.evidence.record(EvidenceRecord(
-                sha=job.sha,
-                branch=job.branch,
-                target_name=name,
-                platform=result.platform,
-                status="pass" if result.passed else "fail",
-                backend=result.backend,
-                completed_at=result.completed_at or job.completed_at,  # type: ignore[arg-type]
-                duration_secs=result.duration_secs,
-                primary_backend=result.primary_backend,
-                failover_reason=result.failover_reason,
-                provider=result.provider,
-                runner_profile=result.runner_profile,
-                failure_class=result.failure_class,
-            ))
+        if not result.is_terminal:
+            continue
+        per_target_validation = _resolve_target_validation(
+            ctx.config, name, validation_base
+        )
+        contract_digest, stages_signature = compute_validation_signature(
+            per_target_validation
+        )
+        ctx.evidence.record(EvidenceRecord(
+            sha=job.sha,
+            branch=job.branch,
+            target_name=name,
+            platform=result.platform,
+            status="pass" if result.passed else "fail",
+            backend=result.backend,
+            completed_at=result.completed_at or job.completed_at,  # type: ignore[arg-type]
+            duration_secs=result.duration_secs,
+            primary_backend=result.primary_backend,
+            failover_reason=result.failover_reason,
+            provider=result.provider,
+            runner_profile=result.runner_profile,
+            failure_class=result.failure_class,
+            reused_from=result.reused_from,
+            contract_digest=contract_digest,
+            stages_signature=stages_signature,
+        ))
 
 
 def _update_ship_state_from_job(
