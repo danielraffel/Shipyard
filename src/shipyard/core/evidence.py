@@ -37,10 +37,28 @@ class EvidenceRecord:
     # "INFRA" | "TIMEOUT" | "CONTRACT" | "TEST" | "UNKNOWN". None on a
     # passing record. See ``shipyard.core.classify``.
     failure_class: str | None = None
+    # Cross-PR evidence reuse provenance. When set, this record was
+    # synthesized from an earlier PASS on an ancestor SHA because the
+    # diff between that SHA and HEAD did not touch any path the target
+    # cares about (see ``reuse_if_paths_unchanged`` on target config).
+    # Value is the ancestor SHA the evidence was borrowed from.
+    reused_from: str | None = None
+    # Fingerprints of the validation contract + stages in effect when
+    # the record was written. Reuse compares these between the
+    # candidate ancestor record and the current target config and
+    # refuses reuse on drift (e.g., contract markers changed, a new
+    # build stage was added). ``None`` on pre-reuse records.
+    contract_digest: str | None = None
+    stages_signature: str | None = None
 
     @property
     def passed(self) -> bool:
         return self.status == "pass"
+
+    @property
+    def reused(self) -> bool:
+        """True if this record was borrowed from an ancestor PASS."""
+        return self.reused_from is not None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -55,6 +73,7 @@ class EvidenceRecord:
         for key in (
             "duration_secs", "host", "primary_backend", "failover_reason",
             "provider", "runner_profile", "failure_class",
+            "reused_from", "contract_digest", "stages_signature",
         ):
             val = getattr(self, key)
             if val is not None:
@@ -78,6 +97,9 @@ class EvidenceRecord:
             provider=d.get("provider"),
             runner_profile=d.get("runner_profile"),
             failure_class=d.get("failure_class"),
+            reused_from=d.get("reused_from"),
+            contract_digest=d.get("contract_digest"),
+            stages_signature=d.get("stages_signature"),
         )
 
 
@@ -138,6 +160,45 @@ class EvidenceStore:
                 all_green = False
 
         return all_green, evidence_map
+
+    def query_passing_for_target(
+        self,
+        target_name: str,
+        sha_candidates: list[str],
+    ) -> EvidenceRecord | None:
+        """Find the most recent PASS record for ``target_name`` whose
+        SHA is in ``sha_candidates``.
+
+        Searches across every branch file in the store. This is the
+        primary lookup for cross-PR evidence reuse: pass in the list
+        of ancestor SHAs reachable from HEAD (newest first) and this
+        returns the first PASS that matches. Returns None if no
+        ancestor has passing evidence for the target.
+
+        ``sha_candidates`` is treated as an ordered preference list —
+        earlier entries win on ties. Records with ``reused_from`` set
+        are **excluded** (we only borrow from real runs, never
+        chain-reuse from another reuse).
+        """
+        candidate_set = {sha: rank for rank, sha in enumerate(sha_candidates)}
+        best: tuple[int, EvidenceRecord] | None = None
+        for entry in self.path.glob("*.json"):
+            branch_key = entry.stem
+            try:
+                records = self._load_branch(branch_key)
+            except (OSError, ValueError):
+                continue
+            for rec in records.values():
+                if rec.target_name != target_name or not rec.passed:
+                    continue
+                if rec.reused_from is not None:
+                    continue
+                rank = candidate_set.get(rec.sha)
+                if rank is None:
+                    continue
+                if best is None or rank < best[0]:
+                    best = (rank, rec)
+        return best[1] if best else None
 
     def _branch_file(self, branch_key: str) -> Path:
         return self.path / f"{branch_key}.json"

@@ -42,6 +42,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Show cloud defaults | `shipyard cloud defaults --json` |
 | Dispatch a cloud workflow | `shipyard cloud run build --json` |
 | Dispatch only if remote matches HEAD | `shipyard cloud run build --require-sha HEAD --json` |
+| Opt a target into cross-PR reuse | set `reuse_if_paths_unchanged = ["src/backend/**"]` under `[targets.<name>]` |
 | Retarget one lane on an in-flight PR | `shipyard cloud retarget --pr <n> --target macos --provider namespace` (dry-run; add `--apply`) |
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider namespace]` (dry-run; add `--apply`) |
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
@@ -205,6 +206,62 @@ Full docs: [`docs/targets.md`](../../docs/targets.md) and
 ## SSH delivery: incremental bundles
 
 SSH-backed targets deliver code via `git bundle`. On the first run the bundle is full (every object reachable from the target SHA, ~443 MB for Pulp-sized repos). On every subsequent run Shipyard probes the remote for its current HEAD over SSH (`git rev-parse HEAD`), verifies that the local clone has that commit as an ancestor, and emits `git bundle create <bundle> <target> ^<remote_head>` — a delta bundle that is typically kilobytes instead of megabytes. Any failure in the probe, ancestry check, or delta create silently falls back to the full-bundle path so the behavior on cold/corrupt remotes is unchanged. Each run logs a `bundle_mode=delta|full bundle_bytes=<N>` line to the per-target log so operators can confirm the optimisation is active.
+
+## Cross-PR evidence reuse
+
+When PR B rebases onto PR A's merged SHA and B's diff doesn't touch any
+path that a target actually exercises, Shipyard can reuse A's passing
+evidence instead of re-running the target. Off by default; opt-in per
+target via `reuse_if_paths_unchanged`.
+
+```toml
+[targets.ubuntu-cpu]
+backend = "ssh"
+host = "ubuntu"
+platform = "linux-x64"
+# Only dispatch this target if HEAD changed one of these paths. If
+# none match, borrow the most-recent passing evidence from an ancestor
+# SHA and skip dispatch.
+reuse_if_paths_unchanged = ["src/backend/**", "Cargo.lock"]
+```
+
+### When reuse fires
+
+Pre-dispatch, for each target with `reuse_if_paths_unchanged` set:
+
+1. Walk HEAD's first-parent ancestors and query the evidence store for
+   the most recent PASS on this target whose SHA is in that list.
+2. If found, compute `git diff --name-only <ancestor>..HEAD`.
+3. If no changed file matches any glob, write a synthetic PASS evidence
+   record with `reused_from: <ancestor_sha>` and skip dispatch.
+4. Otherwise dispatch normally.
+
+### Safety rules (always enforced)
+
+| Refusal | Why |
+|---|---|
+| Non-fast-forward lineage | `git merge-base --is-ancestor` must succeed; rebases across unrelated history never reuse |
+| Validation contract changed | The `[validation.contract]` subtable's digest is stored with each record; any change forces a re-run |
+| Stage list changed | Adding / removing a stage between the ancestor and HEAD forces a re-run |
+| No passing ancestor | If the most recent ancestor failed, or there's no record, reuse is declined |
+| Chain reuse | A reused record is never itself a reuse source — we only borrow from real dispatches |
+
+### How it surfaces
+
+- `shipyard watch --json` emits `{"status": "reused", "reused_from": "<sha>"}` for reused targets (instead of the bare `"pass"`).
+- `shipyard watch` human mode prints `evidence: <target>=✓ reused (from a1b2c3)`.
+- Evidence records in the store carry `reused_from`; `shipyard evidence --json` shows it verbatim.
+- The ship-state merge gate still counts reused targets as `pass`, so PR drain isn't blocked on a borrowed lane.
+
+### When to enable
+
+Reuse pays off on projects where the target's exercised surface is a
+small subset of the repo — think a backend-only test lane on a mixed
+frontend/backend monorepo, or a Cargo `cargo test -p backend` lane
+whose output only changes when the crate or its dependencies move.
+Don't enable it on a lane that runs the full suite — the globs would
+have to cover the whole tree, at which point you're back to
+re-running everything anyway.
 
 ## Failure classification
 
