@@ -49,6 +49,50 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Environment check | `shipyard doctor --json` |
 | Clean up artifacts | `shipyard cleanup --apply` |
 
+## When to use `watch` (agent decision guide)
+
+After dispatching a ship (`shipyard ship`), agents have four ways to
+track it to completion. Pick by **session posture**, not by how long you
+think the build takes:
+
+| Posture | Command | Why |
+|---|---|---|
+| You can hold the session open until merge | `shipyard watch --follow --json` | Blocks; exits `0` pass, `1` fail, `130` SIGINT. Zero polling logic needed. |
+| You want to release the session, re-check later | `shipyard watch --no-follow --json` + `ScheduleWakeup` | One-shot snapshot is cheap. Re-check on wakeup; exits `3` while in-flight. |
+| The agent is stepping away entirely | `shipyard auto-merge <pr>` on cron / GitHub schedule | Idempotent one-shot. Exits `0` merged, `1` fail, `2` not-found, `3` in-flight. |
+| You just want a status peek right now | `shipyard watch --no-follow --json` | Same as a `ship-state show` but uses the live event schema. |
+
+**Rules of thumb for agents:**
+
+- If you just ran `shipyard ship` in the same turn and the user is
+  waiting, `shipyard watch --follow --json` is almost always right —
+  you already own the session.
+- If you'll need more than ~5 minutes and want to yield back to the
+  user, prefer `--no-follow` + `ScheduleWakeup`. Don't `sleep` inside
+  the session.
+- **Never poll with `watch --follow` in a tight loop.** `--follow`
+  already blocks; calling it repeatedly is wasted cache and clock.
+- `auto-merge` is for out-of-session automation (cron, systemd timer,
+  GitHub Actions schedule). Not a substitute for `watch` within a live
+  agent session.
+
+Example — agent blocks until merge in-session:
+
+```sh
+shipyard ship --json
+shipyard watch --follow --json   # exits when ship completes
+```
+
+Example — agent yields, re-checks later via `ScheduleWakeup`:
+
+```sh
+shipyard ship --json
+shipyard watch --no-follow --json | jq '.state'
+# → "in_flight" → ScheduleWakeup 20m, re-run the same snapshot
+# → "passed"    → done
+# → "failed"    → inspect logs
+```
+
 ## Mid-flight runner retargeting
 
 When a provider change would be valuable *during* an in-flight PR drain — e.g., you notice halfway through shipping 10 PRs that Namespace macOS is faster than GitHub-hosted — use `shipyard cloud retarget`:
