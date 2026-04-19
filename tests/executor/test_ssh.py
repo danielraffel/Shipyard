@@ -324,6 +324,8 @@ class TestSSHIncrementalBundle:
         ), patch(
             "shipyard.executor.ssh._remote_head_sha", return_value="aabbcc",
         ), patch(
+            "shipyard.executor.ssh._local_has_commit", return_value=True,
+        ), patch(
             "shipyard.executor.ssh.create_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
         ) as mock_create, patch(
@@ -363,6 +365,8 @@ class TestSSHIncrementalBundle:
         ), patch(
             "shipyard.executor.ssh._remote_head_sha", return_value="aabbcc",
         ), patch(
+            "shipyard.executor.ssh._local_has_commit", return_value=True,
+        ), patch(
             "shipyard.executor.ssh.create_bundle",
             side_effect=create_results,
         ) as mock_create, patch(
@@ -399,6 +403,8 @@ class TestSSHIncrementalBundle:
         ), patch(
             "shipyard.executor.ssh._remote_head_sha", return_value=None,
         ), patch(
+            "shipyard.executor.ssh._local_has_commit", return_value=False,
+        ), patch(
             "shipyard.executor.ssh.create_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
         ) as mock_create, patch(
@@ -422,6 +428,179 @@ class TestSSHIncrementalBundle:
         assert mock_create.call_count == 1
         first_call = mock_create.call_args_list[0]
         assert not first_call[1].get("basis_shas")
+
+    def test_skips_basis_when_local_missing_ancestor(self, tmp_path) -> None:
+        """Remote HEAD is known but not present locally → full bundle.
+
+        This is the case the issue calls out: the ancestry check must
+        reject basis SHAs the local clone hasn't fetched, otherwise
+        `git bundle create ^<basis>` silently degenerates into a full
+        bundle (or fails) and wastes the delta attempt.
+        """
+        from shipyard.bundle.git_bundle import BundleResult
+
+        executor = SSHExecutor()
+        log_path = str(tmp_path / "log.txt")
+
+        with patch(
+            "shipyard.executor.ssh._remote_has_sha", return_value=False,
+        ), patch(
+            "shipyard.executor.ssh._remote_head_sha", return_value="deadbeef",
+        ), patch(
+            "shipyard.executor.ssh._local_has_commit", return_value=False,
+        ), patch(
+            "shipyard.executor.ssh.create_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ) as mock_create, patch(
+            "shipyard.executor.ssh.upload_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh.apply_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh.run_streaming_command",
+            return_value=_streaming_result(0, "ok"),
+        ):
+            executor.validate(
+                sha="abc123", branch="main",
+                target_config=_target_config(),
+                validation_config=_validation_config(),
+                log_path=log_path,
+            )
+
+        assert mock_create.call_count == 1
+        first_call = mock_create.call_args_list[0]
+        assert not first_call[1].get("basis_shas")
+
+    def test_logs_bundle_mode_and_bytes_for_delta(self, tmp_path) -> None:
+        """Delta path must log bundle_mode=delta and bundle_bytes=<N>."""
+        from shipyard.bundle.git_bundle import BundleResult
+
+        executor = SSHExecutor()
+        log_path = tmp_path / "log.txt"
+
+        def fake_create_bundle(sha, output_path, repo_dir=None, basis_shas=()):
+            # Simulate the bundle writer so _safe_filesize returns a
+            # realistic delta size (few KB rather than 443 MB).
+            from pathlib import Path as _P
+            _P(output_path).write_bytes(b"DELTA" * 200)
+            return BundleResult(success=True, message="ok", path=str(output_path))
+
+        with patch(
+            "shipyard.executor.ssh._remote_has_sha", return_value=False,
+        ), patch(
+            "shipyard.executor.ssh._remote_head_sha", return_value="aabbccddeeff",
+        ), patch(
+            "shipyard.executor.ssh._local_has_commit", return_value=True,
+        ), patch(
+            "shipyard.executor.ssh.create_bundle",
+            side_effect=fake_create_bundle,
+        ), patch(
+            "shipyard.executor.ssh.upload_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh.apply_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh.run_streaming_command",
+            return_value=_streaming_result(0, "ok"),
+        ):
+            executor.validate(
+                sha="abc123", branch="main",
+                target_config=_target_config(),
+                validation_config=_validation_config(),
+                log_path=str(log_path),
+            )
+
+        contents = log_path.read_text()
+        assert "bundle_mode=delta" in contents
+        assert "bundle_bytes=1000" in contents
+        assert "remote_head=aabbccddeeff" in contents
+
+    def test_logs_bundle_mode_full_when_no_basis(self, tmp_path) -> None:
+        """Full path must log bundle_mode=full and the byte count."""
+        from shipyard.bundle.git_bundle import BundleResult
+
+        executor = SSHExecutor()
+        log_path = tmp_path / "log.txt"
+
+        def fake_create_bundle(sha, output_path, repo_dir=None, basis_shas=()):
+            from pathlib import Path as _P
+            _P(output_path).write_bytes(b"FULLBUNDLE" * 10)
+            return BundleResult(success=True, message="ok", path=str(output_path))
+
+        with patch(
+            "shipyard.executor.ssh._remote_has_sha", return_value=False,
+        ), patch(
+            "shipyard.executor.ssh._remote_head_sha", return_value=None,
+        ), patch(
+            "shipyard.executor.ssh._local_has_commit", return_value=False,
+        ), patch(
+            "shipyard.executor.ssh.create_bundle",
+            side_effect=fake_create_bundle,
+        ), patch(
+            "shipyard.executor.ssh.upload_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh.apply_bundle",
+            return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh.run_streaming_command",
+            return_value=_streaming_result(0, "ok"),
+        ):
+            executor.validate(
+                sha="abc123", branch="main",
+                target_config=_target_config(),
+                validation_config=_validation_config(),
+                log_path=str(log_path),
+            )
+
+        contents = log_path.read_text()
+        assert "bundle_mode=full" in contents
+        assert "bundle_bytes=100" in contents
+        assert "remote_head=unknown" in contents
+
+
+class TestLocalHasCommit:
+    """Tests for the ancestry probe used to validate basis SHAs."""
+
+    def test_returns_true_when_commit_exists(self) -> None:
+        from shipyard.executor.ssh import _local_has_commit
+        mock_result = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            assert _local_has_commit("abc123") is True
+            cmd = mock_run.call_args[0][0]
+            assert cmd[0] == "git"
+            assert "cat-file" in cmd
+            # Must query the commit type specifically (prevents
+            # false positives on dangling blobs / trees).
+            assert any(arg.startswith("abc123") and "commit" in arg for arg in cmd)
+
+    def test_returns_false_when_commit_missing(self) -> None:
+        from shipyard.executor.ssh import _local_has_commit
+        mock_result = MagicMock(returncode=1, stdout="", stderr="not found")
+        with patch("subprocess.run", return_value=mock_result):
+            assert _local_has_commit("deadbeef") is False
+
+    def test_returns_false_on_timeout(self) -> None:
+        from shipyard.executor.ssh import _local_has_commit
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired("git", 10),
+        ):
+            assert _local_has_commit("abc123") is False
+
+    def test_returns_false_on_os_error(self) -> None:
+        from shipyard.executor.ssh import _local_has_commit
+        with patch("subprocess.run", side_effect=OSError("no git")):
+            assert _local_has_commit("abc123") is False
+
+    def test_uses_repo_dir_cwd(self, tmp_path) -> None:
+        from shipyard.executor.ssh import _local_has_commit
+        mock_result = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            _local_has_commit("abc123", repo_dir=str(tmp_path))
+            assert mock_run.call_args[1]["cwd"] == str(tmp_path)
 
 
 class TestSSHResumeFrom:

@@ -134,6 +134,10 @@ compatible). When nothing matches, the target errors with
 Full docs: [`docs/targets.md`](../../docs/targets.md) and
 [`docs/profiles.md`](../../docs/profiles.md).
 
+## SSH delivery: incremental bundles
+
+SSH-backed targets deliver code via `git bundle`. On the first run the bundle is full (every object reachable from the target SHA, ~443 MB for Pulp-sized repos). On every subsequent run Shipyard probes the remote for its current HEAD over SSH (`git rev-parse HEAD`), verifies that the local clone has that commit as an ancestor, and emits `git bundle create <bundle> <target> ^<remote_head>` — a delta bundle that is typically kilobytes instead of megabytes. Any failure in the probe, ancestry check, or delta create silently falls back to the full-bundle path so the behavior on cold/corrupt remotes is unchanged. Each run logs a `bundle_mode=delta|full bundle_bytes=<N>` line to the per-target log so operators can confirm the optimisation is active.
+
 ## Troubleshooting
 
 - `shipyard doctor --json` — checks git, ssh, gh, nsc are installed
