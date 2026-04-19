@@ -49,6 +49,8 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
 | Clean up artifacts | `shipyard cleanup --apply` |
+| Mark a target advisory | `[targets.<n>] advisory = true` in `.shipyard/config.toml` (see "Advisory lanes" below) |
+| Flip lane policy for one PR | `Lane-Policy: <target>=required\|advisory` trailer on the tip commit |
 | List quarantined targets | `shipyard quarantine list --json` |
 | Quarantine a flaky target | `shipyard quarantine add <target> --reason "..."` |
 | Remove from quarantine | `shipyard quarantine remove <target>` |
@@ -220,6 +222,51 @@ Every non-passing `TargetResult` and `EvidenceRecord` carries a `failure_class` 
 
 Agents should read `failure_class` before deciding whether to retry, escalate, or surface to a human.
 
+## Advisory lanes (lane degrade-mode)
+
+Not every lane should block the merge. A matrix with one noisy runner (flaky Windows, experimental macOS-ARM64) still wants to keep shipping when the known-problem lane is red. Mark it advisory:
+
+```toml
+[targets.windows]
+backend = "cloud"
+platform = "windows-arm64"
+advisory = true
+```
+
+A red advisory lane surfaces in `shipyard watch` and the PR body but does **not** block `shipyard ship` / `shipyard auto-merge`. Required lanes (the default — `advisory = false` or unset) still must be green.
+
+### Overriding per PR — the `Lane-Policy:` trailer
+
+Sometimes a release candidate needs to treat a normally-advisory lane as must-green (or vice versa). Put a trailer on the **tip commit** (never in the PR body):
+
+```
+Lane-Policy: windows=required
+```
+
+Multiple pairs, space- or comma-separated, are fine:
+
+```
+Lane-Policy: windows=required macos=advisory
+```
+
+The trailer overlays the config for this PR only. Unknown target names are ignored silently.
+
+### Advisory vs quarantine — when to reach for which
+
+| Question | Tool |
+|---|---|
+| "This lane is permanently flaky, I want to suppress TEST/UNKNOWN failures but still block on INFRA/TIMEOUT/CONTRACT." | `.shipyard/quarantine.toml` |
+| "This lane is intentionally noisy / experimental / optional; its status is informational at all times." | `advisory = true` |
+| "Just this one PR: escalate a normally-advisory lane to required." | `Lane-Policy: <target>=required` trailer |
+
+They compose cleanly: a target can be both quarantined and advisory; the advisory flag is the wider knob.
+
+### What the surfaces look like
+
+- `shipyard watch` (human) dims advisory evidence/runs and tags them `(advisory)`.
+- `shipyard watch --json` emits each dispatched run with a `required: bool` field so a downstream agent can filter without re-reading the config.
+- The PR body opened by `shipyard ship` lists advisory lanes under an "Advisory lanes" section, calling out any overrides that came from the `Lane-Policy` trailer.
+
 ## Flaky-target quarantine
 
 `.shipyard/quarantine.toml` is an opt-in list of targets whose `TEST` or `UNKNOWN` failures should be treated as advisory during the merge decision. `INFRA`, `TIMEOUT`, and `CONTRACT` failures are *never* suppressed — quarantine only hides authentic test flakiness, not infrastructure or contract bugs.
@@ -264,6 +311,7 @@ Never run `gh pr create` + release separately. Never run the Python gate scripts
 | Version bump  | `Version-Bump: <surface>=<patch\|minor\|major\|skip> reason="..."` |
 | Skill update  | `Skill-Update: skip skill=<name> reason="..."`              |
 | Auto-release  | `Release: skip reason="..."`                                 |
+| Lane policy   | `Lane-Policy: <target>=required\|advisory` (escalate/demote for this PR only) |
 
 **Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `src/shipyard/cli/**`, `src/shipyard/runners/**`, or `src/shipyard/config/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.
 

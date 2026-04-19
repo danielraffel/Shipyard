@@ -38,6 +38,11 @@ class TargetConfig:
         fallback: Ordered list of backend definitions to try when the
             primary is unreachable. Each entry is a dict with a
             ``type`` key and backend-specific fields.
+        advisory: When True, failures on this target are surfaced in
+            watch / PR comment but do NOT block the merge gate.
+            Overridable per-PR via a ``Lane-Policy: <target>=required``
+            commit trailer on the tip commit. Default ``False`` =
+            classic must-green behavior.
         raw: The original dict this was parsed from, preserved so
             callers can reach backend-specific keys without a
             round-trip through the dataclass.
@@ -48,6 +53,7 @@ class TargetConfig:
     backend: str = ""
     requires: list[str] = field(default_factory=list)
     fallback: list[dict[str, Any]] = field(default_factory=list)
+    advisory: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -82,8 +88,24 @@ def parse_target(name: str, data: dict[str, Any]) -> TargetConfig:
         backend=backend,
         requires=requires,
         fallback=[entry for entry in fallback_raw if isinstance(entry, dict)],
+        advisory=_coerce_advisory(data.get("advisory", False)),
         raw=data,
     )
+
+
+def _coerce_advisory(value: Any) -> bool:
+    """Coerce an ``advisory`` TOML value to a strict bool.
+
+    TOML gives us a native bool in the happy path, but be forgiving of
+    string forms written by tooling or humans (``"true"`` / ``"false"``).
+    Anything else falls back to ``False`` — the safer default since it
+    preserves must-green semantics.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return False
 
 
 def extract_requires(target_config: dict[str, Any]) -> list[str]:
@@ -99,4 +121,13 @@ def extract_requires(target_config: dict[str, Any]) -> list[str]:
     return [str(item).strip() for item in raw if str(item).strip()]
 
 
-__all__ = ["TargetConfig", "parse_target", "extract_requires"]
+def is_advisory(target_config: dict[str, Any]) -> bool:
+    """Read the ``advisory`` flag off a raw target dict.
+
+    Mirrors :func:`parse_target` for callers that still pass dicts
+    around instead of ``TargetConfig`` instances.
+    """
+    return _coerce_advisory(target_config.get("advisory", False))
+
+
+__all__ = ["TargetConfig", "parse_target", "extract_requires", "is_advisory"]

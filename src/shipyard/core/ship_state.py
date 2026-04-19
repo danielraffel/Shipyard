@@ -76,6 +76,13 @@ class DispatchedRun:
     "github-hosted") or SSH transports ("ssh", "ssh-windows"). The
     `status` field is the last observed status from the poller:
     "pending", "in_progress", "completed", "failed", "cancelled".
+
+    ``required`` captures the lane policy at dispatch time: ``True``
+    = this target must be green for merge; ``False`` = advisory, a
+    failure surfaces to reviewers but does not block. Default True
+    preserves the pre-advisory must-green behavior so pre-existing
+    state files and callers that don't know about lane policy keep
+    working unchanged.
     """
 
     target: str
@@ -85,6 +92,7 @@ class DispatchedRun:
     started_at: datetime
     updated_at: datetime
     attempt: int = 1
+    required: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +103,7 @@ class DispatchedRun:
             "started_at": self.started_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "attempt": self.attempt,
+            "required": self.required,
         }
 
     @classmethod
@@ -107,6 +116,9 @@ class DispatchedRun:
             started_at=datetime.fromisoformat(d["started_at"]),
             updated_at=datetime.fromisoformat(d["updated_at"]),
             attempt=d.get("attempt", 1),
+            # Default True for back-compat with state files written
+            # before lane policy existed.
+            required=bool(d.get("required", True)),
         )
 
 
