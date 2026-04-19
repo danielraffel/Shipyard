@@ -48,6 +48,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
+| Probe SSH runner reachability | `shipyard doctor --runners --json` |
 | Clean up artifacts | `shipyard cleanup --apply` |
 | List quarantined targets | `shipyard quarantine list --json` |
 | Quarantine a flaky target | `shipyard quarantine add <target> --reason "..."` |
@@ -96,6 +97,21 @@ shipyard watch --no-follow --json | jq '.state'
 # → "passed"    → done
 # → "failed"    → inspect logs
 ```
+
+### Reading rich watch output
+
+`shipyard watch` (human mode) shows per-run elapsed time, heartbeat
+age (`last_seen=12s_ago`, tagged `stale` when > `WATCH_STALE_SECS`,
+default 90s), a progress summary (`2/3 targets complete`), color +
+symbols (`✓`/`✗`/`⋯`), and a timestamp separator between snapshots.
+Honors `NO_COLOR=1` (XDG) for piped output. JSON mode adds
+`last_heartbeat_at`, `phase`, and `elapsed_seconds` fields to each
+dispatched-run emission; existing consumers keep working.
+
+When a runner goes silent past the stale threshold, `FallbackChain`
+auto-demotes it to UNREACHABLE and continues with the next provider.
+Use `shipyard doctor --runners` to probe SSH targets without running
+a ship.
 
 ## Mid-flight runner retargeting
 

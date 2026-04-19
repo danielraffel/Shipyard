@@ -76,6 +76,11 @@ class DispatchedRun:
     "github-hosted") or SSH transports ("ssh", "ssh-windows"). The
     `status` field is the last observed status from the poller:
     "pending", "in_progress", "completed", "failed", "cancelled".
+
+    `last_heartbeat_at`, `phase`, and `required` are optional live
+    metadata populated by the poller as updates arrive. `watch`
+    surfaces them for humans (elapsed, stale, phase column) and
+    emits them additively in `--json` mode for downstream consumers.
     """
 
     target: str
@@ -85,9 +90,12 @@ class DispatchedRun:
     started_at: datetime
     updated_at: datetime
     attempt: int = 1
+    last_heartbeat_at: datetime | None = None
+    phase: str | None = None
+    required: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "target": self.target,
             "provider": self.provider,
             "run_id": self.run_id,
@@ -96,9 +104,21 @@ class DispatchedRun:
             "updated_at": self.updated_at.isoformat(),
             "attempt": self.attempt,
         }
+        # Always emit the new fields (including `null` when unset)
+        # so downstream consumers can rely on a stable schema for
+        # the additive heartbeat/phase/required columns.
+        d["last_heartbeat_at"] = (
+            self.last_heartbeat_at.isoformat()
+            if self.last_heartbeat_at is not None
+            else None
+        )
+        d["phase"] = self.phase
+        d["required"] = self.required
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DispatchedRun:
+        hb_raw = d.get("last_heartbeat_at")
         return cls(
             target=d["target"],
             provider=d["provider"],
@@ -107,6 +127,11 @@ class DispatchedRun:
             started_at=datetime.fromisoformat(d["started_at"]),
             updated_at=datetime.fromisoformat(d["updated_at"]),
             attempt=d.get("attempt", 1),
+            last_heartbeat_at=(
+                datetime.fromisoformat(hb_raw) if hb_raw else None
+            ),
+            phase=d.get("phase"),
+            required=d.get("required"),
         )
 
 

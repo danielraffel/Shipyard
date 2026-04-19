@@ -15,3 +15,13 @@ Parse the JSON output. Report:
 - Overall readiness status
 
 If something is missing, explain how to install it.
+
+## Optional probes
+
+- `shipyard doctor --release-chain --json` — live-probes the
+  `RELEASE_BOT_TOKEN` → auto-release → binaries chain by dispatching
+  a workflow and waiting for the result.
+- `shipyard doctor --runners --json` — probes every SSH-backed target
+  in `.shipyard/config.toml` for reachability (5s per host, 8s
+  timeout). Surfaces a dead SSH host without running a full ship.
+  Skipped silently when the config has no SSH targets.

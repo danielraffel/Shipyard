@@ -19,12 +19,24 @@ clear error naming the requirements and the profiles that were tried.
 Backward compatibility: a target with no ``requires`` (or an empty
 list) is not filtered — every backend still runs in order, exactly as
 before.
+
+Heartbeat-based eviction (#84)
+-------------------------------
+
+When a backend's final TargetResult carries ``liveness == "stuck"``
+or ``last_heartbeat_at`` older than
+``heartbeat_stale_secs`` (default 90s = 3 missed 30-second
+intervals), the chain treats the backend as UNREACHABLE and demotes
+to the next provider. This lets a dead SSH host surface inside the
+~90s window rather than blocking until the per-target wall-clock
+timeout.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 
 from shipyard.core.classify import FailureClass
@@ -34,6 +46,11 @@ if TYPE_CHECKING:
     from shipyard.providers.base import ProviderProfile
 
 logger = logging.getLogger(__name__)
+
+# Default heartbeat-age cutoff: 3 × 30s intervals. Matches the
+# watch renderer's `stale` marker so the chain and the UI agree on
+# when a runner has gone silent.
+DEFAULT_HEARTBEAT_STALE_SECS = 90.0
 
 
 class FallbackExecutor(Protocol):
@@ -82,6 +99,7 @@ class FallbackChain:
     backends: list[dict[str, Any]]
     executors: dict[str, FallbackExecutor]
     profiles: dict[str, dict[str, ProviderProfile]] = field(default_factory=dict)
+    heartbeat_stale_secs: float = DEFAULT_HEARTBEAT_STALE_SECS
 
     def execute(
         self,
@@ -186,6 +204,40 @@ class FallbackChain:
                 log_path=attempt_log,
                 **kwargs,
             )
+
+            # Heartbeat-based demotion (#84). If the executor finished
+            # but the result carries `liveness=stuck` or the last
+            # heartbeat is older than `heartbeat_stale_secs`, treat
+            # the run as UNREACHABLE even if the status came back
+            # PASS/ERROR — a stale stamp means we can't trust the
+            # outcome came from a live runner. PASS is explicitly
+            # excluded from demotion: if the executor claims success,
+            # we accept it (the stale stamp just means output trailed
+            # off at the end), otherwise we'd be inventing failures
+            # on healthy runs.
+            if (
+                result.status != TargetStatus.PASS
+                and _should_evict_for_heartbeat(
+                    result, self.heartbeat_stale_secs
+                )
+            ):
+                logger.info(
+                    "Backend '%s' evicted on stale heartbeat "
+                    "(stale for >%.0fs) — demoting to UNREACHABLE",
+                    _backend_label(backend_def),
+                    self.heartbeat_stale_secs,
+                )
+                result = replace(
+                    result,
+                    status=TargetStatus.UNREACHABLE,
+                    error_message=(
+                        result.error_message
+                        or f"Runner went silent for >{int(self.heartbeat_stale_secs)}s"
+                    ),
+                    failure_class=(
+                        result.failure_class or FailureClass.INFRA.value
+                    ),
+                )
 
             # Test failures are authoritative — don't retry
             if result.status == TargetStatus.FAIL:
@@ -335,3 +387,31 @@ def _backend_label(backend_def: dict[str, Any]) -> str:
     if btype in {"ssh-windows", "ssh_windows"}:
         return f"ssh-windows:{backend_def.get('host', '?')}"
     return btype
+
+
+def _should_evict_for_heartbeat(
+    result: TargetResult, stale_secs: float
+) -> bool:
+    """Return True when `result` should be demoted due to liveness.
+
+    Two signals:
+
+    1. ``liveness == "stuck"`` — already decided by the streaming
+       layer (≥ ``stuck_idle_secs`` of silence from the subprocess).
+    2. ``last_heartbeat_at`` older than ``stale_secs`` relative to
+       the result's ``completed_at`` (or now, if completed_at is
+       missing). This catches cases where the subprocess got killed
+       before the streaming layer could flip liveness to ``stuck``.
+
+    Called only when the incoming result is not PASS — we never
+    invent failures on a success (a trailing quiet spell at the end
+    of a green run is not a failover trigger).
+    """
+    if result.liveness == "stuck":
+        return True
+    hb = result.last_heartbeat_at
+    if hb is None:
+        return False
+    reference = result.completed_at or datetime.now(timezone.utc)
+    age = (reference - hb).total_seconds()
+    return age >= stale_secs
