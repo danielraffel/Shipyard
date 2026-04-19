@@ -9,11 +9,15 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 - feat: runner liveness heartbeat + watch UI polish (#84, #93) ([#96](https://github.com/danielraffel/Shipyard/pull/96))
 
 <a id="v0160"></a>
+## [0.17.0]
+
 ## [0.16.0] - 2026-04-19
 
 - feat/cross pr reuse ([#95](https://github.com/danielraffel/Shipyard/pull/95))
 
 <a id="v0150"></a>
+## [0.16.0]
+
 ## [0.15.0] - 2026-04-19
 
 - feat: failure classification + flaky-target quarantine (closes #83) ([#94](https://github.com/danielraffel/Shipyard/pull/94))

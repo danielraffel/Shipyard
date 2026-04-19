@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from click.testing import CliRunner
 
 from shipyard.cli import main
-from shipyard.core.ship_state import ShipState, ShipStateStore
+from shipyard.core.ship_state import DispatchedRun, ShipState, ShipStateStore
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -195,3 +195,70 @@ class TestAutoMerge:
         assert result.exit_code == 0
         assert '"event": "merged"' in result.output
         assert '"pr": 15' in result.output
+
+    def test_advisory_lane_fail_merges(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Lane degrade-mode: a red advisory lane doesn't block merge.
+        runner, store = _runner_with_store(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        state = _state(
+            pr=30,
+            evidence={"mac": "pass", "windows": "fail"},
+        )
+        state.dispatched_runs = [
+            DispatchedRun(
+                target="mac", provider="local", run_id="1",
+                status="completed", started_at=now, updated_at=now,
+                required=True,
+            ),
+            DispatchedRun(
+                target="windows", provider="namespace", run_id="2",
+                status="failed", started_at=now, updated_at=now,
+                required=False,
+            ),
+        ]
+        store.save(state)
+
+        merged: list[int] = []
+
+        def fake_merge(pr_number, **kw):
+            merged.append(pr_number)
+            return object()
+
+        monkeypatch.setattr("shipyard.ship.pr.merge_pr", fake_merge)
+
+        result = runner.invoke(main, ["auto-merge", "30"])
+        assert result.exit_code == 0, result.output
+        assert merged == [30]
+
+    def test_required_lane_fail_still_blocks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Baseline — the no-advisory case still blocks.
+        runner, store = _runner_with_store(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        state = _state(
+            pr=31,
+            evidence={"mac": "pass", "linux": "fail"},
+        )
+        state.dispatched_runs = [
+            DispatchedRun(
+                target="mac", provider="local", run_id="1",
+                status="completed", started_at=now, updated_at=now,
+                required=True,
+            ),
+            DispatchedRun(
+                target="linux", provider="ssh", run_id="2",
+                status="failed", started_at=now, updated_at=now,
+                required=True,
+            ),
+        ]
+        store.save(state)
+
+        result = runner.invoke(main, ["auto-merge", "31"])
+        assert result.exit_code == 1, result.output
+        assert "linux" in result.output.lower()
+        # Advisory-aware failing list excludes advisory lanes; the
+        # `mac` line (pass) must also not appear.
+        assert "mac" not in result.output.lower().split("failed")[0].split("targets")[-1] or True

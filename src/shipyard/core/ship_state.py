@@ -77,10 +77,17 @@ class DispatchedRun:
     `status` field is the last observed status from the poller:
     "pending", "in_progress", "completed", "failed", "cancelled".
 
-    `last_heartbeat_at`, `phase`, and `required` are optional live
-    metadata populated by the poller as updates arrive. `watch`
-    surfaces them for humans (elapsed, stale, phase column) and
-    emits them additively in `--json` mode for downstream consumers.
+    ``required`` captures the lane policy at dispatch time: ``True``
+    = must be green for merge; ``False`` = advisory, a failure
+    surfaces to reviewers but does not block (see #87 lane policy).
+    Default True preserves the pre-advisory must-green behavior so
+    pre-existing state files and callers that don't know about lane
+    policy keep working unchanged.
+
+    `last_heartbeat_at` and `phase` are optional live metadata
+    populated by the poller as updates arrive. `watch` surfaces them
+    for humans (elapsed, stale, phase column) and emits them
+    additively in `--json` mode for downstream consumers.
     """
 
     target: str
@@ -92,7 +99,7 @@ class DispatchedRun:
     attempt: int = 1
     last_heartbeat_at: datetime | None = None
     phase: str | None = None
-    required: bool | None = None
+    required: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -103,6 +110,7 @@ class DispatchedRun:
             "started_at": self.started_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "attempt": self.attempt,
+            "required": self.required,
         }
         # Always emit the new fields (including `null` when unset)
         # so downstream consumers can rely on a stable schema for
@@ -131,7 +139,9 @@ class DispatchedRun:
                 datetime.fromisoformat(hb_raw) if hb_raw else None
             ),
             phase=d.get("phase"),
-            required=d.get("required"),
+            # Default True for back-compat with state files written
+            # before lane policy existed (#87).
+            required=bool(d.get("required", True)),
         )
 
 

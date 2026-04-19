@@ -214,6 +214,105 @@ class TestWatchCli:
         assert '"event": "update"' in result.output
         assert '"pr": 11' in result.output
 
+    def test_json_dispatched_runs_include_required_field(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # lane degrade-mode: JSON emissions must expose `required`
+        # per dispatched run so a downstream agent can tell advisory
+        # from must-green without re-reading the config.
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        required_run = DispatchedRun(
+            target="mac", provider="local",
+            run_id="1", status="completed",
+            started_at=now, updated_at=now, required=True,
+        )
+        advisory_run = DispatchedRun(
+            target="windows", provider="namespace",
+            run_id="2", status="failed",
+            started_at=now, updated_at=now, required=False,
+        )
+        store.save(
+            _state(
+                pr=12,
+                evidence={"mac": "pass", "windows": "fail"},
+                runs=[required_run, advisory_run],
+            )
+        )
+        monkeypatch.setattr(
+            "shipyard.cli._git_branch", lambda: "feature/x"
+        )
+        result = runner.invoke(
+            main, ["--json", "watch", "--pr", "12", "--no-follow"]
+        )
+        # Verdict: windows is advisory → terminal success.
+        assert result.exit_code == 0, result.output
+        import json as _json
+
+        payload = _json.loads(result.output)
+        assert payload["event"] == "update"
+        by_target = {
+            r["target"]: r for r in payload["dispatched_runs"]
+        }
+        assert by_target["mac"]["required"] is True
+        assert by_target["windows"]["required"] is False
+
+    def test_advisory_fail_is_terminal_success(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Golden path: windows advisory fails; mac required passes.
+        # Overall verdict must be success.
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        runs = [
+            DispatchedRun(
+                target="mac", provider="local", run_id="1",
+                status="completed", started_at=now, updated_at=now,
+                required=True,
+            ),
+            DispatchedRun(
+                target="windows", provider="namespace", run_id="2",
+                status="failed", started_at=now, updated_at=now,
+                required=False,
+            ),
+        ]
+        store.save(
+            _state(
+                pr=79,
+                evidence={"mac": "pass", "windows": "fail"},
+                runs=runs,
+            )
+        )
+        monkeypatch.setattr(
+            "shipyard.cli._git_branch", lambda: "feature/x"
+        )
+        result = runner.invoke(main, ["watch", "--no-follow"])
+        assert result.exit_code == 0, result.output
+        # Human output annotates the advisory lane distinctly.
+        assert "(advisory)" in result.output
+
+    def test_required_fail_still_blocks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Baseline: a required lane's fail still exits 1.
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        runs = [
+            DispatchedRun(
+                target="mac", provider="local", run_id="1",
+                status="failed", started_at=now, updated_at=now,
+                required=True,
+            ),
+        ]
+        store.save(
+            _state(pr=80, evidence={"mac": "fail"}, runs=runs)
+        )
+        monkeypatch.setattr(
+            "shipyard.cli._git_branch", lambda: "feature/x"
+        )
+        result = runner.invoke(main, ["watch", "--no-follow"])
+        assert result.exit_code == 1
+
     def test_reused_surfaced_in_json(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

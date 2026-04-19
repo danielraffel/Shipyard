@@ -29,6 +29,14 @@ class MergeCheck:
     still sees them. Failures with class INFRA / TIMEOUT / CONTRACT are
     never suppressed by quarantine (they indicate real, fixable
     infrastructure or contract problems).
+
+    Lane degrade-mode interaction: platforms in the ``advisory_platforms``
+    set (derived from ``[targets.<name>] advisory = true`` plus the
+    ``Lane-Policy:`` commit trailer) are ALSO routed to ``advisory``
+    regardless of failure class. Unlike quarantine, advisory mode does
+    not discriminate by failure class — it's a strict policy knob that
+    says "this lane never blocks the merge". A missing advisory lane
+    likewise does not block ``ready``.
     """
 
     ready: bool
@@ -61,6 +69,7 @@ def can_merge(
     sha: str,
     required_platforms: list[str],
     quarantine: QuarantineList | None = None,
+    advisory_platforms: set[str] | frozenset[str] | None = None,
 ) -> MergeCheck:
     """Check if all required platforms have passing evidence for this SHA.
 
@@ -69,6 +78,13 @@ def can_merge(
     appears on the list are moved from ``failing`` to ``advisory`` and
     do not block ``ready``. When ``quarantine`` is None, behavior is
     identical to the pre-quarantine code path (backward compatible).
+
+    When ``advisory_platforms`` is supplied, platforms in that set are
+    treated as non-blocking regardless of failure class or missing
+    evidence: a failure lands in ``advisory`` and a missing record is
+    silently tolerated (the merge gate doesn't wait on an advisory
+    lane). This is how ``[targets.<name>] advisory = true`` and the
+    ``Lane-Policy:`` commit trailer flow into the merge decision.
     """
     passing: list[str] = []
     missing: list[str] = []
@@ -77,21 +93,32 @@ def can_merge(
 
     records = evidence_store.get_branch(branch)
     q = quarantine or QuarantineList(entries=[], path=None)
+    adv_platforms: frozenset[str] = frozenset(advisory_platforms or ())
 
     for platform in required_platforms:
+        is_advisory_lane = platform in adv_platforms
         found = False
         for rec in records.values():
             if rec.platform == platform and rec.sha == sha:
                 found = True
                 if rec.passed:
                     passing.append(platform)
+                elif is_advisory_lane:
+                    # Advisory lane: any non-pass status is informational.
+                    advisory.append(platform)
                 elif is_advisory_failure(q, rec.target_name, rec.failure_class):
                     advisory.append(platform)
                 else:
                     failing.append(platform)
                 break
         if not found:
-            missing.append(platform)
+            if is_advisory_lane:
+                # Missing advisory evidence is NOT a blocker — an
+                # advisory lane that never reported is a "don't wait
+                # on it" signal.
+                advisory.append(platform)
+            else:
+                missing.append(platform)
 
     # A platform counts toward merge-ready if it's passing or advisory.
     ready = (len(passing) + len(advisory)) == len(required_platforms) and not failing
@@ -195,11 +222,16 @@ def ship(
     job = queue.enqueue(job)
 
     # Check if we already have enough evidence to merge, honoring
-    # any `.shipyard/quarantine.toml` entries.
+    # any `.shipyard/quarantine.toml` entries and the per-target
+    # advisory flag (plus `Lane-Policy:` trailer overlay).
+    from shipyard.ship.lane_policy import advisory_platforms_for_config
+
     quarantine = QuarantineList.load_from_project(config.project_dir)
+    advisory_platforms = advisory_platforms_for_config(config)
     check = can_merge(
         evidence_store, branch, sha, required_platforms,
         quarantine=quarantine,
+        advisory_platforms=advisory_platforms,
     )
 
     if check.ready:

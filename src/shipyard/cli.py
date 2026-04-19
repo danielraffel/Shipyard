@@ -10,7 +10,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -52,6 +52,9 @@ from shipyard.release_bot.setup import (
     set_secret,
     verify_token,
 )
+
+if TYPE_CHECKING:
+    from shipyard.ship.lane_policy import LanePolicy
 
 
 class Context:
@@ -2320,6 +2323,7 @@ def cloud_add_lane(
         run_id = ""
 
     now = datetime.now(timezone.utc)
+    advisory_policy = _resolve_lane_policy_for_ship(ctx.config)
     dispatched = DispatchedRun(
         target=target,
         provider=resolved_provider,
@@ -2328,6 +2332,7 @@ def cloud_add_lane(
         started_at=now,
         updated_at=now,
         attempt=ship_state.attempt,
+        required=advisory_policy.is_required(target),
     )
     ship_state.append_run(dispatched)
     ctx.ship_state.save(ship_state)
@@ -2572,7 +2577,8 @@ def ship(
         if not ctx.json_mode:
             render_message(f"Found existing PR #{pr_info.number}")
     else:
-        pr_info = create_pr(branch, base, f"Ship {branch}", "Automated by Shipyard")
+        pr_body = _compose_pr_body(ctx.config)
+        pr_info = create_pr(branch, base, f"Ship {branch}", pr_body)
         if not ctx.json_mode:
             render_message(f"Created PR #{pr_info.number}")
 
@@ -3256,8 +3262,15 @@ def auto_merge(
 
     if verdict is False:
         # A target failed. Loud exit so the cron log grep catches it.
+        # Exclude advisory lanes — if we're here and verdict is False,
+        # an advisory lane's fail was tolerated by the verdict, so it
+        # is not what the reviewer should look at.
+        advisory_targets = {
+            r.target for r in state.dispatched_runs if not r.required
+        }
         failing = [
-            t for t, v in state.evidence_snapshot.items() if v != "pass"
+            t for t, v in state.evidence_snapshot.items()
+            if v != "pass" and t not in advisory_targets
         ]
         if ctx.json_mode:
             ctx.output(
@@ -3673,6 +3686,9 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
         f"PR #{state.pr}  sha={state.head_sha[:12]}  "
         f"attempt={state.attempt}  age={age_s}s"
     )
+    advisory_targets = {
+        r.target for r in state.dispatched_runs if not r.required
+    }
 
     # Progress summary above the per-run block.
     complete, in_flight, total = _progress_summary(state)
@@ -3681,32 +3697,40 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
             f"  {complete}/{total} targets complete \u00b7 {in_flight} in flight"
         )
 
-    # Evidence rendering, reuse-aware.
+    # Evidence rendering: reuse-aware (#88) + advisory-aware (#87)
+    # + color/symbols (#93). Advisory dims the whole line.
     for target, status in sorted(state.evidence_snapshot.items()):
+        is_advisory = target in advisory_targets
+        tag = " (advisory)" if is_advisory else ""
         if target in reuse_map and status == "pass":
             short = reuse_map[target][:7]
-            sym, style = _evidence_symbol("pass")
+            sym, sym_style = _evidence_symbol("pass")
+            line_style = "dim" if is_advisory else sym_style
             render_message(
-                f"  {_style(sym, style, enabled=color)} evidence: "
-                f"{target}=reused (from {short})"
+                f"  {_style(sym, line_style, enabled=color)} evidence: "
+                f"{target}=reused (from {short}){tag}"
             )
         else:
-            sym, style = _evidence_symbol(status)
+            sym, sym_style = _evidence_symbol(status)
+            line_style = "dim" if is_advisory else sym_style
             render_message(
-                f"  {_style(sym, style, enabled=color)} evidence: {target}={status}"
+                f"  {_style(sym, line_style, enabled=color)} evidence: "
+                f"{target}={status}{tag}"
             )
 
     for run in state.dispatched_runs:
         elapsed = _run_elapsed_secs(run, now)
         last_seen, is_stale = _heartbeat_age_label(run, now, stale_secs)
-        sym, style = _run_symbol(run.status, "stuck" if is_stale else None)
+        sym, sym_style = _run_symbol(run.status, "stuck" if is_stale else None)
         phase = run.phase or "-"
+        advisory_tag = " (advisory)" if not run.required else ""
+        line_style = "dim" if not run.required else sym_style
         line = (
-            f"  {_style(sym, style, enabled=color)} run: "
+            f"  {_style(sym, line_style, enabled=color)} run: "
             f"{run.target} ({run.provider}) "
             f"id={run.run_id} status={run.status} "
             f"phase={phase} elapsed={elapsed}s "
-            f"last_seen={last_seen}"
+            f"last_seen={last_seen}{advisory_tag}"
         )
         if is_stale:
             line += "  " + _style("stale", "bold magenta", enabled=color)
@@ -3740,13 +3764,25 @@ def _ship_terminal_verdict(state: ShipState) -> bool | None:
     polling until every recorded target has reached a terminal
     outcome — a missing platform is treated as "still in flight"
     because evidence may not have been written yet.
+
+    Advisory lanes (``DispatchedRun.required is False``) do not
+    change the terminal boundary: we still wait for them to finish
+    so the watch output reflects reality. But when computing
+    pass/fail, failures on advisory lanes are tolerated — they're
+    informational, not a blocker for the merge gate.
     """
     if not state.evidence_snapshot:
         return None
     statuses = set(state.evidence_snapshot.values())
     if statuses - {"pass", "fail"}:
         return None
-    return all(v == "pass" for v in state.evidence_snapshot.values())
+    advisory_targets = {
+        r.target for r in state.dispatched_runs if not r.required
+    }
+    return all(
+        v == "pass" or tgt in advisory_targets
+        for tgt, v in state.evidence_snapshot.items()
+    )
 
 
 @ship_state_group.command("discard")
@@ -4338,8 +4374,8 @@ def _update_ship_state_from_job(
     queue rather than a cloud polling loop.
     """
     now = datetime.now(timezone.utc)
-    required_platforms = set(_required_platforms_for_config(ctx.config))
     cloud_runs_by_platform = _cloud_runs_by_platform(ctx, job.sha)
+    advisory_policy = _resolve_lane_policy_for_ship(ctx.config)
     for name, result in job.results.items():
         if not result.is_terminal:
             continue
@@ -4359,14 +4395,57 @@ def _update_ship_state_from_job(
                 attempt=ship_state.attempt,
                 last_heartbeat_at=result.last_heartbeat_at,
                 phase=result.phase,
-                required=(
-                    result.platform in required_platforms
-                    if required_platforms
-                    else None
-                ),
+                required=advisory_policy.is_required(name),
             )
         )
     ctx.ship_state.save(ship_state)
+
+
+def _compose_pr_body(config: Config) -> str:
+    """Build the PR body for a freshly-opened ship, including advisory
+    lane annotations.
+
+    When the resolved lane policy marks one or more lanes advisory,
+    list them in the body so reviewers aren't surprised that a red
+    advisory lane still landed. Trailer-based overrides are called
+    out separately so the reviewer can audit why the default policy
+    was flipped on this PR.
+    """
+    lines: list[str] = ["Automated by Shipyard."]
+    policy = _resolve_lane_policy_for_ship(config)
+    advisory = sorted(policy.advisory_targets)
+    if advisory:
+        lines.append("")
+        lines.append("## Advisory lanes")
+        lines.append(
+            "The following lanes are **advisory** — their status is "
+            "informational and does not block merge:"
+        )
+        for target in advisory:
+            suffix = (
+                " (overridden via Lane-Policy trailer)"
+                if target in policy.overrides_from_trailer
+                else ""
+            )
+            lines.append(f"- `{target}`{suffix}")
+    return "\n".join(lines)
+
+
+def _resolve_lane_policy_for_ship(config: Config) -> LanePolicy:
+    """Resolve the lane policy (advisory vs required) for the current PR.
+
+    Reads the tip commit to pick up a ``Lane-Policy:`` trailer
+    overlay. Falls back silently to config-only advisory if the git
+    read fails — the tip commit isn't always reachable (worktree
+    recreated, shallow clone) and we'd rather ship with the
+    committed policy than abort.
+    """
+    from shipyard.ship.lane_policy import resolve_lane_policy
+
+    return resolve_lane_policy(
+        config,
+        known_targets=list((config.targets or {}).keys()),
+    )
 
 
 def _cloud_runs_by_platform(ctx: Context, sha: str) -> dict[str, str]:
