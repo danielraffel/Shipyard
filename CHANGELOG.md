@@ -9,6 +9,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
      docs/post-release-sync.md for the full end-to-end flow. -->
 
 <a id="v0110"></a>
+## [0.12.0]
+
 ## [0.11.0] - 2026-04-18
 
 - Ship feature/post-tag-sync-bash-fix ([#75](https://github.com/danielraffel/Shipyard/pull/75))
