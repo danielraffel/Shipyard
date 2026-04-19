@@ -58,6 +58,52 @@ fallback = [
 This keeps things predictable. You always know exactly what Shipyard will
 do because you configured it.
 
+## Locality routing (`requires`)
+
+Targets can declare capability constraints with `requires = [...]`.
+Shipyard then filters the fallback chain down to providers whose
+profile advertises every required capability. If nothing in the chain
+matches, the target fails with a clear error — better than silently
+dispatching a CUDA build to a CPU-only runner.
+
+```toml
+[targets.cuda-build]
+platform = "linux-x64"
+requires = ["gpu", "x86_64"]
+fallback = [
+    { type = "cloud", provider = "namespace", profile = "gpu" },
+    { type = "ssh", host = "gpu-box", capabilities = ["gpu", "x86_64", "linux"] },
+]
+```
+
+The standard capability vocabulary is `gpu`, `arm64`, `x86_64`,
+`macos`, `linux`, `windows`, `nested_virt`, `privileged`. You can add
+your own strings — the matcher is pure set containment, so unknown
+capabilities work as long as the target and the provider agree.
+
+Capabilities are resolved in this order for each backend:
+
+1. An inline `capabilities = [...]` list on the backend entry.
+2. For `type = "cloud"` backends, the provider's profile registry
+   (`[providers.<p>.profiles.<name>]`) — see
+   [`docs/profiles.md`](./profiles.md).
+3. Nothing — the backend is filtered out of the chain.
+
+Omitting `requires` keeps today's behavior exactly — every backend in
+the chain is still tried in order.
+
+### Clear error when nothing matches
+
+```
+$ shipyard run --targets cuda-build
+…
+  cuda-build  error
+    no provider satisfies requires=['gpu']: tried [namespace.default, github-hosted.ubuntu-latest]
+```
+
+Fix by either adding a GPU-capable backend to the target's `fallback`
+or adding the needed capability to the profile you're already using.
+
 ## What Shipyard checks on setup
 
 `shipyard doctor` checks what you have and tells you what's missing:

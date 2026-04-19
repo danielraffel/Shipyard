@@ -111,23 +111,33 @@ class SSHExecutor:
                 remote_bundle = target_config.get(
                     "remote_bundle_path", "/tmp/shipyard.bundle"
                 )
+                local_repo_dir = target_config.get("local_repo_dir")
 
                 # Try an incremental bundle first: query the remote
                 # for its HEAD SHA and use it as a basis so only the
-                # delta is bundled. Falls back to a full bundle if
-                # the remote HEAD is unknown or the incremental
-                # bundle fails (e.g. no common ancestor).
+                # delta is bundled. The remote HEAD must also exist
+                # as an ancestor in the local repo, otherwise
+                # `git bundle create ^<basis>` has no meaningful cut
+                # point and either fails or silently produces a full
+                # bundle. Falls back to a full bundle if the remote
+                # HEAD is unknown, not locally reachable, or the
+                # incremental bundle fails.
                 basis_shas: list[str] = []
+                bundle_mode = "full"
                 remote_head = _remote_head_sha(host, remote_repo, ssh_options)
-                if remote_head:
+                if remote_head and _local_has_commit(
+                    remote_head, repo_dir=local_repo_dir,
+                ):
                     basis_shas.append(remote_head)
 
                 bundle_result = create_bundle(
                     sha=sha,
                     output_path=bundle_path,
-                    repo_dir=target_config.get("local_repo_dir"),
+                    repo_dir=local_repo_dir,
                     basis_shas=basis_shas,
                 )
+                if bundle_result.success and basis_shas:
+                    bundle_mode = "delta"
 
                 # If incremental bundle failed and we had a basis,
                 # fall back to a full bundle.
@@ -135,13 +145,21 @@ class SSHExecutor:
                     bundle_result = create_bundle(
                         sha=sha,
                         output_path=bundle_path,
-                        repo_dir=target_config.get("local_repo_dir"),
+                        repo_dir=local_repo_dir,
                     )
+                    bundle_mode = "full"
                 if not bundle_result.success:
                     return _error_result(
                         target_name, platform, started_at, start_time,
                         str(log_file), f"Bundle creation failed: {bundle_result.message}",
                     )
+
+                bundle_bytes = _safe_filesize(bundle_path)
+                _append_log(
+                    log_file,
+                    f"=== bundle_mode={bundle_mode} bundle_bytes={bundle_bytes} "
+                    f"sha={sha} remote_head={remote_head or 'unknown'} ===\n",
+                )
 
                 upload_result = upload_bundle(
                     bundle_path=bundle_path,
@@ -315,6 +333,47 @@ def _remote_head_sha(
         return None
     except (subprocess.SubprocessError, OSError):
         return None
+
+
+def _local_has_commit(
+    sha: str,
+    repo_dir: str | None = None,
+    *,
+    timeout: int = 10,
+) -> bool:
+    """Return True when the local repo has `sha` as a reachable commit.
+
+    Used to validate a candidate basis SHA for incremental-bundle
+    creation. `git bundle create <target> ^<basis>` only produces a
+    meaningful delta when `<basis>` is an ancestor of `<target>` in
+    the local object store; if the local clone hasn't fetched the
+    remote's HEAD yet (e.g. the remote was updated out-of-band, or
+    the basis was rewritten), the negation is a no-op and we'd waste
+    bandwidth shipping what is effectively a full bundle.
+
+    Returns False on any error (missing git, bad cwd, timeout) so
+    the caller falls back to a full bundle as a safe default.
+    """
+    cmd = ["git", "cat-file", "-e", f"{sha}^{{commit}}"]
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _safe_filesize(path: Path) -> int:
+    """Return file size in bytes, or -1 if the file can't be stat'd."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return -1
 
 
 def _remote_has_sha(

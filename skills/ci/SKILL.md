@@ -50,6 +50,50 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Environment check | `shipyard doctor --json` |
 | Clean up artifacts | `shipyard cleanup --apply` |
 
+## When to use `watch` (agent decision guide)
+
+After dispatching a ship (`shipyard ship`), agents have four ways to
+track it to completion. Pick by **session posture**, not by how long you
+think the build takes:
+
+| Posture | Command | Why |
+|---|---|---|
+| You can hold the session open until merge | `shipyard watch --follow --json` | Blocks; exits `0` pass, `1` fail, `130` SIGINT. Zero polling logic needed. |
+| You want to release the session, re-check later | `shipyard watch --no-follow --json` + `ScheduleWakeup` | One-shot snapshot is cheap. Re-check on wakeup; exits `3` while in-flight. |
+| The agent is stepping away entirely | `shipyard auto-merge <pr>` on cron / GitHub schedule | Idempotent one-shot. Exits `0` merged, `1` fail, `2` not-found, `3` in-flight. |
+| You just want a status peek right now | `shipyard watch --no-follow --json` | Same as a `ship-state show` but uses the live event schema. |
+
+**Rules of thumb for agents:**
+
+- If you just ran `shipyard ship` in the same turn and the user is
+  waiting, `shipyard watch --follow --json` is almost always right —
+  you already own the session.
+- If you'll need more than ~5 minutes and want to yield back to the
+  user, prefer `--no-follow` + `ScheduleWakeup`. Don't `sleep` inside
+  the session.
+- **Never poll with `watch --follow` in a tight loop.** `--follow`
+  already blocks; calling it repeatedly is wasted cache and clock.
+- `auto-merge` is for out-of-session automation (cron, systemd timer,
+  GitHub Actions schedule). Not a substitute for `watch` within a live
+  agent session.
+
+Example — agent blocks until merge in-session:
+
+```sh
+shipyard ship --json
+shipyard watch --follow --json   # exits when ship completes
+```
+
+Example — agent yields, re-checks later via `ScheduleWakeup`:
+
+```sh
+shipyard ship --json
+shipyard watch --no-follow --json | jq '.state'
+# → "in_flight" → ScheduleWakeup 20m, re-run the same snapshot
+# → "passed"    → done
+# → "failed"    → inspect logs
+```
+
 ## Mid-flight runner retargeting
 
 When a provider change would be valuable *during* an in-flight PR drain — e.g., you notice halfway through shipping 10 PRs that Namespace macOS is faster than GitHub-hosted — use `shipyard cloud retarget`:
@@ -142,6 +186,22 @@ fallback = [
 There is no `shipyard config` or `shipyard targets` subcommand yet. Inspect
 target definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml`,
 and use `shipyard status --json` for live target state.
+
+### Locality routing (`requires`)
+
+Targets can declare capability constraints with `requires = [...]`; the
+fallback chain is then filtered to providers whose profile matches
+every required capability. Vocabulary: `gpu`, `arm64`, `x86_64`,
+`macos`, `linux`, `windows`, `nested_virt`, `privileged` (plus any
+user-defined strings). Missing `requires` = no filter (backward
+compatible). When nothing matches, the target errors with
+`no provider satisfies requires=[…]: tried [namespace.default, …]`.
+Full docs: [`docs/targets.md`](../../docs/targets.md) and
+[`docs/profiles.md`](../../docs/profiles.md).
+
+## SSH delivery: incremental bundles
+
+SSH-backed targets deliver code via `git bundle`. On the first run the bundle is full (every object reachable from the target SHA, ~443 MB for Pulp-sized repos). On every subsequent run Shipyard probes the remote for its current HEAD over SSH (`git rev-parse HEAD`), verifies that the local clone has that commit as an ancestor, and emits `git bundle create <bundle> <target> ^<remote_head>` — a delta bundle that is typically kilobytes instead of megabytes. Any failure in the probe, ancestry check, or delta create silently falls back to the full-bundle path so the behavior on cold/corrupt remotes is unchanged. Each run logs a `bundle_mode=delta|full bundle_bytes=<N>` line to the per-target log so operators can confirm the optimisation is active.
 
 ## Troubleshooting
 
