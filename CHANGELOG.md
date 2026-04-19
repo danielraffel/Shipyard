@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0150"></a>
+## [0.16.0]
+
 ## [0.15.0] - 2026-04-19
 
 - feat: failure classification + flaky-target quarantine (closes #83) ([#94](https://github.com/danielraffel/Shipyard/pull/94))
