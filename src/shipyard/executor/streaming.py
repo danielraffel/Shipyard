@@ -45,6 +45,13 @@ class StreamingCommandResult:
     # decoded output line, so the validation script can emit them
     # anywhere in a line, not just at line start.
     contract_markers_seen: tuple[str, ...] = ()
+    # Last heartbeat stamp emitted during the run (either from a
+    # decoded output line or from the idle-ticker). The executor
+    # carries this into the final TargetResult so liveness is
+    # preserved after the subprocess terminates — the watch
+    # renderer and FallbackChain eviction both need a stamp on the
+    # final result, not just on the per-tick callback.
+    last_heartbeat_at: datetime | None = None
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -105,6 +112,7 @@ def run_streaming_command(
     output_parts_bytes = 0
     last_output_at: datetime | None = None
     last_output_monotonic = start_time
+    last_heartbeat_at: datetime | None = None
     current_phase = phase
     # Track which contract markers have appeared. Use a list (not a
     # set) so the order of first occurrence is preserved for
@@ -128,7 +136,7 @@ def run_streaming_command(
                 except queue.Empty:
                     if proc.poll() is not None and line_queue.empty():
                         break
-                    _emit_heartbeat(
+                    last_heartbeat_at = _emit_heartbeat(
                         progress_callback=progress_callback,
                         last_output_at=last_output_at,
                         last_output_monotonic=last_output_monotonic,
@@ -170,11 +178,17 @@ def run_streaming_command(
 
                 last_output_at = datetime.now(timezone.utc)
                 last_output_monotonic = time.monotonic()
+                # A fresh line is itself a liveness signal — stamp
+                # the heartbeat too so downstream consumers (watch,
+                # doctor --runners, FallbackChain) agree "last seen"
+                # covers output and idle ticks alike.
+                last_heartbeat_at = last_output_at
                 if progress_callback:
                     progress_callback(
                         {
                             "phase": current_phase,
                             "last_output_at": last_output_at,
+                            "last_heartbeat_at": last_heartbeat_at,
                             "quiet_for_secs": 0.0,
                             "liveness": "active",
                         }
@@ -197,6 +211,7 @@ def run_streaming_command(
         last_output_at=last_output_at,
         phase=current_phase,
         contract_markers_seen=tuple(seen_markers),
+        last_heartbeat_at=last_heartbeat_at,
     )
 
 
@@ -229,9 +244,18 @@ def _emit_heartbeat(
     start_monotonic: float,
     current_phase: str | None,
     stuck_idle_secs: float,
-) -> None:
+) -> datetime:
+    """Emit a heartbeat tick. Returns the timestamp stamped.
+
+    The stamp is returned even when no progress callback is
+    registered so callers can persist the last heartbeat on the
+    final result — the caller owns keeping the stamp for
+    `StreamingCommandResult.last_heartbeat_at`.
+    """
+    now_wall = datetime.now(timezone.utc)
+
     if progress_callback is None:
-        return
+        return now_wall
 
     quiet_for_secs = max(
         0.0,
@@ -246,8 +270,9 @@ def _emit_heartbeat(
         {
             "phase": current_phase,
             "last_output_at": last_output_at,
-            "last_heartbeat_at": datetime.now(timezone.utc),
+            "last_heartbeat_at": now_wall,
             "quiet_for_secs": quiet_for_secs,
             "liveness": liveness,
         }
     )
+    return now_wall

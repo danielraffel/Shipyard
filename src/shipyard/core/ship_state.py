@@ -78,11 +78,16 @@ class DispatchedRun:
     "pending", "in_progress", "completed", "failed", "cancelled".
 
     ``required`` captures the lane policy at dispatch time: ``True``
-    = this target must be green for merge; ``False`` = advisory, a
-    failure surfaces to reviewers but does not block. Default True
-    preserves the pre-advisory must-green behavior so pre-existing
-    state files and callers that don't know about lane policy keep
-    working unchanged.
+    = must be green for merge; ``False`` = advisory, a failure
+    surfaces to reviewers but does not block (see #87 lane policy).
+    Default True preserves the pre-advisory must-green behavior so
+    pre-existing state files and callers that don't know about lane
+    policy keep working unchanged.
+
+    `last_heartbeat_at` and `phase` are optional live metadata
+    populated by the poller as updates arrive. `watch` surfaces them
+    for humans (elapsed, stale, phase column) and emits them
+    additively in `--json` mode for downstream consumers.
     """
 
     target: str
@@ -92,10 +97,12 @@ class DispatchedRun:
     started_at: datetime
     updated_at: datetime
     attempt: int = 1
+    last_heartbeat_at: datetime | None = None
+    phase: str | None = None
     required: bool = True
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "target": self.target,
             "provider": self.provider,
             "run_id": self.run_id,
@@ -105,9 +112,21 @@ class DispatchedRun:
             "attempt": self.attempt,
             "required": self.required,
         }
+        # Always emit the new fields (including `null` when unset)
+        # so downstream consumers can rely on a stable schema for
+        # the additive heartbeat/phase/required columns.
+        d["last_heartbeat_at"] = (
+            self.last_heartbeat_at.isoformat()
+            if self.last_heartbeat_at is not None
+            else None
+        )
+        d["phase"] = self.phase
+        d["required"] = self.required
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DispatchedRun:
+        hb_raw = d.get("last_heartbeat_at")
         return cls(
             target=d["target"],
             provider=d["provider"],
@@ -116,8 +135,12 @@ class DispatchedRun:
             started_at=datetime.fromisoformat(d["started_at"]),
             updated_at=datetime.fromisoformat(d["updated_at"]),
             attempt=d.get("attempt", 1),
+            last_heartbeat_at=(
+                datetime.fromisoformat(hb_raw) if hb_raw else None
+            ),
+            phase=d.get("phase"),
             # Default True for back-compat with state files written
-            # before lane policy existed.
+            # before lane policy existed (#87).
             required=bool(d.get("required", True)),
         )
 

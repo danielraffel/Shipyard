@@ -405,8 +405,18 @@ def queue_cmd(ctx: Context) -> None:
         "minutes to the run."
     ),
 )
+@click.option(
+    "--runners",
+    is_flag=True,
+    help=(
+        "Probe every configured SSH host and cloud target for "
+        "reachability and the last heartbeat stamped on an in-flight "
+        "or recently-finished ship. Surfaces dead/silent runners the "
+        "chain would otherwise only notice at ship time."
+    ),
+)
 @click.pass_obj
-def doctor(ctx: Context, release_chain: bool) -> None:
+def doctor(ctx: Context, release_chain: bool, runners: bool) -> None:
     """Check environment, dependencies, and targets."""
     checks: dict[str, dict[str, Any]] = {}
 
@@ -451,6 +461,11 @@ def doctor(ctx: Context, release_chain: bool) -> None:
         if chain_section:
             checks.setdefault("Release pipeline", {}).update(chain_section)
 
+    if runners:
+        runners_section = _check_runners(ctx)
+        if runners_section:
+            checks["Runners"] = runners_section
+
     # Ready = core tools healthy AND (no governance section declared
     # OR every governance check is ok). Informational entries (the
     # immutable-releases line) set `ok=True` specifically because
@@ -467,6 +482,82 @@ def doctor(ctx: Context, release_chain: bool) -> None:
         ctx.output("doctor", {"ready": ready, "checks": checks})
     else:
         render_doctor(checks, ready)
+
+
+def _check_runners(ctx: Context) -> dict[str, Any] | None:
+    """Probe configured SSH runners for reachability.
+
+    For each SSH-backed target in the config, run a short `true` probe
+    over SSH and report ok / unreachable. Timeout kept tight (5s) so a
+    dead host doesn't hold doctor hostage. Returns None when the
+    config has no SSH targets — doctor then silently skips the section.
+
+    The heartbeat/`last_heartbeat_at` part of #84 lives on
+    `TargetResult` and surfaces through `shipyard watch`; this
+    function intentionally only does the synchronous reachability
+    probe because doctor runs outside of a ship, with no live
+    TargetResult to inspect.
+    """
+    ssh_targets = {
+        name: t
+        for name, t in ctx.config.targets.items()
+        if t.get("backend") == "ssh"
+    }
+    if not ssh_targets:
+        return None
+
+    rows: dict[str, Any] = {}
+    for name, target in ssh_targets.items():
+        host = target.get("host")
+        if not host:
+            rows[name] = {
+                "ok": False,
+                "version": "misconfigured",
+                "detail": "target has no `host` field",
+            }
+            continue
+
+        cmd = [
+            "ssh",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+            host,
+            "true",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=8,
+            )
+        except subprocess.TimeoutExpired:
+            rows[name] = {
+                "ok": False,
+                "version": "unreachable",
+                "detail": f"ssh {host!r} timed out after 8s",
+            }
+            continue
+        except (subprocess.SubprocessError, FileNotFoundError) as exc:
+            rows[name] = {
+                "ok": False,
+                "version": "unreachable",
+                "detail": f"ssh {host!r}: {exc}",
+            }
+            continue
+
+        if result.returncode == 0:
+            rows[name] = {
+                "ok": True,
+                "version": f"reachable ({host})",
+            }
+        else:
+            stderr = result.stderr.strip().splitlines()
+            last_line = stderr[-1] if stderr else f"exit {result.returncode}"
+            rows[name] = {
+                "ok": False,
+                "version": "unreachable",
+                "detail": f"ssh {host!r}: {last_line}",
+            }
+
+    return rows
 
 
 def _check_release_bot_token() -> dict[str, Any] | None:
@@ -3408,7 +3499,9 @@ def _watch_signature(state: ShipState) -> str:
 
     Two calls return the same string if there's nothing new to show.
     Deliberately excludes `updated_at` (which bumps on every save
-    even when no target transitioned).
+    even when no target transitioned) but includes phase and the
+    truncated heartbeat timestamp so a phase transition or a fresh
+    heartbeat triggers a redraw.
     """
     parts = [
         f"pr={state.pr}",
@@ -3418,22 +3511,113 @@ def _watch_signature(state: ShipState) -> str:
             f"{k}:{v}" for k, v in sorted(state.evidence_snapshot.items())
         ),
         "runs=" + ",".join(
-            f"{r.target}:{r.status}:{r.run_id}"
+            f"{r.target}:{r.status}:{r.run_id}:{r.phase or ''}:"
+            f"{r.last_heartbeat_at.isoformat() if r.last_heartbeat_at else ''}"
             for r in sorted(state.dispatched_runs, key=lambda r: r.target)
         ),
     ]
     return "|".join(parts)
 
 
-def _watch_event_signature(ctx: Context, state: ShipState) -> str:
-    """Signature that also folds in reused_from annotations.
+# Heartbeat ages at or above this many seconds are considered "stale".
+# Aligns with the 90s eviction threshold in FallbackChain (#84): 3
+# missed 30-second heartbeat intervals. Override via WATCH_STALE_SECS.
+_WATCH_STALE_THRESHOLD_SECS = 90.0
 
-    `_watch_signature` intentionally omits reuse because it reflects
-    the ship-state snapshot only; reuse is an evidence-store fact.
-    `_watch_event_signature` augments the base signature with the
-    set of reused targets so a first-time reuse detection emits a
-    fresh watch event instead of being collapsed as "no change".
+
+def _color_enabled(ctx: Context) -> bool:
+    """Whether watch should emit ANSI styling.
+
+    NO_COLOR=1 disables all color (XDG convention). JSON mode never
+    colors output (NDJSON consumers expect plain ASCII).
     """
+    import os
+
+    if ctx.json_mode:
+        return False
+    return not os.environ.get("NO_COLOR")
+
+
+def _style(text: str, style: str, *, enabled: bool) -> str:
+    if not enabled or not style:
+        return text
+    return f"[{style}]{text}[/]"
+
+
+def _run_symbol(status: str, liveness: str | None) -> tuple[str, str]:
+    """Return (symbol, rich-style) for a dispatched run status."""
+    s = status.lower()
+    if s in {"pass", "success", "completed", "completed_success"}:
+        return ("\u2713", "bold green")
+    if s in {"fail", "failed", "failure", "completed_failure"}:
+        return ("\u2717", "bold red")
+    if s in {"cancelled", "canceled"}:
+        return ("\u2717", "dim")
+    if s in {"queued", "pending", "waiting"}:
+        return ("\u00b7", "dim")
+    style = "yellow"
+    if liveness == "stuck":
+        style = "bold magenta"
+    return ("\u22ef", style)
+
+
+def _evidence_symbol(status: str) -> tuple[str, str]:
+    s = status.lower()
+    if s == "pass":
+        return ("\u2713", "bold green")
+    if s == "fail":
+        return ("\u2717", "bold red")
+    return ("\u00b7", "dim")
+
+
+def _heartbeat_age_label(
+    run: DispatchedRun, now: datetime, stale_secs: float
+) -> tuple[str, bool]:
+    terminal = run.status.lower() in {
+        "pass", "success", "completed", "completed_success",
+        "fail", "failed", "failure", "completed_failure",
+        "cancelled", "canceled",
+    }
+    if terminal:
+        return ("-", False)
+    hb = run.last_heartbeat_at
+    if hb is None:
+        return ("-", False)
+    age = (now - hb).total_seconds()
+    if age < 0:
+        age = 0
+    age_s = int(age)
+    if age_s < 60:
+        label = f"{age_s}s_ago"
+    else:
+        minutes, secs = divmod(age_s, 60)
+        label = f"{minutes}m{secs:02d}s_ago"
+    return (label, age >= stale_secs)
+
+
+def _run_elapsed_secs(run: DispatchedRun, now: datetime) -> int:
+    return max(0, int((now - run.started_at).total_seconds()))
+
+
+def _progress_summary(state: ShipState) -> tuple[int, int, int]:
+    total = len(state.dispatched_runs)
+    complete = 0
+    in_flight = 0
+    terminal_statuses = {
+        "pass", "success", "completed", "completed_success",
+        "fail", "failed", "failure", "completed_failure",
+        "cancelled", "canceled",
+    }
+    for run in state.dispatched_runs:
+        if run.status.lower() in terminal_statuses:
+            complete += 1
+        else:
+            in_flight += 1
+    return (complete, in_flight, total)
+
+
+def _watch_event_signature(ctx: Context, state: ShipState) -> str:
+    """Signature that folds in reused_from annotations (see #88)."""
     base = _watch_signature(state)
     try:
         records = ctx.evidence.get_branch(state.branch)
@@ -3448,10 +3632,10 @@ def _watch_event_signature(ctx: Context, state: ShipState) -> str:
 
 
 def _emit_watch_event(ctx: Context, state: ShipState) -> None:
-    # Cross-reference the evidence store so we can surface reused
-    # lanes. Reused passes still report status="pass" in the ship
-    # snapshot (merge-gating keeps working), but watch callers want
-    # to see "✓ reused (from a1b2c3)" instead of a plain pass.
+    now = datetime.now(timezone.utc)
+    stale_secs = _watch_stale_threshold()
+
+    # Cross-reference the evidence store so we can surface reused lanes (#88).
     reuse_map: dict[str, str] = {}
     try:
         branch_records = ctx.evidence.get_branch(state.branch)
@@ -3462,6 +3646,11 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
             reuse_map[target] = rec.reused_from
 
     if ctx.json_mode:
+        dispatched: list[dict[str, Any]] = []
+        for run in state.dispatched_runs:
+            entry = run.to_dict()
+            entry["elapsed_seconds"] = _run_elapsed_secs(run, now)
+            dispatched.append(entry)
         evidence_out: dict[str, dict[str, Any] | str] = {}
         for target, status in state.evidence_snapshot.items():
             if target in reuse_map and status == "pass":
@@ -3479,14 +3668,20 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
                 "head_sha": state.head_sha,
                 "attempt": state.attempt,
                 "evidence": evidence_out,
-                "dispatched_runs": [r.to_dict() for r in state.dispatched_runs],
+                "dispatched_runs": dispatched,
                 "updated_at": state.updated_at.isoformat(),
             },
         )
         return
-    now = datetime.now(timezone.utc)
-    age = now - state.updated_at
-    age_s = max(0, int(age.total_seconds()))
+
+    color = _color_enabled(ctx)
+    age_s = max(0, int((now - state.updated_at).total_seconds()))
+
+    # Snapshot separator — local time isn't portable for agents
+    # parsing scrollback; stick with UTC.
+    stamp = now.strftime("%H:%M:%S UTC")
+    render_message(_style(f"\u2500 {stamp} \u2500", "dim", enabled=color))
+
     render_message(
         f"PR #{state.pr}  sha={state.head_sha[:12]}  "
         f"attempt={state.attempt}  age={age_s}s"
@@ -3494,30 +3689,71 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
     advisory_targets = {
         r.target for r in state.dispatched_runs if not r.required
     }
+
+    # Progress summary above the per-run block.
+    complete, in_flight, total = _progress_summary(state)
+    if total:
+        render_message(
+            f"  {complete}/{total} targets complete \u00b7 {in_flight} in flight"
+        )
+
+    # Evidence rendering: reuse-aware (#88) + advisory-aware (#87)
+    # + color/symbols (#93). Advisory dims the whole line.
     for target, status in sorted(state.evidence_snapshot.items()):
-        # advisory vs required (#87) and reuse-aware (#88) orthogonal.
         is_advisory = target in advisory_targets
         tag = " (advisory)" if is_advisory else ""
-        style = "dim" if is_advisory else ""
         if target in reuse_map and status == "pass":
             short = reuse_map[target][:7]
+            sym, sym_style = _evidence_symbol("pass")
+            line_style = "dim" if is_advisory else sym_style
             render_message(
-                f"  evidence: {target}=✓ reused (from {short}){tag}",
-                style=style,
+                f"  {_style(sym, line_style, enabled=color)} evidence: "
+                f"{target}=reused (from {short}){tag}"
             )
         else:
+            sym, sym_style = _evidence_symbol(status)
+            line_style = "dim" if is_advisory else sym_style
             render_message(
-                f"  evidence: {target}={status}{tag}",
-                style=style,
+                f"  {_style(sym, line_style, enabled=color)} evidence: "
+                f"{target}={status}{tag}"
             )
+
     for run in state.dispatched_runs:
-        tag = " (advisory)" if not run.required else ""
-        style = "dim" if not run.required else ""
-        render_message(
-            f"  run: {run.target} ({run.provider}) "
-            f"id={run.run_id} status={run.status}{tag}",
-            style=style,
+        elapsed = _run_elapsed_secs(run, now)
+        last_seen, is_stale = _heartbeat_age_label(run, now, stale_secs)
+        sym, sym_style = _run_symbol(run.status, "stuck" if is_stale else None)
+        phase = run.phase or "-"
+        advisory_tag = " (advisory)" if not run.required else ""
+        line_style = "dim" if not run.required else sym_style
+        line = (
+            f"  {_style(sym, line_style, enabled=color)} run: "
+            f"{run.target} ({run.provider}) "
+            f"id={run.run_id} status={run.status} "
+            f"phase={phase} elapsed={elapsed}s "
+            f"last_seen={last_seen}{advisory_tag}"
         )
+        if is_stale:
+            line += "  " + _style("stale", "bold magenta", enabled=color)
+        render_message(line)
+
+
+def _watch_stale_threshold() -> float:
+    """Heartbeat-age cutoff for the `stale` marker.
+
+    Default 90s (3 missed 30-second heartbeats) mirrors the eviction
+    threshold used by FallbackChain in #84. Override via the
+    ``SHIPYARD_WATCH_STALE_SECS`` env var.
+    """
+    import os
+
+    raw = os.environ.get("SHIPYARD_WATCH_STALE_SECS")
+    if not raw:
+        return _WATCH_STALE_THRESHOLD_SECS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _WATCH_STALE_THRESHOLD_SECS
+    return value if value > 0 else _WATCH_STALE_THRESHOLD_SECS
 
 
 def _ship_terminal_verdict(state: ShipState) -> bool | None:
@@ -4131,6 +4367,11 @@ def _update_ship_state_from_job(
     Writes both an evidence snapshot (target -> "pass"/"fail") and
     a DispatchedRun per terminal target so a future resume can see
     which run IDs it was tracking.
+
+    Additionally propagates ``phase`` and ``last_heartbeat_at`` from
+    the TargetResult onto the DispatchedRun so the watch renderer
+    can show liveness for targets whose state comes from the local
+    queue rather than a cloud polling loop.
     """
     now = datetime.now(timezone.utc)
     cloud_runs_by_platform = _cloud_runs_by_platform(ctx, job.sha)
@@ -4152,6 +4393,8 @@ def _update_ship_state_from_job(
                 started_at=result.started_at or now,
                 updated_at=result.completed_at or now,
                 attempt=ship_state.attempt,
+                last_heartbeat_at=result.last_heartbeat_at,
+                phase=result.phase,
                 required=advisory_policy.is_required(name),
             )
         )

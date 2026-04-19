@@ -178,6 +178,7 @@ class CloudExecutor:
         # infra/timeout paths above, which short-circuit before here.
         failure_class = None if status == TargetStatus.PASS else FailureClass.TEST.value
 
+        completed = datetime.now(timezone.utc)
         return TargetResult(
             target_name=target_name,
             platform=platform,
@@ -185,11 +186,15 @@ class CloudExecutor:
             backend="cloud",
             duration_secs=elapsed,
             started_at=started_at,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=completed,
             log_path=log_path,
             provider=runner_provider,
             runner_profile=runner_profile,
             failure_class=failure_class,
+            # The last poll that saw "completed" is the effective
+            # last heartbeat — stamp it on the terminal result so
+            # watch / doctor --runners agree with per-tick updates.
+            last_heartbeat_at=completed,
         )
 
     def probe(self, target_config: dict[str, Any]) -> bool:

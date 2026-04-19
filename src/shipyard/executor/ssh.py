@@ -256,6 +256,7 @@ class SSHExecutor:
                 log_path=str(log_file),
                 phase=result.phase,
                 last_output_at=result.last_output_at,
+                last_heartbeat_at=result.last_heartbeat_at,
                 error_message=error_message,
                 contract_markers_seen=evaluation.seen,
                 contract_markers_missing=evaluation.missing,
