@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0140"></a>
+## [0.15.0]
+
 ## [0.14.0] - 2026-04-19
 
 - Mid-flight lane add: shipyard cloud add-lane (#86) ([#90](https://github.com/danielraffel/Shipyard/pull/90))
