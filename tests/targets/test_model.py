@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from shipyard.targets import TargetConfig, extract_requires, parse_target
+from shipyard.targets import (
+    extract_requires,
+    extract_reuse_globs,
+    parse_target,
+)
 
 
 class TestParseTarget:
@@ -60,3 +64,32 @@ class TestExtractRequires:
     def test_malformed_returns_empty(self) -> None:
         # Malformed values are tolerated — missing requires is safer than crashing.
         assert extract_requires({"requires": "gpu"}) == []
+
+
+class TestReuseIfPathsUnchanged:
+    def test_parse_reuse_globs(self) -> None:
+        t = parse_target(
+            "mac",
+            {
+                "platform": "macos-arm64",
+                "reuse_if_paths_unchanged": ["src/backend/**", "Cargo.lock"],
+            },
+        )
+        assert t.reuse_if_paths_unchanged == ["src/backend/**", "Cargo.lock"]
+
+    def test_default_empty(self) -> None:
+        t = parse_target("mac", {"platform": "macos-arm64"})
+        assert t.reuse_if_paths_unchanged == []
+
+    def test_reuse_must_be_list(self) -> None:
+        with pytest.raises(ValueError, match="reuse_if_paths_unchanged must be a list"):
+            parse_target("x", {"reuse_if_paths_unchanged": "src/**"})
+
+    def test_extract_helper(self) -> None:
+        assert extract_reuse_globs({}) == []
+        assert extract_reuse_globs({"reuse_if_paths_unchanged": []}) == []
+        assert extract_reuse_globs(
+            {"reuse_if_paths_unchanged": ["src/**", "  ", ""]}
+        ) == ["src/**"]
+        # Malformed -> empty (safer than crashing mid-dispatch).
+        assert extract_reuse_globs({"reuse_if_paths_unchanged": "src/**"}) == []

@@ -16,6 +16,7 @@ from shipyard.cli import (
     _watch_signature,
     main,
 )
+from shipyard.core.evidence import EvidenceRecord, EvidenceStore
 from shipyard.core.ship_state import (
     DispatchedRun,
     ShipState,
@@ -107,22 +108,27 @@ class TestTerminalVerdict:
 class TestWatchCli:
     def _runner_with_store(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> tuple[CliRunner, ShipStateStore]:
+    ) -> tuple[CliRunner, ShipStateStore, EvidenceStore]:
         store = ShipStateStore(path=tmp_path / "ship")
+        evidence = EvidenceStore(path=tmp_path / "evidence")
         monkeypatch.setattr(
             "shipyard.cli.Context.ship_state",
             property(lambda self: store),
+        )
+        monkeypatch.setattr(
+            "shipyard.cli.Context.evidence",
+            property(lambda self: evidence),
         )
         # Don't actually sleep.
         import time
 
         monkeypatch.setattr(time, "sleep", lambda s: None)
-        return CliRunner(), store
+        return CliRunner(), store, evidence
 
     def test_no_active_ship_exits_2(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        runner, _ = self._runner_with_store(tmp_path, monkeypatch)
+        runner, _, _ = self._runner_with_store(tmp_path, monkeypatch)
         monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")
         result = runner.invoke(main, ["watch", "--no-follow"])
         assert result.exit_code == 2
@@ -132,7 +138,7 @@ class TestWatchCli:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Terminal success → exit 0 under --no-follow.
-        runner, store = self._runner_with_store(tmp_path, monkeypatch)
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
         store.save(_state(pr=77, evidence={"macos": "pass", "linux": "pass"}))
         monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")
         result = runner.invoke(main, ["watch", "--no-follow"])
@@ -144,7 +150,7 @@ class TestWatchCli:
     ) -> None:
         # #62 P1: --pr that has no state file must NOT exit 0; that
         # would let automation treat typos as successful completion.
-        runner, _ = self._runner_with_store(tmp_path, monkeypatch)
+        runner, _, _ = self._runner_with_store(tmp_path, monkeypatch)
         monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")
         result = runner.invoke(main, ["watch", "--pr", "9999", "--no-follow"])
         assert result.exit_code == 2, result.output
@@ -156,7 +162,7 @@ class TestWatchCli:
         # #62 P2: --no-follow on an in-flight ship must produce a
         # distinct exit code from terminal success so callers can
         # tell "keep polling" apart from "all done".
-        runner, store = self._runner_with_store(tmp_path, monkeypatch)
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
         store.save(_state(pr=88, evidence={"macos": "pending"}))
         monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")
         result = runner.invoke(main, ["watch", "--no-follow"])
@@ -166,7 +172,7 @@ class TestWatchCli:
     def test_terminal_failure_exits_1(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        runner, store = self._runner_with_store(tmp_path, monkeypatch)
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
         store.save(
             _state(pr=78, evidence={"macos": "pass", "linux": "fail"})
         )
@@ -179,7 +185,7 @@ class TestWatchCli:
     ) -> None:
         # Explicit --pr wins over current-branch detection. This
         # state has a single passing target — terminal success.
-        runner, store = self._runner_with_store(tmp_path, monkeypatch)
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
         store.save(_state(pr=10, evidence={"macos": "pass"}))
         monkeypatch.setattr(
             "shipyard.cli._git_branch", lambda: "unrelated"
@@ -191,7 +197,7 @@ class TestWatchCli:
     def test_json_emits_ndjson_update(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        runner, store = self._runner_with_store(tmp_path, monkeypatch)
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
         store.save(
             _state(
                 pr=11,
@@ -214,7 +220,7 @@ class TestWatchCli:
         # lane degrade-mode: JSON emissions must expose `required`
         # per dispatched run so a downstream agent can tell advisory
         # from must-green without re-reading the config.
-        runner, store = self._runner_with_store(tmp_path, monkeypatch)
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
         now = datetime.now(timezone.utc)
         required_run = DispatchedRun(
             target="mac", provider="local",
@@ -256,7 +262,7 @@ class TestWatchCli:
     ) -> None:
         # Golden path: windows advisory fails; mac required passes.
         # Overall verdict must be success.
-        runner, store = self._runner_with_store(tmp_path, monkeypatch)
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
         now = datetime.now(timezone.utc)
         runs = [
             DispatchedRun(
@@ -289,7 +295,7 @@ class TestWatchCli:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Baseline: a required lane's fail still exits 1.
-        runner, store = self._runner_with_store(tmp_path, monkeypatch)
+        runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
         now = datetime.now(timezone.utc)
         runs = [
             DispatchedRun(
@@ -306,3 +312,54 @@ class TestWatchCli:
         )
         result = runner.invoke(main, ["watch", "--no-follow"])
         assert result.exit_code == 1
+
+    def test_reused_surfaced_in_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A reused evidence record on the current SHA should flip the
+        # JSON status to "reused" and include ``reused_from``.
+        runner, store, evidence = self._runner_with_store(
+            tmp_path, monkeypatch
+        )
+        head_sha = "a" * 40
+        store.save(
+            _state(
+                pr=12,
+                evidence={"macos": "pass", "linux": "pass"},
+            )
+        )
+        evidence.record(EvidenceRecord(
+            sha=head_sha, branch="feature/x", target_name="macos",
+            platform="macos-arm64", status="pass", backend="reused",
+            completed_at=datetime.now(timezone.utc),
+            reused_from="b" * 40,
+        ))
+        monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")
+        result = runner.invoke(
+            main, ["--json", "watch", "--pr", "12", "--no-follow"]
+        )
+        assert result.exit_code == 0, result.output
+        assert '"status": "reused"' in result.output
+        assert '"reused_from"' in result.output
+
+    def test_reused_surfaced_in_human_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner, store, evidence = self._runner_with_store(
+            tmp_path, monkeypatch
+        )
+        head_sha = "a" * 40
+        store.save(
+            _state(pr=13, evidence={"macos": "pass"})
+        )
+        evidence.record(EvidenceRecord(
+            sha=head_sha, branch="feature/x", target_name="macos",
+            platform="macos-arm64", status="pass", backend="reused",
+            completed_at=datetime.now(timezone.utc),
+            reused_from="cafebabe12345678",
+        ))
+        monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")
+        result = runner.invoke(main, ["watch", "--pr", "13", "--no-follow"])
+        assert result.exit_code == 0, result.output
+        assert "reused" in result.output
+        assert "cafebab" in result.output

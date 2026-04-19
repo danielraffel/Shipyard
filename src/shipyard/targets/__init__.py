@@ -43,6 +43,12 @@ class TargetConfig:
             Overridable per-PR via a ``Lane-Policy: <target>=required``
             commit trailer on the tip commit. Default ``False`` =
             classic must-green behavior.
+        reuse_if_paths_unchanged: Opt-in globs for cross-PR evidence
+            reuse. When set, ``shipyard ship`` will borrow a passing
+            evidence record from an ancestor SHA if the diff
+            ``<ancestor>..HEAD`` touches no path matching any of these
+            globs. Empty list = feature off (default; backward-
+            compatible). See ``src/shipyard/ship/reuse.py``.
         raw: The original dict this was parsed from, preserved so
             callers can reach backend-specific keys without a
             round-trip through the dataclass.
@@ -54,6 +60,7 @@ class TargetConfig:
     requires: list[str] = field(default_factory=list)
     fallback: list[dict[str, Any]] = field(default_factory=list)
     advisory: bool = False
+    reuse_if_paths_unchanged: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -82,6 +89,14 @@ def parse_target(name: str, data: dict[str, Any]) -> TargetConfig:
         data.get("backend") or data.get("type") or ""
     ).strip()
 
+    reuse_raw = data.get("reuse_if_paths_unchanged", []) or []
+    if not isinstance(reuse_raw, list):
+        raise ValueError(
+            f"target '{name}': reuse_if_paths_unchanged must be a list, "
+            f"got {type(reuse_raw).__name__}"
+        )
+    reuse_globs = [str(item).strip() for item in reuse_raw if str(item).strip()]
+
     return TargetConfig(
         name=name,
         platform=str(data.get("platform", "")),
@@ -89,6 +104,7 @@ def parse_target(name: str, data: dict[str, Any]) -> TargetConfig:
         requires=requires,
         fallback=[entry for entry in fallback_raw if isinstance(entry, dict)],
         advisory=_coerce_advisory(data.get("advisory", False)),
+        reuse_if_paths_unchanged=reuse_globs,
         raw=data,
     )
 
@@ -106,6 +122,19 @@ def _coerce_advisory(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes"}
     return False
+
+
+def extract_reuse_globs(target_config: dict[str, Any]) -> list[str]:
+    """Extract the normalized ``reuse_if_paths_unchanged`` list.
+
+    Returns an empty list (meaning "reuse disabled") when the key is
+    missing, empty, or malformed. This mirrors ``extract_requires``
+    so dispatch-site callers don't need a full parse.
+    """
+    raw = target_config.get("reuse_if_paths_unchanged", []) or []
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
 
 
 def extract_requires(target_config: dict[str, Any]) -> list[str]:
@@ -130,4 +159,10 @@ def is_advisory(target_config: dict[str, Any]) -> bool:
     return _coerce_advisory(target_config.get("advisory", False))
 
 
-__all__ = ["TargetConfig", "parse_target", "extract_requires", "is_advisory"]
+__all__ = [
+    "TargetConfig",
+    "parse_target",
+    "extract_requires",
+    "extract_reuse_globs",
+    "is_advisory",
+]

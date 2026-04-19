@@ -52,10 +52,16 @@ def render_job(job: Job) -> None:
     for name in job.target_names:
         result = job.results.get(name)
         if result:
-            status_text = _style_status(result.status.value)
-            backend = result.backend
-            if result.failover_reason:
-                backend = f"{result.backend} ({result.failover_reason})"
+            if result.reused_from:
+                # Cross-PR reuse: show "reused" in the status column
+                # so humans see the skipped lane and its provenance.
+                status_text = Text("reused", style="green")
+                backend = f"reused (from {result.reused_from[:7]})"
+            else:
+                status_text = _style_status(result.status.value)
+                backend = result.backend
+                if result.failover_reason:
+                    backend = f"{result.backend} ({result.failover_reason})"
             duration = _format_duration(result.duration_secs) if result.duration_secs else "..."
         else:
             status_text = _style_status("pending")

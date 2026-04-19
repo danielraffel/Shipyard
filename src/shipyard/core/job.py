@@ -90,6 +90,12 @@ class TargetResult:
     # | "UNKNOWN". None for PASS/PENDING/RUNNING results. See
     # ``shipyard.core.classify`` for heuristics.
     failure_class: str | None = None
+    # Cross-PR evidence reuse: set when this result was synthesized
+    # from an earlier PASS on an ancestor SHA because the HEAD diff
+    # did not touch any path the target exercises. The value is the
+    # ancestor SHA the evidence was borrowed from. ``status`` is
+    # always PASS for reused results. See ``shipyard.ship.reuse``.
+    reused_from: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -154,6 +160,8 @@ class TargetResult:
             d["contract_violation"] = self.contract_violation
         if self.failure_class:
             d["failure_class"] = self.failure_class
+        if self.reused_from:
+            d["reused_from"] = self.reused_from
         return d
 
 

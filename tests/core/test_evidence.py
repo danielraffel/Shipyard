@@ -49,6 +49,34 @@ class TestEvidenceRecord:
         assert d["primary_backend"] == "ssh"
         assert d["failover_reason"] == "ssh_unreachable"
 
+    def test_reused_fields_roundtrip(self) -> None:
+        rec = EvidenceRecord(
+            sha="new", branch="feat/x", target_name="mac",
+            platform="macos-arm64", status="pass", backend="reused",
+            completed_at=datetime.now(timezone.utc),
+            reused_from="old", contract_digest="abc123",
+            stages_signature="build|test",
+        )
+        assert rec.reused is True
+        d = rec.to_dict()
+        assert d["reused_from"] == "old"
+        assert d["contract_digest"] == "abc123"
+        assert d["stages_signature"] == "build|test"
+        restored = EvidenceRecord.from_dict(d)
+        assert restored.reused_from == "old"
+        assert restored.contract_digest == "abc123"
+        assert restored.stages_signature == "build|test"
+
+    def test_reused_false_on_normal_record(self) -> None:
+        rec = EvidenceRecord(
+            sha="abc", branch="main", target_name="mac",
+            platform="macos-arm64", status="pass", backend="local",
+            completed_at=datetime.now(timezone.utc),
+        )
+        assert rec.reused is False
+        d = rec.to_dict()
+        assert "reused_from" not in d
+
 
 class TestEvidenceStore:
     def test_record_and_retrieve(self, evidence_store: EvidenceStore) -> None:

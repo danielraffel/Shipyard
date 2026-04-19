@@ -113,6 +113,16 @@ re-dispatching the full matrix. Idempotent (no-op if target already
 tracked); refuses if the ship is past dispatch phase. Dry-run by
 default; add `--apply` to execute.
 
+### Cross-PR evidence reuse
+
+Opt-in per target via `reuse_if_paths_unchanged = ["src/backend/**"]`
+in `[targets.<name>]`. When HEAD's diff since an ancestor SHA doesn't
+touch any matching path, Shipyard borrows that ancestor's passing
+evidence and skips dispatch. Safety: refuses across non-fast-forward
+lineage, validation-contract drift, or stage-list drift. Surfaces as
+`status: "reused"` in `shipyard watch --json` (and `✓ reused (from
+a1b2c3)` in human mode). See `skills/ci/SKILL.md` for details.
+
 ### Trailer shortcuts
 
 `shipyard pr --skip-bump <surface> --bump-reason "..."` and
