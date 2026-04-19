@@ -3,21 +3,22 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0180"></a>
+## [0.18.0] - 2026-04-19
+
+- Ship feat/degrade-mode ([#97](https://github.com/danielraffel/Shipyard/pull/97))
+
 <a id="v0170"></a>
 ## [0.17.0] - 2026-04-19
 
 - feat: runner liveness heartbeat + watch UI polish (#84, #93) ([#96](https://github.com/danielraffel/Shipyard/pull/96))
 
 <a id="v0160"></a>
-## [0.17.0]
-
 ## [0.16.0] - 2026-04-19
 
 - feat/cross pr reuse ([#95](https://github.com/danielraffel/Shipyard/pull/95))
 
 <a id="v0150"></a>
-## [0.16.0]
-
 ## [0.15.0] - 2026-04-19
 
 - feat: failure classification + flaky-target quarantine (closes #83) ([#94](https://github.com/danielraffel/Shipyard/pull/94))
@@ -194,6 +195,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.18.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.18.0
 [0.17.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.17.0
 [0.16.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.16.0
 [0.15.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.15.0
