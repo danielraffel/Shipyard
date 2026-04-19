@@ -7,9 +7,10 @@ required platforms, and merge only when evidence proves all green.
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from shipyard.core.quarantine import QuarantineList, is_advisory_failure
 from shipyard.ship.pr import GhError, PrInfo, create_pr, find_pr_for_branch, merge_pr
 
 if TYPE_CHECKING:
@@ -20,7 +21,15 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class MergeCheck:
-    """Result of checking whether a branch is ready to merge."""
+    """Result of checking whether a branch is ready to merge.
+
+    Quarantine interaction: targets listed in ``.shipyard/quarantine.toml``
+    whose failure class is TEST or UNKNOWN don't count against ``ready``
+    — they land in ``advisory`` instead of ``failing`` so the reviewer
+    still sees them. Failures with class INFRA / TIMEOUT / CONTRACT are
+    never suppressed by quarantine (they indicate real, fixable
+    infrastructure or contract problems).
+    """
 
     ready: bool
     sha: str
@@ -29,9 +38,10 @@ class MergeCheck:
     passing: list[str]
     missing: list[str]
     failing: list[str]
+    advisory: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "ready": self.ready,
             "sha": self.sha,
             "branch": self.branch,
@@ -40,6 +50,9 @@ class MergeCheck:
             "missing": self.missing,
             "failing": self.failing,
         }
+        if self.advisory:
+            d["advisory"] = self.advisory
+        return d
 
 
 def can_merge(
@@ -47,16 +60,23 @@ def can_merge(
     branch: str,
     sha: str,
     required_platforms: list[str],
+    quarantine: QuarantineList | None = None,
 ) -> MergeCheck:
     """Check if all required platforms have passing evidence for this SHA.
 
-    Returns a MergeCheck with detailed status per platform.
+    When ``quarantine`` is supplied, targets whose evidence shows a
+    suppressible failure class (TEST / UNKNOWN) AND whose *target name*
+    appears on the list are moved from ``failing`` to ``advisory`` and
+    do not block ``ready``. When ``quarantine`` is None, behavior is
+    identical to the pre-quarantine code path (backward compatible).
     """
     passing: list[str] = []
     missing: list[str] = []
     failing: list[str] = []
+    advisory: list[str] = []
 
     records = evidence_store.get_branch(branch)
+    q = quarantine or QuarantineList(entries=[], path=None)
 
     for platform in required_platforms:
         found = False
@@ -65,13 +85,16 @@ def can_merge(
                 found = True
                 if rec.passed:
                     passing.append(platform)
+                elif is_advisory_failure(q, rec.target_name, rec.failure_class):
+                    advisory.append(platform)
                 else:
                     failing.append(platform)
                 break
         if not found:
             missing.append(platform)
 
-    ready = len(passing) == len(required_platforms)
+    # A platform counts toward merge-ready if it's passing or advisory.
+    ready = (len(passing) + len(advisory)) == len(required_platforms) and not failing
 
     return MergeCheck(
         ready=ready,
@@ -81,6 +104,7 @@ def can_merge(
         passing=passing,
         missing=missing,
         failing=failing,
+        advisory=advisory,
     )
 
 
@@ -170,8 +194,13 @@ def ship(
     )
     job = queue.enqueue(job)
 
-    # Check if we already have enough evidence to merge
-    check = can_merge(evidence_store, branch, sha, required_platforms)
+    # Check if we already have enough evidence to merge, honoring
+    # any `.shipyard/quarantine.toml` entries.
+    quarantine = QuarantineList.load_from_project(config.project_dir)
+    check = can_merge(
+        evidence_store, branch, sha, required_platforms,
+        quarantine=quarantine,
+    )
 
     if check.ready:
         try:

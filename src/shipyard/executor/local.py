@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from shipyard.core.classify import FailureClass, classify_failure
 from shipyard.core.job import TargetResult, TargetStatus
 from shipyard.core.prepared_state import (
     PreparedStateRecord,
@@ -98,6 +99,7 @@ class LocalExecutor:
                 status=TargetStatus.ERROR, backend="local",
                 error_message="No validation command configured",
                 started_at=started_at, completed_at=datetime.now(timezone.utc),
+                failure_class=FailureClass.UNKNOWN.value,
             )
 
         return self._run_stages(
@@ -130,6 +132,14 @@ class LocalExecutor:
             evaluation = evaluate_contract(contract_config, result.contract_markers_seen)
             if evaluation.should_force_fail and status == TargetStatus.PASS:
                 status = TargetStatus.FAIL
+            failure_class: str | None = None
+            if status != TargetStatus.PASS:
+                failure_class = classify_failure(
+                    stdout="",
+                    stderr=_read_log_tail(log_file),
+                    exit_code=result.returncode,
+                    contract_violated=evaluation.violated and evaluation.enforce,
+                ).value
             return TargetResult(
                 target_name=target_name, platform=platform,
                 status=status, backend="local", duration_secs=result.duration_secs,
@@ -140,6 +150,7 @@ class LocalExecutor:
                 contract_markers_seen=evaluation.seen,
                 contract_markers_missing=evaluation.missing,
                 contract_violation=evaluation.message,
+                failure_class=failure_class,
             )
         except subprocess.TimeoutExpired:
             return TargetResult(
@@ -148,6 +159,7 @@ class LocalExecutor:
                 duration_secs=time.monotonic() - start_time,
                 started_at=started_at, completed_at=datetime.now(timezone.utc),
                 log_path=str(log_file), error_message="Validation timed out",
+                failure_class=FailureClass.TIMEOUT.value,
             )
         except OSError as exc:
             return TargetResult(
@@ -155,6 +167,9 @@ class LocalExecutor:
                 status=TargetStatus.ERROR, backend="local",
                 started_at=started_at, completed_at=datetime.now(timezone.utc),
                 log_path=str(log_file), error_message=str(exc),
+                failure_class=classify_failure(
+                    stdout="", stderr=str(exc), exit_code=-1,
+                ).value,
             )
 
     def _run_stages(
@@ -274,6 +289,7 @@ class LocalExecutor:
                 duration_secs=time.monotonic() - start_time,
                 started_at=started_at, completed_at=datetime.now(timezone.utc),
                 log_path=str(log_file), error_message="Validation timed out",
+                failure_class=FailureClass.TIMEOUT.value,
             )
         except OSError as exc:
             return TargetResult(
@@ -281,6 +297,9 @@ class LocalExecutor:
                 status=TargetStatus.ERROR, backend="local",
                 started_at=started_at, completed_at=datetime.now(timezone.utc),
                 log_path=str(log_file), error_message=str(exc),
+                failure_class=classify_failure(
+                    stdout="", stderr=str(exc), exit_code=-1,
+                ).value,
             )
 
         elapsed = time.monotonic() - start_time
@@ -299,6 +318,12 @@ class LocalExecutor:
                 contract_markers_seen=evaluation.seen,
                 contract_markers_missing=evaluation.missing,
                 contract_violation=evaluation.message,
+                failure_class=classify_failure(
+                    stdout="",
+                    stderr=_read_log_tail(log_file),
+                    exit_code=1,
+                    contract_violated=evaluation.violated and evaluation.enforce,
+                ).value,
             )
 
         # All stages passed by exit code. Now check the contract — a
@@ -320,6 +345,11 @@ class LocalExecutor:
             contract_markers_seen=evaluation.seen,
             contract_markers_missing=evaluation.missing,
             contract_violation=evaluation.message,
+            failure_class=(
+                FailureClass.CONTRACT.value
+                if final_status == TargetStatus.FAIL
+                else None
+            ),
         )
 
     def probe(self, target_config: dict[str, Any]) -> bool:
@@ -352,6 +382,25 @@ def _get_stages(
         stages.append((stage_name, cmd))
 
     return stages
+
+
+def _read_log_tail(log_file: Path, max_bytes: int = 8192) -> str:
+    """Read the tail of the log file for failure-classification heuristics.
+
+    The classifier looks for infra markers (``Connection refused``,
+    ``Network is unreachable``, etc.) which almost always appear near
+    the end of a failed run. Reading only the tail keeps classification
+    cheap on very long logs. Any I/O error returns an empty string so
+    the classifier gracefully falls back to TEST/UNKNOWN.
+    """
+    try:
+        size = log_file.stat().st_size
+        with open(log_file, "rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, 2)  # SEEK_END
+            return f.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
 
 
 def _prepared_state_enabled(validation_config: dict[str, Any] | None) -> bool:

@@ -3721,6 +3721,7 @@ def _record_evidence(ctx: Context, job: Job) -> None:
                 failover_reason=result.failover_reason,
                 provider=result.provider,
                 runner_profile=result.runner_profile,
+                failure_class=result.failure_class,
             ))
 
 
@@ -4384,6 +4385,120 @@ def config_use(ctx: Context, profile_name: str) -> None:
             f"Switched to profile '{profile_name}' in {config_path}",
             style="green",
         )
+
+
+# ── quarantine (flaky targets) ──────────────────────────────────────
+
+
+@main.group(name="quarantine", invoke_without_command=True)
+@click.pass_context
+def quarantine_group(ctx: click.Context) -> None:
+    """Manage the flaky-target quarantine list.
+
+    Targets listed in ``.shipyard/quarantine.toml`` whose failure class
+    is TEST or UNKNOWN are treated as advisory during the merge
+    decision — they don't block ``shipyard ship`` / ``auto-merge``.
+    INFRA / TIMEOUT / CONTRACT failures are still authoritative.
+
+    With no subcommand, lists the quarantined targets.
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(quarantine_list)
+
+
+def _quarantine_path_or_exit(ctx: Context) -> Path:
+    if ctx.config.project_dir is None:
+        render_error("No .shipyard/ directory found. Run `shipyard init` first.")
+        sys.exit(1)
+    from shipyard.core.quarantine import QUARANTINE_FILENAME
+    return ctx.config.project_dir / QUARANTINE_FILENAME
+
+
+@quarantine_group.command("list")
+@click.pass_obj
+def quarantine_list(ctx: Context) -> None:
+    """List quarantined targets."""
+    from shipyard.core.quarantine import QuarantineList
+
+    q = QuarantineList.load_from_project(ctx.config.project_dir)
+    if ctx.json_mode:
+        ctx.output("quarantine.list", q.to_dict())
+        return
+    if not q.entries:
+        render_message(
+            "No quarantined targets. "
+            "(.shipyard/quarantine.toml is absent or empty.)",
+            style="dim",
+        )
+        return
+    console.print()
+    console.print("[bold]Quarantined targets[/]")
+    for entry in q.entries:
+        reason = f" — {entry.reason}" if entry.reason else ""
+        date_str = f" (added {entry.added_at})" if entry.added_at else ""
+        console.print(f"  {entry.target}{reason}{date_str}")
+    console.print()
+
+
+@quarantine_group.command("add")
+@click.argument("target")
+@click.option("--reason", default="", help="Free-form note (recommended).")
+@click.pass_obj
+def quarantine_add(ctx: Context, target: str, reason: str) -> None:
+    """Add a target to the quarantine list."""
+    from shipyard.core.quarantine import QuarantineList
+
+    path = _quarantine_path_or_exit(ctx)
+    q = QuarantineList.load(path)
+    q.path = path  # load() preserves path; defensive re-set
+    added = q.add(target, reason=reason)
+    if added:
+        q.save()
+    if ctx.json_mode:
+        ctx.output(
+            "quarantine.add",
+            {"target": target, "added": added, "path": str(path)},
+        )
+    else:
+        if added:
+            render_message(
+                f"Quarantined '{target}' — TEST/UNKNOWN failures on this "
+                f"target will be advisory.",
+                style="green",
+            )
+        else:
+            render_message(
+                f"'{target}' was already quarantined.", style="dim"
+            )
+
+
+@quarantine_group.command("remove")
+@click.argument("target")
+@click.pass_obj
+def quarantine_remove(ctx: Context, target: str) -> None:
+    """Remove a target from the quarantine list."""
+    from shipyard.core.quarantine import QuarantineList
+
+    path = _quarantine_path_or_exit(ctx)
+    q = QuarantineList.load(path)
+    q.path = path
+    removed = q.remove(target)
+    if removed:
+        q.save()
+    if ctx.json_mode:
+        ctx.output(
+            "quarantine.remove",
+            {"target": target, "removed": removed, "path": str(path)},
+        )
+    else:
+        if removed:
+            render_message(
+                f"Removed '{target}' from quarantine.", style="green"
+            )
+        else:
+            render_message(
+                f"'{target}' was not quarantined.", style="dim"
+            )
 
 
 # ── changelog / post-release docs sync ──────────────────────────────

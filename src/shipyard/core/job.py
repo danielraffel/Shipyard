@@ -84,6 +84,12 @@ class TargetResult:
     contract_markers_seen: tuple[str, ...] = ()
     contract_markers_missing: tuple[str, ...] = ()
     contract_violation: str | None = None
+    # Coarse-grained failure taxonomy. Populated by the executor
+    # (or failover chain) whenever ``status`` is FAIL / ERROR /
+    # UNREACHABLE. Values: "INFRA" | "TIMEOUT" | "CONTRACT" | "TEST"
+    # | "UNKNOWN". None for PASS/PENDING/RUNNING results. See
+    # ``shipyard.core.classify`` for heuristics.
+    failure_class: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -146,6 +152,8 @@ class TargetResult:
             d["contract_markers_missing"] = list(self.contract_markers_missing)
         if self.contract_violation:
             d["contract_violation"] = self.contract_violation
+        if self.failure_class:
+            d["failure_class"] = self.failure_class
         return d
 
 

@@ -48,6 +48,9 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
 | Clean up artifacts | `shipyard cleanup --apply` |
+| List quarantined targets | `shipyard quarantine list --json` |
+| Quarantine a flaky target | `shipyard quarantine add <target> --reason "..."` |
+| Remove from quarantine | `shipyard quarantine remove <target>` |
 
 ## When to use `watch` (agent decision guide)
 
@@ -181,6 +184,35 @@ Full docs: [`docs/targets.md`](../../docs/targets.md) and
 ## SSH delivery: incremental bundles
 
 SSH-backed targets deliver code via `git bundle`. On the first run the bundle is full (every object reachable from the target SHA, ~443 MB for Pulp-sized repos). On every subsequent run Shipyard probes the remote for its current HEAD over SSH (`git rev-parse HEAD`), verifies that the local clone has that commit as an ancestor, and emits `git bundle create <bundle> <target> ^<remote_head>` — a delta bundle that is typically kilobytes instead of megabytes. Any failure in the probe, ancestry check, or delta create silently falls back to the full-bundle path so the behavior on cold/corrupt remotes is unchanged. Each run logs a `bundle_mode=delta|full bundle_bytes=<N>` line to the per-target log so operators can confirm the optimisation is active.
+
+## Failure classification
+
+Every non-passing `TargetResult` and `EvidenceRecord` carries a `failure_class` (visible in `shipyard run --json`, `shipyard evidence --json`, and `shipyard watch --json`):
+
+| Class | Meaning | Retry policy |
+|-------|---------|--------------|
+| `INFRA` | Network/SSH/runner availability problem (`Connection refused`, `ssh: connect`, `Network is unreachable`, `RUN_IN_DAYS_DEAD`, etc.) | Auto-retry on the next backend in the fallback chain |
+| `TIMEOUT` | Hit the wall-clock cap | Auto-retry once |
+| `CONTRACT` | `[validation.contract]` marker missing | Never retry — product bug |
+| `TEST` | Non-zero exit with no infra/contract markers | Never retry — authoritative test failure |
+| `UNKNOWN` | Fallback when the heuristics can't decide | Surfaced to the agent; not auto-retried |
+
+Agents should read `failure_class` before deciding whether to retry, escalate, or surface to a human.
+
+## Flaky-target quarantine
+
+`.shipyard/quarantine.toml` is an opt-in list of targets whose `TEST` or `UNKNOWN` failures should be treated as advisory during the merge decision. `INFRA`, `TIMEOUT`, and `CONTRACT` failures are *never* suppressed — quarantine only hides authentic test flakiness, not infrastructure or contract bugs.
+
+```toml
+[[quarantine]]
+target = "windows-arm64"
+reason = "flaky Windows runner apr-2026 outage"
+added_at = "2026-04-18"
+```
+
+Manage via `shipyard quarantine {list,add,remove}` (see table above). The merge check surfaces quarantined failures in the `advisory` field of the JSON payload; reviewers still see them but the merge is not blocked.
+
+Remove a target from quarantine the moment the underlying flakiness is fixed — the list is meant to be short-lived.
 
 ## Troubleshooting
 

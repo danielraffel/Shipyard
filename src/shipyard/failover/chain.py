@@ -27,6 +27,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from shipyard.core.classify import FailureClass
 from shipyard.core.job import TargetResult, TargetStatus
 
 if TYPE_CHECKING:
@@ -118,6 +119,7 @@ class FallbackChain:
                 status=TargetStatus.ERROR,
                 backend="none",
                 error_message="No backends configured in fallback chain",
+                failure_class=FailureClass.UNKNOWN.value,
             )
 
         # Apply locality-routing filter before any probing/validation.
@@ -137,6 +139,7 @@ class FallbackChain:
                 status=TargetStatus.ERROR,
                 backend=_backend_label(self.backends[0]),
                 error_message=msg,
+                failure_class=FailureClass.INFRA.value,
             )
 
         primary_type = _backend_label(filtered_backends[0])
@@ -168,6 +171,7 @@ class FallbackChain:
                     status=TargetStatus.UNREACHABLE,
                     backend=_backend_label(backend_def),
                     error_message=f"Probe failed for {_backend_label(backend_def)}",
+                    failure_class=FailureClass.INFRA.value,
                 )
                 continue
 
@@ -203,6 +207,7 @@ class FallbackChain:
                         failover_reason=last_result.error_message if last_result else "unknown",
                         provider=result.provider,
                         runner_profile=result.runner_profile,
+                        failure_class=result.failure_class,
                     )
                 return result
 
@@ -229,6 +234,7 @@ class FallbackChain:
                 primary_backend=primary_type,
                 failover_reason="All backends exhausted",
                 error_message=last_result.error_message,
+                failure_class=last_result.failure_class or FailureClass.INFRA.value,
             )
 
         return TargetResult(
@@ -239,6 +245,7 @@ class FallbackChain:
             primary_backend=primary_type,
             failover_reason="No usable executors found",
             error_message="All backends skipped (no matching executors)",
+            failure_class=FailureClass.UNKNOWN.value,
         )
 
 

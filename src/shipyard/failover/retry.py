@@ -2,6 +2,17 @@
 
 Detects common transient SSH errors and retries with increasing delays.
 Fails fast on permanent errors (auth failures, no route, etc.).
+
+Failure-class aware retry
+-------------------------
+
+``should_retry_failure_class`` is the policy surface used by the
+``ship`` and ``failover`` layers when they've already classified a
+failure via :func:`shipyard.core.classify.classify_failure`. Policy:
+
+- ``INFRA`` / ``TIMEOUT`` → retry once on the next backend
+- ``CONTRACT`` / ``TEST`` → no retry (authoritative)
+- ``UNKNOWN`` → no retry (fail safe)
 """
 
 from __future__ import annotations
@@ -11,10 +22,31 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from shipyard.core.classify import FailureClass, is_retryable
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
+
+
+def should_retry_failure_class(failure_class: FailureClass | str | None) -> bool:
+    """Whether a classified failure is worth one auto-retry.
+
+    Accepts either the enum, the string value, or ``None`` (no
+    classification → treat as non-retryable to fail safe). This is the
+    single policy hook called by both the in-process retry path and
+    the cross-backend fallback chain; when Shipyard grows per-class
+    retry budgets, this is the place to extend.
+    """
+    if failure_class is None:
+        return False
+    if isinstance(failure_class, str):
+        try:
+            failure_class = FailureClass(failure_class)
+        except ValueError:
+            return False
+    return is_retryable(failure_class)
 
 # Patterns that indicate a transient (retryable) SSH failure.
 TRANSIENT_PATTERNS: tuple[str, ...] = (

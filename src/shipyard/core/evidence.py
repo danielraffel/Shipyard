@@ -33,6 +33,10 @@ class EvidenceRecord:
     failover_reason: str | None = None
     provider: str | None = None
     runner_profile: str | None = None
+    # Coarse-grained failure taxonomy when ``status == "fail"``. One of
+    # "INFRA" | "TIMEOUT" | "CONTRACT" | "TEST" | "UNKNOWN". None on a
+    # passing record. See ``shipyard.core.classify``.
+    failure_class: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -48,7 +52,10 @@ class EvidenceRecord:
             "backend": self.backend,
             "completed_at": self.completed_at.isoformat(),
         }
-        for key in ("duration_secs", "host", "primary_backend", "failover_reason", "provider", "runner_profile"):
+        for key in (
+            "duration_secs", "host", "primary_backend", "failover_reason",
+            "provider", "runner_profile", "failure_class",
+        ):
             val = getattr(self, key)
             if val is not None:
                 d[key] = val
@@ -70,6 +77,7 @@ class EvidenceRecord:
             failover_reason=d.get("failover_reason"),
             provider=d.get("provider"),
             runner_profile=d.get("runner_profile"),
+            failure_class=d.get("failure_class"),
         )
 
 

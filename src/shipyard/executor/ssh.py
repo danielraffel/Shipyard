@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from shipyard.bundle.git_bundle import apply_bundle, create_bundle, upload_bundle
+from shipyard.core.classify import FailureClass, classify_failure
 from shipyard.core.job import TargetResult, TargetStatus
 from shipyard.executor.contract import evaluate_contract, required_markers
 from shipyard.executor.streaming import ProgressCallback, run_streaming_command
@@ -235,6 +236,15 @@ class SSHExecutor:
                 status = TargetStatus.FAIL
                 error_message = evaluation.message
 
+            failure_class: str | None = None
+            if status != TargetStatus.PASS:
+                failure_class = classify_failure(
+                    stdout="",
+                    stderr=result.output or error_message or "",
+                    exit_code=result.returncode,
+                    contract_violated=evaluation.violated and evaluation.enforce,
+                ).value
+
             return TargetResult(
                 target_name=target_name,
                 platform=platform,
@@ -250,6 +260,7 @@ class SSHExecutor:
                 contract_markers_seen=evaluation.seen,
                 contract_markers_missing=evaluation.missing,
                 contract_violation=evaluation.message,
+                failure_class=failure_class,
             )
 
         except subprocess.TimeoutExpired:
@@ -264,6 +275,7 @@ class SSHExecutor:
                 completed_at=datetime.now(timezone.utc),
                 log_path=str(log_file),
                 error_message="Validation timed out",
+                failure_class=FailureClass.TIMEOUT.value,
             )
 
         except OSError as exc:
@@ -613,7 +625,20 @@ def _error_result(
         completed_at=datetime.now(timezone.utc),
         log_path=log_path,
         error_message=message,
+        failure_class=_classify_ssh_error(message),
     )
+
+
+def _classify_ssh_error(message: str) -> str:
+    """Classify an SSH-level error for ``_error_result`` callers.
+
+    Called only after we've already decided the outcome is ERROR, so
+    the classifier never returns CONTRACT / TEST / TIMEOUT here — the
+    fingerprints in the error message pick INFRA or UNKNOWN.
+    """
+    return classify_failure(
+        stdout="", stderr=message, exit_code=-1,
+    ).value
 
 
 def _extract_ssh_error(output: str) -> str | None:

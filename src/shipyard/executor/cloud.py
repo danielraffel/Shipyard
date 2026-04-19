@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from shipyard.core.classify import FailureClass
 from shipyard.core.job import TargetResult, TargetStatus
 
 if TYPE_CHECKING:
@@ -104,6 +105,7 @@ class CloudExecutor:
                 error_message=f"Failed to dispatch workflow: {exc}",
                 provider=runner_provider,
                 runner_profile=runner_profile,
+                failure_class=FailureClass.INFRA.value,
             )
 
         # Wait for the run to appear and get its ID
@@ -122,6 +124,7 @@ class CloudExecutor:
                 error_message=str(exc),
                 provider=runner_provider,
                 runner_profile=runner_profile,
+                failure_class=FailureClass.TIMEOUT.value,
             )
 
         # Poll for completion. Per-target override allows long-running
@@ -150,6 +153,7 @@ class CloudExecutor:
                 error_message=f"Failed to poll workflow run: {exc}",
                 provider=runner_provider,
                 runner_profile=runner_profile,
+                failure_class=FailureClass.INFRA.value,
             )
         except TimeoutError as exc:
             return TargetResult(
@@ -163,10 +167,16 @@ class CloudExecutor:
                 error_message=str(exc),
                 provider=runner_provider,
                 runner_profile=runner_profile,
+                failure_class=FailureClass.TIMEOUT.value,
             )
 
         elapsed = time.monotonic() - start_time
         status = TargetStatus.PASS if conclusion == "success" else TargetStatus.FAIL
+
+        # Cloud executor doesn't have local stderr — we can only
+        # distinguish "the workflow reported failure" (TEST) from the
+        # infra/timeout paths above, which short-circuit before here.
+        failure_class = None if status == TargetStatus.PASS else FailureClass.TEST.value
 
         return TargetResult(
             target_name=target_name,
@@ -179,6 +189,7 @@ class CloudExecutor:
             log_path=log_path,
             provider=runner_provider,
             runner_profile=runner_profile,
+            failure_class=failure_class,
         )
 
     def probe(self, target_config: dict[str, Any]) -> bool:
