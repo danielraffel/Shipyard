@@ -52,6 +52,16 @@ from shipyard.release_bot.setup import (
     set_secret,
     verify_token,
 )
+from shipyard.targets.warm_pool import (
+    PoolEntry,
+    WarmPool,
+    compute_expires_at,
+    default_pool_path,
+    extract_warm_keepalive_seconds,
+    is_backend_eligible,
+    warm_host_key,
+    warm_reuse_disabled_by_env,
+)
 
 if TYPE_CHECKING:
     from shipyard.ship.lane_policy import LanePolicy
@@ -139,6 +149,15 @@ def main(ctx: click.Context, json_mode: bool) -> None:
     is_flag=True,
     help="Queue the run even if no backend is reachable for one or more targets",
 )
+@click.option(
+    "--no-warm",
+    is_flag=True,
+    help=(
+        "Force cold-start (skip warm-pool reuse even when the target "
+        "opted in with warm_keepalive_seconds). Equivalent to setting "
+        "SHIPYARD_NO_WARM_POOL=1 for this invocation."
+    ),
+)
 @click.pass_obj
 def run(
     ctx: Context,
@@ -148,6 +167,7 @@ def run(
     resume_from: str | None,
     allow_root_mismatch: bool,
     allow_unreachable_targets: bool,
+    no_warm: bool,
 ) -> None:
     """Validate current HEAD on configured targets."""
     config = ctx.config
@@ -201,6 +221,7 @@ def run(
         mode=mode,
         fail_fast=fail_fast,
         resume_from=resume_from,
+        warm_disabled=no_warm,
     )
 
     if ctx.json_mode:
@@ -2537,6 +2558,14 @@ def cloud_status(ctx: Context, identifier: str | None, limit: int, refresh: bool
         "change since the saved state was written."
     ),
 )
+@click.option(
+    "--no-warm",
+    is_flag=True,
+    help=(
+        "Force cold-start (skip warm-pool reuse for every target on this "
+        "ship). Equivalent to setting SHIPYARD_NO_WARM_POOL=1."
+    ),
+)
 @click.pass_obj
 def ship(
     ctx: Context,
@@ -2545,6 +2574,7 @@ def ship(
     allow_unreachable_targets: bool,
     auto_create_base: bool | None,
     resume: bool | None,
+    no_warm: bool,
 ) -> None:
     """Branch -> PR -> validate -> merge on green."""
     from shipyard.ship.pr import create_pr, find_pr_for_branch, merge_pr
@@ -2686,6 +2716,7 @@ def ship(
         fail_fast=False,
         resume_from=None,
         ship_state=existing_state,
+        warm_disabled=no_warm,
     )
 
     if job.passed:
@@ -4174,12 +4205,17 @@ def _execute_job(
     fail_fast: bool,
     resume_from: str | None,
     ship_state: ShipState | None = None,
+    warm_disabled: bool = False,
 ) -> Job:
     job = job.start()
     ctx.queue.update(job)
 
     validation_config = _resolve_validation(config, mode)
     had_failure = False
+    warm_pool = WarmPool(default_pool_path(config.state_dir))
+    # Global kill switch: env var disables everything for this process.
+    warm_globally_off = warm_disabled or warm_reuse_disabled_by_env()
+    warmed_bucket: set[str] = set()  # per-invocation warn-once bucket
 
     for name in job.target_names:
         if had_failure and fail_fast:
@@ -4219,6 +4255,24 @@ def _execute_job(
             if not ctx.json_mode:
                 render_job(job)
             continue
+
+        # Warm-pool reuse gate. When the target opts in via
+        # ``warm_keepalive_seconds > 0`` and a live, same-SHA entry
+        # exists for this ``(target, host)`` pair, re-enter the
+        # previously warmed workdir and skip pre-stage (the bundle
+        # delivery and the ``setup`` step). Validate is always re-run.
+        # See ``src/shipyard/targets/warm_pool.py``.
+        warm_hit, effective_resume = _apply_warm_reuse(
+            pool=warm_pool,
+            target_name=name,
+            target_config=target_config,
+            backend=backend_name,
+            sha=job.sha,
+            requested_resume_from=resume_from,
+            globally_off=warm_globally_off,
+            warn_bucket=warmed_bucket,
+            json_mode=ctx.json_mode,
+        )
 
         running = TargetResult(
             target_name=name,
@@ -4260,10 +4314,24 @@ def _execute_job(
             validation_config=resolved_validation,
             log_path=log_path,
             progress_callback=progress_callback,
-            resume_from=resume_from,
+            resume_from=effective_resume,
         )
         job = state["job"].with_result(result)
         ctx.queue.update(job)
+
+        # Warm-pool bookkeeping. On PASS, refresh / insert the entry;
+        # on any non-PASS outcome during a warm reuse, evict so a
+        # potentially dirty workdir is not served twice.
+        _update_warm_pool_after_run(
+            pool=warm_pool,
+            target_name=name,
+            target_config=target_config,
+            backend=backend_name,
+            sha=job.sha,
+            result=result,
+            warm_was_applied=warm_hit,
+            globally_off=warm_globally_off,
+        )
 
         if not result.passed:
             had_failure = True
@@ -4277,6 +4345,132 @@ def _execute_job(
     if ship_state is not None:
         _update_ship_state_from_job(ctx, ship_state, job)
     return job
+
+
+def _apply_warm_reuse(
+    *,
+    pool: WarmPool,
+    target_name: str,
+    target_config: dict[str, Any],
+    backend: str,
+    sha: str,
+    requested_resume_from: str | None,
+    globally_off: bool,
+    warn_bucket: set[str],
+    json_mode: bool,
+) -> tuple[bool, str | None]:
+    """Consult the warm pool and (if hit) mutate ``target_config`` in place.
+
+    Returns ``(warm_hit, effective_resume_from)``.
+
+    ``warm_hit`` is True when a live pool entry was consumed. The
+    caller uses it to decide whether a subsequent failure should evict
+    the entry.
+
+    ``effective_resume_from`` is the resume stage to pass to the
+    dispatcher. When reuse fires and the caller did not already ask
+    for a more-aggressive resume point, we jump to ``configure`` — i.e.
+    skip the ``setup`` stage (deps install) and re-run configure /
+    build / test. If the caller explicitly asked for a later stage
+    (e.g. ``--resume-from=test``), we honor that instead.
+    """
+    if globally_off:
+        return False, requested_resume_from
+    keepalive = extract_warm_keepalive_seconds(target_config)
+    if keepalive <= 0:
+        return False, requested_resume_from
+    if not is_backend_eligible(backend, target_config):
+        # The target opted in but the backend can't honor it
+        # (workflow-dispatch runners are ephemeral). Warn once per
+        # (target, invocation) so users can reconcile their config.
+        if target_name not in warn_bucket:
+            warn_bucket.add(target_name)
+            if not json_mode:
+                render_message(
+                    f"warning: target '{target_name}' set "
+                    f"warm_keepalive_seconds but backend {backend!r} is "
+                    f"ephemeral — warm-pool reuse ignored",
+                    style="dim yellow",
+                )
+        return False, requested_resume_from
+
+    host = warm_host_key(target_config)
+    entry = pool.get(target_name, host)
+    if entry is None or entry.sha != sha:
+        return False, requested_resume_from
+
+    # Prefer the caller's request if it already skips further than
+    # our default warm resume point — e.g. ``--resume-from=test``
+    # should stay at ``test``.
+    resume_order = ("setup", "configure", "build", "test")
+    warm_default = "configure"  # skip pre-stage, re-run configure+build+test
+    if requested_resume_from in resume_order:
+        try:
+            requested_idx = resume_order.index(requested_resume_from)
+        except ValueError:
+            requested_idx = -1
+        default_idx = resume_order.index(warm_default)
+        effective = requested_resume_from if requested_idx > default_idx else warm_default
+    else:
+        effective = warm_default
+
+    # Re-enter the warmed workdir so the executor finds the repo
+    # already populated. For SSH backends we overwrite ``repo_path``;
+    # other backends treat ``_warm_workdir`` as a hint.
+    target_config["repo_path"] = entry.workdir
+    target_config["_warm_workdir"] = entry.workdir
+    target_config["_warm_reuse"] = True
+    return True, effective
+
+
+def _update_warm_pool_after_run(
+    *,
+    pool: WarmPool,
+    target_name: str,
+    target_config: dict[str, Any],
+    backend: str,
+    sha: str,
+    result: TargetResult,
+    warm_was_applied: bool,
+    globally_off: bool,
+) -> None:
+    """Record / evict warm-pool entries based on run outcome.
+
+    - PASS on an eligible backend: upsert a fresh entry with a new
+      expiry window.
+    - Non-PASS following a warm reuse: evict the entry so the next
+      ship on that ``(target, host)`` pair cold-starts from scratch.
+    - PASS on an ineligible backend or when globally off: no-op.
+    """
+    host = warm_host_key(target_config)
+
+    if result.passed:
+        if globally_off:
+            return
+        keepalive = extract_warm_keepalive_seconds(target_config)
+        if keepalive <= 0:
+            return
+        if not is_backend_eligible(backend, target_config):
+            return
+        workdir = (
+            target_config.get("_warm_workdir")
+            or target_config.get("repo_path")
+            or "~/repo"
+        )
+        entry = PoolEntry(
+            target=target_name,
+            host=host,
+            backend=backend,
+            workdir=str(workdir),
+            sha=sha,
+            expires_at=compute_expires_at(keepalive),
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+        pool.upsert(entry)
+        return
+
+    if warm_was_applied:
+        pool.evict(target_name, host)
 
 
 def _maybe_reuse_evidence(
@@ -4927,6 +5121,105 @@ def targets_add(
         ctx.output("targets.add", {"name": name, "config": new_target})
     else:
         render_message(f"Added target '{name}' to {config_path}", style="green")
+
+
+@targets.group("warm", invoke_without_command=True)
+@click.pass_context
+def targets_warm(ctx: click.Context) -> None:
+    """Inspect and drain the warm-pool of reusable runners.
+
+    With no subcommand, lists live entries — same as
+    ``shipyard targets warm status``.
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(targets_warm_status)
+
+
+@targets_warm.command("status")
+@click.pass_obj
+def targets_warm_status(ctx: Context) -> None:
+    """Show live warm-pool entries (target, host, TTL remaining, SHA).
+
+    Expired entries are pruned from the file as a side effect so
+    repeated calls don't surface stale rows.
+    """
+    pool = WarmPool(default_pool_path(ctx.config.state_dir))
+    pool.prune_expired()
+    entries = pool.all_entries()
+
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        rows.append({
+            "target": entry.target,
+            "host": entry.host,
+            "backend": entry.backend,
+            "workdir": entry.workdir,
+            "sha": entry.sha,
+            "ttl_remaining_secs": round(entry.ttl_remaining_secs(), 1),
+            "expires_at": datetime.fromtimestamp(
+                entry.expires_at, tz=timezone.utc
+            ).isoformat(),
+            "created_at": datetime.fromtimestamp(
+                entry.created_at, tz=timezone.utc
+            ).isoformat(),
+        })
+
+    if ctx.json_mode:
+        ctx.output("targets.warm.status", {"entries": rows})
+        return
+
+    if not rows:
+        render_message("Warm pool is empty.", style="dim")
+        return
+
+    console.print()
+    console.print("[bold]Warm pool[/]")
+    for row in rows:
+        ttl = row["ttl_remaining_secs"]
+        console.print(
+            f"  {row['target']:<16} {row['host']:<20} "
+            f"sha={row['sha'][:8]} ttl={ttl:>6.0f}s "
+            f"workdir={row['workdir']}"
+        )
+    console.print()
+
+
+@targets_warm.command("drain")
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Skip the confirmation prompt.",
+)
+@click.pass_obj
+def targets_warm_drain(ctx: Context, yes: bool) -> None:
+    """Remove every warm-pool entry.
+
+    Useful after a host reboot, a runner image change, or any other
+    event that invalidates the workdirs the pool is tracking. Next
+    ship on every target cold-starts.
+    """
+    pool = WarmPool(default_pool_path(ctx.config.state_dir))
+    entries = pool.all_entries()
+    if not entries:
+        if ctx.json_mode:
+            ctx.output("targets.warm.drain", {"drained": 0})
+        else:
+            render_message("Warm pool already empty.", style="dim")
+        return
+
+    if not yes and not ctx.json_mode and not click.confirm(
+        f"Drain {len(entries)} warm-pool entr"
+        f"{'y' if len(entries) == 1 else 'ies'}?",
+        default=False,
+    ):
+        render_message("Aborted.", style="dim")
+        return
+
+    drained = pool.drain()
+    if ctx.json_mode:
+        ctx.output("targets.warm.drain", {"drained": drained})
+    else:
+        render_message(f"Drained {drained} warm-pool entries.", style="green")
 
 
 @targets.command("remove")

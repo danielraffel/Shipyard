@@ -43,6 +43,11 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Dispatch a cloud workflow | `shipyard cloud run build --json` |
 | Dispatch only if remote matches HEAD | `shipyard cloud run build --require-sha HEAD --json` |
 | Opt a target into cross-PR reuse | set `reuse_if_paths_unchanged = ["src/backend/**"]` under `[targets.<name>]` |
+| Opt a target into warm-pool reuse | set `warm_keepalive_seconds = 600` under `[targets.<name>]` (see "Warm-pool reuse" below) |
+| Inspect warm-pool entries | `shipyard targets warm status --json` |
+| Drain the warm-pool (force cold-start everywhere) | `shipyard targets warm drain --yes` |
+| Force cold-start for one ship only | `shipyard ship --no-warm` (or `shipyard run --no-warm`) |
+| Global warm-pool kill switch | `SHIPYARD_NO_WARM_POOL=1` in the environment |
 | Retarget one lane on an in-flight PR | `shipyard cloud retarget --pr <n> --target macos --provider namespace` (dry-run; add `--apply`) |
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider namespace]` (dry-run; add `--apply`) |
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
@@ -280,6 +285,100 @@ whose output only changes when the crate or its dependencies move.
 Don't enable it on a lane that runs the full suite — the globs would
 have to cover the whole tree, at which point you're back to
 re-running everything anyway.
+
+## Warm-pool runner reuse
+
+Cross-PR evidence reuse (above) skips the whole target when nothing
+the target cares about changed. Warm-pool reuse is a narrower
+optimisation: even when the diff *did* touch paths the target runs
+against, the *runner itself* (SSH host, local workdir) doesn't need
+to be re-cloned and re-dep-installed every time. When a PASS landed
+within the last few minutes, the next ship on the same SHA can
+re-enter the already-populated workdir and skip the pre-stage
+(clone / sync / deps install). Validate — configure / build / test —
+re-runs in full, so a code change is never silently masked.
+
+Off by default. Opt in per target:
+
+```toml
+[targets.ubuntu]
+backend = "ssh"
+host = "ubuntu"
+platform = "linux-x64"
+# Hold the workdir open for 10 minutes after a PASS. Same-SHA ships
+# within the window skip clone/sync/deps. Default 0 = feature off.
+warm_keepalive_seconds = 600
+```
+
+### Three disable levels — why all three exist
+
+| Level | Knob | When to reach for it |
+|-------|------|----------------------|
+| Per-target | `warm_keepalive_seconds = 0` (default) | Targets that rely on a pristine env (release validation, flaky build scripts) stay cold-only. |
+| Global kill switch | `SHIPYARD_NO_WARM_POOL=1` env var | A CI that shells out to `shipyard` from inside another workflow — the outer runner is already ephemeral, and warm-pool state on that runner would be per-job noise. One-shot fresh escape hatch. |
+| Per-ship CLI flag | `shipyard ship --no-warm` / `shipyard run --no-warm` | An agent deliberately wants a cold-start for this one ship — typically when debugging a pre-stage regression or confirming a clean-room build. |
+
+The three levels compose: any one of them is enough to force a cold
+start. Why this isn't simply always-on:
+
+1. **Cloud runners cost money per second.** Silent always-on reuse on
+   a paid provider would surprise a monthly bill.
+2. **State drift is real.** Tests leave tmp files, build scripts
+   assume fresh `~/.cache`, background processes upgrade deps.
+   "Cold every time" is a correctness fence some users rely on.
+3. **Sometimes the point IS cold.** Release-validation lanes
+   deliberately want a pristine env to catch "works on my machine"
+   regressions.
+
+### Mechanics (what gets skipped, what still runs)
+
+When a warm-pool hit fires, the dispatcher passes `resume_from=configure`
+to the executor — the same machinery that powers `shipyard run
+--resume-from <stage>`. The remote:
+
+- Keeps the existing workdir at the recorded SHA — no re-clone, no
+  bundle delivery, no `git checkout`.
+- Skips the `setup` stage (the conventional home for deps installs).
+- Runs `configure`, `build`, `test` as normal.
+
+A validation config that uses a single `command` field (no stage
+breakdown) can still benefit — the pre-stage skip still applies, but
+the single command always runs in full.
+
+### Eligibility and eviction
+
+| Condition | Behavior |
+|---|---|
+| Target is on backend `cloud` / `github-hosted` | Silently ineligible. Workflow runs are ephemeral — there's nothing to keep warm. Shipyard warns once per invocation so a misconfigured target surfaces, not silently. |
+| Current job SHA differs from the pool entry's SHA | Miss → cold start. The pool is strictly same-SHA; it is not a cross-SHA workdir cache. |
+| Pool entry past `expires_at` | Pruned on lookup; cold start. |
+| Any non-PASS outcome after a warm reuse was applied | Entry evicted. The pool never serves a dirty workdir twice. |
+| `SHIPYARD_NO_WARM_POOL=1` set | Every lookup short-circuits to miss; no entries are recorded either. |
+
+### How it surfaces
+
+- `shipyard targets warm status --json` lists every live entry with
+  target, host, backend, workdir, SHA, TTL remaining, expires_at,
+  created_at. Expired entries are pruned as a side effect.
+- `shipyard targets warm drain [--yes]` empties the pool — use after a
+  host reboot, runner-image change, or any event that invalidates
+  the tracked workdirs.
+- Pool file lives at `<state_dir>/warm_pool.json`. Safe to delete
+  manually; worst case, the next ship cold-starts.
+
+### When to enable
+
+- SSH lanes against a long-lived host where `apt install` / `npm
+  install` / `cargo fetch` dominates the per-run wall clock.
+- Local lanes with expensive first-run setup (e.g. virtualenv
+  creation, system framework bootstrap).
+
+### When NOT to enable
+
+- Release-validation lanes — you want pristine every time.
+- Flaky targets that sometimes leave lockfiles behind.
+- Cloud / GitHub-hosted lanes — the backend is ineligible; the knob
+  has no effect and Shipyard warns to reconcile the config.
 
 ## Failure classification
 

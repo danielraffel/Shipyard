@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0180"></a>
+## [0.19.0]
+
 ## [0.18.0] - 2026-04-19
 
 - Ship feat/degrade-mode ([#97](https://github.com/danielraffel/Shipyard/pull/97))
