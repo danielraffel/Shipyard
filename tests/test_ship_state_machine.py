@@ -371,22 +371,31 @@ class TestSF3_SaveTmpWriteDurability:
 
 class TestTouchInvariants:
     """Every mutation helper bumps `updated_at`; read-only helpers
-    do not. Part of the generic Phase B assertion layer."""
+    do not. Part of the generic Phase B assertion layer.
+
+    We back-date `updated_at` before each mutation so the assertion
+    is robust against Windows's ~15ms `datetime.now()` resolution:
+    on Windows, a same-tick capture can otherwise read equal to the
+    value `touch()` wrote.
+    """
 
     def test_update_evidence_bumps_updated_at(self) -> None:
         state = _state()
+        state.updated_at = state.updated_at - timedelta(seconds=1)
         before = state.updated_at
         state.update_evidence("macos", "pass")
         assert state.updated_at > before
 
     def test_upsert_run_bumps_updated_at(self) -> None:
         state = _state()
+        state.updated_at = state.updated_at - timedelta(seconds=1)
         before = state.updated_at
         state.upsert_run(_run("macos"))
         assert state.updated_at > before
 
     def test_append_run_bumps_updated_at(self) -> None:
         state = _state()
+        state.updated_at = state.updated_at - timedelta(seconds=1)
         before = state.updated_at
         state.append_run(_run("ubuntu", run_id="2"))
         assert state.updated_at > before
