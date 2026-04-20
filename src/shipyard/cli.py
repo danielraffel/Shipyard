@@ -3944,19 +3944,26 @@ def pr(
             for line in added:
                 click.echo(f"▸ Added trailer: {line}")
 
-    repo_root = subprocess.check_output(
-        ["git", "rev-parse", "--show-toplevel"], text=True
-    ).strip()
-    ssc = Path(repo_root) / "scripts" / "skill_sync_check.py"
-    vbc = Path(repo_root) / "scripts" / "version_bump_check.py"
-    cfg = Path(repo_root) / "scripts" / "versioning.json"
+    repo_root = Path(
+        subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], text=True
+        ).strip()
+    )
 
-    if not ssc.exists() or not vbc.exists() or not cfg.exists():
-        render_error(
-            "shipyard pr requires scripts/skill_sync_check.py, "
-            "scripts/version_bump_check.py, and scripts/versioning.json "
-            "to be present. Install them via the versioning-sync port."
-        )
+    from shipyard.gate_scripts import (
+        SKILL_SYNC,
+        VERSION_BUMP,
+        VERSIONING_CONFIG,
+        GateScriptNotFound,
+        resolve as resolve_gate_script,
+    )
+
+    try:
+        ssc = resolve_gate_script(SKILL_SYNC, repo_root, config=ctx.obj.config)
+        vbc = resolve_gate_script(VERSION_BUMP, repo_root, config=ctx.obj.config)
+        cfg = resolve_gate_script(VERSIONING_CONFIG, repo_root, config=ctx.obj.config)
+    except GateScriptNotFound as exc:
+        render_error(str(exc))
         sys.exit(2)
 
     python = shutil.which("python3") or "python3"
