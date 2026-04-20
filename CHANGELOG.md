@@ -10,6 +10,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 - docs: ship-state-machine audit (#101 Phase A) ([#107](https://github.com/danielraffel/Shipyard/pull/107))
 
 <a id="v0190"></a>
+## [0.20.0]
+
 ## [0.19.0] - 2026-04-19
 
 - feat: warm-pool runner reuse across PRs (closes #82) ([#98](https://github.com/danielraffel/Shipyard/pull/98))

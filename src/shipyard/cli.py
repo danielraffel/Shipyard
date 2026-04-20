@@ -41,7 +41,11 @@ from shipyard.output.human import (
 )
 from shipyard.output.json_output import render_json
 from shipyard.output.schema import OutputEnvelope
-from shipyard.preflight import run_submission_preflight
+from shipyard.preflight import (
+    EXIT_BACKEND_UNREACHABLE,
+    BackendUnreachableError,
+    run_submission_preflight,
+)
 from shipyard.release_bot.setup import (
     ReleaseBotError,
     describe_state,
@@ -147,7 +151,24 @@ def main(ctx: click.Context, json_mode: bool) -> None:
 @click.option(
     "--allow-unreachable-targets",
     is_flag=True,
-    help="Queue the run even if no backend is reachable for one or more targets",
+    help=(
+        "Proceed even if a target's backend is unreachable. The lane "
+        "is SKIPPED, NOT validated — a validation gap is recorded and "
+        "printed loudly. Distinct from --skip-target, which is a "
+        "deliberate skip not tied to backend health."
+    ),
+)
+@click.option(
+    "--skip-target",
+    "skip_target",
+    multiple=True,
+    metavar="NAME",
+    help=(
+        "Deliberately skip a lane (not tied to backend reachability). "
+        "Repeatable. Unlike --allow-unreachable-targets, this does not "
+        "run a probe — it's the right flag when the user knows they "
+        "don't want to validate that target at all."
+    ),
 )
 @click.option(
     "--no-warm",
@@ -167,6 +188,7 @@ def run(
     resume_from: str | None,
     allow_root_mismatch: bool,
     allow_unreachable_targets: bool,
+    skip_target: tuple[str, ...],
     no_warm: bool,
 ) -> None:
     """Validate current HEAD on configured targets."""
@@ -194,10 +216,22 @@ def run(
             dispatcher=dispatcher,
             allow_root_mismatch=allow_root_mismatch,
             allow_unreachable_targets=allow_unreachable_targets,
+            skip_targets=skip_target,
         )
+    except BackendUnreachableError as exc:
+        render_error(str(exc))
+        sys.exit(EXIT_BACKEND_UNREACHABLE)
     except ValueError as exc:
         render_error(str(exc))
         sys.exit(1)
+
+    # Honor --skip-target by dropping the skipped names from the job
+    # target set. The preflight already recorded them in
+    # `skipped_targets` for the output envelope.
+    target_names = [n for n in target_names if n not in set(skip_target)]
+    if not target_names:
+        render_error("No targets remain after --skip-target filtering.")
+        sys.exit(2)
 
     # Create and enqueue job
     job = Job.create(
@@ -2535,7 +2569,23 @@ def cloud_status(ctx: Context, identifier: str | None, limit: int, refresh: bool
 @click.option(
     "--allow-unreachable-targets",
     is_flag=True,
-    help="Queue the run even if no backend is reachable for one or more targets",
+    help=(
+        "Proceed even if a target's backend is unreachable. The lane "
+        "is SKIPPED, NOT validated — a validation gap is recorded and "
+        "printed loudly. Distinct from --skip-target."
+    ),
+)
+@click.option(
+    "--skip-target",
+    "skip_target",
+    multiple=True,
+    metavar="NAME",
+    help=(
+        "Deliberately skip a lane (not tied to backend reachability). "
+        "Repeatable. Use this when you know you don't want to validate "
+        "the target at all; use --allow-unreachable-targets only when "
+        "the target SHOULD be validated but the backend is down."
+    ),
 )
 @click.option(
     "--auto-create-base/--no-auto-create-base",
@@ -2572,6 +2622,7 @@ def ship(
     base: str,
     allow_root_mismatch: bool,
     allow_unreachable_targets: bool,
+    skip_target: tuple[str, ...],
     auto_create_base: bool | None,
     resume: bool | None,
     no_warm: bool,
@@ -2696,7 +2747,11 @@ def ship(
             dispatcher=dispatcher,
             allow_root_mismatch=allow_root_mismatch,
             allow_unreachable_targets=allow_unreachable_targets,
+            skip_targets=skip_target,
         )
+    except BackendUnreachableError as exc:
+        render_error(str(exc))
+        sys.exit(EXIT_BACKEND_UNREACHABLE)
     except ValueError as exc:
         render_error(str(exc))
         sys.exit(1)
@@ -2704,6 +2759,11 @@ def ship(
     if not ctx.json_mode:
         for warning in preflight.warnings:
             render_message(f"warning: {warning}", style="bold yellow")
+
+    target_names = [n for n in target_names if n not in set(skip_target)]
+    if not target_names:
+        render_error("No targets remain after --skip-target filtering.")
+        sys.exit(2)
 
     job = Job.create(sha=sha, branch=branch, target_names=target_names)
     job = ctx.queue.enqueue(job)
@@ -3857,7 +3917,14 @@ def ship_state_discard(ctx: Context, pr: int) -> None:
 @click.option(
     "--allow-unreachable-targets",
     is_flag=True,
-    help="Forwarded to `shipyard ship`.",
+    help="Forwarded to `shipyard ship`. Lane is skipped, validation gap recorded.",
+)
+@click.option(
+    "--skip-target",
+    "skip_target",
+    multiple=True,
+    metavar="NAME",
+    help="Forwarded to `shipyard ship`. Deliberate skip (not tied to reachability).",
 )
 @click.option(
     "--skip-bump",
@@ -3899,6 +3966,7 @@ def pr(
     base: str,
     apply_bumps: bool,
     allow_unreachable_targets: bool,
+    skip_target: tuple[str, ...],
     skip_bump: tuple[str, ...],
     bump_reason: str | None,
     skip_skill_update: tuple[str, ...],
@@ -4064,6 +4132,7 @@ def pr(
         base=base,
         allow_root_mismatch=False,
         allow_unreachable_targets=allow_unreachable_targets,
+        skip_target=skip_target,
         auto_create_base=None,
     )
 
