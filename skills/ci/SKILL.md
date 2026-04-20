@@ -490,12 +490,19 @@ Never run `gh pr create` + release separately. Never run the Python gate scripts
 
 Missing-script errors list every probed location and every override knob. Consumer repos that keep their tooling under `tools/scripts/` need no configuration; other layouts should set the env var or the `[validation]` key rather than moving the script.
 
+## State-machine lane + doc-sync gate
+
+A dedicated `state-machine` CI job runs `pytest -m state_machine -v` on ubuntu-latest. Failures show up as a distinct check row (not mixed into the cross-platform `test` matrix), so a ship-state regression is visually separable from an infra blip. When writing a test that exercises ship-state transitions, add `pytestmark = pytest.mark.state_machine` at module scope.
+
+A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever `src/shipyard/core/ship_state.py` or `src/shipyard/ship/**` does. Mechanism is `scripts/doc_sync_check.py` + `scripts/doc_sync_map.json` (mirrors `skill_sync_check.py` but targets free-form docs). Bypass via `Doc-Update: skip doc=<path> reason="..."` trailer.
+
 ## Bypass trailers (tip commit)
 
 | Gate          | Trailer                                                      |
 |---------------|--------------------------------------------------------------|
 | Version bump  | `Version-Bump: <surface>=<patch\|minor\|major\|skip> reason="..."` |
 | Skill update  | `Skill-Update: skip skill=<name> reason="..."`              |
+| Doc-sync      | `Doc-Update: skip doc=<path> reason="..."`                  |
 | Auto-release  | `Release: skip reason="..."`                                 |
 | Lane policy   | `Lane-Policy: <target>=required\|advisory` (escalate/demote for this PR only) |
 
