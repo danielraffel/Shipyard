@@ -103,6 +103,19 @@ class ExecutorDispatcher:
         executor = self._resolve_executor(target_config)
         return executor.probe(target_config)
 
+    def diagnose(self, target_config: dict[str, Any]) -> dict[str, Any] | None:
+        """Richer reachability info for preflight's unreachable branch.
+
+        Returns None when the underlying executor doesn't implement a
+        diagnosis — preflight falls back to a generic "unreachable"
+        message in that case.
+        """
+        executor = self._resolve_executor(target_config)
+        diagnose = getattr(executor, "diagnose", None)
+        if callable(diagnose):
+            return diagnose(target_config)
+        return None
+
     def backend_name(self, target_config: dict[str, Any]) -> str:
         return _normalize_backend_name(target_config)
 

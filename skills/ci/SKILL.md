@@ -52,6 +52,8 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider namespace]` (dry-run; add `--apply`) |
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |
+| Deliberately skip one lane | `shipyard run --skip-target windows` (repeatable; no probe run) |
+| Proceed with unreachable lanes (VALIDATION GAP) | `shipyard run --allow-unreachable-targets` (prints a loud warning; exits 3 without the flag) |
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
 | Probe SSH runner reachability | `shipyard doctor --runners --json` |
@@ -459,8 +461,9 @@ Remove a target from quarantine the moment the underlying flakiness is fixed —
 - `shipyard doctor --json` — checks git, ssh, gh, nsc are installed
 - `shipyard status --json` — shows configured targets, queue state, and live target status
 - `shipyard logs <id> --target <name>` — full log for a failed target
-- If a target is unreachable with no fallback, it reports unreachable
-- `shipyard run --allow-unreachable-targets --json` — override preflight if you intentionally want to queue anyway
+- If a target is unreachable with no fallback, `run` / `ship` / `pr` exit **3** (distinct from 1 validation-failed and 2 config-error) with a message that names the target, the failure category (`auth`, `host_key`, `network`, `timeout`, `unknown`), and the last ssh error.
+- `shipyard run --allow-unreachable-targets --json` — proceed with the lane **SKIPPED, NOT validated**. The warning is loud by design because muscle-memory use of this flag (Pulp pre-2026-04-20) hid real backend outages.
+- `shipyard run --skip-target <name>` — **deliberately** skip a lane (no probe run). Use this when you already know you don't want to validate the target — `--allow-unreachable-targets` is for "I want this target, but the backend is down right now."
 - `shipyard cloud defaults --json` — inspect the current cloud workflow/provider dispatch plan
 
 ## Shipping a PR (the `shipyard pr` path)

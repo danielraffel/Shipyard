@@ -6,7 +6,7 @@ import pytest
 
 from shipyard.core.config import Config
 from shipyard.executor.dispatch import ExecutorDispatcher
-from shipyard.preflight import run_submission_preflight
+from shipyard.preflight import BackendUnreachableError, run_submission_preflight
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -76,7 +76,7 @@ def test_unreachable_target_rejected_without_override(tmp_path, monkeypatch) -> 
     monkeypatch.setattr("shipyard.preflight._git_root_for", lambda _: tmp_path)
     monkeypatch.setattr(dispatcher, "probe", lambda target_config: False)
 
-    with pytest.raises(ValueError, match="no reachable backend"):
+    with pytest.raises(BackendUnreachableError, match="unreachable"):
         run_submission_preflight(
             config,
             target_names=["ubuntu"],

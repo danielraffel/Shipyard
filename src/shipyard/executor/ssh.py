@@ -287,15 +287,44 @@ class SSHExecutor:
 
     def probe(self, target_config: dict[str, Any]) -> bool:
         """Check SSH reachability with a quick echo command."""
+        diag = self._probe_ssh(target_config)
+        return diag["reachable"]
+
+    def diagnose(self, target_config: dict[str, Any]) -> dict[str, Any]:
+        """Return a rich reachability diagnosis for preflight.
+
+        The preflight surfaces `message` + `category` in the
+        user-facing error on fail-fast. Categories are stable strings
+        callers can branch on: "auth", "host_key", "network",
+        "timeout", "unknown".
+        """
+        diag = self._probe_ssh(target_config)
+        return {
+            "reachable": diag["reachable"],
+            "message": _format_ssh_diagnosis(target_config, diag),
+            "category": diag["category"],
+        }
+
+    def _probe_ssh(self, target_config: dict[str, Any]) -> dict[str, Any]:
         host = target_config.get("host")
         if not host:
-            return False
+            return {
+                "reachable": False,
+                "category": "configuration",
+                "last_error": "target has no host configured",
+                "timed_out": False,
+            }
 
         ssh_options = _ssh_options(target_config)
         cmd = (
             ["ssh"]
             + list(ssh_options)
-            + ["-o", "ConnectTimeout=5", host, "echo ok"]
+            + [
+                "-o", "ConnectTimeout=5",
+                "-o", "BatchMode=yes",
+                host,
+                "echo ok",
+            ]
         )
 
         try:
@@ -305,9 +334,36 @@ class SSHExecutor:
                 text=True,
                 timeout=10,
             )
-            return result.returncode == 0
-        except (subprocess.TimeoutExpired, OSError):
-            return False
+        except subprocess.TimeoutExpired:
+            return {
+                "reachable": False,
+                "category": "timeout",
+                "last_error": "ssh probe exceeded 10s",
+                "timed_out": True,
+            }
+        except OSError as exc:
+            return {
+                "reachable": False,
+                "category": "network",
+                "last_error": str(exc),
+                "timed_out": False,
+            }
+
+        if result.returncode == 0:
+            return {
+                "reachable": True,
+                "category": None,
+                "last_error": None,
+                "timed_out": False,
+            }
+
+        stderr = (result.stderr or "").strip()
+        return {
+            "reachable": False,
+            "category": _classify_probe_error(stderr, result.returncode),
+            "last_error": stderr or f"ssh exited {result.returncode}",
+            "timed_out": False,
+        }
 
 
 def _remote_head_sha(
@@ -647,3 +703,61 @@ def _extract_ssh_error(output: str) -> str | None:
         if line.strip():
             return line.strip()
     return None
+
+
+def _classify_probe_error(stderr: str, returncode: int) -> str:
+    """Best-effort classification of an ssh probe failure.
+
+    Stable string buckets — preflight surfaces these back to the user
+    and tooling can branch on them without pattern-matching the raw
+    ssh error text.
+    """
+    lowered = stderr.lower()
+    if (
+        "permission denied" in lowered
+        or "publickey" in lowered
+        or "too many authentication failures" in lowered
+    ):
+        return "auth"
+    if (
+        "host key verification failed" in lowered
+        or "remote host identification has changed" in lowered
+        or "offending" in lowered
+    ):
+        return "host_key"
+    if (
+        "could not resolve hostname" in lowered
+        or "name or service not known" in lowered
+        or "nodename nor servname" in lowered  # macOS variant
+        or "no route to host" in lowered
+        or "network is unreachable" in lowered
+        or "connection refused" in lowered
+    ):
+        return "network"
+    if "connection timed out" in lowered:
+        return "timeout"
+    if returncode == 255:
+        return "network"
+    return "unknown"
+
+
+def _format_ssh_diagnosis(
+    target_config: dict[str, Any], diag: dict[str, Any]
+) -> str:
+    """Compose the preflight error message for an unreachable SSH target."""
+    host = target_config.get("host") or "<no host>"
+    user_at_host = host if "@" in host else host
+    port = target_config.get("port")
+    if port:
+        user_at_host = f"{user_at_host}:{port}"
+    lines = [
+        f"SSH backend unreachable at {user_at_host}.",
+        f"  Attempted: 10s probe with ConnectTimeout=5, BatchMode=yes.",
+    ]
+    category = diag.get("category")
+    if category:
+        lines.append(f"  Failure category: {category}")
+    last = diag.get("last_error")
+    if last:
+        lines.append(f"  Last error: {last}")
+    return "\n".join(lines)
