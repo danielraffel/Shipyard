@@ -53,3 +53,10 @@ jobs:
               --base "${{ steps.base.outputs.ref }}" \
               --config scripts/versioning.json \
               --mode=report
+
+      - name: Doc-sync check
+        run: |
+          python3 scripts/doc_sync_check.py \
+              --base "${{ steps.base.outputs.ref }}" \
+              --map scripts/doc_sync_map.json \
+              --mode=report
