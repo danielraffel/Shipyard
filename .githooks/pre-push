@@ -25,6 +25,8 @@ PYTHON="${PYTHON:-python3}"
 VBC="$ROOT/scripts/version_bump_check.py"
 SSC="$ROOT/scripts/skill_sync_check.py"
 CFG="$ROOT/scripts/versioning.json"
+DSC="$ROOT/scripts/doc_sync_check.py"
+DSM="$ROOT/scripts/doc_sync_map.json"
 
 if [ ! -f "$VBC" ] || [ ! -f "$SSC" ] || [ ! -f "$CFG" ]; then
     exit 0  # pre-versioning checkout; no-op
@@ -46,6 +48,15 @@ case $? in
     1) fail=1 ;;
     *) echo "[pre-push] version_bump_check: internal error" >&2 ;;
 esac
+
+if [ -f "$DSC" ] && [ -f "$DSM" ]; then
+    "$PYTHON" "$DSC" --base "$BASE" --map "$DSM" --mode=report
+    case $? in
+        0) ;;
+        1) fail=1 ;;
+        *) echo "[pre-push] doc_sync_check: internal error" >&2 ;;
+    esac
+fi
 
 if [ "$fail" = "0" ]; then
     echo "[pre-push] gates clean." >&2

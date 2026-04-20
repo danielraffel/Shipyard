@@ -74,3 +74,24 @@ jobs:
       - name: Type check
         if: runner.os != 'Windows'
         run: mypy src/
+
+  state-machine:
+    # #101 Phase C — dedicated lane so ship-state-machine failures are
+    # visually distinct from the full-suite run. Fast (ubuntu-only, no
+    # cross-platform matrix) because these tests are pure Python and
+    # don't exercise platform-specific code paths.
+    name: Ship state machine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install .[dev]
+
+      - name: Run state-machine tests
+        run: pytest -m state_machine -v

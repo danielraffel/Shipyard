@@ -387,15 +387,24 @@ silent-failure regression tests from the list above. Every test should
 name the transition it exercises (`test_T5_merge_on_pass_archives_state`
 etc.) so failure output maps directly to this doc.
 
-## Phase C preview
+## Phase C — doc-sync hook + dedicated CI lane
 
-1. **Doc-sync hook.** Add `docs/ship-state-machine.md` to the skill-sync
-   path map so that changes to `src/shipyard/core/ship_state.py` or the
-   relevant chunks of `src/shipyard/cli.py` must update this doc in the
-   same PR. Mechanism identical to `scripts/skill_path_map.json`.
-2. **Dedicated state-machine CI lane.** A `pytest -m state_machine`
-   marker run as its own GitHub Actions job, so a state-machine
-   failure is visually distinct in the PR checks list.
+Both landed in a follow-up PR:
 
-Neither change lands in Phase A. This doc's role is to make Phase B
-testable and Phase C's path-map additions obvious.
+1. **Doc-sync hook.** `scripts/doc_sync_check.py` + `scripts/doc_sync_map.json`
+   enforce that changes to `src/shipyard/core/ship_state.py` or
+   `src/shipyard/ship/**` include an update to this doc. Runs in
+   `.githooks/pre-push` (advisory; `SHIPYARD_ENFORCE_PREPUSH=1`
+   upgrades to block) and in `.github/workflows/version-skill-check.yml`
+   as a hard CI gate. Bypass via a `Doc-Update: skip doc=<path>
+   reason="..."` trailer on any commit in the diff range.
+2. **Dedicated state-machine CI lane.** A `state-machine` job in
+   `.github/workflows/ci.yml` runs `pytest -m state_machine -v` on its
+   own — ubuntu-only because the tests are pure Python. A failure
+   shows up as a distinctly-named check in the PR status list, so an
+   operator can tell a state-machine regression from a cross-platform
+   infra blip at a glance.
+
+When you touch ship-state transition code, either update this doc in
+the same PR, or record why the update is unnecessary on the tip commit
+with `Doc-Update: skip doc=docs/ship-state-machine.md reason="..."`.
