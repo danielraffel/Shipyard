@@ -54,10 +54,31 @@ class Queue:
         the job is marked COMPLETED with an error status. This
         prevents ghost "running" entries from blocking the queue
         after a crash.
+
+        A zero-byte or corrupt queue.json (the failure mode tracked
+        by #102, where a kill mid-write truncated the file) is
+        treated as "no queue" — we re-initialize empty and the next
+        save will write a fresh valid file. Losing the snapshot is
+        strictly better than erroring on every subsequent invocation.
         """
         if self._queue_file.exists():
-            data = json.loads(self._queue_file.read_text())
-            self._jobs = [_job_from_dict(d) for d in data.get("jobs", [])]
+            raw = self._queue_file.read_text()
+            if not raw.strip():
+                # Zero-byte or whitespace-only file (crashed mid-write
+                # on a pre-atomic shipyard, or manual corruption).
+                self._jobs = []
+            else:
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Partial JSON from a crashed pre-atomic writer.
+                    # Atomic writes prevent this going forward, but
+                    # old state files should still be recoverable.
+                    self._jobs = []
+                else:
+                    self._jobs = [
+                        _job_from_dict(d) for d in data.get("jobs", [])
+                    ]
         else:
             self._jobs = []
 
@@ -127,9 +148,71 @@ class Queue:
             return False
 
     def _save(self) -> None:
-        """Write queue state to disk."""
+        """Write queue state to disk atomically.
+
+        The write path is tmp-file + fsync + rename. If the writer
+        is killed between the write and the rename, `queue.json` is
+        untouched and the in-flight update is lost; without this,
+        a kill mid-write produced a zero-byte `queue.json` that
+        crashed every subsequent `shipyard` invocation with a
+        JSONDecodeError (#102, pulp#528, workaround in pulp#534).
+
+        The tmp file name includes the writing process's PID and a
+        random suffix (via `tempfile.mkstemp`) so concurrent writers
+        don't step on each other's tmp files. `Path.replace` is
+        atomic on POSIX and Windows for same-directory renames, so
+        concurrent renames resolve to last-writer-wins without torn
+        reads ever being observable.
+
+        Also clears any pre-existing `queue.json.tmp` left behind by
+        a crashed pre-atomic writer — that file is from a dead
+        process and has no claim on the queue directory.
+        """
+        import tempfile
+
         data = {"jobs": [_job_to_dict(j) for j in self._jobs]}
-        self._queue_file.write_text(json.dumps(data, indent=2) + "\n")
+        payload = json.dumps(data, indent=2) + "\n"
+
+        # One-shot sweep of the legacy tmp name (pre-atomic writers
+        # wrote to `queue.json.tmp`). We don't sweep pid-suffixed
+        # tmp files here because those may belong to a live peer
+        # writer; the cleanup command handles aged-out tmp files.
+        legacy_tmp = self._queue_file.with_suffix(".json.tmp")
+        if legacy_tmp.exists():
+            with contextlib.suppress(OSError):
+                legacy_tmp.unlink()
+
+        # Per-writer unique tmp so concurrent processes don't collide.
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".queue-", suffix=".json.tmp", dir=str(self.state_dir)
+        )
+        tmp_path = self.state_dir / os.path.basename(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            # Path.replace is atomic on POSIX and Windows for same-
+            # directory renames — this is the step that makes the
+            # update visible. Either the old file or the fully-
+            # written new file is present; never a torn half.
+            #
+            # On Windows, MoveFileEx (which backs os.replace) can
+            # fail with PermissionError (WinError 5) when another
+            # process is mid-rename on the same target or has the
+            # target open for reading. This is the normal file-share
+            # contention window, not a real failure. A small retry
+            # loop covers it. POSIX renames don't hit this, so the
+            # first attempt always wins there.
+            _retry_replace_on_windows(tmp_path, self._queue_file)
+        except Exception:
+            # Clean up the tmp file so a failed save doesn't leave
+            # stale files behind. The destination is untouched, so
+            # the next _load() still sees the previous valid state.
+            if tmp_path.exists():
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
+            raise
 
     def enqueue(self, job: Job) -> Job:
         """Add a job to the queue. Returns the job (with ID assigned).
@@ -284,6 +367,33 @@ class _DrainLock:
 
 
 # ---- Serialization ----
+
+
+def _retry_replace_on_windows(src: Path, dst: Path) -> None:
+    """Rename `src` onto `dst` with Windows file-share backoff.
+
+    POSIX: first attempt always succeeds (atomic, no share modes).
+    Windows: MoveFileEx can fail with WinError 5 (Access denied)
+    while a peer writer is mid-rename or the target is briefly open.
+    We retry up to ~600 ms total — long enough to clear any real
+    contention, short enough that a genuinely permission-denied
+    target still surfaces.
+    """
+    if sys.platform != "win32":
+        src.replace(dst)
+        return
+    import time as _time
+
+    last_exc: PermissionError | None = None
+    for attempt in range(12):
+        try:
+            src.replace(dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            _time.sleep(0.05 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 def _job_to_dict(job: Job) -> dict[str, Any]:
