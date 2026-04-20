@@ -469,12 +469,23 @@ When the user says "push a PR", "ship this", "ship it", "we're done", "merge thi
 
 The orchestration, in order:
 
-1. `scripts/skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without a `SKILL.md` update or a `Skill-Update:` trailer on the tip commit.
-2. `scripts/version_bump_check.py --mode=apply` — rewrites `pyproject.toml` + `src/shipyard/__init__.py` for CLI-surface bumps and `.claude-plugin/plugin.json` for plugin-surface bumps. The two version streams are independent per `RELEASING.md`.
+1. `skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without a `SKILL.md` update or a `Skill-Update:` trailer on the tip commit.
+2. `version_bump_check.py --mode=apply` — rewrites `pyproject.toml` + `src/shipyard/__init__.py` for CLI-surface bumps and `.claude-plugin/plugin.json` for plugin-surface bumps. The two version streams are independent per `RELEASING.md`.
 3. `git commit` + `gh pr create` + `shipyard ship`.
 4. On merge, `.github/workflows/auto-release.yml` tags the CLI bump as `v<x.y.z>`. The existing tag-triggered `release.yml` builds the 5-platform binaries and publishes the GitHub Release.
 
 Never run `gh pr create` + release separately. Never run the Python gate scripts by hand.
+
+### Gate-script path resolution
+
+`shipyard pr` looks up each gate script in this order — the first hit wins:
+
+1. Env var (`SHIPYARD_SKILL_SYNC_SCRIPT`, `SHIPYARD_VERSION_BUMP_SCRIPT`, `SHIPYARD_VERSIONING_CONFIG`).
+2. `.shipyard/config.toml` `[validation]` keys (`skill_sync_script`, `version_bump_script`, `versioning_config`).
+3. `tools/scripts/<file>` — common CI-tooling layout (used by Pulp).
+4. `scripts/<file>` — Shipyard's own default.
+
+Missing-script errors list every probed location and every override knob. Consumer repos that keep their tooling under `tools/scripts/` need no configuration; other layouts should set the env var or the `[validation]` key rather than moving the script.
 
 ## Bypass trailers (tip commit)
 
