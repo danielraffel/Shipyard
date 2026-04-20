@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0210"></a>
+## [0.21.0] - 2026-04-20
+
+- fix(queue): atomic writes with fsync + rename ([#105](https://github.com/danielraffel/Shipyard/pull/105))
+- test: Phase B ship-state transition tests (#101) ([#115](https://github.com/danielraffel/Shipyard/pull/115))
+
 <a id="v0200"></a>
 ## [0.20.0] - 2026-04-20
 
@@ -15,8 +21,6 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 - docs: ship-state-machine audit (#101 Phase A) ([#107](https://github.com/danielraffel/Shipyard/pull/107))
 
 <a id="v0190"></a>
-## [0.20.0]
-
 ## [0.19.0] - 2026-04-19
 
 - feat: warm-pool runner reuse across PRs (closes #82) ([#98](https://github.com/danielraffel/Shipyard/pull/98))
@@ -213,6 +217,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.21.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.21.0
 [0.20.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.20.0
 [0.19.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.19.1
 [0.19.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.19.0
