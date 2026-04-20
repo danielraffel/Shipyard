@@ -198,11 +198,19 @@ class TestWatchCli:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         runner, store, _ = self._runner_with_store(tmp_path, monkeypatch)
+        # Evidence keys must cover every required DispatchedRun.target
+        # for a terminal verdict (#108). Fixture previously used
+        # target="mac" with evidence keys macos/linux, which was
+        # incoherent but accidentally worked pre-fix because the
+        # verdict ignored dispatched-run coverage.
         store.save(
             _state(
                 pr=11,
                 evidence={"macos": "pass", "linux": "pass"},
-                runs=[_run(target="mac", status="completed", run_id="999")],
+                runs=[
+                    _run(target="macos", status="completed", run_id="999"),
+                    _run(target="linux", status="completed", run_id="1000"),
+                ],
             )
         )
         monkeypatch.setattr("shipyard.cli._git_branch", lambda: "feature/x")

@@ -2162,6 +2162,47 @@ def cloud_retarget(
         render_error(f"workflow_dispatch failed: {exc}")
         sys.exit(1)
 
+    # Mirror the retarget into ShipState so watch/auto-merge see the
+    # new provider+run_id instead of the stale row (#110). Best-effort
+    # — if the state file is absent (retarget can be invoked against a
+    # PR that never went through shipyard ship), we skip the mirror
+    # rather than fabricate a ShipState on the retarget path.
+    new_run_id: str | None = None
+    try:
+        discovered = find_dispatched_run(
+            repository=plan.repository,
+            workflow_file=plan.workflow.file,
+            ref=plan.ref,
+        )
+        new_run_id = str(discovered.get("databaseId") or "") or None
+    except (subprocess.CalledProcessError, TimeoutError):
+        new_run_id = None
+
+    ship_state = ctx.ship_state.get(pr)
+    if ship_state is not None:
+        advisory_policy = _resolve_lane_policy_for_ship(ctx.config)
+        now = datetime.now(timezone.utc)
+        replacement = DispatchedRun(
+            target=target,
+            provider=plan.provider,
+            run_id=new_run_id or f"pending-{target}",
+            status="queued",
+            started_at=now,
+            updated_at=now,
+            attempt=ship_state.attempt,
+            required=advisory_policy.is_required(target),
+        )
+        # Drop prior rows for this target, append the new one. The
+        # upsert helper keys on (target, run_id) so it would leave a
+        # stale row behind when the run_id differs — retarget semantics
+        # are "this lane has moved providers," which means the old row
+        # is obsolete, not coexistent.
+        ship_state.dispatched_runs = [
+            r for r in ship_state.dispatched_runs if r.target != target
+        ]
+        ship_state.append_run(replacement)
+        ctx.ship_state.save(ship_state)
+
     if ctx.json_mode:
         ctx.output(
             "cloud.retarget",
@@ -2170,6 +2211,7 @@ def cloud_retarget(
                 **payload,
                 "cancelled_job_ids": cancelled,
                 "new_dispatch": plan.to_dict(),
+                "new_run_id": new_run_id,
             },
         )
     else:
@@ -2689,10 +2731,18 @@ def ship(
     ship_state_store = ctx.ship_state
     existing_state = ship_state_store.get(pr_info.number)
     resume_effective = _resolve_resume_mode(resume, existing_state)
+    # Track the bumped attempt across --no-resume so the fresh
+    # ShipState below reflects the monotonic counter rather than
+    # resetting to attempt=1 (#109). None means "no prior attempt".
+    carried_attempt: int | None = None
     if existing_state is not None:
         if resume_effective is False:
             # Explicit --no-resume: archive the stale state and start fresh.
-            ship_state_store.archive_and_replace(existing_state)
+            # archive_and_replace returns a new ShipState with attempt+1;
+            # we previously discarded it and fell through to a fresh
+            # ShipState(...) with the default attempt=1 (#109).
+            replacement = ship_state_store.archive_and_replace(existing_state)
+            carried_attempt = replacement.attempt
             existing_state = None
         else:
             drift = _detect_ship_state_drift(
@@ -2722,6 +2772,9 @@ def ship(
             pr_url=_pr_url(repo_slug, pr_info.number),
             pr_title=getattr(pr_info, "title", "") or "",
             commit_subject=_git_commit_subject(sha),
+            # Carry forward the bumped attempt on --no-resume so the
+            # counter stays monotonic across force-restarts (#109).
+            attempt=carried_attempt if carried_attempt is not None else 1,
         )
         ship_state_store.save(existing_state)
     else:
@@ -3850,17 +3903,19 @@ def _watch_stale_threshold() -> float:
 def _ship_terminal_verdict(state: ShipState) -> bool | None:
     """Return True=pass, False=fail, None=still in flight.
 
-    Terminal when every entry in the evidence snapshot is a terminal
-    value (pass/fail). The watch command conservatively keeps
-    polling until every recorded target has reached a terminal
-    outcome — a missing platform is treated as "still in flight"
-    because evidence may not have been written yet.
+    Terminal when every *required* dispatched lane has a terminal
+    evidence value (pass/fail). Fix for #108: we now require
+    coverage of every required ``DispatchedRun.target``, not just
+    terminal values on whatever rows happen to be present. A ship
+    that dispatched three lanes and only persisted evidence for one
+    (all "pass") previously returned True; it now returns None
+    until the remaining required lanes post evidence.
 
-    Advisory lanes (``DispatchedRun.required is False``) do not
-    change the terminal boundary: we still wait for them to finish
-    so the watch output reflects reality. But when computing
-    pass/fail, failures on advisory lanes are tolerated — they're
-    informational, not a blocker for the merge gate.
+    Advisory lanes (``DispatchedRun.required is False``) are
+    tolerant in both directions — their absence from the snapshot
+    doesn't block the verdict, and a "fail" on an advisory lane is
+    ignored when computing pass/fail. This matches the pre-fix
+    advisory semantics.
     """
     if not state.evidence_snapshot:
         return None
@@ -3870,6 +3925,15 @@ def _ship_terminal_verdict(state: ShipState) -> bool | None:
     advisory_targets = {
         r.target for r in state.dispatched_runs if not r.required
     }
+    required_targets = {
+        r.target for r in state.dispatched_runs if r.required
+    }
+    # Every required lane must have a terminal row. Without this
+    # coverage check, a partial mirror of evidence + all-pass values
+    # looked identical to a complete pass and triggered premature
+    # merges (#108).
+    if required_targets - set(state.evidence_snapshot):
+        return None
     return all(
         v == "pass" or tgt in advisory_targets
         for tgt, v in state.evidence_snapshot.items()
@@ -4723,10 +4787,17 @@ def _resolve_lane_policy_for_ship(config: Config) -> LanePolicy:
 def _cloud_runs_by_platform(ctx: Context, sha: str) -> dict[str, str]:
     """Best-effort map of platform -> cloud run_id for this SHA.
 
-    The CloudRecordStore is keyed by dispatch_id, not SHA, so scan
-    the recent history for records matching this requested_ref or
-    head SHA. Missing entries simply mean "no cloud dispatch" for
-    that platform and the caller falls back to Shipyard's job id.
+    Records whose ``requested_ref`` doesn't match ``sha`` are
+    skipped. Prior to the #111 fix, the ``sha`` parameter was
+    accepted but not read — the function returned the most-recent
+    run_id per platform across every record in the store, so on a
+    busy machine a DispatchedRun for an earlier ship could be
+    attributed to a later ship's cloud run.
+
+    Records whose ``requested_ref`` is blank or doesn't equal the
+    requested SHA are ignored. Records with no ``platform`` /
+    ``target`` hint in their dispatch_fields are also ignored —
+    without a platform key we can't place them in the map.
     """
     try:
         records = ctx.cloud_records.list(limit=40)
@@ -4735,6 +4806,8 @@ def _cloud_runs_by_platform(ctx: Context, sha: str) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for record in records:
         if record.run_id is None:
+            continue
+        if record.requested_ref and record.requested_ref != sha:
             continue
         # A cloud record's dispatch_fields often carries the
         # platform / target hint. Best-effort; absence is fine.
