@@ -752,7 +752,7 @@ def _format_ssh_diagnosis(
         user_at_host = f"{user_at_host}:{port}"
     lines = [
         f"SSH backend unreachable at {user_at_host}.",
-        f"  Attempted: 10s probe with ConnectTimeout=5, BatchMode=yes.",
+        "  Attempted: 10s probe with ConnectTimeout=5, BatchMode=yes.",
     ]
     category = diag.get("category")
     if category:

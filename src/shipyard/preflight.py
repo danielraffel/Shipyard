@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -11,6 +10,8 @@ from typing import TYPE_CHECKING, Any
 from shipyard.failover.auto import apply_auto_cloud_fallback
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from shipyard.core.config import Config
     from shipyard.executor.dispatch import ExecutorDispatcher
 
