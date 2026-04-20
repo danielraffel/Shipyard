@@ -59,6 +59,7 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [
     "integration: marks tests requiring real git repos or SSH",
+    "state_machine: ship-state-machine transition tests (#101 Phase B)",
 ]
 
 [dependency-groups]
