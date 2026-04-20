@@ -353,18 +353,20 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 ## Bugs discovered by this audit
 
 The Codex review pass turned up four real bugs, independent of the doc's
-accuracy. Each is a candidate Phase B regression test + a Shipyard issue.
+accuracy. All four have been fixed — regression tests live in
+`tests/test_ship_state_machine.py` and run on the dedicated
+`state-machine` CI lane.
 
-| ID | Summary | Location | Phase B test name |
-|----|---------|----------|-------------------|
-| B1 | `_ship_terminal_verdict` returns `True` from partial `evidence_snapshot` coverage if every present value is "pass". Can cause a merge to fire before all dispatched lanes have posted evidence. | cli.py:3790–3820 | `test_terminal_verdict_requires_coverage_of_all_required_lanes` |
-| B2 | `--no-resume` discards `archive_and_replace`'s incremented attempt and resets to `attempt=1`. | cli.py:2644 + 2663 | `test_no_resume_increments_attempt_counter` |
-| B3 | `cloud retarget --apply` dispatches a new workflow but never updates `ShipState`; the old `DispatchedRun` remains and the new one is never recorded. | cli.py:2100–2130 | `test_retarget_updates_dispatched_run_row` |
-| B4 | `_cloud_runs_by_platform(ctx, sha)` accepts but ignores `sha`; maps platform → recent run id, so cross-SHA run id attribution is possible on a busy machine. | cli.py:4645–4660 | `test_cloud_runs_by_platform_scopes_to_sha` |
+| ID | Issue | Summary | Status |
+|----|-------|---------|--------|
+| B1 | [#108](https://github.com/danielraffel/Shipyard/issues/108) | `_ship_terminal_verdict` required coverage check — partial evidence with all-pass values no longer declares a premature verdict. | **Fixed** — `cli.py:_ship_terminal_verdict`. Test: `TestB1_PartialEvidenceCoverage`. |
+| B2 | [#109](https://github.com/danielraffel/Shipyard/issues/109) | `--no-resume` now carries forward the attempt counter from `archive_and_replace` instead of resetting to 1. | **Fixed** — `cli.py` ship command `carried_attempt` thread. Test: `TestB2_NoResumeAttemptCounter`. |
+| B3 | [#110](https://github.com/danielraffel/Shipyard/issues/110) | `cloud retarget --apply` now replaces the target's `DispatchedRun` row after a successful dispatch. | **Fixed** — `cli.py` `cloud_retarget`. Test: `TestB3_RetargetUpdatesState`. |
+| B4 | [#111](https://github.com/danielraffel/Shipyard/issues/111) | `_cloud_runs_by_platform` filters by `requested_ref == sha`. | **Fixed** — `cli.py:_cloud_runs_by_platform`. Test: `TestB4_CloudRunsByPlatformScopesToSha`. |
 
-These should be filed as issues before Phase B starts, so test names can
-reference `Fixes #<n>` rather than embedding bug descriptions in test
-fixtures.
+The `xfail(strict=True)` markers used during Phase B have been flipped
+to plain assertions. Any regression that reverts one of these fixes
+will fail the `state-machine` CI lane immediately.
 
 ## Silent-failure regression tests
 
