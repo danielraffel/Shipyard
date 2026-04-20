@@ -12,7 +12,7 @@ Resolution order (highest priority first):
   3. `tools/scripts/<name>` — common for repos that group CI tooling.
   4. `scripts/<name>` — Shipyard's own default.
 
-If none of those resolves, `resolve()` raises GateScriptNotFound with
+If none of those resolves, `resolve()` raises GateScriptNotFoundError with
 every path it probed plus the override knobs. Callers are expected to
 print that message verbatim and exit.
 """
@@ -62,7 +62,7 @@ VERSIONING_CONFIG = GateScript(
 DEFAULT_DIRS: tuple[str, ...] = ("tools/scripts", "scripts")
 
 
-class GateScriptNotFound(FileNotFoundError):
+class GateScriptNotFoundError(FileNotFoundError):
     """Raised when a gate script cannot be resolved from any source."""
 
 
@@ -87,7 +87,7 @@ def resolve(
         candidate = _absolute(Path(env_val), repo_root)
         if candidate.exists():
             return candidate
-        raise GateScriptNotFound(
+        raise GateScriptNotFoundError(
             _not_found_message(
                 script,
                 repo_root,
@@ -105,7 +105,7 @@ def resolve(
             candidate = _absolute(Path(val), repo_root)
             if candidate.exists():
                 return candidate
-            raise GateScriptNotFound(
+            raise GateScriptNotFoundError(
                 _not_found_message(
                     script,
                     repo_root,
@@ -122,7 +122,7 @@ def resolve(
         if candidate.exists():
             return candidate
 
-    raise GateScriptNotFound(
+    raise GateScriptNotFoundError(
         _not_found_message(
             script,
             repo_root,

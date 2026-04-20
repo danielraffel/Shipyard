@@ -3954,7 +3954,9 @@ def pr(
         SKILL_SYNC,
         VERSION_BUMP,
         VERSIONING_CONFIG,
-        GateScriptNotFound,
+        GateScriptNotFoundError,
+    )
+    from shipyard.gate_scripts import (
         resolve as resolve_gate_script,
     )
 
@@ -3962,7 +3964,7 @@ def pr(
         ssc = resolve_gate_script(SKILL_SYNC, repo_root, config=ctx.obj.config)
         vbc = resolve_gate_script(VERSION_BUMP, repo_root, config=ctx.obj.config)
         cfg = resolve_gate_script(VERSIONING_CONFIG, repo_root, config=ctx.obj.config)
-    except GateScriptNotFound as exc:
+    except GateScriptNotFoundError as exc:
         render_error(str(exc))
         sys.exit(2)
 

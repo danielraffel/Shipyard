@@ -11,7 +11,7 @@ from shipyard.gate_scripts import (
     SKILL_SYNC,
     VERSION_BUMP,
     VERSIONING_CONFIG,
-    GateScriptNotFound,
+    GateScriptNotFoundError,
     resolve,
 )
 
@@ -77,7 +77,7 @@ def test_env_override_that_points_to_missing_file_errors_cleanly(tmp_path: Path)
     # A bad override shouldn't silently fall through to the default — the
     # user asked for a specific path, we honor the ask and surface the
     # broken override instead of masking it.
-    with pytest.raises(GateScriptNotFound) as exc:
+    with pytest.raises(GateScriptNotFoundError) as exc:
         resolve(
             SKILL_SYNC,
             tmp_path,
@@ -90,7 +90,7 @@ def test_env_override_that_points_to_missing_file_errors_cleanly(tmp_path: Path)
 
 def test_config_override_missing_file_errors_cleanly(tmp_path: Path) -> None:
     config = Config(data={"validation": {"skill_sync_script": "nope/missing.py"}})
-    with pytest.raises(GateScriptNotFound) as exc:
+    with pytest.raises(GateScriptNotFoundError) as exc:
         resolve(SKILL_SYNC, tmp_path, config=config, env={})
     message = str(exc.value)
     assert "validation.skill_sync_script" in message
@@ -98,7 +98,7 @@ def test_config_override_missing_file_errors_cleanly(tmp_path: Path) -> None:
 
 
 def test_not_found_lists_every_probed_location(tmp_path: Path) -> None:
-    with pytest.raises(GateScriptNotFound) as exc:
+    with pytest.raises(GateScriptNotFoundError) as exc:
         resolve(SKILL_SYNC, tmp_path, env={})
     message = str(exc.value)
     assert "tools/scripts/" in message
