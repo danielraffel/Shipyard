@@ -38,36 +38,27 @@ Accepts `v0.22.1`, `0.22.1`, or `latest`.
 
 ## Responding to the SessionStart staleness signal
 
-If the SessionStart hook detected a stale CLI you'll see a marker
-line like:
+The SessionStart hook now emits a JSON response with two fields
+when the CLI is stale:
 
-```
-[Shipyard] SHIPYARD_CLI_STALE installed=0.22.0 min_expected=0.22.1
-```
+- `systemMessage` — renders as a **user-visible banner** at session
+  start (independent of the agent). Example text:
+  *"Shipyard CLI is on 0.22.0; plugin expects ≥ 0.22.1. Run
+  /shipyard:upgrade to update."*
+- `hookSpecificOutput.additionalContext` — added to your context
+  so you can speak to it if the user asks.
 
-Claude Code injects this as session context *before* the user's
-first turn. Agents don't proactively act before a user message, so
-don't try to force an `AskUserQuestion` on your own. Instead:
+Behavior to follow:
 
-**In your reply to the user's first message**, include a single
-one-line advisory pointing them at `/shipyard:upgrade`, then
-proceed with whatever they actually asked. Example:
-
-> *(Note: shipyard CLI is 0.22.0; plugin expects ≥ 0.22.1 — run
-> `/shipyard:upgrade` when convenient.)*
->
-> [then answer the user's actual question]
-
-If the user responds with "yes, upgrade now", run the install
-command in this file and verify with `shipyard --version`.
-
-If the user says their install is project-pinned (e.g. pulp's
-`tools/install-shipyard.sh`), don't upgrade — instead persist the
-dismissal so the hook stops advising on future sessions (see
-below), and suggest bumping their pin file instead.
-
-If the user ignores the advisory, drop the topic. Don't re-mention
-it within the session unless they raise it.
+- **Do not proactively prompt** on your own. The banner already told
+  the user. If they don't ask about it, don't mention it.
+- **If the user responds to the banner** ("yes upgrade", "go ahead"),
+  run the install command in this file and verify with
+  `shipyard --version`.
+- **If the user says their install is project-pinned** (e.g. pulp's
+  `tools/install-shipyard.sh`), don't upgrade — persist the
+  dismissal (see below) so the banner stops on future sessions, and
+  suggest bumping their pin file instead.
 
 ### Persisting a "don't ask again" choice
 

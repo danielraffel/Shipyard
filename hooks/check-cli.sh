@@ -6,9 +6,10 @@
 #      (best-effort). The plugin is deferential — it only installs
 #      when something's actually missing.
 #   2. Staleness signal: if a shipyard binary IS on PATH but is older
-#      than this plugin build's `min_shipyard_version`, print a
-#      structured marker the agent picks up and turns into an
-#      AskUserQuestion prompt offering to run /shipyard:upgrade.
+#      than this plugin build's `min_shipyard_version`, emit a Claude
+#      Code SessionStart JSON response with `systemMessage` (renders
+#      as a user-visible banner at session start) and
+#      `hookSpecificOutput.additionalContext` (agent-facing).
 #   3. Honor a user's prior "don't ask again" choice via a dismiss
 #      file under the shipyard state dir. Re-prompts only when the
 #      plugin raises its min_shipyard_version past what was dismissed.
@@ -18,12 +19,6 @@
 # their CLI.
 
 set -u
-
-# ── Canary (temporary — remove after schema fix is verified) ────────
-# Confirms the plugin loader actually invokes this hook. Will be
-# removed in a follow-up PR once we've seen it fire.
-echo "HOOK_RAN at $(date) CLAUDE_PLUGIN_ROOT=${CLAUDE_PLUGIN_ROOT:-unset}" \
-  >> /tmp/shipyard-hook-ran.txt 2>/dev/null || true
 
 # ── State-dir resolution (matches shipyard/core/config.py) ──────────
 
@@ -98,31 +93,53 @@ if [ -f "$DISMISS_FILE" ]; then
   fi
 fi
 
-# ── Print the advisory marker the agent surfaces ────────────────────
+# ── Emit the SessionStart JSON response ─────────────────────────────
 #
-# This is advisory, not directive. Claude Code injects SessionStart hook
-# stdout into the session as context, but agents don't proactively act
-# before the user's first message — so the agent can't reliably fire an
-# AskUserQuestion on its own. What actually works: agent notes the
-# staleness in its first reply to the user's first message, and the
-# user initiates the upgrade via /shipyard:upgrade if they want it.
+# Plain-text stdout goes into the agent's context but agents often
+# treat it as ignorable ambient info. Using the structured JSON
+# response renders `systemMessage` as a user-visible banner at session
+# start (doesn't depend on the agent saying anything) and separately
+# populates `additionalContext` for when the user does ask the agent
+# about the upgrade.
 
-cat <<EOF
+if command -v python3 &>/dev/null; then
+  INSTALLED="$INSTALLED" MIN_VERSION="$MIN_VERSION" \
+    SHIPYARD_STATE_DIR="$SHIPYARD_STATE_DIR" DISMISS_FILE="$DISMISS_FILE" \
+    python3 <<'PY'
+import json, os
+installed = os.environ['INSTALLED']
+minv      = os.environ['MIN_VERSION']
+sdir      = os.environ['SHIPYARD_STATE_DIR']
+dfile     = os.environ['DISMISS_FILE']
+
+print(json.dumps({
+    "systemMessage": (
+        f"Shipyard CLI is on {installed}; plugin expects ≥ {minv}. "
+        f"Run /shipyard:upgrade to update."
+    ),
+    "hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": (
+            f"The installed shipyard CLI is {installed} but this plugin "
+            f"expects >= {minv}. If the user asks about upgrading, suggest "
+            f"/shipyard:upgrade. If they say their install is project-pinned "
+            f"(e.g. pulp's tools/install-shipyard.sh) and want to silence "
+            f"this on future sessions, write the dismiss file:\n"
+            f'  mkdir -p "{sdir}"\n'
+            f'  printf \'%s\\n\' \'{{"dismissed_for_min":"{minv}"}}\' '
+            f'> "{dfile}"'
+        ),
+    },
+}))
+PY
+else
+  # Fallback: plain text for environments without python3. Renders as
+  # agent context only — agents may or may not surface it.
+  cat <<EOF
 
 [Shipyard] SHIPYARD_CLI_STALE installed=${INSTALLED} min_expected=${MIN_VERSION}
-[Shipyard] The plugin in this session expects shipyard ≥ ${MIN_VERSION};
-           you're on ${INSTALLED}. Recent releases include fixes that
-           affect plugin behavior (see GitHub releases).
-[Shipyard] Agent: when you reply to the user's first message, include a
-           single-line advisory like "(Note: shipyard CLI is ${INSTALLED};
-           plugin expects ≥ ${MIN_VERSION} — run /shipyard:upgrade when
-           convenient.)" then proceed with what they asked. Don't
-           interrupt their task or auto-run the upgrade. If the user
-           says they're project-pinned and want to silence this, persist
-           the dismiss by writing:
-             mkdir -p "${SHIPYARD_STATE_DIR}"
-             printf '%s\n' '{"dismissed_for_min":"${MIN_VERSION}"}' \\
-               > "${DISMISS_FILE}"
+[Shipyard] Run /shipyard:upgrade to update the CLI.
 
 EOF
+fi
 exit 0
