@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0220"></a>
+## [0.22.0] - 2026-04-21
+
+- Add `shipyard daemon`: webhook receiver with Tailscale Funnel + local IPC (#125) ([#127](https://github.com/danielraffel/Shipyard/pull/127))
+
 <a id="v0212"></a>
 ## [0.21.2] - 2026-04-20
 
@@ -229,6 +234,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.22.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.22.0
 [0.21.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.21.2
 [0.21.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.21.1
 [0.21.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.21.0
