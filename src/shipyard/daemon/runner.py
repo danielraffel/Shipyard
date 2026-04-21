@@ -135,15 +135,54 @@ def spawn_detached(*, state_dir: Path, repos: list[str]) -> int:
     finally:
         os.close(log_fd)
     # Poll briefly for the PID file so callers can report accurately.
+    # Then verify the child is *still alive* — a PyInstaller-bundled
+    # standalone binary can crash 100ms into startup with a
+    # LookupError and write its PID before exiting, leaving callers
+    # with a stale PID that no longer maps to a process. Fixed in
+    # 0.22.4 after the encodings.idna bundling bug surfaced.
     deadline = time.time() + 3.0
+    pid_from_file: int | None = None
     while time.time() < deadline:
         if pid_file.exists():
             try:
-                return int(pid_file.read_text(encoding="utf-8").strip())
+                pid_from_file = int(pid_file.read_text(encoding="utf-8").strip())
             except (OSError, ValueError):
                 break
+            break
         time.sleep(0.05)
-    return proc.pid
+    final_pid = pid_from_file if pid_from_file is not None else proc.pid
+    # Settle window: give the child a bit to die if it's going to.
+    time.sleep(0.3)
+    if not _pid_alive(final_pid):
+        # Harvest the tail of the log so the caller can surface a
+        # useful error instead of a lie ("daemon started").
+        tail = _read_log_tail(log_path)
+        raise DaemonSpawnFailedError(
+            f"daemon exited immediately after spawn (pid {final_pid}). "
+            f"Tail of {log_path}:\n{tail}"
+        )
+    return final_pid
+
+
+class DaemonSpawnFailedError(RuntimeError):
+    """Raised when spawn_detached starts a daemon that dies before
+    the verification window expires. Callers should surface the
+    log tail in the exception message rather than claim success."""
+
+
+def _read_log_tail(log_path: Path, *, bytes_to_read: int = 2048) -> str:
+    """Return the last few KB of the daemon log as text. Best-effort —
+    returns an empty string if the file doesn't exist or can't be read.
+    """
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - bytes_to_read))
+            data = handle.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def stop_running(state_dir: Path) -> bool:

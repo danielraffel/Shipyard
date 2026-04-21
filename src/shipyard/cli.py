@@ -6,6 +6,15 @@ output is the default.
 
 from __future__ import annotations
 
+# PyInstaller only bundles stdlib modules it can detect via static
+# import analysis. Python's http.server -> socket.getfqdn() pulls in
+# the IDNA codec lazily when the server binds to a hostname; if that
+# codec isn't in the bundle the shipyard daemon crashes on start with
+#   LookupError: unknown encoding: idna
+# and the binary exits before writing any useful error to stderr.
+# Explicit import forces PyInstaller to include encodings.idna in the
+# --onefile binary. Keep this even if it looks unused.
+import encodings.idna  # noqa: F401 — PyInstaller bundle primer
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -6241,12 +6250,30 @@ def daemon_start(ctx: Context, repos: tuple[str, ...], detach: bool) -> None:
     """Start the webhook daemon."""
     import os as _os
 
-    from shipyard.daemon.runner import run_blocking, spawn_detached
+    from shipyard.daemon.runner import (
+        DaemonSpawnFailedError,
+        run_blocking,
+        spawn_detached,
+    )
 
     repo_list = _resolve_repo_list(ctx, repos)
     state_dir = ctx.config.state_dir
     if detach:
-        pid = spawn_detached(state_dir=state_dir, repos=repo_list)
+        try:
+            pid = spawn_detached(state_dir=state_dir, repos=repo_list)
+        except DaemonSpawnFailedError as exc:
+            # The child died before the verification window expired.
+            # Don't lie about it ("daemon started") — surface the log
+            # tail so users see the real error (PyInstaller bundling,
+            # port in use, tunnel permission denied, etc.).
+            if ctx.json_mode:
+                ctx.output(
+                    "daemon:start",
+                    {"ok": False, "error": str(exc), "repos": repo_list},
+                )
+            else:
+                render_message(str(exc), style="red")
+            sys.exit(3)
         if ctx.json_mode:
             ctx.output("daemon:start", {"pid": pid, "repos": repo_list})
         else:
