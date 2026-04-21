@@ -4810,11 +4810,10 @@ def _compose_pr_body(config: Config) -> str:
     out separately so the reviewer can audit why the default policy
     was flipped on this PR.
     """
-    lines: list[str] = ["Automated by Shipyard."]
+    lines: list[str] = []
     policy = _resolve_lane_policy_for_ship(config)
     advisory = sorted(policy.advisory_targets)
     if advisory:
-        lines.append("")
         lines.append("## Advisory lanes")
         lines.append(
             "The following lanes are **advisory** — their status is "

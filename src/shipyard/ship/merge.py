@@ -205,7 +205,7 @@ def ship(
         pr = find_pr_for_branch(branch)
         if pr is None:
             title = _default_pr_title(branch)
-            body = f"Ship {branch} @ {sha[:8]}\n\nAutomated by Shipyard."
+            body = f"Branch `{branch}` @ `{sha[:8]}`."
             pr = create_pr(branch, base, title, body)
     except GhError as e:
         return ShipResult(success=False, error=f"PR creation failed: {e}")
