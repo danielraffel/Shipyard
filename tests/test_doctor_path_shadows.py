@@ -5,18 +5,32 @@ Pulp flagged this concretely: a v0.11.0 binary under
 on PATH behind the pinned ``~/.pulp/bin/shipyard``. If PATH reordered
 for any reason, every `shipyard ship` would have silently run v0.11.0.
 This check warns before that happens.
+
+The fake-binary fixtures use ``#!/bin/sh`` shell scripts, which Windows
+cmd.exe can't execute. The underlying PATH-walk logic is pure Python and
+works cross-platform; the tests are POSIX-only by design of the fixture.
 """
 
 from __future__ import annotations
 
 import os
 import stat
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from shipyard.cli import _check_shipyard_path_shadows
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Fake-binary fixtures are POSIX shell scripts; the PATH-walk "
+        "logic itself is cross-platform."
+    ),
+)
 
 
 def _fake_binary(path: Path, stdout: str) -> None:
