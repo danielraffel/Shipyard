@@ -15,7 +15,6 @@ from __future__ import annotations
 # Explicit import forces PyInstaller to include encodings.idna in the
 # --onefile binary. Keep this even if it looks unused.
 import encodings.idna  # noqa: F401 — PyInstaller bundle primer
-
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
