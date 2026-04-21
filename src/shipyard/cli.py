@@ -479,6 +479,11 @@ def doctor(ctx: Context, release_chain: bool, runners: bool) -> None:
     core: dict[str, Any] = {}
     core["git"] = _check_command("git", "--version")
     core["ssh"] = _check_command("ssh", "-V")
+    # PATH-shadow check: if a stale `shipyard` binary sits on a
+    # lower-priority PATH entry, a reshuffle of PATH silently
+    # downgrades the user to a pre-fix version. Surface this in
+    # doctor so the user learns about it before it bites.
+    core["shipyard-on-path"] = _check_shipyard_path_shadows()
     checks["Core"] = core
 
     # Cloud providers
@@ -537,6 +542,84 @@ def doctor(ctx: Context, release_chain: bool, runners: bool) -> None:
         ctx.output("doctor", {"ready": ready, "checks": checks})
     else:
         render_doctor(checks, ready)
+
+
+def _check_shipyard_path_shadows() -> dict[str, Any]:
+    """Detect stale `shipyard` binaries shadowed on PATH.
+
+    Pulp's agents discovered this concretely: a v0.11.0 binary under
+    ``~/.local/bin/shipyard`` (from an old ``uv tool install shipyard``)
+    was sitting second on PATH behind the pinned
+    ``~/.pulp/bin/shipyard``. If PATH order had ever shifted, every
+    ``shipyard ship`` would have silently run v0.11.0 with none of the
+    recent fixes. This check enumerates every ``shipyard`` on PATH,
+    asks each for its ``--version``, and flags the ones that aren't
+    the one currently running.
+
+    Returns a row suitable for the `Core` section of doctor:
+    - ``ok=True`` when only one shipyard is on PATH, or every PATH
+      entry resolves to the same real file (symlinks are fine).
+    - ``ok=False`` when two or more distinct binaries are found,
+      with `detail` naming every path + version + who wins.
+    """
+    import os as _os
+    import shlex as _shlex
+    import subprocess as _sp
+
+    from shipyard import __version__ as _self_version
+
+    paths = [p for p in _os.environ.get("PATH", "").split(_os.pathsep) if p]
+    # Preserve first-seen order so we can show "winner: <first>" below.
+    seen_bins: list[Path] = []
+    seen_reals: set[Path] = set()
+    for directory in paths:
+        candidate = Path(directory) / "shipyard"
+        if not candidate.is_file() or not _os.access(candidate, _os.X_OK):
+            continue
+        try:
+            real = candidate.resolve()
+        except OSError:
+            real = candidate
+        if real in seen_reals:
+            continue
+        seen_reals.add(real)
+        seen_bins.append(candidate)
+
+    if len(seen_bins) <= 1:
+        return {
+            "ok": True,
+            "version": f"v{_self_version} (single binary on PATH)",
+        }
+
+    # Multiple distinct binaries — fetch each version. Keep the probe
+    # fast so doctor stays snappy on repos with unrelated shipyard
+    # checkouts in ~/Code.
+    rows: list[str] = []
+    for i, binary in enumerate(seen_bins):
+        label = "WINS" if i == 0 else f"shadowed by {seen_bins[0]}"
+        try:
+            result = _sp.run(
+                [str(binary), "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            version = (result.stdout or result.stderr).strip().split("\n")[0]
+        except (_sp.SubprocessError, OSError) as exc:
+            version = f"<unreadable: {exc}>"
+        rows.append(f"    {binary} → {version}  [{label}]")
+
+    detail = (
+        "Multiple `shipyard` binaries on PATH — if PATH order ever "
+        "shifts, a stale one could silently shadow the active one.\n"
+        + "\n".join(rows)
+        + "\n  Fix: remove the unused entries (e.g. "
+        f"{_shlex.quote(str(seen_bins[-1]))}) or reorder PATH so the "
+        f"intended binary stays first."
+    )
+    return {
+        "ok": False,
+        "version": f"v{_self_version} ({len(seen_bins)} binaries found)",
+        "detail": detail,
+    }
 
 
 def _check_runners(ctx: Context) -> dict[str, Any] | None:
