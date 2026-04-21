@@ -151,3 +151,4 @@ binaries on 5 platforms when a version is tagged.
 - [Blog post: Shipyard is a cross-platform CI orchestration layer](https://danielraffel.me/2026/04/09/shipyard-is-a-cross-platform-ci-orchestration-layer-that-coordinates-validation-for-ai-agents-working-across-parallel-worktrees/)
 - [Pulp](https://github.com/danielraffel/pulp) — the audio plugin
   Shipyard was extracted from, and the first project to adopt it.
+- [Shipyard MenuBar for macOS](https://github.com/danielraffel/shipyard-macos-gui) - Shipyard itself runs in the terminal, and that's still the preferred way to drive it. This app is a quick glance at what's happening without dropping into a shell. It's a lightweight menu bar app for quickly viewing and managing CI without using the shell. See per-PR, per-platform status at a glance and jump directly to runs, PRs, or logs. It also lets you retarget jobs, add lanes to in-flight PRs, and access diagnostics (shipyard doctor) in one place.
