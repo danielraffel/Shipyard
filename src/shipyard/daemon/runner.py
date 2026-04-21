@@ -72,6 +72,30 @@ def run_blocking(*, state_dir: Path, repos: list[str]) -> int:
     return 0
 
 
+def _spawn_argv() -> list[str]:
+    """Choose the argv prefix for spawning the daemon subprocess.
+
+    Two install shapes to handle:
+
+    * **pip / uv install** — ``sys.executable`` is a Python interpreter
+      (basename ``python`` / ``python3`` / ``pypy3``). Shipyard is
+      imported as a module; we invoke it via ``-m shipyard``.
+    * **Standalone binary** — shiv zipapp, PyInstaller bundle, etc.
+      (e.g. the ``install.sh`` drop-in at ``~/.local/bin/shipyard``).
+      ``sys.executable`` is the shipyard binary itself; passing ``-m``
+      makes Click error with ``No such option: -m`` and the daemon
+      never starts. Invoke the binary directly instead.
+
+    Detection is by basename — Python interpreters always contain
+    "python" (or "pypy"); the shipyard binary never does.
+    """
+    exe_name = os.path.basename(sys.executable).lower()
+    if "python" in exe_name or "pypy" in exe_name:
+        return [sys.executable, "-m", "shipyard", "daemon", "run"]
+    # Anything else is the shipyard binary itself.
+    return [sys.executable, "daemon", "run"]
+
+
 def spawn_detached(*, state_dir: Path, repos: list[str]) -> int:
     """Launch the daemon as a detached child process, return its PID.
 
@@ -88,7 +112,7 @@ def spawn_detached(*, state_dir: Path, repos: list[str]) -> int:
             existing_pid = 0
         if existing_pid > 0 and _pid_alive(existing_pid):
             return existing_pid
-    args = [sys.executable, "-m", "shipyard", "daemon", "run"]
+    args = _spawn_argv()
     for repo in repos:
         args.extend(["--repo", repo])
     # Close stdio so the detached process doesn't hold the parent

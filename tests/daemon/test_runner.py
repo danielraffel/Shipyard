@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from shipyard.daemon.runner import daemon_is_running, stop_running
+from shipyard.daemon.runner import _spawn_argv, daemon_is_running, stop_running
 
 # stop_running uses AF_UNIX sockets on the happy path. PID semantics
 # work on Windows but the full suite wasn't designed for it.
@@ -48,3 +48,42 @@ def test_stop_running_with_stale_pid_cleans_up(tmp_path: Path) -> None:
     assert stop_running(tmp_path) is False  # nothing was actually stopped
     # Stale file should be cleaned up.
     assert not (pid_dir / "daemon.pid").exists()
+
+
+# ── spawn_argv: standalone-binary vs pip-install detection ──────────
+
+
+@pytest.mark.parametrize(
+    ("executable_name", "expects_dash_m"),
+    [
+        ("python", True),
+        ("python3", True),
+        ("python3.12", True),
+        ("pypy3", True),
+        # Standalone binaries: shipyard / sy / anything non-python.
+        ("shipyard", False),
+        ("sy", False),
+        # PyInstaller-style onefile bundle often copies to a temp name.
+        ("shipyard-macos-arm64", False),
+    ],
+)
+def test_spawn_argv_detects_install_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    executable_name: str,
+    expects_dash_m: bool,
+) -> None:
+    """Regression for the 0.22.x daemon.log spam:
+
+        Error: No such option: -m
+
+    Standalone-binary installs (shiv/zipapp) must NOT get ``-m shipyard``
+    in the argv — the CLI's Click root rejects it. Pip installs must.
+    """
+    monkeypatch.setattr("sys.executable", f"/fake/path/{executable_name}")
+    argv = _spawn_argv()
+    assert argv[0] == f"/fake/path/{executable_name}"
+    if expects_dash_m:
+        assert argv[1:4] == ["-m", "shipyard", "daemon"]
+    else:
+        assert "-m" not in argv
+        assert argv[1:3] == ["daemon", "run"]
