@@ -2763,8 +2763,14 @@ def ship(
         if not ctx.json_mode:
             render_message(f"Found existing PR #{pr_info.number}")
     else:
-        pr_body = _compose_pr_body(ctx.config)
-        pr_info = create_pr(branch, base, f"Ship {branch}", pr_body)
+        pr_body = _compose_pr_body(ctx.config, sha=sha)
+        # Use the tip commit subject as the PR title when available —
+        # matches GitHub's own squash-merge-default behavior and avoids
+        # leaking internal Shipyard terminology ("Ship <branch>") into
+        # the reviewer's view. Fall back to the branch name only when
+        # the subject can't be read.
+        pr_title = _git_commit_subject(sha) or branch
+        pr_info = create_pr(branch, base, pr_title, pr_body)
         if not ctx.json_mode:
             render_message(f"Created PR #{pr_info.number}")
 
@@ -4800,34 +4806,148 @@ def _update_ship_state_from_job(
     ctx.ship_state.save(ship_state)
 
 
-def _compose_pr_body(config: Config) -> str:
-    """Build the PR body for a freshly-opened ship, including advisory
-    lane annotations.
+def _compose_pr_body(config: Config, *, sha: str) -> str:
+    """Build the PR body as a useful artifact, not a Shipyard status page.
 
-    When the resolved lane policy marks one or more lanes advisory,
-    list them in the body so reviewers aren't surprised that a red
-    advisory lane still landed. Trailer-based overrides are called
-    out separately so the reviewer can audit why the default policy
-    was flipped on this PR.
+    Shape:
+      1. The tip commit body verbatim — this is the PR description.
+         Empty body degrades to a placeholder prompting the author to
+         fill it in.
+      2. A `> [!WARNING]` callout listing any bypass trailers on the
+         tip (Version-Bump: skip, Skill-Update: skip, Release: skip,
+         Lane-Policy) — only rendered when bypasses are present,
+         because they override default safety rails and reviewers
+         need to see them.
+      3. A one-line `<sub>`-wrapped footer with the validation target
+         list + a `shipyard watch` pointer. Advisory lanes are tacked
+         onto the footer only when present.
+
+    The body is seeded at PR-open time and is never overwritten on
+    resume, so authors can edit freely.
     """
-    lines: list[str] = ["Automated by Shipyard."]
-    policy = _resolve_lane_policy_for_ship(config)
-    advisory = sorted(policy.advisory_targets)
-    if advisory:
-        lines.append("")
-        lines.append("## Advisory lanes")
+    lines: list[str] = []
+
+    # 1. Primary content: the commit body.
+    body = _git_commit_body(sha)
+    if body:
+        lines.append(body)
+    else:
         lines.append(
-            "The following lanes are **advisory** — their status is "
-            "informational and does not block merge:"
+            "_<no commit body — add context so reviewers know what "
+            "this PR does and why>_"
         )
-        for target in advisory:
-            suffix = (
-                " (overridden via Lane-Policy trailer)"
-                if target in policy.overrides_from_trailer
-                else ""
-            )
-            lines.append(f"- `{target}`{suffix}")
+
+    # 2. Bypass trailer callout (only when present).
+    bypasses = _collect_bypass_trailers(sha)
+    if bypasses:
+        lines.append("")
+        lines.append("> [!WARNING]")
+        lines.append(
+            "> **Bypasses on this PR** — confirm these are intentional:"
+        )
+        for trailer in bypasses:
+            lines.append(f"> - `{trailer}`")
+
+    # 3. Footer: validation + watch pointer + advisory callout.
+    policy = _resolve_lane_policy_for_ship(config)
+    target_names = list((config.targets or {}).keys())
+    advisory = sorted(policy.advisory_targets)
+    if target_names:
+        formatted_targets = ", ".join(f"`{n}`" for n in target_names)
+        footer_parts = [f"Validation: {formatted_targets}"]
+        if advisory:
+            advisory_list = ", ".join(f"`{n}`" for n in advisory)
+            footer_parts.append(f"Advisory: {advisory_list}")
+        footer_parts.append("Follow: `shipyard watch`")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append("<sub>" + " · ".join(footer_parts) + "</sub>")
+
     return "\n".join(lines)
+
+
+def _git_commit_body(sha: str) -> str:
+    """Return the tip commit body (everything after the subject line).
+
+    Strips any trailing trailer lines so they don't duplicate into
+    the PR body — they're called out separately in the bypass
+    section. Empty string when the commit has subject-only or when
+    git fails.
+    """
+    try:
+        full = subprocess.check_output(
+            ["git", "log", "-1", "--format=%B", sha],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+    # Split subject/body at the first blank line.
+    parts = full.split("\n\n", 1)
+    if len(parts) < 2:
+        return ""
+    body = parts[1]
+
+    # Strip the trailer block (last paragraph where every line is
+    # `Key: value`). Peel matching lines from the end of the body in
+    # reverse order; stop when a non-trailer line is hit. This
+    # preserves body-embedded "Key: value"-shaped sentences because
+    # they're not at the end.
+    try:
+        trailer_block = subprocess.check_output(
+            ["git", "interpret-trailers", "--only-trailers"],
+            input=full, text=True, stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        trailer_block = ""
+    trailer_lines = [line for line in trailer_block.splitlines() if line.strip()]
+    if trailer_lines:
+        body_lines = body.rstrip("\n").splitlines()
+        remaining_trailers = list(trailer_lines)
+        while body_lines and remaining_trailers:
+            if body_lines[-1].strip() == remaining_trailers[-1].strip():
+                body_lines.pop()
+                remaining_trailers.pop()
+            else:
+                break
+        # Drop the blank line separator that sat between the last
+        # paragraph and the trailer block.
+        while body_lines and not body_lines[-1].strip():
+            body_lines.pop()
+        body = "\n".join(body_lines)
+    return body.strip("\n")
+
+
+_BYPASS_TRAILER_KEYS = ("version-bump", "skill-update", "release", "lane-policy", "doc-update")
+
+
+def _collect_bypass_trailers(sha: str) -> list[str]:
+    """Return bypass-trailer lines from the tip commit, preserving order.
+
+    Only surfaces trailers that disable a default gate (the bypass
+    table in skills/ci/SKILL.md). Regular `Co-Authored-By`, `Signed-
+    Off-By`, etc. are ignored — the callout is specifically for
+    things a reviewer might miss.
+    """
+    try:
+        full = subprocess.check_output(
+            ["git", "log", "-1", "--format=%B", sha],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        parsed = subprocess.check_output(
+            ["git", "interpret-trailers", "--parse"],
+            input=full, text=True, stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    out: list[str] = []
+    for line in parsed.splitlines():
+        if ":" not in line:
+            continue
+        key, _, _ = line.partition(":")
+        if key.strip().lower() in _BYPASS_TRAILER_KEYS:
+            out.append(line.strip())
+    return out
 
 
 def _resolve_lane_policy_for_ship(config: Config) -> LanePolicy:
