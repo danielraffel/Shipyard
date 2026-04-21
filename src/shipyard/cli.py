@@ -4044,11 +4044,13 @@ def ship_state_reconcile(
         render_error("Usage: shipyard ship-state reconcile <pr> | --all")
         sys.exit(2)
 
-    targets: list[ShipState] = (
-        ctx.ship_state.list_active()
-        if reconcile_all
-        else [s for s in [ctx.ship_state.get(pr)] if s is not None]
-    )
+    targets: list[ShipState] = []
+    if reconcile_all:
+        targets = ctx.ship_state.list_active()
+    elif pr is not None:
+        state = ctx.ship_state.get(pr)
+        if state is not None:
+            targets = [state]
     if not targets:
         render_message(
             f"No active ship state for PR #{pr}." if pr else "No active ship state.",
