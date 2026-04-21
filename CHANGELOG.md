@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0223"></a>
+## [0.22.3] - 2026-04-21
+
+- ship: drop Shipyard branding + 'Ship' term from auto-opened PR bodies ([#140](https://github.com/danielraffel/Shipyard/pull/140))
+
 <a id="v0222"></a>
 ## [0.22.2] - 2026-04-21
 
@@ -250,6 +255,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.22.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.22.3
 [0.22.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.22.2
 [0.22.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.22.1
 [0.22.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.22.0
