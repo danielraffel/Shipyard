@@ -6211,5 +6211,142 @@ def release_bot_hook_run(ctx: Context, tag: str | None) -> None:
         sys.exit(1)
 
 
+# --- shipyard daemon ------------------------------------------------
+#
+# Webhook receiver daemon — see Shipyard issue #125. Runs a local
+# webhook server behind a Tailscale Funnel tunnel, registers GitHub
+# webhooks on tracked repos, and fans out events to IPC subscribers
+# (including the macOS menu-bar app and other shipyard CLI
+# invocations).
+
+
+@main.group()
+def daemon() -> None:
+    """Run the live-mode webhook receiver + IPC event broker."""
+
+
+@daemon.command("start")
+@click.option(
+    "--repo",
+    "repos",
+    multiple=True,
+    help="Repo(s) to register webhooks on (overrides ship-state detection)",
+)
+@click.option(
+    "--detach/--no-detach",
+    default=True,
+    help="Fork into the background (default). Use --no-detach for dev/debug.",
+)
+@pass_context
+def daemon_start(ctx: Context, repos: tuple[str, ...], detach: bool) -> None:
+    """Start the webhook daemon."""
+    import os as _os
+
+    from shipyard.daemon.runner import run_blocking, spawn_detached
+
+    repo_list = _resolve_repo_list(ctx, repos)
+    state_dir = ctx.config.state_dir
+    if detach:
+        pid = spawn_detached(state_dir=state_dir, repos=repo_list)
+        if ctx.json_mode:
+            ctx.output("daemon:start", {"pid": pid, "repos": repo_list})
+        else:
+            render_message(
+                f"daemon started (pid {pid}); registering {len(repo_list)} repo(s).",
+                style="green",
+            )
+        return
+    # Foreground mode — helpful for `shipyard daemon run`-equivalent
+    # debugging. Blocks until SIGINT/SIGTERM.
+    _os.environ.setdefault("SHIPYARD_DAEMON_FOREGROUND", "1")
+    exit_code = run_blocking(state_dir=state_dir, repos=repo_list)
+    if exit_code != 0:
+        sys.exit(exit_code)
+
+
+@daemon.command("run")
+@click.option("--repo", "repos", multiple=True)
+@pass_context
+def daemon_run(ctx: Context, repos: tuple[str, ...]) -> None:
+    """Run the daemon in the foreground (logs to stdout). Useful for
+    systemd / launchd unit files and for debugging."""
+    from shipyard.daemon.runner import run_blocking
+
+    repo_list = _resolve_repo_list(ctx, repos)
+    exit_code = run_blocking(state_dir=ctx.config.state_dir, repos=repo_list)
+    if exit_code != 0:
+        sys.exit(exit_code)
+
+
+@daemon.command("stop")
+@pass_context
+def daemon_stop(ctx: Context) -> None:
+    """Ask a running daemon to exit gracefully."""
+    from shipyard.daemon.runner import stop_running
+
+    state_dir = ctx.config.state_dir
+    stopped = stop_running(state_dir)
+    if ctx.json_mode:
+        ctx.output("daemon:stop", {"stopped": stopped})
+    else:
+        if stopped:
+            render_message("daemon stopped.", style="green")
+        else:
+            render_message("daemon wasn't running.", style="dim")
+
+
+@daemon.command("status")
+@pass_context
+def daemon_status(ctx: Context) -> None:
+    """Report whether the daemon is running + tunnel + subscribers."""
+    from shipyard.daemon.controller import read_daemon_status
+
+    status = read_daemon_status(ctx.config.state_dir)
+    if status is None:
+        if ctx.json_mode:
+            ctx.output("daemon:status", {"running": False})
+        else:
+            render_message("daemon is not running.", style="dim")
+        return
+    if ctx.json_mode:
+        ctx.output("daemon:status", {"running": True, **status})
+    else:
+        tunnel_raw = status.get("tunnel")
+        tunnel: dict[str, Any] = tunnel_raw if isinstance(tunnel_raw, dict) else {}
+        url = tunnel.get("url") or "—"
+        backend = tunnel.get("backend") or "—"
+        subs = status.get("subscribers", 0)
+        repos_raw = status.get("registered_repos")
+        repos_list: list[str] = [
+            str(r) for r in (repos_raw if isinstance(repos_raw, list) else [])
+        ]
+        repos_text = ", ".join(repos_list) or "—"
+        render_message(
+            f"daemon running · tunnel={backend} · {url}\n"
+            f"subscribers={subs} · repos={repos_text}",
+            style="green",
+        )
+
+
+def _resolve_repo_list(ctx: Context, explicit: tuple[str, ...]) -> list[str]:
+    """If the user passed `--repo` args, honor them. Otherwise derive
+    the list from the ship-state store so the daemon registers hooks
+    on every repo the user has shipped from this machine."""
+    if explicit:
+        return list(explicit)
+    try:
+        states = ctx.ship_state.list_active()
+    except Exception:  # pragma: no cover — defensive against uninit state dir
+        return []
+    repos: list[str] = []
+    seen: set[str] = set()
+    for state in states:
+        repo = getattr(state, "repo", None)
+        if repo and repo not in seen:
+            seen.add(repo)
+            repos.append(repo)
+    return repos
+
+
 if __name__ == "__main__":
     main()
