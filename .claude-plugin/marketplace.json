@@ -1,6 +1,6 @@
 {
   "name": "shipyard",
   "owner": {"name": "Daniel Raffel"},
-  "metadata": {"description": "Cross-platform CI coordination", "version": "0.1.2"},
-  "plugins": [{"name": "shipyard", "source": "./", "description": "Cross-platform CI coordination — local VMs, SSH hosts, cloud runners", "version": "0.11.3", "author": {"name": "Daniel Raffel"}, "repository": "https://github.com/danielraffel/shipyard", "license": "MIT", "keywords": ["ci", "testing", "cross-platform", "validation"]}]
+  "metadata": {"description": "Cross-platform CI coordination", "version": "0.1.3"},
+  "plugins": [{"name": "shipyard", "source": "./", "description": "Cross-platform CI coordination — local VMs, SSH hosts, cloud runners", "version": "0.11.4", "author": {"name": "Daniel Raffel"}, "repository": "https://github.com/danielraffel/shipyard", "license": "MIT", "keywords": ["ci", "testing", "cross-platform", "validation"]}]
 }
