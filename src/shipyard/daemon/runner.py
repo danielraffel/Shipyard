@@ -20,6 +20,7 @@ import sys
 import time
 from pathlib import Path
 
+from shipyard.daemon import disclosure
 from shipyard.daemon.controller import Daemon, DaemonAlreadyRunningError, DaemonConfig
 from shipyard.daemon.tunnels.base import TunnelNotReadyError, TunnelStartError
 
@@ -28,12 +29,23 @@ logger = logging.getLogger(__name__)
 
 def run_blocking(*, state_dir: Path, repos: list[str]) -> int:
     """Run the daemon in-process until SIGINT/SIGTERM. Returns the
-    exit code the CLI should propagate (0 on graceful shutdown, 1 on
-    startup failure)."""
+    exit code the CLI should propagate.
+
+    Exit codes:
+      0 — graceful shutdown.
+      2 — another daemon is already running (PID file lock held).
+      3 — tunnel backend isn't ready (Tailscale not installed /
+          signed in / Funnel not permitted on the tailnet). The
+          recommended remedy is to either enable Tailscale Funnel or
+          skip the daemon entirely; `shipyard watch` and the macOS
+          app both work without it.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Show the first-run notice before we touch Tailscale or GitHub.
+    disclosure.show_if_first_run(state_dir, repos)
     config = DaemonConfig(state_dir=state_dir, repos=repos)
     daemon = Daemon(config)
     try:
@@ -42,7 +54,14 @@ def run_blocking(*, state_dir: Path, repos: list[str]) -> int:
         logger.error("%s", exc)
         return 2
     except (TunnelNotReadyError, TunnelStartError) as exc:
-        logger.error("tunnel backend unavailable: %s", exc)
+        logger.error(
+            "Tailscale Funnel isn't available: %s. "
+            "The daemon needs a public tunnel to receive GitHub webhooks. "
+            "Install Tailscale + enable Funnel on your tailnet, or skip the "
+            "daemon entirely — `shipyard watch` and the macOS app both fall "
+            "back to polling.",
+            exc,
+        )
         return 3
     except KeyboardInterrupt:
         pass

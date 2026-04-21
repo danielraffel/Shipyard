@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,8 @@ class Registrar:
         binary = gh_binary or shutil.which("gh")
         if binary is None:
             raise RegistrarError("gh CLI not found on PATH")
+        if not os.access(binary, os.X_OK) or not Path(binary).is_file():
+            raise RegistrarError(f"gh CLI not executable: {binary}")
         if repo in self._by_repo:
             # Already registered — update the URL/secret in case they
             # rotated since last time.
