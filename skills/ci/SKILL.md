@@ -13,6 +13,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 |------|---------|
 | Validate current branch | `shipyard run --json` |
 | Validate specific targets | `shipyard run --targets mac,ubuntu --json` |
+| Iterate on one platform's CI failure | `shipyard run --skip-target <others>` (see [Iterating on a single-platform failure](#iterating-on-a-single-platform-failure)) |
 | Fast smoke check | `shipyard run --smoke --json` |
 | Full ship (PR + validate + merge) | `shipyard ship --json` |
 | Ship to develop instead of main | `shipyard ship --base develop --json` |
@@ -167,11 +168,77 @@ See `docs/cloud-retarget.md` for full context; add-lane complements retarget.
 1. Work on a feature branch. Commit your changes.
 2. Run `shipyard ship --json` — this pushes, creates a PR, validates on all
    platforms, and merges when green.
-3. If a target fails, read the logs with `shipyard logs <id> --target <name>`,
-   fix the issue, and run `shipyard ship --json` again.
+3. If a target fails, read the logs with `shipyard logs <id> --target <name>`.
+   If the failure is confined to one platform (which it usually is), **iterate
+   locally against that target instead of re-shipping the full matrix** — see
+   [Iterating on a single-platform failure](#iterating-on-a-single-platform-failure)
+   below. Once the local lane is green, `shipyard ship --json` again.
 
 Shipyard refuses to merge unless every required platform has passing evidence
 for the exact HEAD SHA.
+
+### Iterating on a single-platform failure
+
+When CI goes red on exactly one platform (e.g. only the Windows leg of a
+matrix, only the macOS sanitizer), **do not default to push → wait for full
+matrix → read one platform's result → repeat**. That burns the dispatch cost
+on every platform you didn't touch — typically 15–25 minutes per iteration
+re-validating lanes that were already green.
+
+Use `shipyard run` with target selection to validate the fix against the real
+target, fast:
+
+```bash
+# Iterate on the Windows lane only (skips mac + ubuntu)
+shipyard run --skip-target mac --skip-target ubuntu --json
+
+# Or, equivalent inclusive form
+shipyard run --targets windows --json
+```
+
+`run` validates locally via the configured backend for that target (SSH host,
+local VM, or cloud runner — whichever `.shipyard/config.toml` assigns). You
+get a real result in ~5–10 minutes per target with no GitHub Actions runner
+minutes burned and no re-validation of lanes you didn't change. Once the
+local lane passes cleanly, `shipyard ship --json` to kick the final cross-
+platform gate.
+
+**When this loop doesn't fit:**
+
+- **Final pre-merge gate.** `shipyard ship` / `shipyard pr` is still the
+  only command that produces a merge-eligible evidence record. `shipyard run`
+  iteration is for getting-to-green; `ship` is for landing it.
+- **Platform-specific to a backend you don't have.** If the failure is
+  specific to a GitHub-hosted runner (e.g. the `[github-hosted]` leg of a
+  matrix where your local lane is SSH or Namespace), the local lane is a
+  good proxy but not identical. Consider `shipyard cloud run build <branch>`
+  as the middle ground — dispatches to the same cloud backend CI uses
+  without re-running everything.
+- **Cross-target behavioral differences you're actually testing.** If the
+  bug only manifests when two targets interact (rare but real — e.g.
+  shared caches), the single-target loop hides it.
+
+**When `shipyard run` fails for reasons that don't match your change:**
+
+Long-running SSH or VM backends accumulate per-run state — stale build
+artifacts, partially-applied branches from interrupted earlier runs,
+environment drift. If `run` errors on a lane with messages that look
+unrelated to the code you changed (`cmake` complaining about files you
+didn't touch, configure steps timing out on line one, paths pointing at
+an earlier branch), check the host before assuming your code is wrong.
+
+Typical diagnostic pass on an SSH backend:
+
+```bash
+ssh <backend-host>
+cd <worktree>
+git log -1 && git status             # did we land on the expected SHA?
+ls -la .shipyard-stage-*             # old stage dirs still pinning files?
+rm -rf .shipyard-stage-*             # nuclear reset; safe — always re-staged
+```
+
+Local VM backends usually have their own `reset` path in the project's
+`.shipyard/` config. Re-run `shipyard run` after cleanup.
 
 ### Recovering an interrupted ship
 
