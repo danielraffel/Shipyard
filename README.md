@@ -146,6 +146,72 @@ macOS, Linux, and Windows on every push. The release workflow at
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
 binaries on 5 platforms when a version is tagged.
 
+## FAQ
+
+### Do I need to run `shipyard daemon` / enable live mode?
+
+No. The daemon is an optional optimization for realtime webhook updates. Without it, every shipyard command falls back to polling — behavior is identical to earlier versions. `shipyard run`, `ship`, `watch`, `auto-merge`, and the macOS app all work fine without the daemon.
+
+### Does it hurt if I don't enable live mode?
+
+No. You'll still get the same results; they just arrive on a poll cadence (60 s worst case) rather than push-instant. Webhooks aren't registered on your repos unless the daemon is running. No Tailscale Funnel is created if you don't run `shipyard daemon start`.
+
+### I pushed to a repo without running `shipyard ship`. Will it appear in the macOS app?
+
+Depends on whether you've ever shipped from that repo on this machine:
+
+- **Never shipped from that repo before** → nothing appears. The app only tracks repos it knows about via local ship-state.
+- **You've shipped at least one PR from that repo before** → pushes show up in the "GitHub Actions" section of the app (polled via `gh run list` for known repos), but not as a tracked PR card. Tracked PR cards only appear for PRs that have ship-state — i.e. PRs you invoked `shipyard ship` or `shipyard pr` on.
+
+If live mode is on, the daemon will deliver webhook events for those pushes too, so the "GitHub Actions" section updates in realtime — but it still won't promote an un-shipped PR into a tracked card.
+
+### How do I turn off live mode?
+
+- **From the macOS app**: Settings → Live updates → **Off**. The app sends a stop command to the daemon, which unregisters webhooks and resets the Tailscale Funnel config. Nothing persists after that.
+- **From the CLI**: `shipyard daemon stop` does the same teardown.
+
+### How do I remove everything shipyard installed?
+
+Shipyard doesn't leave much footprint, but here's the complete list:
+
+```bash
+# 1. Stop + unregister the daemon (if running)
+shipyard daemon stop
+
+# 2. Uninstall the CLI (method depends on how you installed)
+pip uninstall shipyard                # if installed via pip
+rm -rf ~/.pulp                        # if installed via install.sh
+
+# 3. Remove state directory (ship-state, daemon config, webhook secret)
+#    macOS:
+rm -rf ~/Library/Application\ Support/shipyard
+#    Linux:
+rm -rf ~/.local/state/shipyard
+
+# 4. (macOS only) Keychain entry for the webhook secret
+security delete-generic-password -s com.danielraffel.shipyard.webhook
+```
+
+The macOS menu-bar app (`shipyard-macos-gui`) is separate: drag it out of `/Applications` to uninstall.
+
+### I don't have Tailscale. Is live mode usable?
+
+Not in v1. Tailscale Funnel is the only tunnel backend shipped currently; others (Cloudflare Tunnel, ngrok, user-supplied reverse proxy) are tracked in [issue #126](https://github.com/danielraffel/Shipyard/issues/126). Until those land, live mode requires Tailscale + Funnel. The rest of shipyard (polling path) works fine without either.
+
+### Does shipyard read or store any secrets besides the webhook HMAC?
+
+- The webhook HMAC secret is the only secret shipyard stores — in macOS Keychain or a `600`-perm file on Linux. It's generated locally, only sent to GitHub (as part of the webhook registration), and only used to verify that incoming deliveries actually came from GitHub.
+- `gh` auth is read through the `gh` CLI's existing token storage. Shipyard doesn't duplicate or persist it.
+- SSH keys for remote targets are whatever's already in your `~/.ssh/`.
+
+### My macOS app says "shipyard CLI not found on PATH"
+
+Live mode requires the `shipyard` CLI to be installed on the Mac running the app. Install it (`curl -fsSL https://install.shipyard.sh | sh` or via `pip install shipyard`). If you don't want live mode, you can ignore this — the app will keep working in polling mode.
+
+### Will pushing without `shipyard ship` break anything I've already shipped?
+
+No. A branch force-push or one-off commit on a tracked PR leaves the existing ship-state entry as-is (still scoped to the old SHA) until you explicitly re-ship or archive it. The app may show stale evidence for that PR until then. [Issue #128](https://github.com/danielraffel/Shipyard/issues/128) tracks improving this with passive observer mode.
+
 ## Learn more
 
 - [Blog post: Shipyard is a cross-platform CI orchestration layer](https://danielraffel.me/2026/04/09/shipyard-is-a-cross-platform-ci-orchestration-layer-that-coordinates-validation-for-ai-agents-working-across-parallel-worktrees/)
