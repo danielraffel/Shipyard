@@ -265,7 +265,22 @@ def _pid_alive(pid: int) -> bool:
 
 def read_daemon_status(state_dir: Path) -> dict[str, object] | None:
     """Query the running daemon over its IPC socket. Returns None if
-    the daemon isn't running / reachable."""
+    the daemon isn't running / reachable.
+
+    Protocol (see `ipc.py`):
+      1. Server sends `{"type":"hello","protocol":1}` on connect.
+      2. Client sends `{"type":"status"}`.
+      3. Server sends `{"type":"status", ...}` back.
+
+    The pre-0.22.5 version of this function read only until the first
+    newline and then searched for a status line in `buf.splitlines()`.
+    That first newline is the hello, so this always returned None while
+    the daemon was happily running — `shipyard daemon status` printed
+    "daemon is not running." even though the process was alive.
+
+    Fixed here: read lines until we either see the `type==status`
+    reply or the socket times out / closes.
+    """
     import socket
 
     sock_path = state_dir / "daemon" / "daemon.sock"
@@ -277,19 +292,22 @@ def read_daemon_status(state_dir: Path) -> dict[str, object] | None:
             client.connect(str(sock_path))
             client.sendall(b'{"type":"status"}\n')
             buf = b""
-            while b"\n" not in buf:
+            while True:
                 chunk = client.recv(65536)
                 if not chunk:
                     break
                 buf += chunk
-            # Skip the initial hello line.
-            for line in buf.splitlines():
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(obj, dict) and obj.get("type") == "status":
-                    return obj
+                # Drain any complete lines we've accumulated and check
+                # each for the status reply. Exit as soon as we find it
+                # so we don't block on further reads.
+                while b"\n" in buf:
+                    line, _, buf = buf.partition(b"\n")
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("type") == "status":
+                        return obj
     except (TimeoutError, OSError):
         return None
     return None
