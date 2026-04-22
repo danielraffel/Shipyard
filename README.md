@@ -11,6 +11,7 @@ shipyard init              # detects your project, probes your machines
 shipyard run               # validates on every platform you configured
 shipyard ship              # validate, open PR, merge on green
 shipyard watch             # live-tail an in-flight ship
+shipyard wait pr 151 --state green  # wait on release / PR / run conditions
 shipyard auto-merge <pr>   # cron-friendly one-shot merge-on-green
 shipyard release-bot setup # guided RELEASE_BOT_TOKEN setup
 shipyard cloud retarget    # switch one target's runner mid-flight

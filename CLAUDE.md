@@ -36,6 +36,15 @@ Full design: borrowed from `pulp` (upstream) — the schema and scripts are shar
 
 ### Shipping a PR
 
+Whenever an agent workflow needs to wait on a GitHub condition — a
+release to finish uploading, a PR's required checks to go green, a
+dispatched workflow run to finish — reach for `shipyard wait ...`
+instead of hand-rolling a `gh`-polling loop. Daemon-backed (wakes in
+seconds on real events) with a transparent polling fallback when no
+daemon is running. Always set `--timeout`. See
+[`skills/ci/SKILL.md#waiting-on-conditions-shipyard-wait`](skills/ci/SKILL.md)
+for patterns and exit-code reference.
+
 When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or similar, invoke `shipyard pr` (or `shipyard ship` if that name is reserved for release today — check `skills/ci/SKILL.md`). It orchestrates:
 
 1. `skill_sync_check.py --mode=report` — hard-fails on missing SKILL.md updates.

@@ -62,6 +62,9 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Environment check | `shipyard doctor --json` |
 | Probe SSH runner reachability | `shipyard doctor --runners --json` |
 | Clean up artifacts | `shipyard cleanup --apply` |
+| Wait for a release to fully upload | `shipyard wait release v0.23.0 --timeout 900 --json` |
+| Wait for a PR's required checks to go green | `shipyard wait pr 151 --state green --timeout 1800 --json` |
+| Wait for a workflow run to finish | `shipyard wait run 223344 --success --timeout 1200 --json` |
 | Mark a target advisory | `[targets.<n>] advisory = true` in `.shipyard/config.toml` (see "Advisory lanes" below) |
 | Flip lane policy for one PR | `Lane-Policy: <target>=required\|advisory` trailer on the tip commit |
 | List quarantined targets | `shipyard quarantine list --json` |
@@ -196,6 +199,66 @@ What it does:
 4. Appends a new `DispatchedRun` to the ShipState so the watch loop joins it into the overall verdict.
 
 See `docs/cloud-retarget.md` for full context; add-lane complements retarget.
+
+## Waiting on conditions (`shipyard wait`)
+
+Whenever you'd otherwise write a polling loop around `gh` — wait for a release to upload, wait for a PR's required checks to go green, wait for a dispatched workflow run to finish — reach for `shipyard wait` instead. It opens a daemon subscription first (if one's running), takes one authoritative `gh` snapshot, and either exits 0 immediately or keeps re-evaluating on real webhook events (no extra REST budget). When the daemon isn't running, it falls back to polling transparently — safe to use on headless CI too.
+
+### Before/after
+
+| Before | After |
+|---|---|
+| `for i in {1..60}; do status=$(gh run view 22345 --json status -q .status); [ "$status" = "completed" ] && break; sleep 20; done` | `shipyard wait run 22345 --success --timeout 1200 --json` |
+| `while ! gh release view v0.23.0 --json assets -q '.assets\|length' \| grep -q '^5$'; do sleep 10; done` | `shipyard wait release v0.23.0 --timeout 900 --json` |
+| `gh pr checks 151 --watch` (blocking; no structured output) | `shipyard wait pr 151 --state green --timeout 1800 --json` |
+
+### Detection gate (when to use it vs hand-rolled `gh`)
+
+Only use `shipyard wait` when:
+
+1. `command -v shipyard` succeeds (binary is installed).
+2. The project has `.shipyard/config.toml` **or** `tools/shipyard.toml` (i.e. opted in to Shipyard).
+
+If either check fails, fall back to `gh run watch` / `gh pr checks --watch`.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | condition matched |
+| 1 | `--timeout` elapsed |
+| 4 | `wait run --success` reached a terminal-but-wrong conclusion |
+| 5 | invalid input (PR/release/run not found, bad tag) |
+| 6 | daemon unreachable + snapshot didn't match + `--no-fallback` |
+| 7 | unsupported scope — rulesets / merge-queue governance detected; switch lanes or do it manually |
+| 130 | SIGINT / SIGTERM |
+
+### JSON shape
+
+```json
+{
+  "schema_version": 1,
+  "command": "wait:pr",
+  "matched": true,
+  "condition": {"type": "pr_green", "pr": 151, "repo": "owner/repo", "head_sha": "f521fa9b"},
+  "observed": {
+    "checks": [{"name": "Linux", "conclusion": "SUCCESS", "required": true}],
+    "advisory": []
+  },
+  "transport": "daemon",
+  "fallback_used": false,
+  "events_received": 3,
+  "elapsed_seconds": 12.4
+}
+```
+
+Branch on `matched` + `transport`. `transport == "daemon"` means a webhook woke the wait; `transport == "polling"` means the daemon wasn't reachable and you got the fallback (which is fine — still correct, just slower).
+
+### Always set `--timeout`
+
+Unbounded waits in an agent workflow hang sessions. Pick a realistic ceiling (10–30 minutes for most checks, longer for a full release). The flag is required in practice even though the CLI has a default.
+
+See `docs/waiting.md` for the full reference: subcommand semantics, event sources, fallback contract, and the rulesets-unsupported caveat.
 
 ## Ship workflow (the main flow)
 
