@@ -102,9 +102,13 @@ class TestRunProbe:
         assert diag["attempts"] == 1, "auth is non-transient — must not retry"
         assert calls["n"] == 1
 
-    def test_timeout_is_retried_once(
+    def test_timeout_is_retried_with_backoff(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """#141: transient timeouts retry with exponential backoff so a
+        Tailscale hiccup doesn't abort the ship. Three attempts total.
+        Test suppresses the real sleep windows to keep wall-clock
+        bounded; the production default is 2s + 6s between attempts."""
         calls = {"n": 0}
 
         def _timeout(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
@@ -112,13 +116,15 @@ class TestRunProbe:
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout", 0))
 
         monkeypatch.setattr(subprocess, "run", _timeout)
+        from shipyard.executor import ssh as _ssh
+        monkeypatch.setattr(_ssh, "_PROBE_BACKOFFS_SECS", (0.0, 0.0))
         diag = run_probe({"host": "win"}, remote_cmd=["echo", "ok"])
         assert diag["reachable"] is False
         assert diag["category"] == "timeout"
-        assert diag["attempts"] == 2
-        assert calls["n"] == 2
+        assert diag["attempts"] == 3
+        assert calls["n"] == 3
 
-    def test_network_error_is_retried_once(
+    def test_network_error_is_retried_with_backoff(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         calls = {"n": 0}
@@ -133,10 +139,12 @@ class TestRunProbe:
             )
 
         monkeypatch.setattr(subprocess, "run", _refused)
+        from shipyard.executor import ssh as _ssh
+        monkeypatch.setattr(_ssh, "_PROBE_BACKOFFS_SECS", (0.0, 0.0))
         diag = run_probe({"host": "win"}, remote_cmd=["echo", "ok"])
         assert diag["reachable"] is False
         assert diag["category"] == "network"
-        assert diag["attempts"] == 2
+        assert diag["attempts"] == 3
 
     def test_transient_retry_succeeds_on_second_attempt(
         self, monkeypatch: pytest.MonkeyPatch
@@ -205,7 +213,7 @@ class TestWindowsDiagnose:
         monkeypatch.setattr(subprocess, "run", _resolve_fail)
         win_diag = SSHWindowsExecutor().diagnose({"host": "win"})
         posix_diag = SSHExecutor().diagnose({"host": "win"})
-        assert win_diag["category"] == posix_diag["category"] == "network"
+        assert win_diag["category"] == posix_diag["category"] == "resolution"
 
     def test_windows_probe_uses_echo_not_powershell(
         self, monkeypatch: pytest.MonkeyPatch
