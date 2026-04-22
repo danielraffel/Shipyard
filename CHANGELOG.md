@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0240"></a>
+## [0.25.0]
+
 ## [0.24.0] - 2026-04-22
 
 - fix/pr text walk past bump commit ([#151](https://github.com/danielraffel/Shipyard/pull/151))
