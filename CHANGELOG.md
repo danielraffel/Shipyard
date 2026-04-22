@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0250"></a>
+## [0.26.1]
+
 ## [0.25.0] - 2026-04-22
 
 - feat/ship state list ipc ([#154](https://github.com/danielraffel/Shipyard/pull/154))
