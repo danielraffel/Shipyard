@@ -48,6 +48,16 @@ RING_BUFFER_SIZE = 100
 SUBSCRIBER_QUEUE_MAX = 64
 SUBSCRIBER_DRAIN_TIMEOUT = 2.0
 
+# IPC protocol version. Bump on any client-observable wire change —
+# new message type, new required field, shape break. Clients read
+# this from the hello frame and can warn / refuse to talk to a daemon
+# whose protocol they don't understand.
+#
+# Version history:
+#   1 — initial: hello / event / status / stop / subscribe / goodbye
+#   2 — adds ship-state-list request + reply (shipyard#153, v0.25.0)
+IPC_PROTOCOL_VERSION = 2
+
 
 @dataclass
 class IPCState:
@@ -167,7 +177,22 @@ class IPCServer:
         # Send a hello so clients can verify protocol compatibility
         # before doing anything else. Goes through the queue so the
         # writer loop fully owns the socket.
-        await sub.queue.put({"type": "hello", "protocol": 1})
+        #
+        # `shipyard_version` lets clients detect a stale daemon (long-
+        # running process that's older than the on-disk CLI binary).
+        # That's the specific pothole that ate most of 2026-04-22:
+        # the GUI sent a new request type, the old daemon silently
+        # ignored it, no one noticed. With the version in hand the
+        # GUI (and `shipyard doctor`) can warn + recommend a restart.
+        from shipyard import __version__ as _sy_version
+
+        await sub.queue.put(
+            {
+                "type": "hello",
+                "protocol": IPC_PROTOCOL_VERSION,
+                "shipyard_version": _sy_version,
+            }
+        )
         try:
             while not reader.at_eof():
                 line = await reader.readline()
@@ -193,16 +218,26 @@ class IPCServer:
             async with self._lock:
                 self._subscribers.add(sub)
                 backlog = list(self._ring)
+            # Ring-buffer replays: use blocking `put()` so the
+            # subscriber's own writer loop provides backpressure.
+            # The prior `put_nowait` variant would drop the subscriber
+            # whenever the ring was larger than the queue (100 vs
+            # 64) — which is every time the daemon had any history.
+            # Every fresh GUI launch was getting kicked out on
+            # connect with reason="slow-subscriber", landing the user
+            # on polling despite a healthy daemon.
+            #
+            # Unlike live broadcasts (where back-pressure would stall
+            # reconcile), replay runs once per connect on a dedicated
+            # task and is free to block.
             for past in backlog:
-                # Ring-buffer replays go through the same queue so
-                # ordering is preserved relative to live events.
-                try:
-                    sub.queue.put_nowait({"type": "event", **past})
-                except asyncio.QueueFull:
-                    await self._drop_subscriber(sub, reason="slow-subscriber")
+                if not sub.alive:
                     return
+                await sub.queue.put({"type": "event", **past})
         elif msg_type == "status":
             state = self._status_provider()
+            from shipyard import __version__ as _sy_version
+
             await sub.queue.put(
                 {
                     "type": "status",
@@ -215,6 +250,12 @@ class IPCServer:
                     "last_event_at": state.last_event_at,
                     "registered_repos": state.registered_repos,
                     "rate_limit": state.rate_limit,
+                    # Expose the daemon's own version + protocol so
+                    # `shipyard doctor` / the GUI can flag drift
+                    # against the on-disk CLI binary. Clients not
+                    # aware of these fields ignore them (additive).
+                    "shipyard_version": _sy_version,
+                    "protocol": IPC_PROTOCOL_VERSION,
                 },
             )
         elif msg_type == "stop":
