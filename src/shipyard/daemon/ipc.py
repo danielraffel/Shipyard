@@ -64,6 +64,7 @@ class IPCState:
 
 StatusProvider = Callable[[], IPCState]
 StopRequestCallback = Callable[[], Awaitable[None]]
+ShipStateListProvider = Callable[[], list[dict[str, object]]]
 
 
 class _Subscriber:
@@ -90,10 +91,12 @@ class IPCServer:
         socket_path: Path,
         status_provider: StatusProvider,
         on_stop_request: StopRequestCallback | None = None,
+        ship_state_list_provider: ShipStateListProvider | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._status_provider = status_provider
         self._on_stop_request = on_stop_request
+        self._ship_state_list_provider = ship_state_list_provider
         self._server: asyncio.AbstractServer | None = None
         self._subscribers: set[_Subscriber] = set()
         self._ring: deque[dict[str, object]] = deque(maxlen=RING_BUFFER_SIZE)
@@ -217,6 +220,22 @@ class IPCServer:
         elif msg_type == "stop":
             if self._on_stop_request is not None:
                 await self._on_stop_request()
+        elif msg_type == "ship-state-list":
+            # Daemon-side shortcut for `shipyard --json ship-state list`.
+            # Subscribers (primarily the macOS GUI) would otherwise pay
+            # the PyInstaller CLI cold-start tax (~5-6s) on every
+            # 7s poll tick; serving the same JSON directly from the
+            # in-daemon `ShipStateStore` returns in milliseconds.
+            # See shipyard#153.
+            if self._ship_state_list_provider is None:
+                await sub.queue.put(
+                    {"type": "ship-state-list", "states": []}
+                )
+            else:
+                states = self._ship_state_list_provider()
+                await sub.queue.put(
+                    {"type": "ship-state-list", "states": states}
+                )
 
     async def _writer_loop(self, sub: _Subscriber) -> None:
         """Drains the subscriber's queue into the socket.

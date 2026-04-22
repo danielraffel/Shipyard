@@ -141,6 +141,7 @@ class Daemon:
             socket_path=self._paths.socket_file,
             status_provider=self._build_status_snapshot,
             on_stop_request=self._request_stop,
+            ship_state_list_provider=self._build_ship_state_list,
         )
         await self._ipc_server.start()
 
@@ -256,6 +257,27 @@ class Daemon:
                 },
             }
         )
+
+    def _build_ship_state_list(self) -> list[dict[str, object]]:
+        """Return the same JSON shape `shipyard --json ship-state list`
+        emits, read directly from the local store.
+
+        Serves the ``{"type":"ship-state-list"}`` IPC request so
+        subscribers (the macOS GUI, primarily) don't have to pay the
+        PyInstaller cold-start tax on every poll. See shipyard#153.
+
+        Read through the store so we pick up any concurrent writes
+        from the ship path. If the read throws (disk glitch, partial
+        write), return an empty list rather than crashing the daemon.
+        """
+        try:
+            from shipyard.core.ship_state import ShipStateStore
+
+            store = ShipStateStore(self._config.state_dir / "ship")
+            return [s.to_dict() for s in store.list_active()]
+        except Exception as exc:  # noqa: BLE001 — never crash daemon
+            logger.warning("ship-state-list IPC: %s", exc)
+            return []
 
     def _build_status_snapshot(self) -> IPCState:
         return IPCState(
