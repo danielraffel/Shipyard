@@ -41,6 +41,10 @@ def _base_state() -> ShipState:
                 status="failed", started_at=ts, updated_at=ts,
             ),
         ],
+        # Pre-seed evidence to match the dispatched_run statuses so
+        # tests that expect "no change" aren't tripped by evidence
+        # bootstrap (which would otherwise go from unset → 'pass').
+        evidence_snapshot={"mac": "pass", "ubuntu": "pass", "windows": "fail"},
     )
 
 
@@ -63,11 +67,13 @@ def test_stale_failed_target_heals_to_completed_on_success() -> None:
         "ubuntu": "completed",
         "windows": "completed",
     }
-    # The only change should be windows — mac + ubuntu were already correct.
-    assert len(changes) == 1
-    assert "windows" in changes[0]
-    assert "failed" in changes[0]
-    assert "completed" in changes[0]
+    # Changes for windows only — dispatched_run.status flip AND the
+    # evidence_snapshot mirror. mac + ubuntu were already correct.
+    assert len(changes) == 2
+    assert any("windows" in c and "failed" in c and "completed" in c for c in changes)
+    assert any("evidence" in c.lower() and "windows" in c for c in changes)
+    # And the evidence_snapshot ended up in the healed state.
+    assert new_state.evidence_snapshot["windows"] == "pass"
 
 
 def test_no_matching_check_preserves_old_status() -> None:
@@ -131,6 +137,35 @@ def test_status_unchanged_emits_no_change() -> None:
     ]
     _, changes = reconcile_ship_state(state, rollup)
     # mac was already 'completed' locally — no change emitted.
+    assert changes == []
+
+
+def test_evidence_snapshot_mirrors_dispatched_run_heal() -> None:
+    """Regression for the pulp#619 bug: reconcile only updated
+    dispatched_runs but not evidence_snapshot. The GUI's
+    ShipStatePoller applies evidence_snapshot LAST (overwriting
+    dispatched_run-derived status), so healing dispatched_runs alone
+    still left the UI showing the old 'failed' pill. Fix: mirror
+    terminal statuses into evidence_snapshot too."""
+    state = _base_state()
+    # Seed stale evidence matching the stale dispatched_run state.
+    state.evidence_snapshot = {"mac": "pass", "ubuntu": "pass", "windows": "fail"}
+    rollup = [
+        {"name": "windows", "state": None, "conclusion": "SUCCESS"},
+    ]
+    new_state, changes = reconcile_ship_state(state, rollup)
+    assert new_state.evidence_snapshot["windows"] == "pass"
+    # Dispatched_run + evidence_snapshot BOTH updated → 2 change lines.
+    assert any("evidence" in c.lower() and "windows" in c for c in changes)
+
+
+def test_evidence_unchanged_when_status_unchanged() -> None:
+    state = _base_state()
+    state.evidence_snapshot = {"mac": "pass"}
+    rollup = [{"name": "mac", "state": None, "conclusion": "SUCCESS"}]
+    new_state, changes = reconcile_ship_state(state, rollup)
+    # mac was already completed + pass; no change expected.
+    assert new_state.evidence_snapshot == {"mac": "pass"}
     assert changes == []
 
 

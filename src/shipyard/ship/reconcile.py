@@ -115,6 +115,7 @@ def reconcile_ship_state(
     """
     now = now or datetime.now(timezone.utc)
     new_runs: list[DispatchedRun] = []
+    new_evidence = dict(state.evidence_snapshot)
     changes: list[str] = []
     for run in state.dispatched_runs:
         match = _match_check(run, status_check_rollup)
@@ -124,15 +125,49 @@ def reconcile_ship_state(
         new_status = _conclusion_to_run_status(
             match.get("conclusion"), match.get("state")
         )
-        if not new_status or new_status == run.status:
+        if not new_status:
             new_runs.append(run)
             continue
-        changes.append(
-            f"target={run.target!r}: {run.status!r} → {new_status!r} "
-            f"(matched check {match.get('name')!r})"
-        )
-        new_runs.append(
-            replace(run, status=new_status, updated_at=now)
-        )
-    new_state = ShipState(**{**state.__dict__, "dispatched_runs": new_runs})
+        if new_status != run.status:
+            changes.append(
+                f"target={run.target!r}: {run.status!r} → {new_status!r} "
+                f"(matched check {match.get('name')!r})"
+            )
+            new_runs.append(
+                replace(run, status=new_status, updated_at=now)
+            )
+        else:
+            new_runs.append(run)
+        # Evidence snapshot is what the GUI actually renders (it
+        # overwrites dispatched_run status when present, see
+        # ShipStatePoller.swift:113). Mirror the healed run status
+        # into evidence so the GUI reflects GitHub truth. Only
+        # terminal statuses map cleanly — leave in_progress / pending
+        # alone so we don't stomp a running indicator with stale
+        # evidence.
+        evidence_value = _run_status_to_evidence(new_status)
+        if evidence_value is not None and new_evidence.get(run.target) != evidence_value:
+            changes.append(
+                f"evidence[{run.target!r}]: "
+                f"{new_evidence.get(run.target)!r} → {evidence_value!r}"
+            )
+            new_evidence[run.target] = evidence_value
+    new_state = ShipState(**{
+        **state.__dict__,
+        "dispatched_runs": new_runs,
+        "evidence_snapshot": new_evidence,
+    })
     return new_state, changes
+
+
+def _run_status_to_evidence(run_status: str) -> str | None:
+    """Project a DispatchedRun.status onto the evidence_snapshot
+    vocabulary used by the GUI (``pass`` / ``fail`` / ``reused``).
+
+    Non-terminal statuses return None so callers leave evidence alone.
+    """
+    if run_status == "completed":
+        return "pass"
+    if run_status in {"failed", "cancelled"}:
+        return "fail"
+    return None
