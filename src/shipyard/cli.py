@@ -494,6 +494,9 @@ def doctor(ctx: Context, release_chain: bool, runners: bool) -> None:
     # downgrades the user to a pre-fix version. Surface this in
     # doctor so the user learns about it before it bites.
     core["shipyard-on-path"] = _check_shipyard_path_shadows()
+    daemon_drift = _check_daemon_version_drift(ctx)
+    if daemon_drift:
+        core["daemon-version"] = daemon_drift
     checks["Core"] = core
 
     # Cloud providers
@@ -629,6 +632,63 @@ def _check_shipyard_path_shadows() -> dict[str, Any]:
         "ok": False,
         "version": f"v{_self_version} ({len(seen_bins)} binaries found)",
         "detail": detail,
+    }
+
+
+def _check_daemon_version_drift(ctx: Context) -> dict[str, Any] | None:
+    """Flag when the running daemon is older than the CLI on PATH.
+
+    The daemon is a long-lived process; a ``shipyard`` binary upgrade
+    doesn't automatically restart it. Clients (GUI, ``shipyard wait``,
+    anything that talks to the IPC socket) may then send newer message
+    types the running daemon doesn't understand — and the old daemon
+    silently drops them. That's exactly the trap that consumed most of
+    2026-04-22 and motivated this check.
+
+    Returns None when the daemon isn't running (no drift to report).
+    Returns an ``ok: True`` row when versions match. Returns an
+    ``ok: False`` row with a one-line recovery hint otherwise.
+    """
+    from shipyard import __version__ as _self_version
+    from shipyard.daemon.controller import read_daemon_status
+
+    try:
+        status = read_daemon_status(ctx.config.state_dir)
+    except Exception:  # noqa: BLE001 — doctor is best-effort
+        return None
+    if status is None:
+        return None
+    daemon_version = status.get("shipyard_version")
+    if not isinstance(daemon_version, str) or not daemon_version:
+        # Pre-v0.26.0 daemon doesn't advertise its version in status.
+        # That IS the drift signal: if the daemon were current, it'd
+        # have populated the field. Surface it the same way we'd
+        # surface a known-older version.
+        return {
+            "ok": False,
+            "version": f"daemon: <unknown>   cli: v{_self_version}",
+            "detail": (
+                "The running daemon predates v0.26.0 and doesn't report "
+                "its own version. Run `shipyard daemon stop` to let the "
+                "next GUI launch (or `shipyard daemon start`) spawn a "
+                "fresh daemon from the current binary."
+            ),
+        }
+    if daemon_version == _self_version:
+        return {
+            "ok": True,
+            "version": f"daemon v{daemon_version} matches CLI",
+        }
+    return {
+        "ok": False,
+        "version": f"daemon: v{daemon_version}   cli: v{_self_version}",
+        "detail": (
+            "The running daemon is an older build than the CLI on "
+            "PATH. New IPC message types (e.g. ship-state-list, added "
+            "in v0.25.0) will be silently dropped. Run "
+            "`shipyard daemon stop` to let the next GUI launch spawn "
+            "a fresh daemon from the current binary."
+        ),
     }
 
 
