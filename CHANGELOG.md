@@ -3,14 +3,17 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0261"></a>
+## [0.26.1] - 2026-04-22
+
+- fix/141 ssh probe backoff retry ([#158](https://github.com/danielraffel/Shipyard/pull/158))
+
 <a id="v0260"></a>
 ## [0.26.0] - 2026-04-22
 
 - feat/daemon version drift check ([#156](https://github.com/danielraffel/Shipyard/pull/156))
 
 <a id="v0250"></a>
-## [0.26.1]
-
 ## [0.25.0] - 2026-04-22
 
 - feat/ship state list ipc ([#154](https://github.com/danielraffel/Shipyard/pull/154))
@@ -309,6 +312,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.26.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.26.1
 [0.26.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.26.0
 [0.25.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.25.0
 [0.24.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.24.0
