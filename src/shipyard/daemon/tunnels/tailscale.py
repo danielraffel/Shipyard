@@ -15,6 +15,29 @@ import asyncio
 from shipyard.daemon import tailscale as probe_mod
 from shipyard.daemon.tunnels.base import TunnelInfo, TunnelNotReadyError, TunnelStartError
 
+# tailscaled can return a partial / not-yet-populated status when it's
+# warming up, restoring a profile, rebuilding its cap map after a
+# control-plane reconnect, or mid-DERP-fallback. A single probe that
+# lands in that window returns `funnel_permitted=False` even on a node
+# that absolutely has Funnel in its ACLs. Retrying with short backoff
+# recovers in every case observed so far. Total worst-case wait before
+# giving up: ~20s, which is long enough to cross most tailscaled
+# transients but short enough that a genuinely-misconfigured tailnet
+# still fails fast.
+_PROBE_BACKOFFS_SECS: tuple[float, ...] = (2.0, 6.0, 12.0)
+
+
+async def _probe_with_retry() -> probe_mod.TailscaleStatus:
+    status = await asyncio.to_thread(probe_mod.probe)
+    if status.is_ready:
+        return status
+    for delay in _PROBE_BACKOFFS_SECS:
+        await asyncio.sleep(delay)
+        status = await asyncio.to_thread(probe_mod.probe)
+        if status.is_ready:
+            return status
+    return status
+
 
 class TailscaleFunnelBackend:
     name = "tailscale"
@@ -27,14 +50,14 @@ class TailscaleFunnelBackend:
         self._binary = probe_mod.resolve_binary()
         if self._binary is None:
             return False
-        status = await asyncio.to_thread(probe_mod.probe)
+        status = await _probe_with_retry()
         return status.is_ready
 
     async def start(self, local_port: int) -> TunnelInfo:
-        status = await asyncio.to_thread(probe_mod.probe)
+        status = await _probe_with_retry()
         if not status.is_ready or status.funnel_url is None:
             raise TunnelNotReadyError(
-                "Tailscale Funnel isn't ready: "
+                "Tailscale Funnel isn't ready after retries: "
                 f"backend={status.backend_state!r} "
                 f"funnel_permitted={status.funnel_permitted}"
             )
