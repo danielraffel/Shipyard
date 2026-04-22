@@ -15,6 +15,16 @@ Messages from client to server:
     {"type": "subscribe",  "since": "<iso>"?}  # opens event stream
     {"type": "status"}                         # request status snapshot
     {"type": "stop"}                           # ask server to stop (drains then exits)
+
+Slow-subscriber isolation
+-------------------------
+Each subscriber gets its own bounded ``asyncio.Queue`` fed by
+``broadcast_event``. A dedicated writer task drains that queue to the
+socket. If the writer can't keep up (client stalled, socket buffer
+full), the broadcaster won't block on that subscriber — instead the
+slow subscriber is dropped with a ``goodbye`` frame after a bounded
+drain timeout. This keeps one confused client from stalling the
+reconcile loop or the webhook path.
 """
 
 from __future__ import annotations
@@ -35,6 +45,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 RING_BUFFER_SIZE = 100
+SUBSCRIBER_QUEUE_MAX = 64
+SUBSCRIBER_DRAIN_TIMEOUT = 2.0
 
 
 @dataclass
@@ -54,6 +66,18 @@ StatusProvider = Callable[[], IPCState]
 StopRequestCallback = Callable[[], Awaitable[None]]
 
 
+class _Subscriber:
+    """One connected client + the goroutine-style writer draining its queue."""
+
+    def __init__(self, writer: asyncio.StreamWriter) -> None:
+        self.writer = writer
+        self.queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue(
+            maxsize=SUBSCRIBER_QUEUE_MAX
+        )
+        self.writer_task: asyncio.Task[None] | None = None
+        self.alive = True
+
+
 class IPCServer:
     """Owns the ``daemon.sock`` listener + fans out events.
 
@@ -71,7 +95,7 @@ class IPCServer:
         self._status_provider = status_provider
         self._on_stop_request = on_stop_request
         self._server: asyncio.AbstractServer | None = None
-        self._subscribers: set[asyncio.StreamWriter] = set()
+        self._subscribers: set[_Subscriber] = set()
         self._ring: deque[dict[str, object]] = deque(maxlen=RING_BUFFER_SIZE)
         self._lock = asyncio.Lock()
 
@@ -94,9 +118,8 @@ class IPCServer:
         async with self._lock:
             subscribers = list(self._subscribers)
             self._subscribers.clear()
-        for writer in subscribers:
-            await _send_safe(writer, {"type": "goodbye"})
-            await _close_safe(writer)
+        for sub in subscribers:
+            await self._drop_subscriber(sub, reason="server-stop")
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -106,13 +129,27 @@ class IPCServer:
                 self._socket_path.unlink()
 
     async def broadcast_event(self, event: dict[str, object]) -> None:
-        """Append to ring buffer + fan out to every connected subscriber."""
+        """Append to ring buffer + fan out to every connected subscriber.
+
+        Each subscriber has its own bounded queue. If the queue is full
+        the subscriber is dropped so a stalled client can't back-pressure
+        the daemon's event loop. The drop itself runs after the lock is
+        released to avoid holding it during a goodbye write.
+        """
         async with self._lock:
             self._ring.append(event)
             targets = list(self._subscribers)
         message = {"type": "event", **event}
-        for writer in targets:
-            await _send_safe(writer, message)
+        to_drop: list[_Subscriber] = []
+        for sub in targets:
+            if not sub.alive:
+                continue
+            try:
+                sub.queue.put_nowait(message)
+            except asyncio.QueueFull:
+                to_drop.append(sub)
+        for sub in to_drop:
+            await self._drop_subscriber(sub, reason="slow-subscriber")
 
     def subscriber_count(self) -> int:
         return len(self._subscribers)
@@ -122,9 +159,12 @@ class IPCServer:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        sub = _Subscriber(writer)
+        sub.writer_task = asyncio.create_task(self._writer_loop(sub))
         # Send a hello so clients can verify protocol compatibility
-        # before doing anything else.
-        await _send_safe(writer, {"type": "hello", "protocol": 1})
+        # before doing anything else. Goes through the queue so the
+        # writer loop fully owns the socket.
+        await sub.queue.put({"type": "hello", "protocol": 1})
         try:
             while not reader.at_eof():
                 line = await reader.readline()
@@ -136,26 +176,31 @@ class IPCServer:
                     continue
                 if not isinstance(msg, dict):
                     continue
-                await self._handle_message(msg, writer)
+                await self._handle_message(msg, sub)
         finally:
             async with self._lock:
-                self._subscribers.discard(writer)
-            await _close_safe(writer)
+                self._subscribers.discard(sub)
+            await self._drop_subscriber(sub, reason="client-disconnect")
 
     async def _handle_message(
-        self, msg: dict[str, object], writer: asyncio.StreamWriter
+        self, msg: dict[str, object], sub: _Subscriber
     ) -> None:
         msg_type = msg.get("type")
         if msg_type == "subscribe":
             async with self._lock:
-                self._subscribers.add(writer)
+                self._subscribers.add(sub)
                 backlog = list(self._ring)
             for past in backlog:
-                await _send_safe(writer, {"type": "event", **past})
+                # Ring-buffer replays go through the same queue so
+                # ordering is preserved relative to live events.
+                try:
+                    sub.queue.put_nowait({"type": "event", **past})
+                except asyncio.QueueFull:
+                    await self._drop_subscriber(sub, reason="slow-subscriber")
+                    return
         elif msg_type == "status":
             state = self._status_provider()
-            await _send_safe(
-                writer,
+            await sub.queue.put(
                 {
                     "type": "status",
                     "tunnel": {
@@ -173,18 +218,63 @@ class IPCServer:
             if self._on_stop_request is not None:
                 await self._on_stop_request()
 
+    async def _writer_loop(self, sub: _Subscriber) -> None:
+        """Drains the subscriber's queue into the socket.
 
-async def _send_safe(writer: asyncio.StreamWriter, message: dict[str, object]) -> None:
-    try:
-        writer.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
-        await writer.drain()
-    except (ConnectionError, OSError):
-        pass
+        A ``None`` sentinel stops the loop (sent by ``_drop_subscriber``).
+        Per-message drain is bounded by ``SUBSCRIBER_DRAIN_TIMEOUT`` — a
+        subscriber that stalls ``writer.drain()`` past that window is
+        dropped so it can't block the broadcaster indirectly.
+        """
+        while sub.alive:
+            msg = await sub.queue.get()
+            if msg is None:
+                return
+            try:
+                payload = (
+                    json.dumps(msg, separators=(",", ":")) + "\n"
+                ).encode()
+                sub.writer.write(payload)
+                await asyncio.wait_for(
+                    sub.writer.drain(), timeout=SUBSCRIBER_DRAIN_TIMEOUT
+                )
+            except (TimeoutError, ConnectionError, OSError):
+                # Slow or dead subscriber — mark so the broadcaster
+                # stops feeding the queue and drop cleanly.
+                sub.alive = False
+                async with self._lock:
+                    self._subscribers.discard(sub)
+                await _send_goodbye_and_close(sub.writer)
+                return
+
+    async def _drop_subscriber(self, sub: _Subscriber, reason: str) -> None:
+        if not sub.alive:
+            return
+        sub.alive = False
+        # Wake the writer loop so it exits; then send the goodbye
+        # frame directly (queue may already be drained/closed).
+        with contextlib.suppress(asyncio.QueueFull):
+            sub.queue.put_nowait(None)
+        if sub.writer_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(sub.writer_task, timeout=0.5)
+        await _send_goodbye_and_close(sub.writer)
+        if reason == "slow-subscriber":
+            logger.warning("ipc: dropped slow subscriber")
 
 
-async def _close_safe(writer: asyncio.StreamWriter) -> None:
-    try:
+async def _send_goodbye_and_close(writer: asyncio.StreamWriter) -> None:
+    with contextlib.suppress(ConnectionError, OSError):
+        writer.write(
+            (
+                json.dumps({"type": "goodbye"}, separators=(",", ":")) + "\n"
+            ).encode()
+        )
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                writer.drain(), timeout=SUBSCRIBER_DRAIN_TIMEOUT
+            )
+    with contextlib.suppress(ConnectionError, OSError):
         writer.close()
-        await writer.wait_closed()
-    except (ConnectionError, OSError):
-        pass
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(writer.wait_closed(), timeout=1.0)

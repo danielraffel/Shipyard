@@ -24,6 +24,7 @@ SUBSCRIBED_EVENTS = (
     "pull_request",
     "check_run",
     "check_suite",
+    "release",
 )
 
 

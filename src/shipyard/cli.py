@@ -6450,5 +6450,318 @@ def _resolve_repo_list(ctx: Context, explicit: tuple[str, ...]) -> list[str]:
     return repos
 
 
+@main.group(name="wait", invoke_without_command=False)
+def wait_cmd() -> None:
+    """Wait for a GitHub condition to match, then exit.
+
+    Three subcommands: ``release``, ``pr``, ``run``. Each opens a daemon
+    subscription first (if one is running), takes one authoritative
+    ``gh`` snapshot, and either exits 0 if the condition already
+    matches or keeps consuming events (daemon) or polling (fallback)
+    until it does — or until ``--timeout`` elapses.
+
+    Exit codes:
+      0  matched
+      1  --timeout elapsed
+      4  ``wait run --success`` hit a terminal-but-wrong conclusion
+      5  invalid input (missing PR, bad tag, etc.)
+      6  daemon unavailable + snapshot missed + --no-fallback
+      7  unsupported scope (rulesets / merge-queue)
+      130 SIGINT / SIGTERM
+    """
+
+
+_WAIT_EXIT_MATCH = 0
+_WAIT_EXIT_TIMEOUT = 1
+_WAIT_EXIT_RUN_TERMINAL_WRONG = 4
+_WAIT_EXIT_INVALID = 5
+_WAIT_EXIT_NO_FALLBACK = 6
+_WAIT_EXIT_UNSUPPORTED = 7
+
+
+def _render_wait_outcome(
+    ctx: Context,
+    *,
+    command: str,
+    condition: dict[str, Any],
+    outcome: Any,
+) -> None:
+    """Common ``--json`` + human renderer for wait subcommands."""
+    data = {
+        "matched": outcome.matched,
+        "condition": condition,
+        "observed": outcome.observed,
+        "transport": outcome.transport,
+        "fallback_used": outcome.fallback_used,
+        "events_received": outcome.events_received,
+        "elapsed_seconds": round(outcome.elapsed_seconds, 3),
+    }
+    if ctx.json_mode:
+        ctx.output(command, data)
+        return
+    if outcome.matched:
+        render_message(
+            f"matched after {data['elapsed_seconds']}s "
+            f"(transport={outcome.transport}, events={outcome.events_received})",
+            style="green",
+        )
+        return
+    if outcome.timed_out:
+        render_error(
+            f"timeout after {data['elapsed_seconds']}s "
+            f"(transport={outcome.transport})"
+        )
+        return
+    if outcome.fallback_disabled_hit:
+        render_error(
+            "daemon unavailable and snapshot didn't match; --no-fallback set"
+        )
+
+
+@wait_cmd.command("release")
+@click.argument("version")
+@click.option("--timeout", "timeout_seconds", type=float, default=600.0,
+              help="Give up after N seconds (default 600).")
+@click.option("--poll-interval", "poll_interval", type=float, default=2.0,
+              help="Polling cadence when daemon is unavailable (default 2s).")
+@click.option("--no-fallback", is_flag=True,
+              help="Fail with exit 6 rather than poll when the daemon isn't available.")
+@pass_context
+def wait_release(
+    ctx: Context,
+    version: str,
+    timeout_seconds: float,
+    poll_interval: float,
+    no_fallback: bool,
+) -> None:
+    """Wait for a release tag to exist and all manifest assets to be
+    uploaded. Matches when:
+
+    \b
+      * a release with tag == VERSION exists, draft=false, AND
+      * every artifact in [release.artifacts] is state=uploaded
+        (or — if no manifest — at least one asset is uploaded).
+    """
+    from shipyard.ship import wait as wait_mod
+    from shipyard.ship import wait_transport
+
+    repo_ref = detect_repo_from_remote()
+    if repo_ref is None:
+        render_error("couldn't resolve the current repo from the git remote.")
+        sys.exit(_WAIT_EXIT_INVALID)
+    repo = repo_ref.slug
+
+    manifest_raw = ctx.config.get("release.artifacts", [])
+    manifest: list[str] = []
+    if isinstance(manifest_raw, list):
+        for entry in manifest_raw:
+            if isinstance(entry, str):
+                manifest.append(entry)
+            elif isinstance(entry, dict):
+                name = entry.get("name")
+                if isinstance(name, str):
+                    manifest.append(name)
+
+    def _evaluator(snapshot: dict[str, Any] | None) -> wait_mod.TruthResult:
+        return wait_mod.evaluate_release(snapshot, manifest=manifest or None)
+
+    def _fetch() -> dict[str, Any] | None:
+        return wait_transport.fetch_release_snapshot(repo=repo, tag=version)
+
+    try:
+        outcome = wait_transport.wait_for_condition(
+            evaluator=_evaluator,
+            fetch_snapshot=_fetch,
+            event_filter=wait_transport.release_event_filter(version, repo),
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval,
+            no_fallback=no_fallback,
+        )
+    except wait_mod.InvalidInputError as exc:
+        render_error(str(exc))
+        sys.exit(_WAIT_EXIT_INVALID)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+    condition: dict[str, Any] = {
+        "type": "release",
+        "repo": repo,
+        "tag": version,
+        "manifest": manifest,
+    }
+    _render_wait_outcome(ctx, command="wait:release", condition=condition, outcome=outcome)
+    if outcome.matched:
+        sys.exit(_WAIT_EXIT_MATCH)
+    if outcome.fallback_disabled_hit:
+        sys.exit(_WAIT_EXIT_NO_FALLBACK)
+    sys.exit(_WAIT_EXIT_TIMEOUT)
+
+
+@wait_cmd.command("pr")
+@click.argument("pr_number", type=int)
+@click.option("--state", "state", type=click.Choice(["green", "merged", "closed"]),
+              required=True, help="What PR state to wait for.")
+@click.option("--timeout", "timeout_seconds", type=float, default=1800.0,
+              help="Give up after N seconds (default 1800).")
+@click.option("--poll-interval", "poll_interval", type=float, default=30.0,
+              help="Polling cadence when daemon is unavailable (default 30s).")
+@click.option("--no-fallback", is_flag=True,
+              help="Fail with exit 6 rather than poll when the daemon isn't available.")
+@pass_context
+def wait_pr(
+    ctx: Context,
+    pr_number: int,
+    state: str,
+    timeout_seconds: float,
+    poll_interval: float,
+    no_fallback: bool,
+) -> None:
+    """Wait for a PR to reach a specific state.
+
+    \b
+      --state green   all required checks on current HEAD pass
+      --state merged  PR is merged
+      --state closed  PR is closed (merged or not)
+    """
+    from shipyard.ship import wait as wait_mod
+    from shipyard.ship import wait_transport
+
+    repo_ref = detect_repo_from_remote()
+    if repo_ref is None:
+        render_error("couldn't resolve the current repo from the git remote.")
+        sys.exit(_WAIT_EXIT_INVALID)
+    repo = repo_ref.slug
+
+    if state == "green":
+        def _evaluator(snapshot: dict[str, Any] | None) -> wait_mod.TruthResult:
+            return wait_mod.evaluate_pr_green(snapshot)
+    else:
+        target_state = state
+        def _evaluator(snapshot: dict[str, Any] | None) -> wait_mod.TruthResult:
+            return wait_mod.evaluate_pr_state(snapshot, target_state=target_state)
+
+    def _fetch() -> dict[str, Any] | None:
+        return wait_transport.fetch_pr_snapshot(repo=repo, pr_number=pr_number)
+
+    try:
+        outcome = wait_transport.wait_for_condition(
+            evaluator=_evaluator,
+            fetch_snapshot=_fetch,
+            event_filter=wait_transport.pr_event_filter(pr_number, repo),
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval,
+            no_fallback=no_fallback,
+        )
+    except wait_mod.InvalidInputError as exc:
+        render_error(str(exc))
+        sys.exit(_WAIT_EXIT_INVALID)
+    except wait_mod.UnsupportedScopeError as exc:
+        render_error(str(exc))
+        sys.exit(_WAIT_EXIT_UNSUPPORTED)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+    condition: dict[str, Any] = {
+        "type": f"pr_{state}",
+        "pr": pr_number,
+        "repo": repo,
+        "head_sha": outcome.observed.get("head_sha") if isinstance(outcome.observed, dict) else None,
+    }
+    _render_wait_outcome(ctx, command="wait:pr", condition=condition, outcome=outcome)
+    if outcome.matched:
+        sys.exit(_WAIT_EXIT_MATCH)
+    if outcome.fallback_disabled_hit:
+        sys.exit(_WAIT_EXIT_NO_FALLBACK)
+    sys.exit(_WAIT_EXIT_TIMEOUT)
+
+
+@wait_cmd.command("run")
+@click.argument("run_id")
+@click.option("--success", is_flag=True,
+              help="Require conclusion=success; any other terminal state exits 4.")
+@click.option("--timeout", "timeout_seconds", type=float, default=1800.0,
+              help="Give up after N seconds (default 1800).")
+@click.option("--poll-interval", "poll_interval", type=float, default=15.0,
+              help="Polling cadence when daemon is unavailable (default 15s).")
+@click.option("--no-fallback", is_flag=True,
+              help="Fail with exit 6 rather than poll when the daemon isn't available.")
+@pass_context
+def wait_run(
+    ctx: Context,
+    run_id: str,
+    success: bool,
+    timeout_seconds: float,
+    poll_interval: float,
+    no_fallback: bool,
+) -> None:
+    """Wait for a GitHub Actions workflow run to reach a terminal status.
+
+    With ``--success`` the run must end with conclusion=success. Any
+    other terminal conclusion exits 4 immediately — no reason to keep
+    waiting on a run that's already decided.
+    """
+    from shipyard.ship import wait as wait_mod
+    from shipyard.ship import wait_transport
+
+    repo_ref = detect_repo_from_remote()
+    if repo_ref is None:
+        render_error("couldn't resolve the current repo from the git remote.")
+        sys.exit(_WAIT_EXIT_INVALID)
+    repo = repo_ref.slug
+
+    def _evaluator(snapshot: dict[str, Any] | None) -> wait_mod.TruthResult:
+        # Let RunFailedFast propagate out of the transport — the
+        # CLI-level handler maps it to exit code 4 with the observed
+        # state in the JSON envelope.
+        return wait_mod.evaluate_run(snapshot, require_success=success)
+
+    def _fetch() -> dict[str, Any] | None:
+        return wait_transport.fetch_run_snapshot(repo=repo, run_id=run_id)
+
+    condition: dict[str, Any] = {
+        "type": "run",
+        "run_id": run_id,
+        "repo": repo,
+        "require_success": success,
+    }
+    try:
+        outcome = wait_transport.wait_for_condition(
+            evaluator=_evaluator,
+            fetch_snapshot=_fetch,
+            event_filter=wait_transport.run_event_filter(run_id, repo),
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval,
+            no_fallback=no_fallback,
+        )
+    except wait_mod.InvalidInputError as exc:
+        render_error(str(exc))
+        sys.exit(_WAIT_EXIT_INVALID)
+    except wait_mod.RunFailedFastError as exc:
+        # Terminal-but-wrong: render the observed state and exit 4.
+        from shipyard.ship.wait_transport import WaitOutcome
+
+        synthetic = WaitOutcome(
+            matched=False,
+            observed=exc.observed,
+            transport="polling",
+            fallback_used=False,
+            events_received=0,
+            timed_out=False,
+        )
+        _render_wait_outcome(
+            ctx, command="wait:run", condition=condition, outcome=synthetic,
+        )
+        sys.exit(_WAIT_EXIT_RUN_TERMINAL_WRONG)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+    _render_wait_outcome(ctx, command="wait:run", condition=condition, outcome=outcome)
+    if outcome.matched:
+        sys.exit(_WAIT_EXIT_MATCH)
+    if outcome.fallback_disabled_hit:
+        sys.exit(_WAIT_EXIT_NO_FALLBACK)
+    sys.exit(_WAIT_EXIT_TIMEOUT)
+
+
 if __name__ == "__main__":
     main()
