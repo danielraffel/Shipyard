@@ -3,14 +3,17 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0240"></a>
+## [0.24.0] - 2026-04-22
+
+- fix/pr text walk past bump commit ([#151](https://github.com/danielraffel/Shipyard/pull/151))
+
 <a id="v0230"></a>
 ## [0.23.0] - 2026-04-22
 
 - feat/wait primitive ([#150](https://github.com/danielraffel/Shipyard/pull/150))
 
 <a id="v0229"></a>
-## [0.24.0]
-
 ## [0.22.9] - 2026-04-21
 
 - ship: quality PR titles + bodies from commit subject/body (0.22.9) ([#148](https://github.com/danielraffel/Shipyard/pull/148))
@@ -293,6 +296,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.24.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.24.0
 [0.23.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.23.0
 [0.22.9]: https://github.com/danielraffel/Shipyard/releases/tag/v0.22.9
 [0.22.8]: https://github.com/danielraffel/Shipyard/releases/tag/v0.22.8
