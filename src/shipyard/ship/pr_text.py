@@ -11,10 +11,14 @@ Principles (see memory ``feedback_no_branding`` + ``feedback_no_ship_in_user_tex
   leak into artifacts reviewers read.
 * Never append "Automated by Shipyard." — the reviewer doesn't need
   to know what tool opened the PR.
-* Pull title + body from the HEAD commit message, which the author
-  already wrote for human consumption.
-* Fall back to a prettified branch name when the commit subject
-  isn't recoverable (shallow clone, detached HEAD, git failure).
+* Pull title + body from the most recent *meaningful* commit, not
+  the tip. `shipyard pr` always tags on a ``chore: bump versions``
+  commit at the tip so version bumps get stamped into git; that
+  commit's subject and body are mechanical filler and must never
+  surface as the PR's title/body. Walk back past them to the
+  feature commit the author actually wrote.
+* Fall back to a prettified branch name when no meaningful commit
+  is recoverable (shallow clone, detached HEAD, git failure).
 
 Kept in a dedicated module so both the ``shipyard pr`` path in
 ``cli.py`` and the ``shipyard ship`` path in ``ship/merge.py`` share
@@ -32,23 +36,35 @@ if TYPE_CHECKING:
     from shipyard.ship.lane_policy import LanePolicy
 
 
+# Subjects that are known to be mechanical/bot commits `shipyard pr`
+# (or similar tooling) tags on. When the tip commit starts with any
+# of these prefixes, we walk back to find the real author commit.
+_MECHANICAL_SUBJECT_PREFIXES = (
+    "chore: bump versions",
+    "chore(plugin): bump",
+    "chore(release):",
+    "chore: regenerate changelog",
+    "docs: regenerate changelog",
+)
+
+# Depth cap on the walk. Branches with more than a handful of
+# consecutive mechanical commits aren't a real scenario; if every
+# commit in the range is mechanical, fall back to the branch name.
+_MEANINGFUL_COMMIT_WALK_DEPTH = 20
+
+
 def compose_pr_title(branch: str) -> str:
     """Return a PR title for ``branch``.
 
-    Prefers the HEAD commit's subject line (usually the most
-    descriptive single sentence available). Falls back to a
-    prettified branch name when git can't answer.
+    Prefers the most recent *meaningful* commit's subject line.
+    Falls back to a prettified branch name when git can't answer
+    or every recent commit is mechanical.
     """
-    try:
-        result = subprocess.run(
-            ["git", "log", "-1", "--format=%s", "HEAD"],
-            capture_output=True, text=True, check=True, timeout=5,
-        )
-        subject = result.stdout.strip()
+    ref = _meaningful_commit_ref()
+    if ref is not None:
+        subject = _commit_field(ref, "%s")
         if subject:
             return subject
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-        pass
     return _branch_fallback(branch)
 
 
@@ -60,10 +76,12 @@ def compose_pr_body(
     """Return a PR body for a freshly-opened PR.
 
     Body shape:
-      1. HEAD commit's body text (everything after the subject line),
-         if present. Authors routinely explain the 'why' in the
-         commit body — surfacing it in the PR makes the PR self-
-         contained without a second click.
+      1. Most recent *meaningful* commit's body text (everything
+         after the subject line), if present. Authors routinely
+         explain the 'why' in the commit body — surfacing it in the
+         PR makes the PR self-contained without a second click.
+         Mechanical tip commits (``chore: bump versions``) are
+         skipped so their empty body doesn't stomp the feature body.
       2. Advisory-lanes section, if the resolved lane policy marks
          any lanes advisory. Reviewers need to know a red advisory
          lane didn't block merge. Lane overrides via Lane-Policy
@@ -74,9 +92,11 @@ def compose_pr_body(
     Passing neither yields a body with only the commit body.
     """
     lines: list[str] = []
-    commit_body = _head_commit_body()
-    if commit_body:
-        lines.append(commit_body)
+    ref = _meaningful_commit_ref()
+    if ref is not None:
+        commit_body = _commit_field(ref, "%b")
+        if commit_body:
+            lines.append(commit_body)
 
     resolved_policy = policy or _resolve_policy_or_none(config)
     if resolved_policy is not None:
@@ -100,10 +120,36 @@ def compose_pr_body(
     return "\n".join(lines)
 
 
-def _head_commit_body() -> str:
+def _meaningful_commit_ref() -> str | None:
+    """Walk back from HEAD, returning the first commit ref whose
+    subject is not a known mechanical bump/release filler.
+
+    Returns ``None`` when every commit in the walk window is
+    mechanical, when git fails, or when the repo has no commits.
+    """
+    for depth in range(_MEANINGFUL_COMMIT_WALK_DEPTH):
+        ref = "HEAD" if depth == 0 else f"HEAD~{depth}"
+        subject = _commit_field(ref, "%s")
+        if not subject:
+            # Either git failed or we walked past the branch root.
+            return None
+        if not _is_mechanical_subject(subject):
+            return ref
+    return None
+
+
+def _is_mechanical_subject(subject: str) -> bool:
+    lowered = subject.strip().lower()
+    return any(
+        lowered.startswith(prefix.lower())
+        for prefix in _MECHANICAL_SUBJECT_PREFIXES
+    )
+
+
+def _commit_field(ref: str, fmt: str) -> str:
     try:
         result = subprocess.run(
-            ["git", "log", "-1", "--format=%b", "HEAD"],
+            ["git", "log", "-1", f"--format={fmt}", ref],
             capture_output=True, text=True, check=True, timeout=5,
         )
         return result.stdout.strip()

@@ -4350,7 +4350,7 @@ def pr(
                 "commit.gpgsign=false",
                 "commit",
                 "-m",
-                "chore: bump versions\n\nAutomated by `shipyard pr`.",
+                "chore: bump versions",
                 "--only",
                 "--",
                 *bumped_files,
