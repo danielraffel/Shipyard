@@ -34,8 +34,8 @@ class TestSSHClassifier:
             ("Too many authentication failures", "auth"),
             ("Host key verification failed.", "host_key"),
             ("REMOTE HOST IDENTIFICATION HAS CHANGED!", "host_key"),
-            ("ssh: Could not resolve hostname bogus: Name or service not known", "network"),
-            ("ssh: Could not resolve hostname bogus: nodename nor servname provided", "network"),
+            ("ssh: Could not resolve hostname bogus: Name or service not known", "resolution"),
+            ("ssh: Could not resolve hostname bogus: nodename nor servname provided", "resolution"),
             ("ssh: connect to host bogus port 22: No route to host", "network"),
             ("ssh: connect to host 10.0.0.1 port 22: Connection refused", "network"),
             ("ssh: connect to host 10.0.0.1 port 22: Connection timed out", "timeout"),
@@ -54,7 +54,12 @@ class TestSSHProbeDiagnosis:
     def test_probe_honors_10s_budget(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A hung ssh probe must surface within ~10s, not the full cmd timeout."""
+        """Each ssh probe attempt must use the 10s budget (not the full
+        validation timeout), and the overall probe must complete
+        promptly once every attempt has short-circuited via subprocess
+        timeout. #141: timeouts now retry with backoff (2s, 6s), so
+        three attempts happen before giving up; we suppress the
+        sleeps in-test so wall-clock still bounds quickly."""
         calls: list[int] = []
 
         def fake_run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
@@ -62,15 +67,19 @@ class TestSSHProbeDiagnosis:
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout", 0))
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        # Suppress the inter-attempt backoff so wall-clock stays bounded.
+        from shipyard.executor import ssh as _ssh
+        monkeypatch.setattr(_ssh, "_PROBE_BACKOFFS_SECS", (0.0, 0.0))
+
         start = time.monotonic()
         diag = SSHExecutor().diagnose({"host": "bogus.invalid"})
         assert time.monotonic() - start < 2.0  # fake_run raises immediately
         assert diag["reachable"] is False
         assert diag["category"] == "timeout"
-        # #119: timeouts now retry once (transient category), so we see
-        # two 10s calls. The important invariant is that EVERY call uses
-        # the 10s probe budget, not the full validation timeout.
-        assert calls == [10, 10], (
+        # #141: timeouts retry twice (three attempts total), so we see
+        # three 10s calls. The important invariant is that EVERY call
+        # uses the 10s probe budget, not the full validation timeout.
+        assert calls == [10, 10, 10], (
             "probe must pass a 10s timeout to subprocess.run on each "
             "attempt, not the validation timeout"
         )

@@ -685,11 +685,17 @@ def _classify_probe_error(stderr: str, returncode: int) -> str:
         or "offending" in lowered
     ):
         return "host_key"
+    # DNS resolution failure: deterministic and fast, don't retry.
+    # A hostname that doesn't resolve once won't resolve on retry;
+    # retrying just slows down the "wrong host in config" path.
     if (
         "could not resolve hostname" in lowered
         or "name or service not known" in lowered
         or "nodename nor servname" in lowered  # macOS variant
-        or "no route to host" in lowered
+    ):
+        return "resolution"
+    if (
+        "no route to host" in lowered
         or "network is unreachable" in lowered
         or "connection refused" in lowered
     ):
@@ -730,11 +736,21 @@ def _format_ssh_diagnosis(
 
 PROBE_TIMEOUT_SECS = 10
 PROBE_CONNECT_TIMEOUT_SECS = 5
-# Transient categories retry once — Windows OpenSSH handshakes occasionally
-# exceed the 10s budget on first connect after idle. Non-transient categories
-# (auth, host_key, configuration) do NOT retry: retrying a wrong key is
-# pointless and slow.
+# Transient categories retry with backoff. Windows OpenSSH handshakes
+# occasionally exceed the 10s budget on first connect after idle, and
+# Tailscale WireGuard needs seconds to re-establish after a DERP
+# fallback or NAT-punch-through rebind. Non-transient categories
+# (auth, host_key, configuration) do NOT retry — retrying a wrong key
+# is pointless and slow.
 _TRANSIENT_CATEGORIES = frozenset({"timeout", "network"})
+
+# Sleep between attempts when the last result was transient. Tuned for
+# Tailscale: first retry almost-immediate (catches one-off race),
+# second allows a full DERP/NAT re-negotiation window. Total
+# worst-case probe cost for a genuinely-offline host: 10 + 2 + 10 + 6
+# + 10 = 38s, vs the old 20s — but we only pay that extra window
+# when the first attempt fails, and only on transient classifications.
+_PROBE_BACKOFFS_SECS = (2.0, 6.0)
 
 
 def _debug_probe_enabled() -> bool:
@@ -802,9 +818,13 @@ def run_probe(
             f"timeout={PROBE_TIMEOUT_SECS}s\n"
         )
 
+    import time as _time
+
     attempts = 0
     last_result: dict[str, Any] | None = None
-    for attempt in range(2):
+    # One initial attempt + one attempt per backoff window.
+    total_attempts = 1 + len(_PROBE_BACKOFFS_SECS)
+    for attempt in range(total_attempts):
         attempts = attempt + 1
         last_result = _single_probe_attempt(cmd)
         last_result["attempts"] = attempts
@@ -812,7 +832,11 @@ def run_probe(
             return last_result
         if last_result["category"] not in _TRANSIENT_CATEGORIES:
             return last_result
-        # Transient — retry once.
+        # Transient — back off before the next attempt. Skip sleep on
+        # the last iteration so we don't waste time after we've
+        # already decided to give up.
+        if attempt < total_attempts - 1:
+            _time.sleep(_PROBE_BACKOFFS_SECS[attempt])
     assert last_result is not None
     return last_result
 
