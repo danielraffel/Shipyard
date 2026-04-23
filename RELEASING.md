@@ -61,6 +61,28 @@ gh workflow run release.yml --ref v<x.y.z>
 
 Run that after the auto-tag appears. The release workflow will pick up the existing tag and publish the binaries. (Pulp's first auto-released tag, `v0.4.0`, used this fallback before its `RELEASE_BOT_TOKEN` was provisioned.)
 
+## Optional: sign + notarize the macOS CLI binary
+
+macOS 26.3+ refuses to execute ad-hoc-signed binaries that carry the `com.apple.provenance` xattr GitHub stamps on every release download — the OS SIGKILLs with "Taskgated Invalid Signature" and the user sees a bare `zsh: killed` with no context.
+
+`install.sh` works around this locally by stripping the xattr and re-applying an ad-hoc signature. Anyone installing via `gh release download` or a manual browser click still hits the crash. The proper fix is Developer-ID-signed + Apple-notarized binaries produced by the release workflow itself.
+
+Five secrets on the repo (all `gh secret set NAME`):
+
+| Secret | What |
+|---|---|
+| `APPLE_ID` | Apple ID email (same one used for Developer ID certificate) |
+| `TEAM_ID` | 10-char Team ID from [developer.apple.com/account](https://developer.apple.com/account) |
+| `APP_SPECIFIC_PASSWORD` | App-specific password generated at [appleid.apple.com](https://appleid.apple.com) → Sign-In and Security → App-Specific Passwords |
+| `SIGNING_CERT_P12_BASE64` | `base64 -i DeveloperID.p12` of your exported Developer ID Application cert + private key |
+| `SIGNING_CERT_PASSWORD` | Export password for the .p12 |
+
+When all five are set, the release workflow's macOS matrix jobs run `codesign --sign "Developer ID Application: … (TEAM_ID)"` + `xcrun notarytool submit --wait` on the PyInstaller output before uploading. Users downloading a signed binary get clean execution on macOS 26.3+ with no xattr dance.
+
+When the secrets aren't set, the sign+notarize step no-ops and the workflow continues to publish ad-hoc-signed binaries (the current default). Forks and pull requests from external contributors aren't blocked.
+
+A bare Mach-O can't be `stapler staple`'d — Gatekeeper verifies notarization online at first launch instead. That requires network, which every CI / user machine has. Accepted tradeoff vs wrapping the CLI in a no-op `.app` bundle just for stapling.
+
 ## Default path: automatic on merge
 
 Normal releases are automatic. You don't call any script.

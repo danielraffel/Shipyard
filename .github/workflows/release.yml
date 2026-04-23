@@ -81,6 +81,75 @@ jobs:
       - name: Build binary
         run: pyinstaller --onefile --name ${{ matrix.artifact }} src/shipyard/cli.py
 
+      # macOS 26.3+ enforces code-signing strictly; ad-hoc-signed
+      # binaries with `com.apple.provenance`/`quarantine` xattrs (which
+      # every GitHub-downloaded file carries) SIGKILL with "Taskgated
+      # Invalid Signature". Sign with Developer ID + notarize so the
+      # binary runs cleanly on a fresh install without the `install.sh`
+      # xattr-strip dance having to be the only backstop.
+      #
+      # No Info.plist → we can't `stapler staple` a bare Mach-O, so
+      # Gatekeeper verifies notarization online at first launch. That
+      # requires network, which every CI user has. Accepted tradeoff
+      # vs wrapping the CLI in a .app bundle we don't otherwise need.
+      #
+      # Skipped when the signing secrets aren't present (forks, PRs
+      # from outside contributors) — the install.sh fallback still
+      # handles those.
+      - name: Sign + notarize macOS binary
+        if: startsWith(matrix.target, 'macos-') && env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
+          SIGNING_CERT_P12_BASE64: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BINARY="dist/${{ matrix.artifact }}"
+
+          # Import the Developer ID certificate into a temporary keychain
+          # so the job is self-contained and cleans up automatically.
+          KEYCHAIN="$RUNNER_TEMP/shipyard-sign.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          CERT_PATH="$RUNNER_TEMP/developer-id.p12"
+
+          echo "$SIGNING_CERT_P12_BASE64" | base64 -d > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT_PATH" -P "$SIGNING_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | sed -e 's/"//g')
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Sign with hardened-runtime + secure timestamp.
+          codesign --force --options runtime --timestamp \
+            --sign "Developer ID Application: Daniel Raffel (${TEAM_ID})" \
+            "$BINARY"
+          codesign -dv --verbose=4 "$BINARY"
+
+          # Notarize. --wait blocks up to 30min; in practice the bare
+          # Mach-O notarizes in <60s. submit needs a zip or dmg, so
+          # wrap first.
+          NOTARIZE_ZIP="$RUNNER_TEMP/${{ matrix.artifact }}.zip"
+          /usr/bin/ditto -c -k --keepParent "$BINARY" "$NOTARIZE_ZIP"
+          xcrun notarytool submit "$NOTARIZE_ZIP" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_SPECIFIC_PASSWORD" \
+            --wait
+
+          # Can't staple a bare Mach-O. Gatekeeper checks online at
+          # first launch instead (requires network). No additional
+          # action needed here; the notarization ticket is registered
+          # with Apple server-side and matches the binary's hash.
+
+          # Cleanup: delete the temp keychain.
+          security delete-keychain "$KEYCHAIN"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
