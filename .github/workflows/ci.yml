@@ -25,8 +25,18 @@ jobs:
       windows: ${{ steps.resolve.outputs.windows }}
     steps:
       - id: resolve
+        # Runner provider resolution, in priority order:
+        #   1. workflow_dispatch input (explicit override per-run).
+        #   2. repo variable `DEFAULT_RUNNER_PROVIDER` — set once,
+        #      applies to every PR/push. Configure with
+        #      `gh variable set DEFAULT_RUNNER_PROVIDER --body namespace`.
+        #   3. Hardcoded fallback `github-hosted` — safe default for
+        #      forks and first-time setup where the variable isn't set.
+        # See RELEASING.md § "Preferred runner provider" for the
+        # rationale (GitHub-hosted macOS queues were blocking this
+        # repo for 10+ minutes during a typical workday).
         run: |
-          PROVIDER="${{ inputs.runner_provider || 'github-hosted' }}"
+          PROVIDER="${{ inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}"
           if [ "$PROVIDER" = "namespace" ]; then
             echo "linux=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT"
             echo "macos=\"macos-15\"" >> "$GITHUB_OUTPUT"

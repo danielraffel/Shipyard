@@ -28,8 +28,14 @@ jobs:
       windows: ${{ steps.resolve.outputs.windows }}
     steps:
       - id: resolve
+        # Same resolution order as ci.yml: workflow_dispatch input
+        # > repo variable `DEFAULT_RUNNER_PROVIDER` > hardcoded
+        # `github-hosted`. Set the variable once:
+        #   gh variable set DEFAULT_RUNNER_PROVIDER --body namespace
+        # and every tag-triggered release build lands on Namespace
+        # without workflow edits. See RELEASING.md.
         run: |
-          PROVIDER="${{ inputs.runner_provider || 'github-hosted' }}"
+          PROVIDER="${{ inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}"
           if [ "$PROVIDER" = "namespace" ]; then
             echo "linux=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT"
             echo "linux_arm=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT"

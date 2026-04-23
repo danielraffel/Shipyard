@@ -94,6 +94,27 @@ When the secrets aren't set, the sign+notarize step no-ops and the workflow cont
 
 A bare Mach-O can't be `stapler staple`'d — Gatekeeper verifies notarization online at first launch instead. That requires network, which every CI / user machine has. Accepted tradeoff vs wrapping the CLI in a no-op `.app` bundle just for stapling.
 
+## Preferred runner provider
+
+Shipyard's own CI defaults to the runner provider configured in the repo variable `DEFAULT_RUNNER_PROVIDER`. Set it once:
+
+```sh
+gh variable set DEFAULT_RUNNER_PROVIDER --repo danielraffel/Shipyard --body namespace
+```
+
+Every subsequent PR push, tag push, and scheduled release picks that up without workflow edits. Per-run overrides still work via `gh workflow run ci.yml --ref <branch> -f runner_provider=github-hosted`.
+
+**Why Namespace is the preferred default:** GitHub-hosted `macos-15` queues routinely stall shipyard PRs for 10+ minutes during business hours. Namespace's cloud pool (profiles `namespace-profile-generouscorp`, `-macos`, `-windows`) has near-zero queue time and faster macOS ARM machines. The trade-off is per-minute cost — Namespace is not free like GitHub-hosted on public repos — but for an active project the wall-clock-time savings are worth it.
+
+**When to flip back to `github-hosted`:**
+- Forks / external contributors whose repos don't have the variable set will naturally fall through to `github-hosted` (safe default, no paid surface exposed).
+- If Namespace has an outage: `gh variable delete DEFAULT_RUNNER_PROVIDER` restores `github-hosted` for all future runs without a workflow PR.
+
+The resolution order in `ci.yml` / `release.yml` is:
+1. `workflow_dispatch` input (per-run override).
+2. `vars.DEFAULT_RUNNER_PROVIDER` (repo-wide default).
+3. Hardcoded fallback `github-hosted`.
+
 ## Default path: automatic on merge
 
 Normal releases are automatic. You don't call any script.
