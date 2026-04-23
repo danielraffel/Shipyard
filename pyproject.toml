@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "shipyard"
-version = "0.27.2"
+version = "0.28.0"
 description = "Cross-platform CI coordination — local VMs, SSH hosts, cloud runners"
 readme = "README.md"
 license = "MIT"

@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0272"></a>
+## [0.28.0]
+
 ## [0.27.2] - 2026-04-22
 
 - fix/22 reconcile skip aged terminal ([#164](https://github.com/danielraffel/Shipyard/pull/164))
