@@ -152,13 +152,39 @@ class Config:
 
     @classmethod
     def load_from_cwd(cls, cwd: Path | None = None) -> Config:
-        """Load config by scanning for .shipyard/ from the given directory."""
+        """Load config by scanning for .shipyard/ from the given directory.
+
+        Git-worktree aware: `.shipyard.local/config.toml` is gitignored
+        so `git worktree add` never copies it. The main checkout has
+        the local overlay; the worktree only has the tracked
+        `.shipyard/config.toml`. Without special handling, running
+        `shipyard pr` from a worktree loads config that resolves
+        ssh targets to `<no host>` and preflight fails with a
+        confusing "backend unreachable" error even though ssh works.
+        See shipyard#155.
+
+        Fix: when the cwd is a git worktree AND it has no local
+        overlay of its own, fall through to the main checkout's
+        `.shipyard.local/` if one exists. Documented explicitly in
+        `local_dir_source` on the returned Config so callers can
+        surface "we borrowed local config from the main checkout"
+        if they want.
+        """
         base = cwd or Path.cwd()
         project_dir = base / ".shipyard"
         local_dir = base / ".shipyard.local"
+
+        resolved_local_dir: Path | None = None
+        if local_dir.exists() and (local_dir / "config.toml").exists():
+            resolved_local_dir = local_dir
+        else:
+            fallback = _worktree_main_local_dir(base)
+            if fallback is not None:
+                resolved_local_dir = fallback
+
         return cls.load(
             project_dir=project_dir if project_dir.exists() else None,
-            local_dir=local_dir if local_dir.exists() else None,
+            local_dir=resolved_local_dir,
         )
 
     def save_project(self, path: Path | None = None) -> None:
@@ -171,6 +197,60 @@ class Config:
 
     def to_dict(self) -> dict[str, Any]:
         return copy.deepcopy(self.data)
+
+
+def _worktree_main_local_dir(base: Path) -> Path | None:
+    """If `base` is a git worktree whose main checkout has a usable
+    `.shipyard.local/config.toml`, return that directory. Otherwise
+    `None`.
+
+    The contract from `git worktree add`: the worktree's `.git` is a
+    file pointing at `<common>/worktrees/<name>`, and
+    `git rev-parse --git-common-dir` resolves to the original
+    checkout's `.git` directory. Going up one level from that gives
+    the main checkout root, which is where the gitignored
+    `.shipyard.local/` lives.
+
+    Bail quietly (return None) on:
+    - base not in a git repo at all
+    - git not on PATH
+    - the "common dir" path doesn't resolve to a checkout with a
+      `.shipyard.local/config.toml`
+    - the base IS the main checkout (no fallback needed or wanted)
+    """
+    import subprocess
+
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=str(base),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    common_dir = Path(res.stdout.strip())
+    if not common_dir.is_absolute():
+        common_dir = (base / common_dir).resolve()
+    # Main checkout root is the parent of the .git directory that
+    # git-common-dir points at.
+    main_checkout = common_dir.parent
+    # Don't fall back to ourselves. If base's own .git resolves to
+    # the same common_dir, we ARE the main checkout and our own
+    # `.shipyard.local/` was already checked.
+    try:
+        if main_checkout.resolve() == base.resolve():
+            return None
+    except OSError:
+        return None
+    candidate = main_checkout / ".shipyard.local"
+    if (candidate / "config.toml").exists():
+        return candidate
+    return None
 
 
 def _load_toml(path: Path) -> dict[str, Any]:

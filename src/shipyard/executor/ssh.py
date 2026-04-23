@@ -711,7 +711,8 @@ def _format_ssh_diagnosis(
     target_config: dict[str, Any], diag: dict[str, Any]
 ) -> str:
     """Compose the preflight error message for an unreachable SSH target."""
-    host = target_config.get("host") or "<no host>"
+    host_raw = target_config.get("host")
+    host = host_raw or "<no host>"
     user_at_host = host if "@" in host else host
     port = target_config.get("port")
     if port:
@@ -729,6 +730,26 @@ def _format_ssh_diagnosis(
     last = diag.get("last_error")
     if last:
         lines.append(f"  Last error: {last}")
+    # Missing-host is almost always "gitignored `.shipyard.local/`
+    # wasn't copied into this worktree." The generic "backend
+    # unreachable" framing above leads users down a network-debugging
+    # rabbit hole (Tailscale, VPN, DNS) when the real fix is 30s of
+    # `cp -r <main>/.shipyard.local/ .`. Call it out explicitly.
+    # See shipyard#155.
+    if not host_raw or category == "configuration":
+        lines.append("")
+        lines.append(
+            "  Hint: the target has no host configured. If you're running "
+            "from a git worktree, the gitignored .shipyard.local/config.toml "
+            "from the main checkout wasn't copied over. Copy it in:"
+        )
+        lines.append(
+            "    cp -r <main-checkout>/.shipyard.local ./"
+        )
+        lines.append(
+            "  shipyard now auto-discovers it too when one exists — re-run "
+            "from a terminal in this worktree to trigger the fallback lookup."
+        )
     return "\n".join(lines)
 
 
