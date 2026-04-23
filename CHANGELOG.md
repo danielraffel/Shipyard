@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0280"></a>
+## [0.29.0]
+
 ## [0.28.0] - 2026-04-22
 
 - cli: surface target error_message under the run/ship summary table ([#170](https://github.com/danielraffel/Shipyard/pull/170))

@@ -2,19 +2,44 @@
 
 All user-facing output goes through this module. Business logic never
 calls print() directly — it returns data, and this module renders it.
+
+Rich itself pulls in ~60ms of imports on a cold start (rich.console
+alone is ~48ms). Many `shipyard` invocations never render anything —
+``shipyard --version``, ``--help``, JSON-mode commands, and the
+daemon subprocess path — so we defer the ``rich`` imports until the
+first actual render call. Ordinary Python module caching makes every
+call after the first free. Perf/cold-start rationale: see #28.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
-from rich.console import Console
-from rich.table import Table
-from rich.text import Text
+from typing import TYPE_CHECKING, Any
 
 from shipyard.core.job import Job, JobStatus
 
-console = Console()
+if TYPE_CHECKING:
+    from rich.console import Console as _Console
+    from rich.text import Text as _Text
+
+
+class _LazyConsole:
+    """Proxy that instantiates a real :class:`rich.console.Console` on
+    first attribute access. ``console.print(...)`` anywhere in the
+    codebase still works; the rich import just doesn't happen until
+    the first call. Subsequent calls hit the cached instance.
+    """
+
+    _real: _Console | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        cls = type(self)
+        if cls._real is None:
+            from rich.console import Console
+            cls._real = Console()
+        return getattr(cls._real, name)
+
+
+console = _LazyConsole()
 
 # ---- Status colors ----
 
@@ -29,7 +54,8 @@ _STATUS_STYLES: dict[str, str] = {
 }
 
 
-def _style_status(status: str) -> Text:
+def _style_status(status: str) -> _Text:
+    from rich.text import Text
     style = _STATUS_STYLES.get(status, "")
     return Text(status, style=style)
 
@@ -39,6 +65,9 @@ def _style_status(status: str) -> Text:
 
 def render_job(job: Job) -> None:
     """Render a job's current state to the terminal."""
+    from rich.table import Table
+    from rich.text import Text
+
     header = f"[bold]{job.id}[/] — {job.branch} @ {job.sha[:8]}"
     if job.mode.value == "smoke":
         header += " [dim](smoke)[/]"
@@ -179,6 +208,9 @@ def render_status(
 
 def render_evidence(records: dict[str, dict[str, Any]]) -> None:
     """Render evidence for a branch."""
+    from rich.table import Table
+    from rich.text import Text
+
     table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
     table.add_column("Platform", style="cyan")
     table.add_column("Status")
@@ -214,7 +246,7 @@ def render_doctor(checks: dict[str, Any], ready: bool) -> None:
         console.print(f"  [bold]{category}:[/]")
         for name, info in items.items():
             ok = info.get("ok", False)
-            icon = "[green]\u2713[/]" if ok else "[red]\u2717[/]"
+            icon = "[green]✓[/]" if ok else "[red]✗[/]"
             detail = info.get("version", info.get("error", info.get("detail", "")))
             extra = ""
             if info.get("user"):
