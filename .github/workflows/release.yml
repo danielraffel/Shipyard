@@ -100,15 +100,41 @@ jobs:
       # run the signing path and fail mid-release on `base64 -d` or
       # `codesign`. Requiring all five makes the no-op fallback match
       # the docs ("when all five are set, we sign; otherwise ad-hoc").
+      #
+      # GitHub Actions does NOT evaluate `secrets.*` in step-level
+      # `if:` conditions (documented limitation; condition evaluates
+      # to an unexpanded string which is truthy → step would run
+      # even when the secret is missing, #184). Work around it with
+      # a detect-readiness step whose env block populates the
+      # secrets and whose bash body emits a boolean output; later
+      # `if:` conditions branch on that output.
+      - name: Detect signing readiness (macOS)
+        id: detect_signing_readiness
+        if: startsWith(matrix.target, 'macos-')
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
+          SIGNING_CERT_P12_BASE64: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${APPLE_ID:-}" ] \
+             && [ -n "${TEAM_ID:-}" ] \
+             && [ -n "${APP_SPECIFIC_PASSWORD:-}" ] \
+             && [ -n "${SIGNING_CERT_P12_BASE64:-}" ] \
+             && [ -n "${SIGNING_CERT_PASSWORD:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "All five signing secrets present; enabling signing path."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "One or more signing secrets missing; falling back to ad-hoc."
+          fi
+
       - name: Import signing identity (macOS)
         id: import_signing_identity
-        if: >-
-          startsWith(matrix.target, 'macos-')
-          && secrets.APPLE_ID != ''
-          && secrets.TEAM_ID != ''
-          && secrets.APP_SPECIFIC_PASSWORD != ''
-          && secrets.SIGNING_CERT_P12_BASE64 != ''
-          && secrets.SIGNING_CERT_PASSWORD != ''
+        if: steps.detect_signing_readiness.outputs.enabled == 'true'
         env:
           TEAM_ID: ${{ secrets.TEAM_ID }}
           SIGNING_CERT_P12_BASE64: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
