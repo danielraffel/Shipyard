@@ -241,6 +241,80 @@ def test_aged_terminal_forced_reconcile_runs_once_per_day(monkeypatch) -> None:
     asyncio.run(run())
 
 
+def test_forced_reconcile_failure_does_not_consume_budget(monkeypatch) -> None:
+    """#182 regression: if the forced reconcile's `gh pr view` call
+    fails (transient CLI error, timeout, missing `gh`), we must NOT
+    stamp ``_LAST_FORCED_RECONCILE``. Stamping on failure would
+    consume the 24h forced-reconcile budget and leave the state
+    un-healable for the next day — the exact permanent blind spot
+    the forced window was supposed to close."""
+    from shipyard.daemon import controller
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory(prefix="sy-fail-") as tmp:
+            store = ShipStateStore(Path(tmp) / "ship")
+            store.save(_ship(
+                pr=55, runs=[("mac", "completed")], age_secs=7200,
+            ))
+
+            # Fail with a CalledProcessError on every gh pr view call.
+            def failing_run(cmd, *a, **kw):
+                raise subprocess.CalledProcessError(
+                    returncode=1, cmd=cmd, stderr="simulated gh failure"
+                )
+
+            monkeypatch.setattr(subprocess, "run", failing_run)
+            controller._LAST_FORCED_RECONCILE.clear()
+
+            # First tick: aged-terminal with no prior forced reconcile
+            # → attempt a forced reconcile → gh call fails → stamp
+            # must NOT be set.
+            await _reconcile_all_active_ships(Path(tmp), daemon=None)
+            assert 55 not in controller._LAST_FORCED_RECONCILE, (
+                "forced reconcile that failed at gh pr view must NOT "
+                "consume the 24h budget"
+            )
+
+            # Second tick (moments later): still no stamp, so the
+            # forced path tries again immediately. Budget untouched.
+            await _reconcile_all_active_ships(Path(tmp), daemon=None)
+            assert 55 not in controller._LAST_FORCED_RECONCILE
+
+    asyncio.run(run())
+
+
+def test_successful_reconcile_stamps_forced_window(monkeypatch) -> None:
+    """Sanity: when the forced reconcile's `gh pr view` succeeds,
+    ``_LAST_FORCED_RECONCILE`` gets stamped so the next 24h of
+    ticks correctly skip the state."""
+    from shipyard.daemon import controller
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory(prefix="sy-ok-") as tmp:
+            store = ShipStateStore(Path(tmp) / "ship")
+            store.save(_ship(
+                pr=56, runs=[("mac", "completed")], age_secs=7200,
+            ))
+
+            class _Completed:
+                stdout = '{"statusCheckRollup": []}'
+                returncode = 0
+
+            monkeypatch.setattr(
+                subprocess, "run",
+                lambda c, *a, **kw: _Completed(),
+            )
+            controller._LAST_FORCED_RECONCILE.clear()
+
+            await _reconcile_all_active_ships(Path(tmp), daemon=None)
+            assert 56 in controller._LAST_FORCED_RECONCILE, (
+                "successful forced reconcile must stamp the "
+                "forced-window timestamp"
+            )
+
+    asyncio.run(run())
+
+
 def test_aged_evidence_only_ship_is_skipped(monkeypatch) -> None:
     """Legacy ship-state layout: only evidence_snapshot populated.
     Aged + all evidence entries terminal → skip (in steady-state,

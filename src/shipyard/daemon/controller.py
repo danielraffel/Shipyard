@@ -729,15 +729,22 @@ async def _reconcile_all_active_ships(
 
     def _is_aged_terminal(state: Any) -> bool:
         """True iff every run is terminal AND the state is past its
-        fresh window AND it was force-reconciled within the last
-        ``RECONCILE_FORCED_WINDOW_SECONDS``. The forced-window clause
-        is the fix for #176: without it, a missed webhook after the
-        aging boundary leaves a permanent blind spot because
-        ``updated_at`` never refreshes locally. Once a day, we still
-        reconcile the aged-terminal state to catch that drift. Same
-        bookkeeping decides whether to stamp a fresh
-        ``_LAST_FORCED_RECONCILE`` entry, so mutation stays colocated
-        with the decision.
+        fresh window AND it was successfully force-reconciled within
+        the last ``RECONCILE_FORCED_WINDOW_SECONDS``. Pure predicate —
+        no mutation.
+
+        The forced-window clause is the fix for #176: without it, a
+        missed webhook after the aging boundary leaves a permanent
+        blind spot because ``updated_at`` never refreshes locally.
+        Once a day, we still reconcile the aged-terminal state to
+        catch that drift.
+
+        Stamping the timestamp was moved out of this predicate and
+        into the post-success path (see #182): recording "forced
+        reconcile at t" *before* the reconcile actually runs lets a
+        transient ``gh`` failure silently consume the 24h budget and
+        re-introduces the blind spot. Now the stamp only fires after
+        a successful fetch+reconcile.
         """
         runs = state.dispatched_runs or []
         if not runs:
@@ -766,17 +773,46 @@ async def _reconcile_all_active_ships(
         if age_secs <= RECONCILE_FRESH_WINDOW_SECONDS:
             return False
 
-        # Aged-terminal. Check whether we're due for the 24h forced
-        # reconcile. Last-forced timestamp is in-memory, per PR.
+        # Aged-terminal. Skip iff we recently force-reconciled.
         last_forced = _LAST_FORCED_RECONCILE.get(state.pr)
-        if (
-            last_forced is None
-            or (now - last_forced).total_seconds()
-            > RECONCILE_FORCED_WINDOW_SECONDS
-        ):
-            _LAST_FORCED_RECONCILE[state.pr] = now
-            return False  # force a reconcile this tick
-        return True  # aged-terminal, recently force-reconciled → skip
+        if last_forced is None:
+            return False  # never force-reconciled; reconcile this tick
+        return (
+            (now - last_forced).total_seconds()
+            <= RECONCILE_FORCED_WINDOW_SECONDS
+        )
+
+    def _is_aged_terminal_candidate(state: Any) -> bool:
+        """Same terminal+aged check as ``_is_aged_terminal``, but
+        ignores the forced-window timestamp. Used to decide whether
+        a *successful* reconcile should stamp ``_LAST_FORCED_RECONCILE``
+        (only ancient states consume the daily forced-reconcile budget;
+        fresh-window reconciles are unbounded by design).
+        """
+        runs = state.dispatched_runs or []
+        if not runs:
+            evidence = state.evidence_snapshot or {}
+            if not evidence:
+                return False
+            all_terminal = all(
+                v in {"pass", "fail", "reused", "skipped"}
+                for v in evidence.values()
+            )
+        else:
+            all_terminal = all(
+                (r.status or "").lower() in RECONCILE_TERMINAL_RUN_STATUSES
+                for r in runs
+            )
+        if not all_terminal:
+            return False
+        updated = state.updated_at
+        if updated is None:
+            return False
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        age_secs = (_dt.now(_tz.utc) - updated).total_seconds()
+        return age_secs > RECONCILE_FRESH_WINDOW_SECONDS
 
     def _reconcile_sync() -> tuple[int, list[transition_t]]:
         """Returns (healed count, list of per-target transitions)."""
@@ -799,6 +835,10 @@ async def _reconcile_all_active_ships(
                 # change, so any drift resets the aging clock.
                 skipped_terminal += 1
                 continue
+            # Snapshot "was this an aged-terminal candidate going in?"
+            # *before* the reconcile, so a successful reconcile that
+            # refreshes updated_at still stamps the forced window.
+            was_aged_candidate = _is_aged_terminal_candidate(state)
             try:
                 raw = _sp.run(
                     [
@@ -813,6 +853,11 @@ async def _reconcile_all_active_ships(
                     "reconcile: skipped PR #%d (%s): %s",
                     state.pr, state.repo, exc,
                 )
+                # #182: must NOT stamp `_LAST_FORCED_RECONCILE` on
+                # failure. If we did, a transient `gh` error would
+                # consume the 24h forced-reconcile budget and leave
+                # the state skipped until tomorrow — the exact blind
+                # spot the forced window was supposed to close.
                 continue
             try:
                 rollup = json.loads(raw).get("statusCheckRollup") or []
@@ -833,6 +878,14 @@ async def _reconcile_all_active_ships(
                         transitions.append(
                             (state.pr, state.repo, run.target, before, run.status)
                         )
+            # Reconcile attempt completed successfully (with or
+            # without a heal). Stamp the forced-window timestamp iff
+            # the state entered this tick as an aged-terminal
+            # candidate — #182.
+            if was_aged_candidate:
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+                _LAST_FORCED_RECONCILE[state.pr] = _dt.now(_tz.utc)
         return healed, transitions
 
     try:
