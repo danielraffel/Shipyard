@@ -80,9 +80,37 @@ def render_job(job: Job) -> None:
     console.print()
     console.print(header)
     console.print(table)
+    _render_target_errors(job)
     if overall:
         console.print(f"  {overall}")
     console.print()
+
+
+def _render_target_errors(job: Job) -> None:
+    """Emit one indented line per non-passing target with its
+    ``error_message`` and log path.
+
+    Without this, the summary table collapses a bundle-upload failure
+    or remote-apply failure into a bare "error" cell and the user has
+    to `cat` the log file by hand to know what happened. See #169.
+    """
+    for name in job.target_names:
+        result = job.results.get(name)
+        if result is None or result.passed:
+            continue
+        if result.reused_from:
+            continue
+        msg = result.error_message
+        if not msg:
+            continue
+        # Trim to keep multi-paragraph tracebacks from ballooning the
+        # terminal; the log file has the full text.
+        first_line = msg.splitlines()[0].strip()
+        if len(first_line) > 200:
+            first_line = first_line[:200].rstrip() + "…"
+        console.print(f"  [red]✗ {name}:[/] {first_line}")
+        if result.log_path:
+            console.print(f"    [dim]log: {result.log_path}[/]")
 
 
 def render_status(
