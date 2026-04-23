@@ -156,6 +156,7 @@ def run_submission_preflight(
         target_states[target_name] = probe_result
 
     if unreachable:
+        skew_note = _daemon_version_skew_note(config)
         if allow_unreachable_targets:
             # Loud warning: the user asked for this escape hatch, but
             # they probably didn't realize they were buying a
@@ -173,9 +174,11 @@ def run_submission_preflight(
             for u in unreachable:
                 detail = u.message or f"Target '{u.target_name}' is unreachable"
                 warnings.append(f"  - {detail}")
+            if skew_note:
+                warnings.append(skew_note)
         else:
             raise BackendUnreachableError(
-                _format_unreachable_error(unreachable)
+                _format_unreachable_error(unreachable, skew_note=skew_note)
             )
 
     return PreflightResult(
@@ -187,7 +190,11 @@ def run_submission_preflight(
     )
 
 
-def _format_unreachable_error(unreachable: list[TargetPreflight]) -> str:
+def _format_unreachable_error(
+    unreachable: list[TargetPreflight],
+    *,
+    skew_note: str | None = None,
+) -> str:
     """Compose the multi-line error that fires on fail-fast."""
     lines: list[str] = []
     for u in unreachable:
@@ -198,6 +205,16 @@ def _format_unreachable_error(unreachable: list[TargetPreflight]) -> str:
                 lines.append(f"  {detail_line}")
         if u.failure_category:
             lines.append(f"  category: {u.failure_category}")
+
+    # #197: when the daemon is on a stale version, preflight errors are
+    # a common symptom (probe logic changes, IPC format drift, etc.).
+    # Surface the skew as a likely-root-cause note so users don't
+    # chase phantom SSH / network bugs when the fix is "restart the
+    # daemon." Non-blocking annotation — the user can still read the
+    # primary error and decide.
+    if skew_note:
+        lines.append("")
+        lines.append(skew_note)
 
     lines.append("")
     lines.append("Options:")
@@ -212,6 +229,50 @@ def _format_unreachable_error(unreachable: list[TargetPreflight]) -> str:
         "(LANE WILL BE SKIPPED, NOT VALIDATED)"
     )
     return "\n".join(lines)
+
+
+def _daemon_version_skew_note(config: Config) -> str | None:
+    """If a daemon is running and its version differs from the CLI's,
+    return a multi-line annotation callers can append to a preflight
+    error. Returns ``None`` otherwise (daemon absent, version matches,
+    or any query error).
+
+    Deliberately fail-quiet: a flaky daemon-status probe must not
+    turn a real preflight error into a confusing aggregate error.
+    """
+    try:
+        from shipyard import __version__ as cli_version
+        from shipyard.daemon.controller import read_daemon_status
+
+        status = read_daemon_status(config.state_dir)
+    except Exception:  # noqa: BLE001 — best-effort annotation
+        return None
+    if status is None:
+        return None  # daemon not running — no skew to warn about
+
+    daemon_version = status.get("shipyard_version")
+    if not isinstance(daemon_version, str) or not daemon_version:
+        # Daemon pre-v0.26.0 doesn't advertise its version. That IS
+        # the skew signal — the current CLI is newer than any version
+        # that would populate this field.
+        return (
+            "Note: a running daemon was detected but it predates v0.26.0 "
+            "and doesn't advertise its version. This daemon's probe logic "
+            "may be incompatible with the current CLI — run "
+            "`shipyard daemon stop && shipyard daemon start` to refresh."
+        )
+    if daemon_version == cli_version:
+        return None
+
+    return (
+        f"Note: the running daemon is v{daemon_version} but this CLI is "
+        f"v{cli_version}. Version skew can surface as phantom SSH "
+        f"timeouts / unreachable errors because probe logic and IPC "
+        f"formats change across versions. If the target reads as "
+        f"reachable from `ssh <host>` directly, try "
+        f"`shipyard daemon stop && shipyard daemon start` to sync the "
+        f"daemon to the current binary before debugging further."
+    )
 
 
 def _probe_target_path(
