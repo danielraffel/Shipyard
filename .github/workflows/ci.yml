@@ -73,7 +73,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install .[dev]
+        run: pip install --break-system-packages .[dev]
 
       - name: Run tests
         run: pytest
@@ -115,7 +115,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install deps + pyinstaller
-        run: pip install .[dev] pyinstaller
+        run: pip install --break-system-packages .[dev] pyinstaller
       - name: Build --onefile binary
         run: pyinstaller --onefile --name shipyard src/shipyard/cli.py
       - name: --version sanity
@@ -160,7 +160,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install .[dev]
+        run: pip install --break-system-packages .[dev]
 
       - name: Run state-machine tests
         run: pytest -m state_machine -v
