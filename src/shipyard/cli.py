@@ -4580,6 +4580,69 @@ def _probe_target(
     return False, None
 
 
+# How frequently the heartbeat line prints during a long-running
+# target. Picked to give an agent / user enough signal that the
+# process is alive without spamming the terminal every poll cycle.
+# Phase changes always print regardless of this interval.
+_HEARTBEAT_MIN_INTERVAL_SECS = 30.0
+
+
+def _maybe_emit_progress_heartbeat(
+    *,
+    progress_state: dict[str, Any],
+    target_name: str,
+    target_backend: str,
+    phase: Any,
+    job_started: Any,
+) -> None:
+    """Print one line when either (a) the target's phase changed
+    since the last print, or (b) ``_HEARTBEAT_MIN_INTERVAL_SECS``
+    have passed since the last heartbeat print.
+
+    The whole point is liveness: agents + users running
+    ``shipyard ship`` / ``shipyard pr`` used to see zero output
+    during long CI matrices (5-10 minutes of silence while sanitizers
+    ran), so they'd poll ``gh pr view`` out-of-band to check whether
+    the process was alive. Now they get a tick every 30s at minimum.
+    """
+    import time as _time
+
+    now = _time.monotonic()
+    last_print = progress_state.get("last_heartbeat_print", 0.0)
+    last_phase = progress_state.get("last_printed_phase")
+    phase_str = str(phase) if phase is not None else ""
+
+    phase_changed = phase_str != (last_phase or "")
+    interval_elapsed = (now - last_print) >= _HEARTBEAT_MIN_INTERVAL_SECS
+
+    if not phase_changed and not interval_elapsed:
+        return
+
+    # Compute elapsed since the job started for the progress line.
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    elapsed = ""
+    if job_started is not None:
+        try:
+            secs = int((_dt.now(_tz.utc) - job_started).total_seconds())
+            if secs >= 60:
+                m, s = divmod(secs, 60)
+                elapsed = f" ({m}m{s:02d}s)"
+            else:
+                elapsed = f" ({secs}s)"
+        except (TypeError, ValueError):
+            pass
+
+    phase_text = phase_str or "running"
+    render_message(
+        f"  ↻ {target_name} [{target_backend}] · {phase_text}{elapsed}",
+        style="dim",
+    )
+    progress_state["last_heartbeat_print"] = now
+    progress_state["last_printed_phase"] = phase_str
+
+
 def _execute_job(
     *,
     ctx: Context,
@@ -4670,7 +4733,15 @@ def _execute_job(
         job = job.with_result(running)
         ctx.queue.update(job)
 
-        state: dict[str, Any] = {"job": job}
+        state: dict[str, Any] = {
+            "job": job,
+            # Heartbeat bookkeeping — throttle stdout to one line per
+            # `_HEARTBEAT_MIN_INTERVAL_SECS` regardless of how often
+            # the backend fires the callback. Long CI matrices would
+            # otherwise spam the terminal on every `gh run view`.
+            "last_heartbeat_print": 0.0,
+            "last_printed_phase": None,
+        }
 
         def progress_callback(
             fields: dict[str, Any],
@@ -4678,6 +4749,8 @@ def _execute_job(
             target_name: str = name,
             default_running: TargetResult = running,
             progress_state: dict[str, Any] = state,
+            target_backend: str = backend_name,
+            job_started: Any = job.started_at,
         ) -> None:
             current = progress_state["job"].results.get(target_name, default_running)
             progress_state["job"] = progress_state["job"].with_result(
@@ -4691,6 +4764,22 @@ def _execute_job(
                 )
             )
             ctx.queue.update(progress_state["job"])
+
+            # Emit a human-readable heartbeat so agents + users have a
+            # liveness signal while a long CI matrix runs. Silent in
+            # --json mode (machine consumers parse the final envelope).
+            # See task #29 / user report: "ship phase has gone quiet,
+            # which usually means it's waiting on external validation
+            # rather than doing local work."
+            if ctx.json_mode:
+                return
+            _maybe_emit_progress_heartbeat(
+                progress_state=progress_state,
+                target_name=target_name,
+                target_backend=target_backend,
+                phase=fields.get("phase", current.phase),
+                job_started=job_started,
+            )
 
         result = dispatcher.validate_target(
             sha=job.sha,
