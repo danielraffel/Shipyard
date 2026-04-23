@@ -273,6 +273,52 @@ def test_runtime_error_restarts_supervisor_loop_not_kills_it() -> None:
     asyncio.run(run())
 
 
+def test_crash_backoff_resets_after_successful_bring_up() -> None:
+    """#183 regression. ``crash_attempt`` must reset to 0 after a
+    successful tunnel bring-up so consecutive unrelated crashes
+    over a daemon's lifetime don't pin later restarts to the max
+    backoff. Plan: runtime-error → ok → (verify fails → reloop) →
+    runtime-error → ok. If the counter reset, BOTH crashes back off
+    at bucket[0]; if it didn't, the second uses bucket[1+].
+
+    We make bucket[0] small (0.2s) and bucket[1+] large (10s) so
+    the total elapsed wall time distinguishes the two cases
+    decisively.
+    """
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory(prefix="sy-reset-") as tmp:
+            ts = _FakeTunnelState(
+                plan=["runtime", "ok", "runtime", "ok"],
+                verify_plan=[False],  # first verify fails → reloop
+            )
+            daemon = _make_daemon(Path(tmp), ts)
+            daemon._TUNNEL_RETRY_BACKOFFS = (0.2, 10.0, 10.0)  # type: ignore[assignment]
+            daemon._TUNNEL_VERIFY_INTERVAL_SECS = 0.01  # type: ignore[assignment]
+            with _patch_webhook_server():
+                start = asyncio.get_event_loop().time()
+                await daemon.start()
+                try:
+                    for _ in range(400):
+                        if ts.start_calls >= 4:
+                            break
+                        await asyncio.sleep(0.05)
+                    elapsed = asyncio.get_event_loop().time() - start
+                    assert ts.start_calls >= 4, (
+                        f"expected two full crash-recover cycles; "
+                        f"got start_calls={ts.start_calls}"
+                    )
+                    assert elapsed < 3.0, (
+                        f"crash backoff didn't reset after recovery — "
+                        f"second crash waited bucket[1+] (10s) instead "
+                        f"of bucket[0] (0.2s); elapsed={elapsed:.1f}s"
+                    )
+                finally:
+                    await daemon.stop()
+
+    asyncio.run(run())
+
+
 def test_tunnel_loss_mid_session_re_establishes() -> None:
     """Up → verify fails → down → re-establish. The daemon must
     not exit during the transition."""

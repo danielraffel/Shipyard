@@ -267,6 +267,16 @@ class Daemon:
         # Tunnel error (#179). We now log and *restart* the inner
         # loop after a short backoff so the supervisor genuinely
         # never gives up short of `_stop_event`.
+        #
+        # ``crash_attempt`` escalates the restart backoff on
+        # consecutive crashes, but resets to 0 whenever the tunnel
+        # successfully comes up (see #183): without that, a few
+        # isolated one-off failures accumulated forever and pinned
+        # future restarts to the 300s max, so later transient issues
+        # took much longer to self-heal than intended. Resetting on
+        # successful bring-up scopes the backoff to "how bad is *this*
+        # crash streak," not "how many crashes has this daemon ever
+        # seen across its lifetime."
         crash_attempt = 0
         while not self._stop_event.is_set():
             try:
@@ -278,6 +288,10 @@ class Daemon:
                     self._state.tunnel = tunnel_info
                     self._state.tunnel_verified_at = time.time()
                     logger.info("tunnel ready: %s", tunnel_info.public_url)
+                    # Fresh recovery — stop compounding backoff from
+                    # pre-recovery crashes. If we crash again later,
+                    # backoff starts over at the first bucket.
+                    crash_attempt = 0
                     await self._register_webhooks(tunnel_info)
 
                     # Watch loop: periodically re-verify. When verify
