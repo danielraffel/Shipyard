@@ -116,24 +116,50 @@ mkdir -p "${INSTALL_DIR}"
 curl -sL "${RELEASE_URL}" -o "${INSTALL_DIR}/shipyard"
 chmod +x "${INSTALL_DIR}/shipyard"
 
-# macOS 26.3+ hardened Gatekeeper SIGKILLs ad-hoc-signed binaries that
-# carry the `com.apple.provenance` / `com.apple.quarantine` xattrs from
-# a GitHub Release download. PyInstaller produces ad-hoc-signed Mach-O,
-# so a fresh install silently crashes with "killed" on every run and
-# the user has to dig through ~/Library/Logs/DiagnosticReports to see
-# the real reason ("Taskgated Invalid Signature" / SIGKILL Code
-# Signature Invalid).
+# macOS post-download signature handling.
 #
-# Fix: strip the download xattrs + re-apply an ad-hoc signature on the
-# user's machine. The re-sign produces a trust-anchored signature
-# because it's local (no download-origin tracking). This is the same
-# two-command dance every PyInstaller / binary-distribution project
-# on macOS ends up running; folding it into the installer saves every
-# user from hitting it.
+# Two orthogonal problems to handle:
+#
+# 1. `com.apple.provenance` / `com.apple.quarantine` xattrs from the
+#    GitHub download. macOS 26.3+ Gatekeeper SIGKILLs ad-hoc-signed
+#    binaries carrying these with "Taskgated Invalid Signature".
+#    Always strip them — they're only metadata anyway.
+#
+# 2. The binary's code signature. Two cases:
+#
+#    a. Developer-ID-signed + Apple-notarized (shipyard main releases
+#       with all 5 signing secrets set — see RELEASING.md). Notarization
+#       makes Gatekeeper trust the binary fast (~1s); XProtect skips the
+#       deep scan. We must PRESERVE this signature. `codesign --force
+#       --sign -` would strip the Developer ID + notarization ticket,
+#       defeating exactly the trust we want. On a test install
+#       2026-04-23 the ad-hoc re-sign turned v0.35.0's ~1s cold start
+#       into a ~6s cold start because XProtect resumed deep-scanning
+#       every invocation.
+#
+#    b. Ad-hoc-signed (forks, local builds, PRs from external
+#       contributors where the signing secrets don't propagate). These
+#       DO need the `xattr -cr` + local ad-hoc re-sign to stop
+#       Taskgated from SIGKILLing them on every launch.
+#
+# Detection: `codesign -dv` prints `TeamIdentifier=<team>` for
+# Developer-ID-signed binaries and `TeamIdentifier=not set` for
+# ad-hoc. The presence/absence of a real Team ID is the fastest
+# reliable discriminator.
 if [ "${OS}" = "macos" ]; then
     xattr -cr "${INSTALL_DIR}/shipyard" 2>/dev/null || true
     if command -v codesign >/dev/null 2>&1; then
-        codesign --force --sign - "${INSTALL_DIR}/shipyard" 2>/dev/null || true
+        team_line=$(codesign -dv "${INSTALL_DIR}/shipyard" 2>&1 | grep "^TeamIdentifier=") || team_line=""
+        if [ -n "${team_line}" ] && [ "${team_line}" != "TeamIdentifier=not set" ]; then
+            # Developer-ID signed. Preserve the signature + notarization.
+            echo "Detected Developer-ID-signed binary (${team_line#TeamIdentifier=}); preserving notarization."
+        else
+            # Ad-hoc signed (fork / local / unsigned fallback path).
+            # Re-sign locally so Gatekeeper accepts it without the
+            # xattr SIGKILL dance. No notarization to lose.
+            codesign --force --sign - "${INSTALL_DIR}/shipyard" 2>/dev/null || true
+            echo "Detected ad-hoc-signed binary; re-signed locally for Gatekeeper."
+        fi
     fi
 fi
 
