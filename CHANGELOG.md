@@ -3,9 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0300"></a>
-## [0.31.0]
+<a id="v0310"></a>
+## [0.31.0] - 2026-04-22
 
+- ssh-windows: decode PowerShell CLIXML error envelope (#188) ([#189](https://github.com/danielraffel/Shipyard/pull/189))
+- release: resolve signing identity by Team ID; require all 5 secrets (#177) ([#184](https://github.com/danielraffel/Shipyard/pull/184))
+
+<a id="v0300"></a>
 ## [0.30.0] - 2026-04-22
 
 - fix: escape dynamic text before Rich markup interpolation (Codex on #170) ([#180](https://github.com/danielraffel/Shipyard/pull/180))
@@ -354,6 +358,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.31.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.31.0
 [0.30.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.30.0
 [0.29.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.29.0
 [0.28.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.28.0
