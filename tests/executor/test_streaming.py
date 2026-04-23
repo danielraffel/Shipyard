@@ -27,17 +27,23 @@ def test_run_streaming_command_parses_phase_markers(tmp_path) -> None:
 
 
 def test_run_streaming_command_emits_stuck_heartbeat(tmp_path) -> None:
+    # #186 was a timing flake on macOS ARM CI under load: the subprocess
+    # completed before any heartbeat thread tick fired in the "stuck"
+    # window. Widened the budget: 0.8s quiet subprocess, 0.05s heartbeat
+    # cadence, 0.15s stuck threshold — leaves ~0.65s where the scheduler
+    # has ample chances to land a ``liveness=stuck`` emission even under
+    # a noisy runner. Trade 0.6s extra wall-clock time for determinism.
     seen: list[dict] = []
 
     result = run_streaming_command(
         [
             sys.executable,
             "-c",
-            "import time; time.sleep(0.18); print('done')",
+            "import time; time.sleep(0.8); print('done')",
         ],
         log_path=str(tmp_path / "heartbeat.log"),
         heartbeat_interval_secs=0.05,
-        stuck_idle_secs=0.1,
+        stuck_idle_secs=0.15,
         progress_callback=lambda fields: seen.append(dict(fields)),
     )
 
