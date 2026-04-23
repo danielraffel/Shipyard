@@ -41,6 +41,7 @@ from shipyard.daemon.tunnels.tailscale import TailscaleFunnelBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import datetime
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -659,6 +660,24 @@ that complete quickly after a failure — updated_at still reflects
 the recent activity, so reconcile picks up the transition. Past
 this window, terminal states are treated as settled and skipped."""
 
+RECONCILE_FORCED_WINDOW_SECONDS = 86400
+"""Safety net on top of the fresh-window skip (#176): even if a
+ship-state is aged-terminal and we'd normally skip it, every ~24h
+we do a single forced reconcile to catch the "missed webhook after
+aging" scenario. Without this, a daemon outage or a Tailscale-funnel
+drop between the aged-terminal boundary and a late CI transition
+left the state permanently un-healable (the webhook that would have
+refreshed ``updated_at`` never landed, so the aging clock never
+reset). One API call per PR per day preserves the rate-limit budget
+while restoring the "eventually correct" self-healing guarantee."""
+
+_LAST_FORCED_RECONCILE: dict[int, datetime] = {}
+"""In-memory bookkeeping for the forced-reconcile window. Keyed by
+PR number; value is the UTC timestamp of the last forced reconcile.
+Cleared on daemon restart (startup re-reconciles everything as
+normal drift heal, so losing this is safe — at worst the first tick
+after restart runs one extra reconcile per aged-terminal PR)."""
+
 
 async def _reconcile_loop(state_dir: Path, daemon: Daemon | None = None) -> None:
     """Continuously heal ship-state drift against GitHub truth.
@@ -710,8 +729,16 @@ async def _reconcile_all_active_ships(
 
     def _is_aged_terminal(state: Any) -> bool:
         """True iff every run is terminal AND the state is past its
-        fresh window (so reconcile can skip it this tick without
-        missing a real CI transition)."""
+        fresh window AND it was force-reconciled within the last
+        ``RECONCILE_FORCED_WINDOW_SECONDS``. The forced-window clause
+        is the fix for #176: without it, a missed webhook after the
+        aging boundary leaves a permanent blind spot because
+        ``updated_at`` never refreshes locally. Once a day, we still
+        reconcile the aged-terminal state to catch that drift. Same
+        bookkeeping decides whether to stamp a fresh
+        ``_LAST_FORCED_RECONCILE`` entry, so mutation stays colocated
+        with the decision.
+        """
         runs = state.dispatched_runs or []
         if not runs:
             evidence = state.evidence_snapshot or {}
@@ -734,8 +761,22 @@ async def _reconcile_all_active_ships(
         from datetime import datetime as _dt
         from datetime import timezone as _tz
 
-        age_secs = (_dt.now(_tz.utc) - updated).total_seconds()
-        return age_secs > RECONCILE_FRESH_WINDOW_SECONDS
+        now = _dt.now(_tz.utc)
+        age_secs = (now - updated).total_seconds()
+        if age_secs <= RECONCILE_FRESH_WINDOW_SECONDS:
+            return False
+
+        # Aged-terminal. Check whether we're due for the 24h forced
+        # reconcile. Last-forced timestamp is in-memory, per PR.
+        last_forced = _LAST_FORCED_RECONCILE.get(state.pr)
+        if (
+            last_forced is None
+            or (now - last_forced).total_seconds()
+            > RECONCILE_FORCED_WINDOW_SECONDS
+        ):
+            _LAST_FORCED_RECONCILE[state.pr] = now
+            return False  # force a reconcile this tick
+        return True  # aged-terminal, recently force-reconciled → skip
 
     def _reconcile_sync() -> tuple[int, list[transition_t]]:
         """Returns (healed count, list of per-target transitions)."""

@@ -70,9 +70,16 @@ def _ship(*, pr: int, runs: list[tuple[str, str]], age_secs: int = 0) -> ShipSta
 
 
 def test_aged_terminal_ships_skip_gh_view(monkeypatch) -> None:
-    """Three aged-terminal ships + one still running. Reconcile hits
+    """Three aged-terminal ships + one still running. Steady-state
+    reconcile (after the forced-window stamp is already fresh) hits
     `gh pr view` exactly once — for the running one. Each aged ship
-    has updated_at > 1hr in the past."""
+    has updated_at > 1hr in the past.
+
+    Pre-populates ``_LAST_FORCED_RECONCILE`` so the 24h forced-window
+    doesn't fire during this tick (see #176); that path is covered
+    by ``test_aged_terminal_forced_reconcile_runs_once_per_day``.
+    """
+    from shipyard.daemon import controller
 
     async def run() -> None:
         with tempfile.TemporaryDirectory(prefix="sy-skip-") as tmp:
@@ -96,6 +103,14 @@ def test_aged_terminal_ships_skip_gh_view(monkeypatch) -> None:
             def fake_run(cmd, *a, **kw):
                 gh_calls.append(cmd)
                 return _Completed()
+
+            # Pretend both aged-terminal PRs had their forced-window
+            # reconcile moments ago so this tick can exercise the
+            # pure-skip branch. The forced-window branch is covered
+            # separately in the dedicated test.
+            now = datetime.now(timezone.utc)
+            controller._LAST_FORCED_RECONCILE[1] = now
+            controller._LAST_FORCED_RECONCILE[2] = now
 
             monkeypatch.setattr(subprocess, "run", fake_run)
             await _reconcile_all_active_ships(Path(tmp), daemon=None)
@@ -165,9 +180,73 @@ def test_pre_dispatch_ship_always_reconciled(monkeypatch) -> None:
     asyncio.run(run())
 
 
+def test_aged_terminal_forced_reconcile_runs_once_per_day(monkeypatch) -> None:
+    """#176 regression: aged-terminal states must reconcile at least
+    once per RECONCILE_FORCED_WINDOW_SECONDS even if we'd normally
+    skip them, so a missed-webhook scenario can't leave them
+    permanently un-healable. First tick force-reconciles; a second
+    tick seconds later skips; a tick past the forced window
+    force-reconciles again."""
+    from shipyard.daemon import controller
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory(prefix="sy-forced-") as tmp:
+            store = ShipStateStore(Path(tmp) / "ship")
+            # Aged-terminal: 2h old, all runs completed.
+            store.save(_ship(
+                pr=99, runs=[("mac", "completed")], age_secs=7200,
+            ))
+
+            gh_calls: list[list[str]] = []
+
+            class _Completed:
+                stdout = '{"statusCheckRollup": []}'
+                returncode = 0
+
+            monkeypatch.setattr(
+                subprocess, "run",
+                lambda c, *a, **kw: gh_calls.append(c) or _Completed(),
+            )
+            # Reset the in-memory bookkeeping so this test's forcing
+            # logic is deterministic regardless of earlier tests.
+            controller._LAST_FORCED_RECONCILE.clear()
+
+            # Tick 1: never force-reconciled → force this tick.
+            await _reconcile_all_active_ships(Path(tmp), daemon=None)
+            assert len(gh_calls) == 1, (
+                "aged-terminal with no prior forced reconcile must "
+                "trigger one forced reconcile"
+            )
+
+            # Tick 2: just force-reconciled → skip.
+            await _reconcile_all_active_ships(Path(tmp), daemon=None)
+            assert len(gh_calls) == 1, (
+                "aged-terminal force-reconciled moments ago must be "
+                "skipped — budget is per-day, not per-tick"
+            )
+
+            # Advance the last-forced stamp by >24h and tick again.
+            from datetime import datetime as _dt
+            from datetime import timedelta as _td
+            from datetime import timezone as _tz
+            controller._LAST_FORCED_RECONCILE[99] = (
+                _dt.now(_tz.utc) - _td(seconds=90_000)
+            )
+            await _reconcile_all_active_ships(Path(tmp), daemon=None)
+            assert len(gh_calls) == 2, (
+                "aged-terminal last force-reconciled >24h ago must "
+                "trigger another forced reconcile"
+            )
+
+    asyncio.run(run())
+
+
 def test_aged_evidence_only_ship_is_skipped(monkeypatch) -> None:
     """Legacy ship-state layout: only evidence_snapshot populated.
-    Aged + all evidence entries terminal → skip."""
+    Aged + all evidence entries terminal → skip (in steady-state,
+    i.e. after the forced-window stamp from #176 is already fresh).
+    """
+    from shipyard.daemon import controller
 
     async def run() -> None:
         with tempfile.TemporaryDirectory(prefix="sy-skip-") as tmp:
@@ -181,6 +260,11 @@ def test_aged_evidence_only_ship_is_skipped(monkeypatch) -> None:
             class _Completed:
                 stdout = '{"statusCheckRollup": []}'
                 returncode = 0
+
+            # See the sibling test above: pre-stamp the forced-window
+            # timestamp so this tick exercises the steady-state skip
+            # branch.
+            controller._LAST_FORCED_RECONCILE[7] = datetime.now(timezone.utc)
 
             monkeypatch.setattr(
                 subprocess, "run",
