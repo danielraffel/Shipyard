@@ -17,9 +17,22 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# install.sh is POSIX shell and the tests drive it via `bash`. On
+# Windows, Git-for-Windows bash exits non-zero on the very first
+# `uname -m` resolution, and Windows doesn't populate `$HOME` so
+# assertions that derive the expected path from `os.environ["HOME"]`
+# throw KeyError. The installer itself isn't shipped for Windows
+# users — they use the winget/msi path (when that exists) or the
+# plugin's bundled binary. Linux + macOS coverage here is enough.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="install.sh is a POSIX shell script; Linux+macOS runners provide full coverage",
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO_ROOT / "install.sh"

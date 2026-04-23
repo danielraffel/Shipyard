@@ -25,27 +25,53 @@ jobs:
       windows: ${{ steps.resolve.outputs.windows }}
     steps:
       - id: resolve
-        # Runner provider resolution, in priority order:
-        #   1. workflow_dispatch input (explicit override per-run).
-        #   2. repo variable `DEFAULT_RUNNER_PROVIDER` — set once,
-        #      applies to every PR/push. Configure with
-        #      `gh variable set DEFAULT_RUNNER_PROVIDER --body namespace`.
-        #   3. Hardcoded fallback `github-hosted` — safe default for
-        #      forks and first-time setup where the variable isn't set.
+        # Runner provider resolution per-target, in priority order:
+        #   1. workflow_dispatch input — one-shot override, covers all
+        #      targets in the run.
+        #   2. Per-target repo variable — `DEFAULT_RUNNER_PROVIDER_LINUX`,
+        #      `DEFAULT_RUNNER_PROVIDER_MACOS`,
+        #      `DEFAULT_RUNNER_PROVIDER_WINDOWS`. Lets us route one
+        #      platform around a provider outage without losing speed
+        #      on the other two. #193 (Namespace Windows saturated
+        #      2026-04-23) is the concrete motivation.
+        #   3. Global repo variable `DEFAULT_RUNNER_PROVIDER`.
+        #   4. Hardcoded fallback `github-hosted` — safe for forks
+        #      (vars don't propagate across fork boundaries).
         # See RELEASING.md § "Preferred runner provider" for the
-        # rationale (GitHub-hosted macOS queues were blocking this
-        # repo for 10+ minutes during a typical workday).
+        # rationale.
+        env:
+          INPUT_PROVIDER: ${{ inputs.runner_provider }}
+          DEFAULT_ALL: ${{ vars.DEFAULT_RUNNER_PROVIDER }}
+          DEFAULT_LINUX: ${{ vars.DEFAULT_RUNNER_PROVIDER_LINUX }}
+          DEFAULT_MACOS: ${{ vars.DEFAULT_RUNNER_PROVIDER_MACOS }}
+          DEFAULT_WINDOWS: ${{ vars.DEFAULT_RUNNER_PROVIDER_WINDOWS }}
         run: |
-          PROVIDER="${{ inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}"
-          if [ "$PROVIDER" = "namespace" ]; then
-            echo "linux=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT"
-            echo "macos=\"macos-15\"" >> "$GITHUB_OUTPUT"
-            echo "windows=\"namespace-profile-generouscorp-windows\"" >> "$GITHUB_OUTPUT"
-          else
-            echo "linux=\"ubuntu-latest\"" >> "$GITHUB_OUTPUT"
-            echo "macos=\"macos-15\"" >> "$GITHUB_OUTPUT"
-            echo "windows=\"windows-latest\"" >> "$GITHUB_OUTPUT"
-          fi
+          resolve_provider() {
+            # $1 = target-specific repo-variable value (possibly empty).
+            local target_var="$1"
+            if [ -n "${INPUT_PROVIDER:-}" ]; then echo "${INPUT_PROVIDER}"; return; fi
+            if [ -n "${target_var:-}" ]; then echo "${target_var}"; return; fi
+            if [ -n "${DEFAULT_ALL:-}" ]; then echo "${DEFAULT_ALL}"; return; fi
+            echo "github-hosted"
+          }
+
+          P_LINUX=$(resolve_provider "${DEFAULT_LINUX}")
+          P_MACOS=$(resolve_provider "${DEFAULT_MACOS}")
+          P_WINDOWS=$(resolve_provider "${DEFAULT_WINDOWS}")
+          echo "resolved providers: linux=$P_LINUX macos=$P_MACOS windows=$P_WINDOWS"
+
+          [ "$P_LINUX" = "namespace" ] \
+            && echo "linux=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT" \
+            || echo "linux=\"ubuntu-latest\"" >> "$GITHUB_OUTPUT"
+
+          # Both namespace and github-hosted macOS resolve to macos-15
+          # today — Namespace piggybacks on GitHub's macOS runner fleet
+          # because Apple silicon hosting is a niche capacity.
+          echo "macos=\"macos-15\"" >> "$GITHUB_OUTPUT"
+
+          [ "$P_WINDOWS" = "namespace" ] \
+            && echo "windows=\"namespace-profile-generouscorp-windows\"" >> "$GITHUB_OUTPUT" \
+            || echo "windows=\"windows-latest\"" >> "$GITHUB_OUTPUT"
 
   test:
     needs: resolve-runners

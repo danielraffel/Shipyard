@@ -28,25 +28,60 @@ jobs:
       windows: ${{ steps.resolve.outputs.windows }}
     steps:
       - id: resolve
-        # Same resolution order as ci.yml: workflow_dispatch input
-        # > repo variable `DEFAULT_RUNNER_PROVIDER` > hardcoded
-        # `github-hosted`. Set the variable once:
-        #   gh variable set DEFAULT_RUNNER_PROVIDER --body namespace
-        # and every tag-triggered release build lands on Namespace
-        # without workflow edits. See RELEASING.md.
+        # Per-target runner provider resolution. Priority per target:
+        #   1. workflow_dispatch input `runner_provider` (all-target
+        #      override for a one-off dispatch).
+        #   2. Per-target repo variable — `DEFAULT_RUNNER_PROVIDER_LINUX`
+        #      / `_MACOS` / `_WINDOWS`. Lets us route one platform
+        #      around a provider outage. #193 motivated this —
+        #      Namespace Windows was saturated 2026-04-23 while
+        #      Namespace Linux + macOS were healthy.
+        #   3. Global repo variable `DEFAULT_RUNNER_PROVIDER`.
+        #   4. Hardcoded fallback `github-hosted` (fork-safe).
+        # See RELEASING.md § "Preferred runner provider".
+        env:
+          INPUT_PROVIDER: ${{ inputs.runner_provider }}
+          DEFAULT_ALL: ${{ vars.DEFAULT_RUNNER_PROVIDER }}
+          DEFAULT_LINUX: ${{ vars.DEFAULT_RUNNER_PROVIDER_LINUX }}
+          DEFAULT_MACOS: ${{ vars.DEFAULT_RUNNER_PROVIDER_MACOS }}
+          DEFAULT_WINDOWS: ${{ vars.DEFAULT_RUNNER_PROVIDER_WINDOWS }}
         run: |
-          PROVIDER="${{ inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}"
-          if [ "$PROVIDER" = "namespace" ]; then
+          resolve_provider() {
+            local target_var="$1"
+            if [ -n "${INPUT_PROVIDER:-}" ]; then echo "${INPUT_PROVIDER}"; return; fi
+            if [ -n "${target_var:-}" ]; then echo "${target_var}"; return; fi
+            if [ -n "${DEFAULT_ALL:-}" ]; then echo "${DEFAULT_ALL}"; return; fi
+            echo "github-hosted"
+          }
+
+          P_LINUX=$(resolve_provider "${DEFAULT_LINUX}")
+          P_MACOS=$(resolve_provider "${DEFAULT_MACOS}")
+          P_WINDOWS=$(resolve_provider "${DEFAULT_WINDOWS}")
+          echo "resolved providers: linux=$P_LINUX macos=$P_MACOS windows=$P_WINDOWS"
+
+          if [ "$P_LINUX" = "namespace" ]; then
             echo "linux=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT"
             echo "linux_arm=\"namespace-profile-generouscorp\"" >> "$GITHUB_OUTPUT"
-            echo "macos_arm=\"namespace-profile-generouscorp-macos\"" >> "$GITHUB_OUTPUT"
-            echo "macos_x64=\"macos-15\"" >> "$GITHUB_OUTPUT"
-            echo "windows=\"namespace-profile-generouscorp-windows\"" >> "$GITHUB_OUTPUT"
           else
             echo "linux=\"ubuntu-latest\"" >> "$GITHUB_OUTPUT"
             echo "linux_arm=\"ubuntu-24.04-arm\"" >> "$GITHUB_OUTPUT"
+          fi
+
+          # macOS has only one runner shape today regardless of
+          # provider (Namespace piggybacks on GitHub's macOS fleet),
+          # but keep the provider plumbing in place so future macOS
+          # ARM self-hosted pools can slot in without another
+          # workflow edit.
+          if [ "$P_MACOS" = "namespace" ]; then
+            echo "macos_arm=\"namespace-profile-generouscorp-macos\"" >> "$GITHUB_OUTPUT"
+          else
             echo "macos_arm=\"macos-15\"" >> "$GITHUB_OUTPUT"
-            echo "macos_x64=\"macos-15\"" >> "$GITHUB_OUTPUT"
+          fi
+          echo "macos_x64=\"macos-15\"" >> "$GITHUB_OUTPUT"
+
+          if [ "$P_WINDOWS" = "namespace" ]; then
+            echo "windows=\"namespace-profile-generouscorp-windows\"" >> "$GITHUB_OUTPUT"
+          else
             echo "windows=\"windows-latest\"" >> "$GITHUB_OUTPUT"
           fi
 

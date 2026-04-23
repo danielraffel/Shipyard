@@ -110,10 +110,23 @@ Every subsequent PR push, tag push, and scheduled release picks that up without 
 - Forks / external contributors whose repos don't have the variable set will naturally fall through to `github-hosted` (safe default, no paid surface exposed).
 - If Namespace has an outage: `gh variable delete DEFAULT_RUNNER_PROVIDER` restores `github-hosted` for all future runs without a workflow PR.
 
-The resolution order in `ci.yml` / `release.yml` is:
-1. `workflow_dispatch` input (per-run override).
-2. `vars.DEFAULT_RUNNER_PROVIDER` (repo-wide default).
-3. Hardcoded fallback `github-hosted`.
+The resolution order per target in `ci.yml` / `release.yml` is:
+1. `workflow_dispatch` input (per-run override — all targets).
+2. `vars.DEFAULT_RUNNER_PROVIDER_LINUX` / `_MACOS` / `_WINDOWS` (per-target repo variable).
+3. `vars.DEFAULT_RUNNER_PROVIDER` (repo-wide default).
+4. Hardcoded fallback `github-hosted`.
+
+**Per-target override use case:** If one Namespace profile goes down (e.g. `generouscorp-windows` saturated 2026-04-23, #193) you can route just that platform to `github-hosted` without losing the speed benefit on the healthy profiles:
+
+```sh
+gh variable set DEFAULT_RUNNER_PROVIDER_WINDOWS --repo danielraffel/Shipyard --body github-hosted
+```
+
+Every subsequent run builds Linux + macOS on Namespace and Windows on `windows-latest`. Delete the variable when the outage clears:
+
+```sh
+gh variable delete DEFAULT_RUNNER_PROVIDER_WINDOWS --repo danielraffel/Shipyard
+```
 
 ## Default path: automatic on merge
 
