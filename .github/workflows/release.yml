@@ -85,7 +85,16 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: pip install .[dev] pyinstaller
+        # `--break-system-packages` is required on Namespace macOS
+        # runners (PEP 668 externally-managed Python). GitHub-hosted
+        # runners accept the flag as a no-op. Without it, v0.32.0's
+        # macos-arm64 build job failed on
+        #   error: externally-managed-environment
+        # when the workflow moved from github-hosted default to
+        # Namespace default (#187). The runner is ephemeral so the
+        # "system-wide install" warning the flag bypasses is
+        # irrelevant.
+        run: pip install --break-system-packages .[dev] pyinstaller
 
       # Keychain setup MUST happen before the PyInstaller build so the
       # --codesign-identity flag can resolve and sign every embedded
