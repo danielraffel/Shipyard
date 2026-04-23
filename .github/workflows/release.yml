@@ -78,38 +78,29 @@ jobs:
       - name: Install dependencies
         run: pip install .[dev] pyinstaller
 
-      - name: Build binary
-        run: pyinstaller --onefile --name ${{ matrix.artifact }} src/shipyard/cli.py
-
-      # macOS 26.3+ enforces code-signing strictly; ad-hoc-signed
-      # binaries with `com.apple.provenance`/`quarantine` xattrs (which
-      # every GitHub-downloaded file carries) SIGKILL with "Taskgated
-      # Invalid Signature". Sign with Developer ID + notarize so the
-      # binary runs cleanly on a fresh install without the `install.sh`
-      # xattr-strip dance having to be the only backstop.
+      # Keychain setup MUST happen before the PyInstaller build so the
+      # --codesign-identity flag can resolve and sign every embedded
+      # dylib (notably Python.framework). A post-build outer-only sign
+      # produced a Team-ID mismatch at runtime — the outer Mach-O
+      # carried the Developer ID Team ID but the embedded
+      # Python.framework was still ad-hoc-signed, so dyld rejected
+      # the load with "code signature ... not valid for use in
+      # process: mapping process and mapped file (non-platform) have
+      # different Team IDs". See RELEASING.md for the background.
       #
-      # No Info.plist → we can't `stapler staple` a bare Mach-O, so
-      # Gatekeeper verifies notarization online at first launch. That
-      # requires network, which every CI user has. Accepted tradeoff
-      # vs wrapping the CLI in a .app bundle we don't otherwise need.
-      #
-      # Skipped when the signing secrets aren't present (forks, PRs
-      # from outside contributors) — the install.sh fallback still
-      # handles those.
-      - name: Sign + notarize macOS binary
+      # Skipped on forks / PRs from outside contributors (APPLE_ID
+      # secret absent) — the install.sh xattr-strip + ad-hoc re-sign
+      # fallback still handles those.
+      - name: Import signing identity (macOS)
+        id: import_signing_identity
         if: startsWith(matrix.target, 'macos-') && env.APPLE_ID != ''
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
-          TEAM_ID: ${{ secrets.TEAM_ID }}
-          APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
           SIGNING_CERT_P12_BASE64: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
           SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
         run: |
           set -euo pipefail
-          BINARY="dist/${{ matrix.artifact }}"
 
-          # Import the Developer ID certificate into a temporary keychain
-          # so the job is self-contained and cleans up automatically.
           KEYCHAIN="$RUNNER_TEMP/shipyard-sign.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
           CERT_PATH="$RUNNER_TEMP/developer-id.p12"
@@ -120,18 +111,76 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security import "$CERT_PATH" -P "$SIGNING_CERT_PASSWORD" \
             -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          # Prepend the temp keychain to the search list so PyInstaller's
+          # invocation of /usr/bin/codesign finds the identity.
           security list-keychains -d user -s "$KEYCHAIN" \
             $(security list-keychains -d user | sed -e 's/"//g')
-          security set-key-partition-list -S apple-tool:,apple: \
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
-          # Sign with hardened-runtime + secure timestamp.
+          # Emit the keychain path so the cleanup step can delete it
+          # regardless of later failures.
+          echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        # When signing is enabled on a macOS matrix row, the keychain
+        # from the import step above is already the default; TEAM_ID
+        # is read from the secret. PyInstaller's --codesign-identity
+        # signs every embedded dylib (incl. Python.framework) with
+        # our Team ID so dyld's runtime Team-ID check passes. On
+        # non-macOS rows, or when the secret is absent (forks), it
+        # falls through to a plain ad-hoc build. `shell: bash` so
+        # Windows uses Git-for-Windows bash instead of PowerShell
+        # (the `case` and `set -euo pipefail` below are bashisms).
+        shell: bash
+        env:
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          SIGNING_IDENTITY=""
+          case "$TARGET" in
+            macos-*)
+              if [ -n "${APPLE_ID:-}" ]; then
+                SIGNING_IDENTITY="Developer ID Application: Daniel Raffel (${TEAM_ID})"
+              fi
+              ;;
+          esac
+          if [ -n "$SIGNING_IDENTITY" ]; then
+            pyinstaller --onefile \
+              --name "$ARTIFACT" \
+              --codesign-identity "$SIGNING_IDENTITY" \
+              src/shipyard/cli.py
+          else
+            pyinstaller --onefile \
+              --name "$ARTIFACT" \
+              src/shipyard/cli.py
+          fi
+
+      - name: Re-sign with hardened runtime + notarize (macOS)
+        if: startsWith(matrix.target, 'macos-') && env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BINARY="dist/${{ matrix.artifact }}"
+
+          # PyInstaller already signed every embedded dylib with our
+          # identity (via --codesign-identity). Re-sign only the outer
+          # Mach-O to add --options runtime (hardened runtime) and
+          # --timestamp (secure timestamp) — both required for
+          # notarytool to accept the submission. Team IDs already match
+          # so dyld's runtime check passes.
           codesign --force --options runtime --timestamp \
             --sign "Developer ID Application: Daniel Raffel (${TEAM_ID})" \
             "$BINARY"
           codesign -dv --verbose=4 "$BINARY"
 
-          # Notarize. --wait blocks up to 30min; in practice the bare
+          # Notarize. --wait blocks up to 30min; in practice a bare
           # Mach-O notarizes in <60s. submit needs a zip or dmg, so
           # wrap first.
           NOTARIZE_ZIP="$RUNNER_TEMP/${{ matrix.artifact }}.zip"
@@ -142,13 +191,15 @@ jobs:
             --password "$APP_SPECIFIC_PASSWORD" \
             --wait
 
-          # Can't staple a bare Mach-O. Gatekeeper checks online at
-          # first launch instead (requires network). No additional
-          # action needed here; the notarization ticket is registered
-          # with Apple server-side and matches the binary's hash.
+          # Can't staple a bare Mach-O (no Info.plist). Gatekeeper
+          # verifies notarization online at first launch. The ticket
+          # is registered with Apple server-side and matches the
+          # binary's hash.
 
-          # Cleanup: delete the temp keychain.
-          security delete-keychain "$KEYCHAIN"
+      - name: Delete signing keychain (macOS)
+        if: always() && steps.import_signing_identity.outputs.keychain != ''
+        run: |
+          security delete-keychain "${{ steps.import_signing_identity.outputs.keychain }}" || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
