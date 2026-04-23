@@ -3,9 +3,14 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0280"></a>
-## [0.29.0]
+<a id="v0290"></a>
+## [0.29.0] - 2026-04-22
 
+- perf: defer rich import + bump PyInstaller Python to 3.13 (#28) ([#174](https://github.com/danielraffel/Shipyard/pull/174))
+- release: sign embedded dylibs during PyInstaller build to fix Team-ID mismatch ([#172](https://github.com/danielraffel/Shipyard/pull/172))
+- ship: heartbeat during long validation phase so stdout isn't silent ([#171](https://github.com/danielraffel/Shipyard/pull/171))
+
+<a id="v0280"></a>
 ## [0.28.0] - 2026-04-22
 
 - cli: surface target error_message under the run/ship summary table ([#170](https://github.com/danielraffel/Shipyard/pull/170))
@@ -342,6 +347,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.29.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.29.0
 [0.28.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.28.0
 [0.27.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.27.2
 [0.27.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.27.1
