@@ -3,11 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0262"></a>
+## [0.26.2] - 2026-04-22
+
+- fix/tailscale funnel probe retry ([#160](https://github.com/danielraffel/Shipyard/pull/160))
+- fix/install macos codesign refresh ([#159](https://github.com/danielraffel/Shipyard/pull/159))
+
 <a id="v0261"></a>
-## [0.27.0]
-
-## [0.26.2]
-
 ## [0.26.1] - 2026-04-22
 
 - fix/141 ssh probe backoff retry ([#158](https://github.com/danielraffel/Shipyard/pull/158))
@@ -316,6 +318,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.26.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.26.2
 [0.26.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.26.1
 [0.26.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.26.0
 [0.25.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.25.0
