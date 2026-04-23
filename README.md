@@ -149,6 +149,52 @@ binaries on 5 platforms when a version is tagged.
 
 ## FAQ
 
+### Where does each install method put the `shipyard` binary?
+
+All three user-facing install paths write the binary to the same
+place:
+
+| Method | Target |
+|---|---|
+| `curl … install.sh` (manual) | `~/.local/bin/shipyard` |
+| Claude Code plugin (auto-installs via `SessionStart` hook if needed) | `~/.local/bin/shipyard` |
+| Codex one-liner (same `install.sh`) | `~/.local/bin/shipyard` |
+
+`~/.local/bin` is the canonical location. Make sure it's on your
+`PATH` and every install method reaches the same binary. `sy` is a
+symlink that resolves to the same `shipyard` binary.
+
+Contributors building from source have two options — see
+[`docs/install.md`](docs/install.md): an **isolated venv install**
+for active development (dev build in the venv, system `shipyard`
+untouched) or **`pipx install .`** which lands at
+`~/.local/bin/shipyard` and overrides the released version.
+
+Project pinners that want a specific version should use
+`SHIPYARD_VERSION="v0.22.1" bash install.sh` — it lands at the same
+`~/.local/bin/shipyard`, no private toolchain dir required.
+
+### Can I install the Claude Code plugin after installing the CLI via the Codex one-liner?
+
+Yes, and you're meant to. The plugin deliberately defers to an
+existing CLI install: on first session its `check-cli.sh` hook runs
+`command -v shipyard` before doing anything else. If it finds a
+binary on `PATH` it skips the auto-install entirely. If it doesn't,
+it runs the same `install.sh` you'd have run by hand and lands at
+`~/.local/bin/shipyard`.
+
+Order doesn't matter. CLI first, then plugin → plugin detects the
+CLI, no duplicate. Plugin first, then CLI → the auto-installer did
+the work already. Both lead to one binary at the canonical location.
+
+### Will installing a newer shipyard via `install.sh` clobber a plugin-installed one (or vice versa)?
+
+Yes, by design. Both land at `~/.local/bin/shipyard` and the later
+install wins. The plugin's `SessionStart` hook doesn't re-install
+when it sees any `shipyard` on `PATH`, so a fresh manual install
+sticks until you explicitly run `install.sh` again. To check which
+version you're on at any moment: `shipyard --version`.
+
 ### Do I need to run `shipyard daemon` / enable live mode?
 
 No. The daemon is an optional optimization for realtime webhook updates. Without it, every shipyard command falls back to polling — behavior is identical to earlier versions. `shipyard run`, `ship`, `watch`, `auto-merge`, and the macOS app all work fine without the daemon.

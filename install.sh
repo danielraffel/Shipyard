@@ -2,47 +2,116 @@
 set -euo pipefail
 
 # Shipyard installer — downloads the correct binary for your platform.
+#
+# Environment variables (all optional):
+#
+#   SHIPYARD_VERSION   Install a specific version instead of the latest
+#                      release. Accepts "v0.22.1", "0.22.1", or "latest".
+#                      Default: "latest".
+#
+#   SHIPYARD_INSTALL_DIR
+#                      Where to place the binary + the `sy` symlink.
+#                      Default: "${HOME}/.local/bin".
+#
+#   SHIPYARD_DRY_RUN   When "1", resolve platform + version + install
+#                      dir, print them as KEY=value lines, and exit
+#                      without downloading or writing anything. Used
+#                      by the unit tests; harmless to use manually.
+#
+# Examples:
+#
+#   # Default: latest release to ~/.local/bin
+#   curl -fsSL https://generouscorp.com/Shipyard/install.sh | bash
+#
+#   # Pin to a specific version (useful for project-level pins):
+#   SHIPYARD_VERSION="v0.22.1" bash install.sh
+#
+#   # Install somewhere else (e.g. a project-private toolchain dir):
+#   SHIPYARD_INSTALL_DIR="${HOME}/.mytools/bin" bash install.sh
+#
+# The canonical install location is `${HOME}/.local/bin`; the Claude
+# Code plugin's auto-install hook, the Codex one-liner, and this
+# script all agree on that by default. Override only when you have a
+# good reason (e.g. a project wants versioned artifacts side-by-side).
 
 REPO="danielraffel/Shipyard"
-INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_DIR="${SHIPYARD_INSTALL_DIR:-${HOME}/.local/bin}"
+REQUESTED_VERSION="${SHIPYARD_VERSION:-latest}"
 
-# Detect OS
+# ── platform detection ──────────────────────────────────────────────
+
 case "$(uname -s)" in
     Darwin)  OS="macos" ;;
     Linux)   OS="linux" ;;
     MINGW*|MSYS*|CYGWIN*) OS="windows" ;;
     *)
-        echo "Unsupported OS: $(uname -s)"
+        echo "Unsupported OS: $(uname -s)" >&2
         exit 1
         ;;
 esac
 
-# Detect architecture
 case "$(uname -m)" in
     arm64|aarch64) ARCH="arm64" ;;
     x86_64|amd64)  ARCH="x64" ;;
     *)
-        echo "Unsupported architecture: $(uname -m)"
+        echo "Unsupported architecture: $(uname -m)" >&2
         exit 1
         ;;
 esac
 
 ARTIFACT="shipyard-${OS}-${ARCH}"
-echo "Detected platform: ${OS}-${ARCH}"
+if [ "${SHIPYARD_DRY_RUN:-0}" != "1" ]; then
+    echo "Detected platform: ${OS}-${ARCH}"
+fi
 
-# Get latest release URL
-RELEASE_URL=$(curl -sL "https://api.github.com/repos/${REPO}/releases/latest" \
+# ── version resolution ──────────────────────────────────────────────
+#
+# Accept "v0.22.1", "0.22.1", and "latest". Normalize to the tag name
+# GitHub's release API uses ("v0.22.1" / "latest").
+
+if [ "${REQUESTED_VERSION}" = "latest" ] || [ -z "${REQUESTED_VERSION}" ]; then
+    API_PATH="releases/latest"
+    VERSION_LABEL="latest"
+else
+    TAG="${REQUESTED_VERSION}"
+    # Allow "0.22.1" as shorthand for "v0.22.1".
+    case "${TAG}" in
+        v*) : ;;
+        *)  TAG="v${TAG}" ;;
+    esac
+    API_PATH="releases/tags/${TAG}"
+    VERSION_LABEL="${TAG}"
+fi
+
+# Dry-run short-circuit — print the resolved config and exit before
+# doing any network or filesystem work. Kept minimal + parseable
+# (KEY=value lines) for test assertions.
+if [ "${SHIPYARD_DRY_RUN:-0}" = "1" ]; then
+    echo "OS=${OS}"
+    echo "ARCH=${ARCH}"
+    echo "ARTIFACT=${ARTIFACT}"
+    echo "INSTALL_DIR=${INSTALL_DIR}"
+    echo "VERSION_LABEL=${VERSION_LABEL}"
+    echo "API_PATH=${API_PATH}"
+    exit 0
+fi
+
+echo "Resolving ${VERSION_LABEL} from ${REPO}..."
+
+# ── fetch release asset URL ─────────────────────────────────────────
+
+RELEASE_URL=$(curl -sL "https://api.github.com/repos/${REPO}/${API_PATH}" \
     | grep "browser_download_url.*${ARTIFACT}" \
     | head -1 \
     | cut -d '"' -f 4)
 
 if [ -z "${RELEASE_URL}" ]; then
-    echo "No binary found for ${ARTIFACT} in latest release."
-    echo "Check https://github.com/${REPO}/releases for available builds."
+    echo "No binary found for ${ARTIFACT} in ${VERSION_LABEL}." >&2
+    echo "Check https://github.com/${REPO}/releases for available builds." >&2
     exit 1
 fi
 
-echo "Downloading ${ARTIFACT}..."
+echo "Downloading ${ARTIFACT} (${VERSION_LABEL})..."
 mkdir -p "${INSTALL_DIR}"
 curl -sL "${RELEASE_URL}" -o "${INSTALL_DIR}/shipyard"
 chmod +x "${INSTALL_DIR}/shipyard"
@@ -68,7 +137,8 @@ if [ "${OS}" = "macos" ]; then
     fi
 fi
 
-# Create sy symlink
+# `sy` is the short-form alias that shipyard's packaging ships as an
+# entry point; mirror it with a symlink here so both names resolve.
 ln -sf "${INSTALL_DIR}/shipyard" "${INSTALL_DIR}/sy"
 
 echo ""
@@ -76,7 +146,8 @@ echo "Installed shipyard to ${INSTALL_DIR}/shipyard"
 echo "Symlink: ${INSTALL_DIR}/sy"
 echo ""
 
-# Check if install dir is in PATH
+# ── PATH hint ───────────────────────────────────────────────────────
+
 if ! echo "${PATH}" | tr ':' '\n' | grep -q "^${INSTALL_DIR}$"; then
     echo "Add ${INSTALL_DIR} to your PATH:"
     echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
