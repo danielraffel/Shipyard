@@ -168,13 +168,21 @@ class SSHWindowsExecutor:
                         f"Bundle upload failed: {upload_result.message}",
                     )
 
-                # Apply bundle via PowerShell on the remote
+                # Apply bundle via PowerShell on the remote. Pass
+                # the per-target log_file through so the raw stderr
+                # (including any CLIXML envelope) gets persisted
+                # before decode, even if bundle apply fails before
+                # the streaming/validation layer would normally
+                # start writing the log. #200: without this, a
+                # bundle-apply-time CLIXML leak leaves zero
+                # diagnostic artifact on disk.
                 apply_result = _apply_bundle_windows(
                     host=host,
                     bundle_path=remote_bundle,
                     repo_path=remote_repo,
                     ssh_options=ssh_options,
                     timeout=int(target_config.get("bundle_apply_timeout_secs", 1800)),
+                    log_file=log_file,
                 )
                 if not apply_result.success:
                     return _error_result(
@@ -524,6 +532,7 @@ def _apply_bundle_windows(
     repo_path: str,
     ssh_options: list[str],
     timeout: int = 1800,
+    log_file: Path | None = None,
 ) -> _ApplyResult:
     """Apply a git bundle on a remote Windows host via PowerShell.
 
@@ -544,6 +553,16 @@ def _apply_bundle_windows(
     upload_bundle) so `git bundle verify` + `git fetch` on a large
     repo doesn't get killed on slow Windows disks. The previous
     120s was too tight for anything with real history.
+
+    On failure, the raw stderr (CLIXML envelope + exit code) is
+    written to a sibling log file — ``<log_file>.bundle-apply-stderr``
+    — before attempting decode. #200: the CLIXML decoder was
+    already wired in (#189) but real bundle-apply failures on pulp
+    surfaced only the sentinel ``#< CLIXML`` with no body or log
+    artifact to analyze. Persisting raw stderr gives every
+    future failure a self-describing forensic record regardless of
+    whether the decoder hits a complete envelope, a truncated one,
+    or something that isn't CLIXML at all.
     """
     # Expand a relative bundle path against $HOME inside PowerShell.
     # Detecting "relative" on the Windows side is simpler than on
@@ -578,15 +597,43 @@ def _apply_bundle_windows(
             timeout=timeout,
         )
         if result.returncode != 0:
+            raw_stderr = result.stderr or ""
+            # Persist raw stderr BEFORE decode (#200). The previous
+            # comment here claimed the envelope was saved by the
+            # streaming layer, but bundle-apply failures happen
+            # before streaming/validation starts — no streaming
+            # capture ever runs, the envelope was lost. Now we
+            # write it next to where the target log would be and
+            # reference it in the error message so the user has a
+            # concrete artifact to inspect.
+            stderr_log_path: Path | None = None
+            if log_file is not None:
+                try:
+                    stderr_log_path = Path(str(log_file) + ".bundle-apply-stderr")
+                    stderr_log_path.parent.mkdir(parents=True, exist_ok=True)
+                    stderr_log_path.write_text(
+                        f"=== exit_code={result.returncode} ===\n"
+                        f"=== stderr (bytes={len(raw_stderr)}) ===\n"
+                        f"{raw_stderr}\n"
+                        f"=== stdout (bytes={len(result.stdout or '')}) ===\n"
+                        f"{result.stdout or ''}\n",
+                    )
+                except OSError:
+                    # Persisting the log is best-effort — the primary
+                    # failure path must not be hidden by a log-write
+                    # error. Fall through to the original error
+                    # message without the log reference.
+                    stderr_log_path = None
+
             # PowerShell relays stderr as a CLIXML envelope (#188).
-            # Decoded text names the actual cause; raw envelope is
-            # still preserved in the per-target log via the streaming
-            # capture earlier in the pipeline.
-            detail = maybe_decode_clixml(result.stderr.strip())
-            return _ApplyResult(
-                success=False,
-                message=f"Remote bundle apply failed: {detail}",
-            )
+            # Decoded text names the actual cause when the envelope
+            # is complete; falls back to raw when it's truncated or
+            # malformed (see #200 for the real-world truncation case).
+            detail = maybe_decode_clixml(raw_stderr.strip())
+            message = f"Remote bundle apply failed: {detail}"
+            if stderr_log_path is not None:
+                message += f" (raw stderr: {stderr_log_path})"
+            return _ApplyResult(success=False, message=message)
         return _ApplyResult(success=True, message="Bundle applied")
 
     except subprocess.TimeoutExpired:
