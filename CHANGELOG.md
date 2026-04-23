@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0340"></a>
+## [0.35.0]
+
 ## [0.34.0] - 2026-04-23
 
 - ci+release: --break-system-packages for Namespace macOS runners ([#191](https://github.com/danielraffel/Shipyard/pull/191))
