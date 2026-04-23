@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0340"></a>
+## [0.34.0] - 2026-04-23
+
+- ci+release: --break-system-packages for Namespace macOS runners ([#191](https://github.com/danielraffel/Shipyard/pull/191))
+- installer: SHIPYARD_VERSION + SHIPYARD_INSTALL_DIR env vars + canonical-location docs + FAQ ([#132](https://github.com/danielraffel/Shipyard/pull/132))
+
 <a id="v0330"></a>
 ## [0.33.0] - 2026-04-23
 
@@ -370,6 +376,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.34.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.34.0
 [0.33.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.33.0
 [0.32.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.32.0
 [0.31.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.31.0
