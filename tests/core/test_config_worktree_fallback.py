@@ -13,7 +13,7 @@ non-worktree layouts are unaffected.
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
+from pathlib import Path  # noqa: TC003 — used at runtime via pytest fixtures, not just annotations
 
 import pytest
 
@@ -106,3 +106,31 @@ def test_non_git_directory_returns_none_fallback(tmp_path: Path) -> None:
     )
     cfg = Config.load_from_cwd(tmp_path)
     assert cfg.get("project.name") == "test"
+
+
+def test_main_checkout_subdir_does_not_trigger_worktree_fallback(
+    main_repo: Path,
+) -> None:
+    """#178 regression. Running shipyard from a subdirectory of the
+    main checkout (e.g. ``repo/src/``) must *not* be mistaken for a
+    linked worktree. Pre-fix, ``_worktree_main_local_dir`` compared
+    ``main_checkout`` against the cwd; since ``repo/src`` != ``repo``,
+    it returned ``repo/.shipyard.local`` as a fallback without
+    loading ``repo/.shipyard/`` as the project overlay — a partial
+    config that surfaced as wrong ssh host or missing target.
+
+    Post-fix it compares against ``git rev-parse --show-toplevel``
+    (which is ``repo`` in both main-root and subdir cases), so the
+    subdir never trips the worktree branch.
+    """
+    from shipyard.core.config import _worktree_main_local_dir
+
+    subdir = main_repo / "src" / "nested"
+    subdir.mkdir(parents=True)
+
+    # With the fix: subdir is identified as "inside the main checkout"
+    # and no worktree fallback dir is returned.
+    assert _worktree_main_local_dir(subdir) is None, (
+        "subdir of the main checkout must not be treated as a "
+        "linked worktree; toplevel equals main_checkout"
+    )

@@ -200,53 +200,77 @@ class Config:
 
 
 def _worktree_main_local_dir(base: Path) -> Path | None:
-    """If `base` is a git worktree whose main checkout has a usable
-    `.shipyard.local/config.toml`, return that directory. Otherwise
-    `None`.
+    """If `base` is inside a *linked* git worktree whose main checkout
+    has a usable ``.shipyard.local/config.toml``, return that
+    directory. Otherwise ``None``.
 
-    The contract from `git worktree add`: the worktree's `.git` is a
-    file pointing at `<common>/worktrees/<name>`, and
-    `git rev-parse --git-common-dir` resolves to the original
-    checkout's `.git` directory. Going up one level from that gives
+    The contract from `git worktree add`: the linked worktree's
+    ``.git`` is a file pointing at ``<common>/worktrees/<name>``, and
+    ``git rev-parse --git-common-dir`` resolves to the original
+    checkout's ``.git`` directory. Going up one level from that gives
     the main checkout root, which is where the gitignored
-    `.shipyard.local/` lives.
+    ``.shipyard.local/`` lives.
 
     Bail quietly (return None) on:
     - base not in a git repo at all
     - git not on PATH
     - the "common dir" path doesn't resolve to a checkout with a
-      `.shipyard.local/config.toml`
-    - the base IS the main checkout (no fallback needed or wanted)
+      ``.shipyard.local/config.toml``
+    - the base IS (or is a subdir of) the main checkout (no fallback
+      needed — the main checkout's own ``.shipyard.local/`` was
+      already in the regular overlay search path)
+
+    The "subdir of the main checkout" case is #178: pre-fix, the
+    comparison was against ``base`` (cwd), not the repo toplevel, so
+    running shipyard from ``repo/src/`` falsely identified it as a
+    linked worktree and returned ``repo/.shipyard.local`` without
+    loading the matching ``repo/.shipyard/`` project overlay —
+    partial config, confusing downstream failures. Now we compare
+    against ``git rev-parse --show-toplevel`` so "inside the main
+    checkout" consistently returns None regardless of cwd depth.
     """
     import subprocess
 
-    try:
-        res = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=str(base),
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
+    def _git(args: list[str]) -> str | None:
+        try:
+            res = subprocess.run(
+                ["git", *args],
+                cwd=str(base),
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return None
+        if res.returncode != 0:
+            return None
+        return res.stdout.strip()
+
+    common_dir_str = _git(["rev-parse", "--git-common-dir"])
+    if common_dir_str is None:
         return None
-    if res.returncode != 0:
-        return None
-    common_dir = Path(res.stdout.strip())
+    common_dir = Path(common_dir_str)
     if not common_dir.is_absolute():
         common_dir = (base / common_dir).resolve()
     # Main checkout root is the parent of the .git directory that
     # git-common-dir points at.
     main_checkout = common_dir.parent
-    # Don't fall back to ourselves. If base's own .git resolves to
-    # the same common_dir, we ARE the main checkout and our own
-    # `.shipyard.local/` was already checked.
+
+    # Compare against the *current checkout's* toplevel, not against
+    # cwd. In a regular repo run from a subdir, show-toplevel
+    # equals main_checkout and we correctly bail. In a linked
+    # worktree, show-toplevel is the worktree root and differs from
+    # main_checkout, so the fallback fires.
+    toplevel_str = _git(["rev-parse", "--show-toplevel"])
+    if toplevel_str is None:
+        return None
     try:
-        if main_checkout.resolve() == base.resolve():
-            return None
+        if Path(toplevel_str).resolve() == main_checkout.resolve():
+            return None  # we're in (or under) the main checkout
     except OSError:
         return None
+
     candidate = main_checkout / ".shipyard.local"
     if (candidate / "config.toml").exists():
         return candidate
