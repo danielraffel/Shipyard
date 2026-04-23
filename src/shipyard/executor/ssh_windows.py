@@ -27,6 +27,7 @@ from typing import Any
 
 from shipyard.bundle.git_bundle import create_bundle, upload_bundle
 from shipyard.core.job import TargetResult, TargetStatus
+from shipyard.executor.clixml import maybe_decode_clixml
 from shipyard.executor.contract import evaluate_contract, required_markers
 from shipyard.executor.streaming import ProgressCallback, run_streaming_command
 from shipyard.executor.windows_toolchain import (
@@ -577,9 +578,14 @@ def _apply_bundle_windows(
             timeout=timeout,
         )
         if result.returncode != 0:
+            # PowerShell relays stderr as a CLIXML envelope (#188).
+            # Decoded text names the actual cause; raw envelope is
+            # still preserved in the per-target log via the streaming
+            # capture earlier in the pipeline.
+            detail = maybe_decode_clixml(result.stderr.strip())
             return _ApplyResult(
                 success=False,
-                message=f"Remote bundle apply failed: {result.stderr.strip()}",
+                message=f"Remote bundle apply failed: {detail}",
             )
         return _ApplyResult(success=True, message="Bundle applied")
 
@@ -793,7 +799,12 @@ def _error_result(
 
 
 def _extract_ssh_error(output: str) -> str | None:
-    for line in reversed(output.splitlines()):
+    # PowerShell wraps any stderr stream in a CLIXML envelope; the
+    # actual message lives inside. Decode before falling through to
+    # the bare-last-line heuristic so ssh_windows errors read the
+    # same as ssh ones under the summary table. See #188.
+    decoded = maybe_decode_clixml(output)
+    for line in reversed(decoded.splitlines()):
         if line.strip():
             return line.strip()
     return None
