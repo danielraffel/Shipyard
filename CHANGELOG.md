@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0320"></a>
+## [0.33.0]
+
 ## [0.32.0] - 2026-04-22
 
 - daemon: 24h forced reconcile window closes aged-terminal blind spot (#176) ([#182](https://github.com/danielraffel/Shipyard/pull/182))
