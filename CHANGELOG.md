@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0270"></a>
+## [0.27.1]
+
 ## [0.27.0] - 2026-04-22
 
 - feat/daemon tunnel supervisor ([#161](https://github.com/danielraffel/Shipyard/pull/161))
