@@ -581,6 +581,19 @@ def _apply_bundle_windows(
         # git fetch output and any non-ASCII bundle path.
         f"{_WINDOWS_UTF8_PRELUDE}"
         f"$Bundle = {resolved}; "
+        # #210: pre-verify the bundle exists at the resolved path
+        # before handing it to git. If the upload landed the file
+        # somewhere else (SSH session working-dir drift, relative-
+        # path mismatch, etc.), `git bundle verify` produces
+        # "error: could not open '...'" which arrives on stderr
+        # BEFORE PowerShell's CLIXML envelope starts, so the decoder
+        # has nothing to extract and the user saw only `#< CLIXML`.
+        # Pre-check surfaces a clean diagnostic naming the exact
+        # expected path.
+        f"if (-not (Test-Path -LiteralPath $Bundle)) {{ "
+        f"Write-Error \"shipyard: bundle file not found at $Bundle \"\""
+        f"(expected after scp/ssh upload; check upload step logs)\"; "
+        f"exit 1 }}; "
         f"cd '{safe_repo}'; "
         f"git bundle verify $Bundle; "
         f"if ($LASTEXITCODE -ne 0) {{ exit 1 }}; "

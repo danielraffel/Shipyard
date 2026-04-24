@@ -141,14 +141,41 @@ def upload_bundle(
     )
 
     if is_windows:
-        # PowerShell binary-safe stdin → file:
-        # $input is the automatic pipeline variable for stdin bytes.
-        # [System.IO.File]::WriteAllBytes reads from stdin via
-        # [Console]::OpenStandardInput().
+        # PowerShell binary-safe stdin → file.
+        #
+        # #210: resolve relative `remote_path` against `$HOME` inside
+        # the PS script before creating the file. Otherwise the file
+        # lands in whatever directory OpenSSH's server spawned the
+        # shell in (SSHD default = $HOME, but various configs
+        # deviate) and the apply step — which Join-Paths against
+        # $HOME explicitly — then fails with "could not open" because
+        # the two sides disagree on what the "relative" base is.
+        # Anchoring at $HOME on both sides makes the bundle location
+        # deterministic regardless of SSHD config.
+        #
+        # We detect "relative" cheaply on the Python side: no drive
+        # letter (`X:`) and no leading backslash. The PS-side
+        # `[System.IO.Path]::IsPathRooted` would be more correct but
+        # requires more plumbing.
+        is_rooted = (
+            len(remote_path) >= 2 and remote_path[1] == ":"
+        ) or remote_path.startswith("\\")
+        if is_rooted:
+            resolved_dest = f"'{remote_path}'"
+        else:
+            # PS single-quote string → no escape needed for ordinary
+            # filenames; reject anything with a quote just in case a
+            # caller's path is adversarial.
+            if "'" in remote_path:
+                return BundleResult(
+                    success=False,
+                    message=f"Refusing single-quoted remote_path: {remote_path!r}",
+                )
+            resolved_dest = f"(Join-Path $HOME '{remote_path}')"
         ps_script = (
-            f"$bytes = [System.IO.Stream]::Null;"
+            f"$Dest = {resolved_dest};"
             f"$stdin = [Console]::OpenStandardInput();"
-            f"$fs = [System.IO.File]::Create('{remote_path}');"
+            f"$fs = [System.IO.File]::Create($Dest);"
             f"$stdin.CopyTo($fs);"
             f"$fs.Close();"
             f"$stdin.Close()"

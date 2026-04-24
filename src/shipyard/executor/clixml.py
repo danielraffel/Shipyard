@@ -62,14 +62,64 @@ def maybe_decode_clixml(text: str) -> str:
     Never raises — malformed CLIXML falls back to the original text
     so callers' existing error surfaces keep working on partial or
     non-standard envelopes.
+
+    Text that appears *before* the CLIXML sentinel is also surfaced
+    (#210). PowerShell's progress-stream CLIXML can arrive AFTER
+    unrelated stderr lines written by child processes (git, cmake,
+    ctest, etc.) — those pre-sentinel bytes used to be dropped
+    because the decoder started at the sentinel. Now they're
+    prefixed to the decoded envelope (or returned alone if the
+    envelope body is empty), so "error: could not open '...'"
+    style messages survive even when wrapped in a later CLIXML
+    progress object.
     """
-    if not is_clixml(text):
+    # Fast path: no sentinel anywhere → plain text, nothing to do.
+    # If the sentinel IS present (whether at the start or mid-string
+    # after pre-sentinel stderr), fall through to _split_and_decode.
+    if not is_clixml(text) and _CLIXML_SENTINEL not in text:
         return text
     try:
-        decoded = _decode(text)
+        prefix, decoded = _split_and_decode(text)
     except (ET.ParseError, ValueError):
         return text
-    return decoded or text
+    # Join pre-sentinel text and decoded body; either can be empty.
+    parts = [p for p in (prefix.strip(), decoded.strip()) if p]
+    joined = "\n".join(parts)
+    return joined or text
+
+
+def _split_and_decode(text: str) -> tuple[str, str]:
+    """Return ``(pre_sentinel_text, decoded_envelope)``.
+
+    Split on the first occurrence of ``#< CLIXML``; decode everything
+    after as one-or-more ``<Objs>…</Objs>`` documents. Pre-sentinel
+    text is returned verbatim. Either half may be empty.
+    """
+    idx = text.find(_CLIXML_SENTINEL)
+    if idx < 0:
+        return (text, "")
+    prefix = text[:idx]
+    xml_blob = text[idx + len(_CLIXML_SENTINEL):].lstrip()
+
+    messages: list[str] = []
+    for obj_doc in _split_objs(xml_blob):
+        messages.extend(_extract_messages(obj_doc))
+    if not messages:
+        return (prefix, "")
+
+    deduped: list[str] = []
+    for m in messages:
+        stripped = m.strip()
+        if not stripped:
+            continue
+        if deduped and deduped[-1] == stripped:
+            continue
+        deduped.append(stripped)
+
+    joined = "\n".join(deduped)
+    if len(joined) > _MAX_DECODED_CHARS:
+        joined = "…" + joined[-(_MAX_DECODED_CHARS - 1):]
+    return (prefix, joined)
 
 
 def _decode(text: str) -> str:
