@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0380"></a>
+## [0.38.0] - 2026-04-23
+
+- ssh-windows: prepend UTF-8 code-page prelude to PS commands (#208) ([#209](https://github.com/danielraffel/Shipyard/pull/209))
+
 <a id="v0370"></a>
 ## [0.37.0] - 2026-04-23
 
@@ -395,6 +400,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.38.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.38.0
 [0.37.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.37.0
 [0.36.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.36.0
 [0.35.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.35.0
