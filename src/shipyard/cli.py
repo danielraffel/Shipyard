@@ -3797,7 +3797,17 @@ def _watch_signature(state: ShipState) -> str:
     even when no target transitioned) but includes phase and the
     truncated heartbeat timestamp so a phase transition or a fresh
     heartbeat triggers a redraw.
+
+    Per-run ``stuck_queued`` flag is folded in (Codex P1 on #206):
+    a run that sits in a queued-family status with no other
+    transition still needs the signature to flip when it crosses
+    the stuck threshold, otherwise ``watch --follow`` never
+    re-emits and the user never sees the ``stuck-queued`` marker
+    appear — the exact failure mode the #190 feature is supposed
+    to surface.
     """
+    now = datetime.now(timezone.utc)
+    threshold = _stuck_queued_threshold_secs()
     parts = [
         f"pr={state.pr}",
         f"sha={state.head_sha}",
@@ -3807,7 +3817,8 @@ def _watch_signature(state: ShipState) -> str:
         ),
         "runs=" + ",".join(
             f"{r.target}:{r.status}:{r.run_id}:{r.phase or ''}:"
-            f"{r.last_heartbeat_at.isoformat() if r.last_heartbeat_at else ''}"
+            f"{r.last_heartbeat_at.isoformat() if r.last_heartbeat_at else ''}:"
+            f"sq={'1' if _is_stuck_queued(r, now, threshold) else '0'}"
             for r in sorted(state.dispatched_runs, key=lambda r: r.target)
         ),
     ]

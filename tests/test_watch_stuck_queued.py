@@ -19,8 +19,9 @@ from shipyard.cli import (
     _is_stuck_queued,
     _queued_for_secs,
     _stuck_queued_threshold_secs,
+    _watch_signature,
 )
-from shipyard.core.ship_state import DispatchedRun
+from shipyard.core.ship_state import DispatchedRun, ShipState
 
 
 def _run(status: str, age_secs: int) -> DispatchedRun:
@@ -99,3 +100,84 @@ def test_waiting_and_pending_statuses_also_qualify() -> None:
     for status in ("queued", "pending", "waiting"):
         assert _queued_for_secs(_run(status, 500), now) is not None
         assert _is_stuck_queued(_run(status, 500), now, threshold=60.0) is True
+
+
+# -- Codex P1 follow-up on #206 -------------------------------------
+# `watch --follow` only re-renders when `_watch_signature` changes.
+# Stuck-queued is time-based: a run that stays `queued` with no
+# transition will never flip the signature under the pre-fix
+# composition (which folded only status/phase/heartbeat). The exact
+# failure mode #190 is supposed to catch — saturated Namespace
+# queue, no other state change — thus stayed silent under --follow.
+# These tests lock in that the signature now flips at threshold
+# crossing and stays stable on either side of it.
+
+def _ship_state_with(runs: list[DispatchedRun]) -> ShipState:
+    return ShipState(
+        pr=1,
+        repo="x/y",
+        branch="b",
+        base_branch="main",
+        head_sha="abc",
+        policy_signature="p",
+        dispatched_runs=runs,
+    )
+
+
+def test_signature_flips_when_run_crosses_stuck_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # One queued run, 400s old. With threshold=600s it's not stuck
+    # (sq=0); with threshold=300s it is (sq=1). No other state
+    # changes between the two captures — only the threshold moved —
+    # but the signature MUST differ so watch --follow re-emits.
+    run = _run("queued", 400)
+    state = _ship_state_with([run])
+
+    monkeypatch.setenv("SHIPYARD_STUCK_QUEUED_THRESHOLD_SECS", "600")
+    sig_before = _watch_signature(state)
+
+    monkeypatch.setenv("SHIPYARD_STUCK_QUEUED_THRESHOLD_SECS", "300")
+    sig_after = _watch_signature(state)
+
+    assert sig_before != sig_after, (
+        "signature must flip on threshold crossing; "
+        f"got identical {sig_before!r}"
+    )
+    assert "sq=0" in sig_before
+    assert "sq=1" in sig_after
+
+
+def test_signature_stable_when_both_runs_stay_sub_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two sub-threshold captures in a row must produce the same
+    # signature — we only want re-emit on the crossing event, not
+    # on every watch loop. Threshold held high on both sides.
+    run = _run("queued", 100)
+    state = _ship_state_with([run])
+
+    monkeypatch.setenv("SHIPYARD_STUCK_QUEUED_THRESHOLD_SECS", "600")
+    sig_a = _watch_signature(state)
+    sig_b = _watch_signature(state)
+
+    assert sig_a == sig_b
+    assert "sq=0" in sig_a
+
+
+def test_signature_stable_after_both_runs_already_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Symmetric to the sub-threshold case: once a run is stuck,
+    # successive captures at the same threshold must not churn the
+    # signature. Otherwise --follow would re-emit on every poll
+    # for a long-stuck run, which is the opposite failure.
+    run = _run("queued", 900)
+    state = _ship_state_with([run])
+
+    monkeypatch.setenv("SHIPYARD_STUCK_QUEUED_THRESHOLD_SECS", "300")
+    sig_a = _watch_signature(state)
+    sig_b = _watch_signature(state)
+
+    assert sig_a == sig_b
+    assert "sq=1" in sig_a
