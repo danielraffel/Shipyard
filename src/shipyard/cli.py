@@ -3894,6 +3894,58 @@ def _run_elapsed_secs(run: DispatchedRun, now: datetime) -> int:
     return max(0, int((now - run.started_at).total_seconds()))
 
 
+# Statuses that mean "GitHub accepted the dispatch but no runner
+# picked it up yet." Used by `_is_stuck_queued` to annotate runs that
+# have been parked longer than ``_stuck_queued_threshold_secs()`` —
+# the scheduler-side stall pattern documented in #190.
+_QUEUED_STATUSES = frozenset({"queued", "pending", "waiting"})
+
+
+def _stuck_queued_threshold_secs() -> float:
+    """Threshold past which a `queued`-status run is flagged as stuck.
+
+    Tunable via ``SHIPYARD_STUCK_QUEUED_THRESHOLD_SECS``. Default 300s
+    (5 min) — generous enough that ordinary GitHub Actions queue
+    warm-up doesn't trigger it, tight enough to catch the 15-min+
+    stalls we saw on 2026-04-23 when Namespace's Windows profile
+    saturated (see #193 for the concrete incident, #190 for the
+    filed feature request).
+    """
+    import os
+
+    raw = os.environ.get("SHIPYARD_STUCK_QUEUED_THRESHOLD_SECS")
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 300.0
+
+
+def _queued_for_secs(run: DispatchedRun, now: datetime) -> int | None:
+    """Seconds since dispatch iff the run is still in a queued-family
+    status. Returns None once the run has left the queue (any other
+    status)."""
+    if run.status.lower() not in _QUEUED_STATUSES:
+        return None
+    return _run_elapsed_secs(run, now)
+
+
+def _is_stuck_queued(run: DispatchedRun, now: datetime, threshold: float) -> bool:
+    qs = _queued_for_secs(run, now)
+    return qs is not None and qs >= threshold
+
+
+def _format_stuck_queued_duration(secs: int) -> str:
+    """Human-readable queue-time marker for the watch line."""
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    hours, rem = divmod(secs, 3600)
+    return f"{hours}h{rem // 60}m"
+
+
 def _progress_summary(state: ShipState) -> tuple[int, int, int]:
     total = len(state.dispatched_runs)
     complete = 0
@@ -3940,11 +3992,19 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
         if rec.sha == state.head_sha and rec.reused_from:
             reuse_map[target] = rec.reused_from
 
+    stuck_queued_threshold = _stuck_queued_threshold_secs()
     if ctx.json_mode:
         dispatched: list[dict[str, Any]] = []
         for run in state.dispatched_runs:
             entry = run.to_dict()
             entry["elapsed_seconds"] = _run_elapsed_secs(run, now)
+            # #190: surface queue-time on queued runs so machine
+            # consumers can flag scheduler-side stalls. `None` when
+            # the run has left the queue — stable schema.
+            entry["queued_for_secs"] = _queued_for_secs(run, now)
+            entry["stuck_queued"] = _is_stuck_queued(
+                run, now, stuck_queued_threshold,
+            )
             dispatched.append(entry)
         evidence_out: dict[str, dict[str, Any] | str] = {}
         for target, status in state.evidence_snapshot.items():
@@ -4029,6 +4089,18 @@ def _emit_watch_event(ctx: Context, state: ShipState) -> None:
         )
         if is_stale:
             line += "  " + _style("stale", "bold magenta", enabled=color)
+        # #190: annotate runs that have been parked in a queued-family
+        # status past the configured threshold. The `stale` marker
+        # above covers "run started but heartbeat went silent"; this
+        # one covers "run never got a runner at all" — different
+        # failure modes, different remediations.
+        if _is_stuck_queued(run, now, stuck_queued_threshold):
+            qs = _queued_for_secs(run, now) or 0
+            line += "  " + _style(
+                f"stuck-queued {_format_stuck_queued_duration(qs)}",
+                "bold yellow",
+                enabled=color,
+            )
         render_message(line)
 
 
