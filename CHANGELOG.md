@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0390"></a>
+## [0.40.0]
+
 ## [0.39.0] - 2026-04-23
 
 - ssh-windows: fix bundle-open path mismatch + pre-sentinel stderr decode (#210) ([#211](https://github.com/danielraffel/Shipyard/pull/211))

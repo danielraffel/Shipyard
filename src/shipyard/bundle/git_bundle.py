@@ -153,13 +153,24 @@ def upload_bundle(
         # Anchoring at $HOME on both sides makes the bundle location
         # deterministic regardless of SSHD config.
         #
-        # We detect "relative" cheaply on the Python side: no drive
-        # letter (`X:`) and no leading backslash. The PS-side
-        # `[System.IO.Path]::IsPathRooted` would be more correct but
-        # requires more plumbing.
+        # Contract must match `_is_windows_absolute_path` in
+        # `executor/ssh_windows.py` — apply-side uses that predicate
+        # to decide whether to quote the bundle path as-is or join
+        # it to $HOME. If upload and apply disagree on what counts as
+        # "absolute," slash-prefixed paths like `/tmp/x.bundle` get
+        # written to `$HOME/tmp/x.bundle` on upload but read from
+        # `/tmp/x.bundle` on apply, reproducing the exact #210 bug
+        # for a different path shape (Codex P1 on #211).
         is_rooted = (
-            len(remote_path) >= 2 and remote_path[1] == ":"
-        ) or remote_path.startswith("\\")
+            remote_path.startswith("\\\\")
+            or remote_path.startswith("\\")
+            or remote_path.startswith("/")
+            or (
+                len(remote_path) >= 2
+                and remote_path[1] == ":"
+                and remote_path[0].isalpha()
+            )
+        )
         if is_rooted:
             resolved_dest = f"'{remote_path}'"
         else:
