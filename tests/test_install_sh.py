@@ -38,6 +38,29 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO_ROOT / "install.sh"
 
 
+def _platform_artifact_name() -> str:
+    """Return the shipyard-<os>-<arch> artifact name for the current
+    host, matching install.sh's ARTIFACT computation.
+
+    Used by tests that shim curl: the fake release URL's filename
+    must match the ARTIFACT regex install.sh greps against, and
+    that's computed from ``uname`` at run time. Hardcoding
+    ``shipyard-macos-arm64`` in the test breaks on Linux CI.
+    """
+    osname = "linux"
+    if sys.platform == "darwin":
+        osname = "macos"
+    elif sys.platform == "win32":
+        osname = "windows"
+    import platform as _platform
+    machine = _platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        arch = "arm64"
+    else:
+        arch = "x64"
+    return f"shipyard-{osname}-{arch}"
+
+
 def _run_dry(env: dict[str, str] | None = None) -> dict[str, str]:
     """Run install.sh in dry-run mode; parse KEY=value output."""
     merged_env = {**os.environ, "SHIPYARD_DRY_RUN": "1"}
@@ -673,10 +696,10 @@ def test_install_sh_force_reinstall_overrides_idempotency(tmp_path: Path) -> Non
     existing.write_text("#!/bin/sh\necho 'shipyard, version 0.46.0'\n")
     existing.chmod(0o755)
 
-    # The "release asset" the shim points at must have a filename
-    # that matches install.sh's ARTIFACT regex (shipyard-<os>-<arch>).
-    # Use the local binary renamed to that shape.
-    asset_src = tmp_path / "shipyard-macos-arm64"
+    # The "release asset" must match install.sh's ARTIFACT regex
+    # (`shipyard-<os>-<arch>`). Derive the name from the test
+    # host's uname so this works on Linux CI + macOS dev alike.
+    asset_src = tmp_path / _platform_artifact_name()
     asset_src.write_text("#!/bin/sh\necho 'shipyard, version 0.46.0'\n")
     asset_src.chmod(0o755)
 
@@ -728,7 +751,7 @@ def test_install_sh_idempotency_skipped_for_latest(tmp_path: Path) -> None:
     existing.write_text("#!/bin/sh\necho 'shipyard, version 0.46.0'\n")
     existing.chmod(0o755)
 
-    asset_src = tmp_path / "shipyard-macos-arm64"
+    asset_src = tmp_path / _platform_artifact_name()
     asset_src.write_text("#!/bin/sh\necho 'shipyard, version 0.46.0'\n")
     asset_src.chmod(0o755)
 
