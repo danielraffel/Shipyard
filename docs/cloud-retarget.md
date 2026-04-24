@@ -103,11 +103,31 @@ Or run in parallel with `xargs -P` for faster propagation.
 
 ## Authentication
 
-Cancelling an individual job requires `gh api -X POST
-/repos/:owner/:repo/actions/jobs/:id/cancel`, which needs
-`actions:write` on the PAT `gh` is authenticated with. If your gh
-token lacks that scope, `cloud retarget` reports a clear message and
-exits 1 without attempting the dispatch half.
+Cancelling a workflow run uses `gh api -X POST
+/repos/:owner/:repo/actions/runs/:id/cancel` (the run-level endpoint
+GitHub exposes; `gh run cancel` wraps the same path). It needs the
+**`workflow` scope** on the PAT `gh` is authenticated with — GitHub's
+short name for `actions:write` on classic PATs, or **Actions: Read
+and write** on fine-grained tokens.
+
+If your gh token lacks that scope, `cloud retarget` reports a clear
+message and exits 1 without attempting the dispatch half:
+
+```
+error: Couldn't cancel the matching job(s). Your gh token may lack
+`actions:write` scope.
+```
+
+The fix is a one-liner for the common case: `gh auth refresh
+-h github.com -s workflow`. For fine-grained tokens and
+GitHub-App-backed identities (bots, `RELEASE_BOT_TOKEN`,
+`pulp-release-bot`, etc.), see [docs/install.md § First-run
+auth](install.md#first-run-auth) for where the scope actually lives
+per identity shape.
+
+`shipyard doctor` probes for the scope under the `Core` section
+(`gh-scope`); if it shows `✗`, you know to run the refresh before
+the next retarget.
 
 ## JSON mode
 
