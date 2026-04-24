@@ -23,7 +23,7 @@
 # this we'd have caught v0.42.0 before it shipped.
 #
 # Usage:
-#   ./scripts/release-macos-local.sh [--tag vX.Y.Z] [--upload]
+#   ./scripts/release-macos-local.sh [--tag vX.Y.Z] [--upload] [--ci-mode]
 #
 # Env vars required for notarization:
 #   SHIPYARD_NOTARIZE_APPLE_ID           (Apple ID email)
@@ -37,6 +37,15 @@
 #   --upload       Upload the signed+tested asset to the GitHub release
 #                  for --tag. Without this, the script only builds and
 #                  verifies — useful for diagnosing without shipping.
+#   --ci-mode      Run in the GH Actions CI-signing experiment path
+#                  (#226). Mount-test becomes a warning instead of a
+#                  hard fail (hosted macOS runners sometimes can't
+#                  mount a freshly-signed dmg from the same process).
+#                  Draft-flip + end-to-end install.sh check are both
+#                  skipped; the maintainer's local (non-ci-mode)
+#                  invocation is the gate that flips public after
+#                  cross-machine verify.
+#
 #   (Intel Mac support was dropped in v0.50.0 per #256; arm64 only.)
 #
 # Exit codes:
@@ -56,6 +65,7 @@ set -euo pipefail
 ARCH="arm64"
 TAG=""
 DO_UPLOAD=0
+CI_MODE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -73,6 +83,20 @@ while [ $# -gt 0 ]; do
             fi
             shift 2 ;;
         --upload) DO_UPLOAD=1; shift ;;
+        --ci-mode)
+            # #226: CI-signing experiment. When set:
+            #   - Step 6 (mount + launch test) runs but doesn't fail
+            #     the run on mount errors — CI macOS runners sometimes
+            #     can't mount freshly-signed dmgs from the same process.
+            #   - Step 8 (draft flip) is SKIPPED — CI runs don't have
+            #     the authoritative "E2E passed on a different Mac"
+            #     signal that the local flow gets. Publishing is the
+            #     maintainer's decision after a cross-machine verify.
+            #   - Step 9 (e2e install.sh) is SKIPPED — meaningless on
+            #     the same runner that just produced the dmg. A
+            #     separate workflow / local invocation does this on a
+            #     different machine.
+            CI_MODE=1; shift ;;
         -h|--help)
             sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# //; s/^#//'
             exit 0
@@ -228,11 +252,25 @@ MOUNT_POINT="$(mktemp -d)/mnt"
 # /Volumes/ looking for the right volume.
 if ! hdiutil attach -nobrowse -readonly \
         -mountpoint "$MOUNT_POINT" "$DIST_DMG" >/dev/null; then
-    echo "ERROR: could not mount DMG." >&2
-    exit 1
+    # #226: in --ci-mode, a mount failure on the same runner that
+    # just signed the dmg is a known-limitation of hosted macOS
+    # environments rather than a broken artifact. The proper
+    # verification happens on a different Mac post-upload; surface
+    # the mount-fail as a warning and proceed to upload.
+    if [ "$CI_MODE" -eq 1 ]; then
+        echo "  ⚠ DMG mount failed on CI runner (known hosted-runner limitation);" >&2
+        echo "    skipping launch test. The real verification happens on a" >&2
+        echo "    different Mac via install.sh after upload." >&2
+        MOUNT_POINT=""
+    else
+        echo "ERROR: could not mount DMG." >&2
+        exit 1
+    fi
 fi
-trap 'hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true' EXIT
-if ! OUTPUT=$("$MOUNT_POINT/shipyard" --version 2>&1); then
+if [ -n "$MOUNT_POINT" ]; then
+    trap 'hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true' EXIT
+fi
+if [ -n "$MOUNT_POINT" ] && ! OUTPUT=$("$MOUNT_POINT/shipyard" --version 2>&1); then
     echo "" >&2
     echo "ERROR: LOCAL LAUNCH TEST FAILED from mounted DMG." >&2
     echo "       DMG: $DIST_DMG" >&2
@@ -257,12 +295,16 @@ if ! OUTPUT=$("$MOUNT_POINT/shipyard" --version 2>&1); then
     hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
     exit 3
 fi
-echo "  ✓ --version printed: ${OUTPUT}"
+if [ -n "$MOUNT_POINT" ]; then
+    echo "  ✓ --version printed: ${OUTPUT}"
+fi
 
 # Detach the DMG before further work — the mount is no longer
 # needed and leaving it attached confuses the later e2e step
 # which mounts a freshly-downloaded copy.
-hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
+if [ -n "$MOUNT_POINT" ]; then
+    hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
+fi
 trap - EXIT
 
 # ── Upload (opt-in) ────────────────────────────────────────────────
@@ -349,7 +391,18 @@ if [ "$DO_UPLOAD" -eq 1 ]; then
         exit 0
     fi
 
-    if [ "$WAS_DRAFT" -eq 1 ]; then
+    # #226: --ci-mode never flips the release to public. The CI
+    # runner can verify its own build, but can't verify a fresh
+    # install.sh download on an independent Mac — which is the
+    # load-bearing rule per #219/CLAUDE.md. Publishing stays with
+    # the maintainer's hand-run of the script in --local mode.
+    if [ "$CI_MODE" -eq 1 ]; then
+        echo "Step 8/9: Skipping draft flip (--ci-mode)."
+        echo "         Release $TAG stays draft; maintainer's local"
+        echo "         invocation of this script (no --ci-mode) is"
+        echo "         the gate that flips it public after verifying"
+        echo "         the CI-signed dmg on a different Mac."
+    elif [ "$WAS_DRAFT" -eq 1 ]; then
         echo "Step 8/9: All expected macOS dmgs present; flipping release"
         echo "         $TAG from draft to published..."
         gh release edit "$TAG" --draft=false >/dev/null
@@ -357,6 +410,22 @@ if [ "$DO_UPLOAD" -eq 1 ]; then
         echo "  ✓ Release $TAG is now public."
     else
         echo "Step 8/9: Release $TAG is already public (skipping draft flip)."
+    fi
+
+    # #226: skip E2E in CI mode. Running install.sh on the runner
+    # that just produced the dmg tests nothing meaningful — the
+    # whole point of E2E is "does a fresh, different machine
+    # succeed." A separate local invocation (no --ci-mode) is
+    # what actually exercises that path.
+    if [ "$CI_MODE" -eq 1 ]; then
+        echo "Step 9/9: E2E verification SKIPPED (--ci-mode)."
+        echo ""
+        echo "═══ CI build done. Run scripts/release-macos-local.sh"
+        echo "    --tag $TAG  (no --ci-mode) on a different Mac to"
+        echo "    flip the release public after the cross-machine"
+        echo "    install.sh check. ═══"
+        echo ""
+        exit 0
     fi
 
     # ── End-to-end verification (#55 codification) ─────────────────

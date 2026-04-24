@@ -246,6 +246,64 @@ def test_install_sh_rejects_intel_mac_cleanly() -> None:
     assert '$OS" = "macos"' in content and '$ARCH" = "x64"' in content
 
 
+def test_ci_mode_skips_publish_and_e2e() -> None:
+    # #226: the CI-signing experiment workflow invokes this script
+    # with --ci-mode. That mode MUST NOT flip the release public and
+    # MUST skip the E2E install.sh check — the load-bearing rule
+    # per #219/CLAUDE.md is cross-machine verification (the dmg runs
+    # cleanly on a Mac OTHER than the one that signed it), and that
+    # only exists via the maintainer's local invocation.
+    content = SCRIPT.read_text()
+    # --ci-mode flag must exist and parse into a CI_MODE variable.
+    assert "--ci-mode)" in content
+    assert "CI_MODE=1" in content
+    # Step 8 must have a CI_MODE branch that skips the draft flip.
+    # Grep the logical block to avoid brittle string matching.
+    step8_pos = content.find("# #226: --ci-mode never flips")
+    assert step8_pos != -1, (
+        "step 8 must have an explicit #226 branch that keeps the "
+        "release in draft under --ci-mode"
+    )
+    # Step 9 must also have a CI_MODE branch that skips E2E.
+    assert 'CI_MODE" -eq 1' in content
+    # Help text must describe --ci-mode so operators/wrappers can
+    # discover it.
+    assert "CI-signing experiment path" in content
+
+
+def test_release_yml_has_ci_signing_job() -> None:
+    # #226: a sign-and-upload-macos job must exist, gated on the
+    # CI_MACOS_SIGNING_ENABLED repo variable so it's opt-in during
+    # the experiment. Don't accidentally enable it by default — the
+    # 3-condition verification (two different Macs) has to land first.
+    release_yml = REPO_ROOT / ".github" / "workflows" / "release.yml"
+    content = release_yml.read_text()
+    assert "sign-and-upload-macos:" in content, (
+        "release.yml must define the #226 CI-signing job"
+    )
+    assert "vars.CI_MACOS_SIGNING_ENABLED == 'true'" in content, (
+        "CI-signing must be gated on the repo variable so it's "
+        "opt-in, not default"
+    )
+    # Job must invoke the script with --ci-mode so publish/E2E are
+    # skipped (cross-machine gate stays with maintainer).
+    assert "--ci-mode" in content
+    # Must use the ephemeral-keychain + delete-keychain pattern so
+    # the cert isn't persisted on the runner past the job.
+    assert "security create-keychain" in content
+    assert "security delete-keychain" in content
+    # Secret names documented in #226's experiment plan must all be
+    # referenced so a typo can't silently pass the gate.
+    for secret in (
+        "MACOS_SIGN_P12_BASE64",
+        "MACOS_SIGN_P12_PASSWORD",
+        "MACOS_NOTARIZE_APPLE_ID",
+        "MACOS_NOTARIZE_APP_PASSWORD",
+        "MACOS_NOTARIZE_TEAM_ID",
+    ):
+        assert secret in content, f"secret {secret} not referenced"
+
+
 def test_intel_guard_runs_after_version_resolution() -> None:
     # Codex P1 on #257: if the Intel guard fires BEFORE version
     # resolution, users who explicitly pinned to a pre-drop tag that

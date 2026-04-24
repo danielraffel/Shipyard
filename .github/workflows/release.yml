@@ -350,3 +350,78 @@ jobs:
           # release-macos-local.sh's final step flips draft=false
           # once the dmg passes the end-to-end install check.
           draft: true
+
+  # ── #226: CI-signing experiment ───────────────────────────────────
+  # Gated on repo variable `CI_MACOS_SIGNING_ENABLED == 'true'`.
+  # Absent / false → this job is a no-op (conditional skips the whole
+  # job, no minutes burned). When enabled, runs the full sign +
+  # notarize + staple + upload pipeline on a Namespace macOS runner
+  # and attaches the dmg to the draft release. Does NOT flip the
+  # release public — the maintainer's local invocation remains the
+  # load-bearing cross-machine verification gate per #219/CLAUDE.md.
+  # The hypothesis (#226): CI-signing failed pre-v0.44 because we
+  # shipped bare Mach-O that depended on Apple's flaky online
+  # notarization check; stapled .dmg verifies offline so that failure
+  # mode shouldn't recur. Two consecutive healthy releases confirm or
+  # disprove it.
+  sign-and-upload-macos:
+    needs: [resolve-runners, release]
+    if: startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
+    runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv + PyInstaller
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --frozen
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Import Developer ID signing identity
+        env:
+          SIGN_P12_B64: ${{ secrets.MACOS_SIGN_P12_BASE64 }}
+          SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+        run: |
+          # Create an ephemeral keychain that only this job can see,
+          # import the cert, unlock, add key-partition ACL so codesign
+          # can use it non-interactively. Kept in a unique-named
+          # keychain so concurrent runs + the cleanup step don't race.
+          KEYCHAIN="ci-sign-$GITHUB_RUN_ID.keychain-db"
+          security create-keychain -p ci "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p ci "$KEYCHAIN"
+          # 6h timeout so a long notarization step doesn't hit a lock.
+          security set-keychain-settings -t 21600 -u "$KEYCHAIN"
+          echo "$SIGN_P12_B64" | base64 -d > /tmp/cert.p12
+          security import /tmp/cert.p12 -k "$KEYCHAIN" \
+            -P "$SIGN_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f /tmp/cert.p12
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN"
+          IDENTITY_SHA=$(security find-identity -p codesigning -v "$KEYCHAIN" \
+            | awk '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$IDENTITY_SHA" ]; then
+            echo "ERROR: no Developer ID Application identity in keychain." >&2
+            exit 1
+          fi
+          echo "IDENTITY_SHA=$IDENTITY_SHA" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Sign + notarize + staple + upload
+        env:
+          SHIPYARD_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          SHIPYARD_NOTARIZE_APP_PASSWORD: ${{ secrets.MACOS_NOTARIZE_APP_PASSWORD }}
+          SHIPYARD_NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZE_TEAM_ID }}
+          SHIPYARD_SIGNING_IDENTITY: ${{ env.IDENTITY_SHA }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./scripts/release-macos-local.sh \
+            --tag ${{ github.ref_name }} \
+            --upload \
+            --ci-mode
+
+      - name: Delete ephemeral signing keychain
+        if: always() && env.SIGNING_KEYCHAIN != ''
+        run: |
+          security delete-keychain "$SIGNING_KEYCHAIN" || true
