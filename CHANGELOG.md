@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0470"></a>
+## [0.48.0]
+
 ## [0.47.0] - 2026-04-24
 
 - #239 Phase A: ssh-windows bundle upload hardening ([#241](https://github.com/danielraffel/Shipyard/pull/241))
