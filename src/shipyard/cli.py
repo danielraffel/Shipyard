@@ -2088,6 +2088,82 @@ def _latest_shipyard_release() -> str | None:
     return tag or None
 
 
+def _parse_version_tuple(version: str) -> tuple[int, int, int] | None:
+    """Parse ``v0.47.0`` / ``0.47.0`` to ``(0, 47, 0)``.
+
+    Returns None for unparseable input (pre-release suffixes, dev
+    builds, etc.) — callers treat that as "can't compare, skip the
+    guard" so non-semver tags never false-trigger a refusal.
+    """
+    import re
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)\s*$", version.strip())
+    if not match:
+        return None
+    a, b, c = match.groups()
+    return (int(a), int(b), int(c))
+
+
+def _current_global_shipyard_version() -> str | None:
+    """Return the version string (without leading ``v``) of the
+    ``shipyard`` binary currently on PATH, or None if we can't
+    determine it.
+
+    We shell out rather than read ``__version__`` because in
+    ``shipyard pin bump`` the whole point is to compare against the
+    *globally-installed* binary the consumer's install script would
+    overwrite — not against the in-process copy (which may be a dev
+    `uv run`).
+    """
+    try:
+        result = subprocess.run(
+            ["shipyard", "--version"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    import re
+    # `shipyard --version` prints "shipyard, version 0.47.0".
+    match = re.search(r"version\s+(\S+)", result.stdout)
+    return match.group(1).strip() if match else None
+
+
+def _main_pinned_version_at_origin(repo_root: Path) -> str | None:
+    """Best-effort read of ``origin/main:tools/shipyard.toml`` and
+    extract its pinned version.
+
+    Returns None when:
+      * ``git fetch`` fails (offline / no origin / no main branch)
+      * ``tools/shipyard.toml`` doesn't exist on origin/main
+      * the file exists but has no ``version = "..."`` line
+
+    Any None result means the redundant-branch guard is skipped —
+    better to let a bump proceed than to refuse on a flaky network.
+    """
+    try:
+        subprocess.run(
+            ["git", "fetch", "--quiet", "origin", "main"],
+            cwd=repo_root, capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "show", "origin/main:tools/shipyard.toml"],
+            cwd=repo_root, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    import re
+    match = re.search(
+        r'^\s*version\s*=\s*"([^"]+)"', result.stdout, re.MULTILINE,
+    )
+    return match.group(1) if match else None
+
+
 @pin.command("show")
 @click.pass_obj
 def pin_show(ctx: Context) -> None:
@@ -2165,9 +2241,35 @@ def pin_show(ctx: Context) -> None:
         "is to catch install failures before the PR."
     ),
 )
+@click.option(
+    "--allow-downgrade",
+    is_flag=True,
+    default=False,
+    help=(
+        "Proceed even if the target version is older than the "
+        "currently-installed shipyard binary (usually a sign of a "
+        "stale worktree). Defaults refuse so install-shipyard.sh "
+        "can't silently downgrade your global binary."
+    ),
+)
+@click.option(
+    "--allow-redundant",
+    is_flag=True,
+    default=False,
+    help=(
+        "Proceed even if origin/main already pins >= the target "
+        "version. Defaults refuse so branches behind main don't "
+        "open redundant pin-bump PRs."
+    ),
+)
 @click.pass_obj
 def pin_bump(
-    ctx: Context, target: str | None, no_pr: bool, skip_verify: bool,
+    ctx: Context,
+    target: str | None,
+    no_pr: bool,
+    skip_verify: bool,
+    allow_downgrade: bool,
+    allow_redundant: bool,
 ) -> None:
     """Bump the pinned Shipyard version to ``--to`` (or latest).
 
@@ -2175,9 +2277,17 @@ def pin_bump(
     ``./tools/install-shipyard.sh``, verify ``shipyard --version``
     matches the target, commit, push, open a PR.
 
-    Refuses with a dirty working tree — folding unrelated changes
-    into a pin-bump PR is exactly the class of release slippage we
-    want to prevent.
+    Refuses:
+
+    * with a dirty working tree — folding unrelated changes into a
+      pin-bump PR is exactly the class of release slippage we want
+      to prevent.
+    * when target < currently-installed binary (stale worktree
+      would silently downgrade the global install). Override with
+      ``--allow-downgrade``.
+    * when origin/main already pins >= target (branch is behind
+      main, PR would be redundant). Override with
+      ``--allow-redundant``.
     """
     toml_path = _detect_consumer_pin()
     if toml_path is None:
@@ -2242,6 +2352,48 @@ def pin_bump(
                 style="dim",
             )
         return
+
+    # Guard A (#243) — refuse a downgrade of the global binary.
+    # `./tools/install-shipyard.sh` fetches the pinned version and
+    # overwrites ~/.local/bin/shipyard, so bumping a stale worktree's
+    # pin backwards silently regresses the operator's global install.
+    target_tuple = _parse_version_tuple(target)
+    if not allow_downgrade and target_tuple is not None:
+        installed = _current_global_shipyard_version()
+        installed_tuple = (
+            _parse_version_tuple(installed) if installed else None
+        )
+        if installed_tuple is not None and target_tuple < installed_tuple:
+            render_error(
+                f"Refusing: target {target} is older than the currently-"
+                f"installed shipyard binary (v{installed}). Running "
+                f"./tools/install-shipyard.sh would DOWNGRADE your "
+                f"global binary.\n"
+                "Likely cause: this worktree is stale — rebase onto "
+                "main before bumping, or pass --allow-downgrade to "
+                "proceed anyway."
+            )
+            sys.exit(1)
+
+    # Guard B (#243) — refuse when origin/main already pins >= target.
+    # A branch behind main that runs pin bump just creates a redundant
+    # or conflict-prone PR. Skipped silently if we can't resolve
+    # origin/main (offline, no remote, etc.) — guards are advisory.
+    if not allow_redundant and target_tuple is not None:
+        main_pin = _main_pinned_version_at_origin(repo_root)
+        main_tuple = (
+            _parse_version_tuple(main_pin) if main_pin else None
+        )
+        if main_tuple is not None and main_tuple >= target_tuple:
+            render_error(
+                f"Refusing: origin/main already pins {main_pin}, which "
+                f"is >= target {target}. Opening a PR here would be "
+                f"redundant or regressive.\n"
+                "Likely cause: this worktree is behind main — rebase "
+                "or merge origin/main first, or pass --allow-redundant "
+                "to proceed anyway."
+            )
+            sys.exit(1)
 
     render_message(f"Bumping pin: {current} → {target}")
     _rewrite_pinned_version(toml_path, target)
