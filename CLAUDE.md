@@ -153,9 +153,9 @@ rather than stacking them.
 
 `./scripts/release.sh` remains as a break-glass manual path. The default is the automatic path above (auto-release workflow on merge). Do not call `release.sh` directly unless the automatic path is genuinely blocked.
 
-## macOS binary is signed LOCALLY, not in CI
+## macOS release is a stapled .dmg, built LOCALLY
 
-As of #219 (2026-04-24), the macOS release binary is **built, signed, notarized, and launch-tested on the maintainer's own Mac** — CI only handles Linux + Windows. Two rounds of CI-signed binaries (v0.42.0, v0.43.0) passed every CI check (including an on-runner launch gate) but SIGKILL'd on the maintainer's actual Mac. The local-signing pipeline in `scripts/release-macos-local.sh` produces a binary that works where it matters, on the Mac that will need to launch it.
+As of #219 (2026-04-24 evening), macOS binaries ship as stapled **.dmg** artifacts built on the maintainer's Mac. CI handles Linux + Windows. The `.dmg` wrapper puts the notarization ticket **inside** the artifact so Gatekeeper verifies offline — no online notarization check, no per-Mac taskgated flakiness. Bare Mach-O binaries depend on an online check that proved unreliable (v0.42.0 and v0.43.0 both shipped bare Mach-O and both SIGKILL'd on the maintainer's Mac).
 
 After any new tag lands and the release workflow publishes non-macOS assets, run:
 
@@ -163,7 +163,11 @@ After any new tag lands and the release workflow publishes non-macOS assets, run
 ./scripts/release-macos-local.sh --tag vX.Y.Z --upload
 ```
 
-The script fails loud if the local `--version` test fails, **refusing to upload a broken binary**. Do not edit `.github/workflows/release.yml` to re-enable CI macOS signing without first re-running the #219 diagnostic and proving the underlying issue is resolved. Full flow + env-var setup in `RELEASING.md` § "macOS signing is local-only".
+The script is 8 steps: build, re-sign, package-to-dmg, sign-dmg, notarize+staple, **mount + launch test** (exit 3 if it fails), upload, **end-to-end install.sh → launch test** (exit 4 if it fails). Refuses to upload a dmg that doesn't mount-and-launch cleanly; refuses to declare success after upload if the download+install chain doesn't end in a working `--version`.
+
+**Load-bearing rule:** the success criterion is a working `--version` after fresh install.sh → mount → extract → launch. Not `codesign --verify`, not `spctl --assess`, not the on-runner launch gate in isolation. We shipped v0.42.0 and v0.43.0 with the same breakage because we declared victory on partial verification. Don't do that again.
+
+Full flow + env-var setup in `RELEASING.md` § "macOS release is a locally-signed + stapled .dmg". Do not revert to CI signing or bare Mach-O without re-running the #219 diagnostic and proving the online-notarization-check issue is resolved (tracked in #226).
 
 ## Development
 

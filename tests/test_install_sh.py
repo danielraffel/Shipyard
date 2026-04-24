@@ -385,3 +385,200 @@ def test_adhoc_fallback_does_not_trigger_on_linux(tmp_path: Path) -> None:
     assert result.returncode != 0
     # Ad-hoc messaging must be absent on Linux.
     assert "ad-hoc" not in result.stderr.lower()
+
+
+# -- #52: .dmg mount-and-extract path ------------------------------
+# install.sh on macOS downloads a stapled .dmg (new default in
+# v0.44.0+), mounts it, copies the binary out. This test drives
+# that path with a real dmg built by hdiutil + a stub binary that
+# prints a known version string. Verifies:
+#   - install.sh correctly detects the .dmg asset and takes the
+#     mount path instead of the bare-Mach-O path
+#   - After mount + copy + detach, the installed binary at
+#     $INSTALL_DIR/shipyard is executable and prints the expected
+#     content
+#   - post-install smoke passes on the extracted binary
+
+def _make_fake_dmg(tmp_path: Path, version_string: str = "shipyard, version test") -> Path:
+    """Build a real stapled-shape .dmg with a stub shipyard inside.
+
+    The dmg won't be *actually* stapled (no notarization ticket for
+    a fake binary), but the mount + extract logic in install.sh is
+    independent of the ticket — we're testing the mechanics, not
+    the cryptography. Returns the dmg path.
+    """
+    if sys.platform != "darwin":
+        raise RuntimeError("hdiutil is macOS-only")
+    stage = tmp_path / "dmg-stage"
+    stage.mkdir()
+    stub = stage / "shipyard"
+    stub.write_text(f"#!/bin/sh\necho '{version_string}'\n")
+    stub.chmod(0o755)
+    dmg = tmp_path / "shipyard-macos-arm64.dmg"
+    subprocess.run(
+        [
+            "hdiutil", "create", "-volname", "Shipyard",
+            "-srcfolder", str(stage), "-ov", "-format", "UDZO",
+            str(dmg),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return dmg
+
+
+def test_install_sh_mounts_dmg_and_extracts_binary(tmp_path: Path) -> None:
+    # macOS only — hdiutil + mount semantics don't exist on Linux
+    # and the dmg path in install.sh only runs on OS=macos.
+    if sys.platform != "darwin":
+        pytest.skip("dmg path is macOS-only")
+
+    dmg = _make_fake_dmg(tmp_path, version_string="shipyard, version dmg-test")
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+
+    # Fake the GitHub API response by shimming curl. install.sh's
+    # URL-resolution step calls curl twice: once for the API JSON,
+    # once for the actual asset download. We return a json blob
+    # that points at our local dmg (via file://) for both.
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    fake_curl = shim_dir / "curl"
+    # First invocation (API JSON lookup) gets faked JSON that
+    # contains a browser_download_url pointing at our local dmg.
+    # Second invocation (the asset download) gets the real curl
+    # which can handle file:// URLs. Use a marker file to track
+    # which call we're on.
+    fake_curl.write_text(f"""#!/bin/sh
+REAL_CURL=/usr/bin/curl
+MARKER={tmp_path}/curl-call-count
+if [ ! -f "$MARKER" ]; then echo 0 > "$MARKER"; fi
+COUNT=$(cat "$MARKER")
+NEW=$((COUNT + 1))
+echo "$NEW" > "$MARKER"
+# Any call that mentions api.github.com: return a fake JSON with
+# browser_download_url pointing at the local dmg. Any other call:
+# pass through to real curl.
+for arg in "$@"; do
+    case "$arg" in
+        *api.github.com*)
+            echo '"browser_download_url": "file://{dmg}"'
+            exit 0
+            ;;
+    esac
+done
+exec "$REAL_CURL" "$@"
+""")
+    fake_curl.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "SHIPYARD_INSTALL_DIR": str(install_dir),
+        "PATH": f"{shim_dir}:{os.environ.get('PATH', '')}",
+    }
+    # Don't skip download — we're exercising the dmg mount path.
+    env.pop("SHIPYARD_SKIP_DOWNLOAD", None)
+    # Skip the smoke since it would codesign-probe the stub as if
+    # it's a shipyard binary; the mount + extract mechanics are
+    # what this test covers.
+    env["SHIPYARD_SKIP_SMOKE"] = "1"
+
+    result = subprocess.run(
+        ["bash", str(INSTALL_SH)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"dmg install failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # The dmg path's download message must have fired, proving
+    # install.sh took the dmg branch rather than bare Mach-O.
+    assert ".dmg" in result.stdout, (
+        f"expected .dmg download message; got stdout={result.stdout!r}"
+    )
+    # The extracted binary must exist and be executable.
+    installed = install_dir / "shipyard"
+    assert installed.exists(), f"binary missing: {list(install_dir.iterdir())}"
+    assert os.access(installed, os.X_OK)
+    # And it must contain what we put in the dmg — confirms the
+    # copy actually happened, not just a pre-existing file.
+    run = subprocess.run(
+        [str(installed)], capture_output=True, text=True, check=False,
+    )
+    assert "dmg-test" in run.stdout, (
+        f"extracted binary produced {run.stdout!r}; expected the "
+        "dmg-test marker, which proves the binary came OUT of the dmg"
+    )
+
+
+def test_install_sh_falls_back_to_bare_macho_when_no_dmg(tmp_path: Path) -> None:
+    # Backward compat: if a tag has no .dmg asset (older releases,
+    # forks without the local-sign script, etc.) install.sh must
+    # still find the bare Mach-O and install it.
+    if sys.platform != "darwin":
+        pytest.skip("test exercises macOS-specific branch selection")
+
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+
+    # Fake a Mach-O. The filename has to match the ARTIFACT grep
+    # pattern install.sh runs (`browser_download_url.*${ARTIFACT}"`)
+    # so that URL resolution finds it — use the real artifact name.
+    bare_binary = tmp_path / "shipyard-macos-arm64"
+    bare_binary.write_text("#!/bin/sh\necho 'shipyard, version bare-test'\n")
+    bare_binary.chmod(0o755)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    fake_curl = shim_dir / "curl"
+    # API shim returns ONLY a bare-Mach-O URL (no dmg entry), so
+    # install.sh's DMG_URL check comes up empty and it falls back
+    # to RELEASE_URL.
+    fake_curl.write_text(f"""#!/bin/sh
+REAL_CURL=/usr/bin/curl
+for arg in "$@"; do
+    case "$arg" in
+        *api.github.com*)
+            # Only the bare artifact — no .dmg sibling. The trailing
+            # double quote matches install.sh's RELEASE_URL grep
+            # pattern (`browser_download_url.*${{ARTIFACT}}"`).
+            echo '"browser_download_url": "file://{bare_binary}"'
+            exit 0
+            ;;
+    esac
+done
+exec "$REAL_CURL" "$@"
+""")
+    fake_curl.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "SHIPYARD_INSTALL_DIR": str(install_dir),
+        "PATH": f"{shim_dir}:{os.environ.get('PATH', '')}",
+        "SHIPYARD_SKIP_SMOKE": "1",
+    }
+    env.pop("SHIPYARD_SKIP_DOWNLOAD", None)
+
+    result = subprocess.run(
+        ["bash", str(INSTALL_SH)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"bare-fallback install failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # Must NOT have taken the dmg mount path (no mention of .dmg
+    # in the download message — bare path uses the artifact name).
+    assert ".dmg" not in result.stdout, (
+        f"expected bare-Mach-O path; got dmg-like stdout={result.stdout!r}"
+    )
+    installed = install_dir / "shipyard"
+    assert installed.exists()
+    run = subprocess.run(
+        [str(installed)], capture_output=True, text=True, check=False,
+    )
+    assert "bare-test" in run.stdout

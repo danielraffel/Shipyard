@@ -99,25 +99,89 @@ fi
 echo "Resolving ${VERSION_LABEL} from ${REPO}..."
 
 # ── fetch release asset URL ─────────────────────────────────────────
+#
+# macOS release assets are distributed as a stapled .dmg starting
+# in v0.44.0 (task #52 / #219). The DMG wraps a single Mach-O with
+# the notarization ticket stapled to the DMG container — Gatekeeper
+# verifies the ticket OFFLINE when the DMG is mounted, eliminating
+# the per-Mac online-check flakiness that sank v0.42.0 + v0.43.0
+# launches.
+#
+# Fallback to bare Mach-O for:
+#   - non-macOS platforms (Linux, Windows)
+#   - older tags that predate the .dmg pipeline
+#   - self-built forks that haven't run scripts/release-macos-local.sh
 
-RELEASE_URL=$(curl -sL "https://api.github.com/repos/${REPO}/${API_PATH}" \
-    | grep "browser_download_url.*${ARTIFACT}" \
-    | head -1 \
-    | cut -d '"' -f 4)
+mkdir -p "${INSTALL_DIR}"
 
-if [ -z "${RELEASE_URL}" ]; then
-    echo "No binary found for ${ARTIFACT} in ${VERSION_LABEL}." >&2
-    echo "Check https://github.com/${REPO}/releases for available builds." >&2
-    exit 1
+# SHIPYARD_SKIP_DOWNLOAD=1 preserves an already-present binary at
+# ${INSTALL_DIR}/shipyard. Used by tests to exercise the smoke +
+# remediation paths without hitting the network. When it's set we
+# skip URL resolution entirely (tests don't want live API calls).
+if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
+    # `set -o pipefail` means a pipe containing `grep` that matches
+    # nothing kills the script via set -e — so `|| true` the final
+    # cut lets us handle the empty-URL case below instead of dying
+    # silently mid-script.
+    DMG_URL=""
+    if [ "${OS}" = "macos" ]; then
+        DMG_URL=$(curl -sL "https://api.github.com/repos/${REPO}/${API_PATH}" \
+            | grep "browser_download_url.*${ARTIFACT}\.dmg" \
+            | head -1 \
+            | cut -d '"' -f 4 || true)
+    fi
+
+    RELEASE_URL=""
+    if [ -z "${DMG_URL}" ]; then
+        RELEASE_URL=$(curl -sL "https://api.github.com/repos/${REPO}/${API_PATH}" \
+            | grep "browser_download_url.*${ARTIFACT}\"" \
+            | head -1 \
+            | cut -d '"' -f 4 || true)
+    fi
+
+    if [ -z "${DMG_URL}" ] && [ -z "${RELEASE_URL}" ]; then
+        echo "No binary found for ${ARTIFACT} in ${VERSION_LABEL}." >&2
+        echo "Check https://github.com/${REPO}/releases for available builds." >&2
+        exit 1
+    fi
+else
+    DMG_URL=""
+    RELEASE_URL=""
 fi
 
-echo "Downloading ${ARTIFACT} (${VERSION_LABEL})..."
-mkdir -p "${INSTALL_DIR}"
-# SHIPYARD_SKIP_DOWNLOAD=1 preserves an already-present binary at
-# ${INSTALL_DIR}/shipyard. Used by the tests to exercise the
-# post-install smoke + remediation paths without hitting the
-# network or needing a real release asset.
-if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
+if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" = "1" ]; then
+    : # existing binary at INSTALL_DIR/shipyard is what we'll test
+elif [ -n "${DMG_URL}" ]; then
+    echo "Downloading ${ARTIFACT}.dmg (${VERSION_LABEL})..."
+    # Stapled DMG path (#52): download the dmg, mount read-only,
+    # copy the binary OUT of the mount, detach. The ticket binding
+    # is on the DMG and Gatekeeper evaluated it at mount time, so
+    # the extracted binary inherits "trusted origin" state in
+    # macOS's provenance tracking — taskgated won't trigger an
+    # online check on first launch.
+    DMG_TMP="$(mktemp -d)/shipyard.dmg"
+    curl -sL "${DMG_URL}" -o "${DMG_TMP}"
+    MOUNT_POINT="$(mktemp -d)/mnt"
+    if ! hdiutil attach -nobrowse -readonly \
+            -mountpoint "${MOUNT_POINT}" "${DMG_TMP}" >/dev/null 2>&1; then
+        echo "Failed to mount ${DMG_TMP} — the DMG may be corrupt or" >&2
+        echo "unsigned. Try re-downloading or check the release page." >&2
+        rm -f "${DMG_TMP}"
+        exit 1
+    fi
+    if [ ! -f "${MOUNT_POINT}/shipyard" ]; then
+        echo "DMG mounted but no 'shipyard' binary inside at ${MOUNT_POINT}." >&2
+        echo "Contents:" >&2
+        ls -la "${MOUNT_POINT}" >&2 || true
+        hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || true
+        rm -f "${DMG_TMP}"
+        exit 1
+    fi
+    cp "${MOUNT_POINT}/shipyard" "${INSTALL_DIR}/shipyard"
+    hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || true
+    rm -f "${DMG_TMP}"
+else
+    echo "Downloading ${ARTIFACT} (${VERSION_LABEL})..."
     curl -sL "${RELEASE_URL}" -o "${INSTALL_DIR}/shipyard"
 fi
 chmod +x "${INSTALL_DIR}/shipyard"

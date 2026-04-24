@@ -61,11 +61,55 @@ gh workflow run release.yml --ref v<x.y.z>
 
 Run that after the auto-tag appears. The release workflow will pick up the existing tag and publish the binaries. (Pulp's first auto-released tag, `v0.4.0`, used this fallback before its `RELEASE_BOT_TOKEN` was provisioned.)
 
-## macOS signing is local-only
+## macOS release is a locally-signed + stapled .dmg
 
-**As of 2026-04-24, the macOS release binary is signed + notarized on the maintainer's own Mac, NOT on GitHub Actions.** Two rounds of CI-signed+notarized binaries (v0.42.0, v0.43.0) passed every CI check — `codesign --verify`, `spctl --assess`, and an on-runner launch gate that ran the notarized binary's `--version` — yet SIGKILL'd at launch on the primary maintainer's actual Mac with "Taskgated Invalid Signature" (issue [#219](https://github.com/danielraffel/Shipyard/issues/219)).
+**As of 2026-04-24 evening, macOS binaries ship as stapled `.dmg` artifacts built on the maintainer's Mac.** This supersedes the "bare Mach-O, notarized at release" path used through v0.43.0.
 
-The 2026-04-24 local-signing diagnostic (commit c112830 → `scripts/release-macos-local.sh`) confirmed the delta: a locally-built+signed+notarized binary from the **same commit as v0.43.0** with the **same Developer-ID cert** launches cleanly on the maintainer's Mac. The CI runner and the end-user Mac differ enough on taskgated/Gatekeeper state that CI-notarized binaries are not reliably launchable.
+**What we learned** (issue [#219](https://github.com/danielraffel/Shipyard/issues/219)):
+
+1. **CI-signed bare Mach-O binaries (v0.42.0, v0.43.0):** passed every CI check — `codesign --verify`, `spctl --assess`, an on-runner launch gate running `--version` under the signed+notarized state — and still SIGKILL'd with "Taskgated Invalid Signature" on the maintainer's Mac. We originally blamed CI signing.
+2. **Locally-signed bare Mach-O (v0.43.0 re-upload):** worked the first time, then SIGKILL'd a few hours later on the same Mac with the same bytes. The delta wasn't CI vs local — it was that **bare Mach-O binaries depend on an online notarization check at launch**, and that check is unreliable on some Macs (contention, Apple CDN state, macOS 26.3+ `com.apple.provenance` enforcement, or all three).
+3. **Stapled `.dmg`:** the only durable fix. A `.dmg` wrapper carries the notarization ticket **inside** the artifact. When macOS mounts the dmg, Gatekeeper verifies the ticket **offline**. The binary extracted from the mount inherits "trusted origin" provenance. No online check, no per-Mac flakiness, no dice rolls. End-to-end verified working on the same Mac that rejected every earlier artifact.
+
+### How to cut a macOS release
+
+CI handles Linux + Windows. For the macOS `.dmg`:
+
+```bash
+# One-time setup — either .env or shell rc.
+export SHIPYARD_NOTARIZE_APPLE_ID=<apple-id-email>
+export SHIPYARD_NOTARIZE_TEAM_ID=<team-id>              # 10-char from developer.apple.com/account
+export SHIPYARD_NOTARIZE_APP_PASSWORD=<app-specific>    # appleid.apple.com → Sign-In and Security
+export SHIPYARD_SIGNING_IDENTITY=<SHA1-or-CN>           # `security find-identity -v -p codesigning`
+
+# After release.yml workflow publishes non-macOS assets:
+./scripts/release-macos-local.sh --tag vX.Y.Z --upload
+```
+
+The script is 8 steps:
+
+1. Fail fast on missing env vars (before the ~60s PyInstaller build).
+2. Build via `pyinstaller --onefile --codesign-identity <...>`.
+3. Re-sign outer Mach-O with `--options runtime --timestamp`.
+4. Package the signed Mach-O into a `.dmg` (`hdiutil create`, volname "Shipyard").
+5. Sign the DMG itself.
+6. Submit to Apple, wait for `status: Accepted`, then `xcrun stapler staple` and `xcrun stapler validate`.
+7. **Local launch test** — mount the stapled DMG read-only, run `<binary> --version`. Refuses to upload if this fails. Distinguishes exit 3 (local launch broke) from exit 4 (download path broke).
+8. **End-to-end verification after upload** — runs the local `install.sh` against the just-uploaded tag. Downloads the dmg, mounts, extracts, launches. Exit 4 if this fails, with a warning that the upload already happened and needs manual deletion.
+
+### Lesson codified
+
+We shipped v0.42.0 and v0.43.0 with the same class of breakage because we declared "works" based on partial verification. The release script now enforces what we should have been doing all along: **the only success criterion is `--version` printing after a fresh install.sh → mount → extract → launch flow**. If any step in that chain fails, the release fails, regardless of what `codesign --verify` or `spctl --assess` say.
+
+### Why the repo secrets stay
+
+The five secrets below are kept in the repo even though CI doesn't use them today — they're needed for:
+
+- Future Rosetta-hosted local cross-builds for x64
+- Forks that may re-enable CI signing for their own environments
+- The `.dmg` pipeline above reuses `SHIPYARD_SIGNING_IDENTITY` conceptually (the cert is in the local keychain rather than a GH secret, but the same cert)
+
+Five secrets on the repo (all `gh secret set NAME`):
 
 ### How to cut a macOS release
 

@@ -123,16 +123,51 @@ codesign --force --options runtime --timestamp \
     "$DIST_BINARY"
 codesign -dv --verbose=4 "$DIST_BINARY" 2>&1 | grep -E "Authority|TeamIdentifier|Timestamp" | head -5
 
-# ── Notarize ───────────────────────────────────────────────────────
-echo "Step 3/5: Submit to Apple notarization service (this takes ~30-90s)..."
-NOTARIZE_ZIP="$(mktemp -d)/${ARTIFACT}.zip"
-/usr/bin/ditto -c -k --keepParent "$DIST_BINARY" "$NOTARIZE_ZIP"
+# ── Package into .dmg ──────────────────────────────────────────────
+# #219 / task #52: bare Mach-O binaries cannot be stapled (no
+# Info.plist for stapler to anchor the ticket to). The online
+# notarization check Apple falls back to is demonstrably flaky on
+# some Macs — v0.42.0 + v0.43.0 both shipped binaries that launched
+# on CI + on the build machine but SIGKILL'd on the end-user Mac.
+# Wrapping the binary in a .dmg and stapling the DMG puts the
+# notarization ticket in a local file the mount path reads
+# offline. Gatekeeper + taskgated verify against that ticket
+# instead of calling Apple, so per-Mac network/CDN/provenance
+# state stops mattering.
+echo "Step 3/6: Package signed Mach-O into .dmg..."
+DMG_NAME="${ARTIFACT}.dmg"
+DIST_DMG="dist/${DMG_NAME}"
+DMG_STAGING="$(mktemp -d)/stage"
+mkdir -p "$DMG_STAGING"
+# Staging dir contains just the bare binary — hdiutil turns the
+# directory into a mountable volume whose root has that binary.
+# install.sh's mount-extract step looks for /Volumes/Shipyard/shipyard
+# (volname matches the HFS+ volume label).
+cp "$DIST_BINARY" "$DMG_STAGING/shipyard"
+rm -f "$DIST_DMG"
+hdiutil create -volname "Shipyard" \
+    -srcfolder "$DMG_STAGING" \
+    -ov -format UDZO \
+    "$DIST_DMG" >/dev/null
 
-# Capture notarytool output so we can grep for the submission id on
-# failure — Apple's rejection reasons are only findable via
-# `notarytool log <submission-id>`.
+# ── Sign the DMG ───────────────────────────────────────────────────
+# The DMG itself needs to carry a valid Developer-ID signature so
+# notarytool can match + return a staple-able ticket. Without this
+# the DMG ships unsigned and notarize fails with "package is not
+# signed".
+echo "Step 4/6: Sign the DMG..."
+codesign --force --sign "$SHIPYARD_SIGNING_IDENTITY" "$DIST_DMG"
+codesign -dv --verbose=2 "$DIST_DMG" 2>&1 | grep -E "Authority|TeamIdentifier" | head -3
+
+# ── Notarize the DMG, then staple ──────────────────────────────────
+# Submit the DMG itself (not a zip-wrapped Mach-O like the
+# pre-#52 path). notarytool accepts .dmg as a first-class input.
+# After acceptance, `stapler staple` embeds the ticket in the DMG
+# so first-launch verification is OFFLINE — the entire point of
+# task #52.
+echo "Step 5/6: Submit DMG to Apple notarization service (~30-90s)..."
 NOTARIZE_LOG="$(mktemp)"
-if ! xcrun notarytool submit "$NOTARIZE_ZIP" \
+if ! xcrun notarytool submit "$DIST_DMG" \
         --apple-id "$SHIPYARD_NOTARIZE_APPLE_ID" \
         --team-id "$SHIPYARD_NOTARIZE_TEAM_ID" \
         --password "$SHIPYARD_NOTARIZE_APP_PASSWORD" \
@@ -140,10 +175,7 @@ if ! xcrun notarytool submit "$NOTARIZE_ZIP" \
     echo "ERROR: notarytool submit failed. Log: $NOTARIZE_LOG" >&2
     exit 1
 fi
-
-if grep -q "status: Accepted" "$NOTARIZE_LOG"; then
-    echo "  ✓ Notarization Accepted"
-else
+if ! grep -q "status: Accepted" "$NOTARIZE_LOG"; then
     SUB_ID=$(grep -E "^\s+id:" "$NOTARIZE_LOG" | head -1 | awk '{print $NF}')
     echo "ERROR: notarization not Accepted. Submission id: $SUB_ID" >&2
     echo "       Fetch the log with:" >&2
@@ -153,49 +185,74 @@ else
     echo "           --password \$SHIPYARD_NOTARIZE_APP_PASSWORD" >&2
     exit 1
 fi
+echo "  ✓ Notarization Accepted"
+
+echo "  Stapling ticket to DMG..."
+if ! xcrun stapler staple "$DIST_DMG"; then
+    echo "ERROR: xcrun stapler staple failed. DMG ships unstapled —" >&2
+    echo "       refusing to upload because that re-introduces the" >&2
+    echo "       online-check dependency #52 is supposed to remove." >&2
+    exit 1
+fi
+# Validate the staple — if this passes, the ticket is bound to
+# the DMG and Gatekeeper can verify offline.
+if ! xcrun stapler validate "$DIST_DMG" >/dev/null 2>&1; then
+    echo "ERROR: stapler validate failed — ticket is not bound to DMG." >&2
+    exit 1
+fi
+echo "  ✓ Ticket stapled and validated"
 
 # ── Local launch test (#219 — THE WHOLE POINT) ─────────────────────
-# CI's launch gate runs on a GH Actions macOS-15 runner, which is
-# NOT the Mac users will actually run the binary on. A notarized
-# binary that launches on the CI runner but SIGKILLs on the user's
-# Mac is exactly the #219 failure mode. Here we test on the ACTUAL
-# Mac that's about to ship the binary — if it dies here, we refuse
-# to upload.
-echo "Step 4/5: Local launch test (taskgated / Gatekeeper / codesign)..."
-if ! OUTPUT=$("$DIST_BINARY" --version 2>&1); then
+# Mount the stapled DMG, run the binary inside. This simulates the
+# Gatekeeper-verifies-offline flow end users will hit after
+# install.sh extracts. If it fails here, the dmg is broken —
+# refuse to upload.
+echo "Step 6/6: Local launch test via mounted DMG..."
+MOUNT_POINT="$(mktemp -d)/mnt"
+# -nobrowse: don't show the volume in Finder. -readonly: prevent
+# accidental writes. Explicit mountpoint so we don't scrape
+# /Volumes/ looking for the right volume.
+if ! hdiutil attach -nobrowse -readonly \
+        -mountpoint "$MOUNT_POINT" "$DIST_DMG" >/dev/null; then
+    echo "ERROR: could not mount DMG." >&2
+    exit 1
+fi
+trap 'hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true' EXIT
+if ! OUTPUT=$("$MOUNT_POINT/shipyard" --version 2>&1); then
     echo "" >&2
-    echo "ERROR: LOCAL LAUNCH TEST FAILED on this Mac." >&2
-    echo "       Binary: $DIST_BINARY" >&2
-    echo "       This is the #219 failure shape. Do NOT ship this binary." >&2
+    echo "ERROR: LOCAL LAUNCH TEST FAILED from mounted DMG." >&2
+    echo "       DMG: $DIST_DMG" >&2
+    echo "       Do NOT ship this binary." >&2
     echo "" >&2
     echo "       Diagnostics:" >&2
-    codesign --verify --deep --strict --verbose=4 "$DIST_BINARY" 2>&1 | sed 's/^/         /' >&2
-    spctl --assess --type execute -vv "$DIST_BINARY" 2>&1 | sed 's/^/         /' >&2
-    xattr -l "$DIST_BINARY" 2>&1 | sed 's/^/         /' >&2
+    codesign --verify --deep --strict --verbose=4 "$DIST_DMG" 2>&1 | sed 's/^/         /' >&2
+    xcrun stapler validate -v "$DIST_DMG" 2>&1 | sed 's/^/         /' >&2
+    spctl --assess --type install -vv "$DIST_DMG" 2>&1 | sed 's/^/         /' >&2
     echo "" >&2
     echo "       Crash report (if any) under:" >&2
     echo "         ~/Library/Logs/DiagnosticReports/shipyard-*.ips" >&2
     echo "" >&2
+    hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
     exit 3
 fi
 echo "  ✓ --version printed: ${OUTPUT}"
 
+# Detach the DMG before further work — the mount is no longer
+# needed and leaving it attached confuses the later e2e step
+# which mounts a freshly-downloaded copy.
+hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
+trap - EXIT
+
 # ── Upload (opt-in) ────────────────────────────────────────────────
 if [ "$DO_UPLOAD" -eq 1 ]; then
-    echo "Step 5/5: Uploading $DIST_BINARY to release $TAG..."
-    # Overwrite if an asset already exists — typically this script
-    # replaces CI's broken asset with a known-working local one.
-    gh release upload "$TAG" "$DIST_BINARY" --clobber
-    # Update the checksum line for this artifact. The release's
-    # checksums.sha256 contains one line per platform; we replace
-    # just our line. If the file doesn't exist yet, this creates it.
-    CHECKSUM=$(shasum -a 256 "$DIST_BINARY" | awk '{print $1}')
-    LINE="${CHECKSUM}  ${ARTIFACT}"
-    # Build the file at its final name from the start. The earlier
-    # approach uploaded a mktemp-named file first then re-uploaded
-    # a renamed copy, which left both on the release as sibling
-    # assets (observed on v0.43.0's first upload — stray `tmp.XYZ`
-    # asset had to be deleted by hand).
+    echo "Step 7/8: Uploading $DIST_DMG to release $TAG..."
+    gh release upload "$TAG" "$DIST_DMG" --clobber
+    # Update the checksum line for this artifact. Keyed on the
+    # full asset filename (e.g. shipyard-macos-arm64.dmg) so an
+    # older shipyard-macos-arm64 (bare Mach-O) line from a
+    # previous release of the same tag doesn't collide.
+    CHECKSUM=$(shasum -a 256 "$DIST_DMG" | awk '{print $1}')
+    LINE="${CHECKSUM}  ${DMG_NAME}"
     CHECKSUMS_DIR="$(mktemp -d)"
     CHECKSUMS_FILE="${CHECKSUMS_DIR}/checksums.sha256"
     if gh release view "$TAG" --json assets \
@@ -203,8 +260,7 @@ if [ "$DO_UPLOAD" -eq 1 ]; then
             | grep -q checksums.sha256; then
         gh release download "$TAG" --pattern checksums.sha256 \
             --output "$CHECKSUMS_FILE" --clobber
-        # Drop any existing line for this artifact; append the new one.
-        grep -v "  ${ARTIFACT}\$" "$CHECKSUMS_FILE" \
+        grep -v "  ${DMG_NAME}\$" "$CHECKSUMS_FILE" \
             > "${CHECKSUMS_FILE}.new" || true
         echo "$LINE" >> "${CHECKSUMS_FILE}.new"
         mv "${CHECKSUMS_FILE}.new" "$CHECKSUMS_FILE"
@@ -214,10 +270,58 @@ if [ "$DO_UPLOAD" -eq 1 ]; then
     gh release upload "$TAG" "$CHECKSUMS_FILE" --clobber
     rm -rf "$CHECKSUMS_DIR"
     echo "  ✓ Uploaded to release $TAG"
+
+    # ── End-to-end verification (#55 codification) ─────────────────
+    # Test the same install.sh → launch path end users hit. The
+    # local launch test above proved the DMG works when mounted
+    # directly; this proves the DOWNLOAD + install path works,
+    # which is the gap we kept shipping past.
+    #
+    # Uses the install.sh in THIS checkout — not the remote copy on
+    # main — so a change-in-progress to install.sh gets validated
+    # against the real DMG *before* the change is merged. After
+    # merge + release, the tag's install.sh and this checkout's
+    # install.sh are the same file, so the test remains honest.
+    #
+    # If this fails, the upload already happened: operator must
+    # manually delete the uploaded asset or re-run after fixing.
+    # Exit 4 distinguishes this from the local mounted-launch test
+    # failure (exit 3).
+    echo "Step 8/8: End-to-end verification (local install.sh → launch)..."
+    E2E_TMPDIR="$(mktemp -d)"
+    E2E_INSTALL_DIR="$E2E_TMPDIR/bin"
+    LOCAL_INSTALL_SH="$(cd "$(dirname "$0")/.." && pwd)/install.sh"
+    if ! SHIPYARD_INSTALL_DIR="$E2E_INSTALL_DIR" \
+            SHIPYARD_VERSION="$TAG" \
+            bash "$LOCAL_INSTALL_SH" \
+            >"$E2E_TMPDIR/install.log" 2>&1; then
+        echo "" >&2
+        echo "ERROR: E2E install.sh FAILED for $TAG." >&2
+        echo "       Upload already happened — this DMG is live but" >&2
+        echo "       end-users won't be able to install it cleanly." >&2
+        echo "       Install log:" >&2
+        sed 's/^/         /' "$E2E_TMPDIR/install.log" >&2
+        rm -rf "$E2E_TMPDIR"
+        exit 4
+    fi
+    if ! E2E_OUTPUT=$("$E2E_INSTALL_DIR/shipyard" --version 2>&1); then
+        echo "" >&2
+        echo "ERROR: E2E installed binary FAILED to launch." >&2
+        echo "       Upload already happened. The DMG mounts + verifies" >&2
+        echo "       but the extracted binary does not survive the" >&2
+        echo "       install.sh download + post-processing path." >&2
+        echo "       Install log:" >&2
+        sed 's/^/         /' "$E2E_TMPDIR/install.log" >&2
+        rm -rf "$E2E_TMPDIR"
+        exit 4
+    fi
+    echo "  ✓ End-to-end install.sh + launch passed: ${E2E_OUTPUT}"
+    rm -rf "$E2E_TMPDIR"
 else
-    echo "Step 5/5: SKIPPED (--upload not passed)."
+    echo "Step 7/8: SKIPPED (--upload not passed)."
+    echo "Step 8/8: E2E verification SKIPPED (requires upload)."
     echo ""
-    echo "Signed + notarized + tested binary is at: $DIST_BINARY"
+    echo "Signed + notarized + stapled DMG at: $DIST_DMG"
     echo "Re-run with --upload to ship it to release $TAG."
 fi
 
