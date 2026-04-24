@@ -201,7 +201,17 @@ def run(
     skip_target: tuple[str, ...],
     no_warm: bool,
 ) -> None:
-    """Validate current HEAD on configured targets."""
+    """Validate current HEAD on configured targets.
+
+    IMPORTANT: `shipyard run` reads the live working tree during
+    configure / build / test stages. Editing or deleting tracked
+    source files while a run is in flight causes non-deterministic
+    mid-stage failures — e.g. cmake's "Cannot find source file" if
+    a .cpp listed in CMakeLists.txt gets removed between
+    configure-list-read and configure-source-probe. Let the run
+    complete before refactoring, or queue the edits in a separate
+    worktree (#238).
+    """
     config = ctx.config
     mode = ValidationMode.SMOKE if smoke else ValidationMode.FULL
 
@@ -211,6 +221,21 @@ def run(
     if not sha or not branch:
         render_error("Not in a git repository")
         sys.exit(1)
+
+    # #238: warn operators that the working tree must stay quiescent
+    # during the run. A multi-agent flow (human + agent, or two
+    # agents in the same worktree) can race mid-run and produce
+    # failures that look like real build regressions but aren't.
+    # Quiet in --json mode — agents parse envelopes, they don't
+    # need human-readable banners.
+    if not ctx.json_mode:
+        render_message(
+            "→ Don't edit source files until this run completes — "
+            "concurrent edits cause non-deterministic mid-stage "
+            "failures (#238). Use a separate worktree for parallel "
+            "work.",
+            style="dim",
+        )
 
     # Resolve targets
     target_names = targets.split(",") if targets else list(config.targets.keys())
