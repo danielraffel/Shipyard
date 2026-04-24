@@ -191,30 +191,76 @@ ln -sf "${INSTALL_DIR}/shipyard" "${INSTALL_DIR}/sy"
 # is set — useful for CI that's dispatching its own verification.
 if [ "${SKIP_SMOKE:-${SHIPYARD_SKIP_SMOKE:-0}}" != "1" ]; then
     if ! "${INSTALL_DIR}/shipyard" --version >/dev/null 2>&1; then
-        # Recovery attempt: macOS occasionally caches an old
-        # taskgated rejection; stripping provenance + retrying gives
-        # the notarization check a second shot.
+        # Recovery step 1: strip com.apple.provenance and retry.
+        # macOS 26+ sometimes caches a taskgated rejection against
+        # the provenance record; clearing it lets the online
+        # notarization check run fresh on the next launch.
         if [ "${OS}" = "macos" ]; then
             xattr -d com.apple.provenance "${INSTALL_DIR}/shipyard" 2>/dev/null || true
             sleep 1
         fi
         if ! "${INSTALL_DIR}/shipyard" --version >/dev/null 2>&1; then
-            echo "" >&2
-            echo "ERROR: shipyard was installed but failed its post-install smoke test." >&2
-            echo "" >&2
-            if [ "${OS}" = "macos" ]; then
-                echo "On macOS this usually means one of:" >&2
-                echo "  - Gatekeeper's first-launch online notarization check failed" >&2
-                echo "    (transient network / Apple CDN). Retry: ${INSTALL_DIR}/shipyard --version" >&2
-                echo "  - taskgated rejected the binary. Check the crash report under" >&2
-                echo "    ~/Library/Logs/DiagnosticReports/shipyard-*.ips for 'Code Signature Invalid'." >&2
-                echo "    If that's the signature, see https://github.com/danielraffel/Shipyard/issues/219" >&2
-                echo "    for status on the .dmg-stapling fix." >&2
-            else
-                echo "Run '${INSTALL_DIR}/shipyard --version' manually for a specific error." >&2
+            # Recovery step 2 (macOS, Developer-ID signed only):
+            # ad-hoc fallback. The notarized binary can't pass
+            # taskgated on this Mac (online notarization check
+            # failing for whatever reason — #219). Re-signing
+            # locally with an ad-hoc signature LOSES notarization
+            # trust (Gatekeeper fast-path, XProtect deep-scan skip)
+            # but gains a launchable binary. For users who just
+            # need shipyard to WORK right now, this is a strictly
+            # better outcome than exit-1 + a dead install.
+            #
+            # Opt out via SHIPYARD_NO_ADHOC_FALLBACK=1 if you'd
+            # rather the installer fail loud (e.g. in a corporate
+            # environment where ad-hoc signing is prohibited).
+            if [ "${OS}" = "macos" ] \
+                && [ "${SHIPYARD_NO_ADHOC_FALLBACK:-0}" != "1" ] \
+                && command -v codesign >/dev/null 2>&1; then
+                team_line=$(codesign -dv "${INSTALL_DIR}/shipyard" 2>&1 \
+                    | grep "^TeamIdentifier=") || team_line=""
+                if [ -n "${team_line}" ] \
+                    && [ "${team_line}" != "TeamIdentifier=not set" ]; then
+                    echo "" >&2
+                    echo "WARN: Notarized binary wouldn't launch (taskgated rejection)." >&2
+                    echo "      Falling back to local ad-hoc signature. Gatekeeper's" >&2
+                    echo "      fast-path + XProtect deep-scan skip are DISABLED" >&2
+                    echo "      until a v0.44+ binary is released with a stapled .dmg." >&2
+                    echo "      Set SHIPYARD_NO_ADHOC_FALLBACK=1 to skip this fallback." >&2
+                    xattr -cr "${INSTALL_DIR}/shipyard" 2>/dev/null || true
+                    codesign --remove-signature "${INSTALL_DIR}/shipyard" 2>/dev/null || true
+                    codesign --force --sign - "${INSTALL_DIR}/shipyard" 2>/dev/null || true
+                    if "${INSTALL_DIR}/shipyard" --version >/dev/null 2>&1; then
+                        echo "      OK: ad-hoc fallback succeeded." >&2
+                        echo "" >&2
+                        # Fall through to success path below.
+                    else
+                        echo "      ad-hoc fallback also failed — see hint below." >&2
+                    fi
+                fi
             fi
-            echo "" >&2
-            exit 1
+            # Final launch probe — might have succeeded via fallback.
+            if ! "${INSTALL_DIR}/shipyard" --version >/dev/null 2>&1; then
+                echo "" >&2
+                echo "ERROR: shipyard was installed but failed its post-install smoke test." >&2
+                echo "" >&2
+                if [ "${OS}" = "macos" ]; then
+                    echo "On macOS this usually means one of:" >&2
+                    echo "  - Gatekeeper's first-launch online notarization check failed" >&2
+                    echo "    (transient network / Apple CDN). Retry: ${INSTALL_DIR}/shipyard --version" >&2
+                    echo "  - taskgated rejected the binary. Check the crash report under" >&2
+                    echo "    ~/Library/Logs/DiagnosticReports/shipyard-*.ips for 'Code Signature Invalid'." >&2
+                    echo "    If that's the signature, see https://github.com/danielraffel/Shipyard/issues/219" >&2
+                    echo "    for status on the .dmg-stapling fix." >&2
+                    if [ "${SHIPYARD_NO_ADHOC_FALLBACK:-0}" = "1" ]; then
+                        echo "  - Ad-hoc fallback is disabled (SHIPYARD_NO_ADHOC_FALLBACK=1)." >&2
+                        echo "    Remove that env var to let install.sh try a local re-sign." >&2
+                    fi
+                else
+                    echo "Run '${INSTALL_DIR}/shipyard --version' manually for a specific error." >&2
+                fi
+                echo "" >&2
+                exit 1
+            fi
         fi
     fi
 fi
