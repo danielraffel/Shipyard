@@ -131,12 +131,14 @@ You don't need everything — just what matches your setup:
 | Tool | Required? | What it's for | Install |
 |------|-----------|---------------|---------|
 | [git](https://github.com/git-guides/install-git) | Yes | Version control | Pre-installed on macOS |
-| [gh](https://github.com/cli/cli) | Yes (for PRs) | GitHub integration | `brew install gh` |
+| [gh](https://github.com/cli/cli) | Yes (for PRs) | GitHub integration[^gh-scope] | `brew install gh` |
 | `ssh` | For remote targets | Connect to VMs | Pre-installed on macOS / [Ubuntu](https://ubuntu.com/server/docs/how-to/security/openssh-server/) / [Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse?tabs=gui&pivots=windows-11) |
 | [nsc](https://namespace.so/docs/reference/cli/installation) | For [Namespace](https://namespace.so) | Cloud runners | `brew install namespace-cli` |
 | [UTM](https://mac.getutm.app) / [Parallels](https://www.parallels.com/products/desktop/) | For VM fallback | Auto-boot VMs | `brew install --cask utm` |
 
 `shipyard doctor` checks all of this and tells you what's missing.
+
+[^gh-scope]: `gh` needs the **`workflow`** scope (classic PAT) or **Actions: Read and write** (fine-grained) for `shipyard cloud retarget`, `cloud handoff`, and any command that cancels + re-dispatches workflow runs. Quick fix: `gh auth refresh -h github.com -s workflow`. Full setup in [docs/install.md § First-run auth](docs/install.md#first-run-auth).
 
 ## This repo uses Shipyard
 

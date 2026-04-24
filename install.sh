@@ -382,6 +382,23 @@ if ! echo "${PATH}" | tr ':' '\n' | grep -q "^${INSTALL_DIR}$"; then
     echo ""
 fi
 
+# #236: classic PAT flow — flag missing `workflow` scope here so
+# the user fixes it at install time instead of discovering it
+# during `cloud retarget --apply`. Silent when gh isn't installed /
+# logged out (the doctor covers those) and silent for fine-grained
+# tokens + GitHub Apps which don't expose their scope list locally.
+if command -v gh >/dev/null 2>&1; then
+    gh_status_out=$(gh auth status 2>&1 || true)
+    if echo "${gh_status_out}" | grep -qi "Token scopes:" \
+        && ! echo "${gh_status_out}" | grep -q "'workflow'"; then
+        echo "heads up: \`shipyard cloud retarget\` + \`cloud handoff run --apply\`"
+        echo "  need the 'workflow' scope on your gh token, which isn't set."
+        echo "  Fix: gh auth refresh -h github.com -s workflow"
+        echo "  (Fine-grained tokens + GitHub Apps: docs/install.md § First-run auth)"
+        echo ""
+    fi
+fi
+
 echo "Next steps:"
 echo "  shipyard init        # set up a project"
 echo "  shipyard doctor      # check your environment"

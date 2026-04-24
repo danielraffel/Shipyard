@@ -29,6 +29,47 @@ curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
 Downloads the right binary for your platform and installs it at
 `~/.local/bin/shipyard`.
 
+## First-run auth
+
+A few Shipyard commands (`cloud retarget`, `cloud handoff`, anything
+that cancels + re-dispatches a GitHub Actions workflow run) need a
+`gh` token with the **`workflow` scope** — GitHub's short name for
+`actions:write` on a classic PAT, or **Actions: Read and write** on a
+fine-grained token. Without it you'll hit:
+
+```
+error: Couldn't cancel the matching job(s). Your gh token may lack
+`actions:write` scope.
+```
+
+`shipyard doctor` probes for this; fix it at install time so the
+first retarget attempt doesn't surprise you.
+
+### Interactive gh login (most common)
+
+```bash
+gh auth refresh -h github.com -s workflow
+```
+
+Follow the browser prompt. You don't have to log out first —
+`refresh` adds the scope to your existing session.
+
+### Fine-grained personal access token
+
+github.com → Settings → Developer settings → Personal access tokens →
+**Fine-grained tokens** → edit the token that's stored in `gh auth` →
+**Actions: Read and write**. Save. `gh auth status` should now show
+the scope in its `Token scopes:` line.
+
+### GitHub App / bot identity
+
+If Shipyard is running under an App install (CI, `RELEASE_BOT_TOKEN`,
+a bot like `pulp-release-bot`), the scope lives on the **App's
+permissions**, not the invoking user's token. github.com →
+organizations/<org> → Settings → GitHub Apps → your app →
+**Permissions & events** → **Actions: Read and write**. Accept the
+install prompt on each repo after saving.
+
 ## Pin a specific version
 
 Pass `SHIPYARD_VERSION` to install an exact release instead of the

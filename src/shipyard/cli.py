@@ -512,6 +512,12 @@ def doctor(ctx: Context, release_chain: bool, runners: bool) -> None:
     # Cloud providers
     cloud: dict[str, Any] = {}
     cloud["gh"] = _check_command("gh", "--version")
+    # #236: surface the workflow-scope requirement at install time
+    # instead of when the user hits `cloud retarget --apply` and
+    # gets "Couldn't cancel the matching job(s)" out of nowhere.
+    gh_scope = _check_gh_workflow_scope()
+    if gh_scope is not None:
+        cloud["gh-scope"] = gh_scope
     cloud["nsc"] = _check_command("nsc", "version")
     checks["Cloud providers"] = cloud
 
@@ -5459,6 +5465,59 @@ def _check_command(name: str, *args: str) -> dict[str, Any]:
         return {"ok": True, "version": version}
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return {"ok": False, "error": "not installed"}
+
+
+def _check_gh_workflow_scope() -> dict[str, Any] | None:
+    """Probe the gh token for `workflow` scope. #236.
+
+    `shipyard cloud retarget --apply` and `cloud handoff run --apply`
+    both call `gh run cancel` / `gh api .../actions/runs/.../cancel`,
+    which need `workflow` (classic) / Actions: Read and write
+    (fine-grained). Without it, the first retarget attempt fails
+    partway through with "Couldn't cancel the matching job(s)".
+    Surface it here at install/doctor time instead.
+
+    Returns None when gh isn't installed or isn't authenticated
+    (not our problem to flag — the `gh` row already covers that).
+    Returns ok=True when the scope is present (classic PATs
+    include it in the `Token scopes:` line; fine-grained PATs have
+    no scope list at all, so we treat "gh auth status succeeded
+    but no scope line" as a neutral pass since we can't know
+    without hitting the API).
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        # gh not logged in — unrelated to scope; stay quiet.
+        return None
+    combined = (result.stdout + result.stderr).lower()
+    # Classic PAT path prints `Token scopes: 'gist', 'repo', 'workflow'`.
+    if "token scopes" in combined:
+        if "'workflow'" in combined or '"workflow"' in combined:
+            return {"ok": True, "version": "workflow scope present"}
+        return {
+            "ok": False,
+            "version": "gh token missing `workflow` scope",
+            "detail": (
+                "`cloud retarget`/`cloud handoff run --apply` need "
+                "workflow scope to cancel runs. Fix:\n"
+                "  gh auth refresh -h github.com -s workflow\n"
+                "Fine-grained tokens + GitHub App identities: see "
+                "docs/install.md § First-run auth."
+            ),
+        }
+    # Fine-grained tokens + GitHub Apps don't list scopes in
+    # `gh auth status`. Can't verify without an API call; skip
+    # rather than false-positive.
+    return {
+        "ok": True,
+        "version": "gh auth (fine-grained / app) — scope not inspectable locally",
+    }
 
 
 def _resolve_validation(config: Config, mode: ValidationMode) -> dict[str, Any]:
