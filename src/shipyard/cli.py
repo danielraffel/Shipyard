@@ -1980,6 +1980,387 @@ def branch_apply(
 
 
 @main.group()
+def pin() -> None:
+    """Bump a consumer repo's Shipyard version pin.
+
+    Runs in repos that pin a specific Shipyard release via
+    ``tools/shipyard.toml`` (e.g. pulp, spectr). Refuses in the
+    Shipyard repo itself — that's auto-release's domain.
+
+    See issue #222 for the full motivation: every manual pin-bump
+    before this command was a multi-step dance across edit + install
+    + verify + PR. One command now.
+    """
+
+
+def _detect_consumer_pin() -> Path | None:
+    """Return the path to ``tools/shipyard.toml`` if we're in a
+    consumer repo, or ``None`` otherwise.
+
+    Walks upward from CWD so ``shipyard pin ...`` works from any
+    subdirectory of the consumer repo.
+    """
+    cur = Path.cwd().resolve()
+    for parent in (cur, *cur.parents):
+        candidate = parent / "tools" / "shipyard.toml"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _is_shipyard_repo() -> bool:
+    """True if CWD is inside the Shipyard repo itself (pyproject.toml
+    has ``name = \"shipyard\"``). We refuse to pin-bump here — the
+    Shipyard repo's own version is governed by auto-release.
+    """
+    cur = Path.cwd().resolve()
+    for parent in (cur, *cur.parents):
+        pyproject = parent / "pyproject.toml"
+        if not pyproject.exists():
+            continue
+        try:
+            text = pyproject.read_text()
+        except OSError:
+            return False
+        # Match `name = "shipyard"` at a line start under [project].
+        # Cheap parse — we don't need full TOML semantics.
+        return (
+            '\nname = "shipyard"' in text
+            or text.startswith('name = "shipyard"')
+        )
+    return False
+
+
+def _read_pinned_version(toml_path: Path) -> str | None:
+    """Extract the current ``version = "..."`` from a consumer
+    ``tools/shipyard.toml``. Returns the raw string (with or
+    without leading ``v``) or None if not found.
+    """
+    import re
+    try:
+        text = toml_path.read_text()
+    except OSError:
+        return None
+    match = re.search(r'^\s*version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _rewrite_pinned_version(toml_path: Path, new_version: str) -> None:
+    """Rewrite the ``version = "..."`` line in-place, preserving
+    comments and formatting around it. Uses regex rather than a
+    TOML parser because tomllib strips comments on round-trip and
+    the consumer repos' shipyard.toml files have operator-facing
+    comments right above the version line.
+    """
+    import re
+    text = toml_path.read_text()
+    new_text = re.sub(
+        r'^(\s*version\s*=\s*)"[^"]+"',
+        rf'\1"{new_version}"',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if new_text == text:
+        raise RuntimeError(
+            f"Failed to rewrite version in {toml_path} — no match found"
+        )
+    toml_path.write_text(new_text)
+
+
+def _latest_shipyard_release() -> str | None:
+    """Query GitHub for Shipyard's latest published tag. Returns
+    the tag name (e.g. ``v0.44.0``) or None on any error.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh", "release", "list",
+                "--repo", "danielraffel/Shipyard",
+                "--limit", "1",
+                "--json", "tagName",
+                "--jq", ".[0].tagName",
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    tag = result.stdout.strip()
+    return tag or None
+
+
+@pin.command("show")
+@click.pass_obj
+def pin_show(ctx: Context) -> None:
+    """Show the currently-pinned Shipyard version + latest available."""
+    toml_path = _detect_consumer_pin()
+    if toml_path is None:
+        if _is_shipyard_repo():
+            render_error(
+                "Refusing: this is the Shipyard repo. `shipyard pin` runs "
+                "in consumer repos that pin Shipyard, not in Shipyard "
+                "itself (auto-release handles that)."
+            )
+        else:
+            render_error(
+                "No tools/shipyard.toml found. `shipyard pin` requires a "
+                "consumer repo that pins Shipyard via that file."
+            )
+        sys.exit(1)
+
+    current = _read_pinned_version(toml_path) or "<unknown>"
+    latest = _latest_shipyard_release() or "<unknown — gh unavailable>"
+
+    if ctx.json_mode:
+        ctx.output(
+            "pin",
+            {
+                "event": "show",
+                "pin_file": str(toml_path),
+                "current": current,
+                "latest": latest,
+                "up_to_date": current == latest,
+            },
+        )
+        return
+
+    render_message(f"pin file:  {toml_path}")
+    render_message(f"current:   {current}")
+    render_message(f"latest:    {latest}")
+    if current == latest:
+        render_message("✓ Up to date.", style="bold green")
+    else:
+        render_message(
+            f"↑ New version available. Run `shipyard pin bump --to {latest}`.",
+            style="bold yellow",
+        )
+
+
+@pin.command("bump")
+@click.option(
+    "--to",
+    "target",
+    default=None,
+    help=(
+        "Target Shipyard version tag (e.g. `v0.44.0`). "
+        "Defaults to the latest published release."
+    ),
+)
+@click.option(
+    "--no-pr",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip the git branch/commit/PR step. Leaves the "
+        "tools/shipyard.toml edit in the working tree for manual "
+        "handling. Useful for scripts that compose the PR themselves."
+    ),
+)
+@click.option(
+    "--skip-verify",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip `./tools/install-shipyard.sh` + `shipyard --version` "
+        "verify. Not recommended — the whole point of this command "
+        "is to catch install failures before the PR."
+    ),
+)
+@click.pass_obj
+def pin_bump(
+    ctx: Context, target: str | None, no_pr: bool, skip_verify: bool,
+) -> None:
+    """Bump the pinned Shipyard version to ``--to`` (or latest).
+
+    Runs the full flow: edit pin, invoke the consumer's
+    ``./tools/install-shipyard.sh``, verify ``shipyard --version``
+    matches the target, commit, push, open a PR.
+
+    Refuses with a dirty working tree — folding unrelated changes
+    into a pin-bump PR is exactly the class of release slippage we
+    want to prevent.
+    """
+    toml_path = _detect_consumer_pin()
+    if toml_path is None:
+        if _is_shipyard_repo():
+            render_error(
+                "Refusing: this is the Shipyard repo. Use auto-release "
+                "to bump Shipyard's own version."
+            )
+        else:
+            render_error(
+                "No tools/shipyard.toml found. `shipyard pin bump` "
+                "requires a consumer repo."
+            )
+        sys.exit(1)
+
+    repo_root = toml_path.parent.parent
+
+    # Refuse on dirty tree — per #222 scope guard. Check specifically
+    # that the pin file + install script aren't already modified;
+    # untracked files elsewhere (logs, .env, etc.) don't count.
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--", "tools/shipyard.toml",
+             "tools/install-shipyard.sh"],
+            cwd=repo_root, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError) as exc:
+        render_error(f"git status failed: {exc}")
+        sys.exit(1)
+    if status.returncode == 0 and status.stdout.strip():
+        render_error(
+            "Refusing: pin files are already modified:\n" + status.stdout
+            + "Commit or stash them first — pin bump folds into a PR."
+        )
+        sys.exit(1)
+
+    # Resolve target version.
+    if target is None:
+        target = _latest_shipyard_release()
+        if target is None:
+            render_error(
+                "Could not resolve latest Shipyard release. "
+                "Pass --to vX.Y.Z explicitly, or check `gh auth status`."
+            )
+            sys.exit(1)
+
+    # Normalize: always prefix with `v` so `tools/shipyard.toml` keeps
+    # the same shape (consumer configs use `"v0.44.0"`).
+    if not target.startswith("v"):
+        target = f"v{target}"
+
+    current = _read_pinned_version(toml_path)
+    if current == target:
+        if ctx.json_mode:
+            ctx.output(
+                "pin",
+                {"event": "bump", "result": "noop", "current": current, "target": target},
+            )
+        else:
+            render_message(
+                f"Already pinned to {target} — nothing to do.",
+                style="dim",
+            )
+        return
+
+    render_message(f"Bumping pin: {current} → {target}")
+    _rewrite_pinned_version(toml_path, target)
+
+    if not skip_verify:
+        install_script = repo_root / "tools" / "install-shipyard.sh"
+        if not install_script.exists():
+            render_error(
+                f"Expected installer at {install_script} — consumer "
+                "repos must ship a tools/install-shipyard.sh wrapper."
+            )
+            sys.exit(1)
+        render_message("Running ./tools/install-shipyard.sh...")
+        try:
+            result = subprocess.run(
+                ["bash", str(install_script)],
+                cwd=repo_root, timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            render_error("install-shipyard.sh timed out after 10 min.")
+            sys.exit(1)
+        if result.returncode != 0:
+            render_error(
+                f"install-shipyard.sh exited {result.returncode}. "
+                "Pin edit left in place for inspection; not opening PR."
+            )
+            sys.exit(result.returncode)
+
+        # Verify the installed binary actually reports the target.
+        try:
+            version_check = subprocess.run(
+                ["shipyard", "--version"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError) as exc:
+            render_error(f"Could not invoke shipyard --version: {exc}")
+            sys.exit(1)
+        if target.lstrip("v") not in version_check.stdout:
+            render_error(
+                f"shipyard --version reported {version_check.stdout!r}; "
+                f"expected to contain {target.lstrip('v')!r}."
+            )
+            sys.exit(1)
+        render_message(f"✓ shipyard --version matches {target}", style="bold green")
+
+    payload = {
+        "pin_file": str(toml_path),
+        "from": current,
+        "to": target,
+        "repo_root": str(repo_root),
+    }
+
+    if no_pr:
+        if ctx.json_mode:
+            ctx.output("pin", {"event": "bump", "result": "edited", **payload})
+        else:
+            render_message(
+                "\n--no-pr: edit left in the working tree. "
+                "Commit + PR yourself when ready.",
+                style="dim",
+            )
+        return
+
+    # Commit + PR. Branch name encodes both versions so it's unique
+    # per-target even if someone runs the flow twice in a row.
+    branch = f"chore/bump-shipyard-pin-to-{target}"
+    try:
+        subprocess.run(["git", "checkout", "-b", branch], cwd=repo_root, check=True)
+        subprocess.run(
+            ["git", "add", "tools/shipyard.toml"], cwd=repo_root, check=True,
+        )
+        commit_msg = (
+            f"chore: bump Shipyard pin {current or 'unknown'} → {target}\n\n"
+            f"See https://github.com/danielraffel/Shipyard/releases/tag/{target} "
+            "for release notes."
+        )
+        subprocess.run(
+            ["git", "commit", "-m", commit_msg], cwd=repo_root, check=True,
+        )
+        subprocess.run(
+            ["git", "push", "-u", "origin", branch], cwd=repo_root, check=True,
+        )
+        pr_result = subprocess.run(
+            [
+                "gh", "pr", "create",
+                "--title", f"chore: bump Shipyard pin {current or '?'} → {target}",
+                "--body",
+                (
+                    f"Bumps the pinned Shipyard version from {current or 'unknown'} "
+                    f"to **{target}**.\n\n"
+                    "Verified locally:\n"
+                    "- [x] `./tools/install-shipyard.sh` succeeded\n"
+                    "- [x] `shipyard --version` matches target\n\n"
+                    f"Release notes: https://github.com/danielraffel/Shipyard/releases/tag/{target}"
+                ),
+            ],
+            cwd=repo_root, capture_output=True, text=True, check=True,
+        )
+        pr_url = pr_result.stdout.strip().split("\n")[-1]
+    except subprocess.CalledProcessError as exc:
+        render_error(
+            f"git/gh step failed: {exc}\n"
+            "Pin edit may be committed to the branch; check git status."
+        )
+        sys.exit(1)
+
+    if ctx.json_mode:
+        ctx.output(
+            "pin",
+            {"event": "bump", "result": "pr-opened", "pr_url": pr_url, **payload},
+        )
+    else:
+        render_message(f"✓ PR opened: {pr_url}", style="bold green")
+
+
+@main.group()
 def cloud() -> None:
     """Dispatch and inspect GitHub Actions workflows."""
 
