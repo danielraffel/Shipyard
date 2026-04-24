@@ -497,6 +497,13 @@ def doctor(ctx: Context, release_chain: bool, runners: bool) -> None:
     # #181: catch a corrupt PyInstaller _unicode_data archive here
     # rather than mid-render during `shipyard ship`.
     core["rich-bundle"] = _check_rich_bundle_health()
+    # #216: surface macOS Gatekeeper / quarantine / codesign state so
+    # a binary in the silent-no-op failure mode is named rather than
+    # mysterious. None on non-macOS / non-frozen; omit that row so
+    # Linux + dev-env don't show a vacuous line.
+    gatekeeper_row = _check_macos_gatekeeper_health()
+    if gatekeeper_row is not None:
+        core["macos-gatekeeper"] = gatekeeper_row
     daemon_drift = _check_daemon_version_drift(ctx)
     if daemon_drift:
         core["daemon-version"] = daemon_drift
@@ -636,6 +643,103 @@ def _check_shipyard_path_shadows() -> dict[str, Any]:
         "version": f"v{_self_version} ({len(seen_bins)} binaries found)",
         "detail": detail,
     }
+
+
+def _check_macos_gatekeeper_health() -> dict[str, Any] | None:
+    """Surface a broken notarization state on macOS before it bites.
+
+    Closes #216 — the user-facing failure is "exit 137 once, then
+    exit 0 with zero output forever after." That shape is exactly
+    what happens when Gatekeeper rejects a PyInstaller bundle whose
+    Developer-ID signature got destroyed: macOS SIGKILLs on first
+    run and then caches the rejection so subsequent runs exit
+    silently. Root cause was ``install.sh``'s pre-v0.36.0
+    ``codesign --force --sign -`` ad-hoc resign (#203 fixed the
+    install side). This check catches users already in the broken
+    state or whose future install path regresses.
+
+    Three signals, any one of which flips ok=False:
+
+    1. ``com.apple.quarantine`` xattr present on the running binary
+       — Gatekeeper's first-run evaluation is still pending or
+       failed.
+    2. ``spctl --assess`` rejects the binary — active Gatekeeper
+       rejection. The definitive "your binary is broken" signal.
+    3. ``codesign --verify --deep`` fails — signing integrity is
+       broken independent of policy.
+
+    Returns None on non-macOS and when the running CLI isn't a
+    frozen bundle (e.g. ``uv run shipyard doctor`` during
+    development) — a passing row there would be false confidence
+    since the Python interpreter is well-signed regardless of how
+    the release binary fared.
+    """
+    if sys.platform != "darwin":
+        return None
+
+    frozen = getattr(sys, "frozen", False)
+    if not frozen:
+        return None
+
+    binary = Path(sys.executable)
+    if not binary.exists():
+        return None
+
+    problems: list[str] = []
+
+    try:
+        xattr_out = subprocess.run(
+            ["xattr", str(binary)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if "com.apple.quarantine" in xattr_out.stdout:
+            import shlex as _shlex
+            problems.append(
+                "com.apple.quarantine xattr present — binary is in "
+                "Gatekeeper first-run evaluation state. Clear with: "
+                f"xattr -d com.apple.quarantine {_shlex.quote(str(binary))}"
+            )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    try:
+        spctl = subprocess.run(
+            ["spctl", "--assess", "--verbose=2", str(binary)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if spctl.returncode != 0:
+            detail = (spctl.stderr.strip() or spctl.stdout.strip())[:200]
+            problems.append(
+                f"spctl rejection: {detail}. Reinstall v0.36.0+ "
+                "(install.sh now preserves Developer-ID notarization): "
+                "curl -fsSL https://raw.githubusercontent.com/"
+                "danielraffel/Shipyard/main/install.sh | sh"
+            )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    try:
+        verify = subprocess.run(
+            ["codesign", "--verify", "--deep", str(binary)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if verify.returncode != 0:
+            detail = (verify.stderr.strip() or "verification failed")[:200]
+            problems.append(
+                f"codesign --verify failed: {detail}. Binary "
+                "signature is broken; reinstall from the release "
+                "artifact."
+            )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    if problems:
+        return {
+            "ok": False,
+            "version": "macOS Gatekeeper rejection risk",
+            "detail": "\n  ".join(problems),
+        }
+    return {"ok": True, "version": "Gatekeeper + codesign + xattr healthy"}
 
 
 def _check_rich_bundle_health() -> dict[str, Any]:
