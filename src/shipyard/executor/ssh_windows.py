@@ -577,6 +577,9 @@ def _apply_bundle_windows(
     )
 
     ps_cmd = (
+        # UTF-8 prelude (#208): also affects git bundle verify /
+        # git fetch output and any non-ASCII bundle path.
+        f"{_WINDOWS_UTF8_PRELUDE}"
         f"$Bundle = {resolved}; "
         f"cd '{safe_repo}'; "
         f"git bundle verify $Bundle; "
@@ -754,6 +757,42 @@ def _append_log(log_file: Path, text: str) -> None:
         pass
 
 
+# Prelude prepended to every PowerShell command shipyard dispatches to
+# a Windows host. Forces UTF-8 across the Win32 console round-trip so
+# non-ASCII argv (em-dashes, emoji, accented test names) survive the
+# trip through any child process.
+#
+# Three settings cover three different encoding paths:
+#
+#   `chcp.com 65001`          → sets the Win32 console code page.
+#                                Child processes' CRT and Win32 APIs
+#                                (GetConsoleCP, GetConsoleOutputCP)
+#                                pick this up. Without it, Namespace's
+#                                Windows image defaults to CP-1252 and
+#                                UTF-8 argv → CP-1252 → mojibake.
+#   `[Console]::OutputEncoding`→ how PowerShell decodes child-process
+#                                stdout back into strings.
+#   `$OutputEncoding`          → how PowerShell sends pipeline data
+#                                TO a child process's stdin.
+#
+# All three are session-scoped — set once at the top of the PS
+# script, they apply to everything that session spawns, and die when
+# the session does. No leak, no global mutation.
+#
+# Zero-cost on hosts already at 65001 (GitHub-hosted Windows runners
+# default to it); the setters are idempotent. See #208 for the
+# concrete incident: pulp's ctest hit 46 spurious failures on
+# Namespace Windows because em-dash test names got mangled.
+#
+# ``| Out-Null`` suppresses `chcp`'s "Active code page: 65001"
+# confirmation line so it doesn't pollute the validation log.
+_WINDOWS_UTF8_PRELUDE = (
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+    "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+    "chcp.com 65001 | Out-Null; "
+)
+
+
 def _build_remote_command(
     sha: str,
     remote_repo: str,
@@ -803,6 +842,7 @@ def _build_remote_command(
     safe_repo = _ps_single_quote(remote_repo)
     safe_sha = _ps_single_quote(sha)
     return (
+        f"{_WINDOWS_UTF8_PRELUDE}"
         f"{toolchain_env_exports(toolchain)}; "
         f"cd '{safe_repo}'; "
         f"git checkout --force '{safe_sha}'; "
