@@ -180,6 +180,37 @@ def test_release_yml_creates_draft_release_until_dmg_uploaded() -> None:
     assert "softprops/action-gh-release" in content
 
 
+def test_partial_arch_exit_path_does_not_reference_unset_vars() -> None:
+    # Codex P1 on #254: the partial-arch exit path (only one of
+    # arm64/x64 dmgs present) must not reference $E2E_TMPDIR — it's
+    # only created later in step 9, and `set -u` is active, so
+    # expanding it here raises an unbound-variable error and the
+    # script exits non-zero instead of returning the intended "exit
+    # 0, re-run for the other arch" contract.
+    #
+    # Doc-check rather than a runtime exercise because the partial
+    # path is reached only via a real `gh release view` call; that
+    # needs auth + a real release. Grep the source.
+    content = SCRIPT.read_text()
+    # Find the partial-arch block (starts at "Keeping release $TAG
+    # as draft" and ends at "exit 0"). The block must NOT reference
+    # any variable that's only created in step 9. E2E_TMPDIR is the
+    # canonical one per #254; broaden the check if others surface.
+    start = content.find("Keeping release $TAG as draft")
+    assert start != -1, "partial-arch message block not found"
+    end = content.find("exit 0", start)
+    assert end != -1, "partial-arch exit 0 not found"
+    partial_block = content[start:end]
+    # Match actual variable expansions (`$E2E_TMPDIR` or
+    # `${E2E_TMPDIR}`), not the word appearing inside a comment.
+    import re
+    matches = re.findall(r"\$\{?E2E_TMPDIR", partial_block)
+    assert not matches, (
+        "partial-arch exit path must not expand $E2E_TMPDIR — "
+        "it's only set in step 9 and `set -u` would crash the script"
+    )
+
+
 def test_publish_waits_for_both_macos_arches() -> None:
     # Codex P1 on #253: running this script for only arm64 previously
     # flipped the release public while the x64 dmg was still missing,
