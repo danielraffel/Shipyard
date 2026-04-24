@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0450"></a>
+## [0.45.0] - 2026-04-24
+
+- feat(cli): shipyard pin show + shipyard pin bump (#222) ([#230](https://github.com/danielraffel/Shipyard/pull/230))
+
 <a id="v0440"></a>
 ## [0.44.0] - 2026-04-24
 
@@ -436,6 +441,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.45.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.45.0
 [0.44.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.44.0
 [0.43.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.43.0
 [0.42.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.42.0
