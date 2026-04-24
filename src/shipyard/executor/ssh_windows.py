@@ -153,6 +153,35 @@ class SSHWindowsExecutor:
                         f"Bundle creation failed: {bundle_result.message}",
                     )
 
+                # #239 Phase A: write an initial log header before
+                # upload starts so the per-target log file exists
+                # even if upload fails pre-stage. The user's Pulp
+                # repro had the ship-flow print a "see log at
+                # windows.log" hint but the file didn't exist —
+                # because error exits happen before any logger
+                # touches it. Now the file always exists with the
+                # attempted command + target metadata, and
+                # per-attempt upload stderr appended on failure.
+                try:
+                    with log_file.open("w", encoding="utf-8") as lf:
+                        lf.write(
+                            f"# shipyard ssh-windows lane log\n"
+                            f"target: {target_name}\n"
+                            f"platform: {platform}\n"
+                            f"host: {host}\n"
+                            f"sha: {sha}\n"
+                            f"branch: {branch}\n"
+                            f"remote_repo: {remote_repo}\n"
+                            f"remote_bundle: {remote_bundle}\n"
+                            f"started_at: {started_at.isoformat()}\n"
+                            f"---\n"
+                        )
+                except OSError:
+                    # Don't let logging failure cascade; the ship
+                    # flow's "see log" hint will point at a missing
+                    # file and that's fine. Upload proceeds.
+                    pass
+
                 upload_result = upload_bundle(
                     bundle_path=bundle_path,
                     host=host,
@@ -162,10 +191,38 @@ class SSHWindowsExecutor:
                     is_windows=True,
                 )
                 if not upload_result.success:
+                    # #239 Phase A: append per-attempt upload stderr
+                    # to the log so the operator has concrete data
+                    # on whether this was a connect-timeout, a slow
+                    # runner, or mid-stream upload break. Without
+                    # this the only artifact was the summary line
+                    # "Upload failed: ssh: connect to host ...".
+                    try:
+                        with log_file.open("a", encoding="utf-8") as lf:
+                            lf.write(
+                                f"bundle-upload failure "
+                                f"(class={upload_result.failure_class})\n"
+                            )
+                            for attempt_line in upload_result.attempts:
+                                lf.write(f"  {attempt_line}\n")
+                            lf.write(f"summary: {upload_result.message}\n")
+                    except OSError:
+                        pass
+                    # Surface the classification in the user-facing
+                    # error message so the summary row tells the
+                    # user "ssh-unreachable" vs "upload failed
+                    # after reachable" without them opening the
+                    # log.
+                    class_hint = ""
+                    if upload_result.failure_class == "ssh_unreachable":
+                        class_hint = " [ssh-unreachable]"
+                    elif upload_result.failure_class == "upload_failed":
+                        class_hint = " [upload failed after reachable]"
                     return _error_result(
                         target_name, platform, started_at, start_time,
                         str(log_file),
-                        f"Bundle upload failed: {upload_result.message}",
+                        f"Bundle upload failed{class_hint}: "
+                        f"{upload_result.message}",
                     )
 
                 # Apply bundle via PowerShell on the remote. Pass

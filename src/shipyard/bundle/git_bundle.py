@@ -18,11 +18,30 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class BundleResult:
-    """Outcome of a bundle operation."""
+    """Outcome of a bundle operation.
+
+    `failure_class` (#239 Phase A): on upload failures, categorizes
+    the root cause so callers can surface it and retry-deciders can
+    route:
+      - ``ssh_unreachable``: raw SSH connect failed (port 22 timeout,
+        connection refused). Retrying the upload won't help on its
+        own — the network / host is down.
+      - ``upload_failed``: SSH reached the host but the upload itself
+        exited non-zero / timed out / broke mid-stream. Could be
+        transient slow-runner behavior; retry-with-backoff helps.
+      - ``other``: bundle creation failure, caller misconfig, etc.
+        Preserved for backward compat.
+    `attempts` carries per-attempt stderr + wall time on upload
+    paths — without this, the user sees one Upload-failed message
+    with no sense of whether attempt 1 failed fast and attempt 2
+    timed out or vice versa.
+    """
 
     success: bool
     message: str
     path: str | None = None
+    failure_class: str = "other"
+    attempts: tuple[str, ...] = ()
 
 
 def create_bundle(
@@ -82,6 +101,31 @@ def create_bundle(
         return BundleResult(success=False, message=f"OS error: {exc}")
 
 
+_SSH_UNREACHABLE_FINGERPRINTS = (
+    # Raw ssh/connect failures — host is down, DNS failed, port
+    # filtered, or TCP handshake timed out. Retrying the upload
+    # alone won't help on its own; the caller may want to probe
+    # connectivity separately before retrying.
+    "connect to host",           # "ssh: connect to host X port 22: …"
+    "connection refused",        # daemon down / wrong port
+    "no route to host",          # network partition
+    "name or service not known",  # DNS
+    "operation timed out",       # TCP handshake timeout
+    "network is unreachable",
+)
+
+
+def _classify_upload_failure(stderr: str) -> str:
+    """Return 'ssh_unreachable' / 'upload_failed' based on stderr
+    fingerprints. See BundleResult.failure_class docstring.
+    """
+    low = stderr.lower()
+    for fp in _SSH_UNREACHABLE_FINGERPRINTS:
+        if fp in low:
+            return "ssh_unreachable"
+    return "upload_failed"
+
+
 def upload_bundle(
     bundle_path: str | Path,
     host: str,
@@ -90,6 +134,7 @@ def upload_bundle(
     timeout: int = 1800,
     *,
     is_windows: bool = False,
+    max_attempts: int = 3,
 ) -> BundleResult:
     """Upload a bundle file to a remote host via SCP.
 
@@ -104,9 +149,18 @@ def upload_bundle(
             small bundles can pass a shorter timeout; 5 minutes was
             the previous default and turned out to be too
             aggressive for real workloads.
+        max_attempts: Retry budget per #239 Phase A. Defaults to 3
+            so a slow-runner hiccup (Pulp repro: Windows runner
+            under AV-scan pressure) doesn't fail the lane on the
+            first transient. When the first attempt fingerprints
+            as ``ssh_unreachable`` we skip further retries —
+            retrying the same unreachable host won't help and we
+            want to fail fast.
 
     Returns:
-        BundleResult indicating success or failure.
+        BundleResult indicating success or failure. On failure,
+        ``failure_class`` carries the classification and
+        ``attempts`` carries per-attempt stderr.
     """
     bundle_path = Path(bundle_path)
     if not bundle_path.exists():
@@ -207,30 +261,99 @@ def upload_bundle(
             cmd.append(opt)
         cmd.extend([host, f"cat > {remote_path}"])
 
-    try:
-        with open(bundle_path, "rb") as f:
-            result = subprocess.run(
-                cmd,
-                stdin=f,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+    # Retry with backoff + jitter on transient upload failures
+    # (#239 Phase A). Slow Windows runners under AV/indexing
+    # pressure hit ~60s PowerShell startup latency, which can blow
+    # the upload's connect phase even though the host is otherwise
+    # reachable. Three attempts with 2s / 5s backoff gives us a
+    # real shot at completing without retry budget becoming
+    # wall-clock-significant on healthy runs.
+    import random as _random
+    import time as _time
+
+    attempts_log: list[str] = []
+    last_stderr = ""
+    last_exception_msg = ""
+    final_class = "upload_failed"
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_start = _time.monotonic()
+        try:
+            with open(bundle_path, "rb") as f:
+                result = subprocess.run(
+                    cmd,
+                    stdin=f,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            elapsed = _time.monotonic() - attempt_start
+            if result.returncode == 0:
+                if attempt > 1:
+                    attempts_log.append(
+                        f"attempt {attempt}/{max_attempts}: "
+                        f"success after {elapsed:.1f}s"
+                    )
+                return BundleResult(
+                    success=True,
+                    message="Bundle uploaded",
+                    path=remote_path,
+                    attempts=tuple(attempts_log),
+                )
+            last_stderr = (result.stderr or "").strip()
+            attempts_log.append(
+                f"attempt {attempt}/{max_attempts} failed "
+                f"after {elapsed:.1f}s: {last_stderr[:200] or '(no stderr)'}"
             )
-        if result.returncode != 0:
+            final_class = _classify_upload_failure(last_stderr)
+            # Fail-fast on unreachable: retrying won't help if the
+            # TCP connect itself is broken. Let the caller see the
+            # classification quickly so they can surface it without
+            # burning the full retry budget on a dead host.
+            if final_class == "ssh_unreachable":
+                break
+        except subprocess.TimeoutExpired:
+            elapsed = _time.monotonic() - attempt_start
+            # Phrase as "timed out after" (past tense) so callers
+            # grepping for the word "timeout" OR "timed out" both
+            # match — the existing BundleResult contract tests
+            # assert the substring "timed out" so we preserve it
+            # verbatim.
+            last_stderr = (
+                f"timed out after {elapsed:.1f}s (budget {timeout}s)"
+            )
+            attempts_log.append(
+                f"attempt {attempt}/{max_attempts}: {last_stderr}"
+            )
+            final_class = "upload_failed"
+        except OSError as exc:
+            last_exception_msg = f"OS error: {exc}"
+            attempts_log.append(
+                f"attempt {attempt}/{max_attempts}: {last_exception_msg}"
+            )
             return BundleResult(
                 success=False,
-                message=f"Upload failed: {result.stderr.strip()}",
+                message=last_exception_msg,
+                failure_class="other",
+                attempts=tuple(attempts_log),
             )
-        return BundleResult(
-            success=True,
-            message="Bundle uploaded",
-            path=remote_path,
-        )
 
-    except subprocess.TimeoutExpired:
-        return BundleResult(success=False, message="Upload timed out")
-    except OSError as exc:
-        return BundleResult(success=False, message=f"OS error: {exc}")
+        # Backoff before the next attempt (unless this is the last).
+        # 2s base + 0-50% jitter on attempt 1→2, 5s on 2→3.
+        if attempt < max_attempts:
+            base = 2.0 if attempt == 1 else 5.0
+            _time.sleep(_random.uniform(base, base * 1.5))
+
+    # All attempts exhausted.
+    summary = last_stderr or last_exception_msg or "no stderr captured"
+    return BundleResult(
+        success=False,
+        message=(
+            f"Upload failed after {len(attempts_log)} attempt(s): {summary}"
+        ),
+        failure_class=final_class,
+        attempts=tuple(attempts_log),
+    )
 
 
 def apply_bundle(
