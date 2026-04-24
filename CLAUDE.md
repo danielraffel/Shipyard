@@ -163,7 +163,9 @@ After any new tag lands and the release workflow publishes non-macOS assets, run
 ./scripts/release-macos-local.sh --tag vX.Y.Z --upload
 ```
 
-The script is 8 steps: build, re-sign, package-to-dmg, sign-dmg, notarize+staple, **mount + launch test** (exit 3 if it fails), upload, **end-to-end install.sh → launch test** (exit 4 if it fails). Refuses to upload a dmg that doesn't mount-and-launch cleanly; refuses to declare success after upload if the download+install chain doesn't end in a working `--version`.
+The script is 9 steps: build, re-sign, package-to-dmg, sign-dmg, notarize+staple, **mount + launch test** (exit 3 if it fails), upload, **flip release from draft to public** (#252), **end-to-end install.sh → launch test** (exit 4 if it fails — reverts release to draft). Refuses to upload a dmg that doesn't mount-and-launch cleanly; refuses to declare success after upload if the download+install chain doesn't end in a working `--version`.
+
+**Draft-until-complete (#252):** `release.yml` now creates the GitHub Release as **draft**. `install.sh`'s `releases/latest` resolution excludes drafts by default — so during the build/upload gap window, macOS users degrade to the previous published tag instead of hitting a 404 on the missing dmg. Step 8 of the local release script flips `draft=false` once the dmg is uploaded; step 9's E2E failure reverts to draft so broken releases disappear from `releases/latest` automatically. This is why shipping is a manual-on-Mac step today, not an auto-release: the maintainer's local script is the gate that flips the release public.
 
 **Load-bearing rule:** the success criterion is a working `--version` after fresh install.sh → mount → extract → launch. Not `codesign --verify`, not `spctl --assess`, not the on-runner launch gate in isolation. We shipped v0.42.0 and v0.43.0 with the same breakage because we declared victory on partial verification. Don't do that again.
 

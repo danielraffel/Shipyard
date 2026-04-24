@@ -43,10 +43,15 @@
 #
 # Exit codes:
 #   0   Build + sign + notarize + local-launch test all passed.
-#       Asset was uploaded if --upload was passed.
+#       Asset was uploaded if --upload was passed. When --upload is
+#       set, the GitHub Release is flipped from draft to public after
+#       the end-to-end install.sh verification passes.
 #   1   One of the steps failed. Diagnostics on stderr.
 #   2   Missing required env var.
 #   3   --version smoke test FAILED on this Mac. Do NOT ship this binary.
+#   4   End-to-end install.sh test FAILED after upload. Release is
+#       reverted to draft so install.sh's `releases/latest` degrades
+#       to the previous good release (#252).
 
 set -euo pipefail
 
@@ -100,7 +105,7 @@ echo ""
 # so the resulting binary is byte-identical to what CI would produce
 # on the same commit (modulo signing timestamp). If this binary
 # launches but the CI-signed one doesn't, the delta is signing.
-echo "Step 1/5: PyInstaller build..."
+echo "Step 1/9: PyInstaller build..."
 if ! command -v pyinstaller >/dev/null 2>&1; then
     echo "ERROR: pyinstaller not on PATH. pip install pyinstaller." >&2
     exit 1
@@ -117,7 +122,7 @@ if [ ! -f "$DIST_BINARY" ]; then
 fi
 
 # ── Re-sign with hardened runtime + timestamp ──────────────────────
-echo "Step 2/5: Re-sign with hardened runtime + secure timestamp..."
+echo "Step 2/9: Re-sign with hardened runtime + secure timestamp..."
 codesign --force --options runtime --timestamp \
     --sign "$SHIPYARD_SIGNING_IDENTITY" \
     "$DIST_BINARY"
@@ -134,7 +139,7 @@ codesign -dv --verbose=4 "$DIST_BINARY" 2>&1 | grep -E "Authority|TeamIdentifier
 # offline. Gatekeeper + taskgated verify against that ticket
 # instead of calling Apple, so per-Mac network/CDN/provenance
 # state stops mattering.
-echo "Step 3/6: Package signed Mach-O into .dmg..."
+echo "Step 3/9: Package signed Mach-O into .dmg..."
 DMG_NAME="${ARTIFACT}.dmg"
 DIST_DMG="dist/${DMG_NAME}"
 DMG_STAGING="$(mktemp -d)/stage"
@@ -155,7 +160,7 @@ hdiutil create -volname "Shipyard" \
 # notarytool can match + return a staple-able ticket. Without this
 # the DMG ships unsigned and notarize fails with "package is not
 # signed".
-echo "Step 4/6: Sign the DMG..."
+echo "Step 4/9: Sign the DMG..."
 codesign --force --sign "$SHIPYARD_SIGNING_IDENTITY" "$DIST_DMG"
 codesign -dv --verbose=2 "$DIST_DMG" 2>&1 | grep -E "Authority|TeamIdentifier" | head -3
 
@@ -165,7 +170,7 @@ codesign -dv --verbose=2 "$DIST_DMG" 2>&1 | grep -E "Authority|TeamIdentifier" |
 # After acceptance, `stapler staple` embeds the ticket in the DMG
 # so first-launch verification is OFFLINE — the entire point of
 # task #52.
-echo "Step 5/6: Submit DMG to Apple notarization service (~30-90s)..."
+echo "Step 5/9: Submit DMG to Apple notarization service (~30-90s)..."
 NOTARIZE_LOG="$(mktemp)"
 if ! xcrun notarytool submit "$DIST_DMG" \
         --apple-id "$SHIPYARD_NOTARIZE_APPLE_ID" \
@@ -207,7 +212,7 @@ echo "  ✓ Ticket stapled and validated"
 # Gatekeeper-verifies-offline flow end users will hit after
 # install.sh extracts. If it fails here, the dmg is broken —
 # refuse to upload.
-echo "Step 6/6: Local launch test via mounted DMG..."
+echo "Step 6/9: Local launch test via mounted DMG..."
 MOUNT_POINT="$(mktemp -d)/mnt"
 # -nobrowse: don't show the volume in Finder. -readonly: prevent
 # accidental writes. Explicit mountpoint so we don't scrape
@@ -253,7 +258,7 @@ trap - EXIT
 
 # ── Upload (opt-in) ────────────────────────────────────────────────
 if [ "$DO_UPLOAD" -eq 1 ]; then
-    echo "Step 7/8: Uploading $DIST_DMG to release $TAG..."
+    echo "Step 7/9: Uploading $DIST_DMG to release $TAG..."
     gh release upload "$TAG" "$DIST_DMG" --clobber
     # Update the checksum line for this artifact. Keyed on the
     # full asset filename (e.g. shipyard-macos-arm64.dmg) so an
@@ -279,6 +284,26 @@ if [ "$DO_UPLOAD" -eq 1 ]; then
     rm -rf "$CHECKSUMS_DIR"
     echo "  ✓ Uploaded to release $TAG"
 
+    # ── Publish (flip draft → public) ─────────────────────────────
+    # #252: `release.yml` creates the release as draft so end users
+    # on macOS don't 404 on the missing dmg during the build/upload
+    # window. Now that the dmg is uploaded (and the mount test at
+    # step 6 proved it launches), flip draft=false so install.sh can
+    # resolve this tag as latest. If step 8's E2E check fails below,
+    # we revert to draft so the broken release disappears from
+    # install.sh's `releases/latest` resolution.
+    WAS_DRAFT=0
+    if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" = "true" ]; then
+        WAS_DRAFT=1
+    fi
+    if [ "$WAS_DRAFT" -eq 1 ]; then
+        echo "Step 8/9: Flipping release $TAG from draft to published..."
+        gh release edit "$TAG" --draft=false >/dev/null
+        echo "  ✓ Release $TAG is now public."
+    else
+        echo "Step 8/9: Release $TAG is already public (skipping draft flip)."
+    fi
+
     # ── End-to-end verification (#55 codification) ─────────────────
     # Test the same install.sh → launch path end users hit. The
     # local launch test above proved the DMG works when mounted
@@ -291,11 +316,17 @@ if [ "$DO_UPLOAD" -eq 1 ]; then
     # merge + release, the tag's install.sh and this checkout's
     # install.sh are the same file, so the test remains honest.
     #
-    # If this fails, the upload already happened: operator must
-    # manually delete the uploaded asset or re-run after fixing.
-    # Exit 4 distinguishes this from the local mounted-launch test
-    # failure (exit 3).
-    echo "Step 8/8: End-to-end verification (local install.sh → launch)..."
+    # On failure, we revert the release to draft (so install.sh's
+    # `releases/latest` degrades to the previous good release) and
+    # exit 4.
+    revert_to_draft_on_failure() {
+        if [ "$WAS_DRAFT" -eq 1 ]; then
+            echo "  → Reverting release $TAG to draft so end users" >&2
+            echo "    don't see the broken dmg." >&2
+            gh release edit "$TAG" --draft=true >/dev/null 2>&1 || true
+        fi
+    }
+    echo "Step 9/9: End-to-end verification (local install.sh → launch)..."
     E2E_TMPDIR="$(mktemp -d)"
     E2E_INSTALL_DIR="$E2E_TMPDIR/bin"
     LOCAL_INSTALL_SH="$(cd "$(dirname "$0")/.." && pwd)/install.sh"
@@ -305,29 +336,30 @@ if [ "$DO_UPLOAD" -eq 1 ]; then
             >"$E2E_TMPDIR/install.log" 2>&1; then
         echo "" >&2
         echo "ERROR: E2E install.sh FAILED for $TAG." >&2
-        echo "       Upload already happened — this DMG is live but" >&2
-        echo "       end-users won't be able to install it cleanly." >&2
         echo "       Install log:" >&2
         sed 's/^/         /' "$E2E_TMPDIR/install.log" >&2
+        revert_to_draft_on_failure
         rm -rf "$E2E_TMPDIR"
         exit 4
     fi
     if ! E2E_OUTPUT=$("$E2E_INSTALL_DIR/shipyard" --version 2>&1); then
         echo "" >&2
         echo "ERROR: E2E installed binary FAILED to launch." >&2
-        echo "       Upload already happened. The DMG mounts + verifies" >&2
-        echo "       but the extracted binary does not survive the" >&2
-        echo "       install.sh download + post-processing path." >&2
+        echo "       The DMG mounts + verifies but the extracted" >&2
+        echo "       binary does not survive the install.sh download" >&2
+        echo "       + post-processing path." >&2
         echo "       Install log:" >&2
         sed 's/^/         /' "$E2E_TMPDIR/install.log" >&2
+        revert_to_draft_on_failure
         rm -rf "$E2E_TMPDIR"
         exit 4
     fi
     echo "  ✓ End-to-end install.sh + launch passed: ${E2E_OUTPUT}"
     rm -rf "$E2E_TMPDIR"
 else
-    echo "Step 7/8: SKIPPED (--upload not passed)."
-    echo "Step 8/8: E2E verification SKIPPED (requires upload)."
+    echo "Step 7/9: SKIPPED (--upload not passed)."
+    echo "Step 8/9: Draft-flip SKIPPED (requires upload)."
+    echo "Step 9/9: E2E verification SKIPPED (requires upload)."
     echo ""
     echo "Signed + notarized + stapled DMG at: $DIST_DMG"
     echo "Re-run with --upload to ship it to release $TAG."

@@ -148,3 +148,33 @@ def test_all_env_vars_missing_names_first_missing_one_clearly() -> None:
     assert len(error_lines) == 1, (
         f"expected exactly one missing-env error line; got {error_lines}"
     )
+
+
+def test_script_documents_draft_until_complete_exit_4() -> None:
+    # #252: script now flips the release from draft to public after
+    # upload, and reverts to draft on E2E failure. Help text must
+    # document exit 4 so operators + wrappers know what it means.
+    content = SCRIPT.read_text()
+    assert "4 " in content and "reverted to draft" in content, (
+        "Exit code 4 must be documented in the script header"
+    )
+    # All nine step labels must be present — proxy test for the new
+    # step 8 (publish) and step 9 (e2e) landing together. If someone
+    # renumbers to 10 steps or drops a step this fires first.
+    for n in range(1, 10):
+        assert f"Step {n}/9" in content, f"missing Step {n}/9 label"
+
+
+def test_release_yml_creates_draft_release_until_dmg_uploaded() -> None:
+    # #252: release.yml must create the GitHub Release as a draft so
+    # install.sh's `releases/latest` degrades to the previous
+    # published release during the build/upload gap window.
+    release_yml = REPO_ROOT / ".github" / "workflows" / "release.yml"
+    content = release_yml.read_text()
+    assert "draft: true" in content, (
+        "release.yml must create new tag releases as draft — "
+        "release-macos-local.sh flips draft=false after upload"
+    )
+    # Anchor the draft:true line to the softprops action block,
+    # not a comment or stray YAML, by requiring both in the file.
+    assert "softprops/action-gh-release" in content

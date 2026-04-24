@@ -344,8 +344,17 @@ jobs:
           done
           cd release && sha256sum * > checksums.sha256
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (draft until macOS dmg attached)
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
           generate_release_notes: true
+          # #252: keep the release in draft until the macOS .dmg has
+          # been uploaded + verified by the maintainer's local script.
+          # install.sh's `releases/latest` resolution automatically
+          # excludes drafts, so end users on macOS degrade to the
+          # previous published release during the gap window instead
+          # of hitting a 404 on the missing dmg asset.
+          # release-macos-local.sh's final step flips draft=false
+          # once the dmg passes the end-to-end install check.
+          draft: true
