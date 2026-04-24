@@ -232,19 +232,46 @@ def test_publish_gate_covers_arm64_only_after_intel_drop() -> None:
 
 def test_install_sh_rejects_intel_mac_cleanly() -> None:
     # #256: install.sh on Intel Mac must surface a clear "unsupported"
-    # message and exit non-zero BEFORE attempting the asset fetch.
-    # Letting it fall through to the 404 on a missing dmg is exactly
-    # the UX regression this drop was meant to clean up.
+    # message and exit non-zero rather than fall through to a 404 on
+    # the missing asset.
     install_sh = REPO_ROOT / "install.sh"
     content = install_sh.read_text()
     assert "Intel Macs (x86_64) are not supported" in content, (
         "install.sh must surface a clean unsupported-platform message "
         "for Intel Macs, not fall through to a 404 on a missing asset"
     )
-    # Refusal must happen on OS=macos + ARCH=x64, not on Linux x64.
+    # Refusal must key on OS=macos + ARCH=x64, not on Linux x64.
     # Anchor to both so a future simplification of the condition
     # doesn't accidentally nuke Linux x64 installs.
     assert '$OS" = "macos"' in content and '$ARCH" = "x64"' in content
+
+
+def test_intel_guard_runs_after_version_resolution() -> None:
+    # Codex P1 on #257: if the Intel guard fires BEFORE version
+    # resolution, users who explicitly pinned to a pre-drop tag that
+    # still ships an Intel dmg (v0.44.0–v0.49.0) get wrongly refused.
+    # The guard must be positioned AFTER the REQUESTED_VERSION →
+    # VERSION_LABEL resolution block, and must gate on the resolved
+    # version (latest OR >= v0.50.0) rather than unconditionally.
+    install_sh = REPO_ROOT / "install.sh"
+    content = install_sh.read_text()
+    # Find both anchors and assert order.
+    ver_resolution = content.find("# ── version resolution")
+    intel_guard = content.find("Intel Macs (x86_64) are not supported")
+    assert ver_resolution != -1, "version resolution block not found"
+    assert intel_guard != -1, "Intel guard not found"
+    assert ver_resolution < intel_guard, (
+        "Intel guard must come AFTER version resolution — Codex P1 on "
+        "#257: pre-drop pinned tags that still have Intel dmgs must "
+        "still be installable via SHIPYARD_VERSION=vX.Y.Z"
+    )
+    # Guard must be version-conditional (latest or >= 0.50), not
+    # unconditional for all macOS x64 invocations.
+    assert "VERSION_LABEL" in content[intel_guard - 500:intel_guard]
+    # Escape hatch (pinned older version) must be discoverable from
+    # the message so operators know the workaround.
+    assert "SHIPYARD_VERSION=v0.49.0" in content
+    assert "v0.44.0" in content or "v0.49.0" in content
 
 
 def test_release_yml_drops_macos_x64_matrix_row() -> None:

@@ -59,18 +59,6 @@ case "$(uname -m)" in
         ;;
 esac
 
-# #256: Intel Macs (x86_64) are no longer supported as of v0.50.0.
-# Surface a clean message rather than letting the user hit a 404 on
-# a missing asset. Exit 2 distinguishes "this platform is
-# unsupported" from exit 1 ("something went wrong").
-if [ "$OS" = "macos" ] && [ "$ARCH" = "x64" ]; then
-    echo "Intel Macs (x86_64) are not supported by Shipyard v0.50.0 and later." >&2
-    echo "Apple Silicon (arm64) Macs only. If you're pinned to an older tag" >&2
-    echo "(SHIPYARD_VERSION=vX.Y.Z) that still has an Intel dmg, that install" >&2
-    echo "remains functional — the cutover only affects new releases." >&2
-    exit 2
-fi
-
 ARTIFACT="shipyard-${OS}-${ARCH}"
 if [ "${SHIPYARD_DRY_RUN:-0}" != "1" ]; then
     echo "Detected platform: ${OS}-${ARCH}"
@@ -93,6 +81,43 @@ else
     esac
     API_PATH="releases/tags/${TAG}"
     VERSION_LABEL="${TAG}"
+fi
+
+# #256: Intel Macs (x86_64) are no longer supported as of v0.50.0.
+# Surface a clean message rather than letting the user hit a 404 on
+# the missing asset. Runs AFTER version resolution (Codex P1 on #257)
+# so pinning SHIPYARD_VERSION to a pre-drop tag that still has an
+# Intel dmg (v0.44.0-v0.49.0) is still installable. The refusal
+# fires when:
+#   - no explicit version → `latest` resolves to v0.50.0+
+#   - the pinned tag is v0.50.0 or newer (strict semver compare)
+# Exit 2 distinguishes "this platform is unsupported" from exit 1.
+if [ "$OS" = "macos" ] && [ "$ARCH" = "x64" ]; then
+    _intel_blocked=0
+    if [ "${VERSION_LABEL}" = "latest" ]; then
+        _intel_blocked=1
+    else
+        # Strip leading `v` and extract major.minor.patch; compare
+        # to 0.50.0 as a lexicographic-safe tuple compare.
+        _ver="${VERSION_LABEL#v}"
+        _major="${_ver%%.*}"
+        _rest="${_ver#*.}"
+        _minor="${_rest%%.*}"
+        if [ -n "$_major" ] && [ -n "$_minor" ] \
+                && { [ "$_major" -gt 0 ] \
+                     || { [ "$_major" -eq 0 ] && [ "$_minor" -ge 50 ]; }; } 2>/dev/null; then
+            _intel_blocked=1
+        fi
+    fi
+    if [ "$_intel_blocked" -eq 1 ]; then
+        echo "Intel Macs (x86_64) are not supported by Shipyard v0.50.0 and later." >&2
+        echo "Apple Silicon (arm64) Macs only." >&2
+        echo "" >&2
+        echo "If you have an Intel Mac, pin to a pre-drop version that" >&2
+        echo "still ships an Intel dmg (v0.44.0–v0.49.0):" >&2
+        echo "  SHIPYARD_VERSION=v0.49.0 bash install.sh" >&2
+        exit 2
+    fi
 fi
 
 # Dry-run short-circuit — print the resolved config and exit before
