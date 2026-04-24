@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0430"></a>
+## [0.43.0] - 2026-04-23
+
+- install.sh + release.yml: gate bad binaries, surface taskgated SIGKILL (#219) ([#220](https://github.com/danielraffel/Shipyard/pull/220))
+
 <a id="v0420"></a>
 ## [0.42.0] - 2026-04-23
 
@@ -422,6 +427,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.43.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.43.0
 [0.42.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.42.0
 [0.41.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.41.0
 [0.40.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.40.0
