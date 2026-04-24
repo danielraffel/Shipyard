@@ -655,6 +655,19 @@ Never run `gh pr create` + release separately. Never run the Python gate scripts
 
 Missing-script errors list every probed location and every override knob. Consumer repos that keep their tooling under `tools/scripts/` need no configuration; other layouts should set the env var or the `[validation]` key rather than moving the script.
 
+## Consumer-repo pin bumps (`shipyard pin bump`)
+
+Consumer repos (pulp, spectr, …) pin a specific Shipyard release via `tools/shipyard.toml` and install it through `./tools/install-shipyard.sh`. `shipyard pin bump` is the one-shot: it rewrites the pin, runs the installer, verifies `shipyard --version` matches, and opens the PR.
+
+**Mental model for multi-worktree / multi-project setups:** just run `shipyard pin bump` in whichever consumer worktree is most up-to-date. Don't hand-edit `tools/shipyard.toml` — the command's guards are what keep you out of trouble. Two refuse-by-default guards fire before any side effect:
+
+1. **Downgrade refusal** — if the target is older than the currently-installed `shipyard` binary (the `~/.local/bin/shipyard` that `install-shipyard.sh` will overwrite), the command refuses. The common trigger is running this in a stale worktree that still pins an old version. Remediation: rebase onto main, or pass `--allow-downgrade` if you really do mean to regress the global.
+2. **Redundant-branch refusal** — if `origin/main:tools/shipyard.toml` already pins a version >= the target, the command refuses. Trigger: branch is behind main; opening a PR here produces a no-op at merge time or a conflict. Remediation: rebase/merge `origin/main`, or pass `--allow-redundant`.
+
+Both guards are skipped silently when their inputs are unavailable (no `shipyard` on PATH, offline, no `origin/main`) — advisory, not load-bearing.
+
+`shipyard pin show` reports the current pin and the latest upstream release without touching anything — safe to run anywhere.
+
 ## State-machine lane + doc-sync gate
 
 A dedicated `state-machine` CI job runs `pytest -m state_machine -v` on ubuntu-latest. Failures show up as a distinct check row (not mixed into the cross-platform `test` matrix), so a ship-state regression is visually separable from an infra blip. When writing a test that exercises ship-state transitions, add `pytestmark = pytest.mark.state_machine` at module scope.

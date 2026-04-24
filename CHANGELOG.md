@@ -12,6 +12,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 - #236: surface workflow scope as first-class install requirement ([#237](https://github.com/danielraffel/Shipyard/pull/237))
 
 <a id="v0460"></a>
+## [0.47.0]
+
 ## [0.46.0] - 2026-04-24
 
 - Codex P2 batch: retry budget (#214), doctor detail (#214), PS quote guard (#213), release-script diag (#224) ([#235](https://github.com/danielraffel/Shipyard/pull/235))

@@ -30,6 +30,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_243_guards(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the #243 guards off so pre-existing tests don't pick up
+    the real ``shipyard --version`` / ``origin/main`` state from the
+    developer's machine.
+
+    Guard-specific tests override these patches explicitly.
+    """
+    monkeypatch.setattr(
+        "shipyard.cli._current_global_shipyard_version", lambda: None,
+    )
+    monkeypatch.setattr(
+        "shipyard.cli._main_pinned_version_at_origin", lambda _root: None,
+    )
+
+
 def _setup_consumer_repo(
     tmp_path: Path,
     *,
@@ -347,3 +363,176 @@ def test_pin_bump_normalizes_missing_v_prefix(
     # Version string must be prefixed with v even though the user
     # passed a bare number.
     assert 'version = "v0.44.0"' in rewritten
+
+
+# ---------------------------------------------------------------------------
+# #243: worktree-safety guards
+# ---------------------------------------------------------------------------
+
+
+def test_pin_bump_refuses_downgrade_of_global_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Stale worktree: pin says v0.20.0, user asks for --to v0.26.0,
+    # but the globally-installed binary is v0.47.0. Running
+    # install-shipyard.sh with v0.26.0 would regress the global
+    # install, so we refuse and tell them to rebase.
+    repo = _setup_consumer_repo(tmp_path, pinned_version="v0.20.0")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "shipyard.cli._current_global_shipyard_version", lambda: "0.47.0",
+    )
+    # Neutralize the redundant-branch guard — we're testing downgrade
+    # only, and origin/main won't exist in this tmp repo anyway.
+    monkeypatch.setattr(
+        "shipyard.cli._main_pinned_version_at_origin", lambda _root: None,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["pin", "bump", "--to", "v0.26.0", "--no-pr", "--skip-verify"],
+    )
+    assert result.exit_code != 0
+    assert "downgrade" in result.output.lower()
+    assert "--allow-downgrade" in result.output
+    # Pin file must NOT be rewritten on refusal.
+    toml_text = (repo / "tools" / "shipyard.toml").read_text()
+    assert 'version = "v0.20.0"' in toml_text
+
+
+def test_pin_bump_allow_downgrade_escape_hatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same setup as above but with --allow-downgrade, the bump
+    # proceeds and rewrites the pin.
+    repo = _setup_consumer_repo(tmp_path, pinned_version="v0.20.0")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "shipyard.cli._current_global_shipyard_version", lambda: "0.47.0",
+    )
+    monkeypatch.setattr(
+        "shipyard.cli._main_pinned_version_at_origin", lambda _root: None,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "pin", "bump", "--to", "v0.26.0",
+            "--allow-downgrade", "--no-pr", "--skip-verify",
+        ],
+    )
+    _assert_cli_ok(result)
+    assert 'version = "v0.26.0"' in (
+        repo / "tools" / "shipyard.toml"
+    ).read_text()
+
+
+def test_pin_bump_skips_downgrade_guard_when_binary_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If `shipyard --version` can't be reached (returns None), the
+    # downgrade guard is skipped — we'd rather proceed than refuse
+    # on a missing binary.
+    repo = _setup_consumer_repo(tmp_path, pinned_version="v0.20.0")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "shipyard.cli._current_global_shipyard_version", lambda: None,
+    )
+    monkeypatch.setattr(
+        "shipyard.cli._main_pinned_version_at_origin", lambda _root: None,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["pin", "bump", "--to", "v0.26.0", "--no-pr", "--skip-verify"],
+    )
+    _assert_cli_ok(result)
+
+
+def test_pin_bump_refuses_redundant_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Branch behind main: origin/main pins v0.47.0, this worktree
+    # pins v0.40.0, user asks to bump to v0.47.0. The bump is
+    # redundant with what main already has — refuse.
+    repo = _setup_consumer_repo(tmp_path, pinned_version="v0.40.0")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "shipyard.cli._current_global_shipyard_version", lambda: None,
+    )
+    monkeypatch.setattr(
+        "shipyard.cli._main_pinned_version_at_origin",
+        lambda _root: "v0.47.0",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["pin", "bump", "--to", "v0.47.0", "--no-pr", "--skip-verify"],
+    )
+    assert result.exit_code != 0
+    assert "redundant" in result.output.lower() or \
+           "origin/main" in result.output.lower()
+    assert "--allow-redundant" in result.output
+
+
+def test_pin_bump_allow_redundant_escape_hatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # --allow-redundant lets the same redundant bump proceed.
+    repo = _setup_consumer_repo(tmp_path, pinned_version="v0.40.0")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "shipyard.cli._current_global_shipyard_version", lambda: None,
+    )
+    monkeypatch.setattr(
+        "shipyard.cli._main_pinned_version_at_origin",
+        lambda _root: "v0.47.0",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "pin", "bump", "--to", "v0.47.0",
+            "--allow-redundant", "--no-pr", "--skip-verify",
+        ],
+    )
+    _assert_cli_ok(result)
+    assert 'version = "v0.47.0"' in (
+        repo / "tools" / "shipyard.toml"
+    ).read_text()
+
+
+def test_pin_bump_skips_redundant_guard_when_origin_main_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Offline / no origin remote / no main branch: guard B returns
+    # None and we proceed. Covers the 'tmp-repo has no origin'
+    # case as well as real offline operation.
+    repo = _setup_consumer_repo(tmp_path, pinned_version="v0.40.0")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "shipyard.cli._current_global_shipyard_version", lambda: None,
+    )
+    monkeypatch.setattr(
+        "shipyard.cli._main_pinned_version_at_origin", lambda _root: None,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["pin", "bump", "--to", "v0.47.0", "--no-pr", "--skip-verify"],
+    )
+    _assert_cli_ok(result)
+
+
+def test_parse_version_tuple_edge_cases() -> None:
+    # Non-semver inputs return None so guards no-op instead of
+    # false-triggering. Regression-guard against a future refactor
+    # that tries to compare 'v0.47.0-rc1' and hits a TypeError.
+    from shipyard.cli import _parse_version_tuple
+    assert _parse_version_tuple("v0.47.0") == (0, 47, 0)
+    assert _parse_version_tuple("0.47.0") == (0, 47, 0)
+    assert _parse_version_tuple("0.47.0-rc1") is None
+    assert _parse_version_tuple("latest") is None
+    assert _parse_version_tuple("") is None
