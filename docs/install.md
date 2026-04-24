@@ -104,11 +104,12 @@ SHIPYARD_INSTALL_DIR="${HOME}/mytools/bin" bash install.sh
 
 | OS | Architecture | Binary |
 |----|-------------|--------|
-| macOS | Apple Silicon (ARM64) | `shipyard-macos-arm64` |
-| macOS | Intel (x64) | `shipyard-macos-x64` |
+| macOS | Apple Silicon (ARM64) | `shipyard-macos-arm64.dmg` |
 | Windows | x64 | `shipyard-windows-x64.exe` |
 | Linux | x64 | `shipyard-linux-x64` |
 | Linux | ARM64 | `shipyard-linux-arm64` |
+
+Intel Macs (x86_64) are not supported from v0.50.0 onward. Apple Silicon only. Older releases (v0.44.0–v0.49.0) that shipped Intel dmgs remain installable by pinning `SHIPYARD_VERSION`; `install.sh` on an Intel Mac surfaces a clear "unsupported" message instead of a 404 on v0.50.0+.
 
 ## Build from source
 

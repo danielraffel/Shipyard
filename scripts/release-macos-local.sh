@@ -23,7 +23,7 @@
 # this we'd have caught v0.42.0 before it shipped.
 #
 # Usage:
-#   ./scripts/release-macos-local.sh [--tag vX.Y.Z] [--upload] [--arch arm64|x64]
+#   ./scripts/release-macos-local.sh [--tag vX.Y.Z] [--upload]
 #
 # Env vars required for notarization:
 #   SHIPYARD_NOTARIZE_APPLE_ID           (Apple ID email)
@@ -37,9 +37,7 @@
 #   --upload       Upload the signed+tested asset to the GitHub release
 #                  for --tag. Without this, the script only builds and
 #                  verifies — useful for diagnosing without shipping.
-#   --arch         Build for arm64 (default) or x64. The host CPU is
-#                  what you'll actually get; x64 needs Rosetta or a
-#                  different host.
+#   (Intel Mac support was dropped in v0.50.0 per #256; arm64 only.)
 #
 # Exit codes:
 #   0   Build + sign + notarize + local-launch test all passed.
@@ -62,7 +60,18 @@ DO_UPLOAD=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --tag) TAG="$2"; shift 2 ;;
-        --arch) ARCH="$2"; shift 2 ;;
+        --arch)
+            # #256: Intel dropped. Preserve the flag for back-compat
+            # so a muscle-memory `--arch arm64` invocation still works,
+            # but refuse any value other than arm64 so an accidental
+            # `--arch x64` fails fast instead of producing an unrelease-
+            # able build.
+            if [ "$2" != "arm64" ]; then
+                echo "Intel Mac (x86_64) support was dropped in v0.50.0 (#256)." >&2
+                echo "Re-run without --arch, or with --arch arm64." >&2
+                exit 2
+            fi
+            shift 2 ;;
         --upload) DO_UPLOAD=1; shift ;;
         -h|--help)
             sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# //; s/^#//'
@@ -298,9 +307,10 @@ if [ "$DO_UPLOAD" -eq 1 ]; then
     # shipyard-macos-*.dmg assets release.yml's build matrix
     # produces today (arm64 + x64; keep in sync if the matrix
     # changes).
+    # #256: Intel Mac support dropped as of v0.50.0. Only arm64 is
+    # expected; the flip-to-public gate is satisfied by this one arch.
     EXPECTED_MACOS_DMGS=(
         "shipyard-macos-arm64.dmg"
-        "shipyard-macos-x64.dmg"
     )
     PRESENT_DMGS=$(gh release view "$TAG" --json assets \
         --jq '.assets[].name' 2>/dev/null | grep -E 'shipyard-macos-.*\.dmg$' || true)
