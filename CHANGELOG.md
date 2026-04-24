@@ -3,9 +3,14 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0470"></a>
-## [0.48.0]
+<a id="v0480"></a>
+## [0.48.0] - 2026-04-24
 
+- shipyard run: tree-hash drift detection at stage boundaries (#249) ([#250](https://github.com/danielraffel/Shipyard/pull/250))
+- pin bump: check git fetch return code (#245 Codex P2) ([#246](https://github.com/danielraffel/Shipyard/pull/246))
+- pin bump: worktree-safety guards (#243) ([#245](https://github.com/danielraffel/Shipyard/pull/245))
+
+<a id="v0470"></a>
 ## [0.47.0] - 2026-04-24
 
 - #239 Phase A: ssh-windows bundle upload hardening ([#241](https://github.com/danielraffel/Shipyard/pull/241))
@@ -14,8 +19,6 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 - #236: surface workflow scope as first-class install requirement ([#237](https://github.com/danielraffel/Shipyard/pull/237))
 
 <a id="v0460"></a>
-## [0.47.0]
-
 ## [0.46.0] - 2026-04-24
 
 - Codex P2 batch: retry budget (#214), doctor detail (#214), PS quote guard (#213), release-script diag (#224) ([#235](https://github.com/danielraffel/Shipyard/pull/235))
@@ -460,6 +463,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.48.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.48.0
 [0.47.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.47.0
 [0.46.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.46.0
 [0.45.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.45.0
