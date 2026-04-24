@@ -246,6 +246,102 @@ def test_install_sh_rejects_intel_mac_cleanly() -> None:
     assert '$OS" = "macos"' in content and '$ARCH" = "x64"' in content
 
 
+def test_release_yml_has_no_dead_signing_infra() -> None:
+    # Pre-cleanup, release.yml had a `Detect signing readiness` +
+    # `Import signing identity` pair that imported the Developer ID
+    # cert and passed `--codesign-identity` to every macOS PyInstaller
+    # build. Post-#54, the signed binary wasn't uploaded (local script
+    # produces the shipping artifact), so the whole signing path paid
+    # a keychain-mutation tax on every release for nothing.
+    #
+    # This cleanup rips it out. Lock the removal with these pins:
+    # the old step names, the old env var names passed into the
+    # import, and the `--codesign-identity` flag must all be absent
+    # from release.yml's build path. The NEW #226 path has its own
+    # ephemeral-keychain import inside sign-and-upload-macos and uses
+    # different secret names, so no false-positive match.
+    release_yml = REPO_ROOT / ".github" / "workflows" / "release.yml"
+    content = release_yml.read_text()
+
+    # Step identifiers from the removed infrastructure must be gone.
+    for dead_token in (
+        "detect_signing_readiness",
+        "import_signing_identity",
+        "Detect signing readiness",
+        "Import signing identity",
+        "Delete signing keychain",
+    ):
+        assert dead_token not in content, (
+            f"release.yml still references '{dead_token}' from the "
+            "dead CI-signing block — clean up missed that reference"
+        )
+
+    # Old secret names (stays out of release.yml; only the new
+    # MACOS_SIGN_* / MACOS_NOTARIZE_* names live in the #226 job).
+    for dead_secret in (
+        "secrets.APPLE_ID",
+        "secrets.APP_SPECIFIC_PASSWORD",
+        "secrets.TEAM_ID",
+        "secrets.SIGNING_CERT_P12_BASE64",
+        "secrets.SIGNING_CERT_PASSWORD",
+    ):
+        assert dead_secret not in content, (
+            f"release.yml still references '{{{{ {dead_secret} }}}}' — "
+            "the old 5 secrets are being retired; the #226 path uses "
+            "MACOS_SIGN_* / MACOS_NOTARIZE_* instead"
+        )
+
+    # The default macOS build step must NOT pass --codesign-identity.
+    # (The #226 sign-and-upload-macos job uses a different codepath
+    # entirely — it invokes release-macos-local.sh which reads the
+    # identity SHA from an env var, not from a PyInstaller flag.)
+    #
+    # Walk the file to find the `- name: Build binary` block and
+    # assert --codesign-identity doesn't appear there.
+    build_idx = content.find("- name: Build binary")
+    assert build_idx != -1, "Build binary step must still exist"
+    # Scope to the ~50 lines of that step block.
+    build_block = content[build_idx:build_idx + 2000]
+    assert "--codesign-identity" not in build_block, (
+        "Build binary step must be ad-hoc only — CI-signing lives "
+        "in the separate #226 job now"
+    )
+
+
+def test_release_yml_build_step_still_produces_pyinstaller_output() -> None:
+    # Regression guard: the build step still has to produce a
+    # PyInstaller --onefile binary named after the matrix artifact.
+    # Removing the signing wrapper was supposed to preserve exactly
+    # this behavior, plus a clean `pyinstaller --onefile` invocation
+    # on every matrix row including macOS.
+    release_yml = REPO_ROOT / ".github" / "workflows" / "release.yml"
+    content = release_yml.read_text()
+    build_idx = content.find("- name: Build binary")
+    build_block = content[build_idx:build_idx + 2000]
+    assert "pyinstaller --onefile" in build_block
+    assert 'matrix.artifact' in build_block or '$ARTIFACT' in build_block
+    assert "src/shipyard/cli.py" in build_block
+
+
+def test_release_yml_macos_artifact_not_uploaded_to_release() -> None:
+    # Invariant kept from pre-cleanup: macOS CI build is health-check
+    # only; the actual shipping artifact comes from the local
+    # script (or the #226 CI-signing job when armed). The
+    # `Upload artifact` step must still be gated on non-macOS so
+    # release.yml's release job doesn't pick up an unsigned macOS
+    # binary.
+    release_yml = REPO_ROOT / ".github" / "workflows" / "release.yml"
+    content = release_yml.read_text()
+    upload_idx = content.find("Upload artifact (non-macOS)")
+    assert upload_idx != -1, "Non-macOS upload step must still exist"
+    # The upload's `if:` condition must exclude macOS.
+    upload_block = content[upload_idx:upload_idx + 400]
+    assert "runner.os != 'macOS'" in upload_block, (
+        "macOS build output must NOT feed the release-artifact "
+        "upload — that would re-introduce the v0.42.0 failure mode"
+    )
+
+
 def test_ci_mode_skips_publish_and_e2e() -> None:
     # #226: the CI-signing experiment workflow invokes this script
     # with --ci-mode. That mode MUST NOT flip the release public and
