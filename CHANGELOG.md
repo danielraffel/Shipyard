@@ -3,6 +3,15 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0440"></a>
+## [0.44.0] - 2026-04-24
+
+- feat(release): ship macOS as stapled .dmg + codify e2e verification (#52, #55, #219) ([#227](https://github.com/danielraffel/Shipyard/pull/227))
+- ci: route macOS PR checks to Namespace pool (fixes slow macos-15 queue) ([#228](https://github.com/danielraffel/Shipyard/pull/228))
+- codify: macOS signing is local-only (#219) ([#225](https://github.com/danielraffel/Shipyard/pull/225))
+- feat: scripts/release-macos-local.sh — Option B local build+sign+test (#219) ([#224](https://github.com/danielraffel/Shipyard/pull/224))
+- install.sh: ad-hoc fallback when notarized binary won't launch (#219 take 2) ([#223](https://github.com/danielraffel/Shipyard/pull/223))
+
 <a id="v0430"></a>
 ## [0.43.0] - 2026-04-23
 
@@ -427,6 +436,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.44.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.44.0
 [0.43.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.43.0
 [0.42.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.42.0
 [0.41.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.41.0
