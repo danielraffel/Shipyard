@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0380"></a>
+## [0.39.0]
+
 ## [0.38.0] - 2026-04-23
 
 - ssh-windows: prepend UTF-8 code-page prelude to PS commands (#208) ([#209](https://github.com/danielraffel/Shipyard/pull/209))
