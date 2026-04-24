@@ -327,12 +327,15 @@ if [ "$DO_UPLOAD" -eq 1 ]; then
         echo "         is attached."
         # With dmgs still missing, skip the E2E check — it would
         # only exercise one arch and doesn't tell us whether the
-        # combined release is ready to go public.
+        # combined release is ready to go public. E2E_TMPDIR isn't
+        # created until step 9, so no cleanup needed here (Codex P1
+        # on #254 — referencing an unset var with `set -u` active
+        # would crash and defeat the "exit 0 on partial arch"
+        # contract).
         echo "Step 9/9: E2E verification SKIPPED (waiting for other arch)."
         echo ""
         echo "═══ Partial done. Re-run for the missing arch(es). ═══"
         echo ""
-        rm -rf "$E2E_TMPDIR" 2>/dev/null || true
         exit 0
     fi
 
