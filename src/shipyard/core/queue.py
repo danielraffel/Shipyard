@@ -399,8 +399,14 @@ def _retry_replace_on_windows(src: Path, dst: Path) -> None:
         except PermissionError as exc:
             last_exc = exc
             base = 0.05 * (attempt + 1)
-            jitter = _random.uniform(0.0, base)
-            _time.sleep(base + jitter)
+            # Jittered backoff AROUND base, not base + unsigned jitter.
+            # Original code did `base + random.uniform(0, base)` which
+            # spans [base, 2*base] per attempt (mean 1.5*base), stretching
+            # the 18-attempt budget from ~8s to up to ~17s worst case
+            # and making a genuinely-denied target appear to hang.
+            # Codex P2 on #214. Use [0.5*base, 1.5*base] — same range
+            # centered on base, total budget stays at ~8s mean.
+            _time.sleep(_random.uniform(0.5 * base, 1.5 * base))
     assert last_exc is not None
     raise last_exc
 

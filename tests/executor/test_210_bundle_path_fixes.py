@@ -172,6 +172,55 @@ def test_decoder_no_sentinel_unchanged() -> None:
     assert maybe_decode_clixml("just a regular error") == "just a regular error"
 
 
+# -- Codex P2 on #213: single-quote guard applies to rooted paths too
+# Pre-fix (#213), only the non-rooted (Join-Path) branch rejected
+# single-quoted paths. The rooted branch interpolated the raw value
+# into `$Dest = '...'` with no escaping, which breaks PS parsing
+# (`$Dest = '/tmp/o'hare.bundle'`) and — with untrusted config —
+# becomes script-injection surface. This test locks in that the
+# guard now applies uniformly.
+
+def test_upload_rejects_single_quoted_rooted_path(tmp_path) -> None:
+    bundle = tmp_path / "shipyard.bundle"
+    bundle.write_bytes(b"fake")
+
+    def fake_run(cmd, **kw):
+        raise AssertionError(
+            "subprocess.run must NOT be called when the rooted path "
+            "contains a single quote — the script should refuse before "
+            "handing a broken PS command to ssh"
+        )
+
+    with patch("shipyard.bundle.git_bundle.subprocess.run", side_effect=fake_run):
+        result = upload_bundle(
+            bundle_path=bundle,
+            host="win",
+            remote_path=r"/tmp/o'hare.bundle",
+            is_windows=True,
+        )
+    assert result.success is False
+    assert "single-quoted" in result.message.lower()
+
+
+def test_upload_rejects_single_quoted_unc_path(tmp_path) -> None:
+    # Same guard for UNC paths (\\server\share\…).
+    bundle = tmp_path / "shipyard.bundle"
+    bundle.write_bytes(b"fake")
+
+    def fake_run(cmd, **kw):
+        raise AssertionError("should refuse before subprocess")
+
+    with patch("shipyard.bundle.git_bundle.subprocess.run", side_effect=fake_run):
+        result = upload_bundle(
+            bundle_path=bundle,
+            host="win",
+            remote_path=r"\\server\share\o'hare.bundle",
+            is_windows=True,
+        )
+    assert result.success is False
+    assert "single-quoted" in result.message.lower()
+
+
 # -- Codex P1 on #211 (slash-prefixed absolute paths) --------------
 # `_is_windows_absolute_path` in executor/ssh_windows.py treats
 # `/foo` as absolute (line 379). The earlier #210 upload-side

@@ -161,6 +161,18 @@ def upload_bundle(
         # written to `$HOME/tmp/x.bundle` on upload but read from
         # `/tmp/x.bundle` on apply, reproducing the exact #210 bug
         # for a different path shape (Codex P1 on #211).
+        # The PS single-quote literal we build below doesn't escape
+        # embedded `'`. Reject paths that contain one — that's
+        # script-injection surface on the rooted branch and a silent
+        # syntax break on both. Codex P2 on #213 caught that my #211
+        # fix only checked the relative branch; before then, rooted
+        # paths couldn't reach this code at all, so my change made it
+        # a regression. Apply the guard uniformly by hoisting it.
+        if "'" in remote_path:
+            return BundleResult(
+                success=False,
+                message=f"Refusing single-quoted remote_path: {remote_path!r}",
+            )
         is_rooted = (
             remote_path.startswith("\\\\")
             or remote_path.startswith("\\")
@@ -171,18 +183,10 @@ def upload_bundle(
                 and remote_path[0].isalpha()
             )
         )
-        if is_rooted:
-            resolved_dest = f"'{remote_path}'"
-        else:
-            # PS single-quote string → no escape needed for ordinary
-            # filenames; reject anything with a quote just in case a
-            # caller's path is adversarial.
-            if "'" in remote_path:
-                return BundleResult(
-                    success=False,
-                    message=f"Refusing single-quoted remote_path: {remote_path!r}",
-                )
-            resolved_dest = f"(Join-Path $HOME '{remote_path}')"
+        resolved_dest = (
+            f"'{remote_path}'" if is_rooted
+            else f"(Join-Path $HOME '{remote_path}')"
+        )
         ps_script = (
             f"$Dest = {resolved_dest};"
             f"$stdin = [Console]::OpenStandardInput();"

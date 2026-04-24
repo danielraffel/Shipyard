@@ -258,7 +258,7 @@ def render_doctor(checks: dict[str, Any], ready: bool) -> None:
         for name, info in items.items():
             ok = info.get("ok", False)
             icon = "[green]✓[/]" if ok else "[red]✗[/]"
-            detail = info.get("version", info.get("error", info.get("detail", "")))
+            summary = info.get("version", info.get("error", info.get("detail", "")))
             extra = ""
             if info.get("user"):
                 extra = f" (as {info['user']})"
@@ -266,7 +266,19 @@ def render_doctor(checks: dict[str, Any], ready: bool) -> None:
                 extra = f" ({info['workspace']})"
             elif info.get("latency_ms"):
                 extra = f" ({info['latency_ms']}ms)"
-            console.print(f"    {icon} {name} {detail}{extra}")
+            console.print(f"    {icon} {name} {summary}{extra}")
+            # Codex P2 on #214: pre-fix, `detail` was only rendered
+            # when `version` was absent — which it never is for
+            # failure rows that want to show actionable recovery info
+            # (e.g. the rich-bundle reinstall hint on corrupt
+            # PyInstaller installs). Show `detail` on every failing
+            # row as indented follow-up lines so the user sees the
+            # fix command without needing --json mode.
+            failure_detail = info.get("detail") if not ok else None
+            if failure_detail and failure_detail != summary:
+                for line in failure_detail.splitlines():
+                    if line.strip():
+                        console.print(f"        [dim]{line.rstrip()}[/]")
         console.print()
 
     if ready:

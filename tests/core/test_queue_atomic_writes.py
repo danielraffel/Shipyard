@@ -329,12 +329,17 @@ def test_retry_replace_uses_jittered_backoff(monkeypatch, tmp_path: Path) -> Non
     assert len(sleeps) == 3
     assert len(jitter_calls) == 3
 
-    # Jitter bounds grow with the attempt — base = 0.05 * (n+1).
+    # Jitter range is [0.5*base, 1.5*base] with base = 0.05 * (n+1).
+    # Codex P2 on #214: the earlier [base, 2*base] shape stretched the
+    # budget mean to 1.5*base (17s worst case for 18 attempts instead
+    # of the documented ~8s). The [0.5*base, 1.5*base] shape keeps
+    # mean = base.
     # Verifies the jitter range isn't constant (which would preserve
-    # lockstep across concurrent callers).
-    assert jitter_calls[0][1] == pytest.approx(0.05)
-    assert jitter_calls[1][1] == pytest.approx(0.10)
-    assert jitter_calls[2][1] == pytest.approx(0.15)
+    # lockstep across concurrent callers) AND that it's centered on
+    # base (Codex P2 budget-preservation fix).
+    assert jitter_calls[0] == (pytest.approx(0.025), pytest.approx(0.075))
+    assert jitter_calls[1] == (pytest.approx(0.050), pytest.approx(0.150))
+    assert jitter_calls[2] == (pytest.approx(0.075), pytest.approx(0.225))
 
 
 def test_retry_replace_surfaces_error_when_budget_exhausted(

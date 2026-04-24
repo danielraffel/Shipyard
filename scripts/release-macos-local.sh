@@ -225,9 +225,17 @@ if ! OUTPUT=$("$MOUNT_POINT/shipyard" --version 2>&1); then
     echo "       Do NOT ship this binary." >&2
     echo "" >&2
     echo "       Diagnostics:" >&2
-    codesign --verify --deep --strict --verbose=4 "$DIST_DMG" 2>&1 | sed 's/^/         /' >&2
-    xcrun stapler validate -v "$DIST_DMG" 2>&1 | sed 's/^/         /' >&2
-    spctl --assess --type install -vv "$DIST_DMG" 2>&1 | sed 's/^/         /' >&2
+    # `|| true` on every probe (Codex P2 on #224). These run under
+    # `set -euo pipefail`, and on a genuinely-broken DMG
+    # `codesign --verify` / `stapler validate` / `spctl --assess`
+    # will all exit non-zero — which is the *point* of running them.
+    # Without the fallthrough, pipefail terminates the script on the
+    # first probe failure and the operator loses the rest of the
+    # diagnostics AND the documented exit 3 (launch-test failure
+    # signal) becomes a generic exit 1 instead.
+    codesign --verify --deep --strict --verbose=4 "$DIST_DMG" 2>&1 | sed 's/^/         /' >&2 || true
+    xcrun stapler validate -v "$DIST_DMG" 2>&1 | sed 's/^/         /' >&2 || true
+    spctl --assess --type install -vv "$DIST_DMG" 2>&1 | sed 's/^/         /' >&2 || true
     echo "" >&2
     echo "       Crash report (if any) under:" >&2
     echo "         ~/Library/Logs/DiagnosticReports/shipyard-*.ips" >&2
