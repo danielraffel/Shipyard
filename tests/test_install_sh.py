@@ -236,7 +236,152 @@ def test_post_install_smoke_remediation_mentions_crash_report_on_macos(
     # On Linux the hint is simpler so we conditionally assert.
     if sys.platform != "darwin":
         pytest.skip("macOS-specific remediation hint")
-    result = _install_with_stub(tmp_path, stub_behaviour="sigkill")
+    # Disable ad-hoc fallback so we exercise the hard-fail path
+    # (otherwise the sigkill stub would recover via fallback).
+    result = _install_with_stub(
+        tmp_path,
+        stub_behaviour="sigkill",
+        extra_env={"SHIPYARD_NO_ADHOC_FALLBACK": "1"},
+    )
     assert result.returncode != 0
     assert "DiagnosticReports" in result.stderr
     assert "Code Signature Invalid" in result.stderr
+
+
+# -- #219 take 2: ad-hoc fallback on taskgated rejection -----------
+# install.sh now, on macOS, if the smoke probe fails AND the binary
+# was Developer-ID signed, re-signs ad-hoc + retries. The user loses
+# notarization trust but gains a launchable binary — strictly better
+# than exit-1 and a dead install. Opt-out via
+# SHIPYARD_NO_ADHOC_FALLBACK=1.
+
+def _install_with_recovering_stub(
+    tmp_path: Path,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Stub that SIGKILLs on first few calls, then succeeds once
+    codesign has been invoked against it.
+
+    Simulates the #219 fingerprint: the fresh notarized binary
+    can't pass taskgated on this Mac, but an ad-hoc re-sign
+    unblocks launch.
+
+    Uses a sentinel sidecar file the stub mutates via `codesign`
+    (observed via a codesign shim on PATH) — we can't really
+    mutate the stub's own behaviour from within its process, so
+    the pattern is: stub checks for sidecar; no sidecar →
+    SIGKILL itself; sidecar present → print version.
+
+    We point PATH at a fake codesign that writes the sidecar
+    when invoked, so the install.sh ad-hoc-resign path flips
+    the stub to working mode.
+    """
+    install_dir = tmp_path / "bin"
+    install_dir.mkdir()
+    stub = install_dir / "shipyard"
+    sentinel = tmp_path / "adhoc-resigned"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"if [ -f {sentinel!s} ]; then\n"
+        "  echo shipyard 99.99.99\n"
+        "  exit 0\n"
+        "fi\n"
+        "kill -KILL $$\n"
+    )
+    stub.chmod(0o755)
+
+    # Fake codesign that:
+    # - Responds to `codesign -dv` with a Developer-ID-ish output
+    #   (TeamIdentifier line present) so install.sh classifies the
+    #   stub as signed and attempts the fallback path.
+    # - Responds to `codesign --force --sign -` by writing the
+    #   sentinel, flipping the stub to "works now" mode.
+    # - Responds to `codesign --remove-signature` as a no-op.
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    fake_codesign = shim_dir / "codesign"
+    fake_codesign.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '    *--force*--sign*-*)\n'
+        f'        touch {sentinel!s}\n'
+        '        exit 0 ;;\n'
+        '    -dv*)\n'
+        '        # install.sh greps the combined output for "^TeamIdentifier=".\n'
+        '        # Write to BOTH streams so whichever the script\n'
+        '        # captures gets a hit.\n'
+        '        echo "TeamIdentifier=TESTTEAM"\n'
+        '        echo "TeamIdentifier=TESTTEAM" >&2\n'
+        '        exit 0 ;;\n'
+        '    *--remove-signature*)\n'
+        '        exit 0 ;;\n'
+        '    *--verify*)\n'
+        '        exit 0 ;;\n'
+        '    *)\n'
+        '        exit 0 ;;\n'
+        'esac\n'
+    )
+    fake_codesign.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "SHIPYARD_INSTALL_DIR": str(install_dir),
+        "SHIPYARD_SKIP_DOWNLOAD": "1",
+        # Put the shim BEFORE the real codesign.
+        "PATH": f"{shim_dir}:{os.environ.get('PATH', '')}",
+    }
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["bash", str(INSTALL_SH)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_adhoc_fallback_recovers_from_taskgated_rejection(
+    tmp_path: Path,
+) -> None:
+    # macOS only: the fallback branch is conditioned on OS=macos
+    # since Linux doesn't have codesign / taskgated.
+    if sys.platform != "darwin":
+        pytest.skip("macOS-specific fallback path")
+    result = _install_with_recovering_stub(tmp_path)
+    assert result.returncode == 0, (
+        "ad-hoc fallback should recover a taskgated-rejected binary; "
+        f"got exit={result.returncode} stderr={result.stderr!r}"
+    )
+    # Fallback path must log the trade-off so the operator knows
+    # Gatekeeper fast-path is now disabled on this install.
+    assert "ad-hoc" in result.stderr.lower()
+    assert "fast-path" in result.stderr.lower() or "fallback" in result.stderr.lower()
+
+
+def test_adhoc_fallback_opt_out_fails_loud(tmp_path: Path) -> None:
+    # Users who don't want ad-hoc (corp policy, prefer loud failure)
+    # should get exit 1 + the hint that mentions how to re-enable.
+    if sys.platform != "darwin":
+        pytest.skip("macOS-specific fallback path")
+    result = _install_with_recovering_stub(
+        tmp_path,
+        extra_env={"SHIPYARD_NO_ADHOC_FALLBACK": "1"},
+    )
+    assert result.returncode != 0
+    assert "smoke test" in result.stderr.lower()
+    # Must explain how to re-enable the fallback, so the user knows
+    # their opt-out is what kept them dead-in-the-water.
+    assert "SHIPYARD_NO_ADHOC_FALLBACK" in result.stderr
+
+
+def test_adhoc_fallback_does_not_trigger_on_linux(tmp_path: Path) -> None:
+    # Even if a Linux user somehow hits the smoke failure, install.sh
+    # must NOT invoke codesign / ad-hoc resign (those are macOS tools).
+    if sys.platform == "darwin":
+        pytest.skip("Linux-only path")
+    result = _install_with_stub(tmp_path, stub_behaviour="sigkill")
+    assert result.returncode != 0
+    # Ad-hoc messaging must be absent on Linux.
+    assert "ad-hoc" not in result.stderr.lower()
