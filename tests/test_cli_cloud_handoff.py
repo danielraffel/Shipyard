@@ -289,3 +289,67 @@ class TestHandoffRun:
         )
         assert result.exit_code != 0
         assert "no matching key" in result.output.lower()
+
+    def test_apply_refuses_when_cloud_repository_differs_from_run_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Codex P1 on #215: a consumer that sets
+        # `cloud.repository = other/repo` in their shipyard config
+        # would make resolve_cloud_dispatch_plan return a plan with
+        # plan.repository = "other/repo". Pre-fix, handoff run
+        # cancelled run N in repo_slug (owner/repo — where the run
+        # actually lives) but dispatched a REPLACEMENT run in
+        # other/repo. Result: stuck run unresolved + cross-repo
+        # mutation. Post-fix, refuse loudly.
+        captured = self._patch(monkeypatch)
+        # Swap the resolver to emit a plan pointing at a DIFFERENT repo.
+        fake_plan = SimpleNamespace(
+            repository="other/repo",  # ← mismatch with repo_slug=owner/repo
+            ref="feat/x",
+            workflow=SimpleNamespace(file="ci.yml", key="ci", name="CI"),
+            provider="namespace",
+            dispatch_fields={"runner_provider": "namespace"},
+            to_dict=lambda: {"provider": "namespace"},
+        )
+        monkeypatch.setattr(
+            "shipyard.cli.resolve_cloud_dispatch_plan",
+            lambda **kw: fake_plan,
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["cloud", "handoff", "run", "555",
+             "--to", "namespace", "--apply"],
+        )
+        assert result.exit_code != 0
+        # Must cite both repos so the operator knows which configs
+        # are fighting.
+        assert "owner/repo" in result.output
+        assert "other/repo" in result.output
+        # Specifically must refuse BEFORE issuing the dispatch —
+        # otherwise we'd have cancelled run 555 and then fired a
+        # replacement in the wrong repo.
+        assert captured["dispatched_with"] is None, (
+            "dispatch must NOT fire when cloud.repository != run source"
+        )
+
+    def test_apply_dispatches_to_run_source_not_config_repo(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Positive case: when plan.repository matches repo_slug
+        # (either explicitly or by being empty), dispatch hits the
+        # run's source repo. Locks in the post-fix invariant.
+        captured = self._patch(monkeypatch)
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["cloud", "handoff", "run", "555",
+             "--to", "namespace", "--apply"],
+        )
+        _assert_cli_ok(result)
+        assert captured["dispatched_with"] is not None
+        assert captured["dispatched_with"]["repository"] == "owner/repo", (
+            "dispatch must target the run's source repo, not "
+            "plan.repository (which could come from a config "
+            "override pointing elsewhere)"
+        )

@@ -296,15 +296,32 @@ jobs:
         # release. Post-workflow, the maintainer runs
         # scripts/release-macos-local.sh to sign+notarize on their
         # Mac and upload the signed asset.
+        #
+        # Codex P1 on #225: the reminder defaults to --arch arm64
+        # (what the script itself defaults to). For users on Intel
+        # Macs, install.sh resolves ARTIFACT=shipyard-macos-x64,
+        # which would 404 if only the arm64 dmg shipped. Emit both
+        # command lines so the maintainer doesn't silently drop
+        # Intel-Mac support for a release.
         run: |
           echo "✓ macOS build succeeded (${{ matrix.artifact }})."
           echo ""
           echo "This binary is NOT being uploaded to the release."
           echo "macOS signing + notarization is local-only (see #219)."
-          echo "Run this on your Mac after the release tag appears:"
+          echo "Run BOTH on your Mac after the release tag appears —"
+          echo "Apple Silicon AND Intel — so install.sh resolves on"
+          echo "both architectures:"
           echo ""
+          echo "  # Apple Silicon (arm64):"
           echo "  ./scripts/release-macos-local.sh \\"
-          echo "    --tag ${{ github.ref_name }} --upload"
+          echo "    --tag ${{ github.ref_name }} --arch arm64 --upload"
+          echo ""
+          echo "  # Intel (x64) — needs a Rosetta or Intel build host:"
+          echo "  ./scripts/release-macos-local.sh \\"
+          echo "    --tag ${{ github.ref_name }} --arch x64 --upload"
+          echo ""
+          echo "If you've dropped Intel support intentionally, remove"
+          echo "the macos-x64 matrix entry above and this reminder."
           echo ""
 
   release:

@@ -129,19 +129,23 @@ def test_refresh_without_running_daemon_starts_fresh(
            "started fresh" in result.output.lower()
 
 
-def test_refresh_refuses_when_no_repos_available(
+def test_refresh_proceeds_when_no_repos_available(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    # Prior daemon had no repos AND caller didn't pass --repo. We
-    # can't cleanly spawn a daemon with no repos registered, so
-    # refuse loudly and tell the operator how to recover.
-    _patch_daemon(
+    # Codex P1 on #233: `daemon refresh` must mirror `daemon start`'s
+    # empty-repo tolerance. The daemon still runs for IPC subscribers
+    # + ship-state ops even without repos, so refusing empty-repo
+    # refresh breaks the doctor-recommended recovery path in the
+    # exact scenarios it's supposed to help (running daemon somehow
+    # lost its registered set; status call fails).
+    calls = _patch_daemon(
         monkeypatch, prior_running=True, prior_repos=[],
     )
     runner = CliRunner()
     result = runner.invoke(main, ["daemon", "refresh"])
-    assert result.exit_code != 0
-    assert "--repo" in result.output
+    _assert_cli_ok(result)
+    # Spawned with the empty list — matches daemon_start behavior.
+    assert calls["run_detached_repos"] == []
 
 
 def test_refresh_emits_json_envelope(

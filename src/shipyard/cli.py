@@ -3531,9 +3531,28 @@ def cloud_handoff_run(
         )
         sys.exit(1)
 
+    # Codex P1 on #215: the old code used `plan.repository or
+    # repo_slug`, which meant a consumer that sets
+    # `cloud.repository = other/repo` in .shipyard/config.toml would
+    # cancel run N in `repo_slug` but dispatch a REPLACEMENT run in
+    # `other/repo` — leaving the stuck run unresolved AND mutating
+    # the wrong repo. Force dispatch to the run's source repo so
+    # cancel + redispatch always target the same location. If the
+    # caller really does need to dispatch elsewhere, they should use
+    # `cloud retarget` (PR-scoped) rather than `handoff run`
+    # (run-id-scoped).
+    if plan.repository and plan.repository != repo_slug:
+        render_error(
+            f"Refusing: cloud.repository ({plan.repository}) differs "
+            f"from the run's source repo ({repo_slug}). `handoff run` "
+            "must dispatch where the cancellation happened. Use "
+            "`cloud retarget` for cross-repo flows, or remove the "
+            "cloud.repository override."
+        )
+        sys.exit(1)
     try:
         workflow_dispatch(
-            repository=plan.repository or repo_slug,
+            repository=repo_slug,
             workflow_file=plan.workflow.file,
             ref=plan.ref,
             fields=plan.dispatch_fields,
@@ -7573,14 +7592,13 @@ def daemon_refresh(ctx: Context, repos: tuple[str, ...]) -> None:
     # running the two commands by hand.
     from shipyard.daemon.runner import DaemonSpawnFailedError, spawn_detached
 
+    # `daemon start` accepts an empty repo list (the daemon still
+    # runs for IPC subscribers + ship-state ops), so `daemon
+    # refresh` must too — otherwise the doctor-recommended refresh
+    # path hard-fails in the exact recovery scenarios it's supposed
+    # to handle (Codex P1 on #233). Fall through with an empty list
+    # when neither --repo nor the prior snapshot supplied one.
     repo_list = list(repos) if repos else prior_repos
-    if not repo_list:
-        render_error(
-            "No repos to register on the refreshed daemon. Pass "
-            "`--repo owner/name` (repeatable) to register, or "
-            "run `shipyard daemon start --repo ...` yourself."
-        )
-        sys.exit(1)
     try:
         pid = spawn_detached(state_dir=state_dir, repos=repo_list)
     except DaemonSpawnFailedError as exc:
