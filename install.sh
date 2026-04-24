@@ -114,11 +114,43 @@ echo "Resolving ${VERSION_LABEL} from ${REPO}..."
 
 mkdir -p "${INSTALL_DIR}"
 
+# Short-circuit when the installed binary is already at the target
+# version (#231). Saves ~15MB per redundant invocation — common when
+# pulp + spectr pins both sit at the same Shipyard version and the
+# user runs both install-shipyard.sh wrappers back-to-back.
+#
+# Only applies when:
+#   - Target is a specific version (not "latest" — we'd have to
+#     resolve latest to know if there's drift, which defeats the
+#     purpose of skipping network work).
+#   - SHIPYARD_FORCE_REINSTALL is not set.
+#   - SHIPYARD_SKIP_DOWNLOAD is not set (tests need their own flow).
+#   - Existing binary actually reports a version. A SIGKILL'd binary
+#     falls through to the full install path where the smoke + ad-hoc
+#     fallback can recover it.
+SHIPYARD_ALREADY_AT_TARGET=0
+if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ] \
+    && [ "${SHIPYARD_FORCE_REINSTALL:-0}" != "1" ] \
+    && [ -x "${INSTALL_DIR}/shipyard" ] \
+    && [ "${VERSION_LABEL}" != "latest" ]; then
+    # Expect `shipyard, version 0.46.0` — extract just the version.
+    existing=$("${INSTALL_DIR}/shipyard" --version 2>/dev/null \
+        | sed -n 's/^shipyard, version \([^ ]*\).*/\1/p' | head -1)
+    target="${VERSION_LABEL#v}"
+    if [ -n "${existing}" ] && [ "${existing}" = "${target}" ]; then
+        echo "Already at v${target} at ${INSTALL_DIR}/shipyard — skipping download."
+        echo "Set SHIPYARD_FORCE_REINSTALL=1 to re-download anyway."
+        SHIPYARD_ALREADY_AT_TARGET=1
+    fi
+fi
+
 # SHIPYARD_SKIP_DOWNLOAD=1 preserves an already-present binary at
 # ${INSTALL_DIR}/shipyard. Used by tests to exercise the smoke +
 # remediation paths without hitting the network. When it's set we
 # skip URL resolution entirely (tests don't want live API calls).
-if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
+# Same when we short-circuited on version match above.
+if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ] \
+    && [ "${SHIPYARD_ALREADY_AT_TARGET}" != "1" ]; then
     # `set -o pipefail` means a pipe containing `grep` that matches
     # nothing kills the script via set -e — so `|| true` the final
     # cut lets us handle the empty-URL case below instead of dying
@@ -156,7 +188,8 @@ else
     RELEASE_URL=""
 fi
 
-if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" = "1" ]; then
+if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" = "1" ] \
+    || [ "${SHIPYARD_ALREADY_AT_TARGET}" = "1" ]; then
     : # existing binary at INSTALL_DIR/shipyard is what we'll test
 elif [ -n "${DMG_URL}" ]; then
     echo "Downloading ${ARTIFACT}.dmg (${VERSION_LABEL})..."

@@ -646,33 +646,41 @@ def _check_shipyard_path_shadows() -> dict[str, Any]:
 
 
 def _check_macos_gatekeeper_health() -> dict[str, Any] | None:
-    """Surface a broken notarization state on macOS before it bites.
+    """Surface a broken signing / Gatekeeper state on macOS.
 
-    Closes #216 — the user-facing failure is "exit 137 once, then
-    exit 0 with zero output forever after." That shape is exactly
-    what happens when Gatekeeper rejects a PyInstaller bundle whose
-    Developer-ID signature got destroyed: macOS SIGKILLs on first
-    run and then caches the rejection so subsequent runs exit
-    silently. Root cause was ``install.sh``'s pre-v0.36.0
-    ``codesign --force --sign -`` ad-hoc resign (#203 fixed the
-    install side). This check catches users already in the broken
-    state or whose future install path regresses.
+    Originally written for #216 (binary passed ``codesign --verify``
+    but SIGKILL'd at launch under pre-v0.36.0 install.sh notarization
+    strip). The check had three probes: xattr quarantine, spctl
+    --assess, and codesign --verify.
 
-    Three signals, any one of which flips ok=False:
+    Revised for #231 — the spctl probe false-positive'd on v0.44.0's
+    stapled-dmg installs. When install.sh copies a binary OUT of a
+    stapled .dmg, the binary inherits trusted provenance and
+    launches cleanly, but ``spctl --assess`` still rejects it
+    because spctl's default policy rejects bare CLI Mach-O
+    regardless of signature validity. That's NOT a real problem —
+    taskgated at launch uses a different trust path (the dmg
+    provenance) and accepts the binary just fine.
 
-    1. ``com.apple.quarantine`` xattr present on the running binary
-       — Gatekeeper's first-run evaluation is still pending or
-       failed.
-    2. ``spctl --assess`` rejects the binary — active Gatekeeper
-       rejection. The definitive "your binary is broken" signal.
-    3. ``codesign --verify --deep`` fails — signing integrity is
-       broken independent of policy.
+    New check shape: two signals, both DEFINITIVE, neither
+    false-positiving on valid CLI binaries:
+
+    1. ``com.apple.quarantine`` xattr present — first-run
+       evaluation genuinely pending/failed. Fix is mechanical
+       (strip the xattr).
+    2. ``codesign --verify --deep`` fails — signing integrity
+       actually broken. Fix is reinstall.
+
+    We DO NOT probe ``spctl --assess`` anymore — its policy
+    rejection on a signed+notarized CLI binary from a stapled dmg
+    is expected behavior, not a bug. The actual launch behavior
+    (which is what users care about) is covered by the install-time
+    post-install smoke in install.sh.
 
     Returns None on non-macOS and when the running CLI isn't a
-    frozen bundle (e.g. ``uv run shipyard doctor`` during
-    development) — a passing row there would be false confidence
-    since the Python interpreter is well-signed regardless of how
-    the release binary fared.
+    frozen bundle (``uv run`` during development) — a passing row
+    there would be false confidence since Python itself is
+    well-signed regardless of release-binary state.
     """
     if sys.platform != "darwin":
         return None
@@ -703,22 +711,6 @@ def _check_macos_gatekeeper_health() -> dict[str, Any] | None:
         pass
 
     try:
-        spctl = subprocess.run(
-            ["spctl", "--assess", "--verbose=2", str(binary)],
-            capture_output=True, text=True, timeout=10,
-        )
-        if spctl.returncode != 0:
-            detail = (spctl.stderr.strip() or spctl.stdout.strip())[:200]
-            problems.append(
-                f"spctl rejection: {detail}. Reinstall v0.36.0+ "
-                "(install.sh now preserves Developer-ID notarization): "
-                "curl -fsSL https://raw.githubusercontent.com/"
-                "danielraffel/Shipyard/main/install.sh | sh"
-            )
-    except (subprocess.SubprocessError, FileNotFoundError):
-        pass
-
-    try:
         verify = subprocess.run(
             ["codesign", "--verify", "--deep", str(binary)],
             capture_output=True, text=True, timeout=10,
@@ -728,7 +720,7 @@ def _check_macos_gatekeeper_health() -> dict[str, Any] | None:
             problems.append(
                 f"codesign --verify failed: {detail}. Binary "
                 "signature is broken; reinstall from the release "
-                "artifact."
+                "artifact via install.sh."
             )
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
@@ -736,10 +728,10 @@ def _check_macos_gatekeeper_health() -> dict[str, Any] | None:
     if problems:
         return {
             "ok": False,
-            "version": "macOS Gatekeeper rejection risk",
+            "version": "macOS signing integrity issue",
             "detail": "\n  ".join(problems),
         }
-    return {"ok": True, "version": "Gatekeeper + codesign + xattr healthy"}
+    return {"ok": True, "version": "codesign + xattr healthy"}
 
 
 def _check_rich_bundle_health() -> dict[str, Any]:
@@ -823,9 +815,9 @@ def _check_daemon_version_drift(ctx: Context) -> dict[str, Any] | None:
             "version": f"daemon: <unknown>   cli: v{_self_version}",
             "detail": (
                 "The running daemon predates v0.26.0 and doesn't report "
-                "its own version. Run `shipyard daemon stop` to let the "
-                "next GUI launch (or `shipyard daemon start`) spawn a "
-                "fresh daemon from the current binary."
+                "its own version. Run `shipyard daemon refresh` to swap "
+                "the stale daemon for a fresh one built from the current "
+                "CLI binary (#231)."
             ),
         }
     if daemon_version == _self_version:
@@ -839,9 +831,8 @@ def _check_daemon_version_drift(ctx: Context) -> dict[str, Any] | None:
         "detail": (
             "The running daemon is an older build than the CLI on "
             "PATH. New IPC message types (e.g. ship-state-list, added "
-            "in v0.25.0) will be silently dropped. Run "
-            "`shipyard daemon stop` to let the next GUI launch spawn "
-            "a fresh daemon from the current binary."
+            "in v0.25.0) will be silently dropped. Fix with: "
+            "`shipyard daemon refresh` (#231)."
         ),
     }
 
@@ -7530,6 +7521,105 @@ def daemon_stop(ctx: Context) -> None:
             render_message("daemon stopped.", style="green")
         else:
             render_message("daemon wasn't running.", style="dim")
+
+
+@daemon.command("refresh")
+@click.option(
+    "--repo",
+    "repos",
+    multiple=True,
+    help="Repo slug to register on the fresh daemon (repeatable).",
+)
+@pass_context
+def daemon_refresh(ctx: Context, repos: tuple[str, ...]) -> None:
+    """Stop the running daemon and start a fresh one.
+
+    Closes the #231 gap: after ``install.sh`` upgrades the CLI
+    binary, the long-running daemon still holds the OLD code and
+    new IPC message types are silently dropped. ``doctor`` flags
+    the drift but there was no one-command fix — this is it.
+
+    If no daemon is running, skips the stop + just starts a new
+    one (idempotent). ``--repo`` is forwarded to the start step
+    so operators don't lose their registered repo list. If no
+    repos are passed, the previous daemon's registered set is
+    re-used from the last status snapshot.
+    """
+    from shipyard.daemon.controller import read_daemon_status
+    from shipyard.daemon.runner import stop_running
+
+    state_dir = ctx.config.state_dir
+
+    # Capture the registered repo list from the current daemon
+    # before we stop it — otherwise the operator has to remember
+    # + re-pass every repo on the refresh call. When the caller
+    # explicitly passes --repo, those win (lets the refresh also
+    # re-register).
+    prior_repos: list[str] = []
+    if not repos:
+        try:
+            status = read_daemon_status(state_dir)
+        except Exception:  # noqa: BLE001 — best-effort snapshot
+            status = None
+        if status is not None:
+            registered = status.get("registered_repos") or []
+            if isinstance(registered, list):
+                prior_repos = [r for r in registered if isinstance(r, str)]
+
+    stopped = stop_running(state_dir)
+
+    # Immediately after stop, spawn a fresh one. Using the same
+    # helper `daemon start` uses keeps behavior identical to
+    # running the two commands by hand.
+    from shipyard.daemon.runner import DaemonSpawnFailedError, spawn_detached
+
+    repo_list = list(repos) if repos else prior_repos
+    if not repo_list:
+        render_error(
+            "No repos to register on the refreshed daemon. Pass "
+            "`--repo owner/name` (repeatable) to register, or "
+            "run `shipyard daemon start --repo ...` yourself."
+        )
+        sys.exit(1)
+    try:
+        pid = spawn_detached(state_dir=state_dir, repos=repo_list)
+    except DaemonSpawnFailedError as exc:
+        if ctx.json_mode:
+            ctx.output(
+                "daemon:refresh",
+                {
+                    "ok": False,
+                    "stopped_prior": stopped,
+                    "error": str(exc),
+                    "repos": repo_list,
+                },
+            )
+        else:
+            render_message(str(exc), style="red")
+        sys.exit(3)
+
+    if ctx.json_mode:
+        ctx.output(
+            "daemon:refresh",
+            {
+                "stopped_prior": stopped,
+                "new_pid": pid,
+                "repos": repo_list,
+            },
+        )
+    else:
+        if stopped:
+            render_message(
+                f"↻ daemon refreshed (new pid {pid}); "
+                f"registered {len(repo_list)} repo(s).",
+                style="green",
+            )
+        else:
+            render_message(
+                f"→ no prior daemon; started fresh (pid {pid}); "
+                f"registered {len(repo_list)} repo(s).",
+                style="green",
+            )
 
 
 @daemon.command("status")

@@ -95,28 +95,37 @@ def test_quarantine_xattr_flagged(
     assert "xattr -d com.apple.quarantine" in result["detail"]
 
 
-def test_spctl_rejection_flagged(
+def test_spctl_rejection_is_NOT_flagged_anymore(  # noqa: N802 — load-bearing test name
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
+    # #231: spctl --assess rejects v0.44.0 stapled-dmg-extracted CLI
+    # binaries by default policy even though the binary launches
+    # cleanly under taskgated. We intentionally DO NOT probe spctl
+    # anymore — a rejection there doesn't predict real-world
+    # launch failure. This test locks that decision in: if spctl
+    # is invoked despite the rejection policy, the test fails
+    # (spctl being called at all means someone reintroduced the
+    # probe).
     _force_frozen_macos(monkeypatch, tmp_path)
+    spctl_called = {"n": 0}
 
     def fake_run(cmd, **kw):
         if cmd[0] == "spctl":
-            return _ok_proc(
-                returncode=3,
-                stderr="rejected (the code is valid but does not seem to be an app)",
-            )
+            spctl_called["n"] += 1
         return _ok_proc(returncode=0)
 
     with patch("shipyard.cli.subprocess.run", side_effect=fake_run):
         result = _check_macos_gatekeeper_health()
 
     assert result is not None
-    assert result["ok"] is False
-    assert "spctl" in result["detail"].lower()
-    # Reinstall hint must point at install.sh so the operator gets
-    # the v0.36.0+ notarization-preserving path.
-    assert "install.sh" in result["detail"]
+    assert result["ok"] is True, (
+        "Binary with healthy xattr + codesign must be marked ok "
+        "regardless of spctl policy"
+    )
+    assert spctl_called["n"] == 0, (
+        "spctl probe was removed per #231 — reintroducing it would "
+        "false-positive on v0.44.0+ stapled-dmg installs"
+    )
 
 
 def test_codesign_verify_failure_flagged(
@@ -137,19 +146,22 @@ def test_codesign_verify_failure_flagged(
     assert "codesign" in result["detail"].lower()
 
 
-def test_multiple_problems_all_surface(
+def test_multiple_real_problems_all_surface(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    # The failure mode reported on #216 is the compounded case —
-    # quarantine xattr AND spctl rejection. Both must appear in the
-    # detail so the operator has the full picture.
+    # Compounded case: quarantine xattr AND broken codesign. Both
+    # must appear in the detail so the operator has the full
+    # picture. Previously this test also checked spctl rejection,
+    # but #231 removed that probe because it false-positives on
+    # stapled-dmg-extracted CLI binaries. Now we check the two
+    # REAL problems side-by-side.
     _force_frozen_macos(monkeypatch, tmp_path)
 
     def fake_run(cmd, **kw):
         if cmd[0] == "xattr":
             return _ok_proc(stdout="com.apple.quarantine\n")
-        if cmd[0] == "spctl":
-            return _ok_proc(returncode=3, stderr="rejected")
+        if cmd[0] == "codesign":
+            return _ok_proc(returncode=1, stderr="code object is not signed at all")
         return _ok_proc(returncode=0)
 
     with patch("shipyard.cli.subprocess.run", side_effect=fake_run):
@@ -158,7 +170,7 @@ def test_multiple_problems_all_surface(
     assert result is not None
     assert result["ok"] is False
     assert "quarantine" in result["detail"].lower()
-    assert "spctl" in result["detail"].lower()
+    assert "codesign" in result["detail"].lower()
 
 
 def test_missing_tool_falls_through_without_raising(
