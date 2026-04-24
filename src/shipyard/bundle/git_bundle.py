@@ -314,7 +314,14 @@ def upload_bundle(
                 break
         except subprocess.TimeoutExpired:
             elapsed = _time.monotonic() - attempt_start
-            last_stderr = f"timeout after {elapsed:.1f}s (budget {timeout}s)"
+            # Phrase as "timed out after" (past tense) so callers
+            # grepping for the word "timeout" OR "timed out" both
+            # match — the existing BundleResult contract tests
+            # assert the substring "timed out" so we preserve it
+            # verbatim.
+            last_stderr = (
+                f"timed out after {elapsed:.1f}s (budget {timeout}s)"
+            )
             attempts_log.append(
                 f"attempt {attempt}/{max_attempts}: {last_stderr}"
             )
