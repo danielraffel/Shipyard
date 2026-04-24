@@ -526,6 +526,66 @@ def test_pin_bump_skips_redundant_guard_when_origin_main_unreachable(
     _assert_cli_ok(result)
 
 
+def test_main_pinned_version_at_origin_fails_open_on_fetch_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Codex P2 on #245: when `git fetch` returns non-zero (offline,
+    # auth rejected, etc.), `_main_pinned_version_at_origin` must
+    # return None so Guard B is skipped — otherwise a stale local
+    # origin/main ref from a previous successful fetch drives a
+    # false refusal in exactly the "offline / stale worktree" case
+    # the guard is supposed to fail open on.
+    from shipyard.cli import _main_pinned_version_at_origin
+
+    # Build a real-ish repo with a committed origin/main ref that
+    # contains a stale pin. If the function reads origin/main
+    # despite fetch failing, it'll surface that stale pin and the
+    # assertion will fail.
+    repo = _setup_consumer_repo(tmp_path, pinned_version="v0.40.0")
+    # Create a local "origin" (bare) remote so origin/main exists,
+    # then add a committed version bump on that ref.
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(remote)], check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
+        cwd=repo, check=True,
+    )
+    # Push current branch as 'main' to origin.
+    current_branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", "-q", "origin",
+         f"{current_branch}:refs/heads/main"],
+        cwd=repo, check=True,
+    )
+    # Update origin/main ref locally to simulate "last successful fetch"
+    subprocess.run(
+        ["git", "fetch", "-q", "origin"], cwd=repo, check=True,
+    )
+
+    # Now poison `git fetch` so the next call returns non-zero.
+    real_run = subprocess.run
+
+    def failing_fetch(cmd, **kw):
+        if (
+            isinstance(cmd, list)
+            and len(cmd) >= 2
+            and cmd[0] == "git"
+            and cmd[1] == "fetch"
+        ):
+            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr("shipyard.cli.subprocess.run", failing_fetch)
+
+    # With fetch failing, the function must return None (fail open).
+    assert _main_pinned_version_at_origin(repo) is None
+
+
 def test_parse_version_tuple_edge_cases() -> None:
     # Non-semver inputs return None so guards no-op instead of
     # false-triggering. Regression-guard against a future refactor

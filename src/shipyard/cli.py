@@ -2166,12 +2166,20 @@ def _main_pinned_version_at_origin(repo_root: Path) -> str | None:
     Any None result means the redundant-branch guard is skipped —
     better to let a bump proceed than to refuse on a flaky network.
     """
+    # Codex P2 on #245: `subprocess.run` returns a CompletedProcess on
+    # non-zero exit (it only raises on missing binary / timeout), so
+    # an unchecked fetch returncode lets a stale local `origin/main`
+    # ref (from the last successful fetch) back into the guard — the
+    # exact "fail open on offline" hole the guard was supposed to
+    # avoid. Check returncode explicitly.
     try:
-        subprocess.run(
+        fetch = subprocess.run(
             ["git", "fetch", "--quiet", "origin", "main"],
             cwd=repo_root, capture_output=True, text=True, timeout=30,
         )
     except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    if fetch.returncode != 0:
         return None
     try:
         result = subprocess.run(
