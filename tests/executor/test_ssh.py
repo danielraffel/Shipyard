@@ -10,9 +10,21 @@ from shipyard.core.job import TargetStatus
 from shipyard.executor.ssh import SSHExecutor
 from shipyard.executor.ssh_windows import (
     SSHWindowsExecutor,
+    _BundleProbe,
     decode_encoded_ssh_argv,
 )
 from shipyard.executor.streaming import StreamingCommandResult
+
+
+def _ok_probe() -> _BundleProbe:
+    # Default passing probe for ssh_windows validate() tests. Real
+    # subprocess-level coverage lives in test_247_bundle_post_upload_probe.py;
+    # existing validate-flow tests only need a "probe said the file
+    # is there" stub so they don't make real SSH calls to mock hosts.
+    return _BundleProbe(
+        exists=True, size=1024,
+        detail="OK size=1024 mtime=2026-01-01T00:00:00Z path=test.bundle",
+    )
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -96,6 +108,10 @@ def _mock_windows_bundle_success():
         patch(
             "shipyard.executor.ssh_windows.upload_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ),
+        patch(
+            "shipyard.executor.ssh_windows._probe_remote_bundle",
+            return_value=_ok_probe(),
         ),
         patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
@@ -693,7 +709,6 @@ class TestSSHResumeFrom:
         assert result is None
 
     def test_validate_passes_resume_from_through(self, tmp_path) -> None:
-        from shipyard.bundle.git_bundle import BundleResult
 
         executor = SSHExecutor()
         log_path = str(tmp_path / "log.txt")
@@ -763,6 +778,9 @@ class TestSSHWindowsExecutorValidate:
             "shipyard.executor.ssh_windows.upload_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
         ), patch(
+            "shipyard.executor.ssh_windows._probe_remote_bundle",
+            return_value=_ok_probe(),
+        ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),
         ), patch(
@@ -792,6 +810,9 @@ class TestSSHWindowsExecutorValidate:
             "shipyard.executor.ssh_windows.upload_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
         ), patch(
+            "shipyard.executor.ssh_windows._probe_remote_bundle",
+            return_value=_ok_probe(),
+        ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),
         ), patch(
@@ -819,6 +840,9 @@ class TestSSHWindowsExecutorValidate:
         ), patch(
             "shipyard.executor.ssh_windows.upload_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows._probe_remote_bundle",
+            return_value=_ok_probe(),
         ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),
@@ -865,6 +889,9 @@ class TestSSHWindowsExecutorValidate:
             "shipyard.executor.ssh_windows.upload_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
         ), patch(
+            "shipyard.executor.ssh_windows._probe_remote_bundle",
+            return_value=_ok_probe(),
+        ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),
         ), patch(
@@ -904,6 +931,9 @@ class TestSSHWindowsExecutorValidate:
         ), patch(
             "shipyard.executor.ssh_windows.upload_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows._probe_remote_bundle",
+            return_value=_ok_probe(),
         ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),
@@ -949,6 +979,9 @@ class TestSSHWindowsExecutorValidate:
             "shipyard.executor.ssh_windows.upload_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
         ), patch(
+            "shipyard.executor.ssh_windows._probe_remote_bundle",
+            return_value=_ok_probe(),
+        ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),
         ), patch(
@@ -992,6 +1025,9 @@ class TestSSHWindowsExecutorValidate:
         ), patch(
             "shipyard.executor.ssh_windows.upload_bundle",
             return_value=BundleResult(success=True, message="ok", path="/tmp/b"),
+        ), patch(
+            "shipyard.executor.ssh_windows._probe_remote_bundle",
+            return_value=_ok_probe(),
         ), patch(
             "shipyard.executor.ssh_windows._apply_bundle_windows",
             return_value=type("R", (), {"success": True, "message": "ok"})(),

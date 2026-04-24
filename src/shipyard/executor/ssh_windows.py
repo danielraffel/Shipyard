@@ -225,6 +225,47 @@ class SSHWindowsExecutor:
                         f"{upload_result.message}",
                     )
 
+                # #247: verify the upload actually landed before
+                # handing off to git. upload_bundle's success can
+                # be reported even when scp closes cleanly with zero
+                # bytes actually on disk — in that failure mode git
+                # emits "error: could not open '...'" which PowerShell
+                # wraps in a CLIXML envelope + progress records, and
+                # the operator sees pulp#728-shaped garbage instead
+                # of a clean "bundle missing after upload" message.
+                # The probe also records size+mtime in the target log
+                # on success, so every future apply failure has
+                # forensic upload state alongside the error.
+                probe = _probe_remote_bundle(
+                    host=host,
+                    bundle_path=remote_bundle,
+                    ssh_options=ssh_options,
+                )
+                try:
+                    with log_file.open("a", encoding="utf-8") as lf:
+                        lf.write(f"bundle post-upload probe: {probe.detail}\n")
+                except OSError:
+                    pass
+                if not probe.exists:
+                    return _error_result(
+                        target_name, platform, started_at, start_time,
+                        str(log_file),
+                        f"Bundle upload completed but remote file is "
+                        f"missing: {probe.detail}. This is the failure "
+                        f"mode from #247 (scp closed cleanly but the "
+                        f"file isn't on the remote). Re-run should "
+                        f"trigger a fresh upload.",
+                    )
+                if probe.size == 0:
+                    return _error_result(
+                        target_name, platform, started_at, start_time,
+                        str(log_file),
+                        f"Bundle upload completed but remote file is "
+                        f"0 bytes: {probe.detail}. This is a silent "
+                        f"truncation (#247). Re-run should trigger a "
+                        f"fresh upload.",
+                    )
+
                 # Apply bundle via PowerShell on the remote. Pass
                 # the per-target log_file through so the raw stderr
                 # (including any CLIXML envelope) gets persisted
@@ -581,6 +622,122 @@ def _remote_has_sha_windows(
         return result.returncode == 0
     except (subprocess.SubprocessError, OSError):
         return False
+
+
+class _BundleProbe:
+    """Result of a post-upload bundle-on-remote check (#247).
+
+    ``exists`` reflects the result of ``Test-Path -LiteralPath``.
+    ``size`` is the file's length in bytes (0 when the file is
+    missing or we couldn't parse the Get-Item output).
+    ``detail`` is a short human-readable summary suitable for logs
+    and error messages.
+    """
+
+    def __init__(self, exists: bool, size: int, detail: str) -> None:
+        self.exists = exists
+        self.size = size
+        self.detail = detail
+
+
+def _probe_remote_bundle(
+    host: str,
+    bundle_path: str,
+    ssh_options: list[str],
+    *,
+    timeout: int = 30,
+) -> _BundleProbe:
+    """Check that the uploaded bundle actually landed on the remote
+    host, and capture its size + mtime as a forensic artifact (#247).
+
+    ``upload_bundle`` returns success when scp/ssh closes cleanly —
+    but a cleanly-closed channel can still end up with zero bytes on
+    disk (session dropout, remote-side write failure the SFTP server
+    didn't surface). Without this probe the next diagnostic signal
+    is git's ``error: could not open '...'``, which gets wrapped by
+    PowerShell's CLIXML envelope and interleaved with progress
+    records — so the user sees the Spectr / pulp#728 failure shape
+    instead of a clean "bundle missing after upload" message.
+
+    Runs a single SSH command (Test-Path + Get-Item if present) and
+    returns an opaque probe object the caller decides what to do
+    with. Any SSH/PowerShell failure returns ``exists=False`` with a
+    diagnostic ``detail`` string — the caller treats that as "upload
+    verification failed, bail" rather than guessing.
+    """
+    safe_bundle = _ps_single_quote(bundle_path)
+    resolved = (
+        f"'{safe_bundle}'"
+        if _is_windows_absolute_path(bundle_path)
+        else f"(Join-Path $HOME '{safe_bundle}')"
+    )
+    script = (
+        f"{_WINDOWS_UTF8_PRELUDE}"
+        f"$Bundle = {resolved}; "
+        f"if (Test-Path -LiteralPath $Bundle) {{ "
+        f"$i = Get-Item -LiteralPath $Bundle; "
+        # One-line, whitespace-separated; easy to parse and easy to
+        # eyeball in the log. mtime in ISO-8601 UTC.
+        f"Write-Output (\"OK size=\" + $i.Length + "
+        f"\" mtime=\" + $i.LastWriteTimeUtc.ToString('o') + "
+        f"\" path=\" + $Bundle) "
+        f"}} else {{ "
+        f"Write-Output (\"MISSING path=\" + $Bundle) "
+        f"}}"
+    )
+    cmd = ["ssh"] + list(ssh_options) + _powershell_encoded_argv(host, script)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return _BundleProbe(
+            exists=False, size=0,
+            detail=f"probe timed out after {timeout}s",
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return _BundleProbe(
+            exists=False, size=0, detail=f"probe error: {exc}",
+        )
+    if result.returncode != 0:
+        stderr_snip = (result.stderr or "").strip()[:200]
+        return _BundleProbe(
+            exists=False, size=0,
+            detail=(
+                f"probe exited {result.returncode}"
+                + (f": {stderr_snip}" if stderr_snip else "")
+            ),
+        )
+    stdout = (result.stdout or "").strip()
+    # Scan for our sentinel lines anywhere in stdout rather than
+    # requiring them at the start. Some users configure a PowerShell
+    # profile that prints a banner on session open; requiring our
+    # line to be position-0 would false-positive fail on those hosts
+    # and regress them relative to pre-#247 behavior.
+    import re
+    ok_match = re.search(
+        r"OK\s+size=(\d+)\s+mtime=(\S+)\s+path=(.+)", stdout,
+    )
+    if ok_match:
+        size = int(ok_match.group(1))
+        # Keep `detail` as the matched line only, not the whole
+        # stdout — makes the log readable even when a banner runs
+        # long.
+        detail = (
+            f"OK size={size} mtime={ok_match.group(2)} "
+            f"path={ok_match.group(3).strip()}"
+        )
+        return _BundleProbe(exists=True, size=size, detail=detail)
+    missing_match = re.search(r"MISSING\s+path=(.+)", stdout)
+    if missing_match:
+        detail = f"MISSING path={missing_match.group(1).strip()}"
+        return _BundleProbe(exists=False, size=0, detail=detail)
+    # Neither sentinel found — treat as "can't verify" and surface
+    # the snippet so the operator can diagnose.
+    return _BundleProbe(
+        exists=False, size=0,
+        detail=f"probe unexpected output: {stdout[:200]!r}",
+    )
 
 
 def _apply_bundle_windows(
