@@ -211,20 +211,53 @@ def test_partial_arch_exit_path_does_not_reference_unset_vars() -> None:
     )
 
 
-def test_publish_waits_for_both_macos_arches() -> None:
-    # Codex P1 on #253: running this script for only arm64 previously
-    # flipped the release public while the x64 dmg was still missing,
-    # leaving Intel-Mac users with a public release that still 404'd
-    # on install. The fix requires EVERY expected macOS dmg to be
-    # on the release before the flip. Pin the two current arches
-    # so a refactor can't silently drop the arch-completeness check.
+def test_publish_gate_covers_arm64_only_after_intel_drop() -> None:
+    # #256: Intel dropped as of v0.50.0. The arch-completeness gate
+    # now expects only arm64. Regression guard: if someone re-adds
+    # x64 to EXPECTED_MACOS_DMGS without also restoring the build
+    # matrix + install.sh resolution, the gate would wait forever.
     content = SCRIPT.read_text()
     assert "EXPECTED_MACOS_DMGS" in content, (
         "script must express which macOS dmgs are expected before publish"
     )
     assert "shipyard-macos-arm64.dmg" in content
-    assert "shipyard-macos-x64.dmg" in content
+    assert "shipyard-macos-x64.dmg" not in content, (
+        "x64 dropped in #256 — EXPECTED_MACOS_DMGS must be arm64 only"
+    )
     # Revert-on-failure must track DID_PUBLISH, not just WAS_DRAFT —
     # otherwise a failed E2E right after this run's flip wouldn't
     # revert (WAS_DRAFT is 0 post-flip).
     assert "DID_PUBLISH" in content
+
+
+def test_install_sh_rejects_intel_mac_cleanly() -> None:
+    # #256: install.sh on Intel Mac must surface a clear "unsupported"
+    # message and exit non-zero BEFORE attempting the asset fetch.
+    # Letting it fall through to the 404 on a missing dmg is exactly
+    # the UX regression this drop was meant to clean up.
+    install_sh = REPO_ROOT / "install.sh"
+    content = install_sh.read_text()
+    assert "Intel Macs (x86_64) are not supported" in content, (
+        "install.sh must surface a clean unsupported-platform message "
+        "for Intel Macs, not fall through to a 404 on a missing asset"
+    )
+    # Refusal must happen on OS=macos + ARCH=x64, not on Linux x64.
+    # Anchor to both so a future simplification of the condition
+    # doesn't accidentally nuke Linux x64 installs.
+    assert '$OS" = "macos"' in content and '$ARCH" = "x64"' in content
+
+
+def test_release_yml_drops_macos_x64_matrix_row() -> None:
+    # Pair with the script-side gate test above: the CI build matrix
+    # must stop producing a macos-x64 artifact. Keeping it around
+    # would waste CI minutes on an artifact that never gets signed
+    # and which install.sh now refuses to resolve anyway.
+    release_yml = REPO_ROOT / ".github" / "workflows" / "release.yml"
+    content = release_yml.read_text()
+    assert "target: macos-arm64" in content
+    assert "target: macos-x64" not in content, (
+        "#256: macos-x64 build matrix row must be gone; Intel dropped"
+    )
+    assert "macos_x64:" not in content, (
+        "#256: macos_x64 runner output must be gone too"
+    )

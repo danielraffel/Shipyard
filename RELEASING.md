@@ -105,8 +105,8 @@ We shipped v0.42.0 and v0.43.0 with the same class of breakage because we declar
 
 The five secrets below are kept in the repo even though CI doesn't use them today — they're needed for:
 
-- Future Rosetta-hosted local cross-builds for x64
-- Forks that may re-enable CI signing for their own environments
+- ~~Future Rosetta-hosted local cross-builds for x64~~ (retired by #256 — Intel dropped as of v0.50.0; arm64 only)
+- Forks that may re-enable CI signing for their own environments (tracked in #226)
 - The `.dmg` pipeline above reuses `SHIPYARD_SIGNING_IDENTITY` conceptually (the cert is in the local keychain rather than a GH secret, but the same cert)
 
 Five secrets on the repo (all `gh secret set NAME`):
@@ -141,7 +141,7 @@ Running without `--upload` is the diagnostic mode (used to confirm the local sig
 
 The CI signing steps have been removed from `.github/workflows/release.yml` (build-only for macOS, no signing / notarizing / uploading). The five secrets below are kept in the repo for:
 
-- The x64 slice once we add Rosetta-hosted local cross-builds or move x64 to local too
+- ~~The x64 slice once we add Rosetta-hosted local cross-builds~~ (retired; see above)
 - Future `.dmg` stapling pipeline (task #52 — the long-term answer that eliminates Apple's online-check dependency entirely)
 - Forks that might want to re-enable CI signing for their own environments
 

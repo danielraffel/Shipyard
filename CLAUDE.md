@@ -153,9 +153,11 @@ rather than stacking them.
 
 `./scripts/release.sh` remains as a break-glass manual path. The default is the automatic path above (auto-release workflow on merge). Do not call `release.sh` directly unless the automatic path is genuinely blocked.
 
-## macOS release is a stapled .dmg, built LOCALLY
+## macOS release is a stapled .dmg, built LOCALLY (arm64 only)
 
 As of #219 (2026-04-24 evening), macOS binaries ship as stapled **.dmg** artifacts built on the maintainer's Mac. CI handles Linux + Windows. The `.dmg` wrapper puts the notarization ticket **inside** the artifact so Gatekeeper verifies offline — no online notarization check, no per-Mac taskgated flakiness. Bare Mach-O binaries depend on an online check that proved unreliable (v0.42.0 and v0.43.0 both shipped bare Mach-O and both SIGKILL'd on the maintainer's Mac).
+
+As of #256 (v0.50.0+), **Apple Silicon (arm64) is the only supported macOS architecture.** Intel Macs (x86_64) were dropped — install.sh now prints a clean "unsupported" message on Intel rather than hitting a 404. This halved the release surface and retired the Rosetta/Intel-host branch of the local flow.
 
 After any new tag lands and the release workflow publishes non-macOS assets, run:
 

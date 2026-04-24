@@ -59,6 +59,18 @@ case "$(uname -m)" in
         ;;
 esac
 
+# #256: Intel Macs (x86_64) are no longer supported as of v0.50.0.
+# Surface a clean message rather than letting the user hit a 404 on
+# a missing asset. Exit 2 distinguishes "this platform is
+# unsupported" from exit 1 ("something went wrong").
+if [ "$OS" = "macos" ] && [ "$ARCH" = "x64" ]; then
+    echo "Intel Macs (x86_64) are not supported by Shipyard v0.50.0 and later." >&2
+    echo "Apple Silicon (arm64) Macs only. If you're pinned to an older tag" >&2
+    echo "(SHIPYARD_VERSION=vX.Y.Z) that still has an Intel dmg, that install" >&2
+    echo "remains functional — the cutover only affects new releases." >&2
+    exit 2
+fi
+
 ARTIFACT="shipyard-${OS}-${ARCH}"
 if [ "${SHIPYARD_DRY_RUN:-0}" != "1" ]; then
     echo "Detected platform: ${OS}-${ARCH}"

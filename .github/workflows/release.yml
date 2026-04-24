@@ -24,7 +24,6 @@ jobs:
       linux: ${{ steps.resolve.outputs.linux }}
       linux_arm: ${{ steps.resolve.outputs.linux_arm }}
       macos_arm: ${{ steps.resolve.outputs.macos_arm }}
-      macos_x64: ${{ steps.resolve.outputs.macos_x64 }}
       windows: ${{ steps.resolve.outputs.windows }}
     steps:
       - id: resolve
@@ -77,7 +76,8 @@ jobs:
           else
             echo "macos_arm=\"macos-15\"" >> "$GITHUB_OUTPUT"
           fi
-          echo "macos_x64=\"macos-15\"" >> "$GITHUB_OUTPUT"
+          # #256: Intel Mac (x86_64) dropped. No macos_x64 output
+          # anymore — it's gone from the build matrix too.
 
           if [ "$P_WINDOWS" = "namespace" ]; then
             echo "windows=\"namespace-profile-generouscorp-windows\"" >> "$GITHUB_OUTPUT"
@@ -94,9 +94,10 @@ jobs:
           - target: macos-arm64
             artifact: shipyard-macos-arm64
             runs_on: ${{ needs.resolve-runners.outputs.macos_arm }}
-          - target: macos-x64
-            artifact: shipyard-macos-x64
-            runs_on: ${{ needs.resolve-runners.outputs.macos_x64 }}
+          # #256: Intel Mac (x86_64) dropped as of v0.50.0. Apple
+          # Silicon only. install.sh surfaces a clean
+          # "unsupported platform" message when an Intel Mac runs
+          # it, distinct from a 404 on a missing asset.
           - target: windows-x64
             artifact: shipyard-windows-x64
             runs_on: ${{ needs.resolve-runners.outputs.windows }}
@@ -297,31 +298,22 @@ jobs:
         # scripts/release-macos-local.sh to sign+notarize on their
         # Mac and upload the signed asset.
         #
-        # Codex P1 on #225: the reminder defaults to --arch arm64
-        # (what the script itself defaults to). For users on Intel
-        # Macs, install.sh resolves ARTIFACT=shipyard-macos-x64,
-        # which would 404 if only the arm64 dmg shipped. Emit both
-        # command lines so the maintainer doesn't silently drop
-        # Intel-Mac support for a release.
+        # #256: Intel (x86_64) support was dropped as of v0.50.0. The
+        # matrix only builds arm64 now; install.sh surfaces a clean
+        # "unsupported" message to anyone running it on Intel.
         run: |
           echo "✓ macOS build succeeded (${{ matrix.artifact }})."
           echo ""
           echo "This binary is NOT being uploaded to the release."
           echo "macOS signing + notarization is local-only (see #219)."
-          echo "Run BOTH on your Mac after the release tag appears —"
-          echo "Apple Silicon AND Intel — so install.sh resolves on"
-          echo "both architectures:"
+          echo "Run on your Mac after the release tag appears:"
           echo ""
-          echo "  # Apple Silicon (arm64):"
           echo "  ./scripts/release-macos-local.sh \\"
-          echo "    --tag ${{ github.ref_name }} --arch arm64 --upload"
+          echo "    --tag ${{ github.ref_name }} --upload"
           echo ""
-          echo "  # Intel (x64) — needs a Rosetta or Intel build host:"
-          echo "  ./scripts/release-macos-local.sh \\"
-          echo "    --tag ${{ github.ref_name }} --arch x64 --upload"
-          echo ""
-          echo "If you've dropped Intel support intentionally, remove"
-          echo "the macos-x64 matrix entry above and this reminder."
+          echo "The script signs, notarizes, staples, uploads the"
+          echo "arm64 dmg, flips the draft release to public (#252),"
+          echo "and runs the end-to-end install.sh verification."
           echo ""
 
   release:
