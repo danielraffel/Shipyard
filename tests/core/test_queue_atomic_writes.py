@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -244,3 +245,104 @@ def test_save_writes_fsynced_before_rename(
     # must precede any rename of a queue tmp file.
     assert fsync_calls, "os.fsync was not called during _save()"
     assert rename_calls, "Path.replace was not called during _save()"
+
+
+# -- #175 retry jitter ----------------------------------------------
+# `_retry_replace_on_windows` was added in #105 but retried in
+# lockstep — 3 concurrent writers that contended at t=0 would
+# contend again at t=0.05s, t=0.15s, etc., because their retry
+# schedules were identical. The #174 CI Windows run hit the
+# residual flake anyway. Fix: random jitter breaks lockstep;
+# bumped to 18 attempts so the total budget outlasts real CI
+# contention (~8s max with jitter).
+
+def test_retry_replace_is_noop_on_posix(tmp_path: Path) -> None:
+    # POSIX path: a single atomic replace, no retry loop — and no
+    # random.uniform call, so we can assert no jitter side effect.
+    if sys.platform == "win32":
+        import pytest
+        pytest.skip("POSIX-only branch")
+
+    from shipyard.core.queue import _retry_replace_on_windows
+
+    src = tmp_path / "src.txt"
+    src.write_text("hello")
+    dst = tmp_path / "dst.txt"
+    _retry_replace_on_windows(src, dst)
+
+    assert not src.exists()
+    assert dst.read_text() == "hello"
+
+
+def test_retry_replace_uses_jittered_backoff(monkeypatch, tmp_path: Path) -> None:
+    # Windows path: every attempt must draw a random jitter value,
+    # and the sleep must include it. We patch sys.platform + replace
+    # to exercise the Windows branch deterministically on macOS.
+    import shipyard.core.queue as queue_mod
+
+    sleeps: list[float] = []
+    jitter_calls: list[tuple[float, float]] = []
+
+    attempts = {"n": 0}
+
+    def _fake_replace(self, _target):
+        # Fail the first 3 attempts with PermissionError, succeed
+        # on the fourth — exercises the retry loop without running
+        # the full 18-attempt budget.
+        attempts["n"] += 1
+        if attempts["n"] <= 3:
+            raise PermissionError(5, "Access denied")
+        return self
+
+    def _fake_sleep(s: float) -> None:
+        sleeps.append(s)
+
+    def _fake_uniform(a: float, b: float) -> float:
+        jitter_calls.append((a, b))
+        return (a + b) / 2.0
+
+    monkeypatch.setattr(queue_mod.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "replace", _fake_replace)
+    import random as _random
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", _fake_sleep)
+    monkeypatch.setattr(_random, "uniform", _fake_uniform)
+
+    src = tmp_path / "src.txt"
+    dst = tmp_path / "dst.txt"
+    queue_mod._retry_replace_on_windows(src, dst)
+
+    # Three failed attempts → three sleeps, three jitter draws.
+    assert len(sleeps) == 3
+    assert len(jitter_calls) == 3
+
+    # Jitter bounds grow with the attempt — base = 0.05 * (n+1).
+    # Verifies the jitter range isn't constant (which would preserve
+    # lockstep across concurrent callers).
+    assert jitter_calls[0][1] == pytest.approx(0.05)
+    assert jitter_calls[1][1] == pytest.approx(0.10)
+    assert jitter_calls[2][1] == pytest.approx(0.15)
+
+
+def test_retry_replace_surfaces_error_when_budget_exhausted(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    # If all 18 attempts fail, the original PermissionError must
+    # propagate — a genuinely denied target shouldn't be swallowed
+    # by the retry loop.
+    import shipyard.core.queue as queue_mod
+
+    def _always_fail(self, _target):
+        raise PermissionError(5, "Access denied")
+
+    monkeypatch.setattr(queue_mod.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "replace", _always_fail)
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+    src = tmp_path / "src.txt"
+    dst = tmp_path / "dst.txt"
+
+    import pytest
+    with pytest.raises(PermissionError, match="Access denied"):
+        queue_mod._retry_replace_on_windows(src, dst)

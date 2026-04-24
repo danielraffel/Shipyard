@@ -375,23 +375,32 @@ def _retry_replace_on_windows(src: Path, dst: Path) -> None:
     POSIX: first attempt always succeeds (atomic, no share modes).
     Windows: MoveFileEx can fail with WinError 5 (Access denied)
     while a peer writer is mid-rename or the target is briefly open.
-    We retry up to ~600 ms total — long enough to clear any real
-    contention, short enough that a genuinely permission-denied
-    target still surfaces.
+
+    Backoff is linear-ish (0.05s, 0.10s, …) with random jitter so
+    N concurrent writers don't retry in lockstep and collide on
+    every attempt — the #175 flake. Without jitter, three workers
+    that contended at t=0 will also contend at t=0.05s, t=0.15s,
+    etc., and the retry budget buys nothing. 18 attempts over ~8s
+    of wall time — long enough to outlast real CI-runner
+    contention, short enough that a genuinely denied target still
+    surfaces before the test timeout.
     """
     if sys.platform != "win32":
         src.replace(dst)
         return
+    import random as _random
     import time as _time
 
     last_exc: PermissionError | None = None
-    for attempt in range(12):
+    for attempt in range(18):
         try:
             src.replace(dst)
             return
         except PermissionError as exc:
             last_exc = exc
-            _time.sleep(0.05 * (attempt + 1))
+            base = 0.05 * (attempt + 1)
+            jitter = _random.uniform(0.0, base)
+            _time.sleep(base + jitter)
     assert last_exc is not None
     raise last_exc
 

@@ -494,6 +494,9 @@ def doctor(ctx: Context, release_chain: bool, runners: bool) -> None:
     # downgrades the user to a pre-fix version. Surface this in
     # doctor so the user learns about it before it bites.
     core["shipyard-on-path"] = _check_shipyard_path_shadows()
+    # #181: catch a corrupt PyInstaller _unicode_data archive here
+    # rather than mid-render during `shipyard ship`.
+    core["rich-bundle"] = _check_rich_bundle_health()
     daemon_drift = _check_daemon_version_drift(ctx)
     if daemon_drift:
         core["daemon-version"] = daemon_drift
@@ -633,6 +636,53 @@ def _check_shipyard_path_shadows() -> dict[str, Any]:
         "version": f"v{_self_version} ({len(seen_bins)} binaries found)",
         "detail": detail,
     }
+
+
+def _check_rich_bundle_health() -> dict[str, Any]:
+    """Smoke-test the rich Unicode data loader against bundle corruption.
+
+    Closes #181 — a PyInstaller onefile bundle whose bundled
+    ``rich/_unicode_data`` archive entry got truncated (partial write,
+    on-disk corruption, XProtect rewrite) crashes ``shipyard ship``
+    mid-render with ``zlib.error: Error -3 … incorrect header check``
+    the first time Rich needs to compute the cell-width of a wide
+    char. That happens *inside the summary table renderer*, so the
+    user-visible failure is "PR opened, no evidence ever recorded,
+    ship silently abandoned."
+
+    This check force-loads the unicode-width table (via ``cell_len``
+    on a known wide char) so a corrupt bundle fails here, in
+    ``doctor``, with a "reinstall the binary" hint — rather than
+    later, during a real ship, with an unhelpful traceback.
+    """
+    try:
+        from rich.cells import cell_len
+
+        # The actual wide-char cell-len computation is what triggers
+        # the lazy ``_unicode_data`` archive read. Any value >= 1
+        # confirms the table loaded; the exact cell count doesn't
+        # matter for this health check.
+        width = cell_len("✓")
+        if width < 1:
+            return {
+                "ok": False,
+                "version": "rich.cells loaded but cell_len < 1",
+                "detail": "Unexpected rich.cells result; reinstall the binary.",
+            }
+    except Exception as exc:  # noqa: BLE001 — we want every failure shape
+        fingerprint = type(exc).__name__
+        hint = (
+            "Reinstall with: "
+            "curl -fsSL https://raw.githubusercontent.com/"
+            "danielraffel/Shipyard/main/install.sh | sh"
+        )
+        return {
+            "ok": False,
+            "version": f"rich bundle read failed ({fingerprint})",
+            "detail": f"{exc}\n  Fix: {hint}",
+        }
+
+    return {"ok": True, "version": "rich.cells + _unicode_data load OK"}
 
 
 def _check_daemon_version_drift(ctx: Context) -> dict[str, Any] | None:
