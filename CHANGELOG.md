@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0400"></a>
+## [0.41.0]
+
 ## [0.40.0] - 2026-04-23
 
 - bundle: treat /-prefixed and UNC paths as absolute in upload (Codex P1 on #211) ([#213](https://github.com/danielraffel/Shipyard/pull/213))
