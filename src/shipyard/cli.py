@@ -218,14 +218,16 @@ def run(
 ) -> None:
     """Validate current HEAD on configured targets.
 
-    IMPORTANT: `shipyard run` reads the live working tree during
-    configure / build / test stages. Editing or deleting tracked
-    source files while a run is in flight causes non-deterministic
-    mid-stage failures — e.g. cmake's "Cannot find source file" if
-    a .cpp listed in CMakeLists.txt gets removed between
-    configure-list-read and configure-source-probe. Let the run
-    complete before refactoring, or queue the edits in a separate
-    worktree (#238).
+    `shipyard run` reads the live working tree during configure /
+    build / test stages, so editing tracked source files mid-run
+    can produce non-deterministic failures (e.g. cmake's "Cannot
+    find source file" if a .cpp listed in CMakeLists.txt gets
+    removed between configure-list-read and configure-source-probe).
+    The original advisory landed in #238; #249 turned it into an
+    active guard that aborts the run with `FailureClass.TREE_DRIFT`
+    + exit code 3 when drift is detected at a stage boundary. Pass
+    `--allow-tree-drift` for the legitimate case where a build step
+    writes generated files into the tree.
     """
     config = ctx.config
     mode = ValidationMode.SMOKE if smoke else ValidationMode.FULL
@@ -237,20 +239,28 @@ def run(
         render_error("Not in a git repository")
         sys.exit(1)
 
-    # #238: warn operators that the working tree must stay quiescent
-    # during the run. A multi-agent flow (human + agent, or two
-    # agents in the same worktree) can race mid-run and produce
-    # failures that look like real build regressions but aren't.
-    # Quiet in --json mode — agents parse envelopes, they don't
-    # need human-readable banners.
+    # #238 → #249: working-tree quiescence advisory + drift-detect
+    # status banner. The drift guard catches mid-run edits between
+    # stage boundaries (TREE_DRIFT failure class, exit 3); this
+    # banner just tells the operator that's the contract so they
+    # don't bake in old "feel free to edit, ignore failures" muscle
+    # memory. Quiet in --json mode — agents parse envelopes, they
+    # don't need human-readable banners.
     if not ctx.json_mode:
-        render_message(
-            "→ Don't edit source files until this run completes — "
-            "concurrent edits cause non-deterministic mid-stage "
-            "failures (#238). Use a separate worktree for parallel "
-            "work.",
-            style="dim",
-        )
+        if allow_tree_drift:
+            render_message(
+                "→ --allow-tree-drift active: working-tree drift "
+                "guard suppressed for this run. Mid-run edits will "
+                "NOT be caught.",
+                style="bold yellow",
+            )
+        else:
+            render_message(
+                "→ Drift guard active (#249): mid-run edits abort "
+                "the run with TREE_DRIFT (exit 3). Use a separate "
+                "worktree for parallel work.",
+                style="dim",
+            )
 
     # Resolve targets
     target_names = targets.split(",") if targets else list(config.targets.keys())
