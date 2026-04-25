@@ -1,0 +1,4 @@
+# Placeholder to keep the fixtures/ directory in git. When a test
+# needs a stub binary or a canned JSON fixture, drop it here. See
+# the Pulp sibling at tools/sandbox-e2e/fixtures/stub_pulp_cpp.sh
+# for the pattern.

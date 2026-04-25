@@ -1,0 +1,112 @@
+# Sandbox E2E — isolated end-to-end tests for the Shipyard CLI.
+# See tools/sandbox-e2e/README.md for what this covers and why.
+# Tracked in Shipyard#248. Sibling harness: pulp#732 / pulp#736.
+#
+# Strategy: install the package in a venv via `pip install -e .` (the
+# fastest path to "we have a runnable shipyard binary") and let the
+# sandbox harness's discovery logic find the entrypoint script
+# (~/.local/bin or the venv's bin/), or fall through to the
+# python-wrapper fallback if the entrypoint isn't on PATH.
+#
+# Why no PyInstaller --onefile here:
+#   * The release workflow already exercises that build path on tags.
+#   * For PR gating we want the CLI behavior under test, not the
+#     packaging behavior. The harness's python-wrapper fallback runs
+#     the *same* `shipyard.cli:main` entrypoint the binary does, so
+#     unknown-subcommand semantics, JSON output, daemon socket paths,
+#     etc. are all identical.
+#
+# `continue-on-error: true` on the install step keeps the harness
+# scenarios that don't need a binary (surface enumeration,
+# contamination-audit smoke) running even when packaging is broken.
+
+name: sandbox-e2e
+
+on:
+  pull_request:
+    paths:
+      - "src/shipyard/**"
+      - "commands/**"
+      - ".claude-plugin/**"
+      - "tools/sandbox-e2e/**"
+      - "install.sh"
+      - "pyproject.toml"
+      - ".github/workflows/sandbox-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/shipyard/**"
+      - "commands/**"
+      - ".claude-plugin/**"
+      - "tools/sandbox-e2e/**"
+      - "install.sh"
+      - "pyproject.toml"
+      - ".github/workflows/sandbox-e2e.yml"
+  # Let release workflows call this as a pre-publish gate.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox-e2e:
+    name: sandbox-e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+
+      - name: Install Shipyard from source (best-effort)
+        id: install
+        # The harness can run with the python-wrapper fallback even if
+        # this fails, so don't gate the whole job on packaging
+        # success — but do report the failure.
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python -m pip install -e .
+          # Resolve the entrypoint and stash it for the harness so we
+          # don't depend on the discovery code finding the venv's bin/
+          # dir for us.
+          if entrypoint="$(python -c 'import shutil; p = shutil.which("shipyard"); print(p) if p else exit(1)')"; then
+            echo "bin=$entrypoint" >> "$GITHUB_OUTPUT"
+            echo "Resolved shipyard entrypoint: $entrypoint"
+          else
+            echo "::warning ::shipyard entrypoint not on PATH after pip install — harness will use python-wrapper fallback"
+          fi
+          # Smoke-test: the entrypoint should at least respond to --version
+          shipyard --version || echo "::warning ::shipyard --version failed; will rely on python-wrapper fallback"
+
+      - name: Run sandbox E2E suite
+        env:
+          SHIPYARD_BINARY_FOR_TEST: ${{ steps.install.outputs.bin }}
+        run: |
+          # Even if the entrypoint isn't resolvable, the harness's
+          # python-wrapper fallback exercises the exact same Click
+          # entrypoint via `python -m shipyard.cli`. pytest.skip
+          # handles per-test gating where required.
+          pytest tools/sandbox-e2e/ -v --tb=short
+
+      - name: Upload sandbox tempdir on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-e2e-${{ matrix.os }}-logs
+          path: |
+            /tmp/shipyard-sandbox-e2e.*/**
+          if-no-files-found: ignore
+          retention-days: 7
