@@ -3,6 +3,19 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0500"></a>
+## [0.50.0] - 2026-04-25
+
+- shipyard run: banner reflects #249 drift guard ([#262](https://github.com/danielraffel/Shipyard/pull/262))
+- feat(test): sandbox E2E harness for Shipyard CLI (#248) ([#260](https://github.com/danielraffel/Shipyard/pull/260))
+- release.yml: retire dead CI signing infrastructure (#226 cleanup) ([#261](https://github.com/danielraffel/Shipyard/pull/261))
+- release: CI-signing experiment scaffolding (#226) ([#259](https://github.com/danielraffel/Shipyard/pull/259))
+- install.sh: Intel guard runs after version resolution (#257 Codex P1) ([#258](https://github.com/danielraffel/Shipyard/pull/258))
+- release: drop Intel Mac (x86_64) support — arm64 only (#256) ([#257](https://github.com/danielraffel/Shipyard/pull/257))
+- release: drop unset-var reference in partial-arch exit path (#254 Codex P1) ([#255](https://github.com/danielraffel/Shipyard/pull/255))
+- release: wait for all macOS arches before publishing (#253 Codex P1) ([#254](https://github.com/danielraffel/Shipyard/pull/254))
+- release: draft-until-complete gate (#252) ([#253](https://github.com/danielraffel/Shipyard/pull/253))
+
 <a id="v0490"></a>
 ## [0.49.0] - 2026-04-24
 
@@ -468,6 +481,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.50.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.50.0
 [0.49.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.49.0
 [0.48.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.48.0
 [0.47.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.47.0
