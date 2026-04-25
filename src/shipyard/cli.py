@@ -239,34 +239,62 @@ def run(
         render_error("Not in a git repository")
         sys.exit(1)
 
-    # #238 → #249: working-tree quiescence advisory + drift-detect
-    # status banner. The drift guard catches mid-run edits between
-    # stage boundaries (TREE_DRIFT failure class, exit 3); this
-    # banner just tells the operator that's the contract so they
-    # don't bake in old "feel free to edit, ignore failures" muscle
-    # memory. Quiet in --json mode — agents parse envelopes, they
-    # don't need human-readable banners.
-    if not ctx.json_mode:
-        if allow_tree_drift:
-            render_message(
-                "→ --allow-tree-drift active: working-tree drift "
-                "guard suppressed for this run. Mid-run edits will "
-                "NOT be caught.",
-                style="bold yellow",
-            )
-        else:
-            render_message(
-                "→ Drift guard active (#249): mid-run edits abort "
-                "the run with TREE_DRIFT (exit 3). Use a separate "
-                "worktree for parallel work.",
-                style="dim",
-            )
-
     # Resolve targets
     target_names = targets.split(",") if targets else list(config.targets.keys())
     if not target_names:
         render_error("No targets configured. Run 'shipyard init' first.")
         sys.exit(1)
+
+    # #238 → #249: working-tree quiescence advisory + drift-detect
+    # status banner.
+    #
+    # Codex P2 on #262: the drift guard only fires inside
+    # LocalExecutor (#249's implementation) and only when a tree
+    # signature can be computed (git repo). SSH / cloud / non-git
+    # targets get NO drift detection. So the banner has to be scoped
+    # to the actual targets in this run — claiming "Drift guard
+    # active" when every target is ssh would be a lie.
+    #
+    # Quiet in --json mode — agents parse envelopes, they don't need
+    # human-readable banners.
+    local_targets = [
+        n for n in target_names
+        if str(
+            (config.targets.get(n) or {}).get("type")
+            or (config.targets.get(n) or {}).get("backend")
+            or "local"
+        ).strip().lower() == "local"
+    ]
+    if not ctx.json_mode:
+        if not local_targets:
+            # No local targets → drift guard doesn't apply anywhere;
+            # don't promise it. Surface the bare advisory only.
+            render_message(
+                "→ Avoid editing source files mid-run on remote "
+                "targets — drift detection only fires for local "
+                "targets (#249). Use a separate worktree for "
+                "parallel work.",
+                style="dim",
+            )
+        elif allow_tree_drift:
+            render_message(
+                "→ --allow-tree-drift active: working-tree drift "
+                "guard suppressed for this run. Mid-run edits will "
+                "NOT be caught on local targets.",
+                style="bold yellow",
+            )
+        else:
+            scope = (
+                "all targets are local"
+                if len(local_targets) == len(target_names)
+                else f"local targets ({', '.join(local_targets)})"
+            )
+            render_message(
+                f"→ Drift guard active (#249) for {scope}: mid-run "
+                "edits abort the run with TREE_DRIFT (exit 3). "
+                "Remote targets (ssh / cloud) are NOT covered.",
+                style="dim",
+            )
 
     dispatcher = _make_dispatcher(config)
     try:

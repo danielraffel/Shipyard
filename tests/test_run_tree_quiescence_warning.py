@@ -59,3 +59,38 @@ def test_run_docstring_mentions_concrete_failure_shape() -> None:
     doc = (run_cmd.__doc__ or "").lower()
     assert "concurrent" in doc or "quiescent" in doc or "edit" in doc
     assert "cmake" in doc or "configure" in doc or "source" in doc
+
+
+def test_drift_banner_only_promises_what_is_actually_enforced() -> None:
+    # Codex P2 on #262: the drift guard fires only inside
+    # LocalExecutor on git-capable trees. The banner must NOT
+    # unconditionally promise drift detection on a run whose targets
+    # are SSH / cloud only — that's misleading users about what's
+    # actually being enforced.
+    #
+    # Pin the source so a future refactor can't silently re-introduce
+    # the unscoped banner. Three branches of the conditional must
+    # exist: no-local-targets, --allow-tree-drift, default(local).
+    from pathlib import Path
+    cli_path = Path(__file__).resolve().parent.parent \
+        / "src" / "shipyard" / "cli.py"
+    content = cli_path.read_text()
+
+    # The banner code must reference the resolved target list to
+    # compute scope, not just blindly fire.
+    banner_idx = content.find("Drift guard active (#249)")
+    assert banner_idx != -1, "drift guard banner must exist"
+    # Window of ~2KB around the banner — should contain the
+    # local_targets computation.
+    window = content[max(0, banner_idx - 1500):banner_idx + 500]
+    assert "local_targets" in window, (
+        "drift banner must compute target-set scope before "
+        "rendering — Codex P2 on #262"
+    )
+    # The "no local targets" branch must exist so SSH-only / cloud-
+    # only runs see a NON-promising message.
+    assert "remote targets" in content.lower() or \
+           "drift detection only fires for local" in content.lower(), (
+        "must have a non-promising banner for runs whose targets "
+        "are all remote — drift guard doesn't fire there"
+    )
