@@ -246,12 +246,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install uv + PyInstaller
+      - name: Install Python deps + PyInstaller
+        # Match the install pattern from the regular Build binary
+        # step (line ~133) so pyinstaller is on PATH globally —
+        # `release-macos-local.sh` does `command -v pyinstaller` and
+        # bails when the binary isn't directly invokable. Earlier
+        # iteration tried `uv sync --frozen` + `$GITHUB_PATH` push,
+        # but the GITHUB_PATH addition didn't propagate to the
+        # release-script's bash subshell on Namespace macOS runners.
+        # System-install via pip3 is the path that works.
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          export PATH="$HOME/.local/bin:$PATH"
-          uv sync --frozen
-          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
+          pip3 install --break-system-packages -e ".[dev]" pyinstaller
+          command -v pyinstaller
 
       - name: Import Developer ID signing identity
         env:
