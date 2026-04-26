@@ -78,9 +78,13 @@ PROTECTED_PATHS: tuple[Path, ...] = (
 #: A test that names one of these gets a clear AssertionError instead
 #: of silently scribbling on the user's repo or remote infra.
 DESTRUCTIVE_COMMANDS: frozenset[str] = frozenset({
-    "ship",      # actually merges PRs!
-    "pr",        # opens a real GitHub PR
-    "upgrade",   # replaces the running binary
+    "ship",        # actually merges PRs!
+    "pr",          # opens a real GitHub PR
+    "upgrade",     # replaces the running binary
+    # Codex P1 on #260: `auto-merge` reaches `merge_pr(...)` in
+    # cli.py and merges the named PR if checks are green — exactly
+    # the kind of real-world mutation the bulkhead exists to prevent.
+    "auto-merge",
     # `cloud run` is destructive (dispatches a real GHA workflow); the
     # parent `cloud` group has read-only subcommands so we don't blanket
     # ban it — see SAFE_CLOUD_SUBCOMMANDS below for the allowlist.
