@@ -469,6 +469,18 @@ def test_sandbox_refuses_to_invoke_cloud_run(
         sandbox_with_shipyard.run(["cloud", "run", "build"])
 
 
+@pytest.mark.smoke
+def test_sandbox_refuses_to_invoke_auto_merge(
+    sandbox_with_shipyard: Sandbox,
+) -> None:
+    """Codex P1 on #260: ``auto-merge`` reaches ``merge_pr(...)`` in
+    cli.py and merges the named PR if checks are green. A test that
+    accidentally calls it would mutate real GitHub state, exactly
+    what the bulkhead exists to prevent. Pin the refusal."""
+    with pytest.raises(AssertionError, match="destructive"):
+        sandbox_with_shipyard.run(["auto-merge", "999"])
+
+
 # -----------------------------------------------------------------------------
 # JSON-flag ergonomics
 # -----------------------------------------------------------------------------

@@ -106,7 +106,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sandbox-e2e-${{ matrix.os }}-logs
+          # Codex P2 on #260: sandbox tempdirs are created via
+          # `tempfile.mkdtemp(...)`, which honors `TMPDIR` /
+          # platform default — on GitHub macOS runners that's
+          # `/private/var/folders/...`, NOT `/tmp/...`. Cover both
+          # locations so failure artifacts actually upload on
+          # macOS instead of silently `if-no-files-found: ignore`.
           path: |
             /tmp/shipyard-sandbox-e2e.*/**
+            /private/var/folders/**/shipyard-sandbox-e2e.*/**
+            /var/folders/**/shipyard-sandbox-e2e.*/**
           if-no-files-found: ignore
           retention-days: 7
