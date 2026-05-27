@@ -1711,14 +1711,19 @@ Current known state from the prior agent:
   Debug build in `/Users/danielraffel/Code/shipyard-macos-gui`. Signed
   build/test attempts were interrupted because Xcode repeatedly probed a locked
   attached iOS device; the GUI app was not launched and was not left open.
+- PR #314 readiness cleanup fixed the `Cargo.lock` package-version drift after
+  the version bump and resolved Clippy findings from the auth/queue refactor.
+  `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`,
+  and `cargo test --all-targets --locked -- --skip auto_merge_failure_preserves_state --skip ship_command_green_merge_failure_keeps_active_state_and_exits_success`
+  passed locally.
 - full cargo test had two unrelated auto-merge failures:
   app::tests::auto_merge_failure_preserves_state and
   app::ship_cmd::tests::ship_command_green_merge_failure_keeps_active_state_and_exits_success.
 
 Recommended next step:
-Continue final packaging and PR readiness checks, then file the PR using the
-Shipyard workflow. Do not start adaptive routing yet. When adaptive routing
-starts, include a test where a GitHub-hosted macOS overflow plan is pulled back
-to a newly available local macOS slot before GitHub dispatch. Update
-planning/phase-handoff-status.md after each completed slice.
+Monitor PR #314 checks after the validation-fix push. Do not start adaptive
+routing yet. When adaptive routing starts, include a test where a GitHub-hosted
+macOS overflow plan is pulled back to a newly available local macOS slot before
+GitHub dispatch. Update planning/phase-handoff-status.md after each completed
+slice.
 ```

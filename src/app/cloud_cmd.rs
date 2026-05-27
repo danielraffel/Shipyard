@@ -375,6 +375,7 @@ fn valid_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[allow(clippy::too_many_lines)]
 fn add_lane<W: Write>(
     args: &CloudAddLaneArgs,
     store: &ShipStateStore,

@@ -261,6 +261,7 @@ impl Registrar {
             .ok_or_else(|| RegistrarError::GhUnavailable("gh CLI not found on PATH".to_owned()))
     }
 
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn configured_gh_client_optional(&self) -> Result<Option<GhClient>, RegistrarError> {
         #[cfg(test)]
         {

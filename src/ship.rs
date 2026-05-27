@@ -45,6 +45,7 @@ const WARM_DEFAULT_RESUME_FROM: &str = "configure";
 const DEFAULT_WORKDIR: &str = "~/repo";
 const DEFAULT_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_DRAIN_MAX_WORKERS: usize = 2;
+#[allow(clippy::duration_suboptimal_units)]
 const QUEUE_ENVELOPE_SWEEP_GRACE: Duration = Duration::from_secs(60);
 
 /// Resolved inputs for one `ship` execution.
@@ -443,7 +444,7 @@ pub fn load_ship_outcome(
 /// owner when possible.
 pub fn drain_or_wait_ship<D: ShipTargetDispatcher + Sync>(
     request: &ShipExecutionRequest,
-    job: Job,
+    #[allow(clippy::needless_pass_by_value)] job: Job,
     stores: ShipStores<'_>,
     dispatcher: &D,
 ) -> Result<ShipExecutionOutcome, ShipExecutionError> {
@@ -456,6 +457,7 @@ pub fn drain_or_wait_ship<D: ShipTargetDispatcher + Sync>(
     )
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
     request: &ShipExecutionRequest,
     job: Job,
@@ -699,6 +701,7 @@ pub fn drain_or_wait_run<D: ShipTargetDispatcher + Sync>(
     )
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn drain_or_wait_run_with_options<D: ShipTargetDispatcher + Sync>(
     _request: &RunExecutionRequest,
     job: Job,
@@ -832,6 +835,7 @@ fn durable_cancelled_job(queue: &mut Queue, job: &Job) -> Result<Option<Job>, Sh
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
     queue: &mut Queue,
     drain_lock: &crate::queue::DrainLock,
@@ -933,12 +937,8 @@ fn sweep_absent_queue_envelopes(
         .iter()
         .map(|job| job.id.clone())
         .collect::<BTreeSet<_>>();
-    request_store
-        .sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)
-        .map_err(QueueRequestError::from)?;
-    outcome_store
-        .sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)
-        .map_err(QueueRequestError::from)?;
+    request_store.sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
+    outcome_store.sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
     Ok(())
 }
 
@@ -991,6 +991,7 @@ fn cap_admit_pass_workers(
     pass.plan.admitted.truncate(available);
 }
 
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run_started_worker<D: ShipTargetDispatcher>(
     job: Job,
     envelope: QueuedExecutionEnvelope,
@@ -1268,6 +1269,7 @@ fn unsaved_ship_state(request: &ShipExecutionRequest, target_names: &[String]) -
     state
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_targets_with_options<D: ShipTargetDispatcher>(
     request: &ShipExecutionRequest,
     state_dir: &Path,
@@ -1805,7 +1807,7 @@ mod tests {
     use crate::queue_request::{
         QueueOutcomeStore, QueueRequestStore, QueuedExecutionOutcome, QueuedExecutionRequest,
     };
-    use crate::queue_scheduler::{AdmitPassPlan, RequestBackedAdmitPass};
+    use crate::queue_scheduler::{AdmitPassPlan, RequestBackedAdmitPass, SamePrShipAdmission};
     use crate::ship_state::{ShipState, ShipStateStore};
     use crate::warm_pool::{PoolEntry, WarmPool};
 
@@ -2594,7 +2596,7 @@ mod tests {
                 ..AdmitPassPlan::default()
             },
             running_request_errors: Vec::new(),
-            same_pr_ship_admission: Default::default(),
+            same_pr_ship_admission: SamePrShipAdmission::default(),
         };
 
         cap_admit_pass_workers(&[running], &mut pass, 2);

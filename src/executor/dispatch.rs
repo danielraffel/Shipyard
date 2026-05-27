@@ -542,6 +542,7 @@ impl ExecutorDispatcher {
         exhausted_result(request.target, &primary_label, last_result)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_host_pool(
         &self,
         request: &mut DispatchValidationRequest<'_, '_>,
@@ -632,12 +633,12 @@ impl ExecutorDispatcher {
             });
 
             if result.status == crate::job::TargetStatus::Fail {
-                result.backend = member.label.clone();
+                result.backend.clone_from(&member.label);
                 return result;
             }
             if result.status == crate::job::TargetStatus::Pass {
                 if attempt == 0 {
-                    result.backend = member.label.clone();
+                    result.backend.clone_from(&member.label);
                     return result;
                 }
                 return failover_pass_result(
@@ -647,7 +648,7 @@ impl ExecutorDispatcher {
                     last_result.as_ref(),
                 );
             }
-            result.backend = member.label.clone();
+            result.backend.clone_from(&member.label);
             last_result = Some(result);
         }
 

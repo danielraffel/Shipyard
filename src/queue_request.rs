@@ -208,6 +208,7 @@ impl QueueOutcomeStore {
 }
 
 /// Durable queued execution request envelope.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueuedExecutionEnvelope {
     /// Schema version.
@@ -1013,6 +1014,7 @@ impl From<&ContractConfig> for QueuedContract {
 /// Durable queued execution outcome envelope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
+#[allow(clippy::large_enum_variant)]
 pub enum QueuedExecutionOutcome {
     /// `shipyard run` outcome.
     Run {
@@ -1373,7 +1375,10 @@ where
     let version = value
         .get("schema_version")
         .and_then(Value::as_u64)
-        .unwrap_or_default() as u32;
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| QueueRequestError::UnsupportedSchema { version: u32::MAX })?
+        .unwrap_or_default();
     if version != QUEUED_EXECUTION_SCHEMA_VERSION {
         return Err(QueueRequestError::UnsupportedSchema { version });
     }
@@ -1809,10 +1814,6 @@ mod tests {
 
     #[test]
     fn request_snapshot_contains_no_token_fields() {
-        let envelope =
-            QueuedExecutionEnvelope::from_ship_request("job-ship", "/work/repo", &ship_request());
-        let value = serde_json::to_value(&envelope).expect("serialize");
-
         fn assert_no_token_keys(value: &Value) {
             match value {
                 Value::Object(object) => {
@@ -1832,6 +1833,10 @@ mod tests {
                 _ => {}
             }
         }
+
+        let envelope =
+            QueuedExecutionEnvelope::from_ship_request("job-ship", "/work/repo", &ship_request());
+        let value = serde_json::to_value(&envelope).expect("serialize");
 
         assert_no_token_keys(&value);
     }

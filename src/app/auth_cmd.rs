@@ -102,6 +102,7 @@ fn auth_export<W: Write>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn auth_import<W: Write>(
     mode: RuntimeMode,
     cwd: &Path,
@@ -334,6 +335,7 @@ fn write_entry<W: Write>(stdout: &mut W, name: &str, entry: &DoctorEntry) -> std
     Ok(())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn io_err(error: std::io::Error) -> CliFailure {
     CliFailure::new(1, error.to_string())
 }

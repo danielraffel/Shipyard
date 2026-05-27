@@ -621,12 +621,11 @@ fn expand_token_command(args: &[String], cwd: &Path) -> Result<Vec<String>, GhPr
         .map(|arg| {
             let mut expanded = arg.replace("{cwd}", &cwd.display().to_string());
             if needs_repo_placeholder(&expanded) {
-                let identity = match &repo {
-                    Some(identity) => identity,
-                    None => {
-                        repo = Some(resolve_repo_identity(cwd)?);
-                        repo.as_ref().expect("repo identity should be set")
-                    }
+                let identity = if let Some(identity) = &repo {
+                    identity
+                } else {
+                    repo = Some(resolve_repo_identity(cwd)?);
+                    repo.as_ref().expect("repo identity should be set")
                 };
                 expanded = expanded
                     .replace("{repo_slug}", &identity.slug)

@@ -257,6 +257,7 @@ pub fn plan_admit_pass(
 /// orphaned pending jobs. Running jobs with missing or unreadable request
 /// envelopes are surfaced separately so the future drain loop can avoid
 /// admitting new work when occupied resources are unknown.
+#[must_use]
 pub fn plan_admit_pass_from_jobs(
     jobs: &[Job],
     request_store: &QueueRequestStore,
@@ -777,7 +778,7 @@ mod tests {
                     warm_disabled: false,
                     fail_fast: false,
                     resume_from: None,
-                    advisory_targets: Default::default(),
+                    advisory_targets: std::collections::BTreeSet::default(),
                     targets: Vec::new(),
                 }),
             })

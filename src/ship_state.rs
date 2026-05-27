@@ -228,8 +228,8 @@ impl ShipStateStore {
     /// Load an active state for a PR.
     #[must_use]
     pub fn get(&self, pr: u64) -> Option<ShipState> {
-        let _lock = self.lock_pr(pr).ok()?;
-        self.get_locked(pr, &_lock)
+        let lock = self.lock_pr(pr).ok()?;
+        self.get_locked(pr, &lock)
     }
 
     /// Acquire the per-PR ship-state lock.
@@ -300,8 +300,8 @@ impl ShipStateStore {
 
     /// Move an active state into the archive directory.
     pub fn archive(&self, pr: u64) -> Result<Option<PathBuf>, std::io::Error> {
-        let _lock = self.lock_pr(pr)?;
-        self.archive_locked(pr, &_lock)
+        let lock = self.lock_pr(pr)?;
+        self.archive_locked(pr, &lock)
     }
 
     /// Move an active state into the archive directory while holding the lock.

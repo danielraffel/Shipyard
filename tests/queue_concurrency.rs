@@ -237,6 +237,7 @@ fn drain_owner_runs_non_conflicting_jobs_concurrently() {
 }
 
 #[test]
+#[allow(clippy::similar_names)]
 fn conflicting_jobs_serialize_across_submitters() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state_dir = temp.path().join("state");

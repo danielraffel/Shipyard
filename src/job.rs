@@ -503,6 +503,7 @@ impl std::fmt::Display for JobTransitionError {
 
 impl std::error::Error for JobTransitionError {}
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &u32) -> bool {
     *value == 0
 }
