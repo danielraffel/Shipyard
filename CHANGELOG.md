@@ -9,6 +9,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 - feat(watch): Phase 2 failure diagnostics — render the Phase 1 failing-job URL + step + parsed test footer on every `shipyard watch --pr N --follow` transition where a target enters a terminal failure state.
 
 <a id="v0580"></a>
+## [0.59.0]
+
 ## [0.58.0] - 2026-05-18
 
 - feat: Phase 1 failure diagnostics (closes #303) ([#304](https://github.com/danielraffel/Shipyard/pull/304))
