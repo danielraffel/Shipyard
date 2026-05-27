@@ -65,7 +65,7 @@ pub(super) fn rescue_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let actions = GitHubActions::new(cwd);
+    let actions = GitHubActions::from_loaded_config(cwd, config);
     rescue_with_actions(args, config, cwd, &actions, json, stdout, Utc::now())
 }
 

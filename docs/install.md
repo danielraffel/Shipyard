@@ -75,6 +75,172 @@ organizations/<org> → Settings → GitHub Apps → your app →
 **Permissions & events** → **Actions: Read and write**. Accept the
 install prompt on each repo after saving.
 
+## Optional Shipyard GitHub auth override
+
+By default, Shipyard uses the same ambient `gh` login as before. You do
+not need this section unless you want Shipyard's built-in GitHub calls
+to use a different quota bucket or a more portable credential setup.
+If `GH_TOKEN` is exported in the parent environment, `gh` itself gives
+that token precedence over keychain auth.
+
+Add `[github.auth]` to global config, `.shipyard/config.toml`, or
+`.shipyard.local/config.toml`. Prefer local config for personal helper
+paths and vault names. Shipyard never stores raw tokens, GitHub App
+private keys, Keychain items, or 1Password sessions.
+
+Environment token:
+
+```toml
+[github.auth]
+source = "env"
+token_env = "SHIPYARD_GITHUB_TOKEN"
+```
+
+Set `SHIPYARD_GITHUB_TOKEN` on each Mac through your shell, direnv,
+launch agent, or secret manager. Shipyard injects it only into child
+`gh` commands as `GH_TOKEN`.
+
+macOS Keychain helper:
+
+```toml
+[github.auth]
+source = "command"
+token_command = ["security", "find-generic-password", "-w", "-s", "shipyard-github-token"]
+cache_ttl_seconds = 300
+```
+
+1Password helper:
+
+```toml
+[github.auth]
+source = "command"
+token_command = ["op", "read", "op://Private/shipyard/github-token"]
+cache_ttl_seconds = 300
+```
+
+GitHub App installation helper:
+
+```toml
+[github.auth]
+source = "command"
+token_command = ["/Users/you/Code/shipyard/scripts/shipyard-github-app-token", "--repo", "{repo_slug}"]
+refresh_skew_seconds = 60
+```
+
+For the full quota-extension walkthrough, including GitHub App registration
+fields, repository-count scaling, and validation commands, see
+[`docs/github-app-quota.md`](github-app-quota.md).
+
+For GitHub Apps, registration and installation are still manual. Register the
+app under the personal account or organization that will own it, install it on
+the account whose repositories Shipyard should inspect, and create a private
+key. The repositories themselves do not need to be GitHub Apps; the installation
+just needs access to them.
+
+Minimal GitHub App registration for a local Shipyard quota/auth helper:
+
+| Field | Value |
+|---|---|
+| GitHub App name | A private name such as `shipyard-local` |
+| Homepage URL | The Shipyard repo URL or the owning account URL |
+| Callback URL | blank |
+| Request user authorization / OAuth / Device Flow | disabled |
+| Setup URL / Redirect on update | blank / disabled |
+| Webhook Active | disabled |
+| Repository permissions | `Contents: Read-only`; add `Actions`, `Checks`, `Commit statuses`, and `Pull requests` as read-only for fuller Shipyard inspection |
+| Subscribe to events | none for quota testing |
+| Installable by | Only on this account |
+
+After creating the app, install it on the account and choose `All repositories`
+when validating the scaled installation bucket. Save the App ID, installation
+ID, and private-key path locally; never put the private key in tracked config.
+
+`scripts/shipyard-github-app-token` is a zero-Python-dependency helper for this
+flow. It uses `openssl` to sign the app JWT, asks GitHub for an installation
+access token, and prints the JSON shape Shipyard expects. Configure it with
+flags or environment variables:
+
+Use an absolute helper path in personal/local config when you plan to export
+and import auth settings into other repositories. A repo-relative helper such as
+`scripts/shipyard-github-app-token` only works from the Shipyard checkout.
+
+```bash
+export SHIPYARD_GITHUB_APP_ID=123456
+export SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$HOME/.config/shipyard/github-app.pem"
+
+# Optional. If absent, the helper uses --repo owner/name to look up the
+# installation id for that repository.
+export SHIPYARD_GITHUB_APP_INSTALLATION_ID=987654
+```
+
+Shipyard only runs the helper, reads stdout, caches the returned token in
+memory until expiry, and injects it into child `gh` commands.
+
+Preferred helper stdout for expiring tokens:
+
+```json
+{
+  "token": "ghs_...",
+  "expires_at": "2026-05-26T20:12:00Z",
+  "kind": "github-app-installation"
+}
+```
+
+Plain token stdout is also accepted. Plain tokens are cached only when
+`cache_ttl_seconds` is set.
+
+Helpers must write tokens only to stdout. Shipyard redacts common GitHub
+token prefixes in diagnostics, but helper stderr is still surfaced for
+debugging and should not contain secrets. The optional `kind` field
+should be a stable label such as `github-app-installation`, not
+free-form sensitive text.
+
+Supported placeholders in `token_command`:
+
+| Placeholder | Expands to |
+|---|---|
+| `{repo_slug}` | `owner/repo` from `origin` |
+| `{repo_owner}` | repo owner |
+| `{repo_name}` | repo name |
+| `{cwd}` | current working directory |
+
+Run `shipyard doctor --rate-limit` to confirm which auth source is in
+use and which REST/GraphQL buckets it sees. This actively resolves the
+configured token source, so command helpers may run and App helpers may
+mint an installation token. For env, command, and App tokens, classic
+scopes may not be locally inspectable with `gh auth status`; verify
+Actions permissions in GitHub when using cloud retarget or handoff.
+
+Focused auth commands:
+
+```bash
+shipyard auth doctor
+shipyard auth export --output shipyard-auth.toml
+shipyard auth import shipyard-auth.toml --scope local
+```
+
+`auth export` writes a config-only bundle: `[github.auth]`, required env
+var names, helper command names, and notes. It does not include tokens,
+private keys, Keychain items, 1Password sessions, queue state, daemon
+sockets, or token caches. `auth import` writes only the `[github.auth]`
+section into the selected config layer: `local` (default), `project`, or
+`global`.
+
+### Moving credentials to another Mac
+
+The signed Shipyard binary and `.dmg` are credential-free and portable.
+Move non-secret config, then reprovision the credential outside
+Shipyard on the destination Mac:
+
+1. Copy global, tracked, or local Shipyard config as appropriate.
+2. Recreate the env var, Keychain item, 1Password sign-in, or App helper.
+3. If using a GitHub App, provision a private key or secret-manager
+   reference for that Mac.
+4. Run `shipyard doctor --rate-limit`.
+
+Do not copy Shipyard queue state, daemon sockets, local runner state,
+`gh auth` keychain state, private keys, or token caches between Macs.
+
 ## Pin a specific version
 
 Pass `SHIPYARD_VERSION` to install an exact release instead of the

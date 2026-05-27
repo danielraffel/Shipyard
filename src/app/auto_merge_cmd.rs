@@ -9,6 +9,8 @@ use super::{
     CliFailure,
     cli::{MergeMethod, MergeResult},
 };
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::ship_state::{ShipState, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
@@ -68,7 +70,10 @@ pub(super) fn execute_auto_merge(
     cwd: &Path,
     request: &AutoMergeRequest,
 ) -> Result<AutoMergeOutcome, AutoMergeOperationError> {
-    let Some(state) = store.get(request.pr) else {
+    let lock = store
+        .lock_pr(request.pr)
+        .map_err(AutoMergeOperationError::Store)?;
+    let Some(state) = store.get_locked(request.pr, &lock) else {
         return Ok(
             if pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref()) {
                 AutoMergeOutcome::AlreadyMerged
@@ -100,7 +105,7 @@ pub(super) fn execute_auto_merge(
                     || pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref())
                 {
                     store
-                        .archive(request.pr)
+                        .archive_locked(request.pr, &lock)
                         .map_err(AutoMergeOperationError::Store)?;
                     return Ok(AutoMergeOutcome::Merged {
                         cleanup_warning: Some(error),
@@ -109,7 +114,7 @@ pub(super) fn execute_auto_merge(
                 return Ok(AutoMergeOutcome::MergeFailed { error });
             }
             store
-                .archive(request.pr)
+                .archive_locked(request.pr, &lock)
                 .map_err(AutoMergeOperationError::Store)?;
             Ok(AutoMergeOutcome::Merged {
                 cleanup_warning: None,
@@ -226,9 +231,14 @@ fn pr_is_merged(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> bool {
     let payload = if let Some(path) = snapshot_file {
         std::fs::read_to_string(path).ok()
     } else {
-        let output = crate::supervised::gh_supervised(None)
+        let Ok(client) = gh_client(cwd) else {
+            return false;
+        };
+        let Ok(mut command) = gh(&client, cwd) else {
+            return false;
+        };
+        let output = command
             .args(["pr", "view", &pr.to_string(), "--json", "state"])
-            .current_dir(cwd)
             .output()
             .ok();
         let Some(output) = output else {
@@ -250,6 +260,17 @@ fn pr_is_merged(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> bool {
         .is_some_and(|state| state.eq_ignore_ascii_case("merged"))
 }
 
+fn gh_client(cwd: &Path) -> Result<GhClient, String> {
+    GhClient::from_cwd(RuntimeMode::Shipyard, cwd)
+        .map_err(|error| format!("github auth config failed: {error}"))
+}
+
+fn gh(client: &GhClient, cwd: &Path) -> Result<Command, String> {
+    client
+        .prepare_command(cwd, None, GhSupervision::Supervised, GhAuthPolicy::Default)
+        .map_err(|error| format!("gh command preparation failed: {error}"))
+}
+
 fn merge_pr(
     pr: u64,
     cwd: &Path,
@@ -266,8 +287,21 @@ fn merge_pr(
     }
 
     let custom_command = merge_command.is_some();
-    let mut command =
-        Command::new(merge_command.map_or_else(|| PathBuf::from("gh"), Path::to_path_buf));
+    let client = if custom_command {
+        None
+    } else {
+        Some(gh_client(cwd)?)
+    };
+    let mut command = if let Some(merge_command) = merge_command {
+        Command::new(merge_command)
+    } else {
+        gh(
+            client
+                .as_ref()
+                .expect("built-in merge should have gh client"),
+            cwd,
+        )?
+    };
     if !custom_command {
         command.args(["pr", "merge", &pr.to_string()]);
     }
@@ -295,8 +329,11 @@ fn merge_pr(
     // rather than failing the ship. Matches src/pr.rs's pattern for
     // gh pr list / create / view.
     if !custom_command && crate::pr::is_graphql_rate_limited(&message) {
-        crate::pr::report_rate_limit_fallback("gh pr merge", cwd);
-        return merge_pr_rest(pr, cwd, merge_method, delete_branch);
+        let client = client
+            .as_ref()
+            .expect("built-in merge should have gh client");
+        crate::pr::report_rate_limit_fallback_with_client(client, "gh pr merge", cwd);
+        return merge_pr_rest(client, pr, cwd, merge_method, delete_branch);
     }
     Err(message)
 }
@@ -318,16 +355,17 @@ fn merge_pr(
 /// (i.e., the modification was purely on the base branch — typical
 /// when a sibling PR lands during our merge attempt).
 fn merge_pr_rest(
+    client: &GhClient,
     pr: u64,
     cwd: &Path,
     merge_method: MergeMethod,
     delete_branch: bool,
 ) -> Result<(), String> {
     let repo = repo_slug_for_rest(cwd)?;
-    let info = pr_head_info_rest(&repo, pr, cwd)?;
+    let info = pr_head_info_rest(client, &repo, pr, cwd)?;
     let endpoint = format!("repos/{repo}/pulls/{pr}/merge");
 
-    let first = attempt_merge_put(&endpoint, &info.sha, merge_method, cwd);
+    let first = attempt_merge_put(client, &endpoint, &info.sha, merge_method, cwd);
     match first {
         Ok(()) => {}
         Err(error) if is_base_modified_405(&error) => {
@@ -335,7 +373,7 @@ fn merge_pr_rest(
             // (i.e., a new commit did NOT land on the head branch).
             // Codex review on PR construction: head_sha invariance is
             // the load-bearing check; `mergeable` can be stale.
-            let refreshed = pr_head_info_rest(&repo, pr, cwd)?;
+            let refreshed = pr_head_info_rest(client, &repo, pr, cwd)?;
             if refreshed.sha != info.sha {
                 return Err(format!(
                     "REST fallback: PR head moved from {} to {} between merge attempts; refusing to retry",
@@ -343,7 +381,7 @@ fn merge_pr_rest(
                     short_sha(&refreshed.sha)
                 ));
             }
-            attempt_merge_put(&endpoint, &refreshed.sha, merge_method, cwd)
+            attempt_merge_put(client, &endpoint, &refreshed.sha, merge_method, cwd)
                 .map_err(|second| format!("{error} (retry: {second})"))?;
         }
         Err(error) => return Err(error),
@@ -352,15 +390,16 @@ fn merge_pr_rest(
     if delete_branch {
         // Best-effort delete; mirrors `gh pr merge --delete-branch` which
         // also tolerates a missing branch silently.
-        let _ = crate::supervised::gh_supervised(None)
-            .args([
-                "api",
-                "-X",
-                "DELETE",
-                &format!("repos/{repo}/git/refs/heads/{}", info.head_ref),
-            ])
-            .current_dir(cwd)
-            .status();
+        if let Ok(mut command) = gh(client, cwd) {
+            let _ = command
+                .args([
+                    "api",
+                    "-X",
+                    "DELETE",
+                    &format!("repos/{repo}/git/refs/heads/{}", info.head_ref),
+                ])
+                .status();
+        }
     }
     Ok(())
 }
@@ -369,12 +408,13 @@ fn merge_pr_rest(
 /// and a server-side `sha` race guard. Returns Ok on 2xx, Err with
 /// the gh stderr (or stdout when stderr empty) on any non-2xx.
 fn attempt_merge_put(
+    client: &GhClient,
     endpoint: &str,
     head_sha: &str,
     merge_method: MergeMethod,
     cwd: &Path,
 ) -> Result<(), String> {
-    let output = crate::supervised::gh_supervised(None)
+    let output = gh(client, cwd)?
         .args([
             "api",
             "-X",
@@ -385,7 +425,6 @@ fn attempt_merge_put(
             "-f",
             &format!("sha={head_sha}"),
         ])
-        .current_dir(cwd)
         .output()
         .map_err(|error| format!("REST fallback: failed to invoke gh api: {error}"))?;
     if output.status.success() {
@@ -420,10 +459,14 @@ struct PrHeadInfo {
     sha: String,
 }
 
-fn pr_head_info_rest(repo: &str, pr: u64, cwd: &Path) -> Result<PrHeadInfo, String> {
-    let output = crate::supervised::gh_supervised(None)
+fn pr_head_info_rest(
+    client: &GhClient,
+    repo: &str,
+    pr: u64,
+    cwd: &Path,
+) -> Result<PrHeadInfo, String> {
+    let output = gh(client, cwd)?
         .args(["api", &format!("repos/{repo}/pulls/{pr}")])
-        .current_dir(cwd)
         .output()
         .map_err(|error| format!("REST fallback: gh api PR fetch failed: {error}"))?;
     if !output.status.success() {
@@ -472,20 +515,7 @@ fn repo_slug_for_rest(cwd: &Path) -> Result<String, String> {
 }
 
 fn parse_github_remote_slug(remote: &str) -> Option<String> {
-    let mut slug = remote
-        .strip_prefix("git@github.com:")
-        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| remote.strip_prefix("https://github.com/"))
-        .or_else(|| remote.strip_prefix("http://github.com/"))?
-        .trim_end_matches('/')
-        .to_owned();
-    if let Some(stripped) = slug.strip_suffix(".git") {
-        slug = stripped.to_owned();
-    }
-    if slug.split('/').count() != 2 {
-        return None;
-    }
-    Some(slug)
+    crate::gh::parse_github_remote_slug(remote)
 }
 
 // (`pr_head_branch_rest` was superseded by `pr_head_info_rest` which

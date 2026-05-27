@@ -50,6 +50,12 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: Option<ConfigCommand>,
     },
+    /// Inspect and move Shipyard GitHub auth config without secrets.
+    Auth {
+        /// Auth subcommand.
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Configure Shipyard for the current project.
     Init {
         /// Show detected config output; preserves Python's current write behavior.
@@ -134,7 +140,7 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: Option<QuarantineCommand>,
     },
-    /// Check environment, dependencies, and targets.
+    /// Check environment, dependencies, targets, and effective GitHub auth.
     Doctor {
         /// Additionally dispatch auto-release.yml to verify the release-bot chain.
         #[arg(long = "release-chain")]
@@ -142,9 +148,9 @@ pub(super) enum Command {
         /// Probe configured non-local runner targets for reachability.
         #[arg(long)]
         runners: bool,
-        /// Probe GitHub's REST and GraphQL rate-limit buckets and report
-        /// both separately. Useful when one bucket is exhausted but the other
-        /// has budget.
+        /// Probe the effective GitHub auth source plus REST and GraphQL
+        /// rate-limit buckets. Shows whether Shipyard is using ambient `gh`,
+        /// an env token, or a command helper such as a GitHub App installation.
         #[arg(long = "rate-limit")]
         rate_limit: bool,
     },
@@ -534,6 +540,36 @@ pub(super) enum ConfigCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub(super) enum AuthCommand {
+    /// Show the effective GitHub auth source Shipyard will use.
+    Doctor,
+    /// Export sanitized GitHub auth config without tokens or private keys.
+    Export {
+        /// Write the bundle to a file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Import sanitized GitHub auth config without moving secrets.
+    Import {
+        /// Bundle previously produced by `shipyard auth export`.
+        input: PathBuf,
+        /// Destination config layer.
+        #[arg(long, value_enum, default_value_t = AuthConfigScope::Local)]
+        scope: AuthConfigScope,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(super) enum AuthConfigScope {
+    /// Machine-global config.
+    Global,
+    /// Tracked project config.
+    Project,
+    /// Per-project local overlay config.
+    Local,
+}
+
+#[derive(Debug, Subcommand)]
 pub(super) enum ChangelogCommand {
     /// Rebuild CHANGELOG.md from the configured tag graph.
     Regenerate {
@@ -726,6 +762,12 @@ pub(super) enum TargetsCommand {
         #[command(subcommand)]
         command: Option<TargetsWarmCommand>,
     },
+    /// Inspect local host-pool capacity and leases.
+    Pool {
+        /// Host-pool subcommand. Defaults to `status`.
+        #[command(subcommand)]
+        command: Option<TargetsPoolCommand>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -757,6 +799,21 @@ pub(super) enum TargetsWarmCommand {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum TargetsPoolCommand {
+    /// Show configured host pools and lease state.
+    Status,
+    /// Remove stale host-pool lease records from Shipyard state.
+    Cleanup {
+        /// Show what would be removed.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Actually remove stale lease records.
+        #[arg(long)]
+        fix: bool,
     },
 }
 

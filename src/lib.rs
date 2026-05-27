@@ -36,8 +36,12 @@ pub mod evidence;
 pub mod executor;
 /// Repo-local gate script resolution for `shipyard pr`.
 pub mod gate_scripts;
+/// Shared GitHub CLI command boundary and auth resolution.
+pub mod gh;
 /// Branch governance profiles and GitHub branch-protection helpers.
 pub mod governance;
+/// Local host-pool configuration and lease state.
+pub mod host_pool;
 /// Product naming and runtime-mode identity.
 pub mod identity;
 /// Project initialization and ecosystem detection.
@@ -64,6 +68,10 @@ pub mod preflight;
 pub mod prepared_state;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
+/// Durable queued execution request and outcome stores.
+pub mod queue_request;
+/// Cooperative queue scheduler planning primitives.
+pub mod queue_scheduler;
 /// Best-effort reconciliation of durable ship-state against GitHub truth.
 pub mod reconcile;
 /// GitHub webhook registration through the user's existing `gh` auth.

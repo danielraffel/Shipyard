@@ -36,7 +36,7 @@ pub(super) fn cloud_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let actions = GitHubActions::new(cwd);
+    let actions = GitHubActions::from_loaded_config(cwd, config);
     match command {
         CloudCommand::AddLane(args) => add_lane(&args, store, config, cwd, &actions, json, stdout),
         CloudCommand::Defaults => cloud_defaults(config, cwd, json, stdout),
@@ -122,7 +122,7 @@ fn cloud_run<W: Write>(
         },
     )
     .map_err(|error| CliFailure::new(1, format!("Could not plan dispatch: {error}")))?;
-    check_required_sha(args.require_sha.as_deref(), &plan, cwd)?;
+    check_required_sha(args.require_sha.as_deref(), &plan, cwd, actions)?;
 
     let dispatch_id = records.new_dispatch_id();
     let mut record = CloudRunRecord::new(
@@ -269,6 +269,7 @@ fn check_required_sha(
     require_sha: Option<&str>,
     plan: &CloudDispatchPlan,
     cwd: &Path,
+    actions: &GitHubActions,
 ) -> Result<(), CliFailure> {
     let Some(require_sha) = require_sha else {
         return Ok(());
@@ -291,7 +292,7 @@ fn check_required_sha(
                 "--require-sha couldn't determine the dispatch repository.",
             )
         })?;
-    let remote_sha = remote_ref_sha(&dispatch_repo, &plan.ref_name, cwd).ok_or_else(|| {
+    let remote_sha = remote_ref_sha(&dispatch_repo, &plan.ref_name, actions).ok_or_else(|| {
         CliFailure::new(
             1,
             format!(
@@ -347,23 +348,14 @@ fn resolve_expected_sha(value: &str, cwd: &Path) -> Option<String> {
     valid_sha(&sha).then_some(sha)
 }
 
-fn remote_ref_sha(repo_slug: &str, ref_name: &str, cwd: &Path) -> Option<String> {
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &format!("repos/{repo_slug}/commits/{ref_name}"),
-            "--jq",
-            ".sha",
-        ])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_lowercase();
+fn remote_ref_sha(repo_slug: &str, ref_name: &str, actions: &GitHubActions) -> Option<String> {
+    let args = vec![
+        "api".to_owned(),
+        format!("repos/{repo_slug}/commits/{ref_name}"),
+        "--jq".to_owned(),
+        ".sha".to_owned(),
+    ];
+    let sha = actions.run_gh(&args).ok()?.trim().to_lowercase();
     valid_sha(&sha).then_some(sha)
 }
 
@@ -392,7 +384,7 @@ fn add_lane<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let Some(mut state) = store.get(args.pr) else {
+    let Some(state) = store.get(args.pr) else {
         return error(
             stdout,
             format!(
@@ -469,15 +461,25 @@ fn add_lane<W: Write>(
         &args.target,
         true,
     )?;
-    append_lane_run(
-        &mut state,
-        &args.target,
-        &plan.provider,
-        &run_id,
-        lane_is_required(config, &args.target),
-    );
     store
-        .save(&state)
+        .with_pr_state_locked(args.pr, |current| {
+            let state = current
+                .as_mut()
+                .ok_or_else(|| format!("No in-flight ship state for PR #{}", args.pr))?;
+            if ship_terminal_verdict(state).is_some() {
+                return Err(format!("PR #{}: ship is already past dispatch phase", args.pr).into());
+            }
+            if !state.has_target(&args.target) {
+                append_lane_run(
+                    state,
+                    &args.target,
+                    &plan.provider,
+                    &run_id,
+                    lane_is_required(config, &args.target),
+                );
+            }
+            Ok(())
+        })
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     data.insert("run_id".to_owned(), Value::from(run_id));
     data.insert(
@@ -550,7 +552,6 @@ fn retarget<W: Write>(
             store,
             config,
             actions,
-            state,
             context,
             data,
         },
@@ -721,7 +722,6 @@ struct RetargetApplyRequest<'a> {
     store: &'a ShipStateStore,
     config: &'a LoadedConfig,
     actions: &'a GitHubActions,
-    state: ShipState,
     context: RetargetContext,
     data: BTreeMap<String, Value>,
 }
@@ -862,19 +862,23 @@ fn apply_retarget<W: Write>(
         false,
     )?;
     request
-        .state
-        .dispatched_runs
-        .retain(|run| run.target != request.args.target);
-    append_lane_run(
-        &mut request.state,
-        &request.args.target,
-        &request.context.plan.provider,
-        &new_run_id,
-        lane_is_required(request.config, &request.args.target),
-    );
-    request
         .store
-        .save(&request.state)
+        .with_pr_state_locked(request.args.pr, |current| {
+            let state = current
+                .as_mut()
+                .ok_or_else(|| format!("No in-flight ship state for PR #{}", request.args.pr))?;
+            state
+                .dispatched_runs
+                .retain(|run| run.target != request.args.target);
+            append_lane_run(
+                state,
+                &request.args.target,
+                &request.context.plan.provider,
+                &new_run_id,
+                lane_is_required(request.config, &request.args.target),
+            );
+            Ok(())
+        })
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     request
         .data

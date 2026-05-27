@@ -283,6 +283,18 @@ Live mode requires the `shipyard` CLI to be installed on the Mac running the app
 
 No. A branch force-push or one-off commit on a tracked PR leaves the existing ship-state entry as-is (still scoped to the old SHA) until you explicitly re-ship or archive it. The app may show stale evidence for that PR until then. [Issue #128](https://github.com/danielraffel/Shipyard/issues/128) tracks improving this with passive observer mode.
 
+### Can Shipyard use a larger GitHub API quota?
+
+Yes. Shipyard can authenticate its GitHub calls with a GitHub App installation
+token instead of your normal `gh` user token. For non-Enterprise GitHub App
+installations, GitHub starts at 5,000 REST requests/hour and scales by
+repository count after 20 repositories, up to 12,500 requests/hour. In practice,
+an installation with access to 170+ repositories reaches the cap. GitHub Pro is
+not the important factor; using an installation access token is.
+
+See [`docs/github-app-quota.md`](docs/github-app-quota.md) for the setup fields,
+permissions, Shipyard config, and quota validation commands.
+
 ## Learn more
 
 - [Blog post: Shipyard is a cross-platform CI orchestration layer](https://danielraffel.me/2026/04/09/shipyard-is-a-cross-platform-ci-orchestration-layer-that-coordinates-validation-for-ai-agents-working-across-parallel-worktrees/)

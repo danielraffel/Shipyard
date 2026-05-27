@@ -4,8 +4,11 @@ use std::io::Write;
 use chrono::Utc;
 use serde_json::Value;
 
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
-use crate::reconcile::{ReconcileFetchError, fetch_status_check_rollup, reconcile_ship_state};
+use crate::reconcile::{
+    ReconcileFetchError, fetch_status_check_rollup_with_cwd, reconcile_ship_state,
+};
 use crate::ship_state::ShipState;
 use crate::ship_state::ShipStateStore;
 
@@ -150,13 +153,15 @@ pub(super) fn ship_state_discard<W: Write>(
 
 pub(super) fn ship_state_reconcile<W: Write>(
     store: &ShipStateStore,
+    mode: RuntimeMode,
+    cwd: &std::path::Path,
     pr: Option<u64>,
     reconcile_all: bool,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ship_state_reconcile_with(store, pr, reconcile_all, json, stdout, |state| {
-        fetch_status_check_rollup(&state.repo, state.pr)
+        fetch_status_check_rollup_with_cwd(mode, cwd, &state.repo, state.pr)
     })
 }
 
@@ -197,11 +202,19 @@ where
     for state in targets {
         match fetch(&state) {
             Ok(rollup) => {
-                let reconciled = reconcile_ship_state(&state, &rollup, now);
-                if !reconciled.changes.is_empty() {
-                    store.save(&reconciled.state)?;
-                }
-                results.push(reconcile_success(state.pr, reconciled.changes));
+                let mut changes = Vec::new();
+                store.with_pr_state_locked(state.pr, |current| {
+                    let Some(current_state) = current.as_ref() else {
+                        return Ok(());
+                    };
+                    let reconciled = reconcile_ship_state(current_state, &rollup, now);
+                    if !reconciled.changes.is_empty() {
+                        changes = reconciled.changes;
+                        *current = Some(reconciled.state);
+                    }
+                    Ok(())
+                })?;
+                results.push(reconcile_success(state.pr, changes));
             }
             Err(error) => {
                 results.push(reconcile_error(state.pr, error.to_string()));

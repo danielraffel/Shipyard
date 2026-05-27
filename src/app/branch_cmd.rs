@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::{CliFailure, cli::BranchCommand, wait_cmd::parse_github_repo_slug};
 use crate::branch::{BranchApplyResult, BranchApplyStatus};
 use crate::config::LoadedConfig;
-use crate::governance::resolve_branch_rules;
+use crate::governance::{GovernanceGh, resolve_branch_rules};
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 
@@ -71,6 +71,8 @@ fn branch_apply<W: Write>(
     })?;
     let rules = resolve_branch_rules(&config.data, branch_name)
         .map_err(|error| CliFailure::new(1, error))?;
+    let gh = GovernanceGh::from_loaded_config(cwd, config, gh_command)
+        .map_err(|error| CliFailure::new(1, error))?;
 
     let result = if create_name.is_some() {
         crate::branch::create_branch_and_apply_rules(
@@ -80,10 +82,10 @@ fn branch_apply<W: Write>(
             base_branch,
             &rules,
             git_command,
-            gh_command,
+            &gh,
         )
     } else {
-        crate::branch::apply_branch_rules(&repo, branch_name, &rules, gh_command)
+        crate::branch::apply_branch_rules(&repo, branch_name, &rules, &gh)
     };
 
     render_result(stdout, &result, json_mode)?;

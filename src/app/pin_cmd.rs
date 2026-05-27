@@ -7,30 +7,34 @@ use std::process::{Command, ExitCode, Stdio};
 use serde_json::Value;
 
 use super::{CliFailure, cli::PinCommand};
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::pin::{
     ConsumerPin, current_global_shipyard_version, detect_consumer_pin, is_shipyard_repo,
-    latest_shipyard_release, main_pinned_version_at_origin, normalize_target_version,
+    latest_shipyard_release_from_cwd, main_pinned_version_at_origin, normalize_target_version,
     origin_main_satisfies_target, parse_version_tuple, read_pinned_version, rewrite_pinned_version,
     would_downgrade_installed,
 };
 
 pub(super) fn pin_command<W: Write>(
     command: PinCommand,
+    mode: RuntimeMode,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     match command {
-        PinCommand::Show => pin_show(cwd, json, stdout),
+        PinCommand::Show => pin_show(mode, cwd, json, stdout),
         PinCommand::Bump {
             target,
             no_pr,
             skip_verify,
             allow_downgrade,
             allow_redundant,
-        } => pin_bump(
+        } => pin_bump_with_mode(
             cwd,
+            mode,
             PinBumpOptions {
                 target,
                 pr_mode: if no_pr { PrMode::NoPr } else { PrMode::OpenPr },
@@ -88,8 +92,15 @@ enum RedundantPolicy {
     Allow,
 }
 
-fn pin_show<W: Write>(cwd: &Path, json: bool, stdout: &mut W) -> Result<ExitCode, CliFailure> {
-    pin_show_with_latest(cwd, json, stdout, latest_shipyard_release)
+fn pin_show<W: Write>(
+    mode: RuntimeMode,
+    cwd: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    pin_show_with_latest(cwd, json, stdout, || {
+        latest_shipyard_release_from_cwd(mode, cwd)
+    })
 }
 
 fn pin_show_with_latest<W, F>(
@@ -138,8 +149,19 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(test)]
 fn pin_bump<W: Write>(
     cwd: &Path,
+    options: PinBumpOptions,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    pin_bump_with_mode(cwd, RuntimeMode::Shipyard, options, json, stdout)
+}
+
+fn pin_bump_with_mode<W: Write>(
+    cwd: &Path,
+    mode: RuntimeMode,
     options: PinBumpOptions,
     json: bool,
     stdout: &mut W,
@@ -147,7 +169,7 @@ fn pin_bump<W: Write>(
     let pin = resolve_consumer_pin(cwd, "`shipyard pin bump` requires a consumer repo")?;
     ensure_pin_files_clean(&pin.repo_root)?;
     let current = read_pinned_version(&pin.pin_file);
-    let target = resolve_target(options.target)?;
+    let target = resolve_target_with_cwd(options.target, mode, cwd)?;
     if current.as_deref() == Some(&target) {
         render_pin_noop(stdout, json, current.as_deref(), &target)?;
         return Ok(ExitCode::SUCCESS);
@@ -183,7 +205,7 @@ fn pin_bump<W: Write>(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let pr_url = commit_push_and_open_pr(&pin.repo_root, current.as_deref(), &target)?;
+    let pr_url = commit_push_and_open_pr(mode, &pin.repo_root, current.as_deref(), &target)?;
     render_pin_bump(
         stdout,
         json,
@@ -236,10 +258,19 @@ fn ensure_pin_files_clean(repo_root: &Path) -> Result<(), CliFailure> {
     Ok(())
 }
 
+#[cfg(test)]
 fn resolve_target(target: Option<String>) -> Result<String, CliFailure> {
+    resolve_target_with_cwd(target, RuntimeMode::Shipyard, Path::new("."))
+}
+
+fn resolve_target_with_cwd(
+    target: Option<String>,
+    mode: RuntimeMode,
+    cwd: &Path,
+) -> Result<String, CliFailure> {
     match target {
         Some(target) => Ok(normalize_target_version(&target)),
-        None => latest_shipyard_release()
+        None => latest_shipyard_release_from_cwd(mode, cwd)
             .map(|target| normalize_target_version(&target))
             .ok_or_else(|| {
                 CliFailure::new(
@@ -362,6 +393,7 @@ fn run_install_and_verify(repo_root: &Path, target: &str) -> Result<(), CliFailu
 }
 
 fn commit_push_and_open_pr(
+    mode: RuntimeMode,
     repo_root: &Path,
     current: Option<&str>,
     target: &str,
@@ -380,7 +412,15 @@ fn commit_push_and_open_pr(
         "Bumps the pinned Shipyard version from {} to **{target}**.\n\nVerified locally:\n- [x] `./tools/install-shipyard.sh` succeeded\n- [x] `shipyard --version` matches target\n\nRelease notes: https://github.com/danielraffel/Shipyard/releases/tag/{target}",
         current.unwrap_or("unknown")
     );
-    let output = Command::new("gh")
+    let output = GhClient::from_cwd(mode, repo_root)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+        .prepare_command(
+            repo_root,
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
         .args([
             "pr",
             "create",
@@ -392,7 +432,6 @@ fn commit_push_and_open_pr(
             "--body",
             &body,
         ])
-        .current_dir(repo_root)
         .output()
         .map_err(|error| CliFailure::new(1, format!("gh pr create failed: {error}")))?;
     if !output.status.success() {
@@ -513,6 +552,7 @@ mod tests {
         pin_command, pin_show_with_latest, render_pin_bump, render_pin_noop, resolve_consumer_pin,
         resolve_target, run_checked, run_install_and_verify,
     };
+    use crate::identity::RuntimeMode;
     use crate::pin::read_pinned_version;
 
     fn write_consumer_files(repo: &Path, version: &str) {
@@ -630,6 +670,7 @@ mod tests {
                 allow_downgrade: true,
                 allow_redundant: true,
             },
+            RuntimeMode::Shipyard,
             &subdir,
             true,
             &mut out,

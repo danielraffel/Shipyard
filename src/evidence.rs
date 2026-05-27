@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Proof that a specific SHA was validated on a specific target.
@@ -90,10 +92,24 @@ impl EvidenceStore {
 
     /// Store or replace a record for the same branch and target.
     pub fn record(&self, evidence: &EvidenceRecord) -> Result<(), Box<dyn std::error::Error>> {
-        let branch_key = sanitize_branch(&evidence.branch);
+        self.with_branch_records_locked(&evidence.branch, |records| {
+            records.insert(evidence.target_name.clone(), evidence.clone());
+            Ok(())
+        })
+    }
+
+    /// Mutate one branch's records while holding that branch's evidence lock.
+    pub fn with_branch_records_locked<T>(
+        &self,
+        branch: &str,
+        f: impl FnOnce(&mut BTreeMap<String, EvidenceRecord>) -> Result<T, Box<dyn std::error::Error>>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let branch_key = sanitize_branch(branch);
+        let _lock = StoreLock::acquire(self.branch_lock_file(&branch_key))?;
         let mut records = self.load_branch(&branch_key)?;
-        records.insert(evidence.target_name.clone(), evidence.clone());
-        self.save_branch(&branch_key, &records)
+        let output = f(&mut records)?;
+        self.save_branch(&branch_key, &records)?;
+        Ok(output)
     }
 
     /// Return all evidence for a branch keyed by target name.
@@ -184,6 +200,10 @@ impl EvidenceStore {
         self.path.join(format!("{branch_key}.json"))
     }
 
+    fn branch_lock_file(&self, branch_key: &str) -> PathBuf {
+        self.path.join(format!("{branch_key}.lock"))
+    }
+
     fn load_branch(
         &self,
         branch_key: &str,
@@ -209,12 +229,44 @@ impl EvidenceStore {
     }
 }
 
+#[derive(Debug)]
+struct StoreLock {
+    file: File,
+}
+
+impl StoreLock {
+    fn acquire(path: PathBuf) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.lock_exclusive()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 fn sanitize_branch(branch: &str) -> String {
     branch.replace(['/', '\\'], "--")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
     use chrono::Utc;
 
     use super::{EvidenceRecord, EvidenceStore};
@@ -379,6 +431,34 @@ mod tests {
             reopened.get_target("main", "mac").expect("record").sha,
             "abc"
         );
+    }
+
+    #[test]
+    fn branch_lock_preserves_two_handle_mutations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(EvidenceStore::new(temp.path().join("evidence")).expect("store"));
+        let writer = Arc::clone(&store);
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let handle = store
+            .with_branch_records_locked("main", |records| {
+                let handle = thread::spawn(move || {
+                    started_tx.send(()).expect("started");
+                    writer
+                        .record(&record("main", "linux", "def"))
+                        .expect("record linux");
+                });
+                started_rx.recv().expect("started received");
+                thread::sleep(Duration::from_millis(50));
+                records.insert("mac".to_owned(), record("main", "mac", "abc"));
+                Ok(handle)
+            })
+            .expect("locked mutation");
+        handle.join().expect("writer thread");
+
+        let records = store.get_branch("main");
+        assert_eq!(records["mac"].sha, "abc");
+        assert_eq!(records["linux"].sha, "def");
     }
 
     #[test]

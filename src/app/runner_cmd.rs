@@ -38,7 +38,7 @@ pub(super) fn runner_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let actions = GitHubActions::new(cwd);
+    let actions = GitHubActions::from_loaded_config(cwd, config);
     match command {
         RunnerCommand::Status {
             runner_id,
@@ -961,36 +961,13 @@ fn gh_api_runner(
     repo: &str,
     runner_id: u64,
 ) -> Result<String, CliFailure> {
-    // We do not have a typed `gh api` helper for a single runner on
-    // `GitHubActions`, but every other call shells out to `gh` from the same
-    // cwd, so do the same here.
-    let output = Command::new("gh")
-        .args(["api", &format!("repos/{repo}/actions/runners/{runner_id}")])
-        .current_dir(actions_cwd(actions))
-        .output()
-        .map_err(|error| {
-            CliFailure::new(
-                2,
-                format!("failed to run gh api runners/{runner_id}: {error}"),
-            )
-        })?;
-    if !output.status.success() {
-        return Err(CliFailure::new(
-            2,
-            format!(
-                "gh api runners/{runner_id} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn actions_cwd(_actions: &GitHubActions) -> PathBuf {
-    // GitHubActions::cwd is private; fall back to the process cwd. The
-    // command-line layer always invokes us with the right CWD already, so
-    // this matches the existing usage pattern in cloud_cmd.rs.
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let args = vec![
+        "api".to_owned(),
+        format!("repos/{repo}/actions/runners/{runner_id}"),
+    ];
+    actions
+        .run_gh(&args)
+        .map_err(|error| CliFailure::new(2, error.to_string()))
 }
 
 fn fetch_queued_runs(

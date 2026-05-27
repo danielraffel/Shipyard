@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 use crate::wait::TruthResult;
 
 /// Common result type for wait snapshot fetches and evaluator calls.
@@ -255,7 +257,9 @@ pub fn read_snapshot_file(path: &Path) -> WaitResult<Option<Value>> {
 
 /// Fetch a GitHub release snapshot.
 pub fn fetch_release_snapshot(repo: &str, tag: &str, cwd: &Path) -> WaitResult<Option<Value>> {
+    let client = gh_client(cwd)?;
     run_gh_json(
+        &client,
         &[
             "api".to_owned(),
             format!("repos/{repo}/releases/tags/{tag}"),
@@ -275,7 +279,9 @@ pub fn fetch_release_snapshot(repo: &str, tag: &str, cwd: &Path) -> WaitResult<O
 /// `gh api repos/:r/commits/:sha/check-runs` for the check rollup. Matches
 /// the same fallback pattern `src/pr.rs` and `src/app/auto_merge_cmd.rs` use.
 pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<Option<Value>> {
+    let client = gh_client(cwd)?;
     match run_gh_capturing(
+        &client,
         &[
             "pr".to_owned(),
             "view".to_owned(),
@@ -293,8 +299,8 @@ pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<O
             Ok(value.is_object().then_some(value))
         }
         GhOutcome::GraphqlRateLimited => {
-            crate::pr::report_rate_limit_fallback("gh pr snapshot", cwd);
-            fetch_pr_snapshot_rest(repo, pr_number, cwd)
+            crate::pr::report_rate_limit_fallback_with_client(&client, "gh pr snapshot", cwd);
+            fetch_pr_snapshot_rest_with_client(&client, repo, pr_number, cwd)
         }
         GhOutcome::OtherFailure => Ok(None),
     }
@@ -310,7 +316,18 @@ pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<O
 /// safe: a green REST evaluation cannot incorrectly report green when
 /// non-required checks fail.
 pub fn fetch_pr_snapshot_rest(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<Option<Value>> {
+    let client = gh_client(cwd)?;
+    fetch_pr_snapshot_rest_with_client(&client, repo, pr_number, cwd)
+}
+
+fn fetch_pr_snapshot_rest_with_client(
+    client: &GhClient,
+    repo: &str,
+    pr_number: u64,
+    cwd: &Path,
+) -> WaitResult<Option<Value>> {
     let pr_value = match run_gh_capturing(
+        client,
         &[
             "api".to_owned(),
             format!("repos/{repo}/pulls/{pr_number}"),
@@ -333,6 +350,7 @@ pub fn fetch_pr_snapshot_rest(repo: &str, pr_number: u64, cwd: &Path) -> WaitRes
         Value::Object(serde_json::Map::new())
     } else {
         match run_gh_capturing(
+            client,
             &[
                 "api".to_owned(),
                 format!("repos/{repo}/commits/{head_sha}/check-runs?per_page=100"),
@@ -404,7 +422,9 @@ pub fn synthesize_pr_snapshot_from_rest(pr_number: u64, pr: &Value, check_runs: 
 
 /// Fetch a GitHub Actions workflow-run snapshot.
 pub fn fetch_run_snapshot(repo: &str, run_id: &str, cwd: &Path) -> WaitResult<Option<Value>> {
+    let client = gh_client(cwd)?;
     run_gh_json(
+        &client,
         &[
             "run".to_owned(),
             "view".to_owned(),
@@ -491,10 +511,19 @@ pub fn release_event_filter(tag: &str, repo: &str) -> impl Fn(&Value) -> bool {
     }
 }
 
-fn run_gh_json(args: &[String], cwd: &Path, timeout_seconds: f64) -> WaitResult<Option<Value>> {
-    let output = crate::supervised::gh_supervised(None)
+fn gh_client(cwd: &Path) -> WaitResult<GhClient> {
+    Ok(GhClient::from_cwd(RuntimeMode::Shipyard, cwd)?)
+}
+
+fn run_gh_json(
+    client: &GhClient,
+    args: &[String],
+    cwd: &Path,
+    timeout_seconds: f64,
+) -> WaitResult<Option<Value>> {
+    let output = client
+        .prepare_command(cwd, None, GhSupervision::Supervised, GhAuthPolicy::Default)?
         .args(args)
-        .current_dir(cwd)
         .output()?;
 
     let _ = timeout_seconds;
@@ -515,10 +544,10 @@ enum GhOutcome {
     OtherFailure,
 }
 
-fn run_gh_capturing(args: &[String], cwd: &Path) -> WaitResult<GhOutcome> {
-    let output = crate::supervised::gh_supervised(None)
+fn run_gh_capturing(client: &GhClient, args: &[String], cwd: &Path) -> WaitResult<GhOutcome> {
+    let output = client
+        .prepare_command(cwd, None, GhSupervision::Supervised, GhAuthPolicy::Default)?
         .args(args)
-        .current_dir(cwd)
         .output()?;
     if output.status.success() {
         return Ok(GhOutcome::Success(output.stdout));

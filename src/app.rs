@@ -11,6 +11,7 @@ use crate::paths::RuntimePaths;
 use crate::ship_state::ShipStateStore;
 use clap::Parser;
 
+mod auth_cmd;
 mod auto_merge_cmd;
 mod branch_cmd;
 mod changelog_cmd;
@@ -40,6 +41,7 @@ mod update_cmd;
 mod wait_cmd;
 mod watch_cmd;
 
+use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
 use self::branch_cmd::branch_command;
 use self::changelog_cmd::changelog_command;
@@ -136,11 +138,21 @@ fn dispatch<W: Write, E: Write>(
             handle_paths_command(cli.json, &runtime_paths, stdout)?;
         }
         Command::Pin { command } => {
-            return pin_command(command, &cwd, cli.json, stdout);
+            return pin_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Update(args) => return update_command(&args, cli.json, stdout),
         Command::Config { command } => {
             return config_command(command, cli.mode.into(), &cwd, cli.json, stdout);
+        }
+        Command::Auth { command } => {
+            return auth_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.global_dir,
+                cli.json,
+                stdout,
+            );
         }
         command @ (Command::Init { .. }
         | Command::Changelog { .. }
@@ -265,13 +277,14 @@ fn handle_operational_variant<W: Write>(
             handle_watch_variant(&command, &runtime_paths.state_dir, cwd, json, stdout)
         }
         command @ Command::ShipState { .. } => {
-            handle_ship_state_variant(&command, &runtime_paths.state_dir, json, stdout)?;
+            handle_ship_state_variant(&command, mode, cwd, &runtime_paths.state_dir, json, stdout)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Runner { command } => handle_runner_command(command, mode, cwd, json, stdout),
         Command::Paths
         | Command::Pin { .. }
         | Command::Config { .. }
+        | Command::Auth { .. }
         | Command::Init { .. }
         | Command::Changelog { .. }
         | Command::Branch { .. }
@@ -359,6 +372,8 @@ fn handle_state_command<W: Write>(
             ship_state,
         } => cleanup_command(
             state_dir,
+            mode,
+            cwd,
             CleanupCommandOptions {
                 mode: CleanupMode::from_flags(dry_run, apply),
                 scope: CleanupScope::from_flag(ship_state),
@@ -680,6 +695,8 @@ fn handle_watch_variant<W: Write>(
 
 fn handle_ship_state_variant<W: Write>(
     command: &Command,
+    mode: RuntimeMode,
+    cwd: &Path,
     state_dir: &Path,
     json: bool,
     stdout: &mut W,
@@ -689,7 +706,7 @@ fn handle_ship_state_variant<W: Write>(
     };
     let store = ShipStateStore::new(state_dir.join("ship"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    handle_ship_state_command(command, &store, json, stdout)
+    handle_ship_state_command(command, &store, mode, cwd, json, stdout)
 }
 
 #[derive(Clone, Copy)]
@@ -802,6 +819,8 @@ fn handle_watch_command<W: Write>(
 fn handle_ship_state_command<W: Write>(
     command: ShipStateCommand,
     store: &ShipStateStore,
+    mode: RuntimeMode,
+    cwd: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
@@ -828,7 +847,7 @@ fn handle_ship_state_command<W: Write>(
                     "Usage: shipyard ship-state reconcile <pr> | --all",
                 ));
             }
-            ship_state_reconcile(store, pr, all, json, stdout)
+            ship_state_reconcile(store, mode, cwd, pr, all, json, stdout)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
     }
@@ -1315,6 +1334,10 @@ mod tests {
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "queue");
         assert!(value["active"].is_null());
+        assert_eq!(
+            value["active_runs"].as_array().expect("active_runs").len(),
+            0
+        );
         assert_eq!(value["pending"].as_array().expect("pending").len(), 0);
         assert_eq!(value["recent"].as_array().expect("recent").len(), 0);
     }
@@ -1341,7 +1364,113 @@ mod tests {
         assert_eq!(value["command"], "status");
         assert_eq!(value["queue"]["pending"], 0);
         assert_eq!(value["queue"]["running"], 0);
+        assert_eq!(
+            value["active_runs"].as_array().expect("active_runs").len(),
+            0
+        );
         assert!(value["targets"].as_object().expect("targets").is_empty());
+    }
+
+    #[test]
+    fn queue_json_reports_multiple_active_runs_additively() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let first = queue
+            .enqueue(Job::create(
+                "abc123456789",
+                "feature/first",
+                vec!["linux".to_owned()],
+                ValidationMode::Full,
+                Priority::Normal,
+            ))
+            .expect("enqueue first")
+            .start()
+            .expect("start first");
+        queue.update(&first).expect("update first");
+        let second = queue
+            .enqueue(Job::create(
+                "def987654321",
+                "feature/second",
+                vec!["mac".to_owned()],
+                ValidationMode::Full,
+                Priority::Normal,
+            ))
+            .expect("enqueue second")
+            .start()
+            .expect("start second");
+        queue.update(&second).expect("update second");
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "queue",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "queue");
+        assert_eq!(value["active"]["id"], first.id);
+        assert_eq!(
+            value["active_runs"].as_array().expect("active_runs").len(),
+            2
+        );
+        assert_eq!(value["active_runs"][0]["id"], first.id);
+        assert_eq!(value["active_runs"][1]["id"], second.id);
+    }
+
+    #[test]
+    fn status_json_reports_multiple_active_runs_additively() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        for (sha, branch, target) in [
+            ("abc123456789", "feature/first", "linux"),
+            ("def987654321", "feature/second", "mac"),
+        ] {
+            let running = queue
+                .enqueue(Job::create(
+                    sha,
+                    branch,
+                    vec![target.to_owned()],
+                    ValidationMode::Full,
+                    Priority::Normal,
+                ))
+                .expect("enqueue")
+                .start()
+                .expect("start");
+            queue.update(&running).expect("update");
+        }
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "status",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "status");
+        assert_eq!(value["queue"]["running"], 2);
+        assert_eq!(value["active_run"]["branch"], "feature/first");
+        assert_eq!(
+            value["active_runs"].as_array().expect("active_runs").len(),
+            2
+        );
     }
 
     #[test]

@@ -7,6 +7,9 @@ use std::process::Command;
 
 use serde_json::Value;
 
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
+
 /// GitHub pull request metadata needed by ship orchestration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrInfo {
@@ -70,7 +73,8 @@ pub fn find_pr_for_branch(
     gh_command: Option<&Path>,
     branch: &str,
 ) -> Result<Option<PrInfo>, PrError> {
-    let output = gh(gh_command)
+    let client = gh_client(cwd)?;
+    let output = gh(&client, cwd, gh_command)?
         .args([
             "pr",
             "list",
@@ -89,8 +93,8 @@ pub fn find_pr_for_branch(
     if !output.status.success() {
         let message = stderr_or_stdout(&output);
         if is_graphql_rate_limited(&message) {
-            report_rate_limit_fallback("gh pr list", cwd);
-            return find_pr_for_branch_rest(cwd, gh_command, branch);
+            report_rate_limit_fallback_with_client(&client, "gh pr list", cwd);
+            return find_pr_for_branch_rest(&client, cwd, gh_command, branch);
         }
         return Err(PrError::new(format!("gh pr list failed: {message}")));
     }
@@ -107,18 +111,18 @@ pub fn create_pr(
     title: &str,
     body: &str,
 ) -> Result<PrInfo, PrError> {
-    let output = gh(gh_command)
+    let client = gh_client(cwd)?;
+    let output = gh(&client, cwd, gh_command)?
         .args([
             "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
         ])
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh pr create failed to start: {error}")))?;
     if !output.status.success() {
         let message = stderr_or_stdout(&output);
         if is_graphql_rate_limited(&message) {
-            report_rate_limit_fallback("gh pr create", cwd);
-            return create_pr_rest(cwd, gh_command, branch, base, title, body);
+            report_rate_limit_fallback_with_client(&client, "gh pr create", cwd);
+            return create_pr_rest(&client, cwd, gh_command, branch, base, title, body);
         }
         return Err(PrError::new(format!("gh pr create failed: {message}")));
     }
@@ -126,7 +130,7 @@ pub fn create_pr(
     if selector.is_empty() {
         return Err(PrError::new("gh pr create did not print a PR URL"));
     }
-    get_pr_status(cwd, gh_command, &selector)
+    get_pr_status_with_client(&client, cwd, gh_command, &selector)
 }
 
 /// Return normalized PR metadata for a PR selector.
@@ -135,16 +139,25 @@ pub fn get_pr_status(
     gh_command: Option<&Path>,
     selector: &str,
 ) -> Result<PrInfo, PrError> {
-    let output = gh(gh_command)
+    let client = gh_client(cwd)?;
+    get_pr_status_with_client(&client, cwd, gh_command, selector)
+}
+
+fn get_pr_status_with_client(
+    client: &GhClient,
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    selector: &str,
+) -> Result<PrInfo, PrError> {
+    let output = gh(client, cwd, gh_command)?
         .args(["pr", "view", selector, "--json", PR_JSON_FIELDS])
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh pr view failed to start: {error}")))?;
     if !output.status.success() {
         let message = stderr_or_stdout(&output);
         if is_graphql_rate_limited(&message) {
-            report_rate_limit_fallback("gh pr view", cwd);
-            return get_pr_status_rest(cwd, gh_command, selector);
+            report_rate_limit_fallback_with_client(client, "gh pr view", cwd);
+            return get_pr_status_rest(client, cwd, gh_command, selector);
         }
         return Err(PrError::new(format!("gh pr view failed: {message}")));
     }
@@ -153,11 +166,20 @@ pub fn get_pr_status(
 
 const PR_JSON_FIELDS: &str = "number,url,title,state,headRefName,baseRefName";
 
-fn gh(gh_command: Option<&Path>) -> Command {
-    // Mark every supervised `gh` invocation with SHIPYARD_PR_RUNNING=1
-    // so downstream pre-push hooks can detect Shipyard-orchestrated
-    // pushes (issue #266).
-    crate::supervised::gh_supervised(gh_command)
+fn gh_client(cwd: &Path) -> Result<GhClient, PrError> {
+    GhClient::from_cwd(RuntimeMode::Shipyard, cwd)
+        .map_err(|error| PrError::new(format!("github auth config failed: {error}")))
+}
+
+fn gh(client: &GhClient, cwd: &Path, gh_command: Option<&Path>) -> Result<Command, PrError> {
+    client
+        .prepare_command(
+            cwd,
+            gh_command,
+            GhSupervision::Supervised,
+            GhAuthPolicy::Default,
+        )
+        .map_err(|error| PrError::new(format!("gh command preparation failed: {error}")))
 }
 
 fn stderr_or_stdout(output: &std::process::Output) -> String {
@@ -178,6 +200,7 @@ fn parse_pr_list(text: &str) -> Result<Option<PrInfo>, PrError> {
 }
 
 fn find_pr_for_branch_rest(
+    client: &GhClient,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
@@ -204,9 +227,8 @@ fn find_pr_for_branch_rest(
         "GET".to_owned(),
         endpoint,
     ];
-    let output = gh(gh_command)
+    let output = gh(client, cwd, gh_command)?
         .args(args)
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh REST PR lookup failed to start: {error}")))?;
     if !output.status.success() {
@@ -219,6 +241,7 @@ fn find_pr_for_branch_rest(
 }
 
 fn create_pr_rest(
+    client: &GhClient,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
@@ -242,9 +265,8 @@ fn create_pr_rest(
         "-f".to_owned(),
         format!("body={body}"),
     ];
-    let output = gh(gh_command)
+    let output = gh(client, cwd, gh_command)?
         .args(args)
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh REST PR create failed to start: {error}")))?;
     if !output.status.success() {
@@ -257,6 +279,7 @@ fn create_pr_rest(
 }
 
 fn get_pr_status_rest(
+    client: &GhClient,
     cwd: &Path,
     gh_command: Option<&Path>,
     selector: &str,
@@ -265,9 +288,8 @@ fn get_pr_status_rest(
     let number = selector_pr_number(selector)
         .ok_or_else(|| PrError::new(format!("could not parse PR selector {selector:?}")))?;
     let endpoint = format!("repos/{repo}/pulls/{number}");
-    let output = gh(gh_command)
+    let output = gh(client, cwd, gh_command)?
         .args(["api", &endpoint])
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh REST PR view failed to start: {error}")))?;
     if !output.status.success() {
@@ -321,21 +343,7 @@ fn url_encode(value: &str) -> String {
 }
 
 fn parse_github_remote_slug(remote: &str) -> Option<String> {
-    let mut slug = remote
-        .strip_prefix("git@github.com:")
-        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| remote.strip_prefix("https://github.com/"))
-        .or_else(|| remote.strip_prefix("http://github.com/"))?
-        .trim_end_matches(".git")
-        .trim_matches('/')
-        .to_owned();
-    if slug.split('/').count() != 2 {
-        return None;
-    }
-    if slug.starts_with('/') {
-        slug.remove(0);
-    }
-    (!slug.is_empty()).then_some(slug)
+    crate::gh::parse_github_remote_slug(remote)
 }
 
 fn selector_pr_number(selector: &str) -> Option<u64> {
@@ -353,8 +361,7 @@ fn selector_pr_number(selector: &str) -> Option<u64> {
 /// budget.
 #[must_use]
 pub(crate) fn is_graphql_rate_limited(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("graphql") && lower.contains("rate limit")
+    crate::gh::is_graphql_rate_limited(message)
 }
 
 /// Print a one-line user-facing notice that GraphQL is exhausted and
@@ -366,8 +373,12 @@ pub(crate) fn is_graphql_rate_limited(message: &str) -> bool {
 /// Issue #266: prior to v0.56.x the fallback happened silently so
 /// users couldn't tell GraphQL had bailed. Surfacing this on stderr
 /// keeps the operation succeeding while making the cost visible.
-pub(crate) fn report_rate_limit_fallback(operation: &str, cwd: &std::path::Path) {
-    let reset_suffix = fetch_graphql_reset_unix(cwd)
+pub(crate) fn report_rate_limit_fallback_with_client(
+    client: &GhClient,
+    operation: &str,
+    cwd: &Path,
+) {
+    let reset_suffix = fetch_graphql_reset_unix(client, cwd)
         .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
         .map(|dt| format!("; reset at {} UTC", dt.format("%H:%M:%S")))
         .unwrap_or_default();
@@ -385,10 +396,10 @@ pub(crate) fn report_rate_limit_fallback(operation: &str, cwd: &std::path::Path)
 /// REST core bucket), so this probe does NOT itself consume GraphQL
 /// budget and is safe to call from inside a GraphQL-rate-limited
 /// recovery path.
-fn fetch_graphql_reset_unix(cwd: &std::path::Path) -> Option<i64> {
-    let output = crate::supervised::gh_supervised(None)
+fn fetch_graphql_reset_unix(client: &GhClient, cwd: &Path) -> Option<i64> {
+    let output = gh(client, cwd, None)
+        .ok()?
         .args(["api", "rate_limit", "--jq", ".resources.graphql.reset"])
-        .current_dir(cwd)
         .output()
         .ok()?;
     if !output.status.success() {

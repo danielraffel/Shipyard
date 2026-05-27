@@ -4,6 +4,10 @@
 # Setup
 shipyard init                  # configure project
 shipyard doctor                # check environment + suggest fixes
+shipyard doctor --rate-limit   # show effective GitHub auth + REST/GraphQL buckets
+shipyard auth doctor           # show Shipyard's configured GitHub auth source
+shipyard auth export --output shipyard-auth.toml        # export non-secret auth config
+shipyard auth import shipyard-auth.toml --scope local   # import auth config locally
 shipyard targets               # show targets + reachability
 shipyard targets add <name>    # interactively add a new target
 shipyard targets remove <name> # remove a target
@@ -84,3 +88,9 @@ shipyard status --json
 
 The envelope always carries `schema_version: 1` and the command name, so
 agents can pin to a stable contract.
+
+`shipyard status` is intentionally limited to queue/target state and does not
+probe GitHub quota. Use `shipyard doctor --rate-limit` when you need to confirm
+whether Shipyard is using ambient `gh`, an env token, or a command helper such
+as a GitHub App installation token, and to see the current REST and GraphQL
+rate-limit buckets.

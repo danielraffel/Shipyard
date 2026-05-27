@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Mint a GitHub App installation token for Shipyard's token_command auth.
+
+The helper intentionally has no Python package dependencies. It uses the
+system `openssl` binary to sign the GitHub App JWT and Python stdlib for the
+REST calls.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_API_URL = "https://api.github.com"
+API_VERSION = "2022-11-28"
+
+
+class HelperError(Exception):
+    """User-facing helper failure."""
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        app_id = required_value(args.app_id, "SHIPYARD_GITHUB_APP_ID", "--app-id")
+        key_path = Path(
+            required_value(
+                args.private_key,
+                "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH",
+                "--private-key",
+            )
+        )
+        api_url = args.api_url.rstrip("/")
+        jwt = build_jwt(app_id, key_path)
+        installation_id = args.installation_id or os.environ.get(
+            "SHIPYARD_GITHUB_APP_INSTALLATION_ID"
+        )
+        if not installation_id:
+            if not args.repo:
+                raise HelperError(
+                    "provide --installation-id, set SHIPYARD_GITHUB_APP_INSTALLATION_ID, "
+                    "or pass --repo owner/name for installation lookup"
+                )
+            installation_id = lookup_repo_installation(api_url, jwt, args.repo)
+        token_payload = create_installation_token(api_url, jwt, installation_id)
+        token = token_payload.get("token")
+        expires_at = token_payload.get("expires_at")
+        if not isinstance(token, str) or not token.strip():
+            raise HelperError("GitHub response did not include an installation token")
+        output: dict[str, Any] = {
+            "token": token,
+            "kind": "github-app-installation",
+        }
+        if isinstance(expires_at, str) and expires_at:
+            output["expires_at"] = expires_at
+        print(json.dumps(output, separators=(",", ":")))
+        return 0
+    except HelperError as error:
+        print(f"shipyard-github-app-token: {error}", file=sys.stderr)
+        return 1
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Mint a GitHub App installation token for Shipyard."
+    )
+    parser.add_argument(
+        "--app-id",
+        help="GitHub App ID. Defaults to SHIPYARD_GITHUB_APP_ID.",
+    )
+    parser.add_argument(
+        "--installation-id",
+        help="GitHub App installation ID. Defaults to SHIPYARD_GITHUB_APP_INSTALLATION_ID.",
+    )
+    parser.add_argument(
+        "--private-key",
+        help=(
+            "Path to the GitHub App PEM private key. Defaults to "
+            "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH."
+        ),
+    )
+    parser.add_argument(
+        "--repo",
+        help=(
+            "owner/name repo slug used to look up the installation id when one "
+            "is not supplied."
+        ),
+    )
+    parser.add_argument(
+        "--api-url",
+        default=os.environ.get("GITHUB_API_URL", DEFAULT_API_URL),
+        help=f"GitHub API URL. Defaults to GITHUB_API_URL or {DEFAULT_API_URL}.",
+    )
+    return parser.parse_args()
+
+
+def required_value(value: str | None, env_name: str, flag_name: str) -> str:
+    resolved = value or os.environ.get(env_name)
+    if not resolved:
+        raise HelperError(f"provide {flag_name} or set {env_name}")
+    return resolved
+
+
+def build_jwt(app_id: str, private_key: Path) -> str:
+    if not private_key.exists():
+        raise HelperError(f"private key not found: {private_key}")
+    now = int(time.time())
+    header = {"alg": "RS256", "typ": "JWT"}
+    payload = {
+        "iat": now - 60,
+        "exp": now + 9 * 60,
+        "iss": app_id,
+    }
+    signing_input = ".".join(
+        [base64url_json(header), base64url_json(payload)]
+    ).encode()
+    try:
+        signed = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", str(private_key)],
+            input=signing_input,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise HelperError("openssl is required to sign the GitHub App JWT") from error
+    if signed.returncode != 0:
+        stderr = signed.stderr.decode(errors="replace").strip()
+        raise HelperError(f"openssl failed to sign JWT: {stderr}")
+    return f"{signing_input.decode()}.{base64url_bytes(signed.stdout)}"
+
+
+def base64url_json(value: dict[str, Any]) -> str:
+    return base64url_bytes(json.dumps(value, separators=(",", ":")).encode())
+
+
+def base64url_bytes(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+
+
+def lookup_repo_installation(api_url: str, jwt: str, repo: str) -> str:
+    if "/" not in repo:
+        raise HelperError("--repo must be an owner/name slug")
+    payload = api_get(api_url, f"/repos/{repo}/installation", jwt)
+    installation_id = payload.get("id")
+    if not isinstance(installation_id, int):
+        raise HelperError(f"GitHub did not return an installation id for {repo}")
+    return str(installation_id)
+
+
+def create_installation_token(
+    api_url: str, jwt: str, installation_id: str
+) -> dict[str, Any]:
+    return api_post(
+        api_url,
+        f"/app/installations/{installation_id}/access_tokens",
+        jwt,
+    )
+
+
+def api_get(api_url: str, path: str, jwt: str) -> dict[str, Any]:
+    request = urllib.request.Request(url=f"{api_url}{path}", method="GET")
+    return api_request(request, jwt)
+
+
+def api_post(api_url: str, path: str, jwt: str) -> dict[str, Any]:
+    request = urllib.request.Request(url=f"{api_url}{path}", method="POST", data=b"{}")
+    return api_request(request, jwt)
+
+
+def api_request(request: urllib.request.Request, jwt: str) -> dict[str, Any]:
+    request.add_header("Authorization", f"Bearer {jwt}")
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("X-GitHub-Api-Version", API_VERSION)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace").strip()
+        raise HelperError(f"GitHub API returned HTTP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise HelperError(f"GitHub API request failed: {error.reason}") from error
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise HelperError("GitHub API returned malformed JSON") from error
+    if not isinstance(payload, dict):
+        raise HelperError("GitHub API returned an unexpected JSON payload")
+    return payload
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

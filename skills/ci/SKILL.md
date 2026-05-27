@@ -75,6 +75,8 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Environment check | `shipyard doctor --json` |
 | Probe SSH runner reachability | `shipyard doctor --runners --json` |
 | Inspect GitHub REST + GraphQL rate-limit buckets (both separately) | `shipyard doctor --rate-limit --json` |
+| Inspect effective GitHub auth only | `shipyard auth doctor --json` |
+| Export/import GitHub auth config only | `shipyard auth export --output shipyard-auth.toml` / `shipyard auth import shipyard-auth.toml --scope local` |
 | Clean up artifacts | `shipyard cleanup --apply` |
 | Wait for a release to fully upload | `shipyard wait release v0.23.0 --timeout 900 --json` |
 | Wait for a PR's required checks to go green | `shipyard wait pr 151 --state green --timeout 1800 --json` |
@@ -84,6 +86,18 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | List quarantined targets | `shipyard quarantine list --json` |
 | Quarantine a flaky target | `shipyard quarantine add <target> --reason "..."` |
 | Remove from quarantine | `shipyard quarantine remove <target>` |
+
+## GitHub Auth Diagnostics
+
+Before blaming ambient `gh auth status`, check whether the repo config has
+`[github.auth]`. Shipyard can inject env or command-helper tokens into its
+built-in `gh` subprocesses as `GH_TOKEN`, including helpers that mint GitHub
+App installation tokens. `shipyard doctor --rate-limit --json` reports the
+effective source and rate-limit buckets. For GitHub App or fine-grained tokens,
+permissions may not be locally inspectable, so verify Actions: Read and write
+on the token/App when cloud retarget or handoff fails with auth/scope errors.
+That doctor command actively resolves configured auth, so command helpers may
+run and GitHub App helpers may mint installation tokens.
 
 ## Supervised-Push Signal (`SHIPYARD_PR_RUNNING=1`)
 
@@ -541,6 +555,37 @@ fallback = [
 There is no `shipyard config` or `shipyard targets` subcommand yet. Inspect
 target definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml`,
 and use `shipyard status --json` for live target state.
+
+### Local Mac capacity
+
+For simple two-Mac capacity, use explicit ordered fallback:
+
+```toml
+[targets.mac]
+backend = "ssh"
+host = "mac-studio"
+platform = "macos-arm64"
+repo_path = "/Users/shipyard/work/shipyard"
+warm_keepalive_seconds = 1800
+
+fallback = [
+  { type = "local", cwd = "/Users/danielraffel/Code/shipyard" },
+]
+```
+
+This makes Mac Studio the first backend tried for macOS work, then falls back
+locally only for infrastructure failures. Real test failures remain
+authoritative.
+
+For named members and lease visibility, use `backend = "host-pool"` with
+explicit `[host_pools]` members, then inspect with
+`shipyard targets pool status`. Stale lease records can be pruned with
+`shipyard targets pool cleanup --fix`. Host-pool targets can drain multiple
+non-conflicting queued jobs across available members under one local drain
+owner; jobs still serialize when they claim the same checkout, PR state,
+evidence lane, or exhausted pool capacity. Use `shipyard targets test mac` and
+then `shipyard run --targets mac` when bringing the Mac Studio online. See
+`docs/local-mac-pool.md`.
 
 ### Locality routing (`requires`)
 

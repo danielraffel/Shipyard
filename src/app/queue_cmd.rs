@@ -35,7 +35,8 @@ pub(super) fn status_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let mut queue = open_queue(state_dir)?;
-    let active = queue.get_active()?;
+    let active_runs = queue.get_running()?;
+    let active = active_runs.first();
     let pending = queue.pending_count()?;
     let recent = queue.get_recent(5)?;
     let config = LoadedConfig::load_from_cwd(mode, cwd)
@@ -48,18 +49,19 @@ pub(super) fn status_command<W: Write>(
             "queue".to_owned(),
             json!({
                 "pending": pending,
-                "running": usize::from(active.is_some()),
+                "running": active_runs.len(),
                 "completed_recent": recent.len(),
             }),
         );
         if let Some(active) = active.as_ref() {
             data.insert("active_run".to_owned(), active.to_json_value());
         }
+        data.insert("active_runs".to_owned(), jobs_value(&active_runs)?);
         data.insert("targets".to_owned(), serde_json::to_value(targets)?);
         write_json_envelope(stdout, "status", data)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     } else {
-        write_status_human(stdout, active.as_ref(), pending, &recent, &targets)?;
+        write_status_human(stdout, active_runs.len(), pending, &recent, &targets)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -193,18 +195,20 @@ pub(super) fn queue_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let mut queue = open_queue(state_dir)?;
-    let active = queue.get_active()?;
+    let active_runs = queue.get_running()?;
+    let active = active_runs.first().cloned();
     let pending = queue.get_pending()?;
     let recent = queue.get_recent(5)?;
     if json_mode {
         let mut data = BTreeMap::new();
         data.insert("active".to_owned(), queue_value(active)?);
+        data.insert("active_runs".to_owned(), jobs_value(&active_runs)?);
         data.insert("pending".to_owned(), jobs_value(&pending)?);
         data.insert("recent".to_owned(), jobs_value(&recent)?);
         write_json_envelope(stdout, "queue", data)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     } else {
-        write_queue_human(stdout, active.as_ref(), &pending, &recent)?;
+        write_queue_human(stdout, &active_runs, &pending, &recent)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -238,13 +242,13 @@ fn target_statuses(config: &LoadedConfig) -> Result<BTreeMap<String, TargetStatu
 
 fn write_status_human<W: Write>(
     stdout: &mut W,
-    active: Option<&Job>,
+    running: usize,
     pending: usize,
     recent: &[Job],
     targets: &BTreeMap<String, TargetStatusRow>,
 ) -> Result<(), CliFailure> {
     writeln!(stdout, "Status").map_err(|error| CliFailure::new(1, error.to_string()))?;
-    writeln!(stdout, "  running: {}", usize::from(active.is_some()))
+    writeln!(stdout, "  running: {running}")
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     writeln!(stdout, "  pending: {pending}")
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -266,21 +270,25 @@ fn write_status_human<W: Write>(
 
 fn write_queue_human<W: Write>(
     stdout: &mut W,
-    active: Option<&Job>,
+    active_runs: &[Job],
     pending: &[Job],
     recent: &[Job],
 ) -> Result<(), CliFailure> {
     writeln!(stdout, "Queue").map_err(|error| CliFailure::new(1, error.to_string()))?;
-    if let Some(active) = active {
-        writeln!(
-            stdout,
-            "  Running: {} {} @ {} [{}]",
-            active.id,
-            active.branch,
-            short_sha(&active.sha),
-            priority_name(active.priority)
-        )
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !active_runs.is_empty() {
+        writeln!(stdout, "  Running ({})", active_runs.len())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        for active in active_runs {
+            writeln!(
+                stdout,
+                "    {} {} @ {} [{}]",
+                active.id,
+                active.branch,
+                short_sha(&active.sha),
+                priority_name(active.priority)
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
     }
     if pending.is_empty() {
         writeln!(stdout, "  No pending jobs")

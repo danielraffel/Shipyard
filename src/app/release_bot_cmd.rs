@@ -14,6 +14,7 @@ use super::{
     cli::{ReleaseBotCommand, ReleaseBotHookCommand},
 };
 use crate::config::LoadedConfig;
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 
@@ -972,7 +973,14 @@ fn run_git_owned(cwd: &Path, args: &[String]) -> Result<(), String> {
 }
 
 fn gh(gh_command: Option<&Path>) -> Command {
-    gh_command.map_or_else(|| Command::new("gh"), Command::new)
+    GhClient::ambient()
+        .prepare_command(
+            Path::new("."),
+            gh_command,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::AmbientOnly,
+        )
+        .expect("ambient gh command preparation should not fail")
 }
 
 fn parse_time(value: &str) -> Option<DateTime<Utc>> {

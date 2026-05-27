@@ -5,15 +5,19 @@
 //! The intent is to replace the lossy `Validation failed. PR #N not merged.`
 //! emit with a structured block that names the failing GitHub job, its URL,
 //! the failing step, and a bounded list of failing tests extracted from the
-//! job log tail. We rely on the same `gh` CLI surface the rest of Shipyard
-//! already uses (`crate::cloud::GitHubActions::run_gh`), so no new dependency
-//! is introduced. Network failure is treated as best-effort; the renderer
-//! degrades to the metadata-only block when the log can't be fetched.
+//! job log tail. We rely on Shipyard's shared `GhClient` CLI boundary, so no
+//! new transport dependency is introduced. Network failure is treated as
+//! best-effort; the renderer degrades to the metadata-only block when the log
+//! can't be fetched.
 
 use std::fmt;
-use std::process::Command;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::config::LoadedConfig;
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 
 /// Default tail size in bytes when scanning a job log.
 pub const DEFAULT_LOG_TAIL_BYTES: usize = 262_144;
@@ -384,36 +388,79 @@ pub trait DiagnosticsFetcher {
 }
 
 /// `gh api`-backed [`DiagnosticsFetcher`].
-#[derive(Clone, Debug, Default)]
-pub struct GhDiagnosticsFetcher;
+#[derive(Clone, Debug)]
+pub struct GhDiagnosticsFetcher {
+    cwd: PathBuf,
+    gh: Result<GhClient, String>,
+}
+
+impl GhDiagnosticsFetcher {
+    /// Build a diagnostics fetcher that loads Shipyard config from `cwd`.
+    #[must_use]
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        let cwd = cwd.into();
+        let gh = GhClient::from_cwd(RuntimeMode::Shipyard, &cwd)
+            .map_err(|error| format!("failed to load GitHub auth config for diagnostics: {error}"));
+        Self { cwd, gh }
+    }
+
+    /// Build a diagnostics fetcher from an already loaded Shipyard config.
+    #[must_use]
+    pub fn from_loaded_config(cwd: impl Into<PathBuf>, config: &LoadedConfig) -> Self {
+        let cwd = cwd.into();
+        let gh = GhClient::from_loaded_config(config)
+            .map_err(|error| format!("failed to load GitHub auth config for diagnostics: {error}"));
+        Self { cwd, gh }
+    }
+
+    fn run_gh_api(&self, args: &[String]) -> Result<String, String> {
+        let client = self.gh.as_ref().map_err(Clone::clone)?;
+        let output = client
+            .prepare_command(
+                &self.cwd,
+                None,
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+            )
+            .map_err(|error| format!("failed to prepare gh: {error}"))?
+            .args(args)
+            .output()
+            .map_err(|error| format!("failed to spawn gh: {error}"))?;
+        if !output.status.success() {
+            let code = output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(format!("gh exited with status {code}: {stderr}"));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+impl Default for GhDiagnosticsFetcher {
+    fn default() -> Self {
+        Self::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+}
 
 impl DiagnosticsFetcher for GhDiagnosticsFetcher {
     fn fetch_jobs_json(&self, repo: &str, run_id: u64) -> Result<String, DiagnosticsError> {
         let path = format!("/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100");
-        run_gh_api(&["api", "-H", "Accept: application/vnd.github+json", &path])
-            .map_err(DiagnosticsError::GhApi)
+        let args = vec![
+            "api".to_owned(),
+            "-H".to_owned(),
+            "Accept: application/vnd.github+json".to_owned(),
+            path,
+        ];
+        self.run_gh_api(&args).map_err(DiagnosticsError::GhApi)
     }
 
     fn fetch_job_log(&self, repo: &str, job_id: u64) -> Result<String, DiagnosticsError> {
         let path = format!("/repos/{repo}/actions/jobs/{job_id}/logs");
-        run_gh_api(&["api", &path]).map_err(DiagnosticsError::LogFetch)
+        let args = vec!["api".to_owned(), path];
+        self.run_gh_api(&args).map_err(DiagnosticsError::LogFetch)
     }
-}
-
-fn run_gh_api(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|error| format!("failed to spawn gh: {error}"))?;
-    if !output.status.success() {
-        let code = output
-            .status
-            .code()
-            .map_or_else(|| "signal".to_owned(), |c| c.to_string());
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(format!("gh exited with status {code}: {stderr}"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 // --- end-to-end orchestrator ---------------------------------------------

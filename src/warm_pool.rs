@@ -5,10 +5,12 @@
 //! only for backends whose workdir survives a Shipyard invocation.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Canonical warm-pool JSON filename.
@@ -93,6 +95,22 @@ impl WarmPool {
     /// Return every valid entry currently in the pool, including expired entries.
     #[must_use]
     pub fn all_entries(&self) -> Vec<PoolEntry> {
+        self.load_entries_unlocked()
+    }
+
+    /// Mutate the pool entries while holding the warm-pool file lock.
+    pub fn with_entries_locked<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<PoolEntry>) -> Result<T, io::Error>,
+    ) -> Result<T, io::Error> {
+        let _lock = StoreLock::acquire(self.lock_path())?;
+        let mut entries = self.load_entries_unlocked();
+        let output = f(&mut entries)?;
+        self.save_entries_unlocked(&entries)?;
+        Ok(output)
+    }
+
+    fn load_entries_unlocked(&self) -> Vec<PoolEntry> {
         self.load_raw()
             .into_iter()
             .filter_map(|value| serde_json::from_value(value).ok())
@@ -101,6 +119,11 @@ impl WarmPool {
 
     /// Atomically rewrite the pool file with the given entries.
     pub fn save_entries(&self, entries: &[PoolEntry]) -> Result<(), std::io::Error> {
+        let _lock = StoreLock::acquire(self.lock_path())?;
+        self.save_entries_unlocked(entries)
+    }
+
+    fn save_entries_unlocked(&self, entries: &[PoolEntry]) -> Result<(), std::io::Error> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -130,56 +153,52 @@ impl WarmPool {
 
     /// Insert or replace the record for `(target, host)`.
     pub fn upsert(&self, entry: PoolEntry) -> Result<(), std::io::Error> {
-        let mut entries = self
-            .all_entries()
-            .into_iter()
-            .filter(|existing| existing.target != entry.target || existing.host != entry.host)
-            .collect::<Vec<_>>();
-        entries.push(entry);
-        self.save_entries(&entries)
+        self.with_entries_locked(|entries| {
+            entries
+                .retain(|existing| existing.target != entry.target || existing.host != entry.host);
+            entries.push(entry);
+            Ok(())
+        })
     }
 
     /// Remove the entry for `(target, host)`. Returns true if removed.
     pub fn evict(&self, target: &str, host: &str) -> Result<bool, std::io::Error> {
-        let entries = self.all_entries();
-        let original_len = entries.len();
-        let kept = entries
-            .into_iter()
-            .filter(|entry| entry.target != target || entry.host != host)
-            .collect::<Vec<_>>();
-        let removed = kept.len() != original_len;
-        if removed {
-            self.save_entries(&kept)?;
-        }
-        Ok(removed)
+        self.with_entries_locked(|entries| {
+            let original_len = entries.len();
+            entries.retain(|entry| entry.target != target || entry.host != host);
+            Ok(entries.len() != original_len)
+        })
     }
 
     /// Remove every entry. Returns count drained.
     pub fn drain(&self) -> Result<usize, std::io::Error> {
-        let count = self.all_entries().len();
-        self.save_entries(&[])?;
-        Ok(count)
+        self.with_entries_locked(|entries| {
+            let count = entries.len();
+            entries.clear();
+            Ok(count)
+        })
     }
 
     /// Remove expired entries. Returns count pruned.
     pub fn prune_expired(&self, now: f64) -> Result<usize, std::io::Error> {
-        let entries = self.all_entries();
-        let mut pruned = 0;
-        let kept = entries
-            .into_iter()
-            .filter(|entry| {
+        self.with_entries_locked(|entries| {
+            let mut pruned = 0;
+            entries.retain(|entry| {
                 if entry.is_expired(now) {
                     pruned += 1;
                     false
                 } else {
                     true
                 }
-            })
-            .collect::<Vec<_>>();
-        if pruned > 0 {
-            self.save_entries(&kept)?;
-        }
-        Ok(pruned)
+            });
+            Ok(pruned)
+        })
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut path = self.path.clone();
+        path.set_extension("lock");
+        path
     }
 
     fn load_raw(&self) -> Vec<serde_json::Value> {
@@ -197,6 +216,33 @@ impl WarmPool {
             .into_iter()
             .filter(serde_json::Value::is_object)
             .collect()
+    }
+}
+
+#[derive(Debug)]
+struct StoreLock {
+    file: File,
+}
+
+impl StoreLock {
+    fn acquire(path: PathBuf) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.lock_exclusive()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -277,6 +323,11 @@ pub fn entries_by_key(entries: &[PoolEntry]) -> BTreeMap<(String, String), PoolE
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
     use super::{
         PoolEntry, WarmPool, compute_expires_at, default_pool_path, entries_by_key,
         extract_warm_keepalive_seconds, is_backend_eligible, warm_host_key,
@@ -377,6 +428,33 @@ mod tests {
             .expect("upsert");
         assert_eq!(pool.drain().expect("drain"), 1);
         assert!(pool.all_entries().is_empty());
+    }
+
+    #[test]
+    fn warm_pool_lock_preserves_two_handle_mutations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = Arc::new(WarmPool::new(temp.path().join("warm_pool.json")));
+        let writer = Arc::clone(&pool);
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let handle = pool
+            .with_entries_locked(|entries| {
+                let handle = thread::spawn(move || {
+                    started_tx.send(()).expect("started");
+                    writer
+                        .upsert(entry("linux", "vm", "def", 100.0))
+                        .expect("upsert linux");
+                });
+                started_rx.recv().expect("started received");
+                thread::sleep(Duration::from_millis(50));
+                entries.push(entry("mac", "local", "abc", 100.0));
+                Ok(handle)
+            })
+            .expect("locked mutation");
+        handle.join().expect("writer thread");
+
+        assert_eq!(pool.get("mac", "local", 1.0).expect("mac").sha, "abc");
+        assert_eq!(pool.get("linux", "vm", 1.0).expect("linux").sha, "def");
     }
 
     #[test]

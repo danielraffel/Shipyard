@@ -40,6 +40,16 @@ pub enum ValidationMode {
     Smoke,
 }
 
+/// Durable execution request kind.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobKind {
+    /// `shipyard run` validation.
+    Run,
+    /// `shipyard ship` validation.
+    Ship,
+}
+
 /// Job lifecycle state.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -172,6 +182,10 @@ pub struct TargetResult {
     /// Per-target failure parser selection from `.shipyard/config.toml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_parser: Option<String>,
+    /// Scheduler-owned deferral reason. A result with this set must not be
+    /// treated as a terminal validation outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_defer_reason: Option<String>,
 }
 
 impl TargetResult {
@@ -213,6 +227,7 @@ impl TargetResult {
             cloud_job_url: None,
             cloud_failed_step: None,
             failure_parser: None,
+            scheduler_defer_reason: None,
         }
     }
 
@@ -226,6 +241,13 @@ impl TargetResult {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
+    }
+
+    /// Whether this result is a scheduler-owned deferral instead of a final
+    /// validation outcome.
+    #[must_use]
+    pub fn is_scheduler_deferred(&self) -> bool {
+        self.scheduler_defer_reason.is_some()
     }
 
     /// Convert to Python-compatible JSON value.
@@ -246,6 +268,9 @@ pub struct Job {
     pub branch: String,
     /// Validation mode.
     pub mode: ValidationMode,
+    /// Durable request kind. Legacy jobs may not have this yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<JobKind>,
     /// Target names.
     #[serde(rename = "targets")]
     pub target_names: Vec<String>,
@@ -261,6 +286,24 @@ pub struct Job {
     /// Completion timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// Optional reason when a job is cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_reason: Option<String>,
+    /// Timestamp when cancellation was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+    /// Scheduler deferral reason when a running job is returned to pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_defer_reason: Option<String>,
+    /// Number of scheduler-owned deferrals for this job.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub scheduler_defer_count: u32,
+    /// Earliest time the scheduler should retry this job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_defer_until: Option<DateTime<Utc>>,
+    /// Resource claims held or attempted by the queue scheduler.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_claims: Vec<String>,
     /// Results keyed by target name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub results: BTreeMap<String, TargetResult>,
@@ -291,7 +334,14 @@ impl Job {
             created_at,
             started_at: None,
             completed_at: None,
+            cancellation_reason: None,
+            cancel_requested_at: None,
+            scheduler_defer_reason: None,
+            scheduler_defer_count: 0,
+            scheduler_defer_until: None,
+            resource_claims: Vec::new(),
             results: BTreeMap::new(),
+            kind: None,
         }
     }
 
@@ -319,13 +369,36 @@ impl Job {
 
     /// Cancel any non-terminal job.
     pub fn cancel(&self) -> Result<Self, JobTransitionError> {
+        self.cancel_with_reason(None)
+    }
+
+    /// Cancel any non-terminal job with an optional reason.
+    pub fn cancel_with_reason(&self, reason: Option<String>) -> Result<Self, JobTransitionError> {
         if matches!(self.status, JobStatus::Completed | JobStatus::Cancelled) {
             return Err(JobTransitionError::InvalidCancel(self.status));
         }
         let mut next = self.clone();
         next.status = JobStatus::Cancelled;
         next.completed_at = Some(Utc::now());
+        next.cancellation_reason = reason;
+        next.cancel_requested_at = next.completed_at;
         Ok(next)
+    }
+
+    /// Return a copy tagged with the durable request kind.
+    #[must_use]
+    pub fn with_kind(&self, kind: JobKind) -> Self {
+        let mut next = self.clone();
+        next.kind = Some(kind);
+        next
+    }
+
+    /// Return a copy with scheduler resource-claim debug labels.
+    #[must_use]
+    pub fn with_resource_claims(&self, resource_claims: Vec<String>) -> Self {
+        let mut next = self.clone();
+        next.resource_claims = resource_claims;
+        next
     }
 
     /// Return a copy with a different priority.
@@ -342,6 +415,27 @@ impl Job {
         let mut next = self.clone();
         next.results.insert(result.target_name.clone(), result);
         next
+    }
+
+    /// Return a running job to pending after a scheduler-owned transient
+    /// deferral. Non-terminal target results are cleared so they can be retried.
+    pub fn defer_for_scheduler(
+        &self,
+        reason: impl Into<String>,
+        defer_until: Option<DateTime<Utc>>,
+    ) -> Result<Self, JobTransitionError> {
+        if self.status != JobStatus::Running {
+            return Err(JobTransitionError::InvalidDefer(self.status));
+        }
+        let mut next = self.clone();
+        next.status = JobStatus::Pending;
+        next.started_at = None;
+        next.completed_at = None;
+        next.scheduler_defer_reason = Some(reason.into());
+        next.scheduler_defer_count = next.scheduler_defer_count.saturating_add(1);
+        next.scheduler_defer_until = defer_until;
+        next.results.retain(|_, result| result.is_terminal());
+        Ok(next)
     }
 
     /// Whether all targets passed and the job completed.
@@ -388,6 +482,8 @@ pub enum JobTransitionError {
     InvalidComplete(JobStatus),
     /// Cannot cancel from this status.
     InvalidCancel(JobStatus),
+    /// Cannot defer from this status.
+    InvalidDefer(JobStatus),
 }
 
 impl std::fmt::Display for JobTransitionError {
@@ -400,11 +496,16 @@ impl std::fmt::Display for JobTransitionError {
             Self::InvalidCancel(status) => {
                 write!(formatter, "cannot cancel job in state {status:?}")
             }
+            Self::InvalidDefer(status) => write!(formatter, "cannot defer job in state {status:?}"),
         }
     }
 }
 
 impl std::error::Error for JobTransitionError {}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
 
 fn generate_id(
     created_at: DateTime<Utc>,
@@ -545,6 +646,7 @@ mod tests {
         let cancelled = job().cancel().expect("cancel");
         assert_eq!(cancelled.status, JobStatus::Cancelled);
         assert!(cancelled.completed_at.is_some());
+        assert!(cancelled.cancel_requested_at.is_some());
     }
 
     #[test]
@@ -622,5 +724,25 @@ mod tests {
             value["targets"],
             Value::Array(vec!["mac".into(), "linux".into()])
         );
+    }
+
+    #[test]
+    fn legacy_job_without_kind_deserializes() {
+        let value = serde_json::json!({
+            "id": "sy-legacy",
+            "sha": "abc123",
+            "branch": "feat/x",
+            "mode": "full",
+            "targets": ["mac"],
+            "priority": "normal",
+            "status": "pending",
+            "created_at": "2026-05-26T00:00:00Z"
+        });
+
+        let job: Job = serde_json::from_value(value).expect("legacy job");
+
+        assert_eq!(job.kind, None);
+        assert!(job.resource_claims.is_empty());
+        assert_eq!(job.cancel_requested_at, None);
     }
 }

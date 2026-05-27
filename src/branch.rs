@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
-use crate::governance::{BranchProtectionRules, put_branch_protection};
+use crate::governance::{BranchProtectionRules, GovernanceGh, put_branch_protection};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_PUSH_TIMEOUT: Duration = Duration::from_mins(1);
@@ -200,14 +200,14 @@ pub fn create_branch_and_apply_rules(
     base_branch: &str,
     rules: &BranchProtectionRules,
     git_command: Option<&Path>,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> BranchApplyResult {
     let create_result = create_branch_on_remote(cwd, branch, base_branch, git_command);
     if create_result.status == BranchApplyStatus::GitFailed {
         return create_result;
     }
 
-    match put_branch_protection(repo, branch, rules, gh_command) {
+    match put_branch_protection(repo, branch, rules, gh) {
         Ok(()) => BranchApplyResult {
             branch: branch.to_owned(),
             status: BranchApplyStatus::RulesApplied,
@@ -233,9 +233,9 @@ pub fn apply_branch_rules(
     repo: &str,
     branch: &str,
     rules: &BranchProtectionRules,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> BranchApplyResult {
-    match put_branch_protection(repo, branch, rules, gh_command) {
+    match put_branch_protection(repo, branch, rules, gh) {
         Ok(()) => BranchApplyResult {
             branch: branch.to_owned(),
             status: BranchApplyStatus::RulesApplied,
@@ -351,7 +351,7 @@ mod tests {
         BranchApplyStatus, apply_branch_rules, create_branch_and_apply_rules,
         create_branch_on_remote,
     };
-    use crate::governance::resolve_branch_rules;
+    use crate::governance::{GovernanceGh, resolve_branch_rules};
 
     #[test]
     fn create_branch_on_remote_is_idempotent_when_remote_branch_exists() {
@@ -444,6 +444,7 @@ exit 0
             ),
         );
         let rules = rules();
+        let gh = GovernanceGh::ambient(temp.path(), Some(&gh));
 
         let result = create_branch_and_apply_rules(
             temp.path(),
@@ -452,7 +453,7 @@ exit 0
             "main",
             &rules,
             Some(&git),
-            Some(&gh),
+            &gh,
         );
 
         assert_eq!(result.status, BranchApplyStatus::RulesApplied);
@@ -473,8 +474,9 @@ echo "forbidden" >&2
 exit 1
 "#,
         );
+        let gh = GovernanceGh::ambient(temp.path(), Some(&gh));
 
-        let result = apply_branch_rules("owner/repo", "main", &rules(), Some(&gh));
+        let result = apply_branch_rules("owner/repo", "main", &rules(), &gh);
 
         assert_eq!(result.status, BranchApplyStatus::RulesFailed);
         assert!(result.message.contains("forbidden"));
