@@ -1,6 +1,6 @@
 [package]
 name = "shipyard"
-version = "0.59.0"
+version = "0.60.0"
 edition = "2024"
 description = "Cross-platform CI coordination for local, SSH, and cloud runners."
 rust-version = "1.92"
