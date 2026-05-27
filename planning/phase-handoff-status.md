@@ -785,6 +785,32 @@ Results:
     `QUEUE_ENVELOPE_SWEEP_GRACE = 60s`,
     `DEFAULT_DRAIN_MAX_WORKERS = 2`, and `scheduler_defer_until` is persisted
     for status/debugging but not yet used to delay admission.
+- After Windows CI failure on PR #314 head `2a07b65`:
+  - Windows `Run tests` failed in
+    `doctor::tests::ready_depends_on_core_tools_only` because the advisory
+    `shipyard-on-path` row affected `report.ready` in the CI PATH, and in
+    three host-pool dispatch tests because Windows temp paths were
+    interpolated into TOML double-quoted strings without escaping backslashes.
+  - Fixed doctor readiness so advisory `shipyard-on-path` does not gate
+    `report.ready`.
+  - Fixed host-pool dispatch tests to TOML-escape command/cwd strings and use
+    cross-platform local commands.
+  - Local focused validation passed:
+    `cargo fmt --all --check`,
+    `cargo test doctor::tests::ready_depends_on_core_tools_only -- --exact`,
+    `cargo test host_pool_dispatch -- --nocapture`, and
+    `cargo clippy --all-targets --locked -- -D warnings`.
+  - The next Linux CI run passed tests but failed clippy on
+    `clippy::uninlined_format_args` in the same Windows-safe test command
+    construction; fixed by using inline format variables and reran the focused
+    tests/clippy locally.
+  - The following PR run showed Linux green, then Windows failed because the
+    host-pool lease test still depended on Windows shell/file quoting. The
+    test now observes the active lease through Shipyard's progress callback
+    while running a portable phase-marker echo.
+  - The same PR run showed a coverage-only failure in a release-bot fake-`gh`
+    test; the fake CLI argument matching is now wildcard-tolerant so the test
+    cannot fall through to stdin prompting when the secret probe should match.
 - Direct raw `Command::new("gh")` audit now reports only:
   - `src/supervised.rs`
   - `src/gh.rs`

@@ -1090,16 +1090,16 @@ mod tests {
             &script,
             r#"#!/bin/sh
 case "$*" in
-  "api repos/owner/repo/actions/secrets --paginate")
+  api\ repos/owner/repo/actions/secrets*)
     printf '%s\n' '{"secrets":[{"name":"RELEASE_BOT_TOKEN","updated_at":"2026-04-25T09:30:00Z"}]}'
     ;;
-  "api repos/owner/other/actions/secrets --paginate")
+  api\ repos/owner/other/actions/secrets*)
     printf '%s\n' '{"secrets":[{"name":"RELEASE_BOT_TOKEN","updated_at":"2026-04-25T08:00:00Z"}]}'
     ;;
-  "run list --workflow auto-release.yml --repo owner/repo --limit 1 --json databaseId,status,conclusion,createdAt")
+  run\ list\ --workflow\ auto-release.yml\ --repo\ owner/repo*)
     printf '%s\n' '[{"databaseId":123,"status":"completed","conclusion":"failure","createdAt":"2026-04-25T10:00:00Z"}]'
     ;;
-  "run view 123 --repo owner/repo --log-failed")
+  run\ view\ 123\ --repo\ owner/repo\ --log-failed*)
     printf '%s\n' 'fatal: Authentication failed'
     ;;
   *)

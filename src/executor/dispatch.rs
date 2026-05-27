@@ -1761,6 +1761,22 @@ mod tests {
         input.parse::<Table>().expect("valid TOML")
     }
 
+    fn toml_string(value: impl AsRef<str>) -> String {
+        let mut escaped = String::from("\"");
+        for ch in value.as_ref().chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped.push('"');
+        escaped
+    }
+
     #[test]
     fn resolves_local_target_with_contract_and_prepared_state() {
         let config = table(
@@ -2102,14 +2118,14 @@ mod tests {
         let config = table(&format!(
             r#"
             [validation.default]
-            command = "grep -q '\\\"job_id\\\": \\\"job-host-pool\\\"' '{}'"
+            command = "echo __SHIPYARD_PHASE__:lease-check"
 
             [host_pools.local_macs]
 
             [[host_pools.local_macs.members]]
             id = "local"
             type = "local"
-            cwd = "{}"
+            cwd = {}
             capabilities = ["macos", "arm64"]
 
             [targets.mac]
@@ -2118,13 +2134,22 @@ mod tests {
             platform = "macos-arm64"
             requires = ["macos", "arm64"]
             "#,
-            default_lease_path(temp.path()).display(),
-            repo.display()
+            toml_string(repo.display().to_string())
         ));
         let target = resolve_targets_from_table(&config, ValidationMode::Full)
             .expect("targets")
             .remove(0);
         let dispatcher = super::ExecutorDispatcher::new_with_state_dir(None, temp.path());
+        let lease_store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        let observed_job_id = std::cell::Cell::new(false);
+        let mut callback = |event: crate::executor::streaming::ProgressEvent| {
+            if event.phase.as_deref() == Some("lease-check") {
+                let leases = lease_store.leases().expect("leases");
+                assert_eq!(leases.len(), 1);
+                assert_eq!(leases[0].job_id.as_deref(), Some("job-host-pool"));
+                observed_job_id.set(true);
+            }
+        };
 
         let result = dispatcher.validate(super::DispatchValidationRequest {
             job_id: Some("job-host-pool".to_owned()),
@@ -2135,11 +2160,12 @@ mod tests {
             log_path: temp.path().join("host-pool.log"),
             resume_from: None,
             mode: ValidationMode::Full,
-            progress_callback: None,
+            progress_callback: Some(&mut callback),
         });
 
         assert_eq!(result.status, TargetStatus::Pass);
         assert_eq!(result.backend, "host-pool:local_macs/local");
+        assert!(observed_job_id.get());
         let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
         assert!(store.leases().expect("leases").is_empty());
     }
@@ -2152,20 +2178,20 @@ mod tests {
         let config = table(&format!(
             r#"
             [validation.default]
-            command = "true"
+            command = "echo ok"
 
             [host_pools.local_macs]
 
             [[host_pools.local_macs.members]]
             id = "mac-studio"
             type = "local"
-            cwd = "{}"
+            cwd = {}
             capabilities = ["macos", "arm64"]
 
             [[host_pools.local_macs.members]]
             id = "local"
             type = "local"
-            cwd = "{}"
+            cwd = {}
             capabilities = ["macos", "arm64"]
 
             [targets.mac]
@@ -2174,8 +2200,8 @@ mod tests {
             platform = "macos-arm64"
             requires = ["macos", "arm64"]
             "#,
-            repo.display(),
-            repo.display()
+            toml_string(repo.display().to_string()),
+            toml_string(repo.display().to_string())
         ));
         let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
         let busy = store
@@ -2231,14 +2257,14 @@ mod tests {
         let config = table(&format!(
             r#"
             [validation.default]
-            command = "true"
+            command = "echo ok"
 
             [host_pools.local_macs]
 
             [[host_pools.local_macs.members]]
             id = "local"
             type = "local"
-            cwd = "{}"
+            cwd = {}
             capabilities = ["macos", "arm64"]
 
             [targets.mac]
@@ -2247,7 +2273,7 @@ mod tests {
             platform = "macos-arm64"
             requires = ["macos", "arm64"]
             "#,
-            repo.display()
+            toml_string(repo.display().to_string())
         ));
         let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
         let busy = store

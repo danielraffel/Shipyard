@@ -141,7 +141,11 @@ pub fn collect_report(
     {
         core.insert("daemon-version".to_owned(), entry);
     }
-    let ready = core.values().all(|entry| entry.ok);
+    let ready = ["git", "ssh", "rich-bundle"]
+        .iter()
+        .all(|name| core.get(*name).is_some_and(|entry| entry.ok))
+        && core.get("macos-gatekeeper").is_none_or(|entry| entry.ok)
+        && core.get("daemon-version").is_none_or(|entry| entry.ok);
     checks.insert("Core".to_owned(), core);
 
     let mut cloud = BTreeMap::new();
