@@ -99,6 +99,18 @@ on the token/App when cloud retarget or handoff fails with auth/scope errors.
 That doctor command actively resolves configured auth, so command helpers may
 run and GitHub App helpers may mint installation tokens.
 
+GitHub App installation tokens are the preferred path for high-volume
+inspection because Shipyard injects them into its built-in `gh` subprocesses
+and REST/GraphQL fallback paths. Do not silently fall back to ambient user auth
+for polling, watch, retarget, handoff, or diagnostics. The narrow exception is
+pull-request creation: if GitHub rejects App-token PR creation with `Resource
+not accessible by integration` through both GraphQL and REST, Shipyard may print
+an explicit notice and use ambient `gh` auth for that one low-volume create
+operation.
+PR merge should stay on the configured token: if GitHub rejects the App token's
+GraphQL merge probe, Shipyard falls back to its REST merge path with the same
+configured token.
+
 ## Supervised-Push Signal (`SHIPYARD_PR_RUNNING=1`)
 
 Every `git` / `gh` subprocess spawned by `shipyard pr` / `ship` /

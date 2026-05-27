@@ -47,6 +47,11 @@ When debugging GitHub behavior:
   and write.
 - Keep `RELEASE_BOT_TOKEN` separate. `shipyard release-bot setup/status` are
   operator actions and intentionally use ambient `gh` auth.
+- Keep high-volume GitHub inspection on the configured Shipyard auth source.
+  PR creation is the only intentional ambient-auth escape hatch: if a GitHub App
+  installation token is rejected for PR creation by both GraphQL and REST,
+  Shipyard prints an explicit notice and uses ambient `gh` auth for that create
+  operation only.
 - Mac-to-Mac portability is config-only. Reprovision env vars, Keychain items,
   1Password sign-in, or App private keys outside Shipyard on the destination
   Mac.
@@ -181,7 +186,7 @@ audit-log use case. If you add a brand new orchestrated flow,
 extend the scope deliberately rather than blanket-supervising
 everything.
 
-## GraphQL Rate-Limit Fallback Behaviour (issue #266)
+## GraphQL And GitHub App Fallback Behaviour
 
 Five operations detect `is_graphql_rate_limited` in `gh` stderr and
 fall through to a REST equivalent: PR list, PR create, PR view, PR
@@ -191,6 +196,21 @@ prints a one-line user-visible notice on stderr, including the
 GraphQL reset time when a best-effort `gh api rate_limit` probe
 succeeds. Add this call to any new REST-fallback dispatch site so
 the operator-visible signal stays consistent.
+
+GitHub App installation tokens can also be rejected by GitHub's GraphQL
+`createPullRequest` / `mergePullRequest` mutations even when the App token is
+otherwise the right auth source for inspection. PR creation first tries the
+existing GraphQL path, then REST with the same configured token. If both are
+blocked with `Resource not accessible by integration`, Shipyard prints a second
+explicit notice and falls back to ambient `gh` auth for PR creation only. PR
+merge falls back from GraphQL to the existing REST merge path with the same
+configured token. Do not apply ambient-auth fallback to polling, watch,
+retarget, diagnostics, merge, or other high-volume operations.
+
+`GitHubActions::pr_head_ref` also falls back from `gh pr view` to
+`GET /repos/:owner/:repo/pulls/:number` when GraphQL is rate-limited; both
+attempts must use the same configured `GhClient` so GitHub App quota is
+preserved.
 
 The REST merge path (`merge_pr_rest`) passes the original head SHA
 as `-f sha=<oid>` on the PUT so GitHub enforces the merge race-guard

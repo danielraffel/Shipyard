@@ -323,22 +323,40 @@ fn merge_pr(
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let message = if stderr.is_empty() { stdout } else { stderr };
 
-    // GraphQL exhausted but REST still has budget? `gh pr merge` uses GraphQL
-    // for the merge state probe; the actual merge atom is REST
+    // GraphQL exhausted but REST still has budget? Or GraphQL rejected an App
+    // installation token before the REST merge atom? `gh pr merge` uses
+    // GraphQL for the merge state probe; the actual merge atom is REST
     // (PUT /repos/:r/pulls/:n/merge), so fall back to a direct REST call
     // rather than failing the ship. Matches src/pr.rs's pattern for
     // gh pr list / create / view.
-    if !custom_command && crate::pr::is_graphql_rate_limited(&message) {
+    if !custom_command
+        && (crate::pr::is_graphql_rate_limited(&message)
+            || is_graphql_merge_integration_blocked(&message))
+    {
         let client = client
             .as_ref()
             .expect("built-in merge should have gh client");
-        crate::pr::report_rate_limit_fallback_with_client(client, "gh pr merge", cwd);
+        if crate::pr::is_graphql_rate_limited(&message) {
+            crate::pr::report_rate_limit_fallback_with_client(client, "gh pr merge", cwd);
+        } else {
+            eprintln!(
+                "shipyard: GraphQL PR merge is unavailable for this GitHub identity. Falling back to REST."
+            );
+        }
         return merge_pr_rest(client, pr, cwd, merge_method, delete_branch);
     }
     Err(message)
 }
 
-/// REST fallback for `gh pr merge` when GraphQL is rate-limited.
+fn is_graphql_merge_integration_blocked(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("graphql")
+        && lower.contains("resource not accessible by integration")
+        && lower.contains("mergepullrequest")
+}
+
+/// REST fallback for `gh pr merge` when GraphQL is rate-limited or App-token
+/// GraphQL merge probing is unavailable.
 ///
 /// `gh pr merge` queries the PR's mergeable state via GraphQL before issuing
 /// the actual merge POST. When GraphQL is at 0/5000 the call fails, but
@@ -640,6 +658,19 @@ mod tests {
         // Defense: only retry when GitHub returned the 405 status, not on
         // arbitrary text containing the phrase.
         assert!(!is_base_modified_405("Base branch was modified."));
+    }
+
+    #[test]
+    fn detects_graphql_merge_app_integration_block() {
+        assert!(is_graphql_merge_integration_blocked(
+            "GraphQL: Resource not accessible by integration (mergePullRequest)"
+        ));
+        assert!(!is_graphql_merge_integration_blocked(
+            "GraphQL: Resource not accessible by integration (createPullRequest)"
+        ));
+        assert!(!is_graphql_merge_integration_blocked(
+            "REST: Resource not accessible by integration (mergePullRequest)"
+        ));
     }
 
     // ── short_sha helper ────────────────────────────────────────────────

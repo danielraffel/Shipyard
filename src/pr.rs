@@ -39,6 +39,10 @@ impl PrError {
             message: message.into(),
         }
     }
+
+    fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl Display for PrError {
@@ -121,8 +125,18 @@ pub fn create_pr(
     if !output.status.success() {
         let message = stderr_or_stdout(&output);
         if is_graphql_rate_limited(&message) {
-            report_rate_limit_fallback_with_client(&client, "gh pr create", cwd);
+            report_graphql_pr_create_fallback_with_client(&client, &message, cwd);
             return create_pr_rest(&client, cwd, gh_command, branch, base, title, body);
+        }
+        if is_graphql_pr_create_integration_blocked(&message) {
+            report_graphql_pr_create_fallback_with_client(&client, &message, cwd);
+            return match create_pr_rest(&client, cwd, gh_command, branch, base, title, body) {
+                Ok(info) => Ok(info),
+                Err(error) if is_integration_blocked(error.message()) => {
+                    create_pr_with_ambient_gh(cwd, gh_command, branch, base, title, body)
+                }
+                Err(error) => Err(error),
+            };
         }
         return Err(PrError::new(format!("gh pr create failed: {message}")));
     }
@@ -172,13 +186,17 @@ fn gh_client(cwd: &Path) -> Result<GhClient, PrError> {
 }
 
 fn gh(client: &GhClient, cwd: &Path, gh_command: Option<&Path>) -> Result<Command, PrError> {
+    gh_with_policy(client, cwd, gh_command, GhAuthPolicy::Default)
+}
+
+fn gh_with_policy(
+    client: &GhClient,
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    auth_policy: GhAuthPolicy,
+) -> Result<Command, PrError> {
     client
-        .prepare_command(
-            cwd,
-            gh_command,
-            GhSupervision::Supervised,
-            GhAuthPolicy::Default,
-        )
+        .prepare_command(cwd, gh_command, GhSupervision::Supervised, auth_policy)
         .map_err(|error| PrError::new(format!("gh command preparation failed: {error}")))
 }
 
@@ -278,6 +296,39 @@ fn create_pr_rest(
     parse_pr_rest_info(&String::from_utf8_lossy(&output.stdout))
 }
 
+fn create_pr_with_ambient_gh(
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    branch: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+) -> Result<PrInfo, PrError> {
+    eprintln!(
+        "shipyard: GitHub App token cannot create this pull request through GraphQL or REST. Falling back to ambient gh auth for PR creation only."
+    );
+    let client = GhClient::ambient();
+    let output = gh_with_policy(&client, cwd, gh_command, GhAuthPolicy::AmbientOnly)?
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .args([
+            "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
+        ])
+        .output()
+        .map_err(|error| PrError::new(format!("ambient gh pr create failed to start: {error}")))?;
+    if !output.status.success() {
+        return Err(PrError::new(format!(
+            "ambient gh pr create failed after GitHub App fallback was blocked: {}",
+            stderr_or_stdout(&output)
+        )));
+    }
+    let selector = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if selector.is_empty() {
+        return Err(PrError::new("ambient gh pr create did not print a PR URL"));
+    }
+    get_pr_status_with_client(&client, cwd, gh_command, &selector)
+}
+
 fn get_pr_status_rest(
     client: &GhClient,
     cwd: &Path,
@@ -362,6 +413,29 @@ fn selector_pr_number(selector: &str) -> Option<u64> {
 #[must_use]
 pub(crate) fn is_graphql_rate_limited(message: &str) -> bool {
     crate::gh::is_graphql_rate_limited(message)
+}
+
+fn is_graphql_pr_create_integration_blocked(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("graphql")
+        && lower.contains("resource not accessible by integration")
+        && lower.contains("createpullrequest")
+}
+
+fn is_integration_blocked(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("resource not accessible by integration")
+}
+
+fn report_graphql_pr_create_fallback_with_client(client: &GhClient, message: &str, cwd: &Path) {
+    if is_graphql_rate_limited(message) {
+        report_rate_limit_fallback_with_client(client, "gh pr create", cwd);
+        return;
+    }
+    eprintln!(
+        "shipyard: GraphQL PR creation is unavailable for this GitHub identity. Falling back to REST."
+    );
 }
 
 /// Print a one-line user-facing notice that GraphQL is exhausted and
@@ -482,7 +556,8 @@ fn nested_string_field(value: &Value, path: &[&str]) -> Result<String, PrError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        PrInfo, is_graphql_rate_limited, parse_github_remote_slug, parse_pr_info, parse_pr_list,
+        PrInfo, is_graphql_pr_create_integration_blocked, is_graphql_rate_limited,
+        is_integration_blocked, parse_github_remote_slug, parse_pr_info, parse_pr_list,
         parse_pr_rest_info, parse_pr_rest_list, selector_pr_number, url_encode,
     };
 
@@ -540,6 +615,22 @@ mod tests {
             "GraphQL: API rate limit already exceeded for user ID 123"
         ));
         assert!(!is_graphql_rate_limited("HTTP 500: something else failed"));
+    }
+
+    #[test]
+    fn detects_graphql_pr_create_app_integration_block() {
+        assert!(is_graphql_pr_create_integration_blocked(
+            "pull request create failed: GraphQL: Resource not accessible by integration (createPullRequest)"
+        ));
+        assert!(!is_graphql_pr_create_integration_blocked(
+            "GraphQL: Resource not accessible by integration (mergePullRequest)"
+        ));
+        assert!(!is_graphql_pr_create_integration_blocked(
+            "REST: Resource not accessible by integration (createPullRequest)"
+        ));
+        assert!(is_integration_blocked(
+            "gh: Resource not accessible by integration (HTTP 403)"
+        ));
     }
 
     #[test]

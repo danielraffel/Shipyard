@@ -187,6 +187,7 @@ impl Error for GitHubError {}
 pub struct GitHubActions {
     cwd: PathBuf,
     gh: Result<GhClient, String>,
+    gh_binary_override: Option<PathBuf>,
 }
 
 impl PartialEq for GitHubActions {
@@ -210,7 +211,11 @@ impl GitHubActions {
         let cwd = cwd.into();
         let gh = GhClient::from_cwd(mode, &cwd)
             .map_err(|error| format!("failed to load GitHub auth config for gh commands: {error}"));
-        Self { cwd, gh }
+        Self {
+            cwd,
+            gh,
+            gh_binary_override: None,
+        }
     }
 
     /// Build a client from an already loaded Shipyard config.
@@ -219,7 +224,17 @@ impl GitHubActions {
         let cwd = cwd.into();
         let gh = GhClient::from_loaded_config(config)
             .map_err(|error| format!("failed to load GitHub auth config for gh commands: {error}"));
-        Self { cwd, gh }
+        Self {
+            cwd,
+            gh,
+            gh_binary_override: None,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
+        self.gh_binary_override = Some(gh_binary.into());
+        self
     }
 
     /// Dispatch a workflow with optional repository and input fields.
@@ -590,12 +605,35 @@ impl GitHubActions {
             "--json".to_owned(),
             "headRefName,number,state".to_owned(),
         ];
-        let stdout = self.run_gh(&args)?;
+        let stdout = match self.run_gh(&args) {
+            Ok(stdout) => stdout,
+            Err(error) if crate::gh::is_graphql_rate_limited(error.message()) => {
+                return self.pr_head_ref_rest(repository, pr);
+            }
+            Err(error) => return Err(error),
+        };
         let value = serde_json::from_str::<Value>(&stdout).map_err(|error| {
             GitHubError::new(format!("failed to parse gh pr view JSON: {error}"))
         })?;
         Ok(value
             .get("headRefName")
+            .and_then(Value::as_str)
+            .filter(|head| !head.is_empty())
+            .map(ToOwned::to_owned))
+    }
+
+    fn pr_head_ref_rest(&self, repository: &str, pr: u64) -> Result<Option<String>, GitHubError> {
+        let args = vec!["api".to_owned(), format!("repos/{repository}/pulls/{pr}")];
+        let stdout = self.run_gh(&args).map_err(|error| {
+            GitHubError::new(format!(
+                "gh pr view hit GraphQL rate limit, then REST PR lookup failed: {error}"
+            ))
+        })?;
+        let value = serde_json::from_str::<Value>(&stdout)
+            .map_err(|error| GitHubError::new(format!("failed to parse REST PR JSON: {error}")))?;
+        Ok(value
+            .get("head")
+            .and_then(|head| head.get("ref"))
             .and_then(Value::as_str)
             .filter(|head| !head.is_empty())
             .map(ToOwned::to_owned))
@@ -627,7 +665,7 @@ impl GitHubActions {
         client
             .prepare_command(
                 &self.cwd,
-                None,
+                self.gh_binary_override.as_deref(),
                 GhSupervision::Unsupervised,
                 GhAuthPolicy::Default,
             )
@@ -1211,6 +1249,8 @@ fn apply_platform_specific_inputs(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::path::Path;
 
     use tempfile::TempDir;
 
@@ -1220,6 +1260,86 @@ mod tests {
         resolve_cloud_dispatch_plan_with_overrides,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).expect("write script");
+        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod script");
+    }
+
+    #[cfg(unix)]
+    fn config_with_command_helper(helper: &Path) -> LoadedConfig {
+        let text = format!(
+            r#"
+[github.auth]
+source = "command"
+token_command = ["{}"]
+cache_ttl_seconds = 300
+"#,
+            helper.display()
+        );
+        LoadedConfig {
+            data: text.parse().expect("parse config"),
+            global_dir: Path::new("/tmp/shipyard-global").to_path_buf(),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_head_ref_falls_back_to_rest_with_configured_app_token() {
+        let temp = TempDir::new().expect("tempdir");
+        let helper = temp.path().join("token-helper");
+        write_executable(
+            &helper,
+            r#"#!/bin/sh
+printf '{"token":"ghs_app_token","kind":"github-app-installation","expires_at":"2099-01-01T00:00:00Z"}'
+"#,
+        );
+
+        let log = temp.path().join("gh.log");
+        let gh = temp.path().join("gh");
+        write_executable(
+            &gh,
+            &format!(
+                r#"#!/bin/sh
+printf 'GH_TOKEN=%s ARGS=%s\n' "$GH_TOKEN" "$*" >> '{}'
+case "$1 $2" in
+  "pr view")
+    printf 'GraphQL: API rate limit already exceeded\n' >&2
+    exit 1
+    ;;
+  "api repos/danielraffel/pulp/pulls/314")
+    printf '{{"head":{{"ref":"feat/app-quota"}}}}'
+    exit 0
+    ;;
+esac
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 2
+"#,
+                log.display()
+            ),
+        );
+
+        let config = config_with_command_helper(&helper);
+        let client = super::GitHubActions::from_loaded_config(temp.path(), &config)
+            .with_gh_binary_for_tests(&gh);
+
+        let head = client
+            .pr_head_ref("danielraffel/pulp", 314)
+            .expect("head ref");
+
+        assert_eq!(head.as_deref(), Some("feat/app-quota"));
+        let log = std::fs::read_to_string(log).expect("gh log");
+        assert!(log.contains("GH_TOKEN=ghs_app_token ARGS=pr view 314"));
+        assert!(log.contains("GH_TOKEN=ghs_app_token ARGS=api repos/danielraffel/pulp/pulls/314"));
+    }
 
     #[test]
     fn discovers_workflow_dispatch_inputs_and_build_alias() {
