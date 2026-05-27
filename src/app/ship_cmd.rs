@@ -52,6 +52,7 @@ pub(super) struct ShipCommandArgs {
     pub(super) skip_targets: Vec<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn ship_command<W: Write>(
     args: ShipCommandArgs,
     config: &LoadedConfig,
