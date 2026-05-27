@@ -4,12 +4,19 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0600"></a>
-## [0.60.0]
+## [0.60.0] - 2026-05-27
+
+- feat: add app auth and local mac queue concurrency ([#314](https://github.com/danielraffel/Shipyard/pull/314))
 
 <a id="v0590"></a>
-## [0.59.0]
+## [0.59.0] - 2026-05-18
 
-- feat(watch): Phase 2 failure diagnostics — render the Phase 1 failing-job URL + step + parsed test footer on every `shipyard watch --pr N --follow` transition where a target enters a terminal failure state.
+- feat(watch): Phase 2 — diagnostics block on terminal-failure transitions ([#310](https://github.com/danielraffel/Shipyard/pull/310))
+- fix(ship): pin auto-merge failure-path probe to a snapshot (closes #296) ([#309](https://github.com/danielraffel/Shipyard/pull/309))
+- fix(preflight): name --skip-target flag in unreachable error (#301 3/3) ([#308](https://github.com/danielraffel/Shipyard/pull/308))
+- fix(ship): stop claiming "all green" when merge was rejected (#301 2/3) ([#307](https://github.com/danielraffel/Shipyard/pull/307))
+- fix(windows): gate WEBHOOK_REGISTRATION_RETRY_INTERVAL on cfg(unix) ([#305](https://github.com/danielraffel/Shipyard/pull/305))
+- fix(pr): accept `--base origin/main`, not just `--base main` (#301 1/3) ([#306](https://github.com/danielraffel/Shipyard/pull/306))
 
 <a id="v0580"></a>
 ## [0.58.0] - 2026-05-18
@@ -547,6 +554,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.60.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.60.0
+[0.59.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.59.0
 [0.58.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.58.0
 [0.57.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.57.0
 [0.56.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.56.2
