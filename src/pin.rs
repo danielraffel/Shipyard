@@ -2,6 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
+
 /// Location of a consumer repository's Shipyard pin file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsumerPin {
@@ -165,7 +168,22 @@ pub fn origin_main_satisfies_target(main_pin: &str, target: &str) -> bool {
 /// Return the latest published Shipyard release tag via `gh`.
 #[must_use]
 pub fn latest_shipyard_release() -> Option<String> {
-    let output = Command::new("gh")
+    let cwd = std::env::current_dir().ok()?;
+    latest_shipyard_release_from_cwd(RuntimeMode::Shipyard, &cwd)
+}
+
+/// Return the latest published Shipyard release tag via the configured `gh`.
+#[must_use]
+pub fn latest_shipyard_release_from_cwd(mode: RuntimeMode, cwd: &Path) -> Option<String> {
+    let output = GhClient::from_cwd(mode, cwd)
+        .ok()?
+        .prepare_command(
+            cwd,
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .ok()?
         .args([
             "release",
             "list",

@@ -63,9 +63,9 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 | Field                | Purpose                                                                            |
 |----------------------|------------------------------------------------------------------------------------|
 | `target`             | Lane name (`macos`, `ubuntu`, …) — matches `[targets.<name>]` in `.shipyard/config.toml`. |
-| `provider`           | Dispatch channel: `namespace`, `github-hosted`, `ssh`, `ssh-windows`, or a local job id for the queue path. |
-| `run_id`             | GH Actions run ID for cloud, Shipyard job id for local/ssh, or `pending-<target>` when `cloud add-lane` couldn't discover the real run id. **No code backfills this sentinel today** — `watch` is read-only with respect to ship state (cli.py:3497). |
-| `status`             | Last observed lifecycle string: `queued`, `in_progress`, `completed`, `failed`, `cancelled`. `reused` is **not** a valid `DispatchedRun.status` — cross-PR evidence reuse synthesizes a `TargetStatus.PASS` with `backend="reused"` (cli.py:4510) and persists it as `status="completed"` (cli.py:4586). |
+| `provider`           | Dispatch channel or backend label: `namespace`, `github-hosted`, `ssh`, `ssh-windows`, `local`, `host_pool`, etc. |
+| `run_id`             | GH Actions run ID for cloud, Shipyard job id for local/SSH/host-pool work, or `pending-<target>` when `cloud add-lane` couldn't discover the real run id. **No code backfills this sentinel today** — `watch` is read-only with respect to ship state (cli.py:3497). |
+| `status`             | Last observed lifecycle string. `cloud add-lane` records `queued`; the Rust ship worker mirrors terminal target results as `completed` or `failed`. `reused` is **not** a valid `DispatchedRun.status` — cross-PR evidence reuse synthesizes a `TargetStatus.PASS` with `backend="reused"` (cli.py:4510) and persists it as `status="completed"` (cli.py:4586). |
 | `attempt`            | `ShipState.attempt` at dispatch time. Intended to survive resume so old attempts don't reattach, but coupled to the broken `attempt` counter from T8. |
 | `last_heartbeat_at`  | Additive liveness signal (default `None`) — written by the poller via `_update_ship_state_from_job`, used by `watch` to mark `stale` runs. |
 | `phase`              | Additive validation-phase tag (setup/configure/build/test, default `None`), same source as `last_heartbeat_at`. |
@@ -208,6 +208,14 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **Trigger:** `_execute_job` per-target loop; or `shipyard cloud add-lane --apply`; or `shipyard cloud retarget --apply` (see T9 — retarget does NOT advance ship state)
 - **Writes for the `ship` path:** `_execute_job` does NOT save `ShipState` at each target boundary. It only calls `_update_ship_state_from_job` **once** after `job.complete()` (cli.py:4345), which performs one `save()` for the whole batch (cli.py:4595). Within the loop, only the per-job `queue.update(job)` is written.
 - **Writes for `cloud add-lane --apply`:** `append_run(DispatchedRun(..., run_id=discovered or f"pending-{target}"))` then `save`.
+- **Queue scheduler note:** The Rust queue path persists a durable
+  `QueuedExecutionRequest` next to each queued job. A drain owner may move
+  admitted jobs from `Pending` to `Running` before a worker process observes
+  them. Workers now accept a job already transitioned to `Running` by the
+  drain owner and execute it, instead of trying to start it again. If the
+  scheduler starts a job only to defer it for host-pool capacity or an
+  unavailable local lease, the drain owner requeues that transient `Running`
+  job so a later local macOS slot can pick it up.
 - **Externals:** `workflow_dispatch` (cloud), `find_dispatched_run` (best-effort run id discovery), `ExecutorDispatcher.{probe,diagnose,validate}`.
 - **Failure modes**
   - `workflow_dispatch` fails in add-lane → `sys.exit(1)` at cli.py:2328 before any DispatchedRun is appended. *Recovery: retry.*

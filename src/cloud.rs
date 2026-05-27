@@ -5,7 +5,6 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -13,6 +12,8 @@ use serde_json::Value;
 use toml::Table;
 
 use crate::config::LoadedConfig;
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 
 const RUN_JSON_FIELDS: &str =
     "databaseId,status,conclusion,url,createdAt,updatedAt,workflowName,headBranch,headSha";
@@ -182,16 +183,43 @@ impl Display for GitHubError {
 impl Error for GitHubError {}
 
 /// Shell-backed GitHub Actions client.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GitHubActions {
     cwd: PathBuf,
+    gh: Result<GhClient, String>,
 }
+
+impl PartialEq for GitHubActions {
+    fn eq(&self, other: &Self) -> bool {
+        self.cwd == other.cwd
+    }
+}
+
+impl Eq for GitHubActions {}
 
 impl GitHubActions {
     /// Build a client that runs `gh` from `cwd`.
     #[must_use]
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: cwd.into() }
+        Self::from_cwd(RuntimeMode::Shipyard, cwd)
+    }
+
+    /// Build a client that runs `gh` from `cwd` using the requested runtime mode.
+    #[must_use]
+    pub fn from_cwd(mode: RuntimeMode, cwd: impl Into<PathBuf>) -> Self {
+        let cwd = cwd.into();
+        let gh = GhClient::from_cwd(mode, &cwd)
+            .map_err(|error| format!("failed to load GitHub auth config for gh commands: {error}"));
+        Self { cwd, gh }
+    }
+
+    /// Build a client from an already loaded Shipyard config.
+    #[must_use]
+    pub fn from_loaded_config(cwd: impl Into<PathBuf>, config: &LoadedConfig) -> Self {
+        let cwd = cwd.into();
+        let gh = GhClient::from_loaded_config(config)
+            .map_err(|error| format!("failed to load GitHub auth config for gh commands: {error}"));
+        Self { cwd, gh }
     }
 
     /// Dispatch a workflow with optional repository and input fields.
@@ -221,11 +249,11 @@ impl GitHubActions {
     /// Check whether the `gh` CLI is authenticated.
     #[must_use]
     pub fn auth_status(&self) -> bool {
-        Command::new("gh")
-            .args(["auth", "status"])
-            .current_dir(&self.cwd)
-            .output()
-            .is_ok_and(|output| output.status.success())
+        let Ok(mut command) = self.prepare_gh_command() else {
+            return false;
+        };
+        command.args(["auth", "status"]);
+        command.output().is_ok_and(|output| output.status.success())
     }
 
     /// Poll for the most recent run created by a workflow dispatch.
@@ -573,10 +601,10 @@ impl GitHubActions {
             .map(ToOwned::to_owned))
     }
 
-    fn run_gh(&self, args: &[String]) -> Result<String, GitHubError> {
-        let output = Command::new("gh")
+    pub(crate) fn run_gh(&self, args: &[String]) -> Result<String, GitHubError> {
+        let output = self
+            .prepare_gh_command()?
             .args(args)
-            .current_dir(&self.cwd)
             .output()
             .map_err(|error| {
                 GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
@@ -589,6 +617,21 @@ impl GitHubActions {
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn prepare_gh_command(&self) -> Result<std::process::Command, GitHubError> {
+        let client = self
+            .gh
+            .as_ref()
+            .map_err(|error| GitHubError::new(error.clone()))?;
+        client
+            .prepare_command(
+                &self.cwd,
+                None,
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+            )
+            .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
 }
 

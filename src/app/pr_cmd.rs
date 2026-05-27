@@ -11,6 +11,7 @@ use super::{
 };
 use crate::config::LoadedConfig;
 use crate::gate_scripts::{SKILL_SYNC, VERSION_BUMP, VERSIONING_CONFIG, resolve};
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::paths::RuntimePaths;
 
 pub(super) struct PrCommandArgs {
@@ -88,7 +89,7 @@ pub(super) fn pr_command<W: Write>(
         .as_deref()
         .map_or_else(|| PathBuf::from("python3"), Path::to_path_buf);
 
-    warn_missing_release_bot_token(stdout, cwd);
+    warn_missing_release_bot_token(stdout, cwd, config);
     run_skill_sync(stdout, &python, &gates, &repo_root, &args.base)?;
     let bumped_files = run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
     if !bumped_files.is_empty() {
@@ -437,11 +438,19 @@ fn commit_bumped_files(repo_root: &Path, bumped_files: &[String]) -> Result<(), 
     }
 }
 
-fn warn_missing_release_bot_token<W: Write>(stdout: &mut W, cwd: &Path) {
+fn warn_missing_release_bot_token<W: Write>(stdout: &mut W, cwd: &Path, config: &LoadedConfig) {
     let Some(repo) = detect_repo_from_remote(cwd, None) else {
         return;
     };
-    let Ok(output) = crate::supervised::gh_supervised(None)
+    let Ok(client) = GhClient::from_loaded_config(config) else {
+        return;
+    };
+    let Ok(mut command) =
+        client.prepare_command(cwd, None, GhSupervision::Supervised, GhAuthPolicy::Default)
+    else {
+        return;
+    };
+    let Ok(output) = command
         .args([
             "api",
             &format!("repos/{repo}/actions/secrets"),

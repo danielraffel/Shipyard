@@ -11,9 +11,9 @@ use toml::{Table, Value};
 use super::{CliFailure, branch_cmd::detect_repo_from_remote, cli::GovernanceCommand};
 use crate::config::LoadedConfig;
 use crate::governance::{
-    ApplyResult, BranchProtectionRules, build_apply_plan, build_status, compute_drift,
-    execute_apply_plan, get_branch_protection, resolve_branch_rules, rules_from_toml_table,
-    rules_to_toml_table,
+    ApplyResult, BranchProtectionRules, GovernanceGh, build_apply_plan, build_status,
+    compute_drift, execute_apply_plan, get_branch_protection, resolve_branch_rules,
+    rules_from_toml_table, rules_to_toml_table,
 };
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
@@ -41,10 +41,12 @@ fn governance_command_with<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let repo = detect_repo_from_remote(cwd, git_command)
         .ok_or_else(|| CliFailure::new(1, "Could not detect repo from git remote."))?;
+    let gh = GovernanceGh::from_loaded_config(cwd, config, gh_command)
+        .map_err(|error| CliFailure::new(1, error))?;
     match command {
         GovernanceCommand::Status { branches } => {
             let branches = branches_or_main(branches);
-            governance_status(&repo, config, &branches, json_mode, stdout, gh_command)
+            governance_status(&repo, config, &branches, json_mode, stdout, &gh)
         }
         GovernanceCommand::Apply {
             branches,
@@ -58,29 +60,21 @@ fn governance_command_with<W: Write>(
             from_path.as_deref(),
             json_mode,
             stdout,
-            gh_command,
+            &gh,
         ),
         GovernanceCommand::Diff { branches } => {
             let branches = branches_or_main(branches);
-            governance_diff(&repo, config, &branches, stdout, gh_command)
+            governance_diff(&repo, config, &branches, stdout, &gh)
         }
         GovernanceCommand::Export { branches, output } => {
             let branches = branches_or_main(branches);
-            governance_export(&repo, &branches, output.as_deref(), stdout, gh_command)
+            governance_export(&repo, &branches, output.as_deref(), stdout, &gh)
         }
         GovernanceCommand::Use {
             profile_name,
             yes,
             dry_run,
-        } => governance_use(
-            &repo,
-            config,
-            &profile_name,
-            yes,
-            dry_run,
-            stdout,
-            gh_command,
-        ),
+        } => governance_use(&repo, config, &profile_name, yes, dry_run, stdout, &gh),
     }
 }
 
@@ -90,9 +84,9 @@ fn governance_status<W: Write>(
     branches: &[String],
     json_mode: bool,
     stdout: &mut W,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> Result<ExitCode, CliFailure> {
-    let status = build_status(repo, &config.data, branches, gh_command);
+    let status = build_status(repo, &config.data, branches, gh);
     if json_mode {
         let mut data = BTreeMap::new();
         data.insert("repo".to_owned(), JsonValue::from(status.repo.clone()));
@@ -144,12 +138,12 @@ fn governance_apply<W: Write>(
     from_path: Option<&Path>,
     json_mode: bool,
     stdout: &mut W,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> Result<ExitCode, CliFailure> {
     let (results, errors, from_snapshot) = if let Some(path) = from_path {
-        apply_from_snapshot(repo, path, branches, dry_run, gh_command)?
+        apply_from_snapshot(repo, path, branches, dry_run, gh)?
     } else {
-        apply_from_config(repo, config, branches, dry_run, gh_command)?
+        apply_from_config(repo, config, branches, dry_run, gh)?
     };
     render_apply_results(stdout, &results, &errors, dry_run, from_snapshot, json_mode)?;
     let failed = !errors.is_empty() || results.iter().any(|result| result.error_message.is_some());
@@ -165,9 +159,9 @@ fn governance_diff<W: Write>(
     config: &LoadedConfig,
     branches: &[String],
     stdout: &mut W,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> Result<ExitCode, CliFailure> {
-    let status = build_status(repo, &config.data, branches, gh_command);
+    let status = build_status(repo, &config.data, branches, gh);
     let mut any_drift = false;
     for report in &status.reports {
         if !report.has_drift() {
@@ -228,12 +222,12 @@ fn governance_export<W: Write>(
     branches: &[String],
     output: Option<&Path>,
     stdout: &mut W,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> Result<ExitCode, CliFailure> {
     let mut live_branches = BTreeMap::new();
     let mut errors = Vec::new();
     for branch in branches {
-        match get_branch_protection(repo, branch, gh_command) {
+        match get_branch_protection(repo, branch, gh) {
             Ok(Some(rules)) => {
                 live_branches.insert(branch.clone(), rules);
             }
@@ -265,7 +259,7 @@ fn governance_use<W: Write>(
     yes: bool,
     dry_run: bool,
     stdout: &mut W,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> Result<ExitCode, CliFailure> {
     if !matches!(profile_name, "solo" | "multi" | "custom") {
         return Err(CliFailure::new(
@@ -277,7 +271,7 @@ fn governance_use<W: Write>(
     let current_profile = config.get_str("project.profile").unwrap_or("solo");
     let mut hypothetical = config.data.clone();
     set_profile(&mut hypothetical, profile_name)?;
-    let status = build_status(repo, &hypothetical, &[String::from("main")], gh_command);
+    let status = build_status(repo, &hypothetical, &[String::from("main")], gh);
 
     writeln!(
         stdout,
@@ -330,7 +324,7 @@ fn governance_use<W: Write>(
         local_overlay_source: config.local_overlay_source,
     };
     let (results, errors, _) =
-        apply_from_config(repo, &updated, &[String::from("main")], false, gh_command)?;
+        apply_from_config(repo, &updated, &[String::from("main")], false, gh)?;
     render_apply_results(stdout, &results, &errors, false, false, false)?;
     Ok(
         if errors.is_empty() && results.iter().all(|result| result.error_message.is_none()) {
@@ -346,16 +340,16 @@ fn apply_from_config(
     config: &LoadedConfig,
     branches: &[String],
     dry_run: bool,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> Result<(Vec<ApplyResult>, Vec<String>, bool), CliFailure> {
-    let status = build_status(repo, &config.data, branches, gh_command);
+    let status = build_status(repo, &config.data, branches, gh);
     let mut results = Vec::new();
     for report in status.reports {
         let declared = resolve_branch_rules(&config.data, &report.branch)
             .map_err(|error| CliFailure::new(1, error))?;
         let branch = report.branch.clone();
         let plan = build_apply_plan(repo, &branch, declared, report);
-        results.push(execute_apply_plan(plan, dry_run, gh_command));
+        results.push(execute_apply_plan(plan, dry_run, gh));
     }
     Ok((results, status.errors, false))
 }
@@ -365,7 +359,7 @@ fn apply_from_snapshot(
     path: &Path,
     branches: &[String],
     dry_run: bool,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> Result<(Vec<ApplyResult>, Vec<String>, bool), CliFailure> {
     let snapshot = parse_snapshot(path)?;
     if snapshot.repo != repo {
@@ -384,7 +378,7 @@ fn apply_from_snapshot(
             errors.push(format!("{branch}: not in snapshot"));
             continue;
         };
-        let live = match get_branch_protection(repo, branch, gh_command) {
+        let live = match get_branch_protection(repo, branch, gh) {
             Ok(rules) => rules,
             Err(error) => {
                 errors.push(format!("{branch}: {error}"));
@@ -393,7 +387,7 @@ fn apply_from_snapshot(
         };
         let report = compute_drift(branch, declared, declared, live.as_ref());
         let plan = build_apply_plan(repo, branch, declared.clone(), report);
-        results.push(execute_apply_plan(plan, dry_run, gh_command));
+        results.push(execute_apply_plan(plan, dry_run, gh));
     }
     Ok((results, errors, true))
 }

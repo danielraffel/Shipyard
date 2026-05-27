@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -226,6 +228,42 @@ impl ShipStateStore {
     /// Load an active state for a PR.
     #[must_use]
     pub fn get(&self, pr: u64) -> Option<ShipState> {
+        let lock = self.lock_pr(pr).ok()?;
+        self.get_locked(pr, &lock)
+    }
+
+    /// Acquire the per-PR ship-state lock.
+    pub fn lock_pr(&self, pr: u64) -> io::Result<ShipStatePrLock> {
+        ShipStatePrLock::acquire(self.lock_path(pr))
+    }
+
+    /// Load an active state while the caller holds the per-PR lock.
+    #[must_use]
+    pub fn get_locked(&self, pr: u64, _lock: &ShipStatePrLock) -> Option<ShipState> {
+        self.get_unlocked(pr)
+    }
+
+    /// Mutate one PR's state while holding that PR's lock.
+    pub fn with_pr_state_locked<T>(
+        &self,
+        pr: u64,
+        f: impl FnOnce(&mut Option<ShipState>) -> Result<T, Box<dyn std::error::Error>>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let lock = self.lock_pr(pr)?;
+        let mut state = self.get_unlocked(pr);
+        let output = f(&mut state)?;
+        if let Some(state) = state {
+            self.save_locked(&state, &lock)?;
+        } else {
+            let path = self.state_path(pr);
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(output)
+    }
+
+    fn get_unlocked(&self, pr: u64) -> Option<ShipState> {
         let path = self.state_path(pr);
         let contents = fs::read_to_string(path).ok()?;
         serde_json::from_str(&contents).ok()
@@ -233,6 +271,16 @@ impl ShipStateStore {
 
     /// Save a state atomically.
     pub fn save(&self, state: &ShipState) -> Result<(), Box<dyn std::error::Error>> {
+        let lock = self.lock_pr(state.pr)?;
+        self.save_locked(state, &lock)
+    }
+
+    /// Save a state atomically while the caller holds the per-PR lock.
+    pub fn save_locked(
+        &self,
+        state: &ShipState,
+        _lock: &ShipStatePrLock,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let payload = serde_json::to_string_pretty(state)?;
         let temp = tempfile::NamedTempFile::new_in(&self.path)?;
         fs::write(temp.path(), format!("{payload}\n"))?;
@@ -242,6 +290,7 @@ impl ShipStateStore {
 
     /// Delete an active state file.
     pub fn delete(&self, pr: u64) -> Result<(), std::io::Error> {
+        let _lock = self.lock_pr(pr)?;
         let path = self.state_path(pr);
         if path.exists() {
             fs::remove_file(path)?;
@@ -251,6 +300,16 @@ impl ShipStateStore {
 
     /// Move an active state into the archive directory.
     pub fn archive(&self, pr: u64) -> Result<Option<PathBuf>, std::io::Error> {
+        let lock = self.lock_pr(pr)?;
+        self.archive_locked(pr, &lock)
+    }
+
+    /// Move an active state into the archive directory while holding the lock.
+    pub fn archive_locked(
+        &self,
+        pr: u64,
+        _lock: &ShipStatePrLock,
+    ) -> Result<Option<PathBuf>, std::io::Error> {
         let source = self.state_path(pr);
         if !source.exists() {
             return Ok(None);
@@ -312,7 +371,18 @@ impl ShipStateStore {
         state: &ShipState,
         new_attempt: Option<u32>,
     ) -> Result<ShipState, Box<dyn std::error::Error>> {
-        let _ = self.archive(state.pr)?;
+        let lock = self.lock_pr(state.pr)?;
+        self.archive_and_replace_locked(state, new_attempt, &lock)
+    }
+
+    /// Archive the current state and create a fresh attempt while holding the lock.
+    pub fn archive_and_replace_locked(
+        &self,
+        state: &ShipState,
+        new_attempt: Option<u32>,
+        lock: &ShipStatePrLock,
+    ) -> Result<ShipState, Box<dyn std::error::Error>> {
+        let _ = self.archive_locked(state.pr, lock)?;
         let now = Utc::now();
         Ok(ShipState {
             attempt: new_attempt.unwrap_or(state.attempt + 1),
@@ -322,6 +392,38 @@ impl ShipStateStore {
             updated_at: now,
             ..state.clone()
         })
+    }
+
+    fn lock_path(&self, pr: u64) -> PathBuf {
+        self.path.join(format!("{pr}.lock"))
+    }
+}
+
+/// Held per-PR ship-state lock.
+#[derive(Debug)]
+pub struct ShipStatePrLock {
+    file: File,
+}
+
+impl ShipStatePrLock {
+    fn acquire(path: PathBuf) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.lock_exclusive()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ShipStatePrLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -382,6 +484,10 @@ where
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration as StdDuration;
 
     use chrono::{Duration, TimeZone, Utc};
 
@@ -580,6 +686,46 @@ mod tests {
             .filter(|name| name.starts_with('.'))
             .collect::<Vec<_>>();
         assert!(strays.is_empty(), "unexpected temp files: {strays:?}");
+    }
+
+    #[test]
+    fn pr_lock_preserves_two_handle_mutations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(ShipStateStore::new(temp.path().join("ship")).expect("store"));
+        store.save(&sample_state(77, "abc")).expect("save");
+        let writer = Arc::clone(&store);
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let handle = store
+            .with_pr_state_locked(77, |state| {
+                let handle = thread::spawn(move || {
+                    started_tx.send(()).expect("started");
+                    writer
+                        .with_pr_state_locked(77, |state| {
+                            let state = state.as_mut().expect("state");
+                            state.upsert_run(sample_run("linux", "222"));
+                            Ok(())
+                        })
+                        .expect("update linux");
+                });
+                started_rx.recv().expect("started received");
+                thread::sleep(StdDuration::from_millis(50));
+                let state = state.as_mut().expect("state");
+                state.upsert_run(sample_run("mac", "111"));
+                Ok(handle)
+            })
+            .expect("locked mutation");
+        handle.join().expect("writer thread");
+
+        let state = store.get(77).expect("state");
+        assert_eq!(
+            state.get_run("mac").map(|run| run.run_id.as_str()),
+            Some("111")
+        );
+        assert_eq!(
+            state.get_run("linux").map(|run| run.run_id.as_str()),
+            Some("222")
+        );
     }
 
     #[test]

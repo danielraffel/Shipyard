@@ -173,7 +173,12 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         webhook_tx,
     )?;
     let repos = normalize_repos(config.repos);
-    let registrar = Arc::new(Mutex::new(Registrar::new(&config.state_dir)));
+    let registrar_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let registrar = Arc::new(Mutex::new(Registrar::new_with_context(
+        config.mode,
+        &config.state_dir,
+        &registrar_cwd,
+    )));
     let registration_error = Arc::new(Mutex::new(None::<String>));
     let ship_dir = config.state_dir.join("ship");
     let ship_dir_for_list = ship_dir.clone();
@@ -357,11 +362,12 @@ fn archive_closed_pull_request_ship_state(
     }
 
     let store = ShipStateStore::new(ship_dir.to_path_buf()).ok()?;
-    let current = store.get(pr)?;
+    let lock = store.lock_pr(pr).ok()?;
+    let current = store.get_locked(pr, &lock)?;
     if current.repo != repo {
         return None;
     }
-    store.archive(pr).ok().flatten()?;
+    store.archive_locked(pr, &lock).ok().flatten()?;
     previous_states.remove(&pr);
 
     let outcome = if merged { "merged" } else { "closed" };

@@ -8,6 +8,7 @@ whatever you want and can have as many as you need.
 | Target name | Platform | Backend | What it is |
 |------------|----------|---------|------------|
 | `mac` | macos-arm64 | local | Your Apple Silicon Mac |
+| `mac-pool` | macos-arm64 | host-pool | Ordered local Mac pool with leases |
 | `mac-intel` | macos-x64 | local | Your Intel Mac (if you have one) |
 | `ubuntu` | linux-x64 | ssh | Ubuntu VM running on your Mac |
 | `ubuntu-arm` | linux-arm64 | ssh | ARM64 Linux server |
@@ -57,6 +58,69 @@ fallback = [
 
 This keeps things predictable. You always know exactly what Shipyard will
 do because you configured it.
+
+## Prefer a Mac Studio with local fallback
+
+For a two-Mac setup, make the network Mac the primary target and this Mac the
+fallback. This gives you an explicit Mac Studio first path without adding a
+scheduler or hidden self-hosted runner behavior:
+
+```toml
+[targets.mac]
+backend = "ssh"
+host = "mac-studio"
+platform = "macos-arm64"
+repo_path = "/Users/shipyard/work/shipyard"
+warm_keepalive_seconds = 1800
+
+fallback = [
+  { type = "local", cwd = "/Users/danielraffel/Code/shipyard" },
+]
+```
+
+Fallback is for infrastructure failures. If the Mac Studio is reachable and
+the validation command fails, Shipyard reports that failure instead of trying
+to make it pass elsewhere. See [`docs/local-mac-pool.md`](./local-mac-pool.md)
+for the Phase 1 setup checklist and current queue limits.
+
+## Host-pool Mac targets
+
+For a named local Mac pool, configure `[host_pools]` and point a target at it:
+
+```toml
+[host_pools.local_macs]
+strategy = "ordered"
+lease_stale_seconds = 180
+heartbeat_interval_seconds = 15
+
+[[host_pools.local_macs.members]]
+id = "mac-studio"
+type = "ssh"
+host = "mac-studio"
+repo_path = "/Users/shipyard/work/shipyard"
+capabilities = ["macos", "arm64"]
+
+[[host_pools.local_macs.members]]
+id = "local"
+type = "local"
+cwd = "/Users/danielraffel/Code/shipyard"
+capabilities = ["macos", "arm64"]
+
+[targets.mac]
+backend = "host-pool"
+pool = "local_macs"
+platform = "macos-arm64"
+requires = ["macos", "arm64"]
+```
+
+`shipyard targets pool status` shows configured members, active leases, stale
+leases, available slots, and queue job ownership when a pool member is leased.
+`shipyard targets pool cleanup --fix` removes stale lease records from Shipyard
+state; it does not delete remote workdirs. The queue can run multiple
+non-conflicting jobs under one local drain owner, so separate jobs may use
+different available host-pool members concurrently. Jobs still serialize when
+they claim the same checkout, PR state, evidence lane, or exhausted pool
+capacity.
 
 ## Locality routing (`requires`)
 

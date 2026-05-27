@@ -15,6 +15,25 @@ shipyard release-bot setup --siblings other/repo --siblings other/repo2  # hint 
 
 If the wizard can't run (headless, no `gh`, etc.), the manual steps below remain the fallback.
 
+## Operational GitHub auth is separate
+
+`[github.auth]` in Shipyard config controls Shipyard's own built-in
+GitHub CLI calls: PR checks, wait/auto-merge probes, cloud dispatch,
+governance, doctor rate-limit checks, and related operations. It can use
+ambient `gh`, an env token, or a command helper, including a helper that
+mints GitHub App installation tokens.
+
+That auth is intentionally separate from `RELEASE_BOT_TOKEN`. Release-bot
+setup/status remain operator actions and use ambient `gh` auth while they
+create or inspect repository secrets. Changing `[github.auth]` does not
+change the workflow secret or the auto-release contract.
+
+Moving Shipyard to another Mac means moving non-secret config and
+reprovisioning credentials externally. Do not place raw tokens, GitHub App
+private keys, Keychain exports, or token caches in release artifacts or
+Shipyard config. Use `shipyard auth export` / `shipyard auth import` only for
+sanitized `[github.auth]` config movement.
+
 ## One-time setup: `RELEASE_BOT_TOKEN` secret
 
 The auto-release workflow needs a fine-grained PAT to push tags so that downstream `release.yml` actually fires. **Without this secret, auto-release silently degrades**: tags are still created via `GITHUB_TOKEN`, but GitHub Actions deliberately does not chain workflows from `GITHUB_TOKEN`-pushed tags (anti-infinite-loop safety), so `release.yml` never runs and no binaries ship.

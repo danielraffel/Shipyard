@@ -270,7 +270,7 @@ pub fn collect_watch_diagnostics_gh(
     state: &ShipState,
     cache: &mut WatchDiagnosticsCache,
 ) -> Vec<WatchTargetDiagnostics> {
-    let fetcher = GhDiagnosticsFetcher;
+    let fetcher = GhDiagnosticsFetcher::default();
     collect_watch_diagnostics(state, &fetcher, cache)
 }
 

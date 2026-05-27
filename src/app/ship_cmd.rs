@@ -18,7 +18,7 @@ use crate::diagnostics::{
 };
 use crate::evidence::EvidenceStore;
 use crate::executor::dispatch::{ExecutorDispatcher, ResolvedTarget, resolve_targets};
-use crate::governance::{put_branch_protection, resolve_branch_rules};
+use crate::governance::{GovernanceGh, put_branch_protection, resolve_branch_rules};
 use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
 use crate::lane_policy::{LanePolicy, resolve_lane_policy};
 use crate::output::write_json_envelope;
@@ -31,7 +31,7 @@ use crate::preflight::{
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
-use crate::ship::{ShipExecutionRequest, ShipStores, execute_ship};
+use crate::ship::{ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_ship};
 use crate::ship_state::ShipStateStore;
 use crate::warm_pool::{WarmPool, default_pool_path};
 
@@ -52,6 +52,7 @@ pub(super) struct ShipCommandArgs {
     pub(super) skip_targets: Vec<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn ship_command<W: Write>(
     args: ShipCommandArgs,
     config: &LoadedConfig,
@@ -98,7 +99,8 @@ pub(super) fn ship_command<W: Write>(
     let prepared = PreparedStateStore::new(runtime_paths.state_dir.join("prepared"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let warm_pool = WarmPool::new(default_pool_path(&runtime_paths.state_dir));
-    let dispatcher = ExecutorDispatcher::new(Some(prepared));
+    let dispatcher =
+        ExecutorDispatcher::new_with_state_dir(Some(prepared), &runtime_paths.state_dir);
     let request = ShipExecutionRequest {
         pr: pr_context.number,
         repo,
@@ -117,13 +119,17 @@ pub(super) fn ship_command<W: Write>(
         targets,
     };
 
-    let outcome = execute_ship(
+    let job = submit_ship(&request, &mut queue, cwd, &runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let outcome = drain_or_wait_ship(
         &request,
+        job.clone(),
         ShipStores {
             queue: &mut queue,
             evidence: &evidence,
             ship_state: &ship_state,
             warm_pool: &warm_pool,
+            cwd,
             state_dir: &runtime_paths.state_dir,
         },
         &dispatcher,
@@ -143,7 +149,7 @@ pub(super) fn ship_command<W: Write>(
     // before we render so the human / JSON output points the user at the
     // failing test list, not just "Validation failed".
     let diagnostics = if render_state == ShipRenderState::ValidationFailed {
-        collect_failure_diagnostics(&request.repo, &outcome.job)
+        collect_failure_diagnostics(&request.repo, &outcome.job, cwd, config)
     } else {
         Vec::new()
     };
@@ -173,8 +179,13 @@ pub(super) struct RenderedDiagnostics {
     pub(super) details: Option<FailureDiagnostics>,
 }
 
-fn collect_failure_diagnostics(repo: &str, job: &Job) -> Vec<RenderedDiagnostics> {
-    let fetcher = GhDiagnosticsFetcher;
+fn collect_failure_diagnostics(
+    repo: &str,
+    job: &Job,
+    cwd: &Path,
+    config: &LoadedConfig,
+) -> Vec<RenderedDiagnostics> {
+    let fetcher = GhDiagnosticsFetcher::from_loaded_config(cwd, config);
     let mut out = Vec::new();
     for result in job.results.values() {
         if matches!(
@@ -353,7 +364,10 @@ fn maybe_auto_create_base_branch(
     let Ok(rules) = resolve_branch_rules(&config.data, base) else {
         return;
     };
-    let _ = put_branch_protection(&repo, base, &rules, gh_command);
+    let Ok(gh) = GovernanceGh::from_loaded_config(cwd, config, gh_command) else {
+        return;
+    };
+    let _ = put_branch_protection(&repo, base, &rules, &gh);
 }
 
 fn origin_branch_exists(cwd: &Path, branch: &str) -> Option<bool> {

@@ -25,6 +25,36 @@ go/no-go for that operation.
 4. Use `--mode isolated`, temporary install directories, and sandbox HOME/PATH
    roots for rehearsals that must not touch the active production state.
 
+## GitHub Auth And Quota
+
+Shipyard's operational GitHub calls can be configured with `[github.auth]`.
+Default behavior is ambient `gh` auth. Configured env or command-helper tokens
+are injected only into child `gh` commands as `GH_TOKEN`; Shipyard must never
+write raw tokens, GitHub App private keys, Keychain items, 1Password sessions,
+or token caches to config, state, logs, or release artifacts.
+
+When debugging GitHub behavior:
+
+- Run `shipyard doctor --rate-limit --json` to see the effective auth source
+  and REST/GraphQL buckets. This actively resolves configured auth, so command
+  helpers may run and GitHub App helpers may mint installation tokens.
+- Check `.shipyard/config.toml`, `.shipyard.local/config.toml`, and global
+  config for `[github.auth]` before assuming ambient `gh auth status` explains
+  the operation.
+- Treat GitHub App installation tokens and fine-grained tokens as permissions
+  that may not be locally inspectable through `gh auth status`; verify App or
+  token permissions in GitHub when cloud retarget/handoff needs Actions: Read
+  and write.
+- Keep `RELEASE_BOT_TOKEN` separate. `shipyard release-bot setup/status` are
+  operator actions and intentionally use ambient `gh` auth.
+- Mac-to-Mac portability is config-only. Reprovision env vars, Keychain items,
+  1Password sign-in, or App private keys outside Shipyard on the destination
+  Mac.
+- Use `shipyard auth export` and `shipyard auth import --scope local` only for
+  sanitized config movement. The bundle must not contain tokens, private keys,
+  Keychain exports, 1Password sessions, queue state, daemon sockets, or token
+  caches.
+
 ## Drift And Parity
 
 Run drift checks whenever Python Shipyard may have changed:
@@ -225,6 +255,57 @@ For local capacity, keep GitHub Actions as the dispatch layer and use SSH only
 to manage the runner hosts. Stable labels such as `shipyard-macos-arm64`,
 `shipyard-linux-arm64`, and `shipyard-windows-x64` are preferable to raw host
 names in workflow `runs-on` selectors.
+
+For a simple Mac Studio setup, use explicit Shipyard fallback config rather
+than hidden self-hosted runner state:
+
+```toml
+[targets.mac]
+backend = "ssh"
+host = "mac-studio"
+platform = "macos-arm64"
+repo_path = "/Users/shipyard/work/shipyard"
+warm_keepalive_seconds = 1800
+
+fallback = [
+  { type = "local", cwd = "/Users/danielraffel/Code/shipyard" },
+]
+```
+
+For named members and lease visibility, use `backend = "host-pool"`:
+
+```toml
+[host_pools.local_macs]
+strategy = "ordered"
+
+[[host_pools.local_macs.members]]
+id = "mac-studio"
+type = "ssh"
+host = "mac-studio"
+repo_path = "/Users/shipyard/work/shipyard"
+capabilities = ["macos", "arm64"]
+
+[[host_pools.local_macs.members]]
+id = "local"
+type = "local"
+cwd = "/Users/danielraffel/Code/shipyard"
+capabilities = ["macos", "arm64"]
+
+[targets.mac]
+backend = "host-pool"
+pool = "local_macs"
+platform = "macos-arm64"
+requires = ["macos", "arm64"]
+```
+
+Host-pool targets acquire/release local leases, show state through
+`shipyard targets pool status`, and prune stale lease records with
+`shipyard targets pool cleanup --fix`. They can drain multiple
+non-conflicting queued jobs across available members under one local drain
+owner, but they still do not interrupt running GitHub-hosted macOS jobs. Jobs
+serialize when they claim the same checkout, PR state, evidence lane, or
+exhausted pool capacity. See `docs/local-mac-pool.md` before claiming
+multi-Mac throughput.
 
 ## Cloud Retargeting
 

@@ -11,6 +11,8 @@ use crate::daemon_version::{DaemonVersionRelation, read_daemon_version_relation}
 use crate::executor::dispatch::{
     ExecutorDispatcher, ResolvedBackend, ResolvedTarget, resolve_targets,
 };
+use crate::gh::{GhAuthPolicy, GhAuthSourceSummary, GhAuthSummary, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 use crate::job::ValidationMode;
 
 const RELEASE_CHAIN_WORKFLOW: &str = "auto-release.yml";
@@ -115,7 +117,12 @@ impl CommandProbe for SystemCommandProbe {
 
 /// Collect the current machine-scoped doctor report.
 #[must_use]
-pub fn collect_report(probe: &impl CommandProbe, cwd: &Path, state_dir: &Path) -> DoctorReport {
+pub fn collect_report(
+    probe: &impl CommandProbe,
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+) -> DoctorReport {
     let mut checks = BTreeMap::new();
 
     let mut core = BTreeMap::new();
@@ -134,19 +141,30 @@ pub fn collect_report(probe: &impl CommandProbe, cwd: &Path, state_dir: &Path) -
     {
         core.insert("daemon-version".to_owned(), entry);
     }
-    let ready = core.values().all(|entry| entry.ok);
+    let ready = ["git", "ssh", "rich-bundle"]
+        .iter()
+        .all(|name| core.get(*name).is_some_and(|entry| entry.ok))
+        && core.get("macos-gatekeeper").is_none_or(|entry| entry.ok)
+        && core.get("daemon-version").is_none_or(|entry| entry.ok);
     checks.insert("Core".to_owned(), core);
 
     let mut cloud = BTreeMap::new();
     cloud.insert("gh".to_owned(), check_command(probe, "gh", &["--version"]));
-    if let Some(entry) = check_gh_workflow_scope(probe) {
+    let github_auth = github_auth_summary(mode, cwd);
+    cloud.insert(
+        "github-auth".to_owned(),
+        github_auth_entry_result(&github_auth),
+    );
+    if let Ok(summary) = &github_auth
+        && let Some(entry) = check_gh_workflow_scope_for_auth(probe, summary)
+    {
         cloud.insert("gh-scope".to_owned(), entry);
     }
     cloud.insert("nsc".to_owned(), check_command(probe, "nsc", &["version"]));
     checks.insert("Cloud providers".to_owned(), cloud);
 
     let mut release = BTreeMap::new();
-    if let Some(entry) = check_release_bot_token(cwd) {
+    if let Some(entry) = check_release_bot_token(mode, cwd) {
         release.insert("RELEASE_BOT_TOKEN".to_owned(), entry);
     }
     if let Some(entry) = check_tag_drift(cwd, 3) {
@@ -450,10 +468,10 @@ fn enumerate_path_binaries(binary_name: &str, path_env: &str) -> Vec<PathBuf> {
     binaries
 }
 
-fn check_release_bot_token(cwd: &Path) -> Option<DoctorEntry> {
+fn check_release_bot_token(mode: RuntimeMode, cwd: &Path) -> Option<DoctorEntry> {
     let repo = detect_repo_slug(cwd)?;
     check_release_bot_token_with(Some(&repo), |repo_slug| {
-        let output = Command::new("gh")
+        let output = gh_command(mode, cwd)?
             .args([
                 "api",
                 &format!("repos/{repo_slug}/actions/secrets"),
@@ -461,7 +479,6 @@ fn check_release_bot_token(cwd: &Path) -> Option<DoctorEntry> {
                 "--jq",
                 ".secrets[].name",
             ])
-            .current_dir(cwd)
             .output()
             .ok()?;
         if !output.status.success() {
@@ -481,11 +498,18 @@ fn check_release_bot_token(cwd: &Path) -> Option<DoctorEntry> {
 /// Dispatch auto-release.yml and report whether the release-bot checkout chain works.
 #[must_use]
 pub fn check_release_chain(cwd: &Path) -> Option<DoctorEntry> {
+    check_release_chain_with_mode(RuntimeMode::Shipyard, cwd)
+}
+
+/// Dispatch auto-release.yml using the configured GitHub auth for `mode`.
+#[must_use]
+pub fn check_release_chain_with_mode(mode: RuntimeMode, cwd: &Path) -> Option<DoctorEntry> {
     let repo = detect_repo_slug(cwd)?;
     Some(check_release_chain_for_repo(
+        mode,
         cwd,
         &repo,
-        release_bot_secret_state(cwd),
+        release_bot_secret_state(mode, cwd),
     ))
 }
 
@@ -496,8 +520,8 @@ enum ReleaseBotSecretState {
     Unknown,
 }
 
-fn release_bot_secret_state(cwd: &Path) -> ReleaseBotSecretState {
-    match check_release_bot_token(cwd) {
+fn release_bot_secret_state(mode: RuntimeMode, cwd: &Path) -> ReleaseBotSecretState {
+    match check_release_bot_token(mode, cwd) {
         Some(entry) if entry.ok => ReleaseBotSecretState::Present,
         Some(_) => ReleaseBotSecretState::Missing,
         None => ReleaseBotSecretState::Unknown,
@@ -505,12 +529,13 @@ fn release_bot_secret_state(cwd: &Path) -> ReleaseBotSecretState {
 }
 
 fn check_release_chain_for_repo(
+    mode: RuntimeMode,
     cwd: &Path,
     repo: &str,
     secret_state: ReleaseBotSecretState,
 ) -> DoctorEntry {
-    let branch = default_branch(cwd, repo).unwrap_or_else(|| "main".to_owned());
-    let client = GitHubActions::new(cwd);
+    let branch = default_branch(mode, cwd, repo).unwrap_or_else(|| "main".to_owned());
+    let client = GitHubActions::from_cwd(mode, cwd);
     let baseline = match client.latest_workflow_run_for_branch(
         Some(repo),
         RELEASE_CHAIN_WORKFLOW,
@@ -613,15 +638,139 @@ fn release_chain_entry(
     }
 }
 
+/// Summarize the effective GitHub auth Shipyard will apply to operational `gh`
+/// calls.
+#[must_use]
+pub fn check_github_auth(mode: RuntimeMode, cwd: &Path) -> DoctorEntry {
+    let result = github_auth_summary(mode, cwd);
+    github_auth_entry_result(&result)
+}
+
+fn github_auth_summary(mode: RuntimeMode, cwd: &Path) -> Result<GhAuthSummary, String> {
+    let client = GhClient::from_cwd(mode, cwd).map_err(|error| error.to_string())?;
+    client
+        .auth_summary(cwd, GhAuthPolicy::Default)
+        .map_err(|error| error.to_string())
+}
+
+fn github_auth_entry_result(result: &Result<GhAuthSummary, String>) -> DoctorEntry {
+    match result {
+        Ok(summary) => github_auth_entry(summary),
+        Err(error) => DoctorEntry {
+            ok: false,
+            version: Some("misconfigured".to_owned()),
+            detail: Some(format!(
+                "Configured [github.auth] could not be resolved: {error}. Shipyard fails closed and will not silently fall back to ambient gh auth."
+            )),
+            error: Some("github auth unavailable".to_owned()),
+        },
+    }
+}
+
+fn github_auth_entry(summary: &GhAuthSummary) -> DoctorEntry {
+    let mut details = vec![match &summary.source {
+        GhAuthSourceSummary::GhCli => {
+            "Resolved. Shipyard will use ambient gh auth. Classic PAT scopes can usually be inspected with `gh auth status`. If GH_TOKEN is exported in the parent environment, gh gives that token precedence over keychain auth.".to_owned()
+        }
+        GhAuthSourceSummary::Env { token_env } => format!(
+            "Resolved. Shipyard will read {token_env} and inject it into child gh commands as GH_TOKEN. The token value is not stored by Shipyard."
+        ),
+        GhAuthSourceSummary::Command => {
+            "Resolved. Shipyard ran the configured token_command and will inject the returned token into child gh commands as GH_TOKEN. Token helper results are cached only in memory when the helper provides an expiry or TTL.".to_owned()
+        }
+    }];
+
+    if let Some(kind) = summary
+        .token_kind
+        .as_deref()
+        .filter(|kind| !kind.is_empty())
+    {
+        details.push(format!(
+            "Token kind reported by helper: {}",
+            safe_auth_value(kind)
+        ));
+        if kind == "github-app-installation" {
+            details.push(
+                "GitHub App installation token detected. Permissions live on the App installation, not on the invoking user's gh auth scopes.".to_owned(),
+            );
+        }
+    }
+    if let Some(expires_at) = summary.expires_at {
+        details.push(format!("Token expires at {}.", expires_at.to_rfc3339()));
+    }
+
+    DoctorEntry {
+        ok: true,
+        version: Some(github_auth_summary_label(summary)),
+        detail: Some(details.join("\n")),
+        error: None,
+    }
+}
+
+fn github_auth_summary_label(summary: &GhAuthSummary) -> String {
+    let base = match &summary.source {
+        GhAuthSourceSummary::GhCli => "gh-cli (ambient)".to_owned(),
+        GhAuthSourceSummary::Env { token_env } => format!("env {token_env}"),
+        GhAuthSourceSummary::Command => "command helper".to_owned(),
+    };
+    summary
+        .token_kind
+        .as_deref()
+        .filter(|kind| !kind.is_empty())
+        .map_or(base.clone(), |kind| {
+            format!("{base} ({})", safe_auth_value(kind))
+        })
+}
+
+fn safe_auth_value(value: &str) -> String {
+    value.chars().take(80).collect()
+}
+
+fn check_gh_workflow_scope_for_auth(
+    probe: &impl CommandProbe,
+    summary: &GhAuthSummary,
+) -> Option<DoctorEntry> {
+    match &summary.source {
+        GhAuthSourceSummary::GhCli => check_gh_workflow_scope(probe),
+        GhAuthSourceSummary::Env { .. } | GhAuthSourceSummary::Command => {
+            Some(configured_token_scope_entry(summary))
+        }
+    }
+}
+
+fn configured_token_scope_entry(summary: &GhAuthSummary) -> DoctorEntry {
+    let detail = match &summary.source {
+        GhAuthSourceSummary::Env { token_env } => format!(
+            "Configured auth comes from {token_env} and is injected as GH_TOKEN. `gh auth status` reports the ambient login, so Shipyard does not use it as a scope check for this token. Confirm the token has Actions: Read and write when using cloud retarget/handoff."
+        ),
+        GhAuthSourceSummary::Command => {
+            if summary.token_kind.as_deref() == Some("github-app-installation") {
+                "Configured auth comes from a GitHub App installation token. `gh auth status` cannot inspect App installation permissions locally; confirm Actions: Read and write on the App installation when using cloud retarget/handoff.".to_owned()
+            } else {
+                "Configured auth comes from a token helper and is injected as GH_TOKEN. `gh auth status` reports the ambient login, so Shipyard does not use it as a scope check for this token. Confirm the helper-issued token has Actions: Read and write when using cloud retarget/handoff.".to_owned()
+            }
+        }
+        GhAuthSourceSummary::GhCli => unreachable!("ambient gh auth is handled by gh auth status"),
+    };
+    DoctorEntry {
+        ok: false,
+        version: Some(
+            "manual verification required - permissions not inspectable locally".to_owned(),
+        ),
+        detail: Some(detail),
+        error: None,
+    }
+}
+
 fn check_gh_workflow_scope(probe: &impl CommandProbe) -> Option<DoctorEntry> {
     check_gh_workflow_scope_with(|args| probe.run("gh", args))
 }
 
-fn check_gh_workflow_scope_with<F>(mut run_gh: F) -> Option<DoctorEntry>
+fn check_gh_workflow_scope_with<F>(mut run_auth_status: F) -> Option<DoctorEntry>
 where
     F: FnMut(&[&str]) -> Option<DoctorCommandOutput>,
 {
-    let output = run_gh(&["auth", "status", "--hostname", "github.com"])?;
+    let output = run_auth_status(&["auth", "status", "--hostname", "github.com"])?;
     if !output.success {
         return None;
     }
@@ -809,8 +958,8 @@ fn detect_repo_slug(cwd: &Path) -> Option<String> {
     parse_github_repo_slug(String::from_utf8_lossy(&output.stdout).trim())
 }
 
-fn default_branch(cwd: &Path, repo_slug: &str) -> Option<String> {
-    let output = Command::new("gh")
+fn default_branch(mode: RuntimeMode, cwd: &Path, repo_slug: &str) -> Option<String> {
+    let output = gh_command(mode, cwd)?
         .args([
             "repo",
             "view",
@@ -820,7 +969,6 @@ fn default_branch(cwd: &Path, repo_slug: &str) -> Option<String> {
             "--jq",
             ".defaultBranchRef.name",
         ])
-        .current_dir(cwd)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -831,6 +979,18 @@ fn default_branch(cwd: &Path, repo_slug: &str) -> Option<String> {
         return None;
     }
     Some(branch)
+}
+
+fn gh_command(mode: RuntimeMode, cwd: &Path) -> Option<Command> {
+    GhClient::from_cwd(mode, cwd)
+        .ok()?
+        .prepare_command(
+            cwd,
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .ok()
 }
 
 fn parse_github_repo_slug(remote: &str) -> Option<String> {
@@ -860,12 +1020,15 @@ mod tests {
 
     use super::{
         CommandProbe, DoctorCommandOutput, DoctorReport, ReleaseBotSecretState,
-        check_daemon_version_drift_with, check_gh_workflow_scope_with,
-        check_macos_gatekeeper_health_with, check_release_bot_token_with,
-        check_shipyard_path_shadows_with, check_tag_drift_with, collect_report, is_runner_target,
+        check_daemon_version_drift_with, check_gh_workflow_scope_for_auth,
+        check_gh_workflow_scope_with, check_macos_gatekeeper_health_with,
+        check_release_bot_token_with, check_shipyard_path_shadows_with, check_tag_drift_with,
+        collect_report, configured_token_scope_entry, github_auth_entry, is_runner_target,
         parse_github_repo_slug, release_chain_result_entry, runner_check,
     };
     use crate::executor::dispatch::{ExecutorDispatcher, resolve_targets_from_table};
+    use crate::gh::{GhAuthSourceSummary, GhAuthSummary};
+    use crate::identity::RuntimeMode;
     use crate::job::ValidationMode;
 
     struct FakeProbe {
@@ -885,7 +1048,12 @@ mod tests {
                 .map(|(command, version)| ((*command).to_owned(), (*version).to_owned()))
                 .collect(),
         };
-        collect_report(&probe, Path::new("."), Path::new("."))
+        collect_report(
+            &probe,
+            RuntimeMode::Shipyard,
+            Path::new("."),
+            Path::new("."),
+        )
     }
 
     #[test]
@@ -1058,6 +1226,94 @@ mod tests {
             }))
             .is_none()
         );
+    }
+
+    #[test]
+    fn github_auth_entry_describes_env_source_without_token_value() {
+        let summary = GhAuthSummary {
+            source: GhAuthSourceSummary::Env {
+                token_env: "SHIPYARD_GITHUB_TOKEN".to_owned(),
+            },
+            token_kind: None,
+            expires_at: None,
+        };
+
+        let entry = github_auth_entry(&summary);
+
+        assert!(entry.ok);
+        assert_eq!(entry.version.as_deref(), Some("env SHIPYARD_GITHUB_TOKEN"));
+        let detail = entry.detail.as_deref().expect("detail");
+        assert!(detail.contains("SHIPYARD_GITHUB_TOKEN"));
+        assert!(detail.contains("GH_TOKEN"));
+    }
+
+    #[test]
+    fn github_auth_entry_describes_app_helper_expiry() {
+        let expires_at = chrono::DateTime::parse_from_rfc3339("2026-05-26T20:12:00Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        let summary = GhAuthSummary {
+            source: GhAuthSourceSummary::Command,
+            token_kind: Some("github-app-installation".to_owned()),
+            expires_at: Some(expires_at),
+        };
+
+        let entry = github_auth_entry(&summary);
+
+        assert!(entry.ok);
+        assert_eq!(
+            entry.version.as_deref(),
+            Some("command helper (github-app-installation)")
+        );
+        let detail = entry.detail.as_deref().expect("detail");
+        assert!(detail.contains("GitHub App installation token detected"));
+        assert!(detail.contains("2026-05-26T20:12:00+00:00"));
+    }
+
+    #[test]
+    fn configured_token_scope_entry_marks_permissions_uninspectable() {
+        let summary = GhAuthSummary {
+            source: GhAuthSourceSummary::Command,
+            token_kind: Some("github-app-installation".to_owned()),
+            expires_at: None,
+        };
+
+        let entry = configured_token_scope_entry(&summary);
+
+        assert!(!entry.ok);
+        assert!(
+            entry
+                .version
+                .as_deref()
+                .expect("version")
+                .contains("not inspectable locally")
+        );
+        assert!(
+            entry
+                .detail
+                .as_deref()
+                .expect("detail")
+                .contains("App installation permissions")
+        );
+    }
+
+    #[test]
+    fn workflow_scope_uses_ambient_probe_only_for_gh_cli_auth() {
+        let summary = GhAuthSummary {
+            source: GhAuthSourceSummary::GhCli,
+            token_kind: None,
+            expires_at: None,
+        };
+        let probe = FakeProbe {
+            values: std::collections::HashMap::from([(
+                "gh".to_owned(),
+                "Token scopes: 'workflow'\n".to_owned(),
+            )]),
+        };
+
+        let entry = check_gh_workflow_scope_for_auth(&probe, &summary).expect("entry");
+
+        assert!(entry.ok);
     }
 
     #[test]

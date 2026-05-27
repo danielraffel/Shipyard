@@ -1,0 +1,1222 @@
+//! Cooperative queue scheduler planning primitives.
+//!
+//! This module intentionally stops short of starting workers. It provides the
+//! host-pool capacity math that the P2b scheduler admission loop will use.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use chrono::{DateTime, Utc};
+
+use crate::host_pool::{HostPoolConfig, HostPoolLease};
+use crate::job::{Job, JobStatus};
+use crate::queue::{DrainLock, Queue, QueueError, QueuePendingCancellation};
+use crate::queue_request::{
+    HostPoolDemand, JobResourcePlan, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
+    QueuedExecutionRequest,
+};
+
+/// Standard cancellation reason for pending jobs whose durable request envelope
+/// cannot be loaded by the scheduler admit pass.
+pub const ORPHANED_PENDING_REQUEST_REASON: &str = "Queued request envelope missing or unreadable";
+
+/// One pending job plus the scheduler-facing request data needed for admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdmissionRequest {
+    /// Queue job id.
+    pub job_id: String,
+    /// Persisted resource plan when the request envelope loaded cleanly.
+    pub resource_plan: Option<JobResourcePlan>,
+    /// Request-envelope load failure reason, when missing or unreadable.
+    pub missing_request_reason: Option<String>,
+}
+
+impl PendingAdmissionRequest {
+    /// Build a loaded pending admission request from a queued execution
+    /// envelope.
+    #[must_use]
+    pub fn loaded(envelope: &QueuedExecutionEnvelope) -> Self {
+        Self {
+            job_id: envelope.job_id.clone(),
+            resource_plan: Some(envelope.resource_plan.clone()),
+            missing_request_reason: None,
+        }
+    }
+
+    /// Build a pending admission request whose durable request envelope is
+    /// missing or unreadable.
+    #[must_use]
+    pub fn missing(job_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            job_id: job_id.into(),
+            resource_plan: None,
+            missing_request_reason: Some(reason.into()),
+        }
+    }
+}
+
+/// Output of one pure scheduler admit pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdmitPassPlan {
+    /// Pending jobs that can transition to running in this pass.
+    pub admitted: Vec<String>,
+    /// Pending jobs that remain blocked by resource conflicts or capacity.
+    pub deferred: Vec<DeferredAdmission>,
+    /// Pending jobs whose durable request envelope is missing or unreadable.
+    pub orphaned: Vec<OrphanedPendingJob>,
+}
+
+/// One pending job deferred by scheduler admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredAdmission {
+    /// Queue job id.
+    pub job_id: String,
+    /// Admission blockers.
+    pub blockers: Vec<SchedulerAdmissionBlocker>,
+}
+
+/// One pending job whose request envelope could not be used for scheduling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrphanedPendingJob {
+    /// Queue job id.
+    pub job_id: String,
+    /// Cancellation reason to apply through the drain-owned queue primitive.
+    pub reason: String,
+}
+
+/// Output of a request-store-backed admit pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestBackedAdmitPass {
+    /// Pure admit-pass plan.
+    pub plan: AdmitPassPlan,
+    /// Running jobs whose request envelopes could not be loaded. The scheduler
+    /// should avoid starting additional work when this is non-empty.
+    pub running_request_errors: Vec<RequestLoadError>,
+    /// Same-PR ship decisions for future drain-owned cancellation/defer wiring.
+    pub same_pr_ship_admission: SamePrShipAdmission,
+}
+
+/// Durable request envelope load problem observed by the scheduler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestLoadError {
+    /// Queue job id.
+    pub job_id: String,
+    /// Human-readable reason.
+    pub reason: String,
+}
+
+/// Queue mutations applied from one request-backed admit pass.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AppliedAdmitPass {
+    /// Pending jobs transitioned to running.
+    pub started: Vec<Job>,
+    /// Pending jobs cancelled before admission.
+    pub cancelled: Vec<Job>,
+    /// Whether starts were skipped because running request envelopes could not
+    /// be loaded.
+    pub skipped_starts_due_to_running_request_errors: bool,
+}
+
+/// Same-PR `shipyard ship` admission decisions derived from queued request
+/// envelopes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SamePrShipAdmission {
+    /// Older pending same-PR ship jobs that should be cancelled by the drain
+    /// owner.
+    pub pending_cancellations: Vec<SamePrShipPendingCancellation>,
+    /// Pending same-PR ship jobs blocked by an already-running ship job.
+    pub running_conflicts: Vec<SamePrShipRunningConflict>,
+}
+
+/// Older pending same-PR ship job selected for cancellation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SamePrShipPendingCancellation {
+    /// Queue job id to cancel.
+    pub job_id: String,
+    /// Newer pending job id that supersedes this one.
+    pub superseded_by_job_id: String,
+    /// Repository slug.
+    pub repo: String,
+    /// Pull request number.
+    pub pr: u64,
+    /// Cancellation reason to apply through the drain-owned queue primitive.
+    pub reason: String,
+}
+
+/// Pending same-PR ship job blocked by a running ship job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SamePrShipRunningConflict {
+    /// Pending queue job id.
+    pub pending_job_id: String,
+    /// Running queue job id.
+    pub running_job_id: String,
+    /// Repository slug.
+    pub repo: String,
+    /// Pull request number.
+    pub pr: u64,
+    /// Human-readable defer/refusal reason.
+    pub reason: String,
+}
+
+/// One reason a queued job cannot be admitted beside running jobs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SchedulerAdmissionBlocker {
+    /// A scheduler-exclusive claim is already held by a running job.
+    ExclusiveClaim {
+        /// Conflicting claim.
+        claim: String,
+    },
+    /// Host-pool capacity is not available for the candidate.
+    HostPoolCapacity(HostPoolCapacityDeficit),
+}
+
+/// One host-pool capacity deficit that prevents admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostPoolCapacityDeficit {
+    /// Pool name.
+    pub pool_name: String,
+    /// Stable demand capability key.
+    pub capability_key: String,
+    /// Candidate slots requested for this pool/capability group.
+    pub requested_slots: u32,
+    /// Slots left after running reservations and active leases.
+    pub available_slots: u32,
+}
+
+/// Return every blocker for admitting `candidate` alongside currently running
+/// resource plans and active host-pool leases.
+#[must_use]
+pub fn admission_blockers(
+    candidate: &JobResourcePlan,
+    running: &[&JobResourcePlan],
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> Vec<SchedulerAdmissionBlocker> {
+    let mut blockers = exclusive_claim_blockers(candidate, running);
+    blockers.extend(
+        host_pool_capacity_deficits(candidate, running, pools, leases, now)
+            .into_iter()
+            .map(SchedulerAdmissionBlocker::HostPoolCapacity),
+    );
+    blockers
+}
+
+/// Return true when `candidate` can run beside currently running plans.
+#[must_use]
+pub fn can_admit(
+    candidate: &JobResourcePlan,
+    running: &[&JobResourcePlan],
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> bool {
+    admission_blockers(candidate, running, pools, leases, now).is_empty()
+}
+
+/// Greedily plan one scheduler admission pass without mutating queue state.
+///
+/// `pending` must already be sorted in queue order. This function admits each
+/// compatible job into an in-memory occupied set before evaluating later
+/// pending jobs, matching the scheduler loop's greedy behavior.
+#[must_use]
+pub fn plan_admit_pass(
+    pending: &[PendingAdmissionRequest],
+    running: &[JobResourcePlan],
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> AdmitPassPlan {
+    let mut plan = AdmitPassPlan::default();
+    let mut occupied = running.to_vec();
+    for candidate in pending {
+        let Some(resource_plan) = candidate.resource_plan.as_ref() else {
+            plan.orphaned.push(OrphanedPendingJob {
+                job_id: candidate.job_id.clone(),
+                reason: orphan_reason(candidate.missing_request_reason.as_deref()),
+            });
+            continue;
+        };
+        let occupied_refs = occupied.iter().collect::<Vec<_>>();
+        let blockers = admission_blockers(resource_plan, &occupied_refs, pools, leases, now);
+        if blockers.is_empty() {
+            plan.admitted.push(candidate.job_id.clone());
+            occupied.push(resource_plan.clone());
+        } else {
+            plan.deferred.push(DeferredAdmission {
+                job_id: candidate.job_id.clone(),
+                blockers,
+            });
+        }
+    }
+    plan
+}
+
+/// Load request envelopes for queue jobs and run a pure scheduler admit pass.
+///
+/// Pending jobs with missing or unreadable request envelopes are reported as
+/// orphaned pending jobs. Running jobs with missing or unreadable request
+/// envelopes are surfaced separately so the future drain loop can avoid
+/// admitting new work when occupied resources are unknown.
+#[must_use]
+pub fn plan_admit_pass_from_jobs(
+    jobs: &[Job],
+    request_store: &QueueRequestStore,
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> RequestBackedAdmitPass {
+    let same_pr_ship_admission = same_pr_ship_admission(jobs, request_store);
+    let same_pr_excluded = same_pr_ship_admission
+        .pending_cancellations
+        .iter()
+        .map(|cancellation| cancellation.job_id.as_str())
+        .chain(
+            same_pr_ship_admission
+                .running_conflicts
+                .iter()
+                .map(|conflict| conflict.pending_job_id.as_str()),
+        )
+        .collect::<BTreeSet<_>>();
+    let pending = sorted_pending_jobs(jobs)
+        .iter()
+        .filter(|job| !same_pr_excluded.contains(job.id.as_str()))
+        .map(|job| pending_admission_request(job, request_store))
+        .collect::<Vec<_>>();
+    let mut running = Vec::new();
+    let mut running_request_errors = Vec::new();
+    for job in jobs.iter().filter(|job| job.status == JobStatus::Running) {
+        match load_resource_plan(&job.id, request_store) {
+            Ok(Some(plan)) => running.push(plan),
+            Ok(None) => running_request_errors.push(RequestLoadError {
+                job_id: job.id.clone(),
+                reason: ORPHANED_PENDING_REQUEST_REASON.to_owned(),
+            }),
+            Err(error) => running_request_errors.push(RequestLoadError {
+                job_id: job.id.clone(),
+                reason: format!("{ORPHANED_PENDING_REQUEST_REASON}: {error}"),
+            }),
+        }
+    }
+    RequestBackedAdmitPass {
+        plan: plan_admit_pass(&pending, &running, pools, leases, now),
+        running_request_errors,
+        same_pr_ship_admission,
+    }
+}
+
+/// Apply the queue mutations from a request-backed admit pass.
+///
+/// This does not spawn workers. It only performs drain-owned queue state
+/// transitions that are safe before worker ownership exists: cancelling
+/// orphaned/superseded pending jobs and transitioning admitted jobs to running.
+pub fn apply_admit_pass_for_drain(
+    queue: &mut Queue,
+    drain_lock: &DrainLock,
+    pass: &RequestBackedAdmitPass,
+) -> Result<AppliedAdmitPass, QueueError> {
+    let cancellations = admit_pass_cancellations(pass);
+    let cancelled = queue.cancel_pending_jobs_for_drain(drain_lock, &cancellations)?;
+    let skipped_starts_due_to_running_request_errors = !pass.running_request_errors.is_empty();
+    let started = if skipped_starts_due_to_running_request_errors {
+        Vec::new()
+    } else {
+        queue.start_pending_jobs_for_drain(drain_lock, &pass.plan.admitted)?
+    };
+    Ok(AppliedAdmitPass {
+        started,
+        cancelled,
+        skipped_starts_due_to_running_request_errors,
+    })
+}
+
+fn admit_pass_cancellations(pass: &RequestBackedAdmitPass) -> Vec<QueuePendingCancellation> {
+    pass.plan
+        .orphaned
+        .iter()
+        .map(|orphan| QueuePendingCancellation {
+            job_id: orphan.job_id.clone(),
+            reason: orphan.reason.clone(),
+        })
+        .chain(
+            pass.same_pr_ship_admission
+                .pending_cancellations
+                .iter()
+                .map(|cancellation| QueuePendingCancellation {
+                    job_id: cancellation.job_id.clone(),
+                    reason: cancellation.reason.clone(),
+                }),
+        )
+        .collect()
+}
+
+/// Return host-pool deficits for admitting `candidate` alongside already
+/// running resource plans and active, non-stale host-pool leases.
+#[must_use]
+pub fn host_pool_capacity_deficits(
+    candidate: &JobResourcePlan,
+    running: &[&JobResourcePlan],
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> Vec<HostPoolCapacityDeficit> {
+    let pool_map = pools
+        .iter()
+        .map(|pool| (pool.name.as_str(), pool))
+        .collect::<BTreeMap<_, _>>();
+    let mut deficits = Vec::new();
+    for demand in combined_demands(&candidate.host_pools) {
+        let capacity = available_slots_for(&demand, &pool_map, running, leases, now);
+        if demand.slots > capacity {
+            deficits.push(HostPoolCapacityDeficit {
+                pool_name: demand.pool_name,
+                capability_key: demand.capability_key,
+                requested_slots: demand.slots,
+                available_slots: capacity,
+            });
+        }
+    }
+    deficits
+}
+
+fn exclusive_claim_blockers(
+    candidate: &JobResourcePlan,
+    running: &[&JobResourcePlan],
+) -> Vec<SchedulerAdmissionBlocker> {
+    let occupied = running
+        .iter()
+        .flat_map(|plan| plan.exclusive_claims.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let mut conflicts = candidate
+        .exclusive_claims
+        .iter()
+        .filter(|claim| occupied.contains(claim.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    conflicts.sort();
+    conflicts.dedup();
+    conflicts
+        .into_iter()
+        .map(|claim| SchedulerAdmissionBlocker::ExclusiveClaim { claim })
+        .collect()
+}
+
+fn pending_admission_request(
+    job: &Job,
+    request_store: &QueueRequestStore,
+) -> PendingAdmissionRequest {
+    match load_resource_plan(&job.id, request_store) {
+        Ok(Some(resource_plan)) => PendingAdmissionRequest {
+            job_id: job.id.clone(),
+            resource_plan: Some(resource_plan),
+            missing_request_reason: None,
+        },
+        Ok(None) => PendingAdmissionRequest::missing(&job.id, ORPHANED_PENDING_REQUEST_REASON),
+        Err(error) => PendingAdmissionRequest::missing(&job.id, error.to_string()),
+    }
+}
+
+fn load_resource_plan(
+    job_id: &str,
+    request_store: &QueueRequestStore,
+) -> Result<Option<JobResourcePlan>, QueueRequestError> {
+    Ok(request_store
+        .load(job_id)?
+        .map(|envelope| envelope.resource_plan))
+}
+
+fn same_pr_ship_admission(jobs: &[Job], request_store: &QueueRequestStore) -> SamePrShipAdmission {
+    let mut by_pr = BTreeMap::<(String, u64), SamePrShipGroup>::new();
+    for job in jobs
+        .iter()
+        .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
+    {
+        let Some(ship_key) = load_ship_key(&job.id, request_store) else {
+            continue;
+        };
+        let group = by_pr.entry(ship_key).or_default();
+        match job.status {
+            JobStatus::Pending => group.pending.push(job.clone()),
+            JobStatus::Running => group.running.push(job.clone()),
+            _ => {}
+        }
+    }
+
+    let mut admission = SamePrShipAdmission::default();
+    for ((repo, pr), mut group) in by_pr {
+        group.running.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        group.pending.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if let Some(running) = group.running.first() {
+            admission
+                .running_conflicts
+                .extend(
+                    group
+                        .pending
+                        .iter()
+                        .map(|pending| SamePrShipRunningConflict {
+                            pending_job_id: pending.id.clone(),
+                            running_job_id: running.id.clone(),
+                            repo: repo.clone(),
+                            pr,
+                            reason: same_pr_running_reason(&repo, pr, &running.id),
+                        }),
+                );
+            continue;
+        }
+        let Some(newest) = group.pending.last() else {
+            continue;
+        };
+        admission
+            .pending_cancellations
+            .extend(group.pending.iter().rev().skip(1).map(|pending| {
+                SamePrShipPendingCancellation {
+                    job_id: pending.id.clone(),
+                    superseded_by_job_id: newest.id.clone(),
+                    repo: repo.clone(),
+                    pr,
+                    reason: same_pr_superseded_reason(&repo, pr, &newest.id),
+                }
+            }));
+    }
+    admission
+}
+
+#[derive(Default)]
+struct SamePrShipGroup {
+    pending: Vec<Job>,
+    running: Vec<Job>,
+}
+
+fn load_ship_key(job_id: &str, request_store: &QueueRequestStore) -> Option<(String, u64)> {
+    let envelope = request_store.load(job_id).ok().flatten()?;
+    match envelope.request {
+        QueuedExecutionRequest::Ship(request) => Some((request.repo, request.pr)),
+        QueuedExecutionRequest::Run(_) => None,
+    }
+}
+
+fn same_pr_superseded_reason(repo: &str, pr: u64, newer_job_id: &str) -> String {
+    format!("Superseded by newer queued ship for {repo}#{pr} ({newer_job_id})")
+}
+
+fn same_pr_running_reason(repo: &str, pr: u64, running_job_id: &str) -> String {
+    format!("Same-PR ship already running for {repo}#{pr} ({running_job_id})")
+}
+
+fn sorted_pending_jobs(jobs: &[Job]) -> Vec<Job> {
+    let mut pending = jobs
+        .iter()
+        .filter(|job| job.status == JobStatus::Pending)
+        .cloned()
+        .collect::<Vec<_>>();
+    pending.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+    });
+    pending
+}
+
+fn orphan_reason(detail: Option<&str>) -> String {
+    let Some(detail) = detail.filter(|detail| !detail.trim().is_empty()) else {
+        return ORPHANED_PENDING_REQUEST_REASON.to_owned();
+    };
+    if detail == ORPHANED_PENDING_REQUEST_REASON {
+        return ORPHANED_PENDING_REQUEST_REASON.to_owned();
+    }
+    format!("{ORPHANED_PENDING_REQUEST_REASON}: {detail}")
+}
+
+fn available_slots_for(
+    candidate: &HostPoolDemand,
+    pools: &BTreeMap<&str, &HostPoolConfig>,
+    running: &[&JobResourcePlan],
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> u32 {
+    let Some(pool) = pools.get(candidate.pool_name.as_str()) else {
+        return 0;
+    };
+    let eligible_members = eligible_member_ids(pool, &candidate.requires);
+    let total = pool
+        .members
+        .iter()
+        .filter(|member| eligible_members.contains(member.id.as_str()))
+        .map(|member| member.max_concurrency)
+        .sum::<u32>();
+    let active_leases = leases
+        .iter()
+        .filter(|lease| {
+            lease.pool_name == candidate.pool_name
+                && eligible_members.contains(lease.member_id.as_str())
+                && !lease.is_stale(now)
+        })
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
+    let running_reservations = running
+        .iter()
+        .flat_map(|plan| plan.host_pools.iter())
+        .filter(|demand| demand.pool_name == candidate.pool_name)
+        .filter(|demand| {
+            let running_members = eligible_member_ids(pool, &demand.requires);
+            !running_members.is_disjoint(&eligible_members)
+        })
+        .map(|demand| demand.slots)
+        .sum::<u32>();
+
+    total
+        .saturating_sub(active_leases)
+        .saturating_sub(running_reservations)
+}
+
+fn eligible_member_ids<'a>(pool: &'a HostPoolConfig, requires: &[String]) -> BTreeSet<&'a str> {
+    pool.members
+        .iter()
+        .filter(|member| {
+            requires.iter().all(|required| {
+                member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == required)
+            })
+        })
+        .map(|member| member.id.as_str())
+        .collect()
+}
+
+fn combined_demands(demands: &[HostPoolDemand]) -> Vec<HostPoolDemand> {
+    let mut combined = Vec::<HostPoolDemand>::new();
+    for demand in demands {
+        if let Some(existing) = combined.iter_mut().find(|existing| {
+            existing.pool_name == demand.pool_name
+                && existing.capability_key == demand.capability_key
+                && existing.requires == demand.requires
+        }) {
+            existing.slots = existing.slots.saturating_add(demand.slots);
+            continue;
+        }
+        combined.push(demand.clone());
+    }
+    combined
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use chrono::{Duration, Utc};
+
+    use super::{
+        ORPHANED_PENDING_REQUEST_REASON, PendingAdmissionRequest, SchedulerAdmissionBlocker,
+        apply_admit_pass_for_drain, can_admit, host_pool_capacity_deficits, plan_admit_pass,
+        plan_admit_pass_from_jobs,
+    };
+    use crate::host_pool::{HostPoolConfig, HostPoolLease, HostPoolMemberConfig};
+    use crate::job::{Job, JobStatus, Priority, ValidationMode};
+    use crate::queue::Queue;
+    use crate::queue_request::{
+        HostPoolDemand, JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION, QueueRequestStore,
+        QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest, QueuedRunRequest,
+        QueuedShipRequest,
+    };
+
+    fn pool() -> HostPoolConfig {
+        HostPoolConfig {
+            name: "local_macs".to_owned(),
+            strategy: "ordered".to_owned(),
+            lease_stale_seconds: 180,
+            heartbeat_interval_seconds: 15,
+            members: vec![
+                HostPoolMemberConfig {
+                    id: "mac-a".to_owned(),
+                    backend_type: "ssh".to_owned(),
+                    host: Some("mac-a".to_owned()),
+                    repo_path: Some("/repo".to_owned()),
+                    cwd: None,
+                    max_concurrency: 1,
+                    capabilities: vec!["macos".to_owned(), "arm64".to_owned()],
+                },
+                HostPoolMemberConfig {
+                    id: "mac-b".to_owned(),
+                    backend_type: "ssh".to_owned(),
+                    host: Some("mac-b".to_owned()),
+                    repo_path: Some("/repo".to_owned()),
+                    cwd: None,
+                    max_concurrency: 1,
+                    capabilities: vec!["macos".to_owned(), "arm64".to_owned()],
+                },
+            ],
+        }
+    }
+
+    fn plan(slots: u32) -> JobResourcePlan {
+        JobResourcePlan {
+            targets: Vec::new(),
+            exclusive_claims: Vec::new(),
+            cloud_targets: Vec::new(),
+            host_pools: vec![HostPoolDemand {
+                pool_name: "local_macs".to_owned(),
+                requires: vec!["arm64".to_owned(), "macos".to_owned()],
+                slots,
+                capability_key: "arm64+macos".to_owned(),
+            }],
+        }
+    }
+
+    fn claim_plan(claims: &[&str]) -> JobResourcePlan {
+        JobResourcePlan {
+            targets: Vec::new(),
+            exclusive_claims: claims.iter().map(|claim| (*claim).to_owned()).collect(),
+            cloud_targets: Vec::new(),
+            host_pools: Vec::new(),
+        }
+    }
+
+    fn cloud_plan(target: &str) -> JobResourcePlan {
+        JobResourcePlan {
+            targets: vec![target.to_owned()],
+            exclusive_claims: Vec::new(),
+            cloud_targets: vec![target.to_owned()],
+            host_pools: Vec::new(),
+        }
+    }
+
+    fn lease(member_id: &str, expires_at: chrono::DateTime<Utc>) -> HostPoolLease {
+        HostPoolLease {
+            lease_id: format!("lease-{member_id}"),
+            pool_name: "local_macs".to_owned(),
+            member_id: member_id.to_owned(),
+            target_name: "mac".to_owned(),
+            backend: "ssh".to_owned(),
+            host: Some(member_id.to_owned()),
+            job_id: Some("job-running".to_owned()),
+            branch: "main".to_owned(),
+            sha: "abc123".to_owned(),
+            owner_pid: 123,
+            acquired_at: Utc::now(),
+            heartbeat_at: Utc::now(),
+            expires_at,
+        }
+    }
+
+    fn job(id: &str, status: JobStatus, priority: Priority, created_offset_secs: i64) -> Job {
+        Job {
+            id: id.to_owned(),
+            sha: "abc123".to_owned(),
+            branch: "main".to_owned(),
+            mode: ValidationMode::Full,
+            kind: None,
+            target_names: vec!["mac".to_owned()],
+            priority,
+            status,
+            created_at: Utc::now() + Duration::seconds(created_offset_secs),
+            started_at: None,
+            completed_at: None,
+            cancellation_reason: None,
+            cancel_requested_at: None,
+            scheduler_defer_reason: None,
+            scheduler_defer_count: 0,
+            scheduler_defer_until: None,
+            resource_claims: Vec::new(),
+            results: BTreeMap::new(),
+        }
+    }
+
+    fn save_plan(store: &QueueRequestStore, job_id: &str, resource_plan: JobResourcePlan) {
+        store
+            .save(&QueuedExecutionEnvelope {
+                schema_version: QUEUED_EXECUTION_SCHEMA_VERSION,
+                job_id: job_id.to_owned(),
+                kind: QueuedExecutionKind::Run,
+                cwd: PathBuf::from("/repo"),
+                created_at: Utc::now(),
+                resource_plan,
+                request: QueuedExecutionRequest::Run(QueuedRunRequest {
+                    branch: "main".to_owned(),
+                    sha: "abc123".to_owned(),
+                    mode: ValidationMode::Full,
+                    priority: Priority::Normal,
+                    warm_disabled: false,
+                    fail_fast: false,
+                    resume_from: None,
+                    targets: Vec::new(),
+                }),
+            })
+            .expect("save request");
+    }
+
+    fn save_ship(store: &QueueRequestStore, job_id: &str, repo: &str, pr: u64) {
+        store
+            .save(&QueuedExecutionEnvelope {
+                schema_version: QUEUED_EXECUTION_SCHEMA_VERSION,
+                job_id: job_id.to_owned(),
+                kind: QueuedExecutionKind::Ship,
+                cwd: PathBuf::from("/repo"),
+                created_at: Utc::now(),
+                resource_plan: claim_plan(&[&format!("ship-state:{repo}:pr-{pr}")]),
+                request: QueuedExecutionRequest::Ship(QueuedShipRequest {
+                    pr,
+                    repo: repo.to_owned(),
+                    branch: "feature".to_owned(),
+                    base_branch: "main".to_owned(),
+                    sha: "abc123".to_owned(),
+                    commit_subject: "subject".to_owned(),
+                    pr_url: None,
+                    pr_title: None,
+                    mode: ValidationMode::Full,
+                    priority: Priority::Normal,
+                    warm_disabled: false,
+                    fail_fast: false,
+                    resume_from: None,
+                    advisory_targets: std::collections::BTreeSet::default(),
+                    targets: Vec::new(),
+                }),
+            })
+            .expect("save ship request");
+    }
+
+    #[test]
+    fn host_pool_capacity_allows_second_job_when_two_members_exist() {
+        let now = Utc::now();
+        let running = plan(1);
+        let candidate = plan(1);
+
+        let deficits = host_pool_capacity_deficits(&candidate, &[&running], &[pool()], &[], now);
+
+        assert!(deficits.is_empty());
+    }
+
+    #[test]
+    fn host_pool_capacity_blocks_when_running_reservations_exhaust_members() {
+        let now = Utc::now();
+        let running = plan(2);
+        let candidate = plan(1);
+
+        let deficits = host_pool_capacity_deficits(&candidate, &[&running], &[pool()], &[], now);
+
+        assert_eq!(deficits.len(), 1);
+        assert_eq!(deficits[0].available_slots, 0);
+        assert_eq!(deficits[0].requested_slots, 1);
+    }
+
+    #[test]
+    fn host_pool_capacity_counts_only_non_stale_leases() {
+        let now = Utc::now();
+        let candidate = plan(1);
+        let leases = vec![
+            lease("mac-a", now + Duration::seconds(60)),
+            lease("mac-b", now - Duration::seconds(1)),
+        ];
+
+        let deficits = host_pool_capacity_deficits(&candidate, &[], &[pool()], &leases, now);
+
+        assert!(deficits.is_empty());
+    }
+
+    #[test]
+    fn host_pool_capacity_reports_missing_pool_as_deficit() {
+        let now = Utc::now();
+        let candidate = plan(1);
+
+        let deficits = host_pool_capacity_deficits(&candidate, &[], &[], &[], now);
+
+        assert_eq!(deficits.len(), 1);
+        assert_eq!(deficits[0].pool_name, "local_macs");
+        assert_eq!(deficits[0].available_slots, 0);
+    }
+
+    #[test]
+    fn admission_blocks_same_local_cwd() {
+        let now = Utc::now();
+        let running = claim_plan(&["local-cwd:/repo"]);
+        let candidate = claim_plan(&["local-cwd:/repo"]);
+
+        let blockers = super::admission_blockers(&candidate, &[&running], &[], &[], now);
+
+        assert_eq!(
+            blockers,
+            [SchedulerAdmissionBlocker::ExclusiveClaim {
+                claim: "local-cwd:/repo".to_owned(),
+            }]
+        );
+        assert!(!can_admit(&candidate, &[&running], &[], &[], now));
+    }
+
+    #[test]
+    fn admission_blocks_same_remote_and_ship_state_claims() {
+        let now = Utc::now();
+        let running = claim_plan(&[
+            "ssh-repo:mac:/repo",
+            r"ssh-windows-repo:win:C:\repo",
+            "ship-state:danielraffel/shipyard:pr-42",
+        ]);
+
+        for claim in [
+            "ssh-repo:mac:/repo",
+            r"ssh-windows-repo:win:C:\repo",
+            "ship-state:danielraffel/shipyard:pr-42",
+        ] {
+            let candidate = claim_plan(&[claim]);
+            assert!(
+                !can_admit(&candidate, &[&running], &[], &[], now),
+                "{claim}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_allows_unrelated_cloud_jobs() {
+        let now = Utc::now();
+        let running = cloud_plan("linux");
+        let candidate = cloud_plan("windows");
+
+        assert!(can_admit(&candidate, &[&running], &[], &[], now));
+    }
+
+    #[test]
+    fn admission_allows_two_host_pool_jobs_when_two_members_exist() {
+        let now = Utc::now();
+        let running = plan(1);
+        let candidate = plan(1);
+
+        assert!(can_admit(&candidate, &[&running], &[pool()], &[], now));
+    }
+
+    #[test]
+    fn admission_blocks_host_pool_when_capacity_exhausted() {
+        let now = Utc::now();
+        let running = plan(2);
+        let candidate = plan(1);
+
+        let blockers = super::admission_blockers(&candidate, &[&running], &[pool()], &[], now);
+
+        assert!(matches!(
+            blockers.as_slice(),
+            [SchedulerAdmissionBlocker::HostPoolCapacity(deficit)]
+                if deficit.pool_name == "local_macs" && deficit.available_slots == 0
+        ));
+    }
+
+    #[test]
+    fn admission_does_not_serialize_against_unclaimed_fallback_secondary() {
+        let now = Utc::now();
+        let running = claim_plan(&["ssh-repo:mac-b:/repo-b"]);
+        let candidate = claim_plan(&["ssh-repo:mac-a:/repo-a"]);
+
+        assert!(can_admit(&candidate, &[&running], &[], &[], now));
+    }
+
+    #[test]
+    fn admit_pass_greedily_admits_and_defers_against_newly_admitted_jobs() {
+        let now = Utc::now();
+        let first = PendingAdmissionRequest {
+            job_id: "job-a".to_owned(),
+            resource_plan: Some(claim_plan(&["local-cwd:/repo"])),
+            missing_request_reason: None,
+        };
+        let second = PendingAdmissionRequest {
+            job_id: "job-b".to_owned(),
+            resource_plan: Some(claim_plan(&["local-cwd:/repo"])),
+            missing_request_reason: None,
+        };
+        let third = PendingAdmissionRequest {
+            job_id: "job-c".to_owned(),
+            resource_plan: Some(claim_plan(&["local-cwd:/other"])),
+            missing_request_reason: None,
+        };
+
+        let plan = plan_admit_pass(&[first, second, third], &[], &[], &[], now);
+
+        assert_eq!(plan.admitted, ["job-a", "job-c"]);
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.deferred[0].job_id, "job-b");
+        assert_eq!(
+            plan.deferred[0].blockers,
+            [SchedulerAdmissionBlocker::ExclusiveClaim {
+                claim: "local-cwd:/repo".to_owned(),
+            }]
+        );
+        assert!(plan.orphaned.is_empty());
+    }
+
+    #[test]
+    fn admit_pass_reports_missing_request_envelopes_as_orphaned() {
+        let now = Utc::now();
+        let missing = PendingAdmissionRequest::missing("job-missing", "No such file");
+
+        let plan = plan_admit_pass(&[missing], &[], &[], &[], now);
+
+        assert!(plan.admitted.is_empty());
+        assert!(plan.deferred.is_empty());
+        assert_eq!(plan.orphaned.len(), 1);
+        assert_eq!(plan.orphaned[0].job_id, "job-missing");
+        assert_eq!(
+            plan.orphaned[0].reason,
+            format!("{ORPHANED_PENDING_REQUEST_REASON}: No such file")
+        );
+    }
+
+    #[test]
+    fn admit_pass_defers_host_pool_capacity_and_allows_later_independent_job() {
+        let now = Utc::now();
+        let running = plan(2);
+        let host_pool_candidate = PendingAdmissionRequest {
+            job_id: "job-pool".to_owned(),
+            resource_plan: Some(plan(1)),
+            missing_request_reason: None,
+        };
+        let cloud_candidate = PendingAdmissionRequest {
+            job_id: "job-cloud".to_owned(),
+            resource_plan: Some(cloud_plan("linux")),
+            missing_request_reason: None,
+        };
+
+        let plan = plan_admit_pass(
+            &[host_pool_candidate, cloud_candidate],
+            &[running],
+            &[pool()],
+            &[],
+            now,
+        );
+
+        assert_eq!(plan.admitted, ["job-cloud"]);
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.deferred[0].job_id, "job-pool");
+        assert!(matches!(
+            plan.deferred[0].blockers.as_slice(),
+            [SchedulerAdmissionBlocker::HostPoolCapacity(deficit)]
+                if deficit.pool_name == "local_macs"
+        ));
+    }
+
+    #[test]
+    fn request_backed_admit_pass_loads_requests_and_sorts_pending() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_plan(&store, "low", claim_plan(&["local-cwd:/low"]));
+        save_plan(&store, "high-old", claim_plan(&["local-cwd:/high-old"]));
+        save_plan(&store, "high-new", claim_plan(&["local-cwd:/high-new"]));
+        let jobs = vec![
+            job("low", JobStatus::Pending, Priority::Low, -30),
+            job("high-new", JobStatus::Pending, Priority::High, -10),
+            job("high-old", JobStatus::Pending, Priority::High, -20),
+        ];
+
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+
+        assert_eq!(pass.plan.admitted, ["high-old", "high-new", "low"]);
+        assert!(pass.plan.deferred.is_empty());
+        assert!(pass.plan.orphaned.is_empty());
+        assert!(pass.running_request_errors.is_empty());
+    }
+
+    #[test]
+    fn request_backed_admit_pass_reports_missing_pending_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let jobs = vec![job("missing", JobStatus::Pending, Priority::Normal, 0)];
+
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+
+        assert!(pass.plan.admitted.is_empty());
+        assert_eq!(pass.plan.orphaned.len(), 1);
+        assert_eq!(pass.plan.orphaned[0].job_id, "missing");
+        assert_eq!(
+            pass.plan.orphaned[0].reason,
+            ORPHANED_PENDING_REQUEST_REASON
+        );
+    }
+
+    #[test]
+    fn request_backed_admit_pass_reports_missing_running_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_plan(&store, "pending", claim_plan(&["local-cwd:/pending"]));
+        let jobs = vec![
+            job("running", JobStatus::Running, Priority::Normal, -10),
+            job("pending", JobStatus::Pending, Priority::Normal, 0),
+        ];
+
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+
+        assert_eq!(pass.running_request_errors.len(), 1);
+        assert_eq!(pass.running_request_errors[0].job_id, "running");
+        assert_eq!(
+            pass.running_request_errors[0].reason,
+            ORPHANED_PENDING_REQUEST_REASON
+        );
+        assert_eq!(pass.plan.admitted, ["pending"]);
+    }
+
+    #[test]
+    fn request_backed_admit_pass_reports_older_pending_same_pr_ship_cancellations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "older", "danielraffel/shipyard", 42);
+        save_ship(&store, "newer", "danielraffel/shipyard", 42);
+        save_ship(&store, "other", "danielraffel/shipyard", 43);
+        let jobs = vec![
+            job("older", JobStatus::Pending, Priority::Normal, -20),
+            job("newer", JobStatus::Pending, Priority::Normal, -10),
+            job("other", JobStatus::Pending, Priority::Normal, -5),
+        ];
+
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+
+        assert_eq!(pass.plan.admitted, ["newer", "other"]);
+        assert_eq!(
+            pass.same_pr_ship_admission.pending_cancellations,
+            [super::SamePrShipPendingCancellation {
+                job_id: "older".to_owned(),
+                superseded_by_job_id: "newer".to_owned(),
+                repo: "danielraffel/shipyard".to_owned(),
+                pr: 42,
+                reason: "Superseded by newer queued ship for danielraffel/shipyard#42 (newer)"
+                    .to_owned(),
+            }]
+        );
+        assert!(pass.same_pr_ship_admission.running_conflicts.is_empty());
+    }
+
+    #[test]
+    fn request_backed_admit_pass_reports_pending_same_pr_ship_running_conflict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "running", "danielraffel/shipyard", 42);
+        save_ship(&store, "pending", "danielraffel/shipyard", 42);
+        save_ship(&store, "other", "danielraffel/shipyard", 43);
+        let jobs = vec![
+            job("running", JobStatus::Running, Priority::Normal, -20),
+            job("pending", JobStatus::Pending, Priority::Normal, -10),
+            job("other", JobStatus::Pending, Priority::Normal, -5),
+        ];
+
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+
+        assert_eq!(pass.plan.admitted, ["other"]);
+        assert_eq!(
+            pass.same_pr_ship_admission.running_conflicts,
+            [super::SamePrShipRunningConflict {
+                pending_job_id: "pending".to_owned(),
+                running_job_id: "running".to_owned(),
+                repo: "danielraffel/shipyard".to_owned(),
+                pr: 42,
+                reason: "Same-PR ship already running for danielraffel/shipyard#42 (running)"
+                    .to_owned(),
+            }]
+        );
+        assert!(pass.same_pr_ship_admission.pending_cancellations.is_empty());
+    }
+
+    #[test]
+    fn apply_admit_pass_cancels_orphans_and_same_pr_then_starts_admitted_jobs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut admitted = job("admitted", JobStatus::Pending, Priority::Normal, -30);
+        admitted.target_names = vec!["admitted".to_owned()];
+        let mut orphan = job("orphan", JobStatus::Pending, Priority::Normal, -20);
+        orphan.target_names = vec!["orphan".to_owned()];
+        let mut older_ship = job("older-ship", JobStatus::Pending, Priority::Normal, -10);
+        older_ship.target_names = vec!["older-ship".to_owned()];
+        let mut newer_ship = job("newer-ship", JobStatus::Pending, Priority::Normal, 0);
+        newer_ship.target_names = vec!["newer-ship".to_owned()];
+
+        for queued in [
+            admitted.clone(),
+            orphan.clone(),
+            older_ship.clone(),
+            newer_ship.clone(),
+        ] {
+            queue.enqueue(queued).expect("enqueue");
+        }
+        save_plan(&store, "admitted", claim_plan(&["local-cwd:/admitted"]));
+        save_ship(&store, "older-ship", "danielraffel/shipyard", 42);
+        save_ship(&store, "newer-ship", "danielraffel/shipyard", 42);
+        let pass = plan_admit_pass_from_jobs(
+            &[admitted, orphan, older_ship, newer_ship],
+            &store,
+            &[],
+            &[],
+            Utc::now(),
+        );
+        let lock = queue.acquire_drain_lock().expect("lock").expect("held");
+
+        let applied = apply_admit_pass_for_drain(&mut queue, &lock, &pass).expect("apply");
+
+        assert_eq!(
+            applied
+                .started
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            ["admitted", "newer-ship"]
+        );
+        assert_eq!(
+            applied
+                .cancelled
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            ["orphan", "older-ship"]
+        );
+        assert!(!applied.skipped_starts_due_to_running_request_errors);
+        assert_eq!(
+            queue
+                .get("admitted")
+                .expect("admitted")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            queue.get("orphan").expect("orphan").expect("job").status,
+            JobStatus::Cancelled
+        );
+        assert_eq!(
+            queue.get("older-ship").expect("older").expect("job").status,
+            JobStatus::Cancelled
+        );
+        assert_eq!(
+            queue.get("newer-ship").expect("newer").expect("job").status,
+            JobStatus::Running
+        );
+    }
+
+    #[test]
+    fn apply_admit_pass_skips_starts_when_running_request_envelopes_are_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let running = job("running", JobStatus::Running, Priority::Normal, -20);
+        let pending = job("pending", JobStatus::Pending, Priority::Normal, -10);
+
+        queue.enqueue(running.clone()).expect("running");
+        queue.enqueue(pending.clone()).expect("pending");
+        save_plan(&store, "pending", claim_plan(&["local-cwd:/pending"]));
+        let pass = plan_admit_pass_from_jobs(&[running, pending], &store, &[], &[], Utc::now());
+        assert_eq!(pass.plan.admitted, ["pending"]);
+        assert_eq!(pass.running_request_errors.len(), 1);
+        let lock = queue.acquire_drain_lock().expect("lock").expect("held");
+
+        let applied = apply_admit_pass_for_drain(&mut queue, &lock, &pass).expect("apply");
+
+        assert!(applied.started.is_empty());
+        assert!(applied.cancelled.is_empty());
+        assert!(applied.skipped_starts_due_to_running_request_errors);
+        assert_eq!(
+            queue.get("pending").expect("pending").expect("job").status,
+            JobStatus::Pending
+        );
+    }
+}

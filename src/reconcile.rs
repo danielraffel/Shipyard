@@ -6,9 +6,10 @@
 //! reports transitions for daemon IPC subscribers.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -16,6 +17,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use wait_timeout::ChildExt;
 
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
 
 /// How often the daemon should run reconciliation after startup.
@@ -98,6 +101,8 @@ pub enum ReconcileFetchError {
     Command(String),
     /// `gh` returned JSON that did not match the expected object shape.
     Parse(String),
+    /// A configured GitHub auth boundary could not prepare a `gh` command.
+    Prepare(String),
 }
 
 impl Display for ReconcileFetchError {
@@ -106,7 +111,8 @@ impl Display for ReconcileFetchError {
             Self::Io(message)
             | Self::Timeout(message)
             | Self::Command(message)
-            | Self::Parse(message) => formatter.write_str(message),
+            | Self::Parse(message)
+            | Self::Prepare(message) => formatter.write_str(message),
         }
     }
 }
@@ -119,8 +125,15 @@ pub fn reconcile_active_ship_states(
     state_dir: &Path,
     window: &mut ReconcileWindow,
 ) -> ReconcileReport {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let gh_client = GhClient::from_cwd(RuntimeMode::Shipyard, &cwd).map_err(|error| {
+        format!("failed to load GitHub auth config during active reconcile: {error}")
+    });
     reconcile_active_ship_states_with(state_dir, window, Utc::now(), |state| {
-        fetch_status_check_rollup(&state.repo, state.pr)
+        let gh_client = gh_client
+            .as_ref()
+            .map_err(|error| ReconcileFetchError::Prepare(error.clone()))?;
+        fetch_status_check_rollup_with_client(gh_client, &cwd, &state.repo, state.pr)
     })
 }
 
@@ -150,10 +163,26 @@ where
             report.fetch_errors += 1;
             continue;
         };
-        let reconciled = reconcile_ship_state(&state, &rollup, now);
-        if !reconciled.changes.is_empty() && store.save(&reconciled.state).is_ok() {
+        let mut reconciled_changes = Vec::new();
+        let mut reconciled_transitions = Vec::new();
+        let saved = store
+            .with_pr_state_locked(state.pr, |current| {
+                let Some(current_state) = current.as_ref() else {
+                    return Ok(());
+                };
+                let reconciled = reconcile_ship_state(current_state, &rollup, now);
+                if reconciled.changes.is_empty() {
+                    return Ok(());
+                }
+                reconciled_changes = reconciled.changes;
+                reconciled_transitions = reconciled.transitions;
+                *current = Some(reconciled.state);
+                Ok(())
+            })
+            .is_ok();
+        if saved && !reconciled_changes.is_empty() {
             report.healed += 1;
-            report.transitions.extend(reconciled.transitions);
+            report.transitions.extend(reconciled_transitions);
         }
         if was_aged_candidate {
             window.stamp(state.pr, now);
@@ -235,7 +264,43 @@ pub fn reconcile_ship_state(
 
 /// Fetch `statusCheckRollup` for a PR through the GitHub CLI.
 pub fn fetch_status_check_rollup(repo: &str, pr: u64) -> Result<Vec<Value>, ReconcileFetchError> {
-    let mut command = Command::new("gh");
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    fetch_status_check_rollup_with_cwd(RuntimeMode::Shipyard, &cwd, repo, pr)
+}
+
+/// Fetch `statusCheckRollup` for a PR through the configured GitHub CLI boundary.
+pub fn fetch_status_check_rollup_with_cwd(
+    mode: RuntimeMode,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+) -> Result<Vec<Value>, ReconcileFetchError> {
+    let gh_client = GhClient::from_cwd(mode, cwd).map_err(|error| {
+        ReconcileFetchError::Prepare(format!(
+            "failed to load GitHub auth config while reconciling PR #{pr} ({repo}): {error}"
+        ))
+    })?;
+    fetch_status_check_rollup_with_client(&gh_client, cwd, repo, pr)
+}
+
+fn fetch_status_check_rollup_with_client(
+    gh_client: &GhClient,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+) -> Result<Vec<Value>, ReconcileFetchError> {
+    let mut command = gh_client
+        .prepare_command(
+            cwd,
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .map_err(|error| {
+            ReconcileFetchError::Prepare(format!(
+                "failed to prepare gh pr view while reconciling PR #{pr} ({repo}): {error}"
+            ))
+        })?;
     command.args([
         "pr",
         "view",
