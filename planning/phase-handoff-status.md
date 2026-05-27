@@ -811,6 +811,31 @@ Results:
   - The same PR run showed a coverage-only failure in a release-bot fake-`gh`
     test; the fake CLI argument matching is now wildcard-tolerant so the test
     cannot fall through to stdin prompting when the secret probe should match.
+- After PR #314 head `0418def`:
+  - Rechecked GitHub checks with the Shipyard GitHub App installation token.
+  - Current green checks: Versioning & Skill-Sync, both runner-resolution
+    jobs, Python helper tests, Coverage >= 75%, Windows, and both Linux jobs.
+  - Remaining checks are two GitHub-hosted `macOS ARM64` jobs, both pending
+    rather than failed.
+  - Direct job inspection shows both queued jobs have label `macos-15`,
+    `runner_name` empty, no conclusion, and no `completed_at`, confirming they
+    are waiting for a hosted runner assignment rather than failing inside a
+    runner.
+  - `target/debug/shipyard wait pr --state green 314 --timeout 240 --poll-interval 30 --json`
+    returned `PR not found` from this checkout, so it did not provide a usable
+    wait signal for PR #314.
+  - Direct `gh pr view 314 --repo danielraffel/Shipyard --json ...` with the
+    GitHub App installation token confirms PR #314 is still open at head
+    `0418def8b9692d14408686b6629b68682a8743cb`, merge state `UNSTABLE`, with
+    all completed checks successful and only the two `macOS ARM64
+    [github-hosted]` checks still `QUEUED`.
+  - Later poll showed both GitHub-hosted `macOS ARM64` jobs completed
+    successfully. PR #314 checks are green across Linux, Windows, macOS,
+    coverage, Python helper tests, runner resolution, and version/skill sync.
+  - Dry-run `target/debug/shipyard cloud retarget --pr 314 --target mac --provider local`
+    returned a valid retarget plan. It was not applied because the active PR
+    macOS checks are GitHub-native queued jobs and the local PR #314
+    ship-state is stale/old-head.
 - Direct raw `Command::new("gh")` audit now reports only:
   - `src/supervised.rs`
   - `src/gh.rs`
