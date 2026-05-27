@@ -1,13 +1,13 @@
 # Shipyard Queue Concurrency Plan
 
-Status: draft for Phase P2b
-Last updated: 2026-05-26
+Status: implemented for the first Phase P2b concurrency release
+Last updated: 2026-05-27
 Primary handoff: `planning/phase-handoff-status.md`
 Supporting plan: `planning/local-mac-pool.md`
 
-This document designs Phase P2b: concurrent execution of non-conflicting
-queued jobs. It is the missing step between Phase P2a host-pool leases/status
-and Phase P3a adaptive Mac routing.
+This document records the Phase P2b design and implementation status for
+concurrent execution of non-conflicting queued jobs. P2b is the step between
+Phase P2a host-pool leases/status and future Phase P3a adaptive Mac routing.
 
 ## Goals
 
@@ -37,17 +37,18 @@ and Phase P3a adaptive Mac routing.
 
 ## Current State
 
-`shipyard run` and `shipyard ship` still execute synchronously from the
-submitting process today, but the queue and worker handoff foundations are now
-partially in place:
+`shipyard run` and `shipyard ship` still present a synchronous UX to the
+submitting process, but execution now goes through durable submit/wait/drain
+paths:
 
 - `src/app/run_cmd.rs` and `src/app/ship_cmd.rs` resolve targets, preflight,
-  build stores, then call `execute_run` or `execute_ship`.
-- `src/ship.rs` now has `submit_run` / `submit_ship` helpers that persist
-  request envelopes and pending jobs, plus `execute_run_worker` /
-  `execute_ship_worker` helpers under the synchronous wrappers.
-- Workers still run serial targets inline in the submitting process. There is
-  no scheduler loop and no sibling-job concurrency yet.
+  build stores, submit durable jobs, and render from durable queue/outcome
+  state.
+- `src/ship.rs` has `submit_run` / `submit_ship`, `drain_or_wait_run` /
+  `drain_or_wait_ship`, and `execute_run_worker` / `execute_ship_worker`.
+- A submitter that owns the drain lock admits compatible pending jobs, hydrates
+  their durable requests, and runs bounded in-process workers. A losing
+  submitter waits on durable state and periodically retries drain ownership.
 - `src/queue.rs` is now a file-backed handle. Queue read-modify-write
   operations take `queue.state.lock`; stale-running recovery and orphan pending
   request cancellation are explicit drain-owner-only primitives.
@@ -61,22 +62,21 @@ partially in place:
   a queue worker and does not currently execute `run` or `ship` jobs.
 - `src/host_pool.rs` already provides JSON-backed leases with advisory locking,
   capacity checks, heartbeat, release, and stale pruning.
-- `src/executor/dispatch.rs` can validate `ResolvedBackend::HostPool`, but
-  host-pool leases currently receive `job_id: None`, so pool status cannot tie
-  leases back to queue jobs.
+- `src/executor/dispatch.rs` can validate `ResolvedBackend::HostPool`, and
+  queued host-pool leases carry the owning queue job id for pool status.
 
 The important conclusion is that P2b cannot be a small change from
-`get_active()` to `get_active_jobs()`. The queue-state locking and durable
-request/outcome foundations are implemented, but P2b still needs resource
-planning, store locks for other shared JSON files, and a scheduler that owns
-execution.
+`get_active()` to `get_active_jobs()`. The first concurrency release now
+includes queue-state locking, durable request/outcome stores, shared-store
+locks, resource planning, host-pool capacity checks, and a submitter-owned
+cooperative drain scheduler. Daemon-owned queue draining remains future work.
 
 ## Architecture
 
-P2b should add a cooperative queue drain controller rather than requiring the
-existing daemon to become a queue runner immediately.
+P2b adds a cooperative queue drain controller rather than requiring the existing
+daemon to become a queue runner immediately.
 
-The submitting `shipyard run` or `shipyard ship` process should:
+The submitting `shipyard run` or `shipyard ship` process:
 
 1. Resolve config and targets as it does today.
 2. Run preflight as it does today.
@@ -185,12 +185,6 @@ explicit bridge deserialization.
 
 ### Retention
 
-P2b still needs a retention policy for request and outcome JSON. Today
-`QueueRequestStore` and `QueueOutcomeStore` can save and load envelopes, but do
-not prune them. Meanwhile `queue.json` trims terminal jobs, so a future losing
-submitter cannot assume the final queue job is always available by the time it
-renders output.
-
 Done as P2b.5m:
 
 - Added a drain-owned trim primitive that returns the ids of terminal jobs
@@ -198,9 +192,9 @@ Done as P2b.5m:
 - Request/outcome envelopes are not deleted at terminal job completion.
 - Every drain-acquired cycle sweeps `<state_dir>/queue/requests/` and
   `<state_dir>/queue/outcomes/` for entries whose job id is absent from
-  `queue.json`. Delete only entries older than a small grace window so a dead
-  drain owner cannot leak envelopes forever while normal completion races stay
-  protected.
+  `queue.json`. Delete only entries older than the current 60-second grace
+  window (`QUEUE_ENVELOPE_SWEEP_GRACE`) so a dead drain owner cannot leak
+  envelopes forever while normal completion races stay protected.
 - Workers persist the outcome envelope before the terminal `queue.update`, so a
   submitter that observes terminal queue state can also load the outcome. If
   outcome persistence fails, the worker does not mark the job terminal in
@@ -413,9 +407,9 @@ pub fn drain_once(&self) -> Result<ScheduleIteration, QueueSchedulerError>;
 ### Drain Ownership
 
 Only the process holding `Queue::acquire_drain_lock()` may transition pending
-jobs to running or spawn workers. Production submitters do not acquire the
-drain lock today; P2b.5 must make drain ownership the gate before any call to
-`execute_run_worker` or `execute_ship_worker`.
+jobs to running or spawn workers. Production submitters now use
+`drain_or_wait_run` / `drain_or_wait_ship` to cooperatively acquire that drain
+lock. Daemon-owned drain remains a later phase.
 
 If a submitter cannot acquire the drain lock, it waits for its own job while
 periodically trying to acquire the lock. If the prior owner exited, normal
@@ -528,10 +522,9 @@ Concrete P2b behavior:
   unavailability, the drain owner should move the queue job back from
   `Running` to `Pending` and clear transient target results that should be
   retried.
-- Add bounded backoff metadata before retrying, such as `defer_count` and
-  `defer_until`, or keep equivalent scheduler-local retry state while the drain
-  owner is alive. Durable metadata is safer if the drain owner exits between
-  deferral and retry.
+- Requeued jobs record durable backoff/debug metadata:
+  `scheduler_defer_count`, `scheduler_defer_reason`, and
+  `scheduler_defer_until`.
 - A deferred job must continue to count as occupied only while it is `Running`;
   once returned to `Pending`, future admit passes re-evaluate it from the latest
   host-pool leases and running request plans.
@@ -545,6 +538,12 @@ results, preserves terminal results, increments `scheduler_defer_count`, and
 records `scheduler_defer_reason` plus optional `scheduler_defer_until` for
 status/debugging and bounded retry.
 
+Current limitation: `scheduler_defer_until` is persisted for status/debugging,
+but admission does not yet use it to delay a retry, and there is no hard
+terminal cap on `scheduler_defer_count`. A future polish should either enforce
+the persisted backoff/cap or remove the field if immediate re-admission remains
+the intended behavior.
+
 ### Submitter Exit Policy
 
 For default `shipyard run` and `shipyard ship`, the process should stop
@@ -556,9 +555,9 @@ entire queue forever.
 The drain owner cannot release `queue.lock` while any worker it spawned is still
 live, including workers for jobs submitted by other waiting processes. If the
 owner's own job finishes quickly, it may still need to keep the process alive
-until sibling workers finish. A future UX polish should surface this as a
-concise `waiting on N sibling worker(s)` status line; the current P2b.5l path
-does not yet promise that human output.
+until sibling workers finish. Follow-up UX polish can surface this as a concise
+`waiting on N sibling worker(s)` status line; the current first release does
+not promise that human output.
 
 Later, a separate explicit `shipyard queue drain` or daemon-owned drain mode
 can run until the queue is idle.
@@ -571,6 +570,9 @@ matching `QueueOutcomeStore` record once its job is terminal.
 
 Required behavior:
 
+- Workers must persist the outcome snapshot before marking the job terminal in
+  `queue.json`; terminal queue state without a matching required outcome is an
+  error, not permission to rerun or synthesize output.
 - If the submitted job completes normally, render the existing `run` or `ship`
   output from the final queue job plus outcome snapshot.
 - If the submitted job is cancelled before a worker writes an outcome, render
@@ -792,15 +794,15 @@ Done as P2b.4b: cloud add-lane/retarget, daemon reconcile, manual
 `ship-state reconcile`, daemon PR-close archival, and auto-merge archival now
 use the per-PR lock helpers for their active ship-state mutations.
 
-Still pending before concurrent workers are admitted: audit any newly-added
-ship-state writers before scheduler work starts, and keep future writers on the
-locked helper APIs.
+Ongoing hygiene: keep future ship-state writers on the locked helper APIs, and
+audit new writers before widening concurrency or introducing daemon-owned drain.
 
 ### Host Pool Leases
 
-`HostPoolLeaseStore` already uses advisory locking and can remain the
-authoritative capacity gate. P2b should add `job_id` to lease requests and
-status output.
+`HostPoolLeaseStore` already uses advisory locking and remains the
+authoritative capacity gate. Queued host-pool execution passes
+`HostPoolLeaseRequest.job_id = Some(job.id.clone())`, so pool status can show
+the owning queue job.
 
 ## CLI And JSON Compatibility
 
@@ -841,11 +843,22 @@ terminal `Cancelled`; workers observe that state at their next durable-state
 poll and stop without overwriting it.
 
 Decision for P2b: `shipyard cancel` should return success once the durable
-cancellation request is recorded for a pending or running job. Use the standard
-reason `Cancelled by operator` when the command does not provide a more
-specific reason. Human output may continue to print `Cancelled <job_id>`, but
-docs and JSON should treat running-job cancellation as cooperative: the worker
-may still be winding down until its next durable-state poll.
+cancellation request is recorded for a pending or running job. Human output may
+continue to print `Cancelled <job_id>`, and the JSON envelope remains the
+existing job envelope with `command: "cancel"` and `job.status: "cancelled"`.
+Docs and JSON consumers should treat running-job cancellation as cooperative:
+the worker may still be winding down until its next durable-state poll.
+
+Cancellation latency is bounded by worker poll points. Local/SSH/Windows/cloud
+commands are not killed in P2b; a long target can delay cancellation
+observation until the next target boundary or progress callback.
+
+### `shipyard watch --json`
+
+P2b does not change the watch event stream shape. GUI and automation consumers
+should continue reading ship-state/watch events as before; queue concurrency is
+surfaced additively through queue/status `active_runs` and through the existing
+per-target ship-state rows.
 
 ## Implementation Slices
 
@@ -1095,13 +1108,9 @@ cargo test queue::tests::drain_owner_starts_selected_pending_jobs_in_requested_o
 cargo test queue_scheduler::tests::apply_admit_pass_cancels_orphans_and_same_pr_then_starts_admitted_jobs
 ```
 
-Add an integration test during P2b.5k/P2b.5l that opens two `Queue` handles,
-has both attempt admit/apply work under drain ownership, and proves only one
-owner can start a given pending job.
-
-P2b.5n should add end-to-end queue concurrency integration coverage in a
-dedicated integration test file such as `tests/queue_concurrency.rs`, rather
-than relying only on queue and scheduler unit tests.
+P2b.5n added end-to-end queue concurrency integration coverage in
+`tests/queue_concurrency.rs`, rather than relying only on queue and scheduler
+unit tests.
 
 CLI smokes:
 
@@ -1115,7 +1124,7 @@ cargo run --quiet -- --mode isolated --cwd <tmp git repo> --state-dir <tmp> --js
 Do not claim full-suite green until the known auto-merge failures are either
 fixed or explicitly excluded with rationale.
 
-## Open Questions Before Implementation
+## Closed Implementation Decisions
 
 - Keep the first implementation inside submitter-owned cooperative drains. An
   explicit `shipyard queue drain` command or daemon-owned drain loop can reuse
@@ -1123,8 +1132,8 @@ fixed or explicitly excluded with rationale.
   surface until submitter-owned concurrency is proven.
 - Done as P2b.5m: use a conservative worker cap before P2b.5n broad
   integration testing. Resource plans and host-pool capacity still gate actual
-  admission, but a hard cap limits blast radius during the first concurrency
-  release.
+  admission, but `DEFAULT_DRAIN_MAX_WORKERS = 2` limits blast radius during the
+  first concurrency release.
 - Do not offer early detach in the first P2b implementation. A drain owner must
   stay alive until every worker it spawned is terminal before releasing
   `queue.lock`.
