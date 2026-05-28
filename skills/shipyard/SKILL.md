@@ -353,14 +353,15 @@ status`, `shipyard --local-state queue`, `shipyard --local-state logs`,
 `shipyard watch --no-follow`, `shipyard --local-state watch --no-follow`,
 controller-backed `shipyard targets pool status`, `shipyard --local-state
 targets pool status`, `shipyard leave`, and controller-backed `shipyard node
-remove <this-machine-id>`. Public laptop `shipyard run` uses the
-authenticated/idempotent `rpc-enqueue` boundary to persist queued execution
-envelopes on the controller; public laptop `shipyard ship --pr <n>` uses the
-same boundary for ship requests. Run `shipyard controller work` on the
+remove <this-machine-id>`, and controller-backed `shipyard cancel <job-id>`.
+Public laptop `shipyard run` uses the authenticated/idempotent `rpc-enqueue`
+boundary to persist queued execution envelopes on the controller; public laptop
+`shipyard ship --pr <n>` uses the same boundary for ship requests. Run
+`shipyard controller start` (an alias for `shipyard controller work`) on the
 controller to drain queued work continuously, or `shipyard controller work
---once` for a single validation pass. Treat streaming `watch --follow`,
-mutating host-pool cleanup, revoking another node from a client, and HTTPS
-controller RPC as planned, not shipped.
+--once` for a single validation pass. Treat streaming `watch --follow`, mutating
+host-pool cleanup, revoking another node from a client, and HTTPS controller RPC
+as planned, not shipped.
 
 ## Cloud Retargeting
 

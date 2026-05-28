@@ -16,7 +16,7 @@ use super::watch_cmd::{WatchCommandContext, WatchCommandOptions, watch};
 use super::{
     CliFailure,
     cli::{ControllerCommand, NodeCommand},
-    queue_cmd::{evidence_command, logs_command, queue_command, status_command},
+    queue_cmd::{cancel_command, evidence_command, logs_command, queue_command, status_command},
     targets_cmd::targets_pool_status,
 };
 use crate::config::{LoadedConfig, LocalOverlaySource};
@@ -103,6 +103,7 @@ pub(super) fn controller_command<W: Write>(
         | ControllerCommand::RpcEvidence { .. }
         | ControllerCommand::RpcNodeList { .. }
         | ControllerCommand::RpcNodeRemove { .. }
+        | ControllerCommand::RpcCancel { .. }
         | ControllerCommand::RpcTargetsPoolStatus { .. }
         | ControllerCommand::RpcEnqueue { .. }
         | ControllerCommand::RpcWatch { .. }) => {
@@ -120,46 +121,12 @@ fn controller_rpc_command<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
+    if let Some(result) =
+        controller_rpc_read_command(&command, mode, cwd, state_dir, json_mode, stdout)
+    {
+        return result;
+    }
     match command {
-        ControllerCommand::RpcStatus {
-            machine_id,
-            token_stdin,
-        } => controller_rpc_status(
-            mode,
-            cwd,
-            state_dir,
-            &machine_id,
-            token_stdin,
-            json_mode,
-            stdout,
-        ),
-        ControllerCommand::RpcQueue {
-            machine_id,
-            token_stdin,
-        } => controller_rpc_queue(state_dir, &machine_id, token_stdin, json_mode, stdout),
-        ControllerCommand::RpcLogs {
-            machine_id,
-            job_id,
-            target,
-            token_stdin,
-        } => controller_rpc_logs(state_dir, &machine_id, token_stdin, &job_id, target, stdout),
-        ControllerCommand::RpcEvidence {
-            machine_id,
-            branch,
-            token_stdin,
-        } => controller_rpc_evidence(
-            cwd,
-            state_dir,
-            &machine_id,
-            token_stdin,
-            branch,
-            json_mode,
-            stdout,
-        ),
-        ControllerCommand::RpcNodeList {
-            machine_id,
-            token_stdin,
-        } => controller_rpc_node_list(state_dir, &machine_id, token_stdin, json_mode, stdout),
         ControllerCommand::RpcNodeRemove {
             machine_id,
             target_machine_id,
@@ -168,6 +135,18 @@ fn controller_rpc_command<W: Write>(
             state_dir,
             &machine_id,
             &target_machine_id,
+            token_stdin,
+            json_mode,
+            stdout,
+        ),
+        ControllerCommand::RpcCancel {
+            machine_id,
+            job_id,
+            token_stdin,
+        } => controller_rpc_cancel(
+            state_dir,
+            &machine_id,
+            &job_id,
             token_stdin,
             json_mode,
             stdout,
@@ -205,11 +184,85 @@ fn controller_rpc_command<W: Write>(
         ControllerCommand::Status
         | ControllerCommand::Init { .. }
         | ControllerCommand::Invite { .. }
+        | ControllerCommand::RpcStatus { .. }
+        | ControllerCommand::RpcQueue { .. }
+        | ControllerCommand::RpcLogs { .. }
+        | ControllerCommand::RpcEvidence { .. }
+        | ControllerCommand::RpcNodeList { .. }
         | ControllerCommand::Work { .. }
         | ControllerCommand::Join { .. }
-        | ControllerCommand::AcceptJoin { .. } => {
-            unreachable!("non-RPC controller command passed to RPC helper")
-        }
+        | ControllerCommand::AcceptJoin { .. } => unreachable!("non-RPC controller command"),
+    }
+}
+
+fn controller_rpc_read_command<W: Write>(
+    command: &ControllerCommand,
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Option<Result<(), CliFailure>> {
+    match command {
+        ControllerCommand::RpcStatus {
+            machine_id,
+            token_stdin,
+        } => Some(controller_rpc_status(
+            mode,
+            cwd,
+            state_dir,
+            machine_id,
+            *token_stdin,
+            json_mode,
+            stdout,
+        )),
+        ControllerCommand::RpcQueue {
+            machine_id,
+            token_stdin,
+        } => Some(controller_rpc_queue(
+            state_dir,
+            machine_id,
+            *token_stdin,
+            json_mode,
+            stdout,
+        )),
+        ControllerCommand::RpcLogs {
+            machine_id,
+            job_id,
+            target,
+            token_stdin,
+        } => Some(controller_rpc_logs(
+            state_dir,
+            machine_id,
+            *token_stdin,
+            job_id,
+            target.clone(),
+            stdout,
+        )),
+        ControllerCommand::RpcEvidence {
+            machine_id,
+            branch,
+            token_stdin,
+        } => Some(controller_rpc_evidence(
+            cwd,
+            state_dir,
+            machine_id,
+            *token_stdin,
+            branch.clone(),
+            json_mode,
+            stdout,
+        )),
+        ControllerCommand::RpcNodeList {
+            machine_id,
+            token_stdin,
+        } => Some(controller_rpc_node_list(
+            state_dir,
+            machine_id,
+            *token_stdin,
+            json_mode,
+            stdout,
+        )),
+        _ => None,
     }
 }
 
@@ -510,7 +563,7 @@ fn controller_work<W: Write>(
         ));
     }
     let sleep_interval = Duration::from_secs_f64(interval);
-    let mut queue = Queue::new(state_dir.to_path_buf())
+    let mut queue = Queue::new(controller_queue_dir(state_dir))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let evidence = EvidenceStore::new(state_dir.join("evidence"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -744,6 +797,31 @@ fn controller_rpc_node_remove_with_token<W: Write>(
     Ok(())
 }
 
+fn controller_rpc_cancel<W: Write>(
+    state_dir: &Path,
+    machine_id: &str,
+    job_id: &str,
+    token_stdin: bool,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let token = read_rpc_token(token_stdin)?;
+    controller_rpc_cancel_with_token(state_dir, machine_id, job_id, &token, json_mode, stdout)
+}
+
+fn controller_rpc_cancel_with_token<W: Write>(
+    state_dir: &Path,
+    machine_id: &str,
+    job_id: &str,
+    bearer_token: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node_with_token(state_dir, machine_id, bearer_token)?;
+    cancel_command(job_id, state_dir, json_mode, stdout)?;
+    Ok(())
+}
+
 fn controller_rpc_targets_pool_status<W: Write>(
     mode: RuntimeMode,
     cwd: &Path,
@@ -787,7 +865,7 @@ fn controller_rpc_enqueue_request<W: Write>(
 ) -> Result<(), CliFailure> {
     authenticate_rpc_node_with_token(state_dir, machine_id, bearer_token)?;
     let job = job_from_envelope(envelope)?;
-    let mut queue = Queue::new(state_dir.to_path_buf())
+    let mut queue = Queue::new(controller_queue_dir(state_dir))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let request_store =
         QueueRequestStore::new(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -829,6 +907,10 @@ fn controller_rpc_enqueue_request<W: Write>(
         writeln!(stdout, "Queued {}", job.id)
     }
     .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+fn controller_queue_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("queue")
 }
 
 fn read_enqueue_request_from_stdin() -> Result<ControllerEnqueueRequest, CliFailure> {
@@ -1428,6 +1510,42 @@ pub(super) fn remote_node_remove_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+pub(super) fn remote_cancel_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    job_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let client = configured_client(config)?;
+    let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
+        return Err(CliFailure::new(
+            1,
+            "configured controller is not reachable through the implemented SSH transport; use --local-state for local cancel",
+        ));
+    };
+    let remote = remote_controller_cancel_shell_command(machine_id, job_id, json_mode);
+    let output = run_controller_ssh(
+        endpoint,
+        &remote,
+        Some(&client.node_token),
+        "controller cancel",
+    )?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "controller_unreachable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    stdout
+        .write_all(&output.stdout)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 pub(super) fn remote_targets_pool_status_command<W: Write>(
     config: &LoadedConfig,
     machine_id: &str,
@@ -1541,9 +1659,8 @@ fn remote_controller_command<W: Write>(
     local_command_hint: &str,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    // This SSH command transport is intentionally limited to read-only,
-    // no-payload RPCs. Mutating controller RPCs need an idempotent request
-    // envelope before they can safely reuse this boundary.
+    // Shared SSH wrapper for token-authenticated RPCs that need no positional
+    // arguments and no JSON request envelope on stdin.
     let client = configured_client(config)?;
     let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
         return Err(CliFailure::new(
@@ -1729,6 +1846,22 @@ fn remote_controller_node_remove_shell_command(
     remote
 }
 
+fn remote_controller_cancel_shell_command(
+    machine_id: &str,
+    job_id: &str,
+    json_mode: bool,
+) -> String {
+    let mut remote = format!(
+        "shipyard --local-state controller rpc-cancel --machine-id {} --token-stdin {}",
+        shlex_quote(machine_id),
+        shlex_quote(job_id),
+    );
+    if json_mode {
+        remote.push_str(" --json");
+    }
+    remote
+}
+
 fn remote_controller_enqueue_shell_command(machine_id: &str, json_mode: bool) -> String {
     let mut remote = format!(
         "shipyard --local-state controller rpc-enqueue --machine-id {}",
@@ -1793,7 +1926,7 @@ fn configured_client(config: &LoadedConfig) -> Result<ConfiguredClient, CliFailu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{Priority, ValidationMode};
+    use crate::job::{JobStatus, Priority, ValidationMode};
     use crate::queue_request::{
         JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION, QueuedRunRequest,
     };
@@ -1942,7 +2075,7 @@ mod tests {
         assert_eq!(payload["command"], "controller.rpc.enqueue");
         assert_eq!(payload["job"]["id"], "job-remote");
         assert_eq!(payload["idempotent"], false);
-        let mut queue = Queue::new(temp.path()).expect("queue");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
         assert_eq!(
             queue.get("job-remote").expect("queue").expect("job").kind,
             Some(JobKind::Run)
@@ -2099,6 +2232,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_controller_cancel_shell_command_targets_authenticated_cancel_rpc() {
+        let command = remote_controller_cancel_shell_command("sy_node_client", "sy-job", true);
+
+        assert!(command.contains("shipyard --local-state controller rpc-cancel"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--token-stdin"));
+        assert!(command.contains(" sy-job"));
+        assert!(command.ends_with("--json"));
+        assert!(!command.contains("synode_secret"));
+    }
+
+    #[test]
     fn remote_controller_shell_command_targets_authenticated_targets_pool_status_rpc() {
         let command =
             remote_controller_shell_command("rpc-targets-pool-status", "sy_node_client", true);
@@ -2209,5 +2354,44 @@ mod tests {
         assert_eq!(error.code, 2);
         assert!(error.message.contains("controller init"));
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn rpc_cancel_cancels_controller_job_after_auth() {
+        let temp = TempDir::new().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let store = NodeRegistryStore::new(&state_dir);
+        let (_invite, token) = store.create_invite("m5", 15).expect("invite");
+        let join = store
+            .accept_join(&token, "sy_node_client", "m5", Vec::new())
+            .expect("join");
+        let mut queue = Queue::new(state_dir.join("queue")).expect("queue");
+        let job = Job::create(
+            "abc123",
+            "feature/test",
+            vec!["mac".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        );
+        queue.enqueue(job.clone()).expect("enqueue");
+        let mut stdout = Vec::new();
+
+        controller_rpc_cancel_with_token(
+            &state_dir,
+            "sy_node_client",
+            &job.id,
+            &join.bearer_token,
+            true,
+            &mut stdout,
+        )
+        .expect("cancel");
+
+        let payload: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(payload["command"], "cancel");
+        assert_eq!(payload["job"]["id"], job.id);
+        assert_eq!(
+            queue.get(&job.id).expect("queue").expect("job").status,
+            JobStatus::Cancelled
+        );
     }
 }

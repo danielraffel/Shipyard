@@ -55,7 +55,7 @@ use self::cloud_cmd::cloud_command;
 use self::config_cmd::config_command;
 use self::controller_cmd::{
     configured_client_enabled, controller_command, leave_command, node_command,
-    remote_evidence_command, remote_logs_command, remote_node_list_command,
+    remote_cancel_command, remote_evidence_command, remote_logs_command, remote_node_list_command,
     remote_node_remove_command, remote_queue_command, remote_status_command,
     remote_targets_pool_status_command, remote_watch_command,
 };
@@ -746,10 +746,16 @@ fn handle_state_command<W: Write>(
         return remote_evidence_command(&config, &machine_id, branch.as_deref(), json, stdout);
     }
     if !local_state
-        && matches!(
-            command,
-            Command::Cancel { .. } | Command::Bump { .. } | Command::Cleanup { .. }
-        )
+        && let Command::Cancel { job_id } = &command
+        && configured_client_enabled(&config)
+    {
+        let machine_id =
+            crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return remote_cancel_command(&config, &machine_id, job_id, json, stdout);
+    }
+    if !local_state
+        && matches!(command, Command::Bump { .. } | Command::Cleanup { .. })
         && configured_client_enabled(&config)
     {
         return Err(CliFailure::new(
@@ -1276,8 +1282,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        Cli, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_RUN_TERMINAL_WRONG, WAIT_EXIT_UNSUPPORTED, run_with,
-        wait_cmd::parse_github_repo_slug,
+        Cli, Command as AppCommand, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_RUN_TERMINAL_WRONG,
+        WAIT_EXIT_UNSUPPORTED, cli::ControllerCommand, run_with, wait_cmd::parse_github_repo_slug,
     };
     use crate::cloud_records::{CloudRecordStore, CloudRunRecord};
     #[cfg(unix)]
@@ -1308,6 +1314,20 @@ mod tests {
     }
 
     #[test]
+    fn controller_start_parses_as_work_alias() {
+        let cli = Cli::parse_from(["shipyard", "controller", "start", "--interval", "1.5"]);
+
+        let AppCommand::Controller {
+            command: ControllerCommand::Work { once, interval },
+        } = cli.command
+        else {
+            panic!("controller start should parse as controller work alias");
+        };
+        assert!(!once);
+        assert!((interval - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn stateful_commands_refuse_local_split_brain_when_client_configured() {
         let temp = tempfile::tempdir().expect("tempdir");
         let local = temp.path().join(".shipyard-dev.local");
@@ -1318,6 +1338,48 @@ mod tests {
             [multi_host.client]
             enabled = true
             controller = "ssh://mac-studio"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "bump",
+            "sy-job",
+            "high",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("--local-state"));
+    }
+
+    #[test]
+    fn cancel_routes_to_controller_when_client_configured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "https://mac-studio.example.ts.net:8765"
             node_token = "synode_secret"
             "#,
         )
@@ -1345,7 +1407,9 @@ mod tests {
         assert_eq!(code, ExitCode::from(1));
         assert!(stdout.is_empty());
         let message = String::from_utf8(stderr).expect("stderr");
-        assert!(message.contains("--local-state"));
+        assert!(message.contains("implemented SSH transport"));
+        assert!(message.contains("--local-state for local cancel"));
+        assert!(!message.contains("stateful command is not routed"));
     }
 
     #[test]

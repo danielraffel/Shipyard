@@ -16,6 +16,8 @@ shipyard controller status
 shipyard controller init --name mac-studio --endpoint ssh=ssh://mac-studio
 shipyard controller invite --name m5
 shipyard controller join --controller ssh://mac-studio --token syjoin_...
+shipyard controller start      # alias for continuous controller work
+shipyard controller work --once # single controller drain pass for validation
 shipyard node list             # show registered controller/client/worker nodes
 shipyard node remove <machine-id>
 shipyard leave                 # remove local controller-client pairing
@@ -34,6 +36,7 @@ shipyard ship --base develop   # target a different branch
 # Monitor
 shipyard status                # controller-backed when joined; local otherwise
 shipyard queue                 # show all jobs; controller-backed when joined
+shipyard cancel <id>           # cancel a job; controller-backed when joined
 shipyard logs <id>             # per-target logs; controller-backed when joined
 shipyard evidence              # last-good SHA; controller-backed when joined
 shipyard node list             # registered nodes; controller-backed when joined
@@ -137,13 +140,15 @@ init`, `shipyard controller invite`, `shipyard controller join --controller
 ssh://... --token ...`, `shipyard controller status`, `shipyard status`,
 `shipyard queue`, `shipyard logs`, `shipyard evidence`, `shipyard node list`,
 `shipyard watch --no-follow`, `shipyard targets pool status`, `shipyard node
-remove <this-machine-id>`, `shipyard controller work --once`, and `shipyard
-leave`. After join, those state commands ask the controller for shared state;
-use `--local-state` for the laptop-local status, queue, logs, evidence, watch,
-node registry, and host-pool status. `shipyard run` and `shipyard ship --pr
+remove <this-machine-id>`, `shipyard cancel <job-id>`, `shipyard controller
+start`, `shipyard controller work --once`, and `shipyard leave`. After join,
+those state commands ask the controller for shared state; use `--local-state`
+for the laptop-local status, queue, logs, evidence, watch, node registry,
+host-pool status, and cancellation. `shipyard run` and `shipyard ship --pr
 <n>` on a joined client now use the authenticated `rpc-enqueue` boundary to
 persist an idempotent queued execution envelope on the controller; run
-`shipyard controller work` on the controller machine to drain queued work
-continuously, or `shipyard controller work --once` for a single validation pass.
+`shipyard controller start` (an alias for `shipyard controller work`) on the
+controller machine to drain queued work continuously, or `shipyard controller
+work --once` for a single validation pass.
 Streaming `watch --follow`, mutating host-pool cleanup, revoking another node
 from a client, and HTTPS controller RPC are still planned.

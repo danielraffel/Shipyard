@@ -24,15 +24,17 @@ the controller registry when joined, and `shipyard watch --no-follow` reads a
 controller-owned ship-state snapshot. `shipyard targets pool status` reads the
 controller's host-pool leases and capacity, and `shipyard node remove
 <this-machine-id>` routes a self-revocation to the controller; revoking another
-node still requires running `node remove` on the controller. Use `--local-state`
-to inspect this machine's local state instead.
+node still requires running `node remove` on the controller. `shipyard cancel
+<job-id>` also routes to the controller when joined. Use `--local-state` to
+inspect or mutate this machine's local state instead.
 
 The controller `rpc-enqueue` endpoint accepts an authenticated, idempotent
 queued execution envelope and persists it to the controller queue. Public
 laptop `shipyard run` and `shipyard ship --pr <n>` now use that boundary to
-enqueue controller-owned work. `shipyard controller work` runs on the controller
-machine and drains queued work continuously; `shipyard controller work --once`
-runs one drain pass for validation and scripts. In the current first slice,
+enqueue controller-owned work. `shipyard controller start` is an alias for
+`shipyard controller work` and drains queued work continuously on the controller
+machine; `shipyard controller work --once` runs one drain pass for validation
+and scripts. In the current first slice,
 controller-backed
 `shipyard ship` requires an existing `--pr` so client laptops do not create
 PRs, push branches, or auto-create protected base branches before controller
@@ -254,9 +256,10 @@ shipyard controller init --endpoint lan-https=https://192.168.86.20:8765#sha256=
 shipyard controller invite --name m5
 shipyard controller join --controller ssh://mac-studio --token ...
 shipyard controller status
+shipyard controller start
 shipyard controller work --once
-shipyard controller work
 shipyard queue
+shipyard cancel <job-id>
 shipyard logs <id>
 shipyard evidence
 shipyard node list

@@ -513,6 +513,7 @@ pub(super) enum ControllerCommand {
         ttl_minutes: i64,
     },
     /// Drain controller-owned queued work on this machine.
+    #[command(alias = "start")]
     Work {
         /// Run a single drain pass and exit.
         #[arg(long)]
@@ -617,6 +618,18 @@ pub(super) enum ControllerCommand {
         machine_id: String,
         /// Machine id to revoke. Must match the authenticated caller.
         target_machine_id: String,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
+    },
+    /// Cancel a controller-owned queued job after bearer-token verification.
+    #[command(name = "rpc-cancel", hide = true)]
+    RpcCancel {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+        /// Job identifier.
+        job_id: String,
         /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
         #[arg(long = "token-stdin", hide = true)]
         token_stdin: bool,
