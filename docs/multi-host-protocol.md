@@ -14,10 +14,20 @@ private tailnet reachability, local controller registry initialization with
 `shipyard controller invite`, and registry inspection/revocation with
 `shipyard node list` / `shipyard node remove`.
 
-Remote join, controller RPC serving, remote enqueue/status/watch, heartbeats,
-and `shipyard leave` are still planned follow-on slices. Until those land, the
-registry commands establish the secure local data model but do not yet make a
-laptop submit work to a Mac Studio controller.
+An SSH-backed first controller/client slice is implemented: `shipyard
+controller join --controller ssh://host --token ...` consumes a controller
+invite over SSH, writes client-local config, stores only bearer-token hashes on
+the controller, `shipyard leave` removes local client config, and `shipyard
+status` routes to the controller when client config is enabled. Use
+`--local-state` to inspect this machine's local state instead.
+
+HTTP controller serving, remote enqueue/ship/watch, periodic heartbeats, and
+GUI consumption are still follow-on slices. Until those land, SSH-backed status
+proves the trust/config/routing model but does not yet make a laptop enqueue
+work to a Mac Studio controller.
+When client config is enabled, stateful local commands that are not yet routed
+to the controller fail closed unless `--local-state` is supplied, so a laptop
+does not silently mutate a separate local queue by accident.
 
 ## Roles
 
@@ -51,6 +61,9 @@ shipyard controller join \
 
 The join token is only for bootstrap. A successful join creates a per-node
 bearer token for subsequent RPCs and writes client-local controller config.
+The SSH transport invokes a controller-side accept command and then uses the
+bearer token for controller RPCs; the token is sent through the encrypted SSH
+channel and is never written to controller state in plaintext.
 
 ## Machine Identity
 
@@ -71,8 +84,6 @@ Clients can remove their local controller config with:
 ```bash
 shipyard leave
 ```
-
-`shipyard leave` is not implemented yet.
 
 ## Transport And Endpoints
 
@@ -223,11 +234,14 @@ shipyard controller init --name mac-studio --endpoint ssh=ssh://mac-studio
 shipyard controller init --endpoint tailscale-dns=https://mac-studio.example.ts.net:8765
 shipyard controller init --endpoint lan-https=https://192.168.86.20:8765#sha256=<fingerprint>
 shipyard controller invite --name m5
-shipyard controller join --controller ... --token ...
+shipyard controller join --controller ssh://mac-studio --token ...
+shipyard controller status
+shipyard leave
 ```
 
-`controller init` and `controller invite` exist now. `controller join` is
-planned. Low-level settings can also be written through the config CLI:
+`controller join` currently supports `ssh://` endpoints. HTTPS endpoints remain
+validated data-model entries until a pinned-TLS controller server is available.
+Low-level settings can also be written through the config CLI:
 
 ```bash
 shipyard config set multi_host.controller.enabled true --scope local

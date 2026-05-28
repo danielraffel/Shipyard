@@ -615,9 +615,12 @@ local Tailscale private-tailnet path that controller setup will prefer, run
 `shipyard network tailscale status --json`; this reports private tailnet
 reachability separately from Tailscale Funnel readiness.
 Use `shipyard controller init`, `shipyard controller invite`,
-`shipyard node list`, and `shipyard node remove` for the implemented local
-registry slice. Do not claim remote laptop enqueue/status is available until
-the controller RPC/join slice lands.
+`shipyard controller join --controller ssh://... --token ...`,
+`shipyard controller status`, `shipyard status`, `shipyard --local-state
+status`, `shipyard leave`, `shipyard node list`, and `shipyard node remove`
+for the implemented SSH-backed first slice. This proves secure pairing and
+controller-backed status. Do not claim remote laptop enqueue/ship/watch or
+HTTPS controller RPC is available until those slices land.
 
 ### Locality routing (`requires`)
 

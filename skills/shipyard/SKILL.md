@@ -342,10 +342,12 @@ route remote enqueue/status through the authenticated protocol described in
 `docs/multi-host-protocol.md`. `shipyard network tailscale status --json`
 exposes the existing Tailscale probe for private tailnet reachability; this is
 separate from Tailscale Funnel readiness used by webhook tunneling.
-The implemented local registry commands are `shipyard controller init`,
-`shipyard controller invite`, `shipyard node list`, and
-`shipyard node remove`. Treat remote join/RPC/enqueue/watch as planned, not
-shipped.
+The implemented SSH-backed first slice includes `shipyard controller init`,
+`shipyard controller invite`, `shipyard controller join --controller
+ssh://... --token ...`, `shipyard controller status`, controller-backed
+`shipyard status`, `shipyard --local-state status`, `shipyard leave`,
+`shipyard node list`, and `shipyard node remove`. Treat remote
+enqueue/ship/watch and HTTPS controller RPC as planned, not shipped.
 
 ## Cloud Retargeting
 

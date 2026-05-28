@@ -124,6 +124,15 @@ pub struct NodeInvite {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Successful join result returned to a client.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeJoin {
+    /// Registered node.
+    pub node: NodeRecord,
+    /// Per-node bearer token shown once to the joining client.
+    pub bearer_token: String,
+}
+
 /// Registry command error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeRegistryError {
@@ -245,6 +254,63 @@ impl NodeRegistryStore {
         invites.push(invite.clone());
         write_json_array(&self.invites_path(), &invites)?;
         Ok((invite, token))
+    }
+
+    /// Consume a one-time invite token and register a node with a per-node bearer token.
+    pub fn accept_join(
+        &self,
+        token: &str,
+        machine_id: &str,
+        name: &str,
+        capabilities: Vec<String>,
+    ) -> Result<NodeJoin, NodeRegistryError> {
+        let now = Utc::now();
+        let expected_hash = token_hash(token);
+        let mut invites: Vec<NodeInvite> = read_json_array(&self.invites_path())?;
+        let Some(index) = invites
+            .iter()
+            .position(|invite| invite.expires_at > now && invite.token_hash == expected_hash)
+        else {
+            return Err(NodeRegistryError::new("join token is invalid or expired"));
+        };
+        invites.remove(index);
+        write_json_array(&self.invites_path(), &invites)?;
+
+        let bearer_token = generate_secret("synode")?;
+        let node = self.upsert_node(NodeRecord {
+            machine_id: machine_id.to_owned(),
+            name: name.to_owned(),
+            role: NodeRole::Client,
+            capabilities,
+            endpoints: Vec::new(),
+            token_hash: Some(token_hash(&bearer_token)),
+            created_at: now,
+            last_seen_at: now,
+            revoked_at: None,
+        })?;
+        Ok(NodeJoin { node, bearer_token })
+    }
+
+    /// Verify a registered node's bearer token and refresh its heartbeat.
+    pub fn authenticate_node(
+        &self,
+        machine_id: &str,
+        bearer_token: &str,
+    ) -> Result<NodeRecord, NodeRegistryError> {
+        let mut nodes = self.list_nodes()?;
+        let Some(node) = nodes.iter_mut().find(|node| node.machine_id == machine_id) else {
+            return Err(NodeRegistryError::new("node is not registered"));
+        };
+        if node.revoked_at.is_some() {
+            return Err(NodeRegistryError::new("node is revoked"));
+        }
+        if node.token_hash.as_deref() != Some(token_hash(bearer_token).as_str()) {
+            return Err(NodeRegistryError::new("node bearer token denied"));
+        }
+        node.last_seen_at = Utc::now();
+        let authenticated = node.clone();
+        write_json_array(&self.nodes_path(), &nodes)?;
+        Ok(authenticated)
     }
 }
 
@@ -369,5 +435,54 @@ mod tests {
         assert!(token.starts_with("syjoin_"));
         assert_eq!(invite.token_hash, token_hash(&token));
         assert!(!raw.contains(&token));
+    }
+
+    #[test]
+    fn accept_join_consumes_invite_and_stores_only_bearer_hash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = NodeRegistryStore::new(temp.path());
+        let (_invite, token) = store.create_invite("m5", 15).expect("invite");
+
+        let join = store
+            .accept_join(
+                &token,
+                "sy_node_client",
+                "m5",
+                vec!["macos".to_owned(), "arm64".to_owned()],
+            )
+            .expect("join");
+        let nodes_raw = fs::read_to_string(store.nodes_path()).expect("nodes");
+        let invites = fs::read_to_string(store.invites_path()).expect("invites");
+
+        assert!(join.bearer_token.starts_with("synode_"));
+        assert_eq!(join.node.role, NodeRole::Client);
+        assert_eq!(join.node.token_hash, Some(token_hash(&join.bearer_token)));
+        assert!(!nodes_raw.contains(&join.bearer_token));
+        assert!(!invites.contains(&token));
+        store
+            .authenticate_node("sy_node_client", &join.bearer_token)
+            .expect("auth");
+        assert!(
+            store
+                .accept_join(&token, "other", "other", Vec::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn revoked_node_cannot_authenticate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = NodeRegistryStore::new(temp.path());
+        let (_invite, token) = store.create_invite("m5", 15).expect("invite");
+        let join = store
+            .accept_join(&token, "sy_node_client", "m5", Vec::new())
+            .expect("join");
+
+        assert!(store.revoke_node("sy_node_client").expect("revoke"));
+        let error = store
+            .authenticate_node("sy_node_client", &join.bearer_token)
+            .expect_err("revoked");
+
+        assert!(error.to_string().contains("revoked"));
     }
 }

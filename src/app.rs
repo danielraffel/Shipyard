@@ -53,7 +53,10 @@ use self::cleanup_cmd::{
 use self::cli::{Cli, Command, MergeMethod, MergeResult, ShipStateCommand, TargetsCommand};
 use self::cloud_cmd::cloud_command;
 use self::config_cmd::config_command;
-use self::controller_cmd::{controller_command, node_command};
+use self::controller_cmd::{
+    configured_client_enabled, controller_command, leave_command, node_command,
+    remote_status_command,
+};
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
 use self::governance_cmd::governance_command;
@@ -182,6 +185,9 @@ fn dispatch<W: Write, E: Write>(
         Command::Node { command } => {
             return node_command(command, &runtime_paths.state_dir, cli.json, stdout);
         }
+        Command::Leave => {
+            return leave_command(cli.mode.into(), &cwd, cli.json, stdout);
+        }
         command @ (Command::Init { .. }
         | Command::Changelog { .. }
         | Command::Branch { .. }
@@ -202,6 +208,7 @@ fn dispatch<W: Write, E: Write>(
                 &cwd,
                 &runtime_paths.state_dir,
                 cli.json,
+                cli.local_state,
                 stdout,
             );
         }
@@ -262,6 +269,7 @@ fn dispatch<W: Write, E: Write>(
                 &cwd,
                 &runtime_paths,
                 cli.json,
+                cli.local_state,
                 stdout,
             );
         }
@@ -282,8 +290,29 @@ fn handle_operational_variant<W: Write>(
     cwd: &Path,
     runtime_paths: &RuntimePaths,
     json: bool,
+    local_state: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    if !local_state
+        && matches!(
+            command,
+            Command::Run { .. }
+                | Command::Ship { .. }
+                | Command::Pr { .. }
+                | Command::AutoMerge { .. }
+                | Command::Watch { .. }
+                | Command::ShipState { .. }
+        )
+    {
+        let config = LoadedConfig::load_from_cwd(mode, cwd)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if configured_client_enabled(&config) {
+            return Err(CliFailure::new(
+                1,
+                "controller client config is enabled, but remote enqueue/ship/watch is not implemented yet; use --local-state to operate on this machine's local state explicitly",
+            ));
+        }
+    }
     match command {
         command @ Command::Run { .. } => {
             handle_run_variant(command, mode, cwd, runtime_paths, json, stdout)
@@ -316,6 +345,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Network { .. }
         | Command::Controller { .. }
         | Command::Node { .. }
+        | Command::Leave
         | Command::Init { .. }
         | Command::Changelog { .. }
         | Command::Branch { .. }
@@ -386,8 +416,32 @@ fn handle_state_command<W: Write>(
     cwd: &Path,
     state_dir: &Path,
     json: bool,
+    local_state: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let config = LoadedConfig::load_from_cwd(mode, cwd)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !local_state && matches!(command, Command::Status) && configured_client_enabled(&config) {
+        let machine_id = crate::machine_identity::get_or_create_machine_id(state_dir)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return remote_status_command(&config, &machine_id, json, stdout);
+    }
+    if !local_state
+        && matches!(
+            command,
+            Command::Logs { .. }
+                | Command::Cancel { .. }
+                | Command::Bump { .. }
+                | Command::Queue
+                | Command::Cleanup { .. }
+        )
+        && configured_client_enabled(&config)
+    {
+        return Err(CliFailure::new(
+            1,
+            "controller client config is enabled, but this stateful command is not routed to the controller yet; use --local-state to operate on this machine's local state explicitly",
+        ));
+    }
     match command {
         Command::Status => status_command(mode, cwd, state_dir, json, stdout),
         Command::Evidence { branch } => evidence_command(branch, cwd, state_dir, json, stdout),
@@ -930,6 +984,88 @@ mod tests {
             .status()
             .expect("git command should run");
         assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    #[test]
+    fn stateful_commands_refuse_local_split_brain_when_client_configured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "ssh://mac-studio"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "queue",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("--local-state"));
+    }
+
+    #[test]
+    fn local_state_allows_stateful_command_when_client_configured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "ssh://mac-studio"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--local-state",
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "--json",
+            "queue",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "queue");
     }
 
     #[cfg(unix)]

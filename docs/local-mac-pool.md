@@ -119,6 +119,9 @@ the controller/client protocol instead of sharing Shipyard state directories.
 The controller is the only writer for queue, lease, ship, warm-pool, and cloud
 state; clients join explicitly and communicate over authenticated RPCs. See
 [`docs/multi-host-protocol.md`](multi-host-protocol.md).
+The first implemented transport is SSH-backed pairing plus controller-backed
+`shipyard status`; use `shipyard --local-state status` when you intentionally
+want the laptop's own local queue.
 
 ## Explicit Cloud Overflow
 

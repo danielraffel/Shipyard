@@ -30,6 +30,9 @@ pub(super) struct Cli {
     /// Override the working directory used for git-branch-sensitive commands.
     #[arg(long, global = true, hide = true)]
     pub(super) cwd: Option<PathBuf>,
+    /// Use this machine's local Shipyard state even when a controller client is configured.
+    #[arg(long = "local-state", global = true)]
+    pub(super) local_state: bool,
     #[command(subcommand)]
     pub(super) command: Command,
 }
@@ -74,6 +77,8 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// Remove this machine's local controller-client pairing.
+    Leave,
     /// Configure Shipyard for the current project.
     Init {
         /// Show detected config output; preserves Python's current write behavior.
@@ -485,6 +490,8 @@ pub(super) enum NetworkTailscaleCommand {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum ControllerCommand {
+    /// Show local controller/client pairing status.
+    Status,
     /// Initialize this install as the local controller.
     Init {
         /// Controller display name. Defaults to the local hostname.
@@ -504,6 +511,41 @@ pub(super) enum ControllerCommand {
         /// Expiry in minutes.
         #[arg(long = "ttl-minutes", default_value_t = 15)]
         ttl_minutes: i64,
+    },
+    /// Pair this machine with a controller using a one-time invite token.
+    Join {
+        /// Local node display name. Defaults to the local hostname.
+        #[arg(long)]
+        name: Option<String>,
+        /// Controller endpoint, currently `ssh://host` for the first secure transport.
+        #[arg(long)]
+        controller: String,
+        /// One-time token printed by `shipyard controller invite`.
+        #[arg(long)]
+        token: String,
+    },
+    /// Accept a join request on the controller side. Intended for SSH transport.
+    #[command(name = "accept-join", hide = true)]
+    AcceptJoin {
+        /// Node display name.
+        #[arg(long)]
+        name: String,
+        /// Stable client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+        /// One-time invite token.
+        #[arg(long)]
+        token: String,
+        /// Node capability label. May repeat.
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+    },
+    /// Return controller-owned status after bearer-token verification.
+    #[command(name = "rpc-status", hide = true)]
+    RpcStatus {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
     },
 }
 

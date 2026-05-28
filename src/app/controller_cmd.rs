@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use chrono::Utc;
 use serde_json::Value;
@@ -11,12 +11,14 @@ use toml::{Table, Value as TomlValue};
 use super::{
     CliFailure,
     cli::{ControllerCommand, NodeCommand},
+    queue_cmd::status_command,
 };
 use crate::config::{LoadedConfig, LocalOverlaySource};
+use crate::executor::ssh::shlex_quote;
 use crate::identity::{ProductIdentity, RuntimeMode};
 use crate::machine_identity::get_or_create_machine_id;
 use crate::node_registry::{
-    NodeEndpoint, NodeEndpointKind, NodeRecord, NodeRegistryStore, NodeRole,
+    NodeEndpoint, NodeEndpointKind, NodeJoin, NodeRecord, NodeRegistryStore, NodeRole,
 };
 use crate::output::write_json_envelope;
 
@@ -29,11 +31,49 @@ pub(super) fn controller_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     match command {
+        ControllerCommand::Status => {
+            controller_status(mode, cwd, state_dir, json_mode, stdout)?;
+        }
         ControllerCommand::Init { name, endpoints } => {
             controller_init(mode, cwd, state_dir, name, &endpoints, json_mode, stdout)?;
         }
         ControllerCommand::Invite { name, ttl_minutes } => {
             controller_invite(state_dir, &name, ttl_minutes, json_mode, stdout)?;
+        }
+        ControllerCommand::Join {
+            name,
+            controller,
+            token,
+        } => {
+            controller_join(
+                mode,
+                cwd,
+                state_dir,
+                name,
+                &controller,
+                &token,
+                json_mode,
+                stdout,
+            )?;
+        }
+        ControllerCommand::AcceptJoin {
+            name,
+            machine_id,
+            token,
+            capabilities,
+        } => {
+            controller_accept_join(
+                state_dir,
+                &name,
+                &machine_id,
+                &token,
+                capabilities,
+                json_mode,
+                stdout,
+            )?;
+        }
+        ControllerCommand::RpcStatus { machine_id } => {
+            controller_rpc_status(mode, cwd, state_dir, &machine_id, json_mode, stdout)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -51,6 +91,38 @@ pub(super) fn node_command<W: Write>(
             node_remove(state_dir, &machine_id, json_mode, stdout)?;
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(super) fn leave_command<W: Write>(
+    mode: RuntimeMode,
+    cwd: &Path,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let path = mutate_local_config(mode, cwd, |table| {
+        let Some(multi_host) = table
+            .get_mut("multi_host")
+            .and_then(TomlValue::as_table_mut)
+        else {
+            return Ok(());
+        };
+        multi_host.remove("client");
+        Ok(())
+    })?;
+    if json_mode {
+        let mut data = BTreeMap::new();
+        data.insert("path".to_owned(), Value::String(path.display().to_string()));
+        return write_json_envelope(stdout, "leave", data)
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|error| CliFailure::new(1, error.to_string()));
+    }
+    writeln!(
+        stdout,
+        "Removed local controller client config from {}",
+        path.display()
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -118,6 +190,91 @@ fn controller_init<W: Write>(
     Ok(())
 }
 
+fn controller_status<W: Write>(
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let config = LoadedConfig::load_from_cwd(mode, cwd)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let machine_id = crate::machine_identity::existing_machine_id(state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+        .unwrap_or_else(|| "uninitialized".to_owned());
+    let controller = config
+        .data
+        .get("multi_host")
+        .and_then(TomlValue::as_table)
+        .and_then(|multi| multi.get("controller"))
+        .and_then(TomlValue::as_table);
+    let client = config
+        .data
+        .get("multi_host")
+        .and_then(TomlValue::as_table)
+        .and_then(|multi| multi.get("client"))
+        .and_then(TomlValue::as_table);
+    let nodes = NodeRegistryStore::new(state_dir)
+        .list_nodes()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if json_mode {
+        let mut data = BTreeMap::new();
+        data.insert("machine_id".to_owned(), Value::String(machine_id));
+        data.insert(
+            "controller_enabled".to_owned(),
+            Value::Bool(
+                controller
+                    .and_then(|table| table.get("enabled"))
+                    .and_then(TomlValue::as_bool)
+                    == Some(true),
+            ),
+        );
+        data.insert(
+            "client_enabled".to_owned(),
+            Value::Bool(
+                client
+                    .and_then(|table| table.get("enabled"))
+                    .and_then(TomlValue::as_bool)
+                    == Some(true),
+            ),
+        );
+        data.insert(
+            "client_controller".to_owned(),
+            client
+                .and_then(|table| table.get("controller"))
+                .and_then(TomlValue::as_str)
+                .map_or(Value::Null, |value| Value::String(value.to_owned())),
+        );
+        data.insert(
+            "nodes".to_owned(),
+            serde_json::to_value(nodes).map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        return write_json_envelope(stdout, "controller.status", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()));
+    }
+    writeln!(stdout, "Controller").map_err(|error| CliFailure::new(1, error.to_string()))?;
+    writeln!(stdout, "  machine_id: {machine_id}")
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    writeln!(
+        stdout,
+        "  controller_enabled: {}",
+        controller
+            .and_then(|table| table.get("enabled"))
+            .and_then(TomlValue::as_bool)
+            .unwrap_or(false)
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if let Some(endpoint) = client
+        .and_then(|table| table.get("controller"))
+        .and_then(TomlValue::as_str)
+    {
+        writeln!(stdout, "  client_controller: {endpoint}")
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    writeln!(stdout, "  registered_nodes: {}", nodes.len())
+        .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
 fn controller_invite<W: Write>(
     state_dir: &Path,
     name: &str,
@@ -151,6 +308,99 @@ fn controller_invite<W: Write>(
         "Use this token once with the future controller join command. The stored invite contains only a token hash."
     )
     .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controller_join<W: Write>(
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    name: Option<String>,
+    controller: &str,
+    token: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let endpoint = parse_join_controller(controller)?;
+    if endpoint.kind != NodeEndpointKind::Ssh {
+        return Err(CliFailure::new(
+            1,
+            "controller join currently supports ssh:// endpoints only; HTTPS controller RPC will land after the pinned-TLS server is implemented",
+        ));
+    }
+    let machine_id = get_or_create_machine_id(state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let name = name.unwrap_or_else(default_node_name);
+    let capabilities = local_capabilities();
+    let join = ssh_accept_join(&endpoint.url, &name, &machine_id, token, &capabilities)?;
+    let config_path = write_client_local_config(mode, cwd, &endpoint.url, &join.bearer_token)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+
+    if json_mode {
+        let mut data = BTreeMap::new();
+        data.insert("machine_id".to_owned(), Value::String(machine_id));
+        data.insert("controller".to_owned(), Value::String(endpoint.url));
+        data.insert(
+            "config_path".to_owned(),
+            Value::String(config_path.display().to_string()),
+        );
+        data.insert(
+            "node".to_owned(),
+            serde_json::to_value(join.node)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        return write_json_envelope(stdout, "controller.join", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()));
+    }
+    writeln!(stdout, "Joined controller {}", endpoint.url)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    writeln!(stdout, "Config: {}", config_path.display())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(())
+}
+
+fn controller_accept_join<W: Write>(
+    state_dir: &Path,
+    name: &str,
+    machine_id: &str,
+    token: &str,
+    capabilities: Vec<String>,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let join = NodeRegistryStore::new(state_dir)
+        .accept_join(token, machine_id, name, capabilities)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if json_mode {
+        let mut data = BTreeMap::new();
+        data.insert(
+            "node".to_owned(),
+            serde_json::to_value(&join.node)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        data.insert("bearer_token".to_owned(), Value::String(join.bearer_token));
+        return write_json_envelope(stdout, "controller.accept_join", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()));
+    }
+    writeln!(stdout, "Registered node {} ({machine_id})", join.node.name)
+        .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+fn controller_rpc_status<W: Write>(
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let token = std::env::var("SHIPYARD_NODE_TOKEN")
+        .map_err(|_| CliFailure::new(1, "missing SHIPYARD_NODE_TOKEN for controller RPC"))?;
+    NodeRegistryStore::new(state_dir)
+        .authenticate_node(machine_id, &token)
+        .map_err(|error| CliFailure::new(1, format!("auth denied: {error}")))?;
+    status_command(mode, cwd, state_dir, json_mode, stdout)?;
+    Ok(())
 }
 
 fn node_list<W: Write>(
@@ -257,10 +507,84 @@ fn parse_endpoint_spec(spec: &str) -> Result<NodeEndpoint, CliFailure> {
     Ok(endpoint)
 }
 
+fn parse_join_controller(controller: &str) -> Result<NodeEndpoint, CliFailure> {
+    if controller.starts_with("ssh://") {
+        return parse_endpoint_spec(&format!("ssh={controller}"));
+    }
+    if controller.starts_with("https://") {
+        return parse_endpoint_spec(&format!("tailscale-dns={controller}"));
+    }
+    Err(CliFailure::new(
+        1,
+        "controller must be ssh://host or https://host:port",
+    ))
+}
+
 fn write_controller_local_config(
     mode: RuntimeMode,
     cwd: &Path,
     name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    mutate_local_config_boxed(mode, cwd, |table| {
+        let multi_host = table
+            .entry("multi_host".to_owned())
+            .or_insert_with(|| TomlValue::Table(Table::new()))
+            .as_table_mut()
+            .ok_or("multi_host config section must be a table")?;
+        let controller = multi_host
+            .entry("controller".to_owned())
+            .or_insert_with(|| TomlValue::Table(Table::new()))
+            .as_table_mut()
+            .ok_or("multi_host.controller config section must be a table")?;
+        controller.insert("enabled".to_owned(), TomlValue::Boolean(true));
+        controller.insert("name".to_owned(), TomlValue::String(name.to_owned()));
+        Ok(())
+    })
+}
+
+fn write_client_local_config(
+    mode: RuntimeMode,
+    cwd: &Path,
+    controller_endpoint: &str,
+    bearer_token: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    mutate_local_config_boxed(mode, cwd, |table| {
+        let multi_host = table
+            .entry("multi_host".to_owned())
+            .or_insert_with(|| TomlValue::Table(Table::new()))
+            .as_table_mut()
+            .ok_or("multi_host config section must be a table")?;
+        let client = multi_host
+            .entry("client".to_owned())
+            .or_insert_with(|| TomlValue::Table(Table::new()))
+            .as_table_mut()
+            .ok_or("multi_host.client config section must be a table")?;
+        client.insert("enabled".to_owned(), TomlValue::Boolean(true));
+        client.insert(
+            "controller".to_owned(),
+            TomlValue::String(controller_endpoint.to_owned()),
+        );
+        client.insert(
+            "node_token".to_owned(),
+            TomlValue::String(bearer_token.to_owned()),
+        );
+        Ok(())
+    })
+}
+
+fn mutate_local_config(
+    mode: RuntimeMode,
+    cwd: &Path,
+    mutate: impl FnOnce(&mut Table) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<PathBuf, CliFailure> {
+    mutate_local_config_boxed(mode, cwd, mutate)
+        .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+fn mutate_local_config_boxed(
+    mode: RuntimeMode,
+    cwd: &Path,
+    mutate: impl FnOnce(&mut Table) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let config = LoadedConfig::load_from_cwd(mode, cwd)?;
     let identity = ProductIdentity::for_mode(mode);
@@ -278,18 +602,7 @@ fn write_controller_local_config(
     } else {
         Table::new()
     };
-    let multi_host = table
-        .entry("multi_host".to_owned())
-        .or_insert_with(|| TomlValue::Table(Table::new()))
-        .as_table_mut()
-        .ok_or("multi_host config section must be a table")?;
-    let controller = multi_host
-        .entry("controller".to_owned())
-        .or_insert_with(|| TomlValue::Table(Table::new()))
-        .as_table_mut()
-        .ok_or("multi_host.controller config section must be a table")?;
-    controller.insert("enabled".to_owned(), TomlValue::Boolean(true));
-    controller.insert("name".to_owned(), TomlValue::String(name.to_owned()));
+    mutate(&mut table)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -322,9 +635,142 @@ fn local_capabilities() -> Vec<String> {
     capabilities
 }
 
+fn ssh_accept_join(
+    endpoint: &str,
+    name: &str,
+    machine_id: &str,
+    token: &str,
+    capabilities: &[String],
+) -> Result<NodeJoin, CliFailure> {
+    let host = endpoint
+        .strip_prefix("ssh://")
+        .ok_or_else(|| CliFailure::new(1, "SSH endpoint must start with ssh://"))?;
+    let mut remote = vec![
+        "shipyard".to_owned(),
+        "controller".to_owned(),
+        "accept-join".to_owned(),
+        "--name".to_owned(),
+        shlex_quote(name),
+        "--machine-id".to_owned(),
+        shlex_quote(machine_id),
+        "--token".to_owned(),
+        shlex_quote(token),
+        "--json".to_owned(),
+    ];
+    for capability in capabilities {
+        remote.push("--capability".to_owned());
+        remote.push(shlex_quote(capability));
+    }
+    let output = Command::new("ssh")
+        .arg(host)
+        .arg(remote.join(" "))
+        .output()
+        .map_err(|error| CliFailure::new(1, format!("ssh join failed to start: {error}")))?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "ssh join failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| CliFailure::new(1, format!("invalid join response: {error}")))?;
+    let node = serde_json::from_value(value.get("node").cloned().unwrap_or(Value::Null))
+        .map_err(|error| CliFailure::new(1, format!("invalid join node: {error}")))?;
+    let bearer_token = value
+        .get("bearer_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliFailure::new(1, "join response missing bearer_token"))?
+        .to_owned();
+    Ok(NodeJoin { node, bearer_token })
+}
+
+pub(super) fn remote_status_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let client = configured_client(config)?;
+    let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
+        return Err(CliFailure::new(
+            1,
+            "configured controller is not reachable through the implemented SSH transport; use --local-state for local status",
+        ));
+    };
+    let remote = format!(
+        "SHIPYARD_NODE_TOKEN={} shipyard --local-state controller rpc-status --machine-id {} {}",
+        shlex_quote(&client.node_token),
+        shlex_quote(machine_id),
+        if json_mode { "--json" } else { "" }
+    );
+    let output = Command::new("ssh")
+        .arg(endpoint)
+        .arg(remote)
+        .output()
+        .map_err(|error| CliFailure::new(1, format!("controller_unreachable: {error}")))?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "controller_unreachable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    stdout
+        .write_all(&output.stdout)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+struct ConfiguredClient {
+    controller: String,
+    node_token: String,
+}
+
+pub(super) fn configured_client_enabled(config: &LoadedConfig) -> bool {
+    config
+        .data
+        .get("multi_host")
+        .and_then(TomlValue::as_table)
+        .and_then(|multi| multi.get("client"))
+        .and_then(TomlValue::as_table)
+        .and_then(|client| client.get("enabled"))
+        .and_then(TomlValue::as_bool)
+        == Some(true)
+}
+
+fn configured_client(config: &LoadedConfig) -> Result<ConfiguredClient, CliFailure> {
+    let client = config
+        .data
+        .get("multi_host")
+        .and_then(TomlValue::as_table)
+        .and_then(|multi| multi.get("client"))
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| CliFailure::new(1, "multi_host.client is not configured"))?;
+    let controller = client
+        .get("controller")
+        .and_then(TomlValue::as_str)
+        .ok_or_else(|| CliFailure::new(1, "multi_host.client.controller is missing"))?
+        .to_owned();
+    let node_token = client
+        .get("node_token")
+        .and_then(TomlValue::as_str)
+        .ok_or_else(|| CliFailure::new(1, "multi_host.client.node_token is missing"))?
+        .to_owned();
+    Ok(ConfiguredClient {
+        controller,
+        node_token,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn endpoint_parser_rejects_plain_http_lan() {
@@ -341,5 +787,59 @@ mod tests {
 
         assert_eq!(endpoint.kind, NodeEndpointKind::LanHttps);
         assert_eq!(endpoint.cert_sha256.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn client_config_marks_controller_enabled_and_leave_removes_it() {
+        let temp = TempDir::new().expect("tempdir");
+        write_client_local_config(
+            RuntimeMode::Shipyard,
+            temp.path(),
+            "ssh://mac-studio",
+            "synode_secret",
+        )
+        .expect("client config");
+        let loaded =
+            LoadedConfig::load_from_cwd(RuntimeMode::Shipyard, temp.path()).expect("config");
+        assert!(configured_client_enabled(&loaded));
+
+        let mut stdout = Vec::new();
+        leave_command(RuntimeMode::Shipyard, temp.path(), true, &mut stdout).expect("leave");
+        let loaded =
+            LoadedConfig::load_from_cwd(RuntimeMode::Shipyard, temp.path()).expect("config");
+
+        assert!(!configured_client_enabled(&loaded));
+        assert!(serde_json::from_slice::<Value>(&stdout).is_ok());
+    }
+
+    #[test]
+    fn accept_join_registers_client_and_returns_token_once() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = NodeRegistryStore::new(temp.path());
+        let (_invite, token) = store.create_invite("m5", 15).expect("invite");
+        let mut stdout = Vec::new();
+
+        controller_accept_join(
+            temp.path(),
+            "m5",
+            "sy_node_client",
+            &token,
+            vec!["macos".to_owned()],
+            true,
+            &mut stdout,
+        )
+        .expect("accept join");
+        let payload: Value = serde_json::from_slice(&stdout).expect("json");
+        let bearer = payload["bearer_token"].as_str().expect("bearer");
+
+        assert!(bearer.starts_with("synode_"));
+        assert_eq!(payload["node"]["machine_id"], "sy_node_client");
+        assert!(
+            store
+                .authenticate_node("sy_node_client", bearer)
+                .expect("auth")
+                .token_hash
+                .is_some()
+        );
     }
 }

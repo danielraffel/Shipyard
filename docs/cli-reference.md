@@ -12,10 +12,13 @@ shipyard network tailscale status # show private tailnet reachability
 shipyard targets               # show targets + reachability
 shipyard targets add <name>    # interactively add a new target
 shipyard targets remove <name> # remove a target
+shipyard controller status
 shipyard controller init --name mac-studio --endpoint ssh=ssh://mac-studio
 shipyard controller invite --name m5
+shipyard controller join --controller ssh://mac-studio --token syjoin_...
 shipyard node list             # show registered controller/client/worker nodes
 shipyard node remove <machine-id>
+shipyard leave                 # remove local controller-client pairing
 
 # Validate
 shipyard run                       # full validation, all targets
@@ -29,7 +32,8 @@ shipyard ship                  # PR → validate → merge on green
 shipyard ship --base develop   # target a different branch
 
 # Monitor
-shipyard status                # dashboard: queue + targets + evidence
+shipyard status                # controller-backed when joined; local otherwise
+shipyard --local-state status  # force this machine's local state
 shipyard queue                 # show all jobs with priorities
 shipyard logs <id>             # per-target logs
 shipyard logs <id> --target windows
@@ -124,6 +128,9 @@ directories across Macs. The controller is the only writer for shared queue,
 lease, ship, warm-pool, and cloud records; clients join explicitly over an
 authenticated protocol. See `docs/multi-host-protocol.md`.
 
-The local registry slice is available with `shipyard controller init`,
-`shipyard controller invite`, `shipyard node list`, and
-`shipyard node remove`; remote join/RPC/enqueue/watch are still planned.
+The implemented SSH-backed first slice is available with `shipyard controller
+init`, `shipyard controller invite`, `shipyard controller join --controller
+ssh://... --token ...`, `shipyard controller status`, `shipyard status`, and
+`shipyard leave`. After join, `shipyard status` asks the controller for shared
+state; use `shipyard --local-state status` for the laptop-local queue. Remote
+enqueue/ship/watch and HTTPS controller RPC are still planned.
