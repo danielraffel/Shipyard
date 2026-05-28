@@ -3,12 +3,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::{
     CliFailure,
     auto_merge_cmd::{AutoMergeOutcome, AutoMergeRequest, execute_auto_merge},
     cli::{MergeMethod, MergeResult},
+    controller_cmd::{ensure_remote_enqueue_supported, remote_enqueue_command},
+    run_cmd::configured_node_token,
     wait_cmd::parse_github_repo_slug,
 };
 use crate::config::LoadedConfig;
@@ -31,6 +34,7 @@ use crate::preflight::{
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
+use crate::queue_request::QueuedExecutionEnvelope;
 use crate::ship::{ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_ship};
 use crate::ship_state::ShipStateStore;
 use crate::warm_pool::{WarmPool, default_pool_path};
@@ -61,33 +65,20 @@ pub(super) fn ship_command<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let preflight_dispatcher = ExecutorDispatcher::new(None);
-    let targets = prepare_ship_targets(
+    let merge_command = args.merge_command.clone();
+    let merge_result = args.merge_result;
+    let pr_snapshot_file = args.pr_snapshot_file.clone();
+    let PreparedShipRequest {
+        request,
+        pr_context,
+    } = prepare_ship_request(
+        args,
         config,
         cwd,
         runtime_paths,
-        &preflight_dispatcher,
-        &args,
         json_mode,
+        ShipRequestMode::Local,
         stdout,
-    )?;
-
-    let branch = git_required(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let sha = git_required(cwd, &["rev-parse", "HEAD"])?;
-    let commit_subject =
-        git_optional(cwd, &["log", "-1", "--format=%s", "HEAD"]).unwrap_or_default();
-    let repo = git_repo_slug(cwd).unwrap_or_default();
-    if should_auto_create_base(&args.base, args.auto_create_base) {
-        maybe_auto_create_base_branch(cwd, &args.base, config, args.gh_command.as_deref());
-    }
-    let lane_policy = resolve_lane_policy(config, cwd);
-    let pr_context = resolve_pr_context(
-        args.pr,
-        &args.base,
-        cwd,
-        &branch,
-        args.gh_command.as_deref(),
-        &lane_policy,
     )?;
 
     let mut queue = Queue::new(runtime_paths.state_dir.clone())
@@ -101,23 +92,6 @@ pub(super) fn ship_command<W: Write>(
     let warm_pool = WarmPool::new(default_pool_path(&runtime_paths.state_dir));
     let dispatcher =
         ExecutorDispatcher::new_with_state_dir(Some(prepared), &runtime_paths.state_dir);
-    let request = ShipExecutionRequest {
-        pr: pr_context.number,
-        repo,
-        branch,
-        base_branch: pr_context.base_branch,
-        sha,
-        commit_subject,
-        pr_url: pr_context.pr_url,
-        pr_title: pr_context.pr_title,
-        mode: ValidationMode::Full,
-        priority: Priority::Normal,
-        warm_disabled: args.no_warm,
-        fail_fast: false,
-        resume_from: args.resume_from,
-        advisory_targets: lane_policy.advisory_targets.clone(),
-        targets,
-    };
 
     let job = submit_ship(&request, &mut queue, cwd, &runtime_paths.state_dir)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -141,9 +115,9 @@ pub(super) fn ship_command<W: Write>(
         cwd,
         &ship_state,
         outcome.job.passed(),
-        args.merge_command,
-        args.merge_result,
-        args.pr_snapshot_file,
+        merge_command,
+        merge_result,
+        pr_snapshot_file,
     )?;
     // Issue #303: when validation failed, resolve failing-job + log diagnostics
     // before we render so the human / JSON output points the user at the
@@ -168,6 +142,143 @@ pub(super) fn ship_command<W: Write>(
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    })
+}
+
+pub(super) fn remote_ship_command<W: Write>(
+    args: ShipCommandArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    ensure_remote_enqueue_supported(config, "ship")?;
+    let PreparedShipRequest { request, .. } = prepare_ship_request(
+        args,
+        config,
+        cwd,
+        runtime_paths,
+        json_mode,
+        ShipRequestMode::RemoteEnqueue,
+        stdout,
+    )?;
+    let job = Job::create(
+        request.sha.clone(),
+        request.branch.clone(),
+        request
+            .targets
+            .iter()
+            .map(|target| target.name.clone())
+            .collect(),
+        request.mode,
+        request.priority,
+    )
+    .with_kind(crate::job::JobKind::Ship);
+    let enqueue = RemoteShipEnqueueRequest {
+        bearer_token: configured_node_token(config)?,
+        envelope: QueuedExecutionEnvelope::from_ship_request(job.id, cwd, &request),
+    };
+    remote_enqueue_command(config, machine_id, &enqueue, json_mode, "ship", stdout)
+}
+
+#[derive(Serialize)]
+struct RemoteShipEnqueueRequest {
+    bearer_token: String,
+    envelope: QueuedExecutionEnvelope,
+}
+
+struct PreparedShipRequest {
+    request: ShipExecutionRequest,
+    pr_context: ResolvedPrContext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShipRequestMode {
+    Local,
+    RemoteEnqueue,
+}
+
+fn prepare_ship_request<W: Write>(
+    args: ShipCommandArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json_mode: bool,
+    mode: ShipRequestMode,
+    stdout: &mut W,
+) -> Result<PreparedShipRequest, CliFailure> {
+    let targets = match mode {
+        ShipRequestMode::Local => {
+            let preflight_dispatcher = ExecutorDispatcher::new(None);
+            prepare_ship_targets(
+                config,
+                cwd,
+                runtime_paths,
+                &preflight_dispatcher,
+                &args,
+                json_mode,
+                stdout,
+            )?
+        }
+        ShipRequestMode::RemoteEnqueue => prepare_remote_ship_targets(config, &args)?,
+    };
+
+    let branch = git_required(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let sha = git_required(cwd, &["rev-parse", "HEAD"])?;
+    let commit_subject =
+        git_optional(cwd, &["log", "-1", "--format=%s", "HEAD"]).unwrap_or_default();
+    let repo = git_repo_slug(cwd).unwrap_or_default();
+    if mode == ShipRequestMode::Local && should_auto_create_base(&args.base, args.auto_create_base)
+    {
+        maybe_auto_create_base_branch(cwd, &args.base, config, args.gh_command.as_deref());
+    }
+    let lane_policy = resolve_lane_policy(config, cwd);
+    let pr_context = match mode {
+        ShipRequestMode::Local => resolve_pr_context(
+            args.pr,
+            &args.base,
+            cwd,
+            &branch,
+            args.gh_command.as_deref(),
+            &lane_policy,
+        )?,
+        ShipRequestMode::RemoteEnqueue => {
+            let Some(number) = args.pr else {
+                return Err(CliFailure::new(
+                    1,
+                    "controller-backed ship enqueue currently requires --pr to avoid creating or pushing PR state from the client; create the PR first or use --local-state",
+                ));
+            };
+            ResolvedPrContext {
+                number,
+                base_branch: args.base.clone(),
+                pr_url: None,
+                pr_title: None,
+            }
+        }
+    };
+    let request = ShipExecutionRequest {
+        pr: pr_context.number,
+        repo,
+        branch,
+        base_branch: pr_context.base_branch.clone(),
+        sha,
+        commit_subject,
+        pr_url: pr_context.pr_url.clone(),
+        pr_title: pr_context.pr_title.clone(),
+        mode: ValidationMode::Full,
+        priority: Priority::Normal,
+        warm_disabled: args.no_warm,
+        fail_fast: false,
+        resume_from: args.resume_from,
+        advisory_targets: lane_policy.advisory_targets.clone(),
+        targets,
+    };
+    Ok(PreparedShipRequest {
+        request,
+        pr_context,
     })
 }
 
@@ -277,6 +388,23 @@ fn prepare_ship_targets<W: Write>(
             writeln!(stdout, "warning: {warning}")
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
+    }
+    Ok(targets)
+}
+
+fn prepare_remote_ship_targets(
+    config: &LoadedConfig,
+    args: &ShipCommandArgs,
+) -> Result<Vec<ResolvedTarget>, CliFailure> {
+    let resolved = resolve_targets(config, ValidationMode::Full)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let _skipped_targets = skipped_present(&resolved, &args.skip_targets)?;
+    let targets = select_targets(resolved, &args.skip_targets);
+    if targets.is_empty() {
+        return Err(CliFailure::new(
+            2,
+            "No targets remain after --skip-target filtering.",
+        ));
     }
     Ok(targets)
 }

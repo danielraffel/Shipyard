@@ -29,15 +29,17 @@ to inspect this machine's local state instead.
 
 The controller `rpc-enqueue` endpoint accepts an authenticated, idempotent
 queued execution envelope and persists it to the controller queue. Public
-laptop `shipyard run` now uses that boundary to enqueue controller-owned work.
-Public laptop `shipyard ship` does not call it yet.
+laptop `shipyard run` and `shipyard ship` now use that boundary to enqueue
+controller-owned work. In the current first slice, controller-backed
+`shipyard ship` requires an existing `--pr` so client laptops do not create
+PRs, push branches, or auto-create protected base branches before controller
+handoff.
 
-HTTP controller serving, public remote ship, streaming `watch --follow`,
-periodic heartbeats, and GUI consumption are still follow-on slices. Until
-those land, SSH-backed state inspection, self-revocation, and the low-level
-enqueue boundary prove the trust/config/routing model and make laptop
-`shipyard run` enqueue to a Mac Studio controller, but do not yet make laptop
-`shipyard ship` work to a Mac Studio controller.
+HTTP controller serving, streaming `watch --follow`, periodic heartbeats, and
+GUI consumption are still follow-on slices. Until those land, SSH-backed state
+inspection, self-revocation, and the low-level enqueue boundary prove the
+trust/config/routing model and make laptop `shipyard run`/`shipyard ship`
+enqueue to a Mac Studio controller.
 When client config is enabled, stateful local commands that are not yet routed
 to the controller fail closed unless `--local-state` is supplied, so a laptop
 does not silently mutate a separate local queue by accident.

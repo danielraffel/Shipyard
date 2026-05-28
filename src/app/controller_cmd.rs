@@ -1320,14 +1320,12 @@ pub(super) fn remote_enqueue_command<W: Write, T: Serialize>(
     machine_id: &str,
     request: &T,
     json_mode: bool,
+    local_command_hint: &str,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let client = configured_client(config)?;
     let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
-        return Err(CliFailure::new(
-            1,
-            "configured controller is not reachable through the implemented SSH transport; use --local-state for local run",
-        ));
+        return Err(remote_enqueue_unsupported(local_command_hint));
     };
     let remote = remote_controller_enqueue_shell_command(machine_id, json_mode);
     let payload =
@@ -1346,6 +1344,27 @@ pub(super) fn remote_enqueue_command<W: Write, T: Serialize>(
         .write_all(&output.stdout)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     Ok(ExitCode::SUCCESS)
+}
+
+pub(super) fn ensure_remote_enqueue_supported(
+    config: &LoadedConfig,
+    local_command_hint: &str,
+) -> Result<(), CliFailure> {
+    let client = configured_client(config)?;
+    if client.controller.starts_with("ssh://") {
+        Ok(())
+    } else {
+        Err(remote_enqueue_unsupported(local_command_hint))
+    }
+}
+
+fn remote_enqueue_unsupported(local_command_hint: &str) -> CliFailure {
+    CliFailure::new(
+        1,
+        format!(
+            "configured controller is not reachable through the implemented SSH transport; use --local-state for local {local_command_hint}"
+        ),
+    )
 }
 
 pub(super) fn remote_watch_command<W: Write>(

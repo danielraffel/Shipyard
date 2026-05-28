@@ -222,12 +222,11 @@ pub(super) fn remote_run_command<W: Write>(
     args: RunCommandArgs,
     config: &LoadedConfig,
     cwd: &Path,
-    runtime_paths: &RuntimePaths,
     machine_id: &str,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let request = prepare_run_request(args, config, cwd, runtime_paths, json_mode, stdout)?;
+    let request = prepare_run_request(args, config, cwd)?;
     let job = Job::create(
         request.sha.clone(),
         request.branch.clone(),
@@ -244,7 +243,7 @@ pub(super) fn remote_run_command<W: Write>(
         bearer_token: configured_node_token(config)?,
         envelope: QueuedExecutionEnvelope::from_run_request(job.id, cwd, &request),
     };
-    remote_enqueue_command(config, machine_id, &enqueue, json_mode, stdout)
+    remote_enqueue_command(config, machine_id, &enqueue, json_mode, "run", stdout)
 }
 
 #[derive(Serialize)]
@@ -253,7 +252,7 @@ struct RemoteRunEnqueueRequest {
     envelope: QueuedExecutionEnvelope,
 }
 
-fn configured_node_token(config: &LoadedConfig) -> Result<String, CliFailure> {
+pub(super) fn configured_node_token(config: &LoadedConfig) -> Result<String, CliFailure> {
     config
         .data
         .get("multi_host")
@@ -266,18 +265,15 @@ fn configured_node_token(config: &LoadedConfig) -> Result<String, CliFailure> {
         .ok_or_else(|| CliFailure::new(1, "multi_host.client.node_token is missing"))
 }
 
-fn prepare_run_request<W: Write>(
+fn prepare_run_request(
     args: RunCommandArgs,
     config: &LoadedConfig,
     cwd: &Path,
-    runtime_paths: &RuntimePaths,
-    json_mode: bool,
-    stdout: &mut W,
 ) -> Result<RunExecutionRequest, CliFailure> {
     let mode = args.mode;
     let resolved =
         resolve_targets(config, mode).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let skipped_targets = skipped_present(&resolved, args.targets.as_deref(), &args.skip_targets)?;
+    skipped_present(&resolved, args.targets.as_deref(), &args.skip_targets)?;
     let mut targets = select_targets(resolved, args.targets.as_deref(), &args.skip_targets)?;
     if targets.is_empty() {
         return Err(CliFailure::new(
@@ -289,36 +285,8 @@ fn prepare_run_request<W: Write>(
         set_allow_tree_drift(&mut targets);
     }
 
-    let preflight_dispatcher = ExecutorDispatcher::new(None);
-    let mut preflight = collect_ship_preflight_with_options(
-        config,
-        cwd,
-        &runtime_paths.state_dir,
-        &targets,
-        &preflight_dispatcher,
-        ShipPreflightOptions {
-            allow_root_mismatch: args.root_mismatch == RootMismatchPolicy::Allow,
-            allow_unreachable_targets: args.reachability == ReachabilityPolicy::AllowUnreachable,
-        },
-    )
-    .map_err(|error| preflight_failure(&error))?;
-    for skipped in &skipped_targets {
-        preflight.warnings.push(format!(
-            "Target '{skipped}' deliberately skipped (--skip-target)."
-        ));
-    }
-    preflight.skipped_targets = skipped_targets;
-
     let branch = git_required(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let sha = git_required(cwd, &["rev-parse", "HEAD"])?;
-
-    if !json_mode {
-        write_tree_drift_banner(stdout, args.tree_drift, &targets)?;
-        for warning in &preflight.warnings {
-            writeln!(stdout, "warning: {warning}")
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        }
-    }
 
     Ok(RunExecutionRequest {
         branch,

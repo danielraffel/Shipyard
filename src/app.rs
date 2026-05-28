@@ -78,7 +78,7 @@ use self::run_cmd::{
     WarmPolicy, remote_run_command, run_command,
 };
 use self::runner_cmd::runner_command;
-use self::ship_cmd::{ShipCommandArgs, ship_command};
+use self::ship_cmd::{ShipCommandArgs, remote_ship_command, ship_command};
 use self::ship_state_cmd::{
     ship_state_discard, ship_state_list, ship_state_reconcile, ship_state_show,
 };
@@ -348,28 +348,18 @@ fn handle_operational_variant<W: Write>(
     )? {
         return Ok(result);
     }
-    if !local_state
-        && matches!(
-            command,
-            Command::Ship { .. }
-                | Command::Pr { .. }
-                | Command::AutoMerge { .. }
-                | Command::ShipState { .. }
-        )
-    {
-        let config = LoadedConfig::load_from_cwd_with_global_dir(
-            mode,
-            cwd,
-            Some(runtime_paths.global_dir.clone()),
-        )
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        if configured_client_enabled(&config) {
-            return Err(CliFailure::new(
-                1,
-                "controller client config is enabled, but remote enqueue/ship/watch is not implemented yet; use --local-state to operate on this machine's local state explicitly",
-            ));
-        }
+    if let Some(result) = maybe_remote_ship_command(
+        &command,
+        mode,
+        cwd,
+        runtime_paths,
+        json,
+        local_state,
+        stdout,
+    )? {
+        return Ok(result);
     }
+    refuse_unrouted_stateful_client_command(&command, mode, cwd, runtime_paths, local_state)?;
     match command {
         command @ Command::Run { .. } => {
             handle_run_variant(command, mode, cwd, runtime_paths, json, stdout)
@@ -422,6 +412,36 @@ fn handle_operational_variant<W: Write>(
         | Command::Wait { .. }
         | Command::Update(_) => unreachable!("command handled by top-level dispatch"),
     }
+}
+
+fn refuse_unrouted_stateful_client_command(
+    command: &Command,
+    mode: RuntimeMode,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    local_state: bool,
+) -> Result<(), CliFailure> {
+    if local_state
+        || !matches!(
+            command,
+            Command::Pr { .. } | Command::AutoMerge { .. } | Command::ShipState { .. }
+        )
+    {
+        return Ok(());
+    }
+    let config = LoadedConfig::load_from_cwd_with_global_dir(
+        mode,
+        cwd,
+        Some(runtime_paths.global_dir.clone()),
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if configured_client_enabled(&config) {
+        return Err(CliFailure::new(
+            1,
+            "controller client config is enabled, but remote enqueue/ship/watch is not implemented yet; use --local-state to operate on this machine's local state explicitly",
+        ));
+    }
+    Ok(())
 }
 
 fn maybe_remote_watch_command<W: Write>(
@@ -493,7 +513,7 @@ fn maybe_remote_run_command<W: Write>(
     }
     let machine_id = crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    remote_run_command(args, &config, cwd, runtime_paths, &machine_id, json, stdout).map(Some)
+    remote_run_command(args, &config, cwd, &machine_id, json, stdout).map(Some)
 }
 
 fn run_args_from_command(command: &Command) -> Option<RunCommandArgs> {
@@ -525,6 +545,68 @@ fn run_args_from_command(command: &Command) -> Option<RunCommandArgs> {
         skip_targets: skip_targets.clone(),
         warm: WarmPolicy::from_no_warm_flag(*no_warm),
         tree_drift: TreeDriftPolicy::from_flag(*allow_tree_drift),
+    })
+}
+
+fn maybe_remote_ship_command<W: Write>(
+    command: &Command,
+    mode: RuntimeMode,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    local_state: bool,
+    stdout: &mut W,
+) -> Result<Option<ExitCode>, CliFailure> {
+    if local_state {
+        return Ok(None);
+    }
+    let Some(args) = ship_args_from_command(command) else {
+        return Ok(None);
+    };
+    let config = LoadedConfig::load_from_cwd_with_global_dir(
+        mode,
+        cwd,
+        Some(runtime_paths.global_dir.clone()),
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !configured_client_enabled(&config) {
+        return Ok(None);
+    }
+    let machine_id = crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    remote_ship_command(args, &config, cwd, runtime_paths, &machine_id, json, stdout).map(Some)
+}
+
+fn ship_args_from_command(command: &Command) -> Option<ShipCommandArgs> {
+    let Command::Ship {
+        pr,
+        base,
+        auto_create_base,
+        no_auto_create_base,
+        no_warm,
+        resume_from,
+        allow_unreachable_targets,
+        skip_targets,
+    } = command
+    else {
+        return None;
+    };
+    Some(ShipCommandArgs {
+        pr: *pr,
+        base: base.clone(),
+        auto_create_base: match (*auto_create_base, *no_auto_create_base) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        },
+        no_warm: *no_warm,
+        resume_from: resume_from.clone(),
+        merge_command: None,
+        merge_result: None,
+        gh_command: None,
+        pr_snapshot_file: None,
+        allow_unreachable_targets: *allow_unreachable_targets,
+        skip_targets: skip_targets.clone(),
     })
 }
 
@@ -1363,6 +1445,117 @@ mod tests {
         assert!(message.contains("implemented SSH transport"));
         assert!(message.contains("--local-state for local run"));
         assert!(!message.contains("remote enqueue/ship/watch is not implemented"));
+    }
+
+    #[test]
+    fn ship_routes_to_controller_enqueue_when_client_configured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(&["init"], temp.path());
+        git(&["checkout", "-b", "feature/test"], temp.path());
+        std::fs::write(temp.path().join("README.md"), "demo\n").expect("readme");
+        git(&["add", "README.md"], temp.path());
+        git(&["commit", "-m", "initial"], temp.path());
+        let project = temp.path().join(".shipyard");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::write(
+            project.join("config.toml"),
+            "[targets.mac]\nbackend = \"local\"\nplatform = \"macos-arm64\"\n",
+        )
+        .expect("project config");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "https://mac-studio.example.ts.net:8765"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "ship",
+            "--pr",
+            "123",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("implemented SSH transport"));
+        assert!(message.contains("--local-state for local ship"));
+        assert!(!message.contains("remote enqueue/ship/watch is not implemented"));
+    }
+
+    #[test]
+    fn remote_ship_requires_existing_pr_before_controller_enqueue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(&["init"], temp.path());
+        git(&["checkout", "-b", "feature/test"], temp.path());
+        std::fs::write(temp.path().join("README.md"), "demo\n").expect("readme");
+        git(&["add", "README.md"], temp.path());
+        git(&["commit", "-m", "initial"], temp.path());
+        let project = temp.path().join(".shipyard");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::write(
+            project.join("config.toml"),
+            "[targets.mac]\nbackend = \"local\"\nplatform = \"macos-arm64\"\n",
+        )
+        .expect("project config");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "ssh://mac-studio.example.ts.net"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "ship",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("requires --pr"));
+        assert!(!message.contains("controller_unreachable"));
     }
 
     #[test]

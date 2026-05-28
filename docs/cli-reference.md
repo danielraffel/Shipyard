@@ -140,8 +140,8 @@ ssh://... --token ...`, `shipyard controller status`, `shipyard status`,
 remove <this-machine-id>`, and `shipyard leave`. After join, those state
 commands ask the controller for shared state; use `--local-state` for the
 laptop-local status, queue, logs, evidence, watch, node registry, and host-pool
-status. `shipyard run` on a joined client now uses the authenticated
-`rpc-enqueue` boundary to persist an idempotent queued execution envelope on the
-controller. Public remote `shipyard ship`, streaming `watch --follow`, mutating
-host-pool cleanup, revoking another node from a client, and HTTPS controller RPC
-are still planned.
+status. `shipyard run` and `shipyard ship --pr <n>` on a joined client now use
+the authenticated `rpc-enqueue` boundary to persist an idempotent queued
+execution envelope on the controller. Streaming `watch --follow`, mutating
+host-pool cleanup, revoking another node from a client, and HTTPS controller
+RPC are still planned.
