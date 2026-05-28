@@ -120,8 +120,9 @@ The controller is the only writer for queue, lease, ship, warm-pool, and cloud
 state; clients join explicitly and communicate over authenticated RPCs. See
 [`docs/multi-host-protocol.md`](multi-host-protocol.md).
 The first implemented transport is SSH-backed pairing plus controller-backed
-`shipyard status` and `shipyard queue`; use `--local-state` with those
-commands when you intentionally want the laptop's own local queue.
+`shipyard status`, `shipyard queue`, and `shipyard logs`; use `--local-state`
+with those commands when you intentionally want the laptop's own local queue or
+logs.
 
 ## Explicit Cloud Overflow
 

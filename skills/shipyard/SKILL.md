@@ -345,8 +345,9 @@ separate from Tailscale Funnel readiness used by webhook tunneling.
 The implemented SSH-backed first slice includes `shipyard controller init`,
 `shipyard controller invite`, `shipyard controller join --controller
 ssh://... --token ...`, `shipyard controller status`, controller-backed
-`shipyard status`, controller-backed `shipyard queue`, `shipyard --local-state
-status`, `shipyard --local-state queue`, `shipyard leave`,
+`shipyard status`, controller-backed `shipyard queue`, controller-backed
+`shipyard logs`, `shipyard --local-state status`, `shipyard --local-state
+queue`, `shipyard --local-state logs`, `shipyard leave`,
 `shipyard node list`, and `shipyard node remove`. Treat remote
 enqueue/ship/watch and HTTPS controller RPC as planned, not shipped.
 

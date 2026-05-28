@@ -554,6 +554,18 @@ pub(super) enum ControllerCommand {
         #[arg(long = "machine-id")]
         machine_id: String,
     },
+    /// Return controller-owned logs after bearer-token verification.
+    #[command(name = "rpc-logs", hide = true)]
+    RpcLogs {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+        /// Job identifier.
+        job_id: String,
+        /// Show logs for a specific target.
+        #[arg(short, long)]
+        target: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

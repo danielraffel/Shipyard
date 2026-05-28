@@ -11,7 +11,7 @@ use toml::{Table, Value as TomlValue};
 use super::{
     CliFailure,
     cli::{ControllerCommand, NodeCommand},
-    queue_cmd::{queue_command, status_command},
+    queue_cmd::{logs_command, queue_command, status_command},
 };
 use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::executor::ssh::shlex_quote;
@@ -77,6 +77,13 @@ pub(super) fn controller_command<W: Write>(
         }
         ControllerCommand::RpcQueue { machine_id } => {
             controller_rpc_queue(state_dir, &machine_id, json_mode, stdout)?;
+        }
+        ControllerCommand::RpcLogs {
+            machine_id,
+            job_id,
+            target,
+        } => {
+            controller_rpc_logs(state_dir, &machine_id, &job_id, target, stdout)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -413,6 +420,18 @@ fn controller_rpc_queue<W: Write>(
     Ok(())
 }
 
+fn controller_rpc_logs<W: Write>(
+    state_dir: &Path,
+    machine_id: &str,
+    job_id: &str,
+    target: Option<String>,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node(state_dir, machine_id)?;
+    logs_command(job_id, target, state_dir, stdout)?;
+    Ok(())
+}
+
 fn authenticate_rpc_node(state_dir: &Path, machine_id: &str) -> Result<(), CliFailure> {
     let token = std::env::var("SHIPYARD_NODE_TOKEN")
         .map_err(|_| CliFailure::new(1, "missing SHIPYARD_NODE_TOKEN for controller RPC"))?;
@@ -731,6 +750,42 @@ pub(super) fn remote_queue_command<W: Write>(
     remote_controller_command(config, machine_id, "rpc-queue", json_mode, "queue", stdout)
 }
 
+pub(super) fn remote_logs_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    job_id: &str,
+    target: Option<&str>,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let client = configured_client(config)?;
+    let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
+        return Err(CliFailure::new(
+            1,
+            "configured controller is not reachable through the implemented SSH transport; use --local-state for local logs",
+        ));
+    };
+    let remote =
+        remote_controller_logs_shell_command(&client.node_token, machine_id, job_id, target);
+    let output = Command::new("ssh")
+        .arg(endpoint)
+        .arg(remote)
+        .output()
+        .map_err(|error| CliFailure::new(1, format!("controller_unreachable: {error}")))?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "controller_unreachable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    stdout
+        .write_all(&output.stdout)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn remote_controller_command<W: Write>(
     config: &LoadedConfig,
     machine_id: &str,
@@ -771,6 +826,25 @@ fn remote_controller_command<W: Write>(
         .write_all(&output.stdout)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn remote_controller_logs_shell_command(
+    node_token: &str,
+    machine_id: &str,
+    job_id: &str,
+    target: Option<&str>,
+) -> String {
+    let mut remote = format!(
+        "SHIPYARD_NODE_TOKEN={} shipyard --local-state controller rpc-logs --machine-id {} {}",
+        shlex_quote(node_token),
+        shlex_quote(machine_id),
+        shlex_quote(job_id),
+    );
+    if let Some(target) = target {
+        remote.push_str(" --target ");
+        remote.push_str(&shlex_quote(target));
+    }
+    remote
 }
 
 fn remote_controller_shell_command(
@@ -914,5 +988,20 @@ mod tests {
         assert!(command.contains("shipyard --local-state controller rpc-queue"));
         assert!(command.contains("--machine-id sy_node_client"));
         assert!(command.ends_with("--json"));
+    }
+
+    #[test]
+    fn remote_controller_logs_shell_command_targets_authenticated_logs_rpc() {
+        let command = remote_controller_logs_shell_command(
+            "synode secret",
+            "sy_node_client",
+            "sy-job",
+            Some("mac target"),
+        );
+
+        assert!(command.contains("SHIPYARD_NODE_TOKEN='synode secret'"));
+        assert!(command.contains("shipyard --local-state controller rpc-logs"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains(" sy-job --target 'mac target'"));
     }
 }
