@@ -622,6 +622,13 @@ pub(super) enum ControllerCommand {
         #[arg(long = "token-stdin", hide = true)]
         token_stdin: bool,
     },
+    /// Enqueue a durable execution envelope on the controller.
+    #[command(name = "rpc-enqueue", hide = true)]
+    RpcEnqueue {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+    },
     /// Return a controller-owned watch snapshot after bearer-token verification.
     #[command(name = "rpc-watch", hide = true)]
     RpcWatch {

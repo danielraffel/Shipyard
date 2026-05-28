@@ -625,7 +625,8 @@ Use `shipyard controller init`, `shipyard controller invite`,
 `shipyard --local-state targets pool status`, `shipyard leave`, and `shipyard
 node remove <this-machine-id>` for the implemented SSH-backed first slice. This
 proves secure pairing plus controller-backed state inspection, watch snapshots,
-host-pool visibility, registry visibility, and self-revocation. Do not claim
+host-pool visibility, registry visibility, self-revocation, and a hidden
+authenticated/idempotent `rpc-enqueue` persistence boundary. Do not claim public
 remote laptop enqueue/ship, streaming `watch --follow`, mutating host-pool
 cleanup, revoking another node from a client, or HTTPS controller RPC is
 available until those slices land.

@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::Value;
 use toml::{Table, Value as TomlValue};
 
@@ -21,11 +22,16 @@ use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::evidence::EvidenceStore;
 use crate::executor::ssh::shlex_quote;
 use crate::identity::{ProductIdentity, RuntimeMode};
+use crate::job::{Job, JobKind};
 use crate::machine_identity::get_or_create_machine_id;
 use crate::node_registry::{
     NodeEndpoint, NodeEndpointKind, NodeJoin, NodeRecord, NodeRegistryStore, NodeRole,
 };
 use crate::output::write_json_envelope;
+use crate::queue::Queue;
+use crate::queue_request::{
+    QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest,
+};
 use crate::ship_state::ShipStateStore;
 use wait_timeout::ChildExt;
 
@@ -90,6 +96,7 @@ pub(super) fn controller_command<W: Write>(
         | ControllerCommand::RpcNodeList { .. }
         | ControllerCommand::RpcNodeRemove { .. }
         | ControllerCommand::RpcTargetsPoolStatus { .. }
+        | ControllerCommand::RpcEnqueue { .. }
         | ControllerCommand::RpcWatch { .. }) => {
             controller_rpc_command(rpc, mode, cwd, state_dir, json_mode, stdout)?;
         }
@@ -169,6 +176,9 @@ fn controller_rpc_command<W: Write>(
             json_mode,
             stdout,
         ),
+        ControllerCommand::RpcEnqueue { machine_id } => {
+            controller_rpc_enqueue(state_dir, &machine_id, json_mode, stdout)
+        }
         ControllerCommand::RpcWatch {
             machine_id,
             pr,
@@ -618,6 +628,143 @@ fn controller_rpc_targets_pool_status<W: Write>(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     targets_pool_status(&config, state_dir, json_mode, stdout)?;
     Ok(())
+}
+
+fn controller_rpc_enqueue<W: Write>(
+    state_dir: &Path,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let request = read_enqueue_request_from_stdin()?;
+    controller_rpc_enqueue_request(
+        state_dir,
+        machine_id,
+        &request.bearer_token,
+        &request.envelope,
+        json_mode,
+        stdout,
+    )
+}
+
+fn controller_rpc_enqueue_request<W: Write>(
+    state_dir: &Path,
+    machine_id: &str,
+    bearer_token: &str,
+    envelope: &QueuedExecutionEnvelope,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node_with_token(state_dir, machine_id, bearer_token)?;
+    let job = job_from_envelope(envelope)?;
+    let mut queue = Queue::new(state_dir.to_path_buf())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let request_store =
+        QueueRequestStore::new(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let idempotent = if let Some(existing) = queue
+        .get(&job.id)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+    {
+        let existing_envelope = request_store
+            .load(&job.id)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if existing == job && existing_envelope.as_ref() == Some(envelope) {
+            true
+        } else {
+            return Err(CliFailure::new(
+                1,
+                "duplicate idempotency key maps to a different queued request",
+            ));
+        }
+    } else {
+        request_store
+            .save(envelope)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        queue
+            .enqueue(job.clone())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        false
+    };
+
+    if json_mode {
+        let mut data = BTreeMap::new();
+        data.insert("job".to_owned(), job.to_json_value());
+        data.insert("idempotent".to_owned(), Value::Bool(idempotent));
+        return write_json_envelope(stdout, "controller.rpc.enqueue", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()));
+    }
+    if idempotent {
+        writeln!(stdout, "Already queued {}", job.id)
+    } else {
+        writeln!(stdout, "Queued {}", job.id)
+    }
+    .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+fn read_enqueue_request_from_stdin() -> Result<ControllerEnqueueRequest, CliFailure> {
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .map_err(|error| CliFailure::new(1, format!("failed to read enqueue request: {error}")))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| CliFailure::new(1, format!("invalid enqueue request JSON: {error}")))
+}
+
+#[derive(Debug, Deserialize)]
+struct ControllerEnqueueRequest {
+    bearer_token: String,
+    envelope: QueuedExecutionEnvelope,
+}
+
+fn job_from_envelope(envelope: &QueuedExecutionEnvelope) -> Result<Job, CliFailure> {
+    let (sha, branch, mode, priority, kind, target_names) = match &envelope.request {
+        QueuedExecutionRequest::Run(request) => {
+            if envelope.kind != QueuedExecutionKind::Run {
+                return Err(CliFailure::new(
+                    1,
+                    "queued envelope kind does not match run request",
+                ));
+            }
+            (
+                request.sha.clone(),
+                request.branch.clone(),
+                request.mode,
+                request.priority,
+                JobKind::Run,
+                request
+                    .targets
+                    .iter()
+                    .map(|target| target.name.clone())
+                    .collect(),
+            )
+        }
+        QueuedExecutionRequest::Ship(request) => {
+            if envelope.kind != QueuedExecutionKind::Ship {
+                return Err(CliFailure::new(
+                    1,
+                    "queued envelope kind does not match ship request",
+                ));
+            }
+            (
+                request.sha.clone(),
+                request.branch.clone(),
+                request.mode,
+                request.priority,
+                JobKind::Ship,
+                request
+                    .targets
+                    .iter()
+                    .map(|target| target.name.clone())
+                    .collect(),
+            )
+        }
+    };
+    let mut job = Job::create(sha, branch, target_names, mode, priority)
+        .with_kind(kind)
+        .with_resource_claims(envelope.resource_plan.exclusive_claims.clone());
+    job.id.clone_from(&envelope.job_id);
+    job.created_at = envelope.created_at;
+    Ok(job)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1453,6 +1600,10 @@ fn configured_client(config: &LoadedConfig) -> Result<ConfiguredClient, CliFailu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::{Priority, ValidationMode};
+    use crate::queue_request::{
+        JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION, QueuedRunRequest,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -1571,6 +1722,125 @@ mod tests {
                 .to_string()
                 .contains("revoked")
         );
+    }
+
+    #[test]
+    fn rpc_enqueue_persists_request_and_is_idempotent() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = NodeRegistryStore::new(temp.path());
+        let (_invite, token) = store.create_invite("m5", 15).expect("invite");
+        let join = store
+            .accept_join(&token, "sy_node_client", "m5", Vec::new())
+            .expect("join");
+        let envelope = enqueue_test_envelope("job-remote");
+        let mut stdout = Vec::new();
+
+        controller_rpc_enqueue_request(
+            temp.path(),
+            "sy_node_client",
+            &join.bearer_token,
+            &envelope,
+            true,
+            &mut stdout,
+        )
+        .expect("enqueue");
+        let payload: Value = serde_json::from_slice(&stdout).expect("json");
+
+        assert_eq!(payload["command"], "controller.rpc.enqueue");
+        assert_eq!(payload["job"]["id"], "job-remote");
+        assert_eq!(payload["idempotent"], false);
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        assert_eq!(
+            queue.get("job-remote").expect("queue").expect("job").kind,
+            Some(JobKind::Run)
+        );
+        assert_eq!(
+            QueueRequestStore::new(temp.path())
+                .expect("store")
+                .load("job-remote")
+                .expect("load"),
+            Some(envelope.clone())
+        );
+
+        let mut second_stdout = Vec::new();
+        controller_rpc_enqueue_request(
+            temp.path(),
+            "sy_node_client",
+            &join.bearer_token,
+            &envelope,
+            true,
+            &mut second_stdout,
+        )
+        .expect("idempotent enqueue");
+        let second: Value = serde_json::from_slice(&second_stdout).expect("json");
+
+        assert_eq!(second["idempotent"], true);
+        assert_eq!(queue.get_all().expect("jobs").len(), 1);
+    }
+
+    #[test]
+    fn rpc_enqueue_rejects_duplicate_idempotency_key_with_different_request() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = NodeRegistryStore::new(temp.path());
+        let (_invite, token) = store.create_invite("m5", 15).expect("invite");
+        let join = store
+            .accept_join(&token, "sy_node_client", "m5", Vec::new())
+            .expect("join");
+        let envelope = enqueue_test_envelope("job-remote");
+        let mut stdout = Vec::new();
+        controller_rpc_enqueue_request(
+            temp.path(),
+            "sy_node_client",
+            &join.bearer_token,
+            &envelope,
+            true,
+            &mut stdout,
+        )
+        .expect("enqueue");
+        let mut conflicting = enqueue_test_envelope("job-remote");
+        if let QueuedExecutionRequest::Run(request) = &mut conflicting.request {
+            request.sha = "def456".to_owned();
+        }
+        let mut conflict_stdout = Vec::new();
+
+        let error = controller_rpc_enqueue_request(
+            temp.path(),
+            "sy_node_client",
+            &join.bearer_token,
+            &conflicting,
+            true,
+            &mut conflict_stdout,
+        )
+        .expect_err("conflict");
+
+        assert!(conflict_stdout.is_empty());
+        assert!(error.message.contains("duplicate idempotency key"));
+    }
+
+    fn enqueue_test_envelope(job_id: &str) -> QueuedExecutionEnvelope {
+        QueuedExecutionEnvelope {
+            schema_version: QUEUED_EXECUTION_SCHEMA_VERSION,
+            job_id: job_id.to_owned(),
+            kind: QueuedExecutionKind::Run,
+            cwd: PathBuf::from("/work/repo"),
+            created_at: Utc::now(),
+            resource_plan: JobResourcePlan {
+                targets: Vec::new(),
+                exclusive_claims: vec!["evidence:feature/test:mac".to_owned()],
+                cloud_targets: Vec::new(),
+                host_pools: Vec::new(),
+            },
+            request: QueuedExecutionRequest::Run(QueuedRunRequest {
+                branch: "feature/test".to_owned(),
+                sha: "abc123".to_owned(),
+                mode: ValidationMode::Full,
+                priority: Priority::Normal,
+                warm_disabled: false,
+                fail_fast: false,
+                resume_from: None,
+                targets: Vec::new(),
+            }),
+        }
     }
 
     #[test]

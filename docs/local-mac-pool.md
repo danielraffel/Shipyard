@@ -126,6 +126,9 @@ The first implemented transport is SSH-backed pairing plus controller-backed
 and controller-backed self-revocation with `shipyard node remove
 <this-machine-id>`; use `--local-state` with those commands when you
 intentionally want the laptop's own local state.
+The hidden authenticated `rpc-enqueue` boundary can persist idempotent queued
+execution envelopes on the controller, but public laptop `run`/`ship` commands
+are not wired to it yet.
 
 ## Explicit Cloud Overflow
 

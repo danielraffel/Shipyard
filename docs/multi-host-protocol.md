@@ -27,11 +27,15 @@ controller's host-pool leases and capacity, and `shipyard node remove
 node still requires running `node remove` on the controller. Use `--local-state`
 to inspect this machine's local state instead.
 
-HTTP controller serving, remote enqueue/ship, streaming `watch --follow`,
+The hidden controller `rpc-enqueue` endpoint now accepts an authenticated,
+idempotent queued execution envelope and persists it to the controller queue.
+Public laptop `run`/`ship` commands do not call it yet.
+
+HTTP controller serving, public remote enqueue/ship, streaming `watch --follow`,
 periodic heartbeats, and GUI consumption are still follow-on slices. Until
-those land, SSH-backed state inspection and self-revocation prove the
-trust/config/routing model but do not yet make a laptop enqueue work to a Mac
-Studio controller.
+those land, SSH-backed state inspection, self-revocation, and the low-level
+enqueue boundary prove the trust/config/routing model but do not yet make a
+laptop `shipyard ship` work to a Mac Studio controller.
 When client config is enabled, stateful local commands that are not yet routed
 to the controller fail closed unless `--local-state` is supplied, so a laptop
 does not silently mutate a separate local queue by accident.
