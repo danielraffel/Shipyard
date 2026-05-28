@@ -64,11 +64,11 @@ fn branch_apply<W: Write>(
     git_command: Option<&Path>,
     gh_command: Option<&Path>,
 ) -> Result<ExitCode, CliFailure> {
-    let repo = detect_repo_from_remote(cwd, git_command)
-        .ok_or_else(|| CliFailure::new(1, "Could not detect repo from git remote."))?;
     let branch_name = create_name.or(target_branch).ok_or_else(|| {
         CliFailure::new(1, "Specify a branch name (positional) or --create <name>")
     })?;
+    let repo = detect_repo_from_remote(cwd, git_command)
+        .ok_or_else(|| CliFailure::new(1, "Could not detect repo from git remote."))?;
     let rules = resolve_branch_rules(&config.data, branch_name)
         .map_err(|error| CliFailure::new(1, error))?;
     let gh = GovernanceGh::from_loaded_config(cwd, config, gh_command)
