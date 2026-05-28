@@ -19,8 +19,9 @@ controller join --controller ssh://host --token ...` consumes a controller
 invite over SSH, writes client-local config, stores only bearer-token hashes on
 the controller, `shipyard leave` removes local client config, and `shipyard
 status` / `shipyard queue` / `shipyard logs` / `shipyard evidence` route to
-the controller when client config is enabled. Use `--local-state` to inspect
-this machine's local state instead.
+the controller when client config is enabled. `shipyard node list` also reads
+the controller registry when joined. Use `--local-state` to inspect this
+machine's local state instead.
 
 HTTP controller serving, remote enqueue/ship/watch, periodic heartbeats, and
 GUI consumption are still follow-on slices. Until those land, SSH-backed
@@ -240,6 +241,7 @@ shipyard controller status
 shipyard queue
 shipyard logs <id>
 shipyard evidence
+shipyard node list
 shipyard leave
 ```
 

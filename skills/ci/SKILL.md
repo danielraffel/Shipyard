@@ -619,11 +619,12 @@ Use `shipyard controller init`, `shipyard controller invite`,
 `shipyard controller status`, `shipyard status`, `shipyard queue`,
 `shipyard logs`, `shipyard evidence`, `shipyard --local-state status`,
 `shipyard --local-state queue`, `shipyard --local-state logs`,
-`shipyard --local-state evidence`, `shipyard leave`, `shipyard node list`, and
-`shipyard node remove` for the implemented SSH-backed first slice. This proves
-secure pairing plus controller-backed read-only state visibility. Do not claim
-remote laptop enqueue/ship/watch or HTTPS controller RPC is available until
-those slices land.
+`shipyard --local-state evidence`, `shipyard node list`,
+`shipyard --local-state node list`, `shipyard leave`, and `shipyard node
+remove` for the implemented SSH-backed first slice. This proves secure pairing
+plus controller-backed read-only state and registry visibility. Do not claim
+remote laptop enqueue/ship/watch, controller-backed node removal, or HTTPS
+controller RPC is available until those slices land.
 
 ### Locality routing (`requires`)
 

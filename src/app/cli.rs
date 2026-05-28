@@ -575,6 +575,13 @@ pub(super) enum ControllerCommand {
         /// Branch to inspect. Defaults to current git branch or main on the controller.
         branch: Option<String>,
     },
+    /// Return controller-owned node registry after bearer-token verification.
+    #[command(name = "rpc-node-list", hide = true)]
+    RpcNodeList {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -88,6 +88,9 @@ pub(super) fn controller_command<W: Write>(
         ControllerCommand::RpcEvidence { machine_id, branch } => {
             controller_rpc_evidence(cwd, state_dir, &machine_id, branch, json_mode, stdout)?;
         }
+        ControllerCommand::RpcNodeList { machine_id } => {
+            controller_rpc_node_list(state_dir, &machine_id, json_mode, stdout)?;
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -445,6 +448,17 @@ fn controller_rpc_evidence<W: Write>(
 ) -> Result<(), CliFailure> {
     authenticate_rpc_node(state_dir, machine_id)?;
     evidence_command(branch, cwd, state_dir, json_mode, stdout)?;
+    Ok(())
+}
+
+fn controller_rpc_node_list<W: Write>(
+    state_dir: &Path,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node(state_dir, machine_id)?;
+    node_list(state_dir, json_mode, stdout)?;
     Ok(())
 }
 
@@ -838,6 +852,22 @@ pub(super) fn remote_evidence_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+pub(super) fn remote_node_list_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    remote_controller_command(
+        config,
+        machine_id,
+        "rpc-node-list",
+        json_mode,
+        "node list",
+        stdout,
+    )
+}
+
 fn remote_controller_command<W: Write>(
     config: &LoadedConfig,
     machine_id: &str,
@@ -1091,5 +1121,20 @@ mod tests {
         assert!(command.contains("shipyard --local-state controller rpc-evidence"));
         assert!(command.contains("--machine-id sy_node_client"));
         assert!(command.contains("--json 'feature/test branch'"));
+    }
+
+    #[test]
+    fn remote_controller_shell_command_targets_authenticated_node_list_rpc() {
+        let command = remote_controller_shell_command(
+            "synode_secret",
+            "rpc-node-list",
+            "sy_node_client",
+            true,
+        );
+
+        assert!(command.contains("SHIPYARD_NODE_TOKEN=synode_secret"));
+        assert!(command.contains("shipyard --local-state controller rpc-node-list"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.ends_with("--json"));
     }
 }

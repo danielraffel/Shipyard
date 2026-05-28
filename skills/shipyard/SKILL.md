@@ -348,9 +348,10 @@ ssh://... --token ...`, `shipyard controller status`, controller-backed
 `shipyard status`, controller-backed `shipyard queue`, controller-backed
 `shipyard logs`, controller-backed `shipyard evidence`, `shipyard --local-state
 status`, `shipyard --local-state queue`, `shipyard --local-state logs`,
-`shipyard --local-state evidence`, `shipyard leave`,
-`shipyard node list`, and `shipyard node remove`. Treat remote
-enqueue/ship/watch and HTTPS controller RPC as planned, not shipped.
+`shipyard --local-state evidence`, controller-backed `shipyard node list`,
+`shipyard --local-state node list`, `shipyard leave`, and `shipyard node
+remove`. Treat remote enqueue/ship/watch, controller-backed node removal, and
+HTTPS controller RPC as planned, not shipped.
 
 ## Cloud Retargeting
 
