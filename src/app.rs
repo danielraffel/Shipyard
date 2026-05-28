@@ -75,7 +75,7 @@ use self::release_bot_cmd::release_bot_command;
 use self::rescue_cmd::rescue_command;
 use self::run_cmd::{
     FailFastMode, ReachabilityPolicy, RootMismatchPolicy, RunCommandArgs, TreeDriftPolicy,
-    WarmPolicy, run_command,
+    WarmPolicy, remote_run_command, run_command,
 };
 use self::runner_cmd::runner_command;
 use self::ship_cmd::{ShipCommandArgs, ship_command};
@@ -337,11 +337,21 @@ fn handle_operational_variant<W: Write>(
     )? {
         return Ok(result);
     }
+    if let Some(result) = maybe_remote_run_command(
+        &command,
+        mode,
+        cwd,
+        runtime_paths,
+        json,
+        local_state,
+        stdout,
+    )? {
+        return Ok(result);
+    }
     if !local_state
         && matches!(
             command,
-            Command::Run { .. }
-                | Command::Ship { .. }
+            Command::Ship { .. }
                 | Command::Pr { .. }
                 | Command::AutoMerge { .. }
                 | Command::ShipState { .. }
@@ -455,6 +465,67 @@ fn maybe_remote_watch_command<W: Write>(
     let branch = if pr.is_none() { git_branch(cwd) } else { None };
     let code = remote_watch_command(&config, &machine_id, *pr, branch.as_deref(), json, stdout)?;
     Ok(Some(code))
+}
+
+fn maybe_remote_run_command<W: Write>(
+    command: &Command,
+    mode: RuntimeMode,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    local_state: bool,
+    stdout: &mut W,
+) -> Result<Option<ExitCode>, CliFailure> {
+    if local_state {
+        return Ok(None);
+    }
+    let Some(args) = run_args_from_command(command) else {
+        return Ok(None);
+    };
+    let config = LoadedConfig::load_from_cwd_with_global_dir(
+        mode,
+        cwd,
+        Some(runtime_paths.global_dir.clone()),
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !configured_client_enabled(&config) {
+        return Ok(None);
+    }
+    let machine_id = crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    remote_run_command(args, &config, cwd, runtime_paths, &machine_id, json, stdout).map(Some)
+}
+
+fn run_args_from_command(command: &Command) -> Option<RunCommandArgs> {
+    let Command::Run {
+        targets,
+        smoke,
+        fail_fast,
+        resume_from,
+        allow_root_mismatch,
+        allow_unreachable_targets,
+        skip_targets,
+        no_warm,
+        allow_tree_drift,
+    } = command
+    else {
+        return None;
+    };
+    Some(RunCommandArgs {
+        targets: targets.clone(),
+        mode: if *smoke {
+            crate::job::ValidationMode::Smoke
+        } else {
+            crate::job::ValidationMode::Full
+        },
+        fail_fast: FailFastMode::from_flag(*fail_fast),
+        resume_from: resume_from.clone(),
+        root_mismatch: RootMismatchPolicy::from_flag(*allow_root_mismatch),
+        reachability: ReachabilityPolicy::from_flag(*allow_unreachable_targets),
+        skip_targets: skip_targets.clone(),
+        warm: WarmPolicy::from_no_warm_flag(*no_warm),
+        tree_drift: TreeDriftPolicy::from_flag(*allow_tree_drift),
+    })
 }
 
 fn git_branch(cwd: &Path) -> Option<String> {
@@ -1235,6 +1306,63 @@ mod tests {
         assert!(stderr.is_empty());
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "queue");
+    }
+
+    #[test]
+    fn run_routes_to_controller_enqueue_when_client_configured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(&["init"], temp.path());
+        git(&["checkout", "-b", "feature/test"], temp.path());
+        std::fs::write(temp.path().join("README.md"), "demo\n").expect("readme");
+        git(&["add", "README.md"], temp.path());
+        git(&["commit", "-m", "initial"], temp.path());
+        let project = temp.path().join(".shipyard");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::write(
+            project.join("config.toml"),
+            "[targets.mac]\nbackend = \"local\"\nplatform = \"macos-arm64\"\n",
+        )
+        .expect("project config");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "https://mac-studio.example.ts.net:8765"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "run",
+            "--targets",
+            "mac",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("implemented SSH transport"));
+        assert!(message.contains("--local-state for local run"));
+        assert!(!message.contains("remote enqueue/ship/watch is not implemented"));
     }
 
     #[test]

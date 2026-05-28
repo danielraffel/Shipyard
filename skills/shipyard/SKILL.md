@@ -353,11 +353,11 @@ status`, `shipyard --local-state queue`, `shipyard --local-state logs`,
 `shipyard watch --no-follow`, `shipyard --local-state watch --no-follow`,
 controller-backed `shipyard targets pool status`, `shipyard --local-state
 targets pool status`, `shipyard leave`, and controller-backed `shipyard node
-remove <this-machine-id>`. A hidden authenticated/idempotent `rpc-enqueue`
-boundary can persist queued execution envelopes on the controller, but public
-laptop `run`/`ship` commands do not call it yet. Treat public remote
-enqueue/ship, streaming `watch --follow`, mutating host-pool cleanup, revoking
-another node from a client, and HTTPS controller RPC as planned, not shipped.
+remove <this-machine-id>`. Public laptop `shipyard run` uses the
+authenticated/idempotent `rpc-enqueue` boundary to persist queued execution
+envelopes on the controller. Treat public remote `shipyard ship`, streaming
+`watch --follow`, mutating host-pool cleanup, revoking another node from a
+client, and HTTPS controller RPC as planned, not shipped.
 
 ## Cloud Retargeting
 

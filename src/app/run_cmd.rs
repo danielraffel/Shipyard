@@ -3,15 +3,16 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
+use serde::Serialize;
 use serde_json::Value;
 
-use super::CliFailure;
+use super::{CliFailure, controller_cmd::remote_enqueue_command};
 use crate::config::LoadedConfig;
 use crate::evidence::EvidenceStore;
 use crate::executor::dispatch::{
     ExecutorDispatcher, ResolvedBackend, ResolvedTarget, ResolvedValidation, resolve_targets,
 };
-use crate::job::{Priority, ValidationMode};
+use crate::job::{Job, JobKind, Priority, ValidationMode};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 use crate::preflight::{
@@ -20,6 +21,7 @@ use crate::preflight::{
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
+use crate::queue_request::QueuedExecutionEnvelope;
 use crate::ship::{RunExecutionRequest, RunStores, drain_or_wait_run, submit_run};
 use crate::warm_pool::{WarmPool, default_pool_path};
 
@@ -214,6 +216,120 @@ pub(super) fn run_command<W: Write>(
     }
 
     Ok(run_exit_code(&outcome.job))
+}
+
+pub(super) fn remote_run_command<W: Write>(
+    args: RunCommandArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let request = prepare_run_request(args, config, cwd, runtime_paths, json_mode, stdout)?;
+    let job = Job::create(
+        request.sha.clone(),
+        request.branch.clone(),
+        request
+            .targets
+            .iter()
+            .map(|target| target.name.clone())
+            .collect(),
+        request.mode,
+        request.priority,
+    )
+    .with_kind(JobKind::Run);
+    let enqueue = RemoteRunEnqueueRequest {
+        bearer_token: configured_node_token(config)?,
+        envelope: QueuedExecutionEnvelope::from_run_request(job.id, cwd, &request),
+    };
+    remote_enqueue_command(config, machine_id, &enqueue, json_mode, stdout)
+}
+
+#[derive(Serialize)]
+struct RemoteRunEnqueueRequest {
+    bearer_token: String,
+    envelope: QueuedExecutionEnvelope,
+}
+
+fn configured_node_token(config: &LoadedConfig) -> Result<String, CliFailure> {
+    config
+        .data
+        .get("multi_host")
+        .and_then(toml::Value::as_table)
+        .and_then(|multi| multi.get("client"))
+        .and_then(toml::Value::as_table)
+        .and_then(|client| client.get("node_token"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| CliFailure::new(1, "multi_host.client.node_token is missing"))
+}
+
+fn prepare_run_request<W: Write>(
+    args: RunCommandArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<RunExecutionRequest, CliFailure> {
+    let mode = args.mode;
+    let resolved =
+        resolve_targets(config, mode).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let skipped_targets = skipped_present(&resolved, args.targets.as_deref(), &args.skip_targets)?;
+    let mut targets = select_targets(resolved, args.targets.as_deref(), &args.skip_targets)?;
+    if targets.is_empty() {
+        return Err(CliFailure::new(
+            2,
+            "No targets remain after --skip-target filtering.",
+        ));
+    }
+    if args.tree_drift == TreeDriftPolicy::Allow {
+        set_allow_tree_drift(&mut targets);
+    }
+
+    let preflight_dispatcher = ExecutorDispatcher::new(None);
+    let mut preflight = collect_ship_preflight_with_options(
+        config,
+        cwd,
+        &runtime_paths.state_dir,
+        &targets,
+        &preflight_dispatcher,
+        ShipPreflightOptions {
+            allow_root_mismatch: args.root_mismatch == RootMismatchPolicy::Allow,
+            allow_unreachable_targets: args.reachability == ReachabilityPolicy::AllowUnreachable,
+        },
+    )
+    .map_err(|error| preflight_failure(&error))?;
+    for skipped in &skipped_targets {
+        preflight.warnings.push(format!(
+            "Target '{skipped}' deliberately skipped (--skip-target)."
+        ));
+    }
+    preflight.skipped_targets = skipped_targets;
+
+    let branch = git_required(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let sha = git_required(cwd, &["rev-parse", "HEAD"])?;
+
+    if !json_mode {
+        write_tree_drift_banner(stdout, args.tree_drift, &targets)?;
+        for warning in &preflight.warnings {
+            writeln!(stdout, "warning: {warning}")
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
+
+    Ok(RunExecutionRequest {
+        branch,
+        sha,
+        mode,
+        priority: Priority::Normal,
+        warm_disabled: args.warm == WarmPolicy::Disabled,
+        fail_fast: args.fail_fast == FailFastMode::StopOnFirstFailure,
+        resume_from: args.resume_from,
+        targets,
+    })
 }
 
 fn preflight_failure(error: &ShipPreflightError) -> CliFailure {

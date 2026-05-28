@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use toml::{Table, Value as TomlValue};
 
@@ -1314,6 +1315,39 @@ pub(super) fn remote_targets_pool_status_command<W: Write>(
     )
 }
 
+pub(super) fn remote_enqueue_command<W: Write, T: Serialize>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    request: &T,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let client = configured_client(config)?;
+    let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
+        return Err(CliFailure::new(
+            1,
+            "configured controller is not reachable through the implemented SSH transport; use --local-state for local run",
+        ));
+    };
+    let remote = remote_controller_enqueue_shell_command(machine_id, json_mode);
+    let payload =
+        serde_json::to_string(request).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let output = run_controller_ssh(endpoint, &remote, Some(&payload), "controller enqueue")?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "controller_unreachable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    stdout
+        .write_all(&output.stdout)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 pub(super) fn remote_watch_command<W: Write>(
     config: &LoadedConfig,
     machine_id: &str,
@@ -1540,6 +1574,17 @@ fn remote_controller_node_remove_shell_command(
         "shipyard --local-state controller rpc-node-remove --machine-id {} --token-stdin {}",
         shlex_quote(machine_id),
         shlex_quote(target_machine_id),
+    );
+    if json_mode {
+        remote.push_str(" --json");
+    }
+    remote
+}
+
+fn remote_controller_enqueue_shell_command(machine_id: &str, json_mode: bool) -> String {
+    let mut remote = format!(
+        "shipyard --local-state controller rpc-enqueue --machine-id {}",
+        shlex_quote(machine_id),
     );
     if json_mode {
         remote.push_str(" --json");
@@ -1915,6 +1960,17 @@ mod tests {
         assert!(command.contains("--token-stdin"));
         assert!(command.ends_with("--json"));
         assert!(!command.contains("synode_secret"));
+    }
+
+    #[test]
+    fn remote_controller_enqueue_shell_command_targets_authenticated_enqueue_rpc() {
+        let command = remote_controller_enqueue_shell_command("sy_node_client", true);
+
+        assert!(command.contains("shipyard --local-state controller rpc-enqueue"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.ends_with("--json"));
+        assert!(!command.contains("synode_secret"));
+        assert!(!command.contains("token"));
     }
 
     #[test]
