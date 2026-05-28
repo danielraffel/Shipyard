@@ -55,9 +55,10 @@ use self::cloud_cmd::cloud_command;
 use self::config_cmd::config_command;
 use self::controller_cmd::{
     configured_client_enabled, controller_command, leave_command, node_command,
-    remote_cancel_command, remote_evidence_command, remote_logs_command, remote_node_list_command,
-    remote_node_remove_command, remote_queue_command, remote_status_command,
-    remote_targets_pool_status_command, remote_watch_command,
+    remote_cancel_command, remote_cloud_status_command, remote_evidence_command,
+    remote_logs_command, remote_node_list_command, remote_node_remove_command,
+    remote_queue_command, remote_status_command, remote_targets_pool_status_command,
+    remote_watch_command,
 };
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
@@ -371,7 +372,7 @@ fn handle_operational_variant<W: Write>(
             handle_pr_variant(command, mode, cwd, runtime_paths, json, stdout)
         }
         command @ Command::Cloud { .. } => {
-            handle_cloud_variant(command, mode, cwd, &runtime_paths.state_dir, json, stdout)
+            handle_cloud_variant(command, mode, cwd, runtime_paths, json, local_state, stdout)
         }
         command @ Command::Rescue(_) => handle_rescue_variant(command, mode, cwd, json, stdout),
         command @ Command::AutoMerge { .. } => {
@@ -1028,14 +1029,15 @@ fn handle_cloud_variant<W: Write>(
     command: Command,
     mode: RuntimeMode,
     cwd: &Path,
-    state_dir: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
+    local_state: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let Command::Cloud { command } = command else {
         unreachable!("cloud variant required")
     };
-    handle_cloud_command(command, mode, cwd, state_dir, json, stdout)
+    handle_cloud_command(command, mode, cwd, runtime_paths, json, local_state, stdout)
 }
 
 fn handle_auto_merge_variant<W: Write>(
@@ -1159,15 +1161,44 @@ fn handle_cloud_command<W: Write>(
     command: self::cli::CloudCommand,
     mode: RuntimeMode,
     cwd: &Path,
-    state_dir: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
+    local_state: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let config = LoadedConfig::load_from_cwd_with_global_dir(
+        mode,
+        cwd,
+        Some(runtime_paths.global_dir.clone()),
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !local_state
+        && let self::cli::CloudCommand::Status {
+            identifier,
+            limit,
+            refresh,
+            no_refresh,
+        } = &command
+        && configured_client_enabled(&config)
+    {
+        let machine_id =
+            crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return remote_cloud_status_command(
+            &config,
+            &machine_id,
+            identifier.as_deref(),
+            *limit,
+            *refresh,
+            *no_refresh,
+            json,
+            stdout,
+        );
+    }
+    let state_dir = &runtime_paths.state_dir;
     let store = ShipStateStore::new(state_dir.join("ship"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let cloud_records = CloudRecordStore::new(state_dir.join("cloud"))
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     cloud_command(command, &store, &cloud_records, &config, cwd, json, stdout)
 }
@@ -1410,6 +1441,52 @@ mod tests {
         assert!(message.contains("implemented SSH transport"));
         assert!(message.contains("--local-state for local cancel"));
         assert!(!message.contains("stateful command is not routed"));
+    }
+
+    #[test]
+    fn cloud_status_routes_to_controller_when_client_configured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "https://mac-studio.example.ts.net:8765"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "cloud",
+            "status",
+            "--limit",
+            "2",
+            "--refresh",
+            "latest",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("implemented SSH transport"));
+        assert!(message.contains("--local-state for local cloud status"));
     }
 
     #[test]

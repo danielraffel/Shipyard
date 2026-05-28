@@ -16,9 +16,12 @@ use super::watch_cmd::{WatchCommandContext, WatchCommandOptions, watch};
 use super::{
     CliFailure,
     cli::{ControllerCommand, NodeCommand},
+    cloud_read_cmd::cloud_status,
     queue_cmd::{cancel_command, evidence_command, logs_command, queue_command, status_command},
     targets_cmd::targets_pool_status,
 };
+use crate::cloud::GitHubActions;
+use crate::cloud_records::CloudRecordStore;
 use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::evidence::EvidenceStore;
 use crate::executor::dispatch::ExecutorDispatcher;
@@ -104,6 +107,7 @@ pub(super) fn controller_command<W: Write>(
         | ControllerCommand::RpcNodeList { .. }
         | ControllerCommand::RpcNodeRemove { .. }
         | ControllerCommand::RpcCancel { .. }
+        | ControllerCommand::RpcCloudStatus { .. }
         | ControllerCommand::RpcTargetsPoolStatus { .. }
         | ControllerCommand::RpcEnqueue { .. }
         | ControllerCommand::RpcWatch { .. }) => {
@@ -148,6 +152,25 @@ fn controller_rpc_command<W: Write>(
             &machine_id,
             &job_id,
             token_stdin,
+            json_mode,
+            stdout,
+        ),
+        ControllerCommand::RpcCloudStatus {
+            machine_id,
+            identifier,
+            limit,
+            refresh,
+            no_refresh,
+            token_stdin,
+        } => controller_rpc_cloud_status(
+            mode,
+            cwd,
+            state_dir,
+            &machine_id,
+            token_stdin,
+            identifier.as_deref(),
+            limit,
+            refresh && !no_refresh,
             json_mode,
             stdout,
         ),
@@ -819,6 +842,50 @@ fn controller_rpc_cancel_with_token<W: Write>(
 ) -> Result<(), CliFailure> {
     authenticate_rpc_node_with_token(state_dir, machine_id, bearer_token)?;
     cancel_command(job_id, state_dir, json_mode, stdout)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controller_rpc_cloud_status<W: Write>(
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    machine_id: &str,
+    token_stdin: bool,
+    identifier: Option<&str>,
+    limit: usize,
+    refresh: bool,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let token = read_rpc_token(token_stdin)?;
+    controller_rpc_cloud_status_with_token(
+        mode, cwd, state_dir, machine_id, &token, identifier, limit, refresh, json_mode, stdout,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controller_rpc_cloud_status_with_token<W: Write>(
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    machine_id: &str,
+    bearer_token: &str,
+    identifier: Option<&str>,
+    limit: usize,
+    refresh: bool,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node_with_token(state_dir, machine_id, bearer_token)?;
+    let records = CloudRecordStore::new(state_dir.join("cloud"))
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let config = LoadedConfig::load_from_cwd(mode, cwd)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let actions = GitHubActions::from_loaded_config(cwd, &config);
+    cloud_status(
+        &records, &actions, identifier, limit, refresh, json_mode, stdout,
+    )?;
     Ok(())
 }
 
@@ -1562,6 +1629,48 @@ pub(super) fn remote_targets_pool_status_command<W: Write>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn remote_cloud_status_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    identifier: Option<&str>,
+    limit: usize,
+    refresh: bool,
+    no_refresh: bool,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let client = configured_client(config)?;
+    let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
+        return Err(CliFailure::new(
+            1,
+            "configured controller is not reachable through the implemented SSH transport; use --local-state for local cloud status",
+        ));
+    };
+    let remote = remote_controller_cloud_status_shell_command(
+        machine_id, identifier, limit, refresh, no_refresh, json_mode,
+    );
+    let output = run_controller_ssh(
+        endpoint,
+        &remote,
+        Some(&client.node_token),
+        "controller cloud status",
+    )?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "controller_unreachable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    stdout
+        .write_all(&output.stdout)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 pub(super) fn remote_enqueue_command<W: Write, T: Serialize>(
     config: &LoadedConfig,
     machine_id: &str,
@@ -1846,6 +1955,35 @@ fn remote_controller_node_remove_shell_command(
     remote
 }
 
+fn remote_controller_cloud_status_shell_command(
+    machine_id: &str,
+    identifier: Option<&str>,
+    limit: usize,
+    refresh: bool,
+    no_refresh: bool,
+    json_mode: bool,
+) -> String {
+    let mut remote = format!(
+        "shipyard --local-state controller rpc-cloud-status --machine-id {} --token-stdin --limit {}",
+        shlex_quote(machine_id),
+        limit,
+    );
+    if json_mode {
+        remote.push_str(" --json");
+    }
+    if refresh {
+        remote.push_str(" --refresh");
+    }
+    if no_refresh {
+        remote.push_str(" --no-refresh");
+    }
+    if let Some(identifier) = identifier {
+        remote.push(' ');
+        remote.push_str(&shlex_quote(identifier));
+    }
+    remote
+}
+
 fn remote_controller_cancel_shell_command(
     machine_id: &str,
     job_id: &str,
@@ -1926,6 +2064,7 @@ fn configured_client(config: &LoadedConfig) -> Result<ConfiguredClient, CliFailu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cloud_records::CloudRunRecord;
     use crate::job::{JobStatus, Priority, ValidationMode};
     use crate::queue_request::{
         JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION, QueuedRunRequest,
@@ -2244,6 +2383,27 @@ mod tests {
     }
 
     #[test]
+    fn remote_controller_cloud_status_shell_command_targets_authenticated_cloud_status_rpc() {
+        let command = remote_controller_cloud_status_shell_command(
+            "sy_node_client",
+            Some("cloud latest"),
+            3,
+            true,
+            false,
+            true,
+        );
+
+        assert!(command.contains("shipyard --local-state controller rpc-cloud-status"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--token-stdin"));
+        assert!(command.contains("--limit 3"));
+        assert!(command.contains("--refresh"));
+        assert!(command.contains("--json"));
+        assert!(command.ends_with("'cloud latest'"));
+        assert!(!command.contains("synode_secret"));
+    }
+
+    #[test]
     fn remote_controller_shell_command_targets_authenticated_targets_pool_status_rpc() {
         let command =
             remote_controller_shell_command("rpc-targets-pool-status", "sy_node_client", true);
@@ -2392,6 +2552,56 @@ mod tests {
         assert_eq!(
             queue.get(&job.id).expect("queue").expect("job").status,
             JobStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn rpc_cloud_status_reads_controller_cloud_records_after_auth() {
+        let temp = TempDir::new().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let store = NodeRegistryStore::new(&state_dir);
+        let (_invite, token) = store.create_invite("m5", 15).expect("invite");
+        let join = store
+            .accept_join(&token, "sy_node_client", "m5", Vec::new())
+            .expect("join");
+        let records = CloudRecordStore::new(state_dir.join("cloud")).expect("records");
+        let mut record = CloudRunRecord::new(
+            "cloud-controller",
+            "ci",
+            "ci.yml",
+            "CI",
+            "feature/test",
+            "github-hosted",
+        );
+        record.status = "completed".to_owned();
+        record.conclusion = Some("success".to_owned());
+        records.save(&record).expect("save");
+        let mut stdout = Vec::new();
+
+        controller_rpc_cloud_status_with_token(
+            RuntimeMode::Shipyard,
+            temp.path(),
+            &state_dir,
+            "sy_node_client",
+            &join.bearer_token,
+            None,
+            10,
+            false,
+            true,
+            &mut stdout,
+        )
+        .expect("cloud status");
+
+        let payload: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(payload["command"], "cloud.status");
+        assert_eq!(payload["records"][0]["dispatch_id"], "cloud-controller");
+        assert_eq!(payload["records"][0]["conclusion"], "success");
+        assert!(
+            store
+                .authenticate_node("sy_node_client", &join.bearer_token)
+                .expect("still registered")
+                .token_hash
+                .is_some()
         );
     }
 }

@@ -40,6 +40,7 @@ shipyard cancel <id>           # cancel a job; controller-backed when joined
 shipyard logs <id>             # per-target logs; controller-backed when joined
 shipyard evidence              # last-good SHA; controller-backed when joined
 shipyard node list             # registered nodes; controller-backed when joined
+shipyard cloud status          # tracked cloud runs; controller-backed when joined
 shipyard --local-state status  # force this machine's local state
 shipyard --local-state queue   # force this machine's local queue
 shipyard --local-state logs <id>
@@ -139,12 +140,13 @@ The implemented SSH-backed first slice is available with `shipyard controller
 init`, `shipyard controller invite`, `shipyard controller join --controller
 ssh://... --token ...`, `shipyard controller status`, `shipyard status`,
 `shipyard queue`, `shipyard logs`, `shipyard evidence`, `shipyard node list`,
-`shipyard watch --no-follow`, `shipyard targets pool status`, `shipyard node
-remove <this-machine-id>`, `shipyard cancel <job-id>`, `shipyard controller
-start`, `shipyard controller work --once`, and `shipyard leave`. After join,
-those state commands ask the controller for shared state; use `--local-state`
-for the laptop-local status, queue, logs, evidence, watch, node registry,
-host-pool status, and cancellation. `shipyard run` and `shipyard ship --pr
+`shipyard watch --no-follow`, `shipyard targets pool status`, `shipyard cloud
+status`, `shipyard node remove <this-machine-id>`, `shipyard cancel <job-id>`,
+`shipyard controller start`, `shipyard controller work --once`, and `shipyard
+leave`. After join, those state commands ask the controller for shared state;
+use `--local-state` for the laptop-local status, queue, logs, evidence, watch,
+node registry, host-pool status, cloud records, and cancellation. `shipyard run`
+and `shipyard ship --pr
 <n>` on a joined client now use the authenticated `rpc-enqueue` boundary to
 persist an idempotent queued execution envelope on the controller; run
 `shipyard controller start` (an alias for `shipyard controller work`) on the

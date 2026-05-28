@@ -352,8 +352,10 @@ status`, `shipyard --local-state queue`, `shipyard --local-state logs`,
 `shipyard --local-state node list`, controller-backed
 `shipyard watch --no-follow`, `shipyard --local-state watch --no-follow`,
 controller-backed `shipyard targets pool status`, `shipyard --local-state
-targets pool status`, `shipyard leave`, and controller-backed `shipyard node
-remove <this-machine-id>`, and controller-backed `shipyard cancel <job-id>`.
+targets pool status`, controller-backed `shipyard cloud status`, `shipyard
+--local-state cloud status`, `shipyard leave`, and controller-backed `shipyard
+node remove <this-machine-id>`, and controller-backed `shipyard cancel
+<job-id>`.
 Public laptop `shipyard run` uses the authenticated/idempotent `rpc-enqueue`
 boundary to persist queued execution envelopes on the controller; public laptop
 `shipyard ship --pr <n>` uses the same boundary for ship requests. Run

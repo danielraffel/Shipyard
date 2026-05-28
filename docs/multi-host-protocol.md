@@ -25,8 +25,11 @@ controller-owned ship-state snapshot. `shipyard targets pool status` reads the
 controller's host-pool leases and capacity, and `shipyard node remove
 <this-machine-id>` routes a self-revocation to the controller; revoking another
 node still requires running `node remove` on the controller. `shipyard cancel
-<job-id>` also routes to the controller when joined. Use `--local-state` to
-inspect or mutate this machine's local state instead.
+<job-id>` also routes to the controller when joined. `shipyard cloud status`
+reads controller-owned cloud records when joined; `--refresh` is evaluated on
+the controller so paired laptops do not fan out GitHub polling from the same App
+installation quota. Use `--local-state` to inspect or mutate this machine's
+local state instead.
 
 The controller `rpc-enqueue` endpoint accepts an authenticated, idempotent
 queued execution envelope and persists it to the controller queue. Public
@@ -260,6 +263,7 @@ shipyard controller start
 shipyard controller work --once
 shipyard queue
 shipyard cancel <job-id>
+shipyard cloud status
 shipyard logs <id>
 shipyard evidence
 shipyard node list

@@ -622,13 +622,15 @@ Use `shipyard controller init`, `shipyard controller invite`,
 `shipyard --local-state evidence`, `shipyard node list`,
 `shipyard --local-state node list`, `shipyard watch --no-follow`,
 `shipyard --local-state watch --no-follow`, `shipyard targets pool status`,
-`shipyard --local-state targets pool status`, `shipyard leave`, and `shipyard
-node remove <this-machine-id>`, plus controller-backed `shipyard cancel
-<job-id>` for the implemented SSH-backed first slice. This proves secure
+`shipyard --local-state targets pool status`, controller-backed `shipyard cloud
+status`, `shipyard --local-state cloud status`, `shipyard leave`, and
+`shipyard node remove <this-machine-id>`, plus controller-backed `shipyard
+cancel <job-id>` for the implemented SSH-backed first slice. This proves secure
 pairing plus controller-backed state inspection, watch snapshots, host-pool
-visibility, registry visibility, self-revocation, cancellation, and public
-controller-backed `shipyard run`/`shipyard ship --pr <n>` enqueue through the
-authenticated/idempotent `rpc-enqueue` persistence boundary. Run `shipyard
+visibility, cloud-record visibility, registry visibility, self-revocation,
+cancellation, and public controller-backed `shipyard run`/`shipyard ship --pr
+<n>` enqueue through the authenticated/idempotent `rpc-enqueue` persistence
+boundary. Run `shipyard
 controller start` (an alias for `shipyard controller work`) on the controller to
 drain queued work continuously, or `shipyard controller work --once` for a
 single validation pass. Do not claim

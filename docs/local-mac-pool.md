@@ -124,9 +124,9 @@ The first implemented transport is SSH-backed pairing plus controller-backed
 `shipyard evidence`, plus controller-backed `shipyard node list` and
 `shipyard watch --no-follow`, controller-backed `shipyard targets pool status`,
 and controller-backed self-revocation with `shipyard node remove
-<this-machine-id>`, plus controller-backed `shipyard cancel <job-id>`; use
-`--local-state` with those commands when you intentionally want the laptop's own
-local state.
+<this-machine-id>`, plus controller-backed `shipyard cancel <job-id>` and
+`shipyard cloud status`; use `--local-state` with those commands when you
+intentionally want the laptop's own local state.
 Joined laptops can enqueue `shipyard run` and `shipyard ship --pr <n>` work to
 the controller through the authenticated/idempotent `rpc-enqueue` boundary.
 Run `shipyard controller start` (an alias for `shipyard controller work`) on the

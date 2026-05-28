@@ -634,6 +634,27 @@ pub(super) enum ControllerCommand {
         #[arg(long = "token-stdin", hide = true)]
         token_stdin: bool,
     },
+    /// Return controller-owned cloud run status after bearer-token verification.
+    #[command(name = "rpc-cloud-status", hide = true)]
+    RpcCloudStatus {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+        /// Dispatch ID to show, or `latest`.
+        identifier: Option<String>,
+        /// Number of records to show.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Refresh run state from GitHub before rendering.
+        #[arg(long, action = ArgAction::SetTrue)]
+        refresh: bool,
+        /// Preserve public cloud status option shape.
+        #[arg(long = "no-refresh", action = ArgAction::SetTrue)]
+        no_refresh: bool,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
+    },
     /// Return controller-owned host-pool status after bearer-token verification.
     #[command(name = "rpc-targets-pool-status", hide = true)]
     RpcTargetsPoolStatus {
