@@ -56,6 +56,24 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Inspect local network transports used by Shipyard.
+    Network {
+        /// Network subcommand.
+        #[command(subcommand)]
+        command: NetworkCommand,
+    },
+    /// Configure this machine as a multi-host controller.
+    Controller {
+        /// Controller subcommand.
+        #[command(subcommand)]
+        command: ControllerCommand,
+    },
+    /// Inspect or revoke multi-host nodes.
+    Node {
+        /// Node subcommand.
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
     /// Configure Shipyard for the current project.
     Init {
         /// Show detected config output; preserves Python's current write behavior.
@@ -449,6 +467,57 @@ pub(super) enum RunnerCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub(super) enum NetworkCommand {
+    /// Inspect the local Tailscale status used for controller discovery.
+    Tailscale {
+        /// Tailscale subcommand.
+        #[command(subcommand)]
+        command: NetworkTailscaleCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum NetworkTailscaleCommand {
+    /// Show whether this node is reachable on its private tailnet.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum ControllerCommand {
+    /// Initialize this install as the local controller.
+    Init {
+        /// Controller display name. Defaults to the local hostname.
+        #[arg(long)]
+        name: Option<String>,
+        /// Ordered controller endpoint. Supported forms:
+        /// tailscale-dns=https://host:port, tailscale-ip=https://100.x:port,
+        /// lan-https=https://ip:port#sha256=<fingerprint>, ssh=ssh://host.
+        #[arg(long = "endpoint")]
+        endpoints: Vec<String>,
+    },
+    /// Create a short-lived pairing invite token.
+    Invite {
+        /// Intended node display name.
+        #[arg(long)]
+        name: String,
+        /// Expiry in minutes.
+        #[arg(long = "ttl-minutes", default_value_t = 15)]
+        ttl_minutes: i64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum NodeCommand {
+    /// List registered nodes.
+    List,
+    /// Revoke one node and clear its bearer-token hash.
+    Remove {
+        /// Machine id to revoke.
+        machine_id: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Subcommand)]
 pub(super) enum ShipStateCommand {
     /// List active in-flight ship states.
@@ -537,6 +606,42 @@ pub(super) enum ConfigCommand {
         /// Profile name to activate.
         profile_name: String,
     },
+    /// Set one dotted config key in a writable config layer.
+    Set {
+        /// Dotted key, for example `multi_host.controller.enabled`.
+        key: String,
+        /// TOML value. Bare words are stored as strings; TOML scalars,
+        /// arrays, and inline tables are preserved.
+        value: String,
+        /// Destination config layer.
+        #[arg(long, value_enum, default_value_t = ConfigScope::Local)]
+        scope: ConfigScope,
+    },
+    /// Remove one dotted config key from a writable config layer.
+    Unset {
+        /// Dotted key to remove.
+        key: String,
+        /// Destination config layer.
+        #[arg(long, value_enum, default_value_t = ConfigScope::Local)]
+        scope: ConfigScope,
+    },
+    /// Export non-secret local setup config to a portable bundle.
+    Export {
+        /// Write the bundle to a file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Import one config layer from a portable setup bundle.
+    Import {
+        /// Bundle previously produced by `shipyard config export`.
+        input: PathBuf,
+        /// Bundle layer to import.
+        #[arg(long = "from", value_enum, default_value_t = ConfigBundleLayer::Local)]
+        from: ConfigBundleLayer,
+        /// Destination config layer.
+        #[arg(long, value_enum, default_value_t = ConfigScope::Local)]
+        scope: ConfigScope,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -567,6 +672,28 @@ pub(super) enum AuthConfigScope {
     Project,
     /// Per-project local overlay config.
     Local,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(super) enum ConfigScope {
+    /// Machine-global config.
+    Global,
+    /// Tracked project config.
+    Project,
+    /// Per-project local overlay config.
+    Local,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(super) enum ConfigBundleLayer {
+    /// Machine-global config layer from the bundle.
+    Global,
+    /// Tracked project config layer from the bundle.
+    Project,
+    /// Per-project local overlay config layer from the bundle.
+    Local,
+    /// Effective merged config from the bundle.
+    Effective,
 }
 
 #[derive(Debug, Subcommand)]

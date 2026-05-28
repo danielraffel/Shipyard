@@ -42,6 +42,16 @@ pub struct LoadedConfig {
 impl LoadedConfig {
     /// Load and merge config layers for a given mode and directory.
     pub fn load_from_cwd(mode: RuntimeMode, cwd: &Path) -> ConfigResult<Self> {
+        Self::load_from_cwd_with_global_dir(mode, cwd, None)
+    }
+
+    /// Load and merge config layers for a given mode and directory, with an
+    /// optional machine-global config directory override.
+    pub fn load_from_cwd_with_global_dir(
+        mode: RuntimeMode,
+        cwd: &Path,
+        global_dir: Option<PathBuf>,
+    ) -> ConfigResult<Self> {
         let identity = ProductIdentity::for_mode(mode);
         let runtime_paths = RuntimePaths::current(mode);
         let project_dir = cwd.join(identity.tracked_project_dir_name);
@@ -57,7 +67,7 @@ impl LoadedConfig {
         };
 
         Self::load(
-            Some(runtime_paths.global_dir),
+            Some(global_dir.unwrap_or(runtime_paths.global_dir)),
             project_dir.exists().then_some(project_dir),
             local_dir,
             local_overlay_source,

@@ -1776,7 +1776,13 @@ mod tests {
         while Instant::now() < deadline {
             let mut stream = TcpStream::connect(("127.0.0.1", listener.port)).expect("connect");
             stream.write_all(&request_bytes).expect("request");
-            stream.shutdown(Shutdown::Write).expect("shutdown");
+            if let Err(error) = stream.shutdown(Shutdown::Write) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotConnected,
+                    "shutdown: {error}"
+                );
+            }
             response.clear();
             match stream.read_to_string(&mut response) {
                 Ok(_) if response.starts_with("HTTP/1.1 200 OK") => break,

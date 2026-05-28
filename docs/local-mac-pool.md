@@ -114,6 +114,12 @@ The first concurrency release uses a conservative worker cap, so host-pool
 throughput is bounded by both configured pool capacity and the queue worker
 limit.
 
+For a multi-machine setup where laptops submit to an always-on controller, use
+the controller/client protocol instead of sharing Shipyard state directories.
+The controller is the only writer for queue, lease, ship, warm-pool, and cloud
+state; clients join explicitly and communicate over authenticated RPCs. See
+[`docs/multi-host-protocol.md`](multi-host-protocol.md).
+
 ## Explicit Cloud Overflow
 
 GitHub-hosted macOS overflow must be explicit:

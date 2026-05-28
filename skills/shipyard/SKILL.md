@@ -59,6 +59,14 @@ When debugging GitHub behavior:
   sanitized config movement. The bundle must not contain tokens, private keys,
   Keychain exports, 1Password sessions, queue state, daemon sockets, or token
   caches.
+- Prefer `shipyard config set <dotted.key> <value> --scope local|project|global`
+  and `shipyard config unset ...` for operator setup changes. Do not tell users
+  to hand-edit TOML when a CLI-backed setting write is available.
+- Use `shipyard config export --output shipyard-setup.toml` for a portable
+  non-secret setup bundle. It can be restored with `shipyard config import
+  shipyard-setup.toml --from local --scope local`. It does not move raw tokens,
+  PEM/private-key material, Keychain items, daemon sockets, queue state, logs,
+  or token caches.
 
 ## Drift And Parity
 
@@ -326,6 +334,18 @@ owner, but they still do not interrupt running GitHub-hosted macOS jobs. Jobs
 serialize when they claim the same checkout, PR state, evidence lane, or
 exhausted pool capacity. See `docs/local-mac-pool.md` before claiming
 multi-Mac throughput.
+
+For controller/client multi-host designs, keep one controller as the sole
+writer for shared queue, lease, ship, warm-pool, and cloud state. Do not use a
+shared filesystem as a distributed state backend. Pair clients explicitly and
+route remote enqueue/status through the authenticated protocol described in
+`docs/multi-host-protocol.md`. `shipyard network tailscale status --json`
+exposes the existing Tailscale probe for private tailnet reachability; this is
+separate from Tailscale Funnel readiness used by webhook tunneling.
+The implemented local registry commands are `shipyard controller init`,
+`shipyard controller invite`, `shipyard node list`, and
+`shipyard node remove`. Treat remote join/RPC/enqueue/watch as planned, not
+shipped.
 
 ## Cloud Retargeting
 

@@ -8,9 +8,14 @@ shipyard doctor --rate-limit   # show effective GitHub auth + REST/GraphQL bucke
 shipyard auth doctor           # show Shipyard's configured GitHub auth source
 shipyard auth export --output shipyard-auth.toml        # export non-secret auth config
 shipyard auth import shipyard-auth.toml --scope local   # import auth config locally
+shipyard network tailscale status # show private tailnet reachability
 shipyard targets               # show targets + reachability
 shipyard targets add <name>    # interactively add a new target
 shipyard targets remove <name> # remove a target
+shipyard controller init --name mac-studio --endpoint ssh=ssh://mac-studio
+shipyard controller invite --name m5
+shipyard node list             # show registered controller/client/worker nodes
+shipyard node remove <machine-id>
 
 # Validate
 shipyard run                       # full validation, all targets
@@ -39,6 +44,12 @@ shipyard cleanup --apply       # prune old logs and artifacts
 shipyard config profiles       # list defined profiles
 shipyard config use <profile>  # switch active profile
 shipyard config show           # dump effective merged config
+shipyard config set multi_host.controller.enabled true --scope local
+shipyard config unset multi_host.controller.enabled --scope local
+shipyard config export --output shipyard-setup.toml
+shipyard config import shipyard-setup.toml --from local --scope local
+shipyard auth export --output shipyard-auth.toml
+shipyard auth import shipyard-auth.toml --scope local
 
 # Governance
 shipyard governance status     # declared vs live drift
@@ -94,3 +105,25 @@ probe GitHub quota. Use `shipyard doctor --rate-limit` when you need to confirm
 whether Shipyard is using ambient `gh`, an env token, or a command helper such
 as a GitHub App installation token, and to see the current REST and GraphQL
 rate-limit buckets.
+
+## Setup Movement
+
+For machine-to-machine setup movement, use `shipyard config export --output
+shipyard-setup.toml` and restore a chosen layer with `shipyard config import
+shipyard-setup.toml --from local --scope local`. Reprovision secrets
+separately.
+
+For GitHub App auth specifically, use `shipyard auth export` and
+`shipyard auth import`; the export is allow-listed to omit private keys,
+tokens, and unknown secret-bearing keys.
+
+## Multi-Host Registry
+
+For controller/client multi-host planning, do not share Shipyard state
+directories across Macs. The controller is the only writer for shared queue,
+lease, ship, warm-pool, and cloud records; clients join explicitly over an
+authenticated protocol. See `docs/multi-host-protocol.md`.
+
+The local registry slice is available with `shipyard controller init`,
+`shipyard controller invite`, `shipyard node list`, and
+`shipyard node remove`; remote join/RPC/enqueue/watch are still planned.

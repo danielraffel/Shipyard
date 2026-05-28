@@ -158,7 +158,7 @@ pub(super) fn ship_command<W: Write>(
             stdout,
             pr_context.number,
             &outcome,
-            render_state.merged(),
+            &render_state,
             &diagnostics,
         )?;
     } else {
@@ -471,6 +471,21 @@ impl ShipRenderState {
     fn merged(&self) -> bool {
         matches!(self, Self::Merged)
     }
+
+    fn status_label(&self) -> &'static str {
+        match self {
+            Self::ValidationFailed => "validation_failed",
+            Self::Merged => "merged",
+            Self::GreenNotMerged(_) => "green_not_merged",
+        }
+    }
+
+    fn merge_error(&self) -> Option<&str> {
+        match self {
+            Self::GreenNotMerged(error) => Some(error),
+            Self::ValidationFailed | Self::Merged => None,
+        }
+    }
 }
 
 fn post_run_merge_state(
@@ -514,7 +529,7 @@ fn render_json<W: Write>(
     stdout: &mut W,
     pr: u64,
     outcome: &crate::ship::ShipExecutionOutcome,
-    merged: bool,
+    render_state: &ShipRenderState,
     diagnostics: &[RenderedDiagnostics],
 ) -> Result<(), CliFailure> {
     let diag_payload: Vec<Value> = diagnostics
@@ -537,7 +552,17 @@ fn render_json<W: Write>(
         "ship",
         fields([
             ("pr", Value::from(pr)),
-            ("merged", Value::Bool(merged)),
+            ("merged", Value::Bool(render_state.merged())),
+            (
+                "status",
+                Value::String(render_state.status_label().to_owned()),
+            ),
+            (
+                "merge_error",
+                render_state
+                    .merge_error()
+                    .map_or(Value::Null, |error| Value::String(error.to_owned())),
+            ),
             ("run", outcome.job.to_json_value()),
             ("ship_state", json!(outcome.ship_state)),
             (
@@ -729,11 +754,16 @@ mod tests {
 
     use toml::Table;
 
-    use super::{ShipCommandArgs, ShipRenderState, render_green_not_merged, ship_command};
+    use super::{
+        ShipCommandArgs, ShipRenderState, render_green_not_merged, render_json, ship_command,
+    };
     use crate::app::cli::MergeResult;
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::identity::RuntimeMode;
+    use crate::job::{Job, Priority, ValidationMode};
     use crate::paths::RuntimePaths;
+    use crate::ship::ShipExecutionOutcome;
+    use crate::ship_state::ShipState;
 
     /// Issue #301 (2/3): the render must surface the underlying merge
     /// error verbatim and point the user at the two unblocks
@@ -774,6 +804,45 @@ mod tests {
         assert!(ShipRenderState::Merged.merged());
         assert!(!ShipRenderState::ValidationFailed.merged());
         assert!(!ShipRenderState::GreenNotMerged("err".to_owned()).merged());
+    }
+
+    #[test]
+    fn render_json_surfaces_green_not_merged_error() {
+        let outcome = ShipExecutionOutcome {
+            job: Job::create(
+                "abc123",
+                "feature/test",
+                vec!["macos".to_owned()],
+                ValidationMode::Full,
+                Priority::Normal,
+            ),
+            ship_state: ShipState::new(
+                2020,
+                "danielraffel/Shipyard",
+                "feature/test",
+                "main",
+                "abc123",
+                "policy",
+            ),
+            resumed_existing_state: false,
+        };
+        let error = "GraphQL: Pull request is not mergeable: Base branch was modified.";
+        let mut buf = Vec::<u8>::new();
+
+        render_json(
+            &mut buf,
+            2020,
+            &outcome,
+            &ShipRenderState::GreenNotMerged(error.to_owned()),
+            &[],
+        )
+        .expect("render");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&buf).expect("json envelope should parse");
+
+        assert_eq!(payload["merged"], false);
+        assert_eq!(payload["status"], "green_not_merged");
+        assert_eq!(payload["merge_error"], error);
     }
 
     fn git(args: &[&str], cwd: &std::path::Path) {

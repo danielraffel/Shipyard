@@ -50,6 +50,10 @@ pub mod init_config;
 pub mod job;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
+/// Stable per-install machine identity for multi-host ownership.
+pub mod machine_identity;
+/// Durable multi-host node registry and invite state.
+pub mod node_registry;
 /// Structured JSON output helpers.
 pub mod output;
 /// Filesystem path resolution for isolated and compatible modes.
@@ -72,6 +76,8 @@ pub mod queue;
 pub mod queue_request;
 /// Cooperative queue scheduler planning primitives.
 pub mod queue_scheduler;
+/// OS-backed random byte helpers.
+pub mod random;
 /// Best-effort reconciliation of durable ship-state against GitHub truth.
 pub mod reconcile;
 /// GitHub webhook registration through the user's existing `gh` auth.

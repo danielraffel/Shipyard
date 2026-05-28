@@ -400,18 +400,44 @@ pub struct TailscaleStatus {
     pub backend_state: Option<String>,
     /// Current node DNS name.
     pub dns_name: Option<String>,
+    /// Current node Tailscale IPs.
+    pub tailscale_ips: Vec<String>,
+    /// `Self.Online` from `tailscale status --json`, when present.
+    pub online: Option<bool>,
     /// Whether Funnel is permitted by the tailnet capability map.
     pub funnel_permitted: bool,
 }
 
 impl TailscaleStatus {
+    /// Return whether this snapshot has enough private tailnet information for
+    /// controller/client reachability. Funnel permissions are intentionally not
+    /// part of this predicate.
+    #[must_use]
+    pub fn is_tailnet_reachable(&self) -> bool {
+        self.binary_path.is_some()
+            && self.backend_state.as_deref() == Some("Running")
+            && self.online != Some(false)
+            && self.dns_name.as_deref().is_some_and(|dns| !dns.is_empty())
+    }
+
+    /// Return the `MagicDNS` name without a trailing dot.
+    #[must_use]
+    pub fn magic_dns_name(&self) -> Option<String> {
+        if !self.is_tailnet_reachable() {
+            return None;
+        }
+        let trimmed = self.dns_name.as_deref()?.trim_end_matches('.');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    }
+
     /// Return whether this snapshot is ready to start Funnel.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.binary_path.is_some()
-            && self.backend_state.as_deref() == Some("Running")
-            && self.dns_name.as_deref().is_some_and(|dns| !dns.is_empty())
-            && self.funnel_permitted
+        self.is_tailnet_reachable() && self.funnel_permitted
     }
 
     /// Return the HTTPS Funnel URL derived from DNS name when ready.
@@ -420,12 +446,7 @@ impl TailscaleStatus {
         if !self.is_ready() {
             return None;
         }
-        let trimmed = self.dns_name.as_deref()?.trim_end_matches('.');
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(format!("https://{trimmed}"))
-        }
+        Some(format!("https://{}", self.magic_dns_name()?))
     }
 }
 
@@ -448,6 +469,19 @@ pub fn decode_tailscale_status(raw_json: &[u8], binary_path: Option<PathBuf>) ->
         .and_then(|entry| entry.get("DNSName"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let tailscale_ips = self_object
+        .and_then(|entry| entry.get("TailscaleIPs"))
+        .and_then(Value::as_array)
+        .map(|ips| {
+            ips.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let online = self_object
+        .and_then(|entry| entry.get("Online"))
+        .and_then(Value::as_bool);
     let funnel_permitted = self_object
         .and_then(|entry| entry.get("CapMap"))
         .and_then(Value::as_object)
@@ -457,6 +491,8 @@ pub fn decode_tailscale_status(raw_json: &[u8], binary_path: Option<PathBuf>) ->
         binary_path,
         backend_state,
         dns_name,
+        tailscale_ips,
+        online,
         funnel_permitted,
     }
 }
@@ -482,6 +518,8 @@ fn tailscale_not_ready(binary_path: Option<PathBuf>) -> TailscaleStatus {
         binary_path,
         backend_state: None,
         dns_name: None,
+        tailscale_ips: Vec::new(),
+        online: None,
         funnel_permitted: false,
     }
 }
@@ -796,6 +834,8 @@ mod tests {
             binary_path: Some("/bin/tailscale".into()),
             backend_state: Some("Running".to_owned()),
             dns_name: Some("node.tailnet.ts.net.".to_owned()),
+            tailscale_ips: vec!["100.64.0.1".to_owned()],
+            online: Some(true),
             funnel_permitted: true,
         }
     }
@@ -805,6 +845,8 @@ mod tests {
             binary_path: Some("/bin/tailscale".into()),
             backend_state: Some("Starting".to_owned()),
             dns_name: Some("node.tailnet.ts.net.".to_owned()),
+            tailscale_ips: Vec::new(),
+            online: Some(false),
             funnel_permitted: false,
         }
     }
@@ -816,6 +858,8 @@ mod tests {
               "BackendState": "Running",
               "Self": {
                 "DNSName": "node.tailnet.ts.net.",
+                "Online": true,
+                "TailscaleIPs": ["100.64.0.1", "fd7a:115c:a1e0::1"],
                 "CapMap": {"https://tailscale.com/cap/funnel": []}
               }
             }"#,
@@ -823,10 +867,62 @@ mod tests {
         );
 
         assert!(status.is_ready());
+        assert!(status.is_tailnet_reachable());
+        assert_eq!(
+            status.magic_dns_name().as_deref(),
+            Some("node.tailnet.ts.net")
+        );
+        assert_eq!(
+            status.tailscale_ips,
+            vec!["100.64.0.1".to_owned(), "fd7a:115c:a1e0::1".to_owned()]
+        );
+        assert_eq!(status.online, Some(true));
         assert_eq!(
             status.funnel_url().as_deref(),
             Some("https://node.tailnet.ts.net")
         );
+    }
+
+    #[test]
+    fn tailscale_status_tailnet_reachable_does_not_require_funnel_cap() {
+        let status = decode_tailscale_status(
+            br#"{
+              "BackendState": "Running",
+              "Self": {
+                "DNSName": "node.tailnet.ts.net.",
+                "Online": true,
+                "TailscaleIPs": ["100.64.0.1"]
+              }
+            }"#,
+            Some("/Applications/Tailscale.app/Contents/MacOS/Tailscale".into()),
+        );
+
+        assert!(status.is_tailnet_reachable());
+        assert!(!status.is_ready());
+        assert_eq!(
+            status.magic_dns_name().as_deref(),
+            Some("node.tailnet.ts.net")
+        );
+        assert_eq!(status.funnel_url(), None);
+    }
+
+    #[test]
+    fn tailscale_status_tailnet_reachable_rejects_explicit_offline_self() {
+        let status = decode_tailscale_status(
+            br#"{
+              "BackendState": "Running",
+              "Self": {
+                "DNSName": "node.tailnet.ts.net.",
+                "Online": false,
+                "TailscaleIPs": ["100.64.0.1"]
+              }
+            }"#,
+            Some("/Applications/Tailscale.app/Contents/MacOS/Tailscale".into()),
+        );
+
+        assert!(!status.is_tailnet_reachable());
+        assert_eq!(status.magic_dns_name(), None);
+        assert_eq!(status.funnel_url(), None);
     }
 
     #[test]

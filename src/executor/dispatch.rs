@@ -34,6 +34,7 @@ use crate::host_pool::{
     parse_host_pools,
 };
 use crate::job::{TargetResult, ValidationMode};
+use crate::machine_identity::get_or_create_machine_id;
 use crate::prepared_state::PreparedStateStore;
 use crate::warm_pool::extract_warm_keepalive_seconds;
 
@@ -338,6 +339,7 @@ pub struct ExecutorDispatcher {
     windows: WindowsExecutor,
     cloud: CloudExecutor,
     host_pool_store: Option<HostPoolLeaseStore>,
+    node_id: Option<String>,
 }
 
 impl ExecutorDispatcher {
@@ -353,9 +355,10 @@ impl ExecutorDispatcher {
         prepared_state_store: Option<PreparedStateStore>,
         state_dir: &std::path::Path,
     ) -> Self {
-        Self::new_with_host_pool_store(
+        Self::new_with_host_pool_store_and_node_id(
             prepared_state_store,
             Some(HostPoolLeaseStore::new(default_lease_path(state_dir))),
+            get_or_create_machine_id(state_dir).ok(),
         )
     }
 
@@ -365,6 +368,14 @@ impl ExecutorDispatcher {
         prepared_state_store: Option<PreparedStateStore>,
         host_pool_store: Option<HostPoolLeaseStore>,
     ) -> Self {
+        Self::new_with_host_pool_store_and_node_id(prepared_state_store, host_pool_store, None)
+    }
+
+    fn new_with_host_pool_store_and_node_id(
+        prepared_state_store: Option<PreparedStateStore>,
+        host_pool_store: Option<HostPoolLeaseStore>,
+        node_id: Option<String>,
+    ) -> Self {
         Self {
             local: LocalExecutor::new(prepared_state_store),
             ssh: SshExecutor::new(),
@@ -373,6 +384,7 @@ impl ExecutorDispatcher {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ),
             host_pool_store,
+            node_id,
         }
     }
 
@@ -581,6 +593,7 @@ impl ExecutorDispatcher {
                 backend: member.target.backend_name.clone(),
                 host: member.target.host.clone(),
                 job_id: request.job_id.clone(),
+                owner_node_id: self.node_id.clone(),
                 branch: request.branch.clone(),
                 sha: request.sha.clone(),
                 max_concurrency: member.max_concurrency,
@@ -2141,12 +2154,18 @@ mod tests {
             .remove(0);
         let dispatcher = super::ExecutorDispatcher::new_with_state_dir(None, temp.path());
         let lease_store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        let expected_node_id =
+            crate::machine_identity::get_or_create_machine_id(temp.path()).expect("machine id");
         let observed_job_id = std::cell::Cell::new(false);
         let mut callback = |event: crate::executor::streaming::ProgressEvent| {
             if event.phase.as_deref() == Some("lease-check") {
                 let leases = lease_store.leases().expect("leases");
                 assert_eq!(leases.len(), 1);
                 assert_eq!(leases[0].job_id.as_deref(), Some("job-host-pool"));
+                assert_eq!(
+                    leases[0].owner_node_id.as_deref(),
+                    Some(expected_node_id.as_str())
+                );
                 observed_job_id.set(true);
             }
         };
@@ -2212,6 +2231,7 @@ mod tests {
                 backend: "local".to_owned(),
                 host: None,
                 job_id: Some("existing".to_owned()),
+                owner_node_id: Some("sy_node_test".to_owned()),
                 branch: "main".to_owned(),
                 sha: "busy".to_owned(),
                 max_concurrency: 1,
@@ -2284,6 +2304,7 @@ mod tests {
                 backend: "local".to_owned(),
                 host: None,
                 job_id: Some("existing".to_owned()),
+                owner_node_id: Some("sy_node_test".to_owned()),
                 branch: "main".to_owned(),
                 sha: "busy".to_owned(),
                 max_concurrency: 1,

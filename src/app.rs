@@ -20,10 +20,12 @@ mod cli;
 mod cloud_cmd;
 mod cloud_read_cmd;
 mod config_cmd;
+mod controller_cmd;
 mod daemon_cmd;
 mod doctor_cmd;
 mod governance_cmd;
 mod init_cmd;
+mod network_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
@@ -51,10 +53,12 @@ use self::cleanup_cmd::{
 use self::cli::{Cli, Command, MergeMethod, MergeResult, ShipStateCommand, TargetsCommand};
 use self::cloud_cmd::cloud_command;
 use self::config_cmd::config_command;
+use self::controller_cmd::{controller_command, node_command};
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
 use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
+use self::network_cmd::network_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
 use self::pr_cmd::{PrCommandArgs, pr_command};
@@ -142,7 +146,15 @@ fn dispatch<W: Write, E: Write>(
         }
         Command::Update(args) => return update_command(&args, cli.json, stdout),
         Command::Config { command } => {
-            return config_command(command, cli.mode.into(), &cwd, cli.json, stdout);
+            return config_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.global_dir,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
         }
         Command::Auth { command } => {
             return auth_command(
@@ -153,6 +165,22 @@ fn dispatch<W: Write, E: Write>(
                 cli.json,
                 stdout,
             );
+        }
+        Command::Network { command } => {
+            return network_command(command, cli.json, stdout);
+        }
+        Command::Controller { command } => {
+            return controller_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
+        }
+        Command::Node { command } => {
+            return node_command(command, &runtime_paths.state_dir, cli.json, stdout);
         }
         command @ (Command::Init { .. }
         | Command::Changelog { .. }
@@ -285,6 +313,9 @@ fn handle_operational_variant<W: Write>(
         | Command::Pin { .. }
         | Command::Config { .. }
         | Command::Auth { .. }
+        | Command::Network { .. }
+        | Command::Controller { .. }
+        | Command::Node { .. }
         | Command::Init { .. }
         | Command::Changelog { .. }
         | Command::Branch { .. }

@@ -309,8 +309,6 @@ fn create_pr_with_ambient_gh(
     );
     let client = GhClient::ambient();
     let output = gh_with_policy(&client, cwd, gh_command, GhAuthPolicy::AmbientOnly)?
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
         .args([
             "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
         ])

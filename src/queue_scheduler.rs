@@ -54,6 +54,28 @@ impl PendingAdmissionRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RunningAdmissionRequest {
+    job_id: Option<String>,
+    resource_plan: JobResourcePlan,
+}
+
+impl RunningAdmissionRequest {
+    fn anonymous(resource_plan: JobResourcePlan) -> Self {
+        Self {
+            job_id: None,
+            resource_plan,
+        }
+    }
+
+    fn from_job(job_id: impl Into<String>, resource_plan: JobResourcePlan) -> Self {
+        Self {
+            job_id: Some(job_id.into()),
+            resource_plan,
+        }
+    }
+}
+
 /// Output of one pure scheduler admit pass.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdmitPassPlan {
@@ -184,6 +206,10 @@ pub struct HostPoolCapacityDeficit {
 
 /// Return every blocker for admitting `candidate` alongside currently running
 /// resource plans and active host-pool leases.
+///
+/// `running` does not carry queue job ids, so this helper cannot reconcile a
+/// running reservation with a lease held by the same job. Queue-backed
+/// scheduling should use `plan_admit_pass_from_jobs`.
 #[must_use]
 pub fn admission_blockers(
     candidate: &JobResourcePlan,
@@ -226,6 +252,21 @@ pub fn plan_admit_pass(
     leases: &[HostPoolLease],
     now: DateTime<Utc>,
 ) -> AdmitPassPlan {
+    let running = running
+        .iter()
+        .cloned()
+        .map(RunningAdmissionRequest::anonymous)
+        .collect::<Vec<_>>();
+    plan_admit_pass_with_running(pending, &running, pools, leases, now)
+}
+
+fn plan_admit_pass_with_running(
+    pending: &[PendingAdmissionRequest],
+    running: &[RunningAdmissionRequest],
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> AdmitPassPlan {
     let mut plan = AdmitPassPlan::default();
     let mut occupied = running.to_vec();
     for candidate in pending {
@@ -236,11 +277,22 @@ pub fn plan_admit_pass(
             });
             continue;
         };
-        let occupied_refs = occupied.iter().collect::<Vec<_>>();
-        let blockers = admission_blockers(resource_plan, &occupied_refs, pools, leases, now);
+        let occupied_refs = occupied
+            .iter()
+            .map(|request| &request.resource_plan)
+            .collect::<Vec<_>>();
+        let mut blockers = exclusive_claim_blockers(resource_plan, &occupied_refs);
+        blockers.extend(
+            host_pool_capacity_deficits_for_running(resource_plan, &occupied, pools, leases, now)
+                .into_iter()
+                .map(SchedulerAdmissionBlocker::HostPoolCapacity),
+        );
         if blockers.is_empty() {
             plan.admitted.push(candidate.job_id.clone());
-            occupied.push(resource_plan.clone());
+            occupied.push(RunningAdmissionRequest::from_job(
+                candidate.job_id.clone(),
+                resource_plan.clone(),
+            ));
         } else {
             plan.deferred.push(DeferredAdmission {
                 job_id: candidate.job_id.clone(),
@@ -286,7 +338,7 @@ pub fn plan_admit_pass_from_jobs(
     let mut running_request_errors = Vec::new();
     for job in jobs.iter().filter(|job| job.status == JobStatus::Running) {
         match load_resource_plan(&job.id, request_store) {
-            Ok(Some(plan)) => running.push(plan),
+            Ok(Some(plan)) => running.push(RunningAdmissionRequest::from_job(job.id.clone(), plan)),
             Ok(None) => running_request_errors.push(RequestLoadError {
                 job_id: job.id.clone(),
                 reason: ORPHANED_PENDING_REQUEST_REASON.to_owned(),
@@ -298,7 +350,7 @@ pub fn plan_admit_pass_from_jobs(
         }
     }
     RequestBackedAdmitPass {
-        plan: plan_admit_pass(&pending, &running, pools, leases, now),
+        plan: plan_admit_pass_with_running(&pending, &running, pools, leases, now),
         running_request_errors,
         same_pr_ship_admission,
     }
@@ -351,10 +403,28 @@ fn admit_pass_cancellations(pass: &RequestBackedAdmitPass) -> Vec<QueuePendingCa
 
 /// Return host-pool deficits for admitting `candidate` alongside already
 /// running resource plans and active, non-stale host-pool leases.
+///
+/// `running` does not carry queue job ids, so this helper cannot reconcile a
+/// running reservation with a lease held by the same job. Queue-backed
+/// scheduling should use `plan_admit_pass_from_jobs`.
 #[must_use]
 pub fn host_pool_capacity_deficits(
     candidate: &JobResourcePlan,
     running: &[&JobResourcePlan],
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> Vec<HostPoolCapacityDeficit> {
+    let running = running
+        .iter()
+        .map(|plan| RunningAdmissionRequest::anonymous((*plan).clone()))
+        .collect::<Vec<_>>();
+    host_pool_capacity_deficits_for_running(candidate, &running, pools, leases, now)
+}
+
+fn host_pool_capacity_deficits_for_running(
+    candidate: &JobResourcePlan,
+    running: &[RunningAdmissionRequest],
     pools: &[HostPoolConfig],
     leases: &[HostPoolLease],
     now: DateTime<Utc>,
@@ -538,7 +608,7 @@ fn orphan_reason(detail: Option<&str>) -> String {
 fn available_slots_for(
     candidate: &HostPoolDemand,
     pools: &BTreeMap<&str, &HostPoolConfig>,
-    running: &[&JobResourcePlan],
+    running: &[RunningAdmissionRequest],
     leases: &[HostPoolLease],
     now: DateTime<Utc>,
 ) -> u32 {
@@ -559,23 +629,73 @@ fn available_slots_for(
                 && eligible_members.contains(lease.member_id.as_str())
                 && !lease.is_stale(now)
         })
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX);
-    let running_reservations = running
-        .iter()
-        .flat_map(|plan| plan.host_pools.iter())
-        .filter(|demand| demand.pool_name == candidate.pool_name)
-        .filter(|demand| {
-            let running_members = eligible_member_ids(pool, &demand.requires);
-            !running_members.is_disjoint(&eligible_members)
-        })
-        .map(|demand| demand.slots)
-        .sum::<u32>();
+        .collect::<Vec<_>>();
+    let active_lease_count = active_leases.len().try_into().unwrap_or(u32::MAX);
+    let running_reservations =
+        running_reservation_slots(pool, candidate, &eligible_members, running, &active_leases);
 
     total
-        .saturating_sub(active_leases)
+        .saturating_sub(active_lease_count)
         .saturating_sub(running_reservations)
+}
+
+fn running_reservation_slots(
+    pool: &HostPoolConfig,
+    candidate: &HostPoolDemand,
+    candidate_members: &BTreeSet<&str>,
+    running: &[RunningAdmissionRequest],
+    active_leases: &[&HostPoolLease],
+) -> u32 {
+    let mut credited_lease_indexes = BTreeSet::new();
+    let mut reservations = 0u32;
+    for request in running {
+        for demand in request
+            .resource_plan
+            .host_pools
+            .iter()
+            .filter(|demand| demand.pool_name == candidate.pool_name)
+        {
+            let running_members = eligible_member_ids(pool, &demand.requires);
+            if running_members.is_disjoint(candidate_members) {
+                continue;
+            }
+            let credited = active_leases
+                .iter()
+                .enumerate()
+                .filter(|(index, lease)| {
+                    !credited_lease_indexes.contains(index)
+                        && lease_matches_running_demand(
+                            lease,
+                            request.job_id.as_deref(),
+                            &running_members,
+                        )
+                })
+                .take(demand.slots as usize)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            for index in &credited {
+                credited_lease_indexes.insert(*index);
+            }
+            reservations = reservations.saturating_add(
+                demand
+                    .slots
+                    .saturating_sub(u32::try_from(credited.len()).unwrap_or(u32::MAX)),
+            );
+        }
+    }
+    reservations
+}
+
+fn lease_matches_running_demand(
+    lease: &HostPoolLease,
+    running_job_id: Option<&str>,
+    running_members: &BTreeSet<&str>,
+) -> bool {
+    let Some(running_job_id) = running_job_id else {
+        return false;
+    };
+    running_members.contains(lease.member_id.as_str())
+        && (lease.job_id.as_deref() == Some(running_job_id) || lease.job_id.is_none())
 }
 
 fn eligible_member_ids<'a>(pool: &'a HostPoolConfig, requires: &[String]) -> BTreeSet<&'a str> {
@@ -659,6 +779,24 @@ mod tests {
         }
     }
 
+    fn single_member_pool(max_concurrency: u32) -> HostPoolConfig {
+        HostPoolConfig {
+            name: "local_macs".to_owned(),
+            strategy: "ordered".to_owned(),
+            lease_stale_seconds: 180,
+            heartbeat_interval_seconds: 15,
+            members: vec![HostPoolMemberConfig {
+                id: "mac-studio".to_owned(),
+                backend_type: "ssh".to_owned(),
+                host: Some("mac-studio".to_owned()),
+                repo_path: Some("/repo".to_owned()),
+                cwd: None,
+                max_concurrency,
+                capabilities: vec!["macos".to_owned(), "arm64".to_owned()],
+            }],
+        }
+    }
+
     fn plan(slots: u32) -> JobResourcePlan {
         JobResourcePlan {
             targets: Vec::new(),
@@ -700,6 +838,7 @@ mod tests {
             backend: "ssh".to_owned(),
             host: Some(member_id.to_owned()),
             job_id: Some("job-running".to_owned()),
+            owner_node_id: Some("sy_node_test".to_owned()),
             branch: "main".to_owned(),
             sha: "abc123".to_owned(),
             owner_pid: 123,
@@ -707,6 +846,25 @@ mod tests {
             heartbeat_at: Utc::now(),
             expires_at,
         }
+    }
+
+    fn lease_for_job(
+        member_id: &str,
+        job_id: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> HostPoolLease {
+        let mut lease = lease(member_id, expires_at);
+        lease.job_id = Some(job_id.to_owned());
+        lease
+    }
+
+    fn legacy_lease_without_job_id(
+        member_id: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> HostPoolLease {
+        let mut lease = lease(member_id, expires_at);
+        lease.job_id = None;
+        lease
     }
 
     fn job(id: &str, status: JobStatus, priority: Priority, created_offset_secs: i64) -> Job {
@@ -821,6 +979,120 @@ mod tests {
         let deficits = host_pool_capacity_deficits(&candidate, &[], &[pool()], &leases, now);
 
         assert!(deficits.is_empty());
+    }
+
+    #[test]
+    fn host_pool_capacity_does_not_double_count_running_job_with_lease() {
+        let now = Utc::now();
+        let jobs = vec![
+            job("job-running", JobStatus::Running, Priority::Normal, -10),
+            job("job-candidate", JobStatus::Pending, Priority::Normal, 0),
+        ];
+        let temp = tempfile::tempdir().expect("tempdir");
+        let request_store = QueueRequestStore::new(temp.path()).expect("request store");
+        save_plan(&request_store, "job-running", plan(1));
+        save_plan(&request_store, "job-candidate", plan(1));
+        let leases = vec![lease_for_job(
+            "mac-studio",
+            "job-running",
+            now + Duration::seconds(60),
+        )];
+
+        let pass = plan_admit_pass_from_jobs(
+            &jobs,
+            &request_store,
+            &[single_member_pool(2)],
+            &leases,
+            now,
+        );
+
+        assert_eq!(pass.plan.admitted, vec!["job-candidate"]);
+        assert!(pass.plan.deferred.is_empty());
+    }
+
+    #[test]
+    fn host_pool_capacity_does_not_double_count_running_job_with_legacy_lease() {
+        let now = Utc::now();
+        let jobs = vec![
+            job("job-running", JobStatus::Running, Priority::Normal, -10),
+            job("job-candidate", JobStatus::Pending, Priority::Normal, 0),
+        ];
+        let temp = tempfile::tempdir().expect("tempdir");
+        let request_store = QueueRequestStore::new(temp.path()).expect("request store");
+        save_plan(&request_store, "job-running", plan(1));
+        save_plan(&request_store, "job-candidate", plan(1));
+        let leases = vec![legacy_lease_without_job_id(
+            "mac-studio",
+            now + Duration::seconds(60),
+        )];
+
+        let pass = plan_admit_pass_from_jobs(
+            &jobs,
+            &request_store,
+            &[single_member_pool(2)],
+            &leases,
+            now,
+        );
+
+        assert_eq!(pass.plan.admitted, vec!["job-candidate"]);
+        assert!(pass.plan.deferred.is_empty());
+    }
+
+    #[test]
+    fn host_pool_capacity_only_credits_one_running_slot_per_matching_lease() {
+        let now = Utc::now();
+        let jobs = vec![
+            job("job-running", JobStatus::Running, Priority::Normal, -10),
+            job("job-candidate", JobStatus::Pending, Priority::Normal, 0),
+        ];
+        let temp = tempfile::tempdir().expect("tempdir");
+        let request_store = QueueRequestStore::new(temp.path()).expect("request store");
+        save_plan(&request_store, "job-running", plan(2));
+        save_plan(&request_store, "job-candidate", plan(1));
+        let leases = vec![lease_for_job(
+            "mac-studio",
+            "job-running",
+            now + Duration::seconds(60),
+        )];
+
+        let pass = plan_admit_pass_from_jobs(
+            &jobs,
+            &request_store,
+            &[single_member_pool(2)],
+            &leases,
+            now,
+        );
+
+        assert!(pass.plan.admitted.is_empty());
+        assert_eq!(pass.plan.deferred.len(), 1);
+    }
+
+    #[test]
+    fn host_pool_capacity_blocks_when_distinct_leases_exhaust_member_slots() {
+        let now = Utc::now();
+        let jobs = vec![
+            job("job-running", JobStatus::Running, Priority::Normal, -10),
+            job("job-candidate", JobStatus::Pending, Priority::Normal, 0),
+        ];
+        let temp = tempfile::tempdir().expect("tempdir");
+        let request_store = QueueRequestStore::new(temp.path()).expect("request store");
+        save_plan(&request_store, "job-running", plan(1));
+        save_plan(&request_store, "job-candidate", plan(1));
+        let leases = vec![
+            lease_for_job("mac-studio", "job-running", now + Duration::seconds(60)),
+            lease_for_job("mac-studio", "other-job", now + Duration::seconds(60)),
+        ];
+
+        let pass = plan_admit_pass_from_jobs(
+            &jobs,
+            &request_store,
+            &[single_member_pool(2)],
+            &leases,
+            now,
+        );
+
+        assert!(pass.plan.admitted.is_empty());
+        assert_eq!(pass.plan.deferred.len(), 1);
     }
 
     #[test]

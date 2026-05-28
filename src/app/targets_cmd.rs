@@ -506,6 +506,7 @@ struct HostPoolLeaseStatusRow {
     backend: String,
     host: Option<String>,
     job_id: Option<String>,
+    owner_node_id: Option<String>,
     branch: String,
     sha: String,
     short_sha: String,
@@ -684,6 +685,7 @@ fn host_pool_lease_row(lease: &HostPoolLease, now: DateTime<Utc>) -> HostPoolLea
         backend: lease.backend.clone(),
         host: lease.host.clone(),
         job_id: lease.job_id.clone(),
+        owner_node_id: lease.owner_node_id.clone(),
         branch: lease.branch.clone(),
         sha: lease.sha.clone(),
         short_sha: short_sha(&lease.sha).to_owned(),
@@ -734,7 +736,7 @@ fn write_host_pool_status_human<W: Write>(
             for lease in &member.leases {
                 writeln!(
                     stdout,
-                    "      lease={} target={} sha={} branch={} age={}s heartbeat={}s{}{}",
+                    "      lease={} target={} sha={} branch={} age={}s heartbeat={}s{}{}{}",
                     lease.lease_id,
                     lease.target,
                     lease.short_sha,
@@ -745,6 +747,11 @@ fn write_host_pool_status_human<W: Write>(
                         .job_id
                         .as_ref()
                         .map(|job| format!(" job={job}"))
+                        .unwrap_or_default(),
+                    lease
+                        .owner_node_id
+                        .as_ref()
+                        .map(|node| format!(" node={node}"))
                         .unwrap_or_default(),
                     if lease.stale { " stale" } else { "" }
                 )
@@ -1006,6 +1013,7 @@ mod tests {
             backend: "ssh".to_owned(),
             host: Some(member_id.to_owned()),
             job_id: Some("job-1".to_owned()),
+            owner_node_id: Some("sy_node_test".to_owned()),
             branch: "main".to_owned(),
             sha: "abcdef123456".to_owned(),
             max_concurrency: 1,

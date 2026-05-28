@@ -142,8 +142,7 @@ fn export_bundle(config: &LoadedConfig) -> Table {
     let auth = config
         .get("github.auth")
         .and_then(TomlValue::as_table)
-        .cloned()
-        .unwrap_or_else(ambient_auth_table);
+        .map_or_else(ambient_auth_table, sanitized_auth_table);
 
     let mut github = Table::new();
     github.insert("auth".to_owned(), TomlValue::Table(auth.clone()));
@@ -238,6 +237,27 @@ fn validate_auth_table(auth: &Table, reference: &LoadedConfig) -> Result<(), Cli
 }
 
 fn reject_unknown_auth_keys(auth: &Table) -> Result<(), CliFailure> {
+    if let Some(key) = first_unknown_auth_key(auth) {
+        return Err(CliFailure::new(
+            1,
+            format!("unsupported github.auth key {key:?} in auth bundle"),
+        ));
+    }
+    Ok(())
+}
+
+fn sanitized_auth_table(auth: &Table) -> Table {
+    auth.iter()
+        .filter(|(key, _)| is_allowed_auth_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn first_unknown_auth_key(auth: &Table) -> Option<&String> {
+    auth.keys().find(|key| !is_allowed_auth_key(key))
+}
+
+fn is_allowed_auth_key(key: &str) -> bool {
     const ALLOWED: &[&str] = &[
         "source",
         "token_env",
@@ -245,13 +265,7 @@ fn reject_unknown_auth_keys(auth: &Table) -> Result<(), CliFailure> {
         "cache_ttl_seconds",
         "refresh_skew_seconds",
     ];
-    if let Some(key) = auth.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
-        return Err(CliFailure::new(
-            1,
-            format!("unsupported github.auth key {key:?} in auth bundle"),
-        ));
-    }
-    Ok(())
+    ALLOWED.contains(&key)
 }
 
 fn config_path_for_scope(
@@ -394,6 +408,39 @@ mod tests {
                     .iter()
                     .any(|value| value.as_str() == Some("SHIPYARD_GITHUB_TOKEN")))
         );
+    }
+
+    #[test]
+    fn export_bundle_drops_unknown_secret_bearing_auth_keys() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = loaded_config(
+            temp.path(),
+            r#"
+            [github.auth]
+            source = "env"
+            token_env = "SHIPYARD_GITHUB_TOKEN"
+            token = "ghp_secret"
+            private_key = "-----BEGIN PRIVATE KEY-----"
+            "#,
+        );
+
+        let bundle = export_bundle(&config);
+        let text = bundle.to_string();
+        let auth = bundle
+            .get("github")
+            .and_then(TomlValue::as_table)
+            .and_then(|github| github.get("auth"))
+            .and_then(TomlValue::as_table)
+            .expect("auth");
+
+        assert_eq!(
+            auth.get("token_env").and_then(TomlValue::as_str),
+            Some("SHIPYARD_GITHUB_TOKEN")
+        );
+        assert!(!auth.contains_key("token"));
+        assert!(!auth.contains_key("private_key"));
+        assert!(!text.contains("ghp_secret"));
+        assert!(!text.contains("BEGIN PRIVATE KEY"));
     }
 
     #[test]

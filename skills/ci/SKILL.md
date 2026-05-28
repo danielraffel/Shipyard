@@ -564,9 +564,15 @@ fallback = [
 ]
 ```
 
-There is no `shipyard config` or `shipyard targets` subcommand yet. Inspect
-target definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml`,
-and use `shipyard status --json` for live target state.
+Use `shipyard targets` for target inspection and `shipyard config set` /
+`shipyard config unset` for simple dotted-key setting writes. Inspect target
+definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml` when
+the CLI surface does not cover a complex edit, and use `shipyard status --json`
+for live target state.
+
+For machine-to-machine setup movement, use `shipyard config export --output
+shipyard-setup.toml` and restore a chosen layer with `shipyard config import
+shipyard-setup.toml --from local --scope local`. Reprovision secrets separately.
 
 ### Local Mac capacity
 
@@ -595,9 +601,23 @@ explicit `[host_pools]` members, then inspect with
 `shipyard targets pool cleanup --fix`. Host-pool targets can drain multiple
 non-conflicting queued jobs across available members under one local drain
 owner; jobs still serialize when they claim the same checkout, PR state,
-evidence lane, or exhausted pool capacity. Use `shipyard targets test mac` and
-then `shipyard run --targets mac` when bringing the Mac Studio online. See
+evidence lane, or exhausted pool capacity. Capacity accounting reconciles
+running queue jobs with their active leases so `max_concurrency > 1` members
+can admit additional work when slots remain. Use `shipyard targets test mac`
+and then `shipyard run --targets mac` when bringing the Mac Studio online. See
 `docs/local-mac-pool.md`.
+
+For controller/client multi-host planning, do not share Shipyard state
+directories across Macs. The controller is the only writer for shared queue,
+lease, ship, warm-pool, and cloud records; clients join explicitly over an
+authenticated protocol. See `docs/multi-host-protocol.md`. To validate the
+local Tailscale private-tailnet path that controller setup will prefer, run
+`shipyard network tailscale status --json`; this reports private tailnet
+reachability separately from Tailscale Funnel readiness.
+Use `shipyard controller init`, `shipyard controller invite`,
+`shipyard node list`, and `shipyard node remove` for the implemented local
+registry slice. Do not claim remote laptop enqueue/status is available until
+the controller RPC/join slice lands.
 
 ### Locality routing (`requires`)
 

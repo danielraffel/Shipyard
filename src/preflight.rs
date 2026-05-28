@@ -166,7 +166,7 @@ impl Display for ShipPreflightError {
                 // exact flag invocation is copy-pasteable.
                 let skip_flags = failures
                     .iter()
-                    .map(|f| format!("--skip-target {}", f.target_name))
+                    .map(|f| format!("--skip-target {}", shell_quote(&f.target_name)))
                     .collect::<Vec<_>>()
                     .join(" ");
                 writeln!(formatter, "Options:")?;
@@ -181,6 +181,17 @@ impl Display for ShipPreflightError {
             }
         }
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/'))
+    {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 impl Error for ShipPreflightError {}
@@ -424,6 +435,32 @@ mod tests {
             rendered.contains("Fix the backend"),
             "must still offer the original 'fix the backend' option; got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn backend_unreachable_display_quotes_skip_target_values() {
+        let err = ShipPreflightError::BackendUnreachable {
+            failures: vec![
+                TargetPreflightFailure {
+                    target_name: "linux $(touch /tmp/bad)".to_owned(),
+                    backend: "ssh".to_owned(),
+                    message: "unreachable".to_owned(),
+                    failure_category: None,
+                },
+                TargetPreflightFailure {
+                    target_name: "mac's runner".to_owned(),
+                    backend: "ssh".to_owned(),
+                    message: "unreachable".to_owned(),
+                    failure_category: None,
+                },
+            ],
+            skew_note: None,
+        };
+
+        let rendered = format!("{err}");
+
+        assert!(rendered.contains("--skip-target 'linux $(touch /tmp/bad)'"));
+        assert!(rendered.contains("--skip-target 'mac'\\''s runner'"));
     }
 
     fn config(data: &str, project_dir: Option<std::path::PathBuf>) -> LoadedConfig {

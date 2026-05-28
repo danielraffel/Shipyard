@@ -190,6 +190,9 @@ pub struct HostPoolLease {
     /// Queue job id when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
+    /// Shipyard machine id that owns this lease, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_node_id: Option<String>,
     /// Branch under validation.
     pub branch: String,
     /// SHA under validation.
@@ -227,6 +230,8 @@ pub struct HostPoolLeaseRequest {
     pub host: Option<String>,
     /// Queue job id when available.
     pub job_id: Option<String>,
+    /// Shipyard machine id that owns this lease, when available.
+    pub owner_node_id: Option<String>,
     /// Branch under validation.
     pub branch: String,
     /// SHA under validation.
@@ -288,6 +293,7 @@ impl HostPoolLeaseStore {
                 backend: request.backend.clone(),
                 host: request.host.clone(),
                 job_id: request.job_id.clone(),
+                owner_node_id: request.owner_node_id.clone(),
                 branch: request.branch.clone(),
                 sha: request.sha.clone(),
                 owner_pid: process::id(),
@@ -611,6 +617,7 @@ mod tests {
             backend: "ssh".to_owned(),
             host: Some(member_id.to_owned()),
             job_id: Some("job-1".to_owned()),
+            owner_node_id: Some("sy_node_test".to_owned()),
             branch: "main".to_owned(),
             sha: "abc123".to_owned(),
             max_concurrency: 1,
