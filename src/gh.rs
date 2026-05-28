@@ -16,6 +16,9 @@ use crate::identity::RuntimeMode;
 
 const DEFAULT_REFRESH_SKEW_SECONDS: u64 = 60;
 const GH_TOKEN_ENV: &str = "GH_TOKEN";
+const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
+const GH_ENTERPRISE_TOKEN_ENV: &str = "GH_ENTERPRISE_TOKEN";
+const GITHUB_ENTERPRISE_TOKEN_ENV: &str = "GITHUB_ENTERPRISE_TOKEN";
 
 /// Auth-aware GitHub CLI command factory.
 #[derive(Clone)]
@@ -70,6 +73,12 @@ impl GhClient {
             }
         };
         command.current_dir(cwd);
+        if auth_policy == GhAuthPolicy::AmbientOnly {
+            command.env_remove(GH_TOKEN_ENV);
+            command.env_remove(GITHUB_TOKEN_ENV);
+            command.env_remove(GH_ENTERPRISE_TOKEN_ENV);
+            command.env_remove(GITHUB_ENTERPRISE_TOKEN_ENV);
+        }
         if auth_policy == GhAuthPolicy::Default
             && let Some(token) = self.resolve_token(cwd)?
         {
@@ -227,7 +236,10 @@ impl GhClient {
 pub enum GhAuthPolicy {
     /// Use configured Shipyard auth when present.
     Default,
-    /// Ignore configured Shipyard auth and use ambient `gh` auth.
+    /// Ignore configured Shipyard auth and use the stored `gh` login.
+    ///
+    /// GitHub token environment variables are masked for the child process so
+    /// this path cannot accidentally reuse the configured integration token.
     AmbientOnly,
 }
 
@@ -804,6 +816,12 @@ mod tests {
         })
     }
 
+    fn env_removed(command: &Command, key: &str) -> bool {
+        command
+            .get_envs()
+            .any(|(name, value)| name == key && value.is_none())
+    }
+
     #[test]
     fn missing_config_uses_ambient_auth() {
         let config = config_from_toml("");
@@ -904,6 +922,25 @@ mod tests {
             )
             .expect("command");
         assert_eq!(env_value(&command, GH_TOKEN_ENV), None);
+    }
+
+    #[test]
+    fn ambient_only_masks_inherited_github_token_env_vars() {
+        let config = config_from_toml("");
+        let client = GhClient::from_loaded_config(&config).expect("client");
+        let command = client
+            .prepare_command(
+                Path::new("/tmp"),
+                None,
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::AmbientOnly,
+            )
+            .expect("command");
+
+        assert!(env_removed(&command, GH_TOKEN_ENV));
+        assert!(env_removed(&command, GITHUB_TOKEN_ENV));
+        assert!(env_removed(&command, GH_ENTERPRISE_TOKEN_ENV));
+        assert!(env_removed(&command, GITHUB_ENTERPRISE_TOKEN_ENV));
     }
 
     #[test]
