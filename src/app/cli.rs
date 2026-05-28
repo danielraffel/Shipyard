@@ -535,7 +535,10 @@ pub(super) enum ControllerCommand {
         machine_id: String,
         /// One-time invite token.
         #[arg(long)]
-        token: String,
+        token: Option<String>,
+        /// Read the one-time invite token from stdin.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
         /// Node capability label. May repeat.
         #[arg(long = "capability")]
         capabilities: Vec<String>,
@@ -546,6 +549,9 @@ pub(super) enum ControllerCommand {
         /// Registered client machine id.
         #[arg(long = "machine-id")]
         machine_id: String,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
     },
     /// Return controller-owned queue details after bearer-token verification.
     #[command(name = "rpc-queue", hide = true)]
@@ -553,6 +559,9 @@ pub(super) enum ControllerCommand {
         /// Registered client machine id.
         #[arg(long = "machine-id")]
         machine_id: String,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
     },
     /// Return controller-owned logs after bearer-token verification.
     #[command(name = "rpc-logs", hide = true)]
@@ -565,6 +574,9 @@ pub(super) enum ControllerCommand {
         /// Show logs for a specific target.
         #[arg(short, long)]
         target: Option<String>,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
     },
     /// Return controller-owned evidence after bearer-token verification.
     #[command(name = "rpc-evidence", hide = true)]
@@ -574,6 +586,9 @@ pub(super) enum ControllerCommand {
         machine_id: String,
         /// Branch to inspect. Defaults to current git branch or main on the controller.
         branch: Option<String>,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
     },
     /// Return controller-owned node registry after bearer-token verification.
     #[command(name = "rpc-node-list", hide = true)]
@@ -581,6 +596,9 @@ pub(super) enum ControllerCommand {
         /// Registered client machine id.
         #[arg(long = "machine-id")]
         machine_id: String,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
     },
 }
 

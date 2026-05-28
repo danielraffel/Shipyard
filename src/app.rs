@@ -184,8 +184,12 @@ fn dispatch<W: Write, E: Write>(
             );
         }
         Command::Node { command } => {
-            let config = LoadedConfig::load_from_cwd(cli.mode.into(), &cwd)
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            let config = LoadedConfig::load_from_cwd_with_global_dir(
+                cli.mode.into(),
+                &cwd,
+                Some(runtime_paths.global_dir.clone()),
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
             if !cli.local_state && configured_client_enabled(&config) {
                 match command {
                     self::cli::NodeCommand::List => {
@@ -226,7 +230,7 @@ fn dispatch<W: Write, E: Write>(
                 command,
                 cli.mode.into(),
                 &cwd,
-                &runtime_paths.state_dir,
+                &runtime_paths,
                 cli.json,
                 cli.local_state,
                 stdout,
@@ -324,8 +328,12 @@ fn handle_operational_variant<W: Write>(
                 | Command::ShipState { .. }
         )
     {
-        let config = LoadedConfig::load_from_cwd(mode, cwd)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let config = LoadedConfig::load_from_cwd_with_global_dir(
+            mode,
+            cwd,
+            Some(runtime_paths.global_dir.clone()),
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
         if configured_client_enabled(&config) {
             return Err(CliFailure::new(
                 1,
@@ -434,37 +442,45 @@ fn handle_state_command<W: Write>(
     command: Command,
     mode: RuntimeMode,
     cwd: &Path,
-    state_dir: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
     local_state: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let config = LoadedConfig::load_from_cwd(mode, cwd)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let config = LoadedConfig::load_from_cwd_with_global_dir(
+        mode,
+        cwd,
+        Some(runtime_paths.global_dir.clone()),
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if !local_state && matches!(command, Command::Status) && configured_client_enabled(&config) {
-        let machine_id = crate::machine_identity::get_or_create_machine_id(state_dir)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let machine_id =
+            crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return remote_status_command(&config, &machine_id, json, stdout);
     }
     if !local_state && matches!(command, Command::Queue) && configured_client_enabled(&config) {
-        let machine_id = crate::machine_identity::get_or_create_machine_id(state_dir)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let machine_id =
+            crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return remote_queue_command(&config, &machine_id, json, stdout);
     }
     if !local_state
         && let Command::Logs { job_id, target } = &command
         && configured_client_enabled(&config)
     {
-        let machine_id = crate::machine_identity::get_or_create_machine_id(state_dir)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let machine_id =
+            crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return remote_logs_command(&config, &machine_id, job_id, target.as_deref(), stdout);
     }
     if !local_state
         && let Command::Evidence { branch } = &command
         && configured_client_enabled(&config)
     {
-        let machine_id = crate::machine_identity::get_or_create_machine_id(state_dir)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let machine_id =
+            crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return remote_evidence_command(&config, &machine_id, branch.as_deref(), json, stdout);
     }
     if !local_state
@@ -480,20 +496,26 @@ fn handle_state_command<W: Write>(
         ));
     }
     match command {
-        Command::Status => status_command(mode, cwd, state_dir, json, stdout),
-        Command::Evidence { branch } => evidence_command(branch, cwd, state_dir, json, stdout),
-        Command::Logs { job_id, target } => logs_command(&job_id, target, state_dir, stdout),
-        Command::Cancel { job_id } => cancel_command(&job_id, state_dir, json, stdout),
-        Command::Bump { job_id, priority } => {
-            bump_command(&job_id, priority, state_dir, json, stdout)
+        Command::Status => status_command(mode, cwd, &runtime_paths.state_dir, json, stdout),
+        Command::Evidence { branch } => {
+            evidence_command(branch, cwd, &runtime_paths.state_dir, json, stdout)
         }
-        Command::Queue => queue_command(state_dir, json, stdout),
+        Command::Logs { job_id, target } => {
+            logs_command(&job_id, target, &runtime_paths.state_dir, stdout)
+        }
+        Command::Cancel { job_id } => {
+            cancel_command(&job_id, &runtime_paths.state_dir, json, stdout)
+        }
+        Command::Bump { job_id, priority } => {
+            bump_command(&job_id, priority, &runtime_paths.state_dir, json, stdout)
+        }
+        Command::Queue => queue_command(&runtime_paths.state_dir, json, stdout),
         Command::Cleanup {
             dry_run,
             apply,
             ship_state,
         } => cleanup_command(
-            state_dir,
+            &runtime_paths.state_dir,
             mode,
             cwd,
             CleanupCommandOptions {
@@ -1148,6 +1170,46 @@ mod tests {
     }
 
     #[test]
+    fn queue_routes_to_controller_from_global_dir_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global_dir = temp.path().join("global");
+        std::fs::create_dir_all(&global_dir).expect("global");
+        std::fs::write(
+            global_dir.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "https://mac-studio.example.ts.net:8765"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "queue",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("implemented SSH transport"));
+        assert!(message.contains("--local-state for local queue"));
+    }
+
+    #[test]
     fn logs_route_to_controller_when_client_configured() {
         let temp = tempfile::tempdir().expect("tempdir");
         let local = temp.path().join(".shipyard-dev.local");
@@ -1250,6 +1312,47 @@ mod tests {
         .expect("config");
         let state_dir = temp.path().join("state");
         let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "node",
+            "list",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("implemented SSH transport"));
+        assert!(message.contains("--local-state for local node list"));
+    }
+
+    #[test]
+    fn node_list_routes_to_controller_from_global_dir_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global_dir = temp.path().join("global");
+        std::fs::create_dir_all(&global_dir).expect("global");
+        std::fs::write(
+            global_dir.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "https://mac-studio.example.ts.net:8765"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
         let cli = Cli::parse_from([
             "shipyard",
             "--mode",

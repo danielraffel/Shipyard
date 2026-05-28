@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
@@ -21,6 +23,9 @@ use crate::node_registry::{
     NodeEndpoint, NodeEndpointKind, NodeJoin, NodeRecord, NodeRegistryStore, NodeRole,
 };
 use crate::output::write_json_envelope;
+use wait_timeout::ChildExt;
+
+const CONTROLLER_SSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) fn controller_command<W: Write>(
     command: ControllerCommand,
@@ -60,8 +65,10 @@ pub(super) fn controller_command<W: Write>(
             name,
             machine_id,
             token,
+            token_stdin,
             capabilities,
         } => {
+            let token = read_token_argument(token.as_deref(), token_stdin)?;
             controller_accept_join(
                 state_dir,
                 &name,
@@ -72,24 +79,54 @@ pub(super) fn controller_command<W: Write>(
                 stdout,
             )?;
         }
-        ControllerCommand::RpcStatus { machine_id } => {
-            controller_rpc_status(mode, cwd, state_dir, &machine_id, json_mode, stdout)?;
+        ControllerCommand::RpcStatus {
+            machine_id,
+            token_stdin,
+        } => {
+            controller_rpc_status(
+                mode,
+                cwd,
+                state_dir,
+                &machine_id,
+                token_stdin,
+                json_mode,
+                stdout,
+            )?;
         }
-        ControllerCommand::RpcQueue { machine_id } => {
-            controller_rpc_queue(state_dir, &machine_id, json_mode, stdout)?;
+        ControllerCommand::RpcQueue {
+            machine_id,
+            token_stdin,
+        } => {
+            controller_rpc_queue(state_dir, &machine_id, token_stdin, json_mode, stdout)?;
         }
         ControllerCommand::RpcLogs {
             machine_id,
             job_id,
             target,
+            token_stdin,
         } => {
-            controller_rpc_logs(state_dir, &machine_id, &job_id, target, stdout)?;
+            controller_rpc_logs(state_dir, &machine_id, token_stdin, &job_id, target, stdout)?;
         }
-        ControllerCommand::RpcEvidence { machine_id, branch } => {
-            controller_rpc_evidence(cwd, state_dir, &machine_id, branch, json_mode, stdout)?;
+        ControllerCommand::RpcEvidence {
+            machine_id,
+            branch,
+            token_stdin,
+        } => {
+            controller_rpc_evidence(
+                cwd,
+                state_dir,
+                &machine_id,
+                token_stdin,
+                branch,
+                json_mode,
+                stdout,
+            )?;
         }
-        ControllerCommand::RpcNodeList { machine_id } => {
-            controller_rpc_node_list(state_dir, &machine_id, json_mode, stdout)?;
+        ControllerCommand::RpcNodeList {
+            machine_id,
+            token_stdin,
+        } => {
+            controller_rpc_node_list(state_dir, &machine_id, token_stdin, json_mode, stdout)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -407,10 +444,11 @@ fn controller_rpc_status<W: Write>(
     cwd: &Path,
     state_dir: &Path,
     machine_id: &str,
+    token_stdin: bool,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    authenticate_rpc_node(state_dir, machine_id)?;
+    authenticate_rpc_node(state_dir, machine_id, token_stdin)?;
     status_command(mode, cwd, state_dir, json_mode, stdout)?;
     Ok(())
 }
@@ -418,10 +456,11 @@ fn controller_rpc_status<W: Write>(
 fn controller_rpc_queue<W: Write>(
     state_dir: &Path,
     machine_id: &str,
+    token_stdin: bool,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    authenticate_rpc_node(state_dir, machine_id)?;
+    authenticate_rpc_node(state_dir, machine_id, token_stdin)?;
     queue_command(state_dir, json_mode, stdout)?;
     Ok(())
 }
@@ -429,11 +468,12 @@ fn controller_rpc_queue<W: Write>(
 fn controller_rpc_logs<W: Write>(
     state_dir: &Path,
     machine_id: &str,
+    token_stdin: bool,
     job_id: &str,
     target: Option<String>,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    authenticate_rpc_node(state_dir, machine_id)?;
+    authenticate_rpc_node(state_dir, machine_id, token_stdin)?;
     logs_command(job_id, target, state_dir, stdout)?;
     Ok(())
 }
@@ -442,11 +482,12 @@ fn controller_rpc_evidence<W: Write>(
     cwd: &Path,
     state_dir: &Path,
     machine_id: &str,
+    token_stdin: bool,
     branch: Option<String>,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    authenticate_rpc_node(state_dir, machine_id)?;
+    authenticate_rpc_node(state_dir, machine_id, token_stdin)?;
     evidence_command(branch, cwd, state_dir, json_mode, stdout)?;
     Ok(())
 }
@@ -454,21 +495,59 @@ fn controller_rpc_evidence<W: Write>(
 fn controller_rpc_node_list<W: Write>(
     state_dir: &Path,
     machine_id: &str,
+    token_stdin: bool,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    authenticate_rpc_node(state_dir, machine_id)?;
+    authenticate_rpc_node(state_dir, machine_id, token_stdin)?;
     node_list(state_dir, json_mode, stdout)?;
     Ok(())
 }
 
-fn authenticate_rpc_node(state_dir: &Path, machine_id: &str) -> Result<(), CliFailure> {
-    let token = std::env::var("SHIPYARD_NODE_TOKEN")
-        .map_err(|_| CliFailure::new(1, "missing SHIPYARD_NODE_TOKEN for controller RPC"))?;
+fn authenticate_rpc_node(
+    state_dir: &Path,
+    machine_id: &str,
+    token_stdin: bool,
+) -> Result<(), CliFailure> {
+    let token = read_rpc_token(token_stdin)?;
     NodeRegistryStore::new(state_dir)
         .authenticate_node(machine_id, &token)
         .map_err(|error| CliFailure::new(1, format!("auth denied: {error}")))?;
     Ok(())
+}
+
+fn read_rpc_token(token_stdin: bool) -> Result<String, CliFailure> {
+    if token_stdin {
+        return read_secret_from_stdin("controller RPC token");
+    }
+    std::env::var("SHIPYARD_NODE_TOKEN")
+        .map_err(|_| CliFailure::new(1, "missing SHIPYARD_NODE_TOKEN for controller RPC"))
+}
+
+fn read_token_argument(token: Option<&str>, token_stdin: bool) -> Result<String, CliFailure> {
+    match (token, token_stdin) {
+        (Some(_), true) => Err(CliFailure::new(
+            1,
+            "use either --token or --token-stdin, not both",
+        )),
+        (Some(token), false) => Ok(token.to_owned()),
+        (None, true) => read_secret_from_stdin("join token"),
+        (None, false) => Err(CliFailure::new(1, "missing --token for accept-join")),
+    }
+}
+
+fn read_secret_from_stdin(label: &str) -> Result<String, CliFailure> {
+    let mut token = String::new();
+    std::io::stdin()
+        .read_to_string(&mut token)
+        .map_err(|error| {
+            CliFailure::new(1, format!("failed to read {label} from stdin: {error}"))
+        })?;
+    let token = token.trim_end_matches(['\r', '\n']).to_owned();
+    if token.is_empty() {
+        return Err(CliFailure::new(1, format!("{label} from stdin is empty")));
+    }
+    Ok(token)
 }
 
 fn node_list<W: Write>(
@@ -715,25 +794,21 @@ fn ssh_accept_join(
         .ok_or_else(|| CliFailure::new(1, "SSH endpoint must start with ssh://"))?;
     let mut remote = vec![
         "shipyard".to_owned(),
+        "--local-state".to_owned(),
         "controller".to_owned(),
         "accept-join".to_owned(),
         "--name".to_owned(),
         shlex_quote(name),
         "--machine-id".to_owned(),
         shlex_quote(machine_id),
-        "--token".to_owned(),
-        shlex_quote(token),
+        "--token-stdin".to_owned(),
         "--json".to_owned(),
     ];
     for capability in capabilities {
         remote.push("--capability".to_owned());
         remote.push(shlex_quote(capability));
     }
-    let output = Command::new("ssh")
-        .arg(host)
-        .arg(remote.join(" "))
-        .output()
-        .map_err(|error| CliFailure::new(1, format!("ssh join failed to start: {error}")))?;
+    let output = run_controller_ssh(host, &remote.join(" "), Some(token), "ssh join")?;
     if !output.status.success() {
         return Err(CliFailure::new(
             1,
@@ -794,13 +869,13 @@ pub(super) fn remote_logs_command<W: Write>(
             "configured controller is not reachable through the implemented SSH transport; use --local-state for local logs",
         ));
     };
-    let remote =
-        remote_controller_logs_shell_command(&client.node_token, machine_id, job_id, target);
-    let output = Command::new("ssh")
-        .arg(endpoint)
-        .arg(remote)
-        .output()
-        .map_err(|error| CliFailure::new(1, format!("controller_unreachable: {error}")))?;
+    let remote = remote_controller_logs_shell_command(machine_id, job_id, target);
+    let output = run_controller_ssh(
+        endpoint,
+        &remote,
+        Some(&client.node_token),
+        "controller logs",
+    )?;
     if !output.status.success() {
         return Err(CliFailure::new(
             1,
@@ -830,13 +905,13 @@ pub(super) fn remote_evidence_command<W: Write>(
             "configured controller is not reachable through the implemented SSH transport; use --local-state for local evidence",
         ));
     };
-    let remote =
-        remote_controller_evidence_shell_command(&client.node_token, machine_id, branch, json_mode);
-    let output = Command::new("ssh")
-        .arg(endpoint)
-        .arg(remote)
-        .output()
-        .map_err(|error| CliFailure::new(1, format!("controller_unreachable: {error}")))?;
+    let remote = remote_controller_evidence_shell_command(machine_id, branch, json_mode);
+    let output = run_controller_ssh(
+        endpoint,
+        &remote,
+        Some(&client.node_token),
+        "controller evidence",
+    )?;
     if !output.status.success() {
         return Err(CliFailure::new(
             1,
@@ -888,13 +963,13 @@ fn remote_controller_command<W: Write>(
             ),
         ));
     };
-    let remote =
-        remote_controller_shell_command(&client.node_token, rpc_command, machine_id, json_mode);
-    let output = Command::new("ssh")
-        .arg(endpoint)
-        .arg(remote)
-        .output()
-        .map_err(|error| CliFailure::new(1, format!("controller_unreachable: {error}")))?;
+    let remote = remote_controller_shell_command(rpc_command, machine_id, json_mode);
+    let output = run_controller_ssh(
+        endpoint,
+        &remote,
+        Some(&client.node_token),
+        "controller RPC",
+    )?;
     if !output.status.success() {
         return Err(CliFailure::new(
             1,
@@ -910,15 +985,91 @@ fn remote_controller_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+struct ControllerSshOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_controller_ssh(
+    endpoint: &str,
+    remote_command: &str,
+    stdin_payload: Option<&str>,
+    action: &str,
+) -> Result<ControllerSshOutput, CliFailure> {
+    let mut command = crate::supervised::supervised(Command::new("ssh"));
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(endpoint)
+        .arg(remote_command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if stdin_payload.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| CliFailure::new(1, format!("{action} failed to start: {error}")))?;
+    if let Some(payload) = stdin_payload
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        stdin.write_all(payload.as_bytes()).map_err(|error| {
+            CliFailure::new(1, format!("{action} failed to send token: {error}"))
+        })?;
+    }
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = thread::spawn(move || read_child_pipe(stdout));
+    let stderr_reader = thread::spawn(move || read_child_pipe(stderr));
+    let Some(status) = child
+        .wait_timeout(CONTROLLER_SSH_TIMEOUT)
+        .map_err(|error| CliFailure::new(1, format!("{action} wait failed: {error}")))?
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "{action} timed out after {}s",
+                CONTROLLER_SSH_TIMEOUT.as_secs()
+            ),
+        ));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| CliFailure::new(1, format!("{action} stdout reader panicked")))?
+        .map_err(|error| CliFailure::new(1, format!("{action} stdout read failed: {error}")))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| CliFailure::new(1, format!("{action} stderr reader panicked")))?
+        .map_err(|error| CliFailure::new(1, format!("{action} stderr read failed: {error}")))?;
+    Ok(ControllerSshOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_child_pipe(pipe: Option<impl Read>) -> Result<Vec<u8>, std::io::Error> {
+    let mut output = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut output)?;
+    }
+    Ok(output)
+}
+
 fn remote_controller_logs_shell_command(
-    node_token: &str,
     machine_id: &str,
     job_id: &str,
     target: Option<&str>,
 ) -> String {
     let mut remote = format!(
-        "SHIPYARD_NODE_TOKEN={} shipyard --local-state controller rpc-logs --machine-id {} {}",
-        shlex_quote(node_token),
+        "shipyard --local-state controller rpc-logs --machine-id {} --token-stdin {}",
         shlex_quote(machine_id),
         shlex_quote(job_id),
     );
@@ -930,14 +1081,12 @@ fn remote_controller_logs_shell_command(
 }
 
 fn remote_controller_evidence_shell_command(
-    node_token: &str,
     machine_id: &str,
     branch: Option<&str>,
     json_mode: bool,
 ) -> String {
     let mut remote = format!(
-        "SHIPYARD_NODE_TOKEN={} shipyard --local-state controller rpc-evidence --machine-id {}",
-        shlex_quote(node_token),
+        "shipyard --local-state controller rpc-evidence --machine-id {} --token-stdin",
         shlex_quote(machine_id),
     );
     if json_mode {
@@ -950,15 +1099,9 @@ fn remote_controller_evidence_shell_command(
     remote
 }
 
-fn remote_controller_shell_command(
-    node_token: &str,
-    rpc_command: &str,
-    machine_id: &str,
-    json_mode: bool,
-) -> String {
+fn remote_controller_shell_command(rpc_command: &str, machine_id: &str, json_mode: bool) -> String {
     format!(
-        "SHIPYARD_NODE_TOKEN={} shipyard --local-state controller {} --machine-id {} {}",
-        shlex_quote(node_token),
+        "shipyard --local-state controller {} --machine-id {} --token-stdin {}",
         shlex_quote(rpc_command),
         shlex_quote(machine_id),
         if json_mode { "--json" } else { "" }
@@ -1084,57 +1227,50 @@ mod tests {
 
     #[test]
     fn remote_controller_shell_command_targets_authenticated_queue_rpc() {
-        let command =
-            remote_controller_shell_command("synode_secret", "rpc-queue", "sy_node_client", true);
+        let command = remote_controller_shell_command("rpc-queue", "sy_node_client", true);
 
-        assert!(command.contains("SHIPYARD_NODE_TOKEN=synode_secret"));
         assert!(command.contains("shipyard --local-state controller rpc-queue"));
         assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--token-stdin"));
         assert!(command.ends_with("--json"));
+        assert!(!command.contains("synode_secret"));
     }
 
     #[test]
     fn remote_controller_logs_shell_command_targets_authenticated_logs_rpc() {
-        let command = remote_controller_logs_shell_command(
-            "synode secret",
-            "sy_node_client",
-            "sy-job",
-            Some("mac target"),
-        );
+        let command =
+            remote_controller_logs_shell_command("sy_node_client", "sy-job", Some("mac target"));
 
-        assert!(command.contains("SHIPYARD_NODE_TOKEN='synode secret'"));
         assert!(command.contains("shipyard --local-state controller rpc-logs"));
         assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--token-stdin"));
         assert!(command.contains(" sy-job --target 'mac target'"));
+        assert!(!command.contains("synode secret"));
     }
 
     #[test]
     fn remote_controller_evidence_shell_command_targets_authenticated_evidence_rpc() {
         let command = remote_controller_evidence_shell_command(
-            "synode secret",
             "sy_node_client",
             Some("feature/test branch"),
             true,
         );
 
-        assert!(command.contains("SHIPYARD_NODE_TOKEN='synode secret'"));
         assert!(command.contains("shipyard --local-state controller rpc-evidence"));
         assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--token-stdin"));
         assert!(command.contains("--json 'feature/test branch'"));
+        assert!(!command.contains("synode secret"));
     }
 
     #[test]
     fn remote_controller_shell_command_targets_authenticated_node_list_rpc() {
-        let command = remote_controller_shell_command(
-            "synode_secret",
-            "rpc-node-list",
-            "sy_node_client",
-            true,
-        );
+        let command = remote_controller_shell_command("rpc-node-list", "sy_node_client", true);
 
-        assert!(command.contains("SHIPYARD_NODE_TOKEN=synode_secret"));
         assert!(command.contains("shipyard --local-state controller rpc-node-list"));
         assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--token-stdin"));
         assert!(command.ends_with("--json"));
+        assert!(!command.contains("synode_secret"));
     }
 }
