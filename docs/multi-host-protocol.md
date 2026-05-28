@@ -18,14 +18,14 @@ An SSH-backed first controller/client slice is implemented: `shipyard
 controller join --controller ssh://host --token ...` consumes a controller
 invite over SSH, writes client-local config, stores only bearer-token hashes on
 the controller, `shipyard leave` removes local client config, and `shipyard
-status` / `shipyard queue` / `shipyard logs` route to the controller when
-client config is enabled. Use `--local-state` to inspect this machine's local
-state instead.
+status` / `shipyard queue` / `shipyard logs` / `shipyard evidence` route to
+the controller when client config is enabled. Use `--local-state` to inspect
+this machine's local state instead.
 
 HTTP controller serving, remote enqueue/ship/watch, periodic heartbeats, and
-GUI consumption are still follow-on slices. Until those land, SSH-backed status
-plus queue/log inspection prove the trust/config/routing model but do not yet
-make a laptop enqueue work to a Mac Studio controller.
+GUI consumption are still follow-on slices. Until those land, SSH-backed
+read-only state inspection proves the trust/config/routing model but does not
+yet make a laptop enqueue work to a Mac Studio controller.
 When client config is enabled, stateful local commands that are not yet routed
 to the controller fail closed unless `--local-state` is supplied, so a laptop
 does not silently mutate a separate local queue by accident.
@@ -239,6 +239,7 @@ shipyard controller join --controller ssh://mac-studio --token ...
 shipyard controller status
 shipyard queue
 shipyard logs <id>
+shipyard evidence
 shipyard leave
 ```
 

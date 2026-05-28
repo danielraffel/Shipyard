@@ -11,7 +11,7 @@ use toml::{Table, Value as TomlValue};
 use super::{
     CliFailure,
     cli::{ControllerCommand, NodeCommand},
-    queue_cmd::{logs_command, queue_command, status_command},
+    queue_cmd::{evidence_command, logs_command, queue_command, status_command},
 };
 use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::executor::ssh::shlex_quote;
@@ -84,6 +84,9 @@ pub(super) fn controller_command<W: Write>(
             target,
         } => {
             controller_rpc_logs(state_dir, &machine_id, &job_id, target, stdout)?;
+        }
+        ControllerCommand::RpcEvidence { machine_id, branch } => {
+            controller_rpc_evidence(cwd, state_dir, &machine_id, branch, json_mode, stdout)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -429,6 +432,19 @@ fn controller_rpc_logs<W: Write>(
 ) -> Result<(), CliFailure> {
     authenticate_rpc_node(state_dir, machine_id)?;
     logs_command(job_id, target, state_dir, stdout)?;
+    Ok(())
+}
+
+fn controller_rpc_evidence<W: Write>(
+    cwd: &Path,
+    state_dir: &Path,
+    machine_id: &str,
+    branch: Option<String>,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node(state_dir, machine_id)?;
+    evidence_command(branch, cwd, state_dir, json_mode, stdout)?;
     Ok(())
 }
 
@@ -786,6 +802,42 @@ pub(super) fn remote_logs_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+pub(super) fn remote_evidence_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    branch: Option<&str>,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let client = configured_client(config)?;
+    let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
+        return Err(CliFailure::new(
+            1,
+            "configured controller is not reachable through the implemented SSH transport; use --local-state for local evidence",
+        ));
+    };
+    let remote =
+        remote_controller_evidence_shell_command(&client.node_token, machine_id, branch, json_mode);
+    let output = Command::new("ssh")
+        .arg(endpoint)
+        .arg(remote)
+        .output()
+        .map_err(|error| CliFailure::new(1, format!("controller_unreachable: {error}")))?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "controller_unreachable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    stdout
+        .write_all(&output.stdout)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn remote_controller_command<W: Write>(
     config: &LoadedConfig,
     machine_id: &str,
@@ -843,6 +895,27 @@ fn remote_controller_logs_shell_command(
     if let Some(target) = target {
         remote.push_str(" --target ");
         remote.push_str(&shlex_quote(target));
+    }
+    remote
+}
+
+fn remote_controller_evidence_shell_command(
+    node_token: &str,
+    machine_id: &str,
+    branch: Option<&str>,
+    json_mode: bool,
+) -> String {
+    let mut remote = format!(
+        "SHIPYARD_NODE_TOKEN={} shipyard --local-state controller rpc-evidence --machine-id {}",
+        shlex_quote(node_token),
+        shlex_quote(machine_id),
+    );
+    if json_mode {
+        remote.push_str(" --json");
+    }
+    if let Some(branch) = branch {
+        remote.push(' ');
+        remote.push_str(&shlex_quote(branch));
     }
     remote
 }
@@ -1003,5 +1076,20 @@ mod tests {
         assert!(command.contains("shipyard --local-state controller rpc-logs"));
         assert!(command.contains("--machine-id sy_node_client"));
         assert!(command.contains(" sy-job --target 'mac target'"));
+    }
+
+    #[test]
+    fn remote_controller_evidence_shell_command_targets_authenticated_evidence_rpc() {
+        let command = remote_controller_evidence_shell_command(
+            "synode secret",
+            "sy_node_client",
+            Some("feature/test branch"),
+            true,
+        );
+
+        assert!(command.contains("SHIPYARD_NODE_TOKEN='synode secret'"));
+        assert!(command.contains("shipyard --local-state controller rpc-evidence"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--json 'feature/test branch'"));
     }
 }

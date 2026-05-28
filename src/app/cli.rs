@@ -566,6 +566,15 @@ pub(super) enum ControllerCommand {
         #[arg(short, long)]
         target: Option<String>,
     },
+    /// Return controller-owned evidence after bearer-token verification.
+    #[command(name = "rpc-evidence", hide = true)]
+    RpcEvidence {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+        /// Branch to inspect. Defaults to current git branch or main on the controller.
+        branch: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
