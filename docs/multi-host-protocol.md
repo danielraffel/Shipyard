@@ -285,6 +285,11 @@ Backup/export should be explicit about secrets:
 
 - non-secret config can be exported to a portable file with
   `shipyard config export --output shipyard-setup.toml`
+- a private single-install backup that preserves per-node bearer tokens and
+  other raw config secrets can be exported with
+  `shipyard config export --include-secrets --output shipyard-private-setup.toml`
+  (`--output` is required so secrets are not printed to stdout; Unix exports are
+  chmodded owner-only)
 - a selected config layer can be restored with
   `shipyard config import shipyard-setup.toml --from local --scope local`
 - per-node bearer tokens are secrets

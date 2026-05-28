@@ -49,9 +49,18 @@ pub(super) fn config_command<W: Write>(
         ConfigCommand::Unset { key, scope } => {
             config_unset(mode, cwd, &config, &key, scope, json, stdout)?;
         }
-        ConfigCommand::Export { output } => {
-            config_export(mode, state_dir, &config, output.as_deref(), json, stdout)?;
-        }
+        ConfigCommand::Export {
+            output,
+            include_secrets,
+        } => config_export(
+            mode,
+            state_dir,
+            &config,
+            output.as_deref(),
+            include_secrets,
+            json,
+            stdout,
+        )?,
         ConfigCommand::Import { input, from, scope } => config_import(
             ConfigWriteContext {
                 mode,
@@ -335,10 +344,17 @@ fn config_export<W: Write>(
     state_dir: &Path,
     config: &LoadedConfig,
     output: Option<&Path>,
+    include_secrets: bool,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    let bundle = export_setup_bundle(mode, state_dir, config)?;
+    if include_secrets && output.is_none() {
+        return Err(CliFailure::new(
+            2,
+            "config export --include-secrets requires --output to avoid writing secrets to stdout",
+        ));
+    }
+    let bundle = export_setup_bundle(mode, state_dir, config, include_secrets)?;
     let text = format!("{bundle}\n");
     if let Some(path) = output {
         if let Some(parent) = path.parent()
@@ -347,14 +363,21 @@ fn config_export<W: Write>(
             fs::create_dir_all(parent).map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         fs::write(path, text).map_err(|error| CliFailure::new(1, error.to_string()))?;
+        #[cfg(unix)]
+        if include_secrets {
+            restrict_private_export_permissions(path)?;
+        }
         if json {
             let mut data = BTreeMap::new();
             data.insert("path".to_owned(), Value::String(path.display().to_string()));
-            data.insert(
-                "bundle".to_owned(),
-                serde_json::to_value(&bundle)
-                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
-            );
+            data.insert("include_secrets".to_owned(), Value::Bool(include_secrets));
+            if !include_secrets {
+                data.insert(
+                    "bundle".to_owned(),
+                    serde_json::to_value(&bundle)
+                        .map_err(|error| CliFailure::new(1, error.to_string()))?,
+                );
+            }
             return write_json_envelope(stdout, "config.export", data)
                 .map_err(|error| CliFailure::new(1, error.to_string()));
         }
@@ -374,6 +397,14 @@ fn config_export<W: Write>(
     } else {
         write!(stdout, "{text}").map_err(|error| CliFailure::new(1, error.to_string()))
     }
+}
+
+#[cfg(unix)]
+fn restrict_private_export_permissions(path: &Path) -> Result<(), CliFailure> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 fn config_import<W: Write>(
@@ -446,6 +477,7 @@ fn export_setup_bundle(
     mode: RuntimeMode,
     state_dir: &Path,
     config: &LoadedConfig,
+    include_secrets: bool,
 ) -> Result<Table, CliFailure> {
     let mut metadata = Table::new();
     metadata.insert(
@@ -473,42 +505,57 @@ fn export_setup_bundle(
     let mut layers = Table::new();
     layers.insert(
         "global".to_owned(),
-        TomlValue::Table(read_sanitized_config_file(
+        TomlValue::Table(read_export_config_file(
             &config.global_dir.join("config.toml"),
+            include_secrets,
         )?),
     );
     layers.insert(
         "project".to_owned(),
-        TomlValue::Table(read_optional_sanitized_config(
+        TomlValue::Table(read_optional_export_config(
             config
                 .project_dir
                 .as_ref()
                 .map(|dir| dir.join("config.toml")),
+            include_secrets,
         )?),
     );
     layers.insert(
         "local".to_owned(),
-        TomlValue::Table(read_optional_sanitized_config(
+        TomlValue::Table(read_optional_export_config(
             config.local_dir.as_ref().map(|dir| dir.join("config.toml")),
+            include_secrets,
         )?),
     );
     layers.insert(
         "effective".to_owned(),
-        TomlValue::Table(sanitize_config_table(&config.data)),
+        TomlValue::Table(export_config_table(&config.data, include_secrets)),
     );
 
     let mut requirements = Table::new();
-    requirements.insert(
-        "notes".to_owned(),
-        TomlValue::Array(vec![
-            TomlValue::String(
-                "This bundle intentionally excludes raw tokens, private keys, token caches, daemon sockets, queue state, and runtime logs.".to_owned(),
-            ),
-            TomlValue::String(
-                "Reprovision GitHub App private keys, Keychain items, 1Password sessions, and environment variables separately.".to_owned(),
-            ),
-        ]),
-    );
+    let mut notes = Vec::new();
+    if include_secrets {
+        notes.push(TomlValue::String(
+            "This bundle includes raw config secrets such as per-node bearer tokens; store it only in a private, trusted location.".to_owned(),
+        ));
+        notes.push(TomlValue::String(
+            "Treat this file like a private key: keep permissions owner-only and never check it into a repository.".to_owned(),
+        ));
+        notes.push(TomlValue::String(
+            "Token caches, daemon sockets, queue state, runtime logs, Keychain items, and 1Password sessions are still not exported.".to_owned(),
+        ));
+    } else {
+        notes.push(TomlValue::String(
+            "This bundle intentionally excludes raw tokens, private keys, token caches, daemon sockets, queue state, and runtime logs.".to_owned(),
+        ));
+        notes.push(TomlValue::String(
+            "Use --include-secrets only for private backups when you need to preserve per-node pairing tokens or other raw config secrets.".to_owned(),
+        ));
+        notes.push(TomlValue::String(
+            "Reprovision GitHub App private keys, Keychain items, 1Password sessions, and environment variables separately.".to_owned(),
+        ));
+    }
+    requirements.insert("notes".to_owned(), TomlValue::Array(notes));
 
     let mut bundle = Table::new();
     bundle.insert("shipyard_setup".to_owned(), TomlValue::Table(metadata));
@@ -517,14 +564,17 @@ fn export_setup_bundle(
     Ok(bundle)
 }
 
-fn read_optional_sanitized_config(path: Option<PathBuf>) -> Result<Table, CliFailure> {
+fn read_optional_export_config(
+    path: Option<PathBuf>,
+    include_secrets: bool,
+) -> Result<Table, CliFailure> {
     match path {
-        Some(path) => read_sanitized_config_file(&path),
+        Some(path) => read_export_config_file(&path, include_secrets),
         None => Ok(Table::new()),
     }
 }
 
-fn read_sanitized_config_file(path: &Path) -> Result<Table, CliFailure> {
+fn read_export_config_file(path: &Path, include_secrets: bool) -> Result<Table, CliFailure> {
     if !path.exists() {
         return Ok(Table::new());
     }
@@ -532,29 +582,34 @@ fn read_sanitized_config_file(path: &Path) -> Result<Table, CliFailure> {
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .parse::<Table>()
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    Ok(sanitize_config_table(&table))
+    Ok(export_config_table(&table, include_secrets))
 }
 
-fn sanitize_config_table(table: &Table) -> Table {
+fn export_config_table(table: &Table, include_secrets: bool) -> Table {
     table
         .iter()
         .filter_map(|(key, value)| {
-            sanitize_config_value(key, value).map(|value| (key.clone(), value))
+            export_config_value(key, value, include_secrets).map(|value| (key.clone(), value))
         })
         .collect()
 }
 
-fn sanitize_config_value(key: &str, value: &TomlValue) -> Option<TomlValue> {
-    if is_secret_config_key(key) {
+fn export_config_value(key: &str, value: &TomlValue, include_secrets: bool) -> Option<TomlValue> {
+    if !include_secrets && is_secret_config_key(key) {
         return None;
     }
     match value {
-        TomlValue::Table(table) => Some(TomlValue::Table(sanitize_config_table(table))),
+        TomlValue::Table(table) => Some(TomlValue::Table(export_config_table(
+            table,
+            include_secrets,
+        ))),
         TomlValue::Array(values) => Some(TomlValue::Array(
             values
                 .iter()
                 .map(|value| match value {
-                    TomlValue::Table(table) => TomlValue::Table(sanitize_config_table(table)),
+                    TomlValue::Table(table) => {
+                        TomlValue::Table(export_config_table(table, include_secrets))
+                    }
                     other => other.clone(),
                 })
                 .collect(),
@@ -894,6 +949,7 @@ mod tests {
             RuntimeMode::Shipyard,
             temp.path().join("state").as_path(),
             &config,
+            false,
         )
         .expect("bundle");
         let text = bundle.to_string();
@@ -924,13 +980,172 @@ mod tests {
         };
 
         let bundle =
-            export_setup_bundle(RuntimeMode::Shipyard, &state_dir, &config).expect("bundle");
+            export_setup_bundle(RuntimeMode::Shipyard, &state_dir, &config, false).expect("bundle");
 
         assert!(
             bundle
                 .to_string()
                 .contains("machine_id = \"sy_node_0123456789abcdef0123456789abcdef\"")
         );
+    }
+
+    #[test]
+    fn export_setup_bundle_can_include_secrets_for_private_backup() {
+        let temp = TempDir::new().expect("tempdir");
+        let local_dir = temp.path().join(".shipyard.local");
+        fs::create_dir_all(&local_dir).expect("local");
+        fs::write(
+            local_dir.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "ssh://mac-studio"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("local config");
+        let config = LoadedConfig {
+            data: r#"
+                [multi_host.client]
+                enabled = true
+                controller = "ssh://mac-studio"
+                node_token = "synode_secret"
+            "#
+            .parse::<Table>()
+            .expect("effective"),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: Some(local_dir),
+            local_overlay_source: LocalOverlaySource::Direct,
+        };
+
+        let safe = export_setup_bundle(RuntimeMode::Shipyard, temp.path(), &config, false)
+            .expect("safe bundle")
+            .to_string();
+        let private = export_setup_bundle(RuntimeMode::Shipyard, temp.path(), &config, true)
+            .expect("private bundle")
+            .to_string();
+
+        assert!(!safe.contains("node_token"));
+        assert!(!safe.contains("synode_secret"));
+        assert!(private.contains("node_token = \"synode_secret\""));
+        assert!(private.contains("includes raw config secrets"));
+        assert!(private.contains("Treat this file like a private key"));
+    }
+
+    #[test]
+    fn include_secrets_export_requires_output() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = loaded_config(temp.path());
+        let mut stdout = Vec::new();
+
+        let error = config_export(
+            RuntimeMode::Shipyard,
+            temp.path(),
+            &config,
+            None,
+            true,
+            false,
+            &mut stdout,
+        )
+        .expect_err("stdout secret export should fail");
+
+        assert_eq!(error.code, 2);
+        assert!(
+            error
+                .message
+                .contains("requires --output to avoid writing secrets to stdout")
+        );
+        assert!(stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_secrets_export_writes_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let local_dir = temp.path().join(".shipyard.local");
+        fs::create_dir_all(&local_dir).expect("local");
+        fs::write(
+            local_dir.join("config.toml"),
+            r#"
+            [multi_host.client]
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("local config");
+        let config = LoadedConfig {
+            data: Table::new(),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: Some(local_dir),
+            local_overlay_source: LocalOverlaySource::Direct,
+        };
+        let output = temp.path().join("shipyard-private-setup.toml");
+        let mut stdout = Vec::new();
+
+        config_export(
+            RuntimeMode::Shipyard,
+            temp.path(),
+            &config,
+            Some(&output),
+            true,
+            false,
+            &mut stdout,
+        )
+        .expect("export");
+
+        let mode = fs::metadata(&output)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn include_secrets_export_json_omits_bundle_from_stdout() {
+        let temp = TempDir::new().expect("tempdir");
+        let local_dir = temp.path().join(".shipyard.local");
+        fs::create_dir_all(&local_dir).expect("local");
+        fs::write(
+            local_dir.join("config.toml"),
+            r#"
+            [multi_host.client]
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("local config");
+        let config = LoadedConfig {
+            data: Table::new(),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: Some(local_dir),
+            local_overlay_source: LocalOverlaySource::Direct,
+        };
+        let output = temp.path().join("shipyard-private-setup.toml");
+        let mut stdout = Vec::new();
+
+        config_export(
+            RuntimeMode::Shipyard,
+            temp.path(),
+            &config,
+            Some(&output),
+            true,
+            true,
+            &mut stdout,
+        )
+        .expect("export");
+
+        let rendered = String::from_utf8(stdout).expect("utf8");
+        assert!(!rendered.contains("synode_secret"));
+        assert!(!rendered.contains("node_token"));
+        let payload: Value = serde_json::from_str(&rendered).expect("json");
+        assert_eq!(payload["command"], "config.export");
+        assert_eq!(payload["include_secrets"], true);
+        assert!(payload.get("bundle").is_none());
+        assert_eq!(payload["path"], output.display().to_string());
     }
 
     #[test]

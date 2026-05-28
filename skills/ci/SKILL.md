@@ -572,7 +572,11 @@ for live target state.
 
 For machine-to-machine setup movement, use `shipyard config export --output
 shipyard-setup.toml` and restore a chosen layer with `shipyard config import
-shipyard-setup.toml --from local --scope local`. Reprovision secrets separately.
+shipyard-setup.toml --from local --scope local`. Use `shipyard config export
+--include-secrets --output shipyard-private-setup.toml` only for trusted private
+backups that intentionally preserve raw config secrets such as per-node pairing
+tokens. Secret-inclusive exports require `--output`; on Unix, Shipyard writes
+the file with owner-only permissions.
 
 ### Local Mac capacity
 

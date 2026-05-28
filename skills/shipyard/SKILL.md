@@ -52,9 +52,11 @@ When debugging GitHub behavior:
   installation token is rejected for PR creation by both GraphQL and REST,
   Shipyard prints an explicit notice and uses ambient `gh` auth for that create
   operation only.
-- Mac-to-Mac portability is config-only. Reprovision env vars, Keychain items,
-  1Password sign-in, or App private keys outside Shipyard on the destination
-  Mac.
+- Mac-to-Mac portability defaults to non-secret config. Use `shipyard config
+  export --include-secrets --output shipyard-private-setup.toml` only for
+  trusted private backups that intentionally preserve raw config secrets such as
+  per-node pairing tokens. Secret-inclusive exports require `--output`; on Unix,
+  Shipyard writes the file with owner-only permissions.
 - Use `shipyard auth export` and `shipyard auth import --scope local` only for
   sanitized config movement. The bundle must not contain tokens, private keys,
   Keychain exports, 1Password sessions, queue state, daemon sockets, or token

@@ -813,6 +813,9 @@ pub(super) enum ConfigCommand {
         /// Write the bundle to a file instead of stdout.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Include raw config secrets such as per-node bearer tokens.
+        #[arg(long = "include-secrets", action = ArgAction::SetTrue)]
+        include_secrets: bool,
     },
     /// Import one config layer from a portable setup bundle.
     Import {

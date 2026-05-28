@@ -59,6 +59,7 @@ shipyard config show           # dump effective merged config
 shipyard config set multi_host.controller.enabled true --scope local
 shipyard config unset multi_host.controller.enabled --scope local
 shipyard config export --output shipyard-setup.toml
+shipyard config export --include-secrets --output shipyard-private-setup.toml
 shipyard config import shipyard-setup.toml --from local --scope local
 shipyard auth export --output shipyard-auth.toml
 shipyard auth import shipyard-auth.toml --scope local
@@ -122,8 +123,11 @@ rate-limit buckets.
 
 For machine-to-machine setup movement, use `shipyard config export --output
 shipyard-setup.toml` and restore a chosen layer with `shipyard config import
-shipyard-setup.toml --from local --scope local`. Reprovision secrets
-separately.
+shipyard-setup.toml --from local --scope local`. Use `shipyard config export
+--include-secrets --output shipyard-private-setup.toml` only for trusted private
+backups when you need to preserve per-node pairing tokens or other raw config
+secrets. Secret-inclusive exports require `--output`; on Unix, Shipyard writes
+the file with owner-only permissions.
 
 For GitHub App auth specifically, use `shipyard auth export` and
 `shipyard auth import`; the export is allow-listed to omit private keys,
