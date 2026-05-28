@@ -56,7 +56,7 @@ use self::config_cmd::config_command;
 use self::controller_cmd::{
     configured_client_enabled, controller_command, leave_command, node_command,
     remote_evidence_command, remote_logs_command, remote_node_list_command, remote_queue_command,
-    remote_status_command,
+    remote_status_command, remote_watch_command,
 };
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
@@ -317,6 +317,17 @@ fn handle_operational_variant<W: Write>(
     local_state: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    if let Some(result) = maybe_remote_watch_command(
+        &command,
+        mode,
+        cwd,
+        runtime_paths,
+        json,
+        local_state,
+        stdout,
+    )? {
+        return Ok(result);
+    }
     if !local_state
         && matches!(
             command,
@@ -324,7 +335,6 @@ fn handle_operational_variant<W: Write>(
                 | Command::Ship { .. }
                 | Command::Pr { .. }
                 | Command::AutoMerge { .. }
-                | Command::Watch { .. }
                 | Command::ShipState { .. }
         )
     {
@@ -393,6 +403,62 @@ fn handle_operational_variant<W: Write>(
         | Command::Wait { .. }
         | Command::Update(_) => unreachable!("command handled by top-level dispatch"),
     }
+}
+
+fn maybe_remote_watch_command<W: Write>(
+    command: &Command,
+    mode: RuntimeMode,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    local_state: bool,
+    stdout: &mut W,
+) -> Result<Option<ExitCode>, CliFailure> {
+    if local_state {
+        return Ok(None);
+    }
+    let Command::Watch {
+        pr,
+        follow,
+        no_follow,
+        ..
+    } = command
+    else {
+        return Ok(None);
+    };
+    let config = LoadedConfig::load_from_cwd_with_global_dir(
+        mode,
+        cwd,
+        Some(runtime_paths.global_dir.clone()),
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !configured_client_enabled(&config) {
+        return Ok(None);
+    }
+    if *follow && !*no_follow {
+        return Err(CliFailure::new(
+            1,
+            "controller client config is enabled, but controller-backed watch --follow is not implemented yet; use --no-follow for a controller snapshot or --local-state for this machine's local watch",
+        ));
+    }
+    let machine_id = crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let branch = if pr.is_none() { git_branch(cwd) } else { None };
+    let code = remote_watch_command(&config, &machine_id, *pr, branch.as_deref(), json, stdout)?;
+    Ok(Some(code))
+}
+
+fn git_branch(cwd: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!branch.is_empty()).then_some(branch)
 }
 
 fn handle_rescue_variant<W: Write>(
@@ -1293,6 +1359,94 @@ mod tests {
         let message = String::from_utf8(stderr).expect("stderr");
         assert!(message.contains("implemented SSH transport"));
         assert!(message.contains("--local-state for local evidence"));
+    }
+
+    #[test]
+    fn watch_routes_to_controller_when_client_configured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "https://mac-studio.example.ts.net:8765"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "watch",
+            "--pr",
+            "319",
+            "--no-follow",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("implemented SSH transport"));
+        assert!(message.contains("--local-state for local watch"));
+    }
+
+    #[test]
+    fn watch_follow_refuses_controller_client_until_streaming_rpc_lands() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "ssh://mac-studio"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "watch",
+            "--pr",
+            "319",
+            "--follow",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("watch --follow is not implemented"));
+        assert!(message.contains("--no-follow"));
     }
 
     #[test]

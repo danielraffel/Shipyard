@@ -20,13 +20,15 @@ invite over SSH, writes client-local config, stores only bearer-token hashes on
 the controller, `shipyard leave` removes local client config, and `shipyard
 status` / `shipyard queue` / `shipyard logs` / `shipyard evidence` route to
 the controller when client config is enabled. `shipyard node list` also reads
-the controller registry when joined. Use `--local-state` to inspect this
+the controller registry when joined, and `shipyard watch --no-follow` reads a
+controller-owned ship-state snapshot. Use `--local-state` to inspect this
 machine's local state instead.
 
-HTTP controller serving, remote enqueue/ship/watch, periodic heartbeats, and
-GUI consumption are still follow-on slices. Until those land, SSH-backed
-read-only state inspection proves the trust/config/routing model but does not
-yet make a laptop enqueue work to a Mac Studio controller.
+HTTP controller serving, remote enqueue/ship, streaming `watch --follow`,
+periodic heartbeats, and GUI consumption are still follow-on slices. Until
+those land, SSH-backed read-only state inspection proves the trust/config/
+routing model but does not yet make a laptop enqueue work to a Mac Studio
+controller.
 When client config is enabled, stateful local commands that are not yet routed
 to the controller fail closed unless `--local-state` is supplied, so a laptop
 does not silently mutate a separate local queue by accident.

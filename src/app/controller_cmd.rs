@@ -10,12 +10,14 @@ use chrono::Utc;
 use serde_json::Value;
 use toml::{Table, Value as TomlValue};
 
+use super::watch_cmd::{WatchCommandContext, WatchCommandOptions, watch};
 use super::{
     CliFailure,
     cli::{ControllerCommand, NodeCommand},
     queue_cmd::{evidence_command, logs_command, queue_command, status_command},
 };
 use crate::config::{LoadedConfig, LocalOverlaySource};
+use crate::evidence::EvidenceStore;
 use crate::executor::ssh::shlex_quote;
 use crate::identity::{ProductIdentity, RuntimeMode};
 use crate::machine_identity::get_or_create_machine_id;
@@ -23,6 +25,7 @@ use crate::node_registry::{
     NodeEndpoint, NodeEndpointKind, NodeJoin, NodeRecord, NodeRegistryStore, NodeRole,
 };
 use crate::output::write_json_envelope;
+use crate::ship_state::ShipStateStore;
 use wait_timeout::ChildExt;
 
 const CONTROLLER_SSH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -79,57 +82,89 @@ pub(super) fn controller_command<W: Write>(
                 stdout,
             )?;
         }
+        rpc @ (ControllerCommand::RpcStatus { .. }
+        | ControllerCommand::RpcQueue { .. }
+        | ControllerCommand::RpcLogs { .. }
+        | ControllerCommand::RpcEvidence { .. }
+        | ControllerCommand::RpcNodeList { .. }
+        | ControllerCommand::RpcWatch { .. }) => {
+            controller_rpc_command(rpc, mode, cwd, state_dir, json_mode, stdout)?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn controller_rpc_command<W: Write>(
+    command: ControllerCommand,
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    match command {
         ControllerCommand::RpcStatus {
             machine_id,
             token_stdin,
-        } => {
-            controller_rpc_status(
-                mode,
-                cwd,
-                state_dir,
-                &machine_id,
-                token_stdin,
-                json_mode,
-                stdout,
-            )?;
-        }
+        } => controller_rpc_status(
+            mode,
+            cwd,
+            state_dir,
+            &machine_id,
+            token_stdin,
+            json_mode,
+            stdout,
+        ),
         ControllerCommand::RpcQueue {
             machine_id,
             token_stdin,
-        } => {
-            controller_rpc_queue(state_dir, &machine_id, token_stdin, json_mode, stdout)?;
-        }
+        } => controller_rpc_queue(state_dir, &machine_id, token_stdin, json_mode, stdout),
         ControllerCommand::RpcLogs {
             machine_id,
             job_id,
             target,
             token_stdin,
-        } => {
-            controller_rpc_logs(state_dir, &machine_id, token_stdin, &job_id, target, stdout)?;
-        }
+        } => controller_rpc_logs(state_dir, &machine_id, token_stdin, &job_id, target, stdout),
         ControllerCommand::RpcEvidence {
             machine_id,
             branch,
             token_stdin,
-        } => {
-            controller_rpc_evidence(
-                cwd,
-                state_dir,
-                &machine_id,
-                token_stdin,
-                branch,
-                json_mode,
-                stdout,
-            )?;
-        }
+        } => controller_rpc_evidence(
+            cwd,
+            state_dir,
+            &machine_id,
+            token_stdin,
+            branch,
+            json_mode,
+            stdout,
+        ),
         ControllerCommand::RpcNodeList {
             machine_id,
             token_stdin,
-        } => {
-            controller_rpc_node_list(state_dir, &machine_id, token_stdin, json_mode, stdout)?;
+        } => controller_rpc_node_list(state_dir, &machine_id, token_stdin, json_mode, stdout),
+        ControllerCommand::RpcWatch {
+            machine_id,
+            pr,
+            branch,
+            token_stdin,
+        } => controller_rpc_watch(
+            cwd,
+            state_dir,
+            &machine_id,
+            token_stdin,
+            pr,
+            branch.as_deref(),
+            json_mode,
+            stdout,
+        ),
+        ControllerCommand::Status
+        | ControllerCommand::Init { .. }
+        | ControllerCommand::Invite { .. }
+        | ControllerCommand::Join { .. }
+        | ControllerCommand::AcceptJoin { .. } => {
+            unreachable!("non-RPC controller command passed to RPC helper")
         }
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 pub(super) fn node_command<W: Write>(
@@ -502,6 +537,53 @@ fn controller_rpc_node_list<W: Write>(
     authenticate_rpc_node(state_dir, machine_id, token_stdin)?;
     node_list(state_dir, json_mode, stdout)?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controller_rpc_watch<W: Write>(
+    cwd: &Path,
+    state_dir: &Path,
+    machine_id: &str,
+    token_stdin: bool,
+    pr: Option<u64>,
+    branch: Option<&str>,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node(state_dir, machine_id, token_stdin)?;
+    let store = ShipStateStore::new(state_dir.join("ship"))
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let evidence = EvidenceStore::new(state_dir.join("evidence"))
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let pr = match (pr, branch) {
+        (Some(pr), _) => Some(pr),
+        (None, Some(branch)) => active_pr_for_branch(&store, branch),
+        (None, None) => None,
+    };
+    watch(
+        WatchCommandContext {
+            store: &store,
+            evidence_store: &evidence,
+            cwd,
+        },
+        WatchCommandOptions {
+            pr,
+            follow: false,
+            interval: 5.0,
+            json: json_mode,
+        },
+        stdout,
+    )?;
+    Ok(())
+}
+
+fn active_pr_for_branch(store: &ShipStateStore, branch: &str) -> Option<u64> {
+    store
+        .list_active()
+        .into_iter()
+        .filter(|state| state.branch == branch)
+        .max_by_key(|state| state.updated_at)
+        .map(|state| state.pr)
 }
 
 fn authenticate_rpc_node(
@@ -943,6 +1025,43 @@ pub(super) fn remote_node_list_command<W: Write>(
     )
 }
 
+pub(super) fn remote_watch_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    pr: Option<u64>,
+    branch: Option<&str>,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let client = configured_client(config)?;
+    let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
+        return Err(CliFailure::new(
+            1,
+            "configured controller is not reachable through the implemented SSH transport; use --local-state for local watch",
+        ));
+    };
+    let remote = remote_controller_watch_shell_command(machine_id, pr, branch, json_mode);
+    let output = run_controller_ssh(
+        endpoint,
+        &remote,
+        Some(&client.node_token),
+        "controller watch",
+    )?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "controller_unreachable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    stdout
+        .write_all(&output.stdout)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn remote_controller_command<W: Write>(
     config: &LoadedConfig,
     machine_id: &str,
@@ -1094,6 +1213,30 @@ fn remote_controller_evidence_shell_command(
     }
     if let Some(branch) = branch {
         remote.push(' ');
+        remote.push_str(&shlex_quote(branch));
+    }
+    remote
+}
+
+fn remote_controller_watch_shell_command(
+    machine_id: &str,
+    pr: Option<u64>,
+    branch: Option<&str>,
+    json_mode: bool,
+) -> String {
+    let mut remote = format!(
+        "shipyard --local-state controller rpc-watch --machine-id {} --token-stdin",
+        shlex_quote(machine_id),
+    );
+    if json_mode {
+        remote.push_str(" --json");
+    }
+    if let Some(pr) = pr {
+        remote.push_str(" --pr ");
+        remote.push_str(&pr.to_string());
+    }
+    if let Some(branch) = branch {
+        remote.push_str(" --branch ");
         remote.push_str(&shlex_quote(branch));
     }
     remote
@@ -1271,6 +1414,24 @@ mod tests {
         assert!(command.contains("--machine-id sy_node_client"));
         assert!(command.contains("--token-stdin"));
         assert!(command.ends_with("--json"));
+        assert!(!command.contains("synode_secret"));
+    }
+
+    #[test]
+    fn remote_controller_watch_shell_command_targets_authenticated_watch_rpc() {
+        let command = remote_controller_watch_shell_command(
+            "sy_node_client",
+            Some(319),
+            Some("feature/test branch"),
+            true,
+        );
+
+        assert!(command.contains("shipyard --local-state controller rpc-watch"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--token-stdin"));
+        assert!(command.contains("--json"));
+        assert!(command.contains("--pr 319"));
+        assert!(command.contains("--branch 'feature/test branch'"));
         assert!(!command.contains("synode_secret"));
     }
 }

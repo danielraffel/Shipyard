@@ -600,6 +600,22 @@ pub(super) enum ControllerCommand {
         #[arg(long = "token-stdin", hide = true)]
         token_stdin: bool,
     },
+    /// Return a controller-owned watch snapshot after bearer-token verification.
+    #[command(name = "rpc-watch", hide = true)]
+    RpcWatch {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+        /// Pull request number to watch.
+        #[arg(long)]
+        pr: Option<u64>,
+        /// Branch used to find the active PR when `--pr` is omitted.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
