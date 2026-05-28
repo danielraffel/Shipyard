@@ -55,8 +55,8 @@ use self::cloud_cmd::cloud_command;
 use self::config_cmd::config_command;
 use self::controller_cmd::{
     configured_client_enabled, controller_command, leave_command, node_command,
-    remote_evidence_command, remote_logs_command, remote_node_list_command, remote_queue_command,
-    remote_status_command, remote_watch_command,
+    remote_evidence_command, remote_logs_command, remote_node_list_command,
+    remote_node_remove_command, remote_queue_command, remote_status_command, remote_watch_command,
 };
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
@@ -199,11 +199,18 @@ fn dispatch<W: Write, E: Write>(
                         .map_err(|error| CliFailure::new(1, error.to_string()))?;
                         return remote_node_list_command(&config, &machine_id, cli.json, stdout);
                     }
-                    self::cli::NodeCommand::Remove { .. } => {
-                        return Err(CliFailure::new(
-                            1,
-                            "controller client config is enabled, but node removal is not routed to the controller yet; use --local-state to operate on this machine's local registry explicitly",
-                        ));
+                    self::cli::NodeCommand::Remove { machine_id } => {
+                        let local_machine_id = crate::machine_identity::get_or_create_machine_id(
+                            &runtime_paths.state_dir,
+                        )
+                        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+                        return remote_node_remove_command(
+                            &config,
+                            &local_machine_id,
+                            &machine_id,
+                            cli.json,
+                            stdout,
+                        );
                     }
                 }
             }
@@ -1533,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn node_remove_refuses_split_brain_when_client_configured() {
+    fn node_remove_routes_self_revoke_to_controller_when_client_configured() {
         let temp = tempfile::tempdir().expect("tempdir");
         let local = temp.path().join(".shipyard-dev.local");
         std::fs::create_dir_all(&local).expect("local");
@@ -1548,6 +1555,14 @@ mod tests {
         )
         .expect("config");
         let state_dir = temp.path().join("state");
+        let machine_id_path = crate::machine_identity::machine_id_path(&state_dir);
+        std::fs::create_dir_all(machine_id_path.parent().expect("machine id parent"))
+            .expect("machine id parent");
+        std::fs::write(
+            machine_id_path,
+            "sy_node_0123456789abcdef0123456789abcdef\n",
+        )
+        .expect("machine id");
         let global_dir = temp.path().join("global");
         let cli = Cli::parse_from([
             "shipyard",
@@ -1571,8 +1586,8 @@ mod tests {
         assert_eq!(code, ExitCode::from(1));
         assert!(stdout.is_empty());
         let message = String::from_utf8(stderr).expect("stderr");
-        assert!(message.contains("node removal is not routed"));
-        assert!(message.contains("--local-state"));
+        assert!(message.contains("controller_unreachable"));
+        assert!(message.contains("mac-studio"));
     }
 
     #[cfg(unix)]

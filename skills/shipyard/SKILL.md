@@ -351,9 +351,10 @@ status`, `shipyard --local-state queue`, `shipyard --local-state logs`,
 `shipyard --local-state evidence`, controller-backed `shipyard node list`,
 `shipyard --local-state node list`, controller-backed
 `shipyard watch --no-follow`, `shipyard --local-state watch --no-follow`,
-`shipyard leave`, and `shipyard node remove`. Treat remote enqueue/ship,
-streaming `watch --follow`, controller-backed node removal, and HTTPS
-controller RPC as planned, not shipped.
+`shipyard leave`, and controller-backed `shipyard node remove
+<this-machine-id>`. Treat remote enqueue/ship, streaming `watch --follow`,
+revoking another node from a client, and HTTPS controller RPC as planned, not
+shipped.
 
 ## Cloud Retargeting
 

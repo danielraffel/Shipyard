@@ -21,14 +21,16 @@ the controller, `shipyard leave` removes local client config, and `shipyard
 status` / `shipyard queue` / `shipyard logs` / `shipyard evidence` route to
 the controller when client config is enabled. `shipyard node list` also reads
 the controller registry when joined, and `shipyard watch --no-follow` reads a
-controller-owned ship-state snapshot. Use `--local-state` to inspect this
+controller-owned ship-state snapshot. `shipyard node remove <this-machine-id>`
+routes a self-revocation to the controller; revoking another node still requires
+running `node remove` on the controller. Use `--local-state` to inspect this
 machine's local state instead.
 
 HTTP controller serving, remote enqueue/ship, streaming `watch --follow`,
 periodic heartbeats, and GUI consumption are still follow-on slices. Until
-those land, SSH-backed read-only state inspection proves the trust/config/
-routing model but does not yet make a laptop enqueue work to a Mac Studio
-controller.
+those land, SSH-backed state inspection and self-revocation prove the
+trust/config/routing model but do not yet make a laptop enqueue work to a Mac
+Studio controller.
 When client config is enabled, stateful local commands that are not yet routed
 to the controller fail closed unless `--local-state` is supplied, so a laptop
 does not silently mutate a separate local queue by accident.
@@ -244,6 +246,7 @@ shipyard queue
 shipyard logs <id>
 shipyard evidence
 shipyard node list
+shipyard node remove <this-machine-id>
 shipyard leave
 ```
 

@@ -122,8 +122,9 @@ state; clients join explicitly and communicate over authenticated RPCs. See
 The first implemented transport is SSH-backed pairing plus controller-backed
 `shipyard status`, `shipyard queue`, `shipyard logs`, and
 `shipyard evidence`, plus controller-backed `shipyard node list` and
-`shipyard watch --no-follow`; use `--local-state` with those commands when you
-intentionally want the laptop's own local state.
+`shipyard watch --no-follow`, plus controller-backed self-revocation with
+`shipyard node remove <this-machine-id>`; use `--local-state` with those
+commands when you intentionally want the laptop's own local state.
 
 ## Explicit Cloud Overflow
 

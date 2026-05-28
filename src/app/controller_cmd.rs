@@ -87,6 +87,7 @@ pub(super) fn controller_command<W: Write>(
         | ControllerCommand::RpcLogs { .. }
         | ControllerCommand::RpcEvidence { .. }
         | ControllerCommand::RpcNodeList { .. }
+        | ControllerCommand::RpcNodeRemove { .. }
         | ControllerCommand::RpcWatch { .. }) => {
             controller_rpc_command(rpc, mode, cwd, state_dir, json_mode, stdout)?;
         }
@@ -142,6 +143,18 @@ fn controller_rpc_command<W: Write>(
             machine_id,
             token_stdin,
         } => controller_rpc_node_list(state_dir, &machine_id, token_stdin, json_mode, stdout),
+        ControllerCommand::RpcNodeRemove {
+            machine_id,
+            target_machine_id,
+            token_stdin,
+        } => controller_rpc_node_remove(
+            state_dir,
+            &machine_id,
+            &target_machine_id,
+            token_stdin,
+            json_mode,
+            stdout,
+        ),
         ControllerCommand::RpcWatch {
             machine_id,
             pr,
@@ -539,6 +552,44 @@ fn controller_rpc_node_list<W: Write>(
     Ok(())
 }
 
+fn controller_rpc_node_remove<W: Write>(
+    state_dir: &Path,
+    machine_id: &str,
+    target_machine_id: &str,
+    token_stdin: bool,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let token = read_rpc_token(token_stdin)?;
+    controller_rpc_node_remove_with_token(
+        state_dir,
+        machine_id,
+        target_machine_id,
+        &token,
+        json_mode,
+        stdout,
+    )
+}
+
+fn controller_rpc_node_remove_with_token<W: Write>(
+    state_dir: &Path,
+    machine_id: &str,
+    target_machine_id: &str,
+    bearer_token: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node_with_token(state_dir, machine_id, bearer_token)?;
+    if target_machine_id != machine_id {
+        return Err(CliFailure::new(
+            1,
+            "auth denied: client node tokens can only revoke their own node; run node remove on the controller to revoke another node",
+        ));
+    }
+    node_remove(state_dir, target_machine_id, json_mode, stdout)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn controller_rpc_watch<W: Write>(
     cwd: &Path,
@@ -590,12 +641,20 @@ fn authenticate_rpc_node(
     state_dir: &Path,
     machine_id: &str,
     token_stdin: bool,
-) -> Result<(), CliFailure> {
+) -> Result<NodeRecord, CliFailure> {
     let token = read_rpc_token(token_stdin)?;
-    NodeRegistryStore::new(state_dir)
-        .authenticate_node(machine_id, &token)
+    authenticate_rpc_node_with_token(state_dir, machine_id, &token)
+}
+
+fn authenticate_rpc_node_with_token(
+    state_dir: &Path,
+    machine_id: &str,
+    bearer_token: &str,
+) -> Result<NodeRecord, CliFailure> {
+    let node = NodeRegistryStore::new(state_dir)
+        .authenticate_node(machine_id, bearer_token)
         .map_err(|error| CliFailure::new(1, format!("auth denied: {error}")))?;
-    Ok(())
+    Ok(node)
 }
 
 fn read_rpc_token(token_stdin: bool) -> Result<String, CliFailure> {
@@ -1025,6 +1084,43 @@ pub(super) fn remote_node_list_command<W: Write>(
     )
 }
 
+pub(super) fn remote_node_remove_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    target_machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let client = configured_client(config)?;
+    let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
+        return Err(CliFailure::new(
+            1,
+            "configured controller is not reachable through the implemented SSH transport; use --local-state for local node remove",
+        ));
+    };
+    let remote =
+        remote_controller_node_remove_shell_command(machine_id, target_machine_id, json_mode);
+    let output = run_controller_ssh(
+        endpoint,
+        &remote,
+        Some(&client.node_token),
+        "controller node remove",
+    )?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "controller_unreachable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    stdout
+        .write_all(&output.stdout)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 pub(super) fn remote_watch_command<W: Write>(
     config: &LoadedConfig,
     machine_id: &str,
@@ -1242,6 +1338,22 @@ fn remote_controller_watch_shell_command(
     remote
 }
 
+fn remote_controller_node_remove_shell_command(
+    machine_id: &str,
+    target_machine_id: &str,
+    json_mode: bool,
+) -> String {
+    let mut remote = format!(
+        "shipyard --local-state controller rpc-node-remove --machine-id {} --token-stdin {}",
+        shlex_quote(machine_id),
+        shlex_quote(target_machine_id),
+    );
+    if json_mode {
+        remote.push_str(" --json");
+    }
+    remote
+}
+
 fn remote_controller_shell_command(rpc_command: &str, machine_id: &str, json_mode: bool) -> String {
     format!(
         "shipyard --local-state controller {} --machine-id {} --token-stdin {}",
@@ -1369,6 +1481,53 @@ mod tests {
     }
 
     #[test]
+    fn rpc_node_remove_allows_self_revoke_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = NodeRegistryStore::new(temp.path());
+        let (_invite, token) = store.create_invite("m5", 15).expect("invite");
+        let join = store
+            .accept_join(&token, "sy_node_client", "m5", Vec::new())
+            .expect("join");
+
+        let mut other_stdout = Vec::new();
+        let error = controller_rpc_node_remove_with_token(
+            temp.path(),
+            "sy_node_client",
+            "sy_node_other",
+            &join.bearer_token,
+            true,
+            &mut other_stdout,
+        )
+        .expect_err("other revoke denied");
+
+        assert!(other_stdout.is_empty());
+        assert!(error.message.contains("only revoke their own node"));
+
+        let mut self_stdout = Vec::new();
+        controller_rpc_node_remove_with_token(
+            temp.path(),
+            "sy_node_client",
+            "sy_node_client",
+            &join.bearer_token,
+            true,
+            &mut self_stdout,
+        )
+        .expect("self revoke");
+        let payload: Value = serde_json::from_slice(&self_stdout).expect("json");
+
+        assert_eq!(payload["command"], "node.remove");
+        assert_eq!(payload["machine_id"], "sy_node_client");
+        assert_eq!(payload["removed"], true);
+        assert!(
+            store
+                .authenticate_node("sy_node_client", &join.bearer_token)
+                .expect_err("revoked")
+                .to_string()
+                .contains("revoked")
+        );
+    }
+
+    #[test]
     fn remote_controller_shell_command_targets_authenticated_queue_rpc() {
         let command = remote_controller_shell_command("rpc-queue", "sy_node_client", true);
 
@@ -1413,6 +1572,19 @@ mod tests {
         assert!(command.contains("shipyard --local-state controller rpc-node-list"));
         assert!(command.contains("--machine-id sy_node_client"));
         assert!(command.contains("--token-stdin"));
+        assert!(command.ends_with("--json"));
+        assert!(!command.contains("synode_secret"));
+    }
+
+    #[test]
+    fn remote_controller_node_remove_shell_command_targets_authenticated_node_remove_rpc() {
+        let command =
+            remote_controller_node_remove_shell_command("sy_node_client", "sy_node_client", true);
+
+        assert!(command.contains("shipyard --local-state controller rpc-node-remove"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--token-stdin"));
+        assert!(command.contains("sy_node_client"));
         assert!(command.ends_with("--json"));
         assert!(!command.contains("synode_secret"));
     }

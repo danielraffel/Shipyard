@@ -600,6 +600,18 @@ pub(super) enum ControllerCommand {
         #[arg(long = "token-stdin", hide = true)]
         token_stdin: bool,
     },
+    /// Revoke this node on the controller after bearer-token verification.
+    #[command(name = "rpc-node-remove", hide = true)]
+    RpcNodeRemove {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+        /// Machine id to revoke. Must match the authenticated caller.
+        target_machine_id: String,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
+    },
     /// Return a controller-owned watch snapshot after bearer-token verification.
     #[command(name = "rpc-watch", hide = true)]
     RpcWatch {
