@@ -621,12 +621,14 @@ Use `shipyard controller init`, `shipyard controller invite`,
 `shipyard --local-state queue`, `shipyard --local-state logs`,
 `shipyard --local-state evidence`, `shipyard node list`,
 `shipyard --local-state node list`, `shipyard watch --no-follow`,
-`shipyard --local-state watch --no-follow`, `shipyard leave`, and `shipyard
+`shipyard --local-state watch --no-follow`, `shipyard targets pool status`,
+`shipyard --local-state targets pool status`, `shipyard leave`, and `shipyard
 node remove <this-machine-id>` for the implemented SSH-backed first slice. This
 proves secure pairing plus controller-backed state inspection, watch snapshots,
-registry visibility, and self-revocation. Do not claim remote laptop
-enqueue/ship, streaming `watch --follow`, revoking another node from a client,
-or HTTPS controller RPC is available until those slices land.
+host-pool visibility, registry visibility, and self-revocation. Do not claim
+remote laptop enqueue/ship, streaming `watch --follow`, mutating host-pool
+cleanup, revoking another node from a client, or HTTPS controller RPC is
+available until those slices land.
 
 ### Locality routing (`requires`)
 

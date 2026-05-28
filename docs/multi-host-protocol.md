@@ -21,10 +21,11 @@ the controller, `shipyard leave` removes local client config, and `shipyard
 status` / `shipyard queue` / `shipyard logs` / `shipyard evidence` route to
 the controller when client config is enabled. `shipyard node list` also reads
 the controller registry when joined, and `shipyard watch --no-follow` reads a
-controller-owned ship-state snapshot. `shipyard node remove <this-machine-id>`
-routes a self-revocation to the controller; revoking another node still requires
-running `node remove` on the controller. Use `--local-state` to inspect this
-machine's local state instead.
+controller-owned ship-state snapshot. `shipyard targets pool status` reads the
+controller's host-pool leases and capacity, and `shipyard node remove
+<this-machine-id>` routes a self-revocation to the controller; revoking another
+node still requires running `node remove` on the controller. Use `--local-state`
+to inspect this machine's local state instead.
 
 HTTP controller serving, remote enqueue/ship, streaming `watch --follow`,
 periodic heartbeats, and GUI consumption are still follow-on slices. Until
@@ -246,6 +247,7 @@ shipyard queue
 shipyard logs <id>
 shipyard evidence
 shipyard node list
+shipyard targets pool status
 shipyard node remove <this-machine-id>
 shipyard leave
 ```

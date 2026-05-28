@@ -363,7 +363,7 @@ fn targets_pool<W: Write>(
     }
 }
 
-fn targets_pool_status<W: Write>(
+pub(super) fn targets_pool_status<W: Write>(
     config: &LoadedConfig,
     state_dir: &Path,
     json_mode: bool,

@@ -56,7 +56,8 @@ use self::config_cmd::config_command;
 use self::controller_cmd::{
     configured_client_enabled, controller_command, leave_command, node_command,
     remote_evidence_command, remote_logs_command, remote_node_list_command,
-    remote_node_remove_command, remote_queue_command, remote_status_command, remote_watch_command,
+    remote_node_remove_command, remote_queue_command, remote_status_command,
+    remote_targets_pool_status_command, remote_watch_command,
 };
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
@@ -248,8 +249,9 @@ fn dispatch<W: Write, E: Write>(
                 command,
                 cli.mode.into(),
                 &cwd,
-                &runtime_paths.state_dir,
+                &runtime_paths,
                 cli.json,
+                cli.local_state,
                 stdout,
             );
         }
@@ -504,11 +506,45 @@ fn handle_targets_command<W: Write>(
     command: Option<TargetsCommand>,
     mode: RuntimeMode,
     cwd: &Path,
-    state_dir: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
+    local_state: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    targets_command(command, mode, cwd, state_dir, json, stdout)
+    if !local_state {
+        let config = LoadedConfig::load_from_cwd_with_global_dir(
+            mode,
+            cwd,
+            Some(runtime_paths.global_dir.clone()),
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if configured_client_enabled(&config) {
+            match &command {
+                Some(TargetsCommand::Pool {
+                    command: None | Some(self::cli::TargetsPoolCommand::Status),
+                }) => {
+                    let machine_id =
+                        crate::machine_identity::get_or_create_machine_id(&runtime_paths.state_dir)
+                            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+                    return remote_targets_pool_status_command(&config, &machine_id, json, stdout);
+                }
+                Some(TargetsCommand::Pool { command: Some(_) }) => {
+                    return Err(CliFailure::new(
+                        1,
+                        "controller client config is enabled, but targets pool cleanup is not routed to the controller yet; use --local-state to operate on this machine's local pool state explicitly",
+                    ));
+                }
+                Some(TargetsCommand::Warm { .. }) => {
+                    return Err(CliFailure::new(
+                        1,
+                        "controller client config is enabled, but warm-pool commands are not routed to the controller yet; use --local-state to operate on this machine's local warm-pool state explicitly",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    targets_command(command, mode, cwd, &runtime_paths.state_dir, json, stdout)
 }
 
 fn handle_state_command<W: Write>(
@@ -2477,6 +2513,49 @@ mod tests {
         assert_eq!(value["name"], "mac");
         assert_eq!(value["reachable"], true);
         assert_eq!(value["active_backend"], "local");
+    }
+
+    #[test]
+    fn targets_pool_status_routes_to_controller_when_client_configured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "https://mac-studio.example.ts.net:8765"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "targets",
+            "pool",
+            "status",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("implemented SSH transport"));
+        assert!(message.contains("--local-state for local targets pool status"));
     }
 
     #[test]

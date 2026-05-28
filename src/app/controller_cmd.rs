@@ -15,6 +15,7 @@ use super::{
     CliFailure,
     cli::{ControllerCommand, NodeCommand},
     queue_cmd::{evidence_command, logs_command, queue_command, status_command},
+    targets_cmd::targets_pool_status,
 };
 use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::evidence::EvidenceStore;
@@ -88,6 +89,7 @@ pub(super) fn controller_command<W: Write>(
         | ControllerCommand::RpcEvidence { .. }
         | ControllerCommand::RpcNodeList { .. }
         | ControllerCommand::RpcNodeRemove { .. }
+        | ControllerCommand::RpcTargetsPoolStatus { .. }
         | ControllerCommand::RpcWatch { .. }) => {
             controller_rpc_command(rpc, mode, cwd, state_dir, json_mode, stdout)?;
         }
@@ -151,6 +153,18 @@ fn controller_rpc_command<W: Write>(
             state_dir,
             &machine_id,
             &target_machine_id,
+            token_stdin,
+            json_mode,
+            stdout,
+        ),
+        ControllerCommand::RpcTargetsPoolStatus {
+            machine_id,
+            token_stdin,
+        } => controller_rpc_targets_pool_status(
+            mode,
+            cwd,
+            state_dir,
+            &machine_id,
             token_stdin,
             json_mode,
             stdout,
@@ -587,6 +601,22 @@ fn controller_rpc_node_remove_with_token<W: Write>(
         ));
     }
     node_remove(state_dir, target_machine_id, json_mode, stdout)?;
+    Ok(())
+}
+
+fn controller_rpc_targets_pool_status<W: Write>(
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    machine_id: &str,
+    token_stdin: bool,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node(state_dir, machine_id, token_stdin)?;
+    let config = LoadedConfig::load_from_cwd(mode, cwd)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    targets_pool_status(&config, state_dir, json_mode, stdout)?;
     Ok(())
 }
 
@@ -1121,6 +1151,22 @@ pub(super) fn remote_node_remove_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+pub(super) fn remote_targets_pool_status_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    remote_controller_command(
+        config,
+        machine_id,
+        "rpc-targets-pool-status",
+        json_mode,
+        "targets pool status",
+        stdout,
+    )
+}
+
 pub(super) fn remote_watch_command<W: Write>(
     config: &LoadedConfig,
     machine_id: &str,
@@ -1585,6 +1631,18 @@ mod tests {
         assert!(command.contains("--machine-id sy_node_client"));
         assert!(command.contains("--token-stdin"));
         assert!(command.contains("sy_node_client"));
+        assert!(command.ends_with("--json"));
+        assert!(!command.contains("synode_secret"));
+    }
+
+    #[test]
+    fn remote_controller_shell_command_targets_authenticated_targets_pool_status_rpc() {
+        let command =
+            remote_controller_shell_command("rpc-targets-pool-status", "sy_node_client", true);
+
+        assert!(command.contains("shipyard --local-state controller rpc-targets-pool-status"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.contains("--token-stdin"));
         assert!(command.ends_with("--json"));
         assert!(!command.contains("synode_secret"));
     }

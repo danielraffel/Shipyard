@@ -136,9 +136,10 @@ The implemented SSH-backed first slice is available with `shipyard controller
 init`, `shipyard controller invite`, `shipyard controller join --controller
 ssh://... --token ...`, `shipyard controller status`, `shipyard status`,
 `shipyard queue`, `shipyard logs`, `shipyard evidence`, `shipyard node list`,
-`shipyard watch --no-follow`, `shipyard node remove <this-machine-id>`, and
-`shipyard leave`. After join, those state commands ask the controller for
-shared state; use `--local-state` for the laptop-local status, queue, logs,
-evidence, watch, and node registry. Remote enqueue/ship, streaming
-`watch --follow`, revoking another node from a client, and HTTPS controller RPC
-are still planned.
+`shipyard watch --no-follow`, `shipyard targets pool status`, `shipyard node
+remove <this-machine-id>`, and `shipyard leave`. After join, those state
+commands ask the controller for shared state; use `--local-state` for the
+laptop-local status, queue, logs, evidence, watch, node registry, and host-pool
+status. Remote enqueue/ship, streaming `watch --follow`, mutating host-pool
+cleanup, revoking another node from a client, and HTTPS controller RPC are still
+planned.

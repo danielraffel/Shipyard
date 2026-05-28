@@ -612,6 +612,16 @@ pub(super) enum ControllerCommand {
         #[arg(long = "token-stdin", hide = true)]
         token_stdin: bool,
     },
+    /// Return controller-owned host-pool status after bearer-token verification.
+    #[command(name = "rpc-targets-pool-status", hide = true)]
+    RpcTargetsPoolStatus {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+        /// Read bearer token from stdin instead of `SHIPYARD_NODE_TOKEN`.
+        #[arg(long = "token-stdin", hide = true)]
+        token_stdin: bool,
+    },
     /// Return a controller-owned watch snapshot after bearer-token verification.
     #[command(name = "rpc-watch", hide = true)]
     RpcWatch {
