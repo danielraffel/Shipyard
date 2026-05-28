@@ -627,7 +627,9 @@ node remove <this-machine-id>` for the implemented SSH-backed first slice. This
 proves secure pairing plus controller-backed state inspection, watch snapshots,
 host-pool visibility, registry visibility, self-revocation, and public
 controller-backed `shipyard run`/`shipyard ship --pr <n>` enqueue through the
-authenticated/idempotent `rpc-enqueue` persistence boundary. Do not claim
+authenticated/idempotent `rpc-enqueue` persistence boundary. Run `shipyard
+controller work` on the controller to drain queued work continuously, or
+`shipyard controller work --once` for a single validation pass. Do not claim
 streaming `watch --follow`, mutating host-pool cleanup, revoking another node
 from a client, or HTTPS controller RPC is available until those slices land.
 

@@ -128,6 +128,9 @@ and controller-backed self-revocation with `shipyard node remove
 intentionally want the laptop's own local state.
 Joined laptops can enqueue `shipyard run` and `shipyard ship --pr <n>` work to
 the controller through the authenticated/idempotent `rpc-enqueue` boundary.
+Run `shipyard controller work` on the Mac Studio to keep draining that
+controller-owned queue, or `shipyard controller work --once` when validating the
+setup without leaving a worker process running.
 
 ## Explicit Cloud Overflow
 

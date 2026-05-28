@@ -29,17 +29,20 @@ to inspect this machine's local state instead.
 
 The controller `rpc-enqueue` endpoint accepts an authenticated, idempotent
 queued execution envelope and persists it to the controller queue. Public
-laptop `shipyard run` and `shipyard ship` now use that boundary to enqueue
-controller-owned work. In the current first slice, controller-backed
+laptop `shipyard run` and `shipyard ship --pr <n>` now use that boundary to
+enqueue controller-owned work. `shipyard controller work` runs on the controller
+machine and drains queued work continuously; `shipyard controller work --once`
+runs one drain pass for validation and scripts. In the current first slice,
+controller-backed
 `shipyard ship` requires an existing `--pr` so client laptops do not create
 PRs, push branches, or auto-create protected base branches before controller
 handoff.
 
 HTTP controller serving, streaming `watch --follow`, periodic heartbeats, and
 GUI consumption are still follow-on slices. Until those land, SSH-backed state
-inspection, self-revocation, and the low-level enqueue boundary prove the
-trust/config/routing model and make laptop `shipyard run`/`shipyard ship`
-enqueue to a Mac Studio controller.
+inspection, self-revocation, controller enqueue, and controller-local queue
+draining prove the trust/config/routing model and make laptop `shipyard
+run`/`shipyard ship --pr <n>` enqueue to a Mac Studio controller.
 When client config is enabled, stateful local commands that are not yet routed
 to the controller fail closed unless `--local-state` is supplied, so a laptop
 does not silently mutate a separate local queue by accident.
@@ -251,6 +254,8 @@ shipyard controller init --endpoint lan-https=https://192.168.86.20:8765#sha256=
 shipyard controller invite --name m5
 shipyard controller join --controller ssh://mac-studio --token ...
 shipyard controller status
+shipyard controller work --once
+shipyard controller work
 shipyard queue
 shipyard logs <id>
 shipyard evidence

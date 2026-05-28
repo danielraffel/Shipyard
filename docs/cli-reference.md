@@ -137,11 +137,13 @@ init`, `shipyard controller invite`, `shipyard controller join --controller
 ssh://... --token ...`, `shipyard controller status`, `shipyard status`,
 `shipyard queue`, `shipyard logs`, `shipyard evidence`, `shipyard node list`,
 `shipyard watch --no-follow`, `shipyard targets pool status`, `shipyard node
-remove <this-machine-id>`, and `shipyard leave`. After join, those state
-commands ask the controller for shared state; use `--local-state` for the
-laptop-local status, queue, logs, evidence, watch, node registry, and host-pool
-status. `shipyard run` and `shipyard ship --pr <n>` on a joined client now use
-the authenticated `rpc-enqueue` boundary to persist an idempotent queued
-execution envelope on the controller. Streaming `watch --follow`, mutating
-host-pool cleanup, revoking another node from a client, and HTTPS controller
-RPC are still planned.
+remove <this-machine-id>`, `shipyard controller work --once`, and `shipyard
+leave`. After join, those state commands ask the controller for shared state;
+use `--local-state` for the laptop-local status, queue, logs, evidence, watch,
+node registry, and host-pool status. `shipyard run` and `shipyard ship --pr
+<n>` on a joined client now use the authenticated `rpc-enqueue` boundary to
+persist an idempotent queued execution envelope on the controller; run
+`shipyard controller work` on the controller machine to drain queued work
+continuously, or `shipyard controller work --once` for a single validation pass.
+Streaming `watch --follow`, mutating host-pool cleanup, revoking another node
+from a client, and HTTPS controller RPC are still planned.

@@ -134,6 +134,23 @@ pub struct RunStores<'a> {
     pub state_dir: &'a Path,
 }
 
+/// Summary from one controller queue drain pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrainOnceOutcome {
+    /// Whether this process acquired drain ownership.
+    pub acquired: bool,
+    /// Number of stale running jobs recovered before dispatch.
+    pub recovered: usize,
+    /// Pending jobs before the pass.
+    pub pending_before: usize,
+    /// Running jobs before the pass.
+    pub running_before: usize,
+    /// Pending jobs after the pass.
+    pub pending_after: usize,
+    /// Running jobs after the pass.
+    pub running_after: usize,
+}
+
 /// Outcome of one ship execution pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShipExecutionOutcome {
@@ -701,6 +718,56 @@ pub fn drain_or_wait_run<D: ShipTargetDispatcher + Sync>(
     )
 }
 
+/// Run one controller-owned queue drain pass without waiting on a specific job.
+pub fn drain_queued_once<D: ShipTargetDispatcher + Sync>(
+    stores: ShipStores<'_>,
+    dispatcher: &D,
+) -> Result<DrainOnceOutcome, ShipExecutionError> {
+    let ShipStores {
+        queue,
+        evidence,
+        ship_state,
+        warm_pool,
+        cwd,
+        state_dir,
+    } = stores;
+    let (pending_before, running_before) = queue_counts(queue)?;
+    let Some(drain_lock) = queue.acquire_drain_lock()? else {
+        let (pending_after, running_after) = queue_counts(queue)?;
+        return Ok(DrainOnceOutcome {
+            acquired: false,
+            recovered: 0,
+            pending_before,
+            running_before,
+            pending_after,
+            running_after,
+        });
+    };
+    let recovered = run_owned_drain_pass(
+        queue,
+        &drain_lock,
+        evidence,
+        ship_state,
+        warm_pool,
+        cwd,
+        state_dir,
+        dispatcher,
+    )?;
+    let (pending_after, running_after) = queue_counts(queue)?;
+    Ok(DrainOnceOutcome {
+        acquired: true,
+        recovered,
+        pending_before,
+        running_before,
+        pending_after,
+        running_after,
+    })
+}
+
+fn queue_counts(queue: &mut Queue) -> Result<(usize, usize), ShipExecutionError> {
+    Ok((queue.pending_count()?, queue.running_count()?))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn drain_or_wait_run_with_options<D: ShipTargetDispatcher + Sync>(
     _request: &RunExecutionRequest,
@@ -742,6 +809,25 @@ fn drain_or_wait_run_with_options<D: ShipTargetDispatcher + Sync>(
         }
         wait_or_timeout(&job.id, &mut wait_iterations, options)?;
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_owned_drain_pass<D: ShipTargetDispatcher + Sync>(
+    queue: &mut Queue,
+    drain_lock: &crate::queue::DrainLock,
+    evidence: &EvidenceStore,
+    ship_state: &ShipStateStore,
+    warm_pool: &WarmPool,
+    cwd: &Path,
+    state_dir: &Path,
+    dispatcher: &D,
+) -> Result<usize, ShipExecutionError> {
+    let recovered = queue.recover_stale_running_jobs_for_drain(drain_lock)?;
+    persist_recovered_outcomes(&recovered, state_dir, ship_state)?;
+    run_drain_worker_cycle(
+        queue, drain_lock, evidence, ship_state, warm_pool, cwd, state_dir, dispatcher,
+    )?;
+    Ok(recovered.len())
 }
 
 /// Execute a previously submitted `shipyard run` job.
@@ -1793,9 +1879,10 @@ mod tests {
     use super::{
         CooperativeDrainOptions, RunExecutionRequest, RunStores, ShipExecutionError,
         ShipExecutionRequest, ShipStores, ShipTargetDispatcher, WarmPoolUpdate, apply_warm_reuse,
-        cap_admit_pass_workers, drain_or_wait_run, drain_or_wait_run_with_options, execute_run,
-        execute_run_worker, execute_ship, execute_ship_worker, execute_targets_with_options,
-        load_run_outcome, load_ship_outcome, submit_run, submit_ship, update_warm_pool_after_run,
+        cap_admit_pass_workers, drain_or_wait_run, drain_or_wait_run_with_options,
+        drain_queued_once, execute_run, execute_run_worker, execute_ship, execute_ship_worker,
+        execute_targets_with_options, load_run_outcome, load_ship_outcome, submit_run, submit_ship,
+        update_warm_pool_after_run,
     };
     use crate::evidence::EvidenceStore;
     use crate::executor::dispatch::{
@@ -2328,6 +2415,104 @@ mod tests {
                 .expect("load outcome"),
             Some(QueuedExecutionOutcome::run(outcome.job.id))
         );
+    }
+
+    #[test]
+    fn drain_queued_once_executes_pending_run_when_it_owns_drain() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship state");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![target],
+        };
+        let job = submit_run(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+
+        let outcome = drain_queued_once(
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: &state_dir,
+            },
+            &dispatcher,
+        )
+        .expect("drain once");
+
+        assert!(outcome.acquired);
+        assert_eq!(outcome.pending_before, 1);
+        assert_eq!(outcome.running_before, 0);
+        assert_eq!(outcome.pending_after, 0);
+        assert_eq!(outcome.running_after, 0);
+        assert_eq!(dispatcher.seen_count(), 1);
+        assert!(queue.get(&job.id).expect("queue").expect("job").passed());
+        assert_eq!(
+            QueueOutcomeStore::new(&state_dir)
+                .expect("outcome store")
+                .load(&job.id)
+                .expect("load outcome"),
+            Some(QueuedExecutionOutcome::run(job.id))
+        );
+    }
+
+    #[test]
+    fn drain_queued_once_reports_active_drain_owner_without_dispatching() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship state");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![target],
+        };
+        submit_run(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let _held_drain = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+
+        let outcome = drain_queued_once(
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: &state_dir,
+            },
+            &dispatcher,
+        )
+        .expect("drain once");
+
+        assert!(!outcome.acquired);
+        assert_eq!(outcome.pending_before, 1);
+        assert_eq!(outcome.running_before, 0);
+        assert_eq!(outcome.pending_after, 1);
+        assert_eq!(outcome.running_after, 0);
+        assert_eq!(dispatcher.seen_count(), 0);
     }
 
     #[test]

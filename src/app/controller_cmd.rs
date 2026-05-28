@@ -21,6 +21,7 @@ use super::{
 };
 use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::evidence::EvidenceStore;
+use crate::executor::dispatch::ExecutorDispatcher;
 use crate::executor::ssh::shlex_quote;
 use crate::identity::{ProductIdentity, RuntimeMode};
 use crate::job::{Job, JobKind};
@@ -29,11 +30,14 @@ use crate::node_registry::{
     NodeEndpoint, NodeEndpointKind, NodeJoin, NodeRecord, NodeRegistryStore, NodeRole,
 };
 use crate::output::write_json_envelope;
+use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
 use crate::queue_request::{
     QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest,
 };
+use crate::ship::{ShipStores, drain_queued_once};
 use crate::ship_state::ShipStateStore;
+use crate::warm_pool::{WarmPool, default_pool_path};
 use wait_timeout::ChildExt;
 
 const CONTROLLER_SSH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -55,6 +59,9 @@ pub(super) fn controller_command<W: Write>(
         }
         ControllerCommand::Invite { name, ttl_minutes } => {
             controller_invite(state_dir, &name, ttl_minutes, json_mode, stdout)?;
+        }
+        ControllerCommand::Work { once, interval } => {
+            controller_work(mode, cwd, state_dir, once, interval, json_mode, stdout)?;
         }
         ControllerCommand::Join {
             name,
@@ -198,6 +205,7 @@ fn controller_rpc_command<W: Write>(
         ControllerCommand::Status
         | ControllerCommand::Init { .. }
         | ControllerCommand::Invite { .. }
+        | ControllerCommand::Work { .. }
         | ControllerCommand::Join { .. }
         | ControllerCommand::AcceptJoin { .. } => {
             unreachable!("non-RPC controller command passed to RPC helper")
@@ -483,6 +491,127 @@ fn controller_join<W: Write>(
     writeln!(stdout, "Config: {}", config_path.display())
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     Ok(())
+}
+
+fn controller_work<W: Write>(
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
+    once: bool,
+    interval: f64,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    require_controller_enabled(mode, cwd)?;
+    if !interval.is_finite() || interval < 0.25 {
+        return Err(CliFailure::new(
+            2,
+            "--interval must be a finite number of seconds >= 0.25",
+        ));
+    }
+    let sleep_interval = Duration::from_secs_f64(interval);
+    let mut queue = Queue::new(state_dir.to_path_buf())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let evidence = EvidenceStore::new(state_dir.join("evidence"))
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let ship_state = ShipStateStore::new(state_dir.join("ship"))
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let prepared = PreparedStateStore::new(state_dir.join("prepared"))
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let warm_pool = WarmPool::new(default_pool_path(state_dir));
+    let dispatcher = ExecutorDispatcher::new_with_state_dir(Some(prepared), state_dir);
+    loop {
+        let outcome = drain_queued_once(
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd,
+                state_dir,
+            },
+            &dispatcher,
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+
+        let should_render = once
+            || !outcome.acquired
+            || outcome.recovered > 0
+            || outcome.pending_before > 0
+            || outcome.running_before > 0
+            || outcome.pending_after > 0
+            || outcome.running_after > 0;
+        if json_mode && should_render {
+            let mut data = BTreeMap::new();
+            data.insert("once".to_owned(), Value::Bool(once));
+            data.insert("acquired".to_owned(), Value::Bool(outcome.acquired));
+            data.insert("recovered".to_owned(), json_u64(outcome.recovered));
+            data.insert(
+                "pending_before".to_owned(),
+                json_u64(outcome.pending_before),
+            );
+            data.insert(
+                "running_before".to_owned(),
+                json_u64(outcome.running_before),
+            );
+            data.insert("pending_after".to_owned(), json_u64(outcome.pending_after));
+            data.insert("running_after".to_owned(), json_u64(outcome.running_after));
+            write_json_envelope(stdout, "controller.work", data)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        } else if should_render && outcome.acquired {
+            writeln!(
+                stdout,
+                "controller work: pending {}->{}, running {}->{}, recovered {}",
+                outcome.pending_before,
+                outcome.pending_after,
+                outcome.running_before,
+                outcome.running_after,
+                outcome.recovered
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        } else if should_render {
+            writeln!(
+                stdout,
+                "controller work: another drain owner is active; pending {}, running {}",
+                outcome.pending_after, outcome.running_after
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+
+        if once {
+            return Ok(());
+        }
+        stdout
+            .flush()
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        thread::sleep(sleep_interval);
+    }
+}
+
+fn require_controller_enabled(mode: RuntimeMode, cwd: &Path) -> Result<(), CliFailure> {
+    let config = LoadedConfig::load_from_cwd(mode, cwd)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let enabled = config
+        .data
+        .get("multi_host")
+        .and_then(TomlValue::as_table)
+        .and_then(|multi| multi.get("controller"))
+        .and_then(TomlValue::as_table)
+        .and_then(|controller| controller.get("enabled"))
+        .and_then(TomlValue::as_bool)
+        == Some(true);
+    if enabled {
+        Ok(())
+    } else {
+        Err(CliFailure::new(
+            2,
+            "controller work requires this install to be initialized with `shipyard controller init`",
+        ))
+    }
+}
+
+fn json_u64(value: usize) -> Value {
+    Value::Number(serde_json::Number::from(value as u64))
 }
 
 fn controller_accept_join<W: Write>(
@@ -2008,5 +2137,77 @@ mod tests {
         assert!(command.contains("--pr 319"));
         assert!(command.contains("--branch 'feature/test branch'"));
         assert!(!command.contains("synode_secret"));
+    }
+
+    #[test]
+    fn controller_work_once_reports_empty_queue_json() {
+        let temp = TempDir::new().expect("tempdir");
+        write_controller_local_config(RuntimeMode::Shipyard, temp.path(), "mac-studio")
+            .expect("controller config");
+        let mut stdout = Vec::new();
+
+        controller_work(
+            RuntimeMode::Shipyard,
+            temp.path(),
+            temp.path(),
+            true,
+            5.0,
+            true,
+            &mut stdout,
+        )
+        .expect("controller work");
+
+        let payload: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(payload["command"], "controller.work");
+        assert_eq!(payload["once"], true);
+        assert_eq!(payload["acquired"], true);
+        assert_eq!(payload["pending_before"], 0);
+        assert_eq!(payload["running_before"], 0);
+        assert_eq!(payload["pending_after"], 0);
+        assert_eq!(payload["running_after"], 0);
+    }
+
+    #[test]
+    fn controller_work_rejects_non_positive_interval() {
+        let temp = TempDir::new().expect("tempdir");
+        write_controller_local_config(RuntimeMode::Shipyard, temp.path(), "mac-studio")
+            .expect("controller config");
+        let mut stdout = Vec::new();
+
+        let error = controller_work(
+            RuntimeMode::Shipyard,
+            temp.path(),
+            temp.path(),
+            true,
+            0.0,
+            false,
+            &mut stdout,
+        )
+        .expect_err("interval");
+
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("--interval"));
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn controller_work_requires_controller_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut stdout = Vec::new();
+
+        let error = controller_work(
+            RuntimeMode::Shipyard,
+            temp.path(),
+            temp.path(),
+            true,
+            5.0,
+            false,
+            &mut stdout,
+        )
+        .expect_err("controller config");
+
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("controller init"));
+        assert!(stdout.is_empty());
     }
 }

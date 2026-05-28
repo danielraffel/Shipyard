@@ -512,6 +512,15 @@ pub(super) enum ControllerCommand {
         #[arg(long = "ttl-minutes", default_value_t = 15)]
         ttl_minutes: i64,
     },
+    /// Drain controller-owned queued work on this machine.
+    Work {
+        /// Run a single drain pass and exit.
+        #[arg(long)]
+        once: bool,
+        /// Seconds to sleep between drain passes when running continuously.
+        #[arg(long, default_value_t = 5.0)]
+        interval: f64,
+    },
     /// Pair this machine with a controller using a one-time invite token.
     Join {
         /// Local node display name. Defaults to the local hostname.
