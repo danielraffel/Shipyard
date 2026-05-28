@@ -11,7 +11,7 @@ use toml::{Table, Value as TomlValue};
 use super::{
     CliFailure,
     cli::{ControllerCommand, NodeCommand},
-    queue_cmd::status_command,
+    queue_cmd::{queue_command, status_command},
 };
 use crate::config::{LoadedConfig, LocalOverlaySource};
 use crate::executor::ssh::shlex_quote;
@@ -74,6 +74,9 @@ pub(super) fn controller_command<W: Write>(
         }
         ControllerCommand::RpcStatus { machine_id } => {
             controller_rpc_status(mode, cwd, state_dir, &machine_id, json_mode, stdout)?;
+        }
+        ControllerCommand::RpcQueue { machine_id } => {
+            controller_rpc_queue(state_dir, &machine_id, json_mode, stdout)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -394,12 +397,28 @@ fn controller_rpc_status<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
+    authenticate_rpc_node(state_dir, machine_id)?;
+    status_command(mode, cwd, state_dir, json_mode, stdout)?;
+    Ok(())
+}
+
+fn controller_rpc_queue<W: Write>(
+    state_dir: &Path,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    authenticate_rpc_node(state_dir, machine_id)?;
+    queue_command(state_dir, json_mode, stdout)?;
+    Ok(())
+}
+
+fn authenticate_rpc_node(state_dir: &Path, machine_id: &str) -> Result<(), CliFailure> {
     let token = std::env::var("SHIPYARD_NODE_TOKEN")
         .map_err(|_| CliFailure::new(1, "missing SHIPYARD_NODE_TOKEN for controller RPC"))?;
     NodeRegistryStore::new(state_dir)
         .authenticate_node(machine_id, &token)
         .map_err(|error| CliFailure::new(1, format!("auth denied: {error}")))?;
-    status_command(mode, cwd, state_dir, json_mode, stdout)?;
     Ok(())
 }
 
@@ -693,19 +712,47 @@ pub(super) fn remote_status_command<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    remote_controller_command(
+        config,
+        machine_id,
+        "rpc-status",
+        json_mode,
+        "status",
+        stdout,
+    )
+}
+
+pub(super) fn remote_queue_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    remote_controller_command(config, machine_id, "rpc-queue", json_mode, "queue", stdout)
+}
+
+fn remote_controller_command<W: Write>(
+    config: &LoadedConfig,
+    machine_id: &str,
+    rpc_command: &str,
+    json_mode: bool,
+    local_command_hint: &str,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    // This SSH command transport is intentionally limited to read-only,
+    // no-payload RPCs. Mutating controller RPCs need an idempotent request
+    // envelope before they can safely reuse this boundary.
     let client = configured_client(config)?;
     let Some(endpoint) = client.controller.strip_prefix("ssh://") else {
         return Err(CliFailure::new(
             1,
-            "configured controller is not reachable through the implemented SSH transport; use --local-state for local status",
+            format!(
+                "configured controller is not reachable through the implemented SSH transport; use --local-state for local {local_command_hint}"
+            ),
         ));
     };
-    let remote = format!(
-        "SHIPYARD_NODE_TOKEN={} shipyard --local-state controller rpc-status --machine-id {} {}",
-        shlex_quote(&client.node_token),
-        shlex_quote(machine_id),
-        if json_mode { "--json" } else { "" }
-    );
+    let remote =
+        remote_controller_shell_command(&client.node_token, rpc_command, machine_id, json_mode);
     let output = Command::new("ssh")
         .arg(endpoint)
         .arg(remote)
@@ -724,6 +771,21 @@ pub(super) fn remote_status_command<W: Write>(
         .write_all(&output.stdout)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn remote_controller_shell_command(
+    node_token: &str,
+    rpc_command: &str,
+    machine_id: &str,
+    json_mode: bool,
+) -> String {
+    format!(
+        "SHIPYARD_NODE_TOKEN={} shipyard --local-state controller {} --machine-id {} {}",
+        shlex_quote(node_token),
+        shlex_quote(rpc_command),
+        shlex_quote(machine_id),
+        if json_mode { "--json" } else { "" }
+    )
 }
 
 struct ConfiguredClient {
@@ -841,5 +903,16 @@ mod tests {
                 .token_hash
                 .is_some()
         );
+    }
+
+    #[test]
+    fn remote_controller_shell_command_targets_authenticated_queue_rpc() {
+        let command =
+            remote_controller_shell_command("synode_secret", "rpc-queue", "sy_node_client", true);
+
+        assert!(command.contains("SHIPYARD_NODE_TOKEN=synode_secret"));
+        assert!(command.contains("shipyard --local-state controller rpc-queue"));
+        assert!(command.contains("--machine-id sy_node_client"));
+        assert!(command.ends_with("--json"));
     }
 }

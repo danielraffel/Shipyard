@@ -547,6 +547,13 @@ pub(super) enum ControllerCommand {
         #[arg(long = "machine-id")]
         machine_id: String,
     },
+    /// Return controller-owned queue details after bearer-token verification.
+    #[command(name = "rpc-queue", hide = true)]
+    RpcQueue {
+        /// Registered client machine id.
+        #[arg(long = "machine-id")]
+        machine_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

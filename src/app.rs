@@ -55,7 +55,7 @@ use self::cloud_cmd::cloud_command;
 use self::config_cmd::config_command;
 use self::controller_cmd::{
     configured_client_enabled, controller_command, leave_command, node_command,
-    remote_status_command,
+    remote_queue_command, remote_status_command,
 };
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
@@ -426,13 +426,17 @@ fn handle_state_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return remote_status_command(&config, &machine_id, json, stdout);
     }
+    if !local_state && matches!(command, Command::Queue) && configured_client_enabled(&config) {
+        let machine_id = crate::machine_identity::get_or_create_machine_id(state_dir)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return remote_queue_command(&config, &machine_id, json, stdout);
+    }
     if !local_state
         && matches!(
             command,
             Command::Logs { .. }
                 | Command::Cancel { .. }
                 | Command::Bump { .. }
-                | Command::Queue
                 | Command::Cleanup { .. }
         )
         && configured_client_enabled(&config)
@@ -1013,7 +1017,8 @@ mod tests {
             global_dir.to_str().expect("global"),
             "--cwd",
             temp.path().to_str().expect("temp path"),
-            "queue",
+            "logs",
+            "sy-job",
         ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1066,6 +1071,47 @@ mod tests {
         assert!(stderr.is_empty());
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "queue");
+    }
+
+    #[test]
+    fn queue_routes_to_controller_when_client_configured() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local = temp.path().join(".shipyard-dev.local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("config.toml"),
+            r#"
+            [multi_host.client]
+            enabled = true
+            controller = "https://mac-studio.example.ts.net:8765"
+            node_token = "synode_secret"
+            "#,
+        )
+        .expect("config");
+        let state_dir = temp.path().join("state");
+        let global_dir = temp.path().join("global");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "--global-dir",
+            global_dir.to_str().expect("global"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "queue",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stdout.is_empty());
+        let message = String::from_utf8(stderr).expect("stderr");
+        assert!(message.contains("implemented SSH transport"));
+        assert!(message.contains("--local-state for local queue"));
     }
 
     #[cfg(unix)]

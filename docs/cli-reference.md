@@ -33,8 +33,9 @@ shipyard ship --base develop   # target a different branch
 
 # Monitor
 shipyard status                # controller-backed when joined; local otherwise
+shipyard queue                 # show all jobs; controller-backed when joined
 shipyard --local-state status  # force this machine's local state
-shipyard queue                 # show all jobs with priorities
+shipyard --local-state queue   # force this machine's local queue
 shipyard logs <id>             # per-target logs
 shipyard logs <id> --target windows
 shipyard evidence              # last-good SHA per platform
@@ -130,7 +131,8 @@ authenticated protocol. See `docs/multi-host-protocol.md`.
 
 The implemented SSH-backed first slice is available with `shipyard controller
 init`, `shipyard controller invite`, `shipyard controller join --controller
-ssh://... --token ...`, `shipyard controller status`, `shipyard status`, and
-`shipyard leave`. After join, `shipyard status` asks the controller for shared
-state; use `shipyard --local-state status` for the laptop-local queue. Remote
-enqueue/ship/watch and HTTPS controller RPC are still planned.
+ssh://... --token ...`, `shipyard controller status`, `shipyard status`,
+`shipyard queue`, and `shipyard leave`. After join, `shipyard status` and
+`shipyard queue` ask the controller for shared state; use `--local-state` for
+the laptop-local queue. Remote enqueue/ship/watch and HTTPS controller RPC are
+still planned.
