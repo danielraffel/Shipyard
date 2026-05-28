@@ -251,6 +251,10 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **Externals:** `gh pr merge` (branch protection, auth, network)
 - **Failure-handling split:**
   - `shipyard ship` treats merge-command failure as "green but not merged" and leaves the state file active for retry.
+    In `--json` mode this is surfaced explicitly as
+    `status="green_not_merged"` with `merged=false` and `merge_error` set
+    to the merge failure text, so agents do not mistake a green validation
+    result for a completed merge.
   - `shipyard auto-merge` returns `merge-failed` only when the PR is still unmerged. If `gh pr merge --delete-branch` exits nonzero after GitHub has already merged the PR (for example, local branch deletion failed because another worktree has it checked out), Shipyard archives state and exits 0 with a `cleanup_warning`.
 - **GraphQL/App-token fallback:** if `gh pr merge` fails because GraphQL is rate-limited or because the App installation token cannot access `mergePullRequest`, Shipyard falls through to `merge_pr_rest` with the same configured `GhClient`. This preserves App-token quota and avoids silently switching to ambient user auth. If GitHub rejects the REST merge endpoint too, the merge remains a normal T5 failure for retry or manual/user-auth merge.
 - **Archive failure remains a store error.** If `archive(pr)` itself fails after GitHub merge succeeds, the active state file remains and the command exits nonzero. A later retry can still recover if `gh pr merge` reports "already merged" or PR-state lookup confirms `MERGED`.

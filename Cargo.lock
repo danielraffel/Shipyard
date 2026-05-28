@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard"
-version = "0.60.1"
+version = "0.61.0"
 dependencies = [
  "base64",
  "chrono",
