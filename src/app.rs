@@ -2321,6 +2321,13 @@ mod tests {
                 &[("macos", "pass"), ("linux", "pass")],
             ))
             .expect("save");
+        // The auto-merge preflight (issue #321) verifies the live PR head
+        // matches the validated SHA before merging. `auto_merge_state` seeds
+        // `head_sha = "a"*40`; pin the live head to the same value so the
+        // happy-path merge proceeds.
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{}"}}"#, "a".repeat(40)))
+            .expect("write snapshot");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
@@ -2333,6 +2340,8 @@ mod tests {
             "--admin",
             "--merge-result",
             "success",
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
         ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2346,6 +2355,54 @@ mod tests {
         assert_eq!(value["pr"], 12);
         assert!(store.get(12).is_none());
         assert_eq!(store.list_archived().len(), 1);
+    }
+
+    #[test]
+    fn auto_merge_green_refuses_when_live_head_supersedes_validated_sha() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        // `auto_merge_state` seeds the validated `head_sha = "a"*40`.
+        store
+            .save(&auto_merge_state(
+                42,
+                &[("macos", "pass"), ("linux", "pass")],
+            ))
+            .expect("save");
+        // Live head advanced to a different SHA after validation.
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{}"}}"#, "b".repeat(40)))
+            .expect("write snapshot");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "auto-merge",
+            "42",
+            // Prove the merge WOULD have succeeded if the preflight let it
+            // through — the refusal must come from the SHA check, not a
+            // simulated merge failure.
+            "--merge-result",
+            "success",
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "auto-merge");
+        assert_eq!(value["event"], "superseded-sha");
+        assert_eq!(value["pr"], 42);
+        assert_eq!(value["validated"], "a".repeat(40));
+        assert_eq!(value["current"], "b".repeat(40));
+        // State must stay active (not archived) so the new head can be
+        // re-validated.
+        assert!(store.get(42).is_some());
+        assert_eq!(store.list_archived().len(), 0);
     }
 
     #[cfg(unix)]
@@ -2363,6 +2420,12 @@ mod tests {
         )
         .expect("merge script");
         make_executable(&merge);
+        // Satisfy the issue #321 preflight: pin the live head to the validated
+        // SHA ("a"*40 from `auto_merge_state`) so the custom merge command runs
+        // and exercises the already-merged archive escape hatch.
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{}"}}"#, "a".repeat(40)))
+            .expect("write snapshot");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
@@ -2372,6 +2435,8 @@ mod tests {
             "13",
             "--merge-command",
             merge.to_str().expect("merge script"),
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
         ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2404,8 +2469,16 @@ mod tests {
         store
             .save(&auto_merge_state(14, &[("macos", "pass")]))
             .expect("save");
+        // `state:OPEN` keeps the failure-path `pr_is_merged` escape hatch
+        // closed; `headRefOid` matching the validated SHA ("a"*40) lets the
+        // issue #321 preflight pass so the `--merge-result failure` path is
+        // the thing under test.
         let snapshot = temp.path().join("pr.json");
-        std::fs::write(&snapshot, r#"{"state":"OPEN"}"#).expect("write snapshot");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"state":"OPEN","headRefOid":"{}"}}"#, "a".repeat(40)),
+        )
+        .expect("write snapshot");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
