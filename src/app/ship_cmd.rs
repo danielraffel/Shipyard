@@ -947,8 +947,7 @@ mod tests {
         // so the happy-path merge proceeds.
         let head = git_capture(&["rev-parse", "HEAD"], &repo);
         let snapshot = temp.path().join("pr.json");
-        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{head}"}}"#))
-            .expect("write snapshot");
+        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{head}"}}"#)).expect("write snapshot");
         let mut stdout = Vec::new();
 
         let code = ship_command(

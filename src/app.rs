@@ -2326,8 +2326,11 @@ mod tests {
         // `head_sha = "a"*40`; pin the live head to the same value so the
         // happy-path merge proceeds.
         let snapshot = temp.path().join("pr.json");
-        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{}"}}"#, "a".repeat(40)))
-            .expect("write snapshot");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"headRefOid":"{}"}}"#, "a".repeat(40)),
+        )
+        .expect("write snapshot");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
@@ -2370,8 +2373,11 @@ mod tests {
             .expect("save");
         // Live head advanced to a different SHA after validation.
         let snapshot = temp.path().join("pr.json");
-        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{}"}}"#, "b".repeat(40)))
-            .expect("write snapshot");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"headRefOid":"{}"}}"#, "b".repeat(40)),
+        )
+        .expect("write snapshot");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
@@ -2424,8 +2430,11 @@ mod tests {
         // SHA ("a"*40 from `auto_merge_state`) so the custom merge command runs
         // and exercises the already-merged archive escape hatch.
         let snapshot = temp.path().join("pr.json");
-        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{}"}}"#, "a".repeat(40)))
-            .expect("write snapshot");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"headRefOid":"{}"}}"#, "a".repeat(40)),
+        )
+        .expect("write snapshot");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",

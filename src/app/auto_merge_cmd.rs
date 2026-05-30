@@ -454,7 +454,14 @@ fn merge_pr(
                 "shipyard: GraphQL PR merge is unavailable for this GitHub identity. Falling back to REST."
             );
         }
-        return merge_pr_rest(client, pr, cwd, expected_head_sha, merge_method, delete_branch);
+        return merge_pr_rest(
+            client,
+            pr,
+            cwd,
+            expected_head_sha,
+            merge_method,
+            delete_branch,
+        );
     }
     Err(message)
 }
