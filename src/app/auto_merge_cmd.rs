@@ -39,6 +39,14 @@ pub(super) enum AutoMergeOutcome {
     MergeFailed {
         error: String,
     },
+    /// The live PR head SHA advanced past the validated merge-candidate SHA
+    /// (someone pushed new commits to the branch after validation). Refuse
+    /// to merge the stale validated SHA; leave the ship state active so the
+    /// new head can be re-validated. See issue #321.
+    SupersededSha {
+        validated: String,
+        current: String,
+    },
     Merged {
         cleanup_warning: Option<String>,
     },
@@ -92,9 +100,34 @@ pub(super) fn execute_auto_merge(
             evidence: state.evidence_snapshot,
         }),
         Some(true) => {
+            // Preflight (issue #321): before merging, confirm the live PR head
+            // still points at the SHA we validated. If new commits landed on
+            // the branch after validation, the validated evidence is stale and
+            // merging would land unvalidated code. Refuse and leave the state
+            // active so the new head can be re-validated.
+            //
+            // Fail closed: if the live head cannot be verified, do NOT merge
+            // blind — report a merge failure instead.
+            match fetch_live_head_sha(request.pr, cwd, request.pr_snapshot_file.as_deref()) {
+                Some(live_head) => {
+                    if !shas_match(&live_head, &state.head_sha) {
+                        return Ok(AutoMergeOutcome::SupersededSha {
+                            validated: state.head_sha.clone(),
+                            current: live_head,
+                        });
+                    }
+                }
+                None => {
+                    return Ok(AutoMergeOutcome::MergeFailed {
+                        error: "failed to verify live PR head before merge".to_owned(),
+                    });
+                }
+            }
+
             if let Err(error) = merge_pr(
                 request.pr,
                 cwd,
+                &state.head_sha,
                 request.merge_method,
                 request.delete_branch,
                 request.admin,
@@ -146,9 +179,21 @@ pub(super) fn auto_merge<W: Write>(
         merge_command,
         merge_result,
     };
-    match execute_auto_merge(store, cwd, &request)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?
-    {
+    let outcome = execute_auto_merge(store, cwd, &request)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    render_auto_merge_outcome(outcome, pr, json, stdout)
+}
+
+/// Render an `AutoMergeOutcome` as a CLI event and map it to the
+/// command's process exit code. Split out of `auto_merge` to keep that
+/// function within the line budget.
+fn render_auto_merge_outcome<W: Write>(
+    outcome: AutoMergeOutcome,
+    pr: u64,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    match outcome {
         AutoMergeOutcome::AlreadyMerged => {
             render_event(
                 stdout,
@@ -172,14 +217,7 @@ pub(super) fn auto_merge<W: Write>(
                 stdout,
                 json,
                 "in-flight",
-                fields([
-                    ("pr", Value::from(pr)),
-                    (
-                        "evidence",
-                        serde_json::to_value(&evidence)
-                            .map_err(|error| CliFailure::new(1, error.to_string()))?,
-                    ),
-                ]),
+                fields([("pr", Value::from(pr)), ("evidence", to_value(&evidence)?)]),
             )?;
             Ok(ExitCode::from(3))
         }
@@ -193,16 +231,8 @@ pub(super) fn auto_merge<W: Write>(
                 "target-failed",
                 fields([
                     ("pr", Value::from(pr)),
-                    (
-                        "failing_targets",
-                        serde_json::to_value(&failing_targets)
-                            .map_err(|error| CliFailure::new(1, error.to_string()))?,
-                    ),
-                    (
-                        "evidence",
-                        serde_json::to_value(&evidence)
-                            .map_err(|error| CliFailure::new(1, error.to_string()))?,
-                    ),
+                    ("failing_targets", to_value(&failing_targets)?),
+                    ("evidence", to_value(&evidence)?),
                 ]),
             )?;
             Ok(ExitCode::from(1))
@@ -216,6 +246,19 @@ pub(super) fn auto_merge<W: Write>(
             )?;
             Ok(ExitCode::from(1))
         }
+        AutoMergeOutcome::SupersededSha { validated, current } => {
+            render_event(
+                stdout,
+                json,
+                "superseded-sha",
+                fields([
+                    ("pr", Value::from(pr)),
+                    ("validated", Value::from(validated)),
+                    ("current", Value::from(current)),
+                ]),
+            )?;
+            Ok(ExitCode::from(1))
+        }
         AutoMergeOutcome::Merged { cleanup_warning } => {
             let mut data = fields([("pr", Value::from(pr))]);
             if let Some(warning) = cleanup_warning {
@@ -225,6 +268,12 @@ pub(super) fn auto_merge<W: Write>(
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Serialize a value into a JSON `Value`, mapping serialization failures
+/// to a `CliFailure` so render arms stay compact.
+fn to_value<T: serde::Serialize>(value: &T) -> Result<Value, CliFailure> {
+    serde_json::to_value(value).map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 fn pr_is_merged(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> bool {
@@ -260,6 +309,64 @@ fn pr_is_merged(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> bool {
         .is_some_and(|state| state.eq_ignore_ascii_case("merged"))
 }
 
+/// Fetch the live PR head SHA for the merge preflight (issue #321).
+///
+/// Returns `Some(full_sha)` when the head can be verified, `None` when it
+/// cannot (so the caller can fail closed rather than merge a stale SHA).
+///
+/// Reuses the same `--pr-snapshot-file` injection seam as `pr_is_merged`,
+/// accepting either the GraphQL `gh pr view --json` shape (`headRefOid`)
+/// or the REST `gh api repos/:r/pulls/:n` shape (`head.sha`) so tests can
+/// inject either. With no snapshot file it fetches the PR over REST.
+fn fetch_live_head_sha(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> Option<String> {
+    let payload = if let Some(path) = snapshot_file {
+        std::fs::read_to_string(path).ok()?
+    } else {
+        let client = gh_client(cwd).ok()?;
+        let mut command = gh(&client, cwd).ok()?;
+        let output = command
+            .args(["api", &format!("repos/{{owner}}/{{repo}}/pulls/{pr}")])
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let value = serde_json::from_str::<Value>(&payload).ok()?;
+    head_sha_from_value(&value)
+}
+
+/// Extract a head SHA from either the GraphQL (`headRefOid`) or the REST
+/// (`head.sha`) PR payload shape.
+fn head_sha_from_value(value: &Value) -> Option<String> {
+    if let Some(sha) = value
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .filter(|sha| !sha.is_empty())
+    {
+        return Some(sha.to_owned());
+    }
+    value
+        .get("head")
+        .and_then(|head| head.get("sha"))
+        .and_then(Value::as_str)
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_owned)
+}
+
+/// Compare two head SHAs for full (not prefix) identity, case-insensitively
+/// and tolerant of surrounding whitespace. Both sides must be non-empty, so an
+/// empty or unreadable head never silently equals an empty validated SHA — the
+/// preflight fails closed instead. Equality is full (never a prefix test), so a
+/// short SHA can never satisfy a full one.
+fn shas_match(a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    !a.is_empty() && !b.is_empty() && a.eq_ignore_ascii_case(b)
+}
+
 fn gh_client(cwd: &Path) -> Result<GhClient, String> {
     GhClient::from_cwd(RuntimeMode::Shipyard, cwd)
         .map_err(|error| format!("github auth config failed: {error}"))
@@ -271,9 +378,11 @@ fn gh(client: &GhClient, cwd: &Path) -> Result<Command, String> {
         .map_err(|error| format!("gh command preparation failed: {error}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_pr(
     pr: u64,
     cwd: &Path,
+    expected_head_sha: &str,
     merge_method: MergeMethod,
     delete_branch: bool,
     admin: bool,
@@ -304,6 +413,12 @@ fn merge_pr(
     };
     if !custom_command {
         command.args(["pr", "merge", &pr.to_string()]);
+        // Defense in depth (issue #321): tell GitHub the exact head we
+        // validated so the SERVER rejects the merge if the head drifted
+        // between the preflight and this call. A custom `--merge-command`
+        // path can't get this guard — the preflight above is its only
+        // protection.
+        command.args(["--match-head-commit", expected_head_sha]);
     }
     command.arg(merge_method.gh_flag());
     if delete_branch {
@@ -343,7 +458,14 @@ fn merge_pr(
                 "shipyard: GraphQL PR merge is unavailable for this GitHub identity. Falling back to REST."
             );
         }
-        return merge_pr_rest(client, pr, cwd, merge_method, delete_branch);
+        return merge_pr_rest(
+            client,
+            pr,
+            cwd,
+            expected_head_sha,
+            merge_method,
+            delete_branch,
+        );
     }
     Err(message)
 }
@@ -365,17 +487,22 @@ fn is_graphql_merge_integration_blocked(message: &str) -> bool {
 /// directly through `gh api`, then optionally deletes the head branch the
 /// same way `gh pr merge --delete-branch` would.
 ///
-/// Race protection (issue #266): the original head SHA is fetched first
-/// and passed to the merge PUT as `sha=<oid>`, so GitHub rejects the
-/// merge server-side if the head changed between our snapshot and the
-/// PUT. On a "Base branch was modified" 405, we re-fetch the head once
-/// and retry exactly once if and only if the head SHA is unchanged
-/// (i.e., the modification was purely on the base branch — typical
-/// when a sibling PR lands during our merge attempt).
+/// Race protection (issue #266 + #321): the validated head SHA
+/// (`expected_head_sha`, the SHA Shipyard actually validated) is passed
+/// to the merge PUT as `sha=<oid>`, so GitHub rejects the merge
+/// server-side if the live head no longer matches what we validated.
+/// The auto-merge preflight (issue #321) already refused the merge if it
+/// detected drift, but this is defense in depth for the window between
+/// the preflight and the PUT. On a "Base branch was modified" 405, we
+/// re-fetch the head once and retry exactly once if and only if the live
+/// head SHA still equals the validated SHA (i.e., the modification was
+/// purely on the base branch — typical when a sibling PR lands during
+/// our merge attempt).
 fn merge_pr_rest(
     client: &GhClient,
     pr: u64,
     cwd: &Path,
+    expected_head_sha: &str,
     merge_method: MergeMethod,
     delete_branch: bool,
 ) -> Result<(), String> {
@@ -383,23 +510,23 @@ fn merge_pr_rest(
     let info = pr_head_info_rest(client, &repo, pr, cwd)?;
     let endpoint = format!("repos/{repo}/pulls/{pr}/merge");
 
-    let first = attempt_merge_put(client, &endpoint, &info.sha, merge_method, cwd);
+    let first = attempt_merge_put(client, &endpoint, expected_head_sha, merge_method, cwd);
     match first {
         Ok(()) => {}
         Err(error) if is_base_modified_405(&error) => {
-            // Re-fetch head; only retry if the head SHA is unchanged
-            // (i.e., a new commit did NOT land on the head branch).
-            // Codex review on PR construction: head_sha invariance is
-            // the load-bearing check; `mergeable` can be stale.
+            // Re-fetch head; only retry if the live head still equals the
+            // validated SHA (i.e., a new commit did NOT land on the head
+            // branch). Codex review on PR construction: head_sha invariance
+            // is the load-bearing check; `mergeable` can be stale.
             let refreshed = pr_head_info_rest(client, &repo, pr, cwd)?;
-            if refreshed.sha != info.sha {
+            if !shas_match(&refreshed.sha, expected_head_sha) {
                 return Err(format!(
-                    "REST fallback: PR head moved from {} to {} between merge attempts; refusing to retry",
-                    short_sha(&info.sha),
+                    "REST fallback: PR head moved from validated {} to {} between merge attempts; refusing to retry",
+                    short_sha(expected_head_sha),
                     short_sha(&refreshed.sha)
                 ));
             }
-            attempt_merge_put(client, &endpoint, &refreshed.sha, merge_method, cwd)
+            attempt_merge_put(client, &endpoint, expected_head_sha, merge_method, cwd)
                 .map_err(|second| format!("{error} (retry: {second})"))?;
         }
         Err(error) => return Err(error),
@@ -607,6 +734,16 @@ fn render_event<W: Write>(
             "PR #{pr}: merge attempt failed - {}",
             data.get("error").and_then(Value::as_str).unwrap_or("")
         ),
+        "superseded-sha" => {
+            let validated = data.get("validated").and_then(Value::as_str).unwrap_or("");
+            let current = data.get("current").and_then(Value::as_str).unwrap_or("");
+            writeln!(
+                stdout,
+                "PR #{pr}: refusing to merge - validated {} but live head is {}. Re-run shipyard ship to validate the new head.",
+                short_sha(validated),
+                short_sha(current)
+            )
+        }
         "merged" => {
             if let Some(warning) = data.get("cleanup_warning").and_then(Value::as_str) {
                 writeln!(stdout, "PR #{pr}: merged. Cleanup warning: {warning}")
@@ -685,5 +822,75 @@ mod tests {
     fn short_sha_returns_input_when_already_short() {
         assert_eq!(short_sha("abc"), "abc");
         assert_eq!(short_sha(""), "");
+    }
+
+    // ── superseded-SHA preflight helpers (#321) ─────────────────────────
+
+    #[test]
+    fn head_sha_from_value_reads_graphql_head_ref_oid() {
+        let v = serde_json::json!({ "headRefOid": "a".repeat(40) });
+        assert_eq!(head_sha_from_value(&v), Some("a".repeat(40)));
+    }
+
+    #[test]
+    fn head_sha_from_value_reads_rest_head_sha() {
+        // The production snapshot-less path hits `gh api .../pulls/:n`, which
+        // returns the REST `{ "head": { "sha": ... } }` shape — not headRefOid.
+        let v = serde_json::json!({ "head": { "sha": "b".repeat(40) } });
+        assert_eq!(head_sha_from_value(&v), Some("b".repeat(40)));
+    }
+
+    #[test]
+    fn head_sha_from_value_prefers_head_ref_oid_when_both_present() {
+        let v = serde_json::json!({
+            "headRefOid": "a".repeat(40),
+            "head": { "sha": "b".repeat(40) },
+        });
+        assert_eq!(head_sha_from_value(&v), Some("a".repeat(40)));
+    }
+
+    #[test]
+    fn head_sha_from_value_returns_none_for_empty_or_missing() {
+        assert_eq!(head_sha_from_value(&serde_json::json!({})), None);
+        assert_eq!(
+            head_sha_from_value(&serde_json::json!({ "headRefOid": "" })),
+            None
+        );
+        assert_eq!(
+            head_sha_from_value(&serde_json::json!({ "head": { "sha": "" } })),
+            None
+        );
+    }
+
+    #[test]
+    fn shas_match_full_identity_case_insensitive() {
+        let sha = "deadbeefcafef00d1234567890abcdef12345678";
+        assert!(shas_match(sha, sha));
+        assert!(shas_match(sha, &sha.to_uppercase()));
+    }
+
+    #[test]
+    fn shas_match_tolerates_surrounding_whitespace() {
+        // A SHA captured from `git rev-parse` carries a trailing newline; the
+        // preflight must not read that as a superseded head and block a valid
+        // merge.
+        let sha = "deadbeefcafef00d1234567890abcdef12345678";
+        assert!(shas_match(sha, &format!("{sha}\n")));
+        assert!(shas_match(&format!("  {sha}  "), sha));
+    }
+
+    #[test]
+    fn shas_match_rejects_mismatch_short_and_empty() {
+        let full = "deadbeefcafef00d1234567890abcdef12345678";
+        assert!(!shas_match(
+            full,
+            "deadbeef0000000000000000000000000000beef"
+        ));
+        // Full equality, never a prefix test — a short SHA never satisfies a full one.
+        assert!(!shas_match(full, "deadbee"));
+        // Empty never matches: an unreadable head fails closed, not silently equal.
+        assert!(!shas_match("", ""));
+        assert!(!shas_match(full, ""));
+        assert!(!shas_match("   ", full));
     }
 }

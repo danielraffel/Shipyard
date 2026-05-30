@@ -220,6 +220,21 @@ if and only if the head SHA is unchanged. A changed head SHA means
 a new commit landed during the merge attempt — the retry is refused
 because the prior green evidence may no longer apply.
 
+Before that merge ever runs, `execute_auto_merge` does a **client-side
+superseded-SHA preflight** (#321): it fetches the live PR head via
+`fetch_live_head_sha` (which accepts either `headRefOid` or `head.sha`
+from a snapshot or a fresh `gh`/REST read) and compares it with
+`shas_match` against the `state.head_sha` Shipyard actually validated.
+If they differ, it returns `AutoMergeOutcome::SupersededSha { validated,
+current }` and **refuses to merge** rather than landing a SHA whose
+green evidence is stale — `ship_cmd`'s `post_run_merge_state` maps that
+outcome to `GreenNotMerged`. This is fail-closed: if the live head
+cannot be read, the preflight does not assume safety. It is a belt-and-
+suspenders layer in front of the server-side `--match-head-commit`/`sha=`
+guard above, because GraphQL auto-merge can otherwise land a commit
+pushed *after* validation completed (the bug that merged pulp #3128 at a
+pre-fix SHA).
+
 ## Validation Gates
 
 Prefer non-mutating checks first:

@@ -501,6 +501,15 @@ fn post_run_merge_state(
             Ok(ShipRenderState::Merged)
         }
         AutoMergeOutcome::MergeFailed { error } => Ok(ShipRenderState::GreenNotMerged(error)),
+        // Validation passed but the live head advanced past the validated SHA
+        // (issue #321). Report green-not-merged so `shipyard ship` surfaces
+        // merged:false / status:"green_not_merged" and the operator re-ships
+        // to validate the new head.
+        AutoMergeOutcome::SupersededSha { validated, current } => {
+            Ok(ShipRenderState::GreenNotMerged(format!(
+                "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
+            )))
+        }
         AutoMergeOutcome::PrNotFound
         | AutoMergeOutcome::InFlight { .. }
         | AutoMergeOutcome::TargetFailed { .. } => Err(CliFailure::new(
@@ -791,6 +800,19 @@ mod tests {
         assert!(status.success(), "git command failed: {args:?}");
     }
 
+    /// Capture a git command's trimmed stdout (e.g. `rev-parse HEAD`) so a
+    /// test can pin the issue #321 merge preflight's live-head snapshot to
+    /// the seeded repo's real HEAD SHA.
+    fn git_capture(args: &[&str], cwd: &std::path::Path) -> String {
+        let output = crate::supervised::git_supervised()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git command should run");
+        assert!(output.status.success(), "git command failed: {args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
     fn seed_repo(repo: &std::path::Path) {
         std::fs::create_dir_all(repo).expect("repo dir");
         git(&["init", "--quiet", "--initial-branch=main"], repo);
@@ -920,6 +942,12 @@ mod tests {
             Some(temp.path().join("global")),
             Some(temp.path().join("state")),
         );
+        // The issue #321 merge preflight verifies the live PR head matches
+        // the validated SHA. Pin the live head to the seeded repo's real HEAD
+        // so the happy-path merge proceeds.
+        let head = git_capture(&["rev-parse", "HEAD"], &repo);
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{head}"}}"#)).expect("write snapshot");
         let mut stdout = Vec::new();
 
         let code = ship_command(
@@ -932,7 +960,7 @@ mod tests {
                 merge_command: None,
                 merge_result: Some(MergeResult::Success),
                 gh_command: None,
-                pr_snapshot_file: None,
+                pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
             },
@@ -984,8 +1012,17 @@ mod tests {
             Some(temp.path().join("global")),
             Some(temp.path().join("state")),
         );
+        // `state:OPEN` keeps the failure-path `pr_is_merged` escape hatch
+        // closed; `headRefOid` matching the seeded HEAD lets the issue #321
+        // preflight pass so the injected `MergeResult::Failure` is the thing
+        // under test.
+        let head = git_capture(&["rev-parse", "HEAD"], &repo);
         let snapshot = temp.path().join("pr.json");
-        std::fs::write(&snapshot, r#"{"state":"OPEN"}"#).expect("write snapshot");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"state":"OPEN","headRefOid":"{head}"}}"#),
+        )
+        .expect("write snapshot");
         let mut stdout = Vec::new();
 
         let code = ship_command(
