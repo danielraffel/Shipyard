@@ -2411,6 +2411,56 @@ mod tests {
         assert_eq!(store.list_archived().len(), 0);
     }
 
+    #[test]
+    fn auto_merge_green_fails_closed_when_live_head_is_unreadable() {
+        // The single most important property: if the live PR head cannot be
+        // verified (network error, missing/empty head field), the preflight
+        // must NOT merge blind — it fails closed. Here the snapshot has no
+        // readable head, so `fetch_live_head_sha` returns None even though the
+        // merge itself is told to succeed.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        store
+            .save(&auto_merge_state(
+                7,
+                &[("macos", "pass"), ("linux", "pass")],
+            ))
+            .expect("save");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(&snapshot, r#"{"headRefOid":""}"#).expect("write snapshot");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "auto-merge",
+            "7",
+            "--merge-result",
+            "success",
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "auto-merge");
+        assert_eq!(value["event"], "merge-failed");
+        assert_eq!(value["pr"], 7);
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("verify live PR head"),
+            "error should explain the fail-closed head verification: {value:?}"
+        );
+        // State stays active for a retry once the head can be verified.
+        assert!(store.get(7).is_some());
+        assert_eq!(store.list_archived().len(), 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn auto_merge_archives_when_merge_error_reports_already_merged() {

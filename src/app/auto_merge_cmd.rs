@@ -356,11 +356,15 @@ fn head_sha_from_value(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Compare two head SHAs by full 40-char identity (case-insensitive). We
-/// never compare short SHAs here — a 7-char prefix collision could let a
-/// superseded head slip through the preflight.
+/// Compare two head SHAs for full (not prefix) identity, case-insensitively
+/// and tolerant of surrounding whitespace. Both sides must be non-empty, so an
+/// empty or unreadable head never silently equals an empty validated SHA — the
+/// preflight fails closed instead. Equality is full (never a prefix test), so a
+/// short SHA can never satisfy a full one.
 fn shas_match(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
+    let a = a.trim();
+    let b = b.trim();
+    !a.is_empty() && !b.is_empty() && a.eq_ignore_ascii_case(b)
 }
 
 fn gh_client(cwd: &Path) -> Result<GhClient, String> {
@@ -818,5 +822,75 @@ mod tests {
     fn short_sha_returns_input_when_already_short() {
         assert_eq!(short_sha("abc"), "abc");
         assert_eq!(short_sha(""), "");
+    }
+
+    // ── superseded-SHA preflight helpers (#321) ─────────────────────────
+
+    #[test]
+    fn head_sha_from_value_reads_graphql_head_ref_oid() {
+        let v = serde_json::json!({ "headRefOid": "a".repeat(40) });
+        assert_eq!(head_sha_from_value(&v), Some("a".repeat(40)));
+    }
+
+    #[test]
+    fn head_sha_from_value_reads_rest_head_sha() {
+        // The production snapshot-less path hits `gh api .../pulls/:n`, which
+        // returns the REST `{ "head": { "sha": ... } }` shape — not headRefOid.
+        let v = serde_json::json!({ "head": { "sha": "b".repeat(40) } });
+        assert_eq!(head_sha_from_value(&v), Some("b".repeat(40)));
+    }
+
+    #[test]
+    fn head_sha_from_value_prefers_head_ref_oid_when_both_present() {
+        let v = serde_json::json!({
+            "headRefOid": "a".repeat(40),
+            "head": { "sha": "b".repeat(40) },
+        });
+        assert_eq!(head_sha_from_value(&v), Some("a".repeat(40)));
+    }
+
+    #[test]
+    fn head_sha_from_value_returns_none_for_empty_or_missing() {
+        assert_eq!(head_sha_from_value(&serde_json::json!({})), None);
+        assert_eq!(
+            head_sha_from_value(&serde_json::json!({ "headRefOid": "" })),
+            None
+        );
+        assert_eq!(
+            head_sha_from_value(&serde_json::json!({ "head": { "sha": "" } })),
+            None
+        );
+    }
+
+    #[test]
+    fn shas_match_full_identity_case_insensitive() {
+        let sha = "deadbeefcafef00d1234567890abcdef12345678";
+        assert!(shas_match(sha, sha));
+        assert!(shas_match(sha, &sha.to_uppercase()));
+    }
+
+    #[test]
+    fn shas_match_tolerates_surrounding_whitespace() {
+        // A SHA captured from `git rev-parse` carries a trailing newline; the
+        // preflight must not read that as a superseded head and block a valid
+        // merge.
+        let sha = "deadbeefcafef00d1234567890abcdef12345678";
+        assert!(shas_match(sha, &format!("{sha}\n")));
+        assert!(shas_match(&format!("  {sha}  "), sha));
+    }
+
+    #[test]
+    fn shas_match_rejects_mismatch_short_and_empty() {
+        let full = "deadbeefcafef00d1234567890abcdef12345678";
+        assert!(!shas_match(
+            full,
+            "deadbeef0000000000000000000000000000beef"
+        ));
+        // Full equality, never a prefix test — a short SHA never satisfies a full one.
+        assert!(!shas_match(full, "deadbee"));
+        // Empty never matches: an unreadable head fails closed, not silently equal.
+        assert!(!shas_match("", ""));
+        assert!(!shas_match(full, ""));
+        assert!(!shas_match("   ", full));
     }
 }
