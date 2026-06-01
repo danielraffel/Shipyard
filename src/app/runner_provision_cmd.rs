@@ -214,7 +214,15 @@ pub(super) fn register_command<W: Write>(
 
     if args.dry_run {
         return report_register(
-            stdout, args.json, &slug, &tag, &labels_csv, &ci_root, parallel, &plan, true,
+            stdout,
+            args.json,
+            &slug,
+            &tag,
+            &labels_csv,
+            &ci_root,
+            parallel,
+            &plan,
+            true,
         );
     }
 
@@ -236,13 +244,20 @@ pub(super) fn register_command<W: Write>(
             "could not resolve the osx-arm64 actions-runner package URL",
         ));
     }
-    let pkg_name = pkg_url.rsplit('/').next().unwrap_or("actions-runner.tar.gz");
+    let pkg_name = pkg_url
+        .rsplit('/')
+        .next()
+        .unwrap_or("actions-runner.tar.gz");
     let pkg_cache = ci_root.join("cache").join("actions-runner-pkg");
     fs::create_dir_all(&pkg_cache)
         .map_err(|e| CliFailure::new(1, format!("failed to create package cache: {e}")))?;
     let pkg_path = pkg_cache.join(pkg_name);
     if !pkg_path.exists() {
-        run("curl", &["-fsSL", "-o", &pkg_path.to_string_lossy(), &pkg_url], "download runner")?;
+        run(
+            "curl",
+            &["-fsSL", "-o", &pkg_path.to_string_lossy(), &pkg_url],
+            "download runner",
+        )?;
     }
 
     for entry in &plan {
@@ -253,7 +268,12 @@ pub(super) fn register_command<W: Write>(
         if !entry.dir.join("config.sh").exists() {
             run(
                 "tar",
-                &["xzf", &pkg_path.to_string_lossy(), "-C", &entry.dir.to_string_lossy()],
+                &[
+                    "xzf",
+                    &pkg_path.to_string_lossy(),
+                    "-C",
+                    &entry.dir.to_string_lossy(),
+                ],
                 "extract runner",
             )?;
         }
@@ -296,12 +316,25 @@ pub(super) fn register_command<W: Write>(
             ],
             "configure runner",
         )?;
-        run_in(&entry.dir, "./svc.sh", &["install"], "install runner service")?;
+        run_in(
+            &entry.dir,
+            "./svc.sh",
+            &["install"],
+            "install runner service",
+        )?;
         run_in(&entry.dir, "./svc.sh", &["start"], "start runner service")?;
     }
 
     report_register(
-        stdout, args.json, &slug, &tag, &labels_csv, &ci_root, parallel, &plan, false,
+        stdout,
+        args.json,
+        &slug,
+        &tag,
+        &labels_csv,
+        &ci_root,
+        parallel,
+        &plan,
+        false,
     )
 }
 
@@ -348,7 +381,11 @@ fn report_register<W: Write>(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let verb = if dry_run { "Would register" } else { "Registered" };
+    let verb = if dry_run {
+        "Would register"
+    } else {
+        "Registered"
+    };
     writeln!(
         stdout,
         "{verb} {} runner(s) for {slug} [tag={tag}, ~{parallel} cores each]",
@@ -495,7 +532,11 @@ pub(super) fn list_command<W: Write>(
         )
         .ok();
         for name in &orphans {
-            writeln!(stdout, "  - {name}  (~/actions-runner-{name} or ~/actions-runner)").ok();
+            writeln!(
+                stdout,
+                "  - {name}  (~/actions-runner-{name} or ~/actions-runner)"
+            )
+            .ok();
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -544,7 +585,10 @@ pub(super) fn remove_command<W: Write>(
         .to_owned();
 
     // Stop the service first; ignore failure (it may already be stopped).
-    let _ = Command::new("./svc.sh").current_dir(&dir).arg("stop").status();
+    let _ = Command::new("./svc.sh")
+        .current_dir(&dir)
+        .arg("stop")
+        .status();
     run_in(
         &dir,
         "./config.sh",
@@ -641,7 +685,9 @@ mod tests {
         );
         assert!(env.contains("CCACHE_DIR=/Volumes/Workshop/ci/pulp/cache/ccache"));
         assert!(env.contains("CCACHE_BASEDIR=/Volumes/Workshop/ci/pulp/work/pulp-studio-01"));
-        assert!(env.contains("FETCHCONTENT_BASE_DIR=/Volumes/Workshop/ci/pulp/cache/fetchcontent-src"));
+        assert!(
+            env.contains("FETCHCONTENT_BASE_DIR=/Volumes/Workshop/ci/pulp/cache/fetchcontent-src")
+        );
         assert!(env.contains("CMAKE_BUILD_PARALLEL_LEVEL=9"));
         assert!(env.contains("CTEST_PARALLEL_LEVEL=9"));
         assert!(env.contains("CCACHE_NOHASHDIR=true"));

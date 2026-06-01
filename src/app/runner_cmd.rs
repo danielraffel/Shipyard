@@ -145,28 +145,16 @@ pub(super) fn runner_command<W: Write>(
             },
             stdout,
         ),
-        RunnerCommand::List { repo, all_repos } => super::runner_provision_cmd::list_command(
-            cwd,
-            &actions,
-            &repo,
-            all_repos,
-            json,
-            stdout,
-        ),
+        RunnerCommand::List { repo, all_repos } => {
+            super::runner_provision_cmd::list_command(cwd, &actions, &repo, all_repos, json, stdout)
+        }
         RunnerCommand::Remove {
             name,
             repo,
             purge_dir,
             yes,
         } => super::runner_provision_cmd::remove_command(
-            cwd,
-            &actions,
-            name,
-            repo,
-            purge_dir,
-            yes,
-            json,
-            stdout,
+            cwd, &actions, name, repo, purge_dir, yes, json, stdout,
         ),
     }
 }

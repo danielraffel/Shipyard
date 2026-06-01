@@ -352,10 +352,7 @@ mod tests {
 
     #[test]
     fn infer_machine_tag_falls_back_to_name() {
-        assert_eq!(
-            infer_machine_tag("pulp-m1-02", &[]),
-            Some("m1".to_owned())
-        );
+        assert_eq!(infer_machine_tag("pulp-m1-02", &[]), Some("m1".to_owned()));
     }
 
     #[test]
