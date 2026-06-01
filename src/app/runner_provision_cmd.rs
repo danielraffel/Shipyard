@@ -21,10 +21,37 @@ use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 use crate::runner_provision::{
-    AuditFinding, PoolRow, audit_runners, default_labels, format_audit_table, format_pool_table,
-    next_index, orphan_local_runners, parse_runners_response, pool_rows, runner_name, short_repo,
+    ApiRunner, AuditFinding, PoolRow, audit_runners, default_labels, format_audit_table,
+    format_pool_table, next_index, orphan_local_runners, pool_rows, runner_name, short_repo,
     validate_machine_tag,
 };
+
+/// Fetch every self-hosted runner for a repo across **all** pages. GitHub caps
+/// `per_page` at 100, so a one-page fetch silently misses runners on a large
+/// fleet — `gh api --paginate` follows the `Link` headers and `--jq '.runners[]'`
+/// streams each runner object (newline-delimited) across pages.
+fn fetch_all_runners(actions: &GitHubActions, slug: &str) -> Result<Vec<ApiRunner>, CliFailure> {
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            "--paginate".to_owned(),
+            format!("repos/{slug}/actions/runners?per_page=100"),
+            "--jq".to_owned(),
+            ".runners[]".to_owned(),
+        ])
+        .map_err(|e| CliFailure::new(2, format!("failed to list runners for {slug}: {e}")))?;
+    let mut runners = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let runner: ApiRunner = serde_json::from_str(line)
+            .map_err(|e| CliFailure::new(2, format!("runner JSON parse failed for {slug}: {e}")))?;
+        runners.push(runner);
+    }
+    Ok(runners)
+}
 
 /// jq filter selecting the Apple-silicon macOS runner tarball download URL.
 const RUNNER_ASSET_JQ: &str =
@@ -152,14 +179,12 @@ fn runner_env_file(ci_root: &Path, work: &Path, parallel: usize) -> String {
 /// Existing runner names registered on a repo (any machine), for index
 /// continuation.
 fn existing_runner_names(actions: &GitHubActions, slug: &str) -> Result<Vec<String>, CliFailure> {
-    let raw = actions
-        .run_gh(&[
-            "api".to_owned(),
-            format!("repos/{slug}/actions/runners?per_page=100"),
-        ])
-        .map_err(|e| CliFailure::new(2, format!("failed to list existing runners: {e}")))?;
-    let parsed = parse_runners_response(&raw).map_err(|e| CliFailure::new(2, e))?;
-    Ok(parsed.runners.into_iter().map(|r| r.name).collect())
+    // Paginated: a fleet with >100 runners must not under-count, or the next
+    // index could collide with an existing `<repo>-<tag>-NN`.
+    Ok(fetch_all_runners(actions, slug)?
+        .into_iter()
+        .map(|r| r.name)
+        .collect())
 }
 
 /// `shipyard runner register`.
@@ -486,17 +511,11 @@ pub(super) fn list_command<W: Write>(
     let mut rows: Vec<PoolRow> = Vec::new();
     let mut github_names: Vec<String> = Vec::new();
     for slug in &slugs {
-        let raw = actions
-            .run_gh(&[
-                "api".to_owned(),
-                format!("repos/{slug}/actions/runners?per_page=100"),
-            ])
-            .map_err(|e| CliFailure::new(2, format!("failed to list runners for {slug}: {e}")))?;
-        let parsed = parse_runners_response(&raw).map_err(|e| CliFailure::new(2, e))?;
-        for r in &parsed.runners {
+        let runners = fetch_all_runners(actions, slug)?;
+        for r in &runners {
             github_names.push(r.name.clone());
         }
-        rows.extend(pool_rows(short_repo(slug), &parsed.runners));
+        rows.extend(pool_rows(short_repo(slug), &runners));
     }
 
     let local_names: Vec<String> = locals.iter().map(|l| l.name.clone()).collect();
@@ -589,15 +608,9 @@ pub(super) fn audit_command<W: Write>(
 
     let mut findings: Vec<(String, AuditFinding)> = Vec::new();
     for slug in &slugs {
-        let raw = actions
-            .run_gh(&[
-                "api".to_owned(),
-                format!("repos/{slug}/actions/runners?per_page=100"),
-            ])
-            .map_err(|e| CliFailure::new(2, format!("failed to list runners for {slug}: {e}")))?;
-        let parsed = parse_runners_response(&raw).map_err(|e| CliFailure::new(2, e))?;
+        let runners = fetch_all_runners(actions, slug)?;
         let repo_short = short_repo(slug);
-        for finding in audit_runners(repo_short, &parsed.runners) {
+        for finding in audit_runners(repo_short, &runners) {
             findings.push((repo_short.to_owned(), finding));
         }
     }

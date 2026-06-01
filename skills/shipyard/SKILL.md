@@ -276,7 +276,10 @@ rerouted within `--flap-window`), **one reroute per tick** (natural pacing), and
 **deterministic** oldest-run-first choice. **Observe by default** — without
 `--apply` it logs each decision but acts on nothing. `--apply` shells `shipyard
 cloud retarget … --provider local --apply`, which works for PRs Shipyard is
-shipping (ship-state-backed). **Follow-up (Part C.2):** rerouting a PR with no
+shipping (ship-state-backed). `cloud retarget` has no `--repo` flag — it
+resolves the repo from the current checkout — so run `reroute-watch --apply`
+inside the target repo's checkout (its `--repo` only scopes which queued runs
+are listed, not where the reroute acts). **Follow-up (Part C.2):** rerouting a PR with no
 ship-state, and spinning an ephemeral JIT VM runner on a free-slot host (drive
 Pulp's `tart-run-job.sh` equivalent) — until then a persistent host-class runner
 handles pickup. Full design: `planning/2026-06-01-multi-mac-controller.md`.
