@@ -447,6 +447,66 @@ pub(super) enum RunnerCommand {
         #[arg(long = "no-wait-github", hide = true)]
         no_wait_github: bool,
     },
+    /// Show or set this machine's runner tag (e.g. `studio`, `m1`, `m5`).
+    /// The tag names runners `<repo>-<tag>-NN`; it is stored per-box in
+    /// Shipyard state and is never derived from the hostname (two laptops
+    /// can share a hostname, which would collide).
+    Tag {
+        /// New tag to store. Omit to print the current tag.
+        #[arg(long)]
+        set: Option<String>,
+    },
+    /// Register N self-hosted GitHub Actions runners on this machine for a
+    /// repo. Names continue from the highest existing `<repo>-<tag>-NN` so
+    /// re-running appends capacity without collisions.
+    Register {
+        /// Owner/repo slug. Defaults to the current git repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Number of runners to register.
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        /// Machine tag override. Defaults to the stored per-box tag.
+        #[arg(long = "machine-tag")]
+        machine_tag: Option<String>,
+        /// Comma-separated labels override. Defaults to
+        /// `self-hosted,macos,arm64,<repo>-build,<repo>-build-<tag>`.
+        #[arg(long, value_delimiter = ',')]
+        labels: Vec<String>,
+        /// CI root holding per-runner `_work` and shared caches. Defaults to
+        /// `runner.provision.ci_root` or `$HOME/actions-ci`.
+        #[arg(long = "ci-root")]
+        ci_root: Option<PathBuf>,
+        /// Print the plan without downloading, configuring, or starting.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// List self-hosted runners across repos, grouped by machine, reconciling
+    /// local runner directories against GitHub to flag orphans.
+    List {
+        /// Owner/repo slug. Repeatable. Defaults to repos discovered from
+        /// local `actions-runner-*` dirs plus the current repo.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Query every repo with a local runner dir on this machine.
+        #[arg(long = "all-repos")]
+        all_repos: bool,
+    },
+    /// Deregister a runner: stop its launchd service and remove it from GitHub.
+    Remove {
+        /// Runner name, e.g. `pulp-studio-03`.
+        #[arg(long)]
+        name: String,
+        /// Owner/repo slug. Defaults to the current git repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Also delete the local `actions-runner-<name>` directory.
+        #[arg(long = "purge-dir")]
+        purge_dir: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Subcommand)]

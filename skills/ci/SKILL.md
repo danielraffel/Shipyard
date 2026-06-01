@@ -43,6 +43,11 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Runner watchdog: cancel stale queued runs** | `shipyard runner cleanup --fix` |
 | **Runner watchdog: daemon mode** | `shipyard runner watch --fix` |
 | **Runner watchdog: auto-kill hung workers (full recovery)** | `shipyard runner watch --kill-hung-workers` (implies `--fix`) |
+| **Runner provisioning: set this box's machine tag** | `shipyard runner tag --set <studio\|m1\|m5>` (stored per-box; never hostname-derived) |
+| **Runner provisioning: register N runners for a repo** | `shipyard runner register --repo <owner/repo> --count <N> [--ci-root <dir>]` (names `<repo>-<tag>-NN`, continues the index) |
+| **Runner provisioning: dry-run the registration plan** | `shipyard runner register --repo <owner/repo> --count <N> --dry-run` |
+| **Runner provisioning: live cross-repo pool view** | `shipyard runner list [--repo <owner/repo>]` (groups by machine; flags orphaned local dirs) |
+| **Runner provisioning: deregister a runner** | `shipyard runner remove --name <repo>-<tag>-NN --yes [--purge-dir]` |
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
 | **Self-update: apply latest stable** | `shipyard update` (delegates to `install.sh`) |
 | **Self-update: pin / rollback to a specific tag** | `shipyard update --to v0.53.0` |

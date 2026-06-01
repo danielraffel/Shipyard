@@ -159,6 +159,66 @@ watch_interval_seconds = 300
 auto_fix = false
 ```
 
+## Runner Provisioning (register / list / remove / tag)
+
+The `runner` family also *provisions* self-hosted GitHub Actions runners, not
+just recovers them. This is the generic, repo-agnostic path for bringing a Mac
+into a repo's CI fleet — used to stand up the Mac Studio's pulp runners. Pure
+naming/index/label/table logic lives in `src/runner_provision.rs`; the shell
+side (gh, `config.sh`, `svc.sh`, local `~/actions-runner-*` dirs) is
+`src/app/runner_provision_cmd.rs`. See `docs/runner-provisioning.md`.
+
+### Machine tag (load-bearing for multi-Mac fleets)
+
+Runners are named `<repo>-<machine-tag>-NN` (e.g. `pulp-studio-01`). The tag is
+an explicit per-box value stored at `<state_dir>/machine-tag`, **never derived
+from the hostname** — two MacBook Pros can share a hostname, so a
+hostname-derived tag would collide. Set it once per machine:
+
+```bash
+shipyard runner tag --set studio   # or m1, m5, …
+shipyard runner tag                # prints the stored tag
+```
+
+### Register
+
+```bash
+# Host must already have the toolchain/caches (repo-specific bootstrap).
+# This step only registers runners and points their .env at the shared caches.
+shipyard runner register --repo danielraffel/pulp --count 3 \
+  --ci-root /Volumes/Workshop/ci/pulp [--dry-run]
+```
+
+- Names continue from the highest existing `<repo>-<tag>-NN` (any machine), so
+  re-running appends capacity without collisions.
+- Default labels: `self-hosted,macos,arm64,<repo>-build,<repo>-build-<tag>`.
+  `<repo>-build` is what a repo's workflow selects for normal routing;
+  `<repo>-build-<tag>` pins work to one machine. Override with `--labels`.
+- Per-runner `_work` is `<ci-root>/work/<name>`; the `.env` points ccache and
+  FetchContent at `<ci-root>/cache/*`. Cache *size* is owned by the host's
+  `ccache.conf`, not this command.
+
+### List and remove
+
+```bash
+shipyard runner list --repo danielraffel/pulp   # live pool, grouped by machine
+shipyard runner remove --name pulp-studio-03 --yes [--purge-dir]
+```
+
+`list` aggregates across machines straight from GitHub (no controller needed)
+and reconciles local `~/actions-runner-*` dirs against GitHub to flag orphans.
+
+### Gotchas
+
+- These four subcommands are newer than the watchdog set; an older installed
+  binary will not have them. Verify with `shipyard runner register --help`.
+- `register` does **not** provision the host toolchain (Xcode, Homebrew deps,
+  Skia, ccache sizing). Run the repo's own host bootstrap first; this command
+  assumes a buildable host and only wires up runners + caches.
+- A fresh python.org Python with no CA certs breaks asset downloads in repo
+  bootstraps (`SSL: CERTIFICATE_VERIFY_FAILED`) — run the bundled
+  `Install Certificates.command`.
+
 ## Supervised Subprocess Marker (issue #266)
 
 Every `git` / `gh` child process spawned by the supervised

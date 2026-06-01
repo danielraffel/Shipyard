@@ -76,6 +76,8 @@ pub mod queue_scheduler;
 pub mod reconcile;
 /// GitHub webhook registration through the user's existing `gh` auth.
 pub mod registrar;
+/// Self-hosted runner provisioning (register/list/remove) pure logic.
+pub mod runner_provision;
 /// Self-hosted runner watchdog detection logic.
 pub mod runner_watchdog;
 /// Ship execution orchestration helpers.

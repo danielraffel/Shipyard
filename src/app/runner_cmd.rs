@@ -21,6 +21,7 @@ use super::CliFailure;
 use super::cli::RunnerCommand;
 use crate::cloud::{GitHubActions, QueuedRun};
 use crate::config::LoadedConfig;
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::runner_watchdog::{
     DEFAULT_MAX_JOB_MIN, DEFAULT_MAX_QUEUE_AGE_HOURS, DEFAULT_WATCH_INTERVAL_SECONDS, RunnerHealth,
@@ -31,8 +32,10 @@ use crate::runner_watchdog::{
 const QUEUED_RUNS_LIMIT: u32 = 100;
 
 /// Entry point dispatched from `src/app.rs`.
+#[allow(clippy::too_many_lines)]
 pub(super) fn runner_command<W: Write>(
     command: RunnerCommand,
+    mode: RuntimeMode,
     config: &LoadedConfig,
     cwd: &Path,
     json: bool,
@@ -115,6 +118,54 @@ pub(super) fn runner_command<W: Write>(
                 no_wait_github,
                 json,
             },
+            stdout,
+        ),
+        RunnerCommand::Tag { set } => {
+            super::runner_provision_cmd::tag_command(mode, set, json, stdout)
+        }
+        RunnerCommand::Register {
+            repo,
+            count,
+            machine_tag,
+            labels,
+            ci_root,
+            dry_run,
+        } => super::runner_provision_cmd::register_command(
+            super::runner_provision_cmd::RegisterArgs {
+                mode,
+                cwd,
+                actions: &actions,
+                repo,
+                count,
+                machine_tag,
+                labels,
+                ci_root,
+                dry_run,
+                json,
+            },
+            stdout,
+        ),
+        RunnerCommand::List { repo, all_repos } => super::runner_provision_cmd::list_command(
+            cwd,
+            &actions,
+            &repo,
+            all_repos,
+            json,
+            stdout,
+        ),
+        RunnerCommand::Remove {
+            name,
+            repo,
+            purge_dir,
+            yes,
+        } => super::runner_provision_cmd::remove_command(
+            cwd,
+            &actions,
+            name,
+            repo,
+            purge_dir,
+            yes,
+            json,
             stdout,
         ),
     }
@@ -876,7 +927,7 @@ fn default_runner_dir() -> PathBuf {
     }
 }
 
-fn resolve_repo_slug(repo: Option<String>, cwd: &Path) -> Result<String, CliFailure> {
+pub(super) fn resolve_repo_slug(repo: Option<String>, cwd: &Path) -> Result<String, CliFailure> {
     if let Some(repo) = repo.filter(|value| !value.trim().is_empty()) {
         return Ok(repo);
     }
@@ -897,7 +948,7 @@ fn resolve_repo_slug(repo: Option<String>, cwd: &Path) -> Result<String, CliFail
     ))
 }
 
-fn parse_github_repo_slug(remote: &str) -> Option<String> {
+pub(super) fn parse_github_repo_slug(remote: &str) -> Option<String> {
     // Mirrors crate::app::wait_cmd::parse_github_repo_slug but kept local so
     // this module has no cross-module visibility creep.
     let trimmed = remote.trim().trim_end_matches('/').trim_end_matches(".git");
