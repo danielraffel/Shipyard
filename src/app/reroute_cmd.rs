@@ -137,9 +137,7 @@ fn tick<W: Write>(
                 Err(reason) => format!("reroute failed: {reason}"),
             }
         }
-        RerouteDecision::Reroute(_) => {
-            "observe (would reroute; pass --apply to act)".to_owned()
-        }
+        RerouteDecision::Reroute(_) => "observe (would reroute; pass --apply to act)".to_owned(),
         _ => "none".to_owned(),
     };
 
