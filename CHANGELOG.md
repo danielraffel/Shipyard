@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0610"></a>
-## [0.62.0]
+<a id="v0620"></a>
+## [0.62.0] - 2026-06-01
 
+- feat(ci): add `local` runner provider to route macOS jobs to a self-hosted Mac ([#326](https://github.com/danielraffel/Shipyard/pull/326))
+
+<a id="v0610"></a>
 ## [0.61.0] - 2026-06-01
 
 - feat(runner): add register/list/remove/tag provisioning suite ([#323](https://github.com/danielraffel/Shipyard/pull/323))
@@ -567,6 +570,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.62.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.62.0
 [0.61.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.61.0
 [0.60.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.60.1
 [0.60.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.60.0
