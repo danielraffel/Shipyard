@@ -255,8 +255,31 @@ cap = 2
 # [host_class.m5] arrives later — same shape, inherits cap = 2.
 ```
 
-This free-slot count is what the cloud→local reroute watcher (#316 Part C) will
-gate on: drain a still-queued cloud macOS job to local only when `free > 0`.
+This free-slot count is what the cloud→local reroute watcher (#316 Part C)
+gates on: drain a still-queued cloud macOS job to local only when `free > 0`.
+
+### Reroute watcher (cloud→local drain)
+
+```bash
+shipyard runner reroute-watch --repo danielraffel/Shipyard            # observe
+shipyard runner reroute-watch --apply --interval 30 --flap-window 300 # act
+```
+
+Ports Pulp's `macos_reroute_watcher.py` (task #22), generalized to multi-host
+VM-slot accounting. Each tick: read free slots (`runner capacity`), list the
+repo's cloud-queued macOS jobs (`gh` runs+jobs, cloud markers `macos-15` /
+`nscloud-` / `namespace-profile-`), and — when `free > 0` and a job is still
+waiting on cloud — drain **one** PR back to local. Safety properties (pure logic
+in `src/reroute.rs`): **slot-safe/fail-closed** (unreadable hosts count as 0
+free, so an all-unreadable fleet does nothing), **flap-guard** (skip a PR
+rerouted within `--flap-window`), **one reroute per tick** (natural pacing), and
+**deterministic** oldest-run-first choice. **Observe by default** — without
+`--apply` it logs each decision but acts on nothing. `--apply` shells `shipyard
+cloud retarget … --provider local --apply`, which works for PRs Shipyard is
+shipping (ship-state-backed). **Follow-up (Part C.2):** rerouting a PR with no
+ship-state, and spinning an ephemeral JIT VM runner on a free-slot host (drive
+Pulp's `tart-run-job.sh` equivalent) — until then a persistent host-class runner
+handles pickup. Full design: `planning/2026-06-01-multi-mac-controller.md`.
 
 ### Gotchas
 

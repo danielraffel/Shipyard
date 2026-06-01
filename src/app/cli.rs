@@ -503,6 +503,31 @@ pub(super) enum RunnerCommand {
     /// Report VM-slot-aware free macOS capacity across `[host_class.*]` hosts
     /// (`Σ max(0, cap − running tart VMs)`). Exit 1 if any host is unreadable.
     Capacity,
+    /// Watch for cloud-queued macOS jobs and drain them to a local runner when
+    /// a VM slot frees up. Observe-only unless `--apply`.
+    RerouteWatch {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Lane/job-name substring passed to `cloud retarget --target`.
+        #[arg(long, default_value = "macos")]
+        target: String,
+        /// Seconds between polling ticks.
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+        /// Suppress re-routing the same PR within this many seconds.
+        #[arg(long = "flap-window", default_value_t = 300)]
+        flap_window: i64,
+        /// Run a single tick and exit.
+        #[arg(long)]
+        once: bool,
+        /// Stop after N ticks (mainly for testing).
+        #[arg(long = "max-ticks")]
+        max_ticks: Option<u32>,
+        /// Actually perform reroutes (default: observe and log only).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Deregister a runner: stop its launchd service and remove it from GitHub.
     Remove {
         /// Runner name, e.g. `pulp-studio-03`.

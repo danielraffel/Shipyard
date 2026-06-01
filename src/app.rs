@@ -31,6 +31,7 @@ mod pr_cmd;
 mod quarantine_cmd;
 mod queue_cmd;
 mod release_bot_cmd;
+mod reroute_cmd;
 mod rescue_cmd;
 mod run_cmd;
 mod runner_cmd;
