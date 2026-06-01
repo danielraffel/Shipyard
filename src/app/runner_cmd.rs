@@ -148,6 +148,9 @@ pub(super) fn runner_command<W: Write>(
         RunnerCommand::List { repo, all_repos } => {
             super::runner_provision_cmd::list_command(cwd, &actions, &repo, all_repos, json, stdout)
         }
+        RunnerCommand::Audit { repo } => {
+            super::runner_provision_cmd::audit_command(cwd, &actions, &repo, json, stdout)
+        }
         RunnerCommand::Remove {
             name,
             repo,

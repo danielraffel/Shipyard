@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0620"></a>
+## [0.63.0]
+
 ## [0.62.0] - 2026-06-01
 
 - feat(ci): add `local` runner provider to route macOS jobs to a self-hosted Mac ([#326](https://github.com/danielraffel/Shipyard/pull/326))
