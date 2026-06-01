@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0640"></a>
+## [0.65.0]
+
 ## [0.64.0] - 2026-06-01
 
 - feat(runner): add VM-slot-aware capacity accounting (#316 Part B) ([#328](https://github.com/danielraffel/Shipyard/pull/328))

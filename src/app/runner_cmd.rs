@@ -152,6 +152,30 @@ pub(super) fn runner_command<W: Write>(
             super::runner_provision_cmd::audit_command(cwd, &actions, &repo, json, stdout)
         }
         RunnerCommand::Capacity => super::capacity_cmd::capacity_command(config, json, stdout),
+        RunnerCommand::RerouteWatch {
+            repo,
+            target,
+            interval,
+            flap_window,
+            once,
+            max_ticks,
+            apply,
+        } => super::reroute_cmd::reroute_watch_command(
+            &super::reroute_cmd::RerouteWatchArgs {
+                repo,
+                target,
+                interval_secs: interval,
+                flap_window_secs: flap_window,
+                once,
+                max_ticks,
+                apply,
+            },
+            config,
+            cwd,
+            &actions,
+            json,
+            stdout,
+        ),
         RunnerCommand::Remove {
             name,
             repo,

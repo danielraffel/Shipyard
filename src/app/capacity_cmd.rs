@@ -77,6 +77,13 @@ fn read_running(class: &HostClassConfig) -> Result<u32, String> {
     parse_tart_running(&stdout)
 }
 
+/// Gather per-host capacity for every configured `[host_class.*]` (probing each
+/// host). Shared by `runner capacity` and the reroute watcher (#316 Part C).
+pub(super) fn gather(config: &LoadedConfig) -> Result<Vec<HostCapacity>, CliFailure> {
+    let classes = parse_host_classes(&config.data).map_err(|e| CliFailure::new(2, e))?;
+    Ok(classes.iter().map(probe).collect())
+}
+
 /// Probe one host class and fold the result into a [`HostCapacity`].
 fn probe(class: &HostClassConfig) -> HostCapacity {
     let (running, source) = match read_running(class) {
