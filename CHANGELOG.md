@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0601"></a>
+## [0.61.0]
+
 ## [0.60.1] - 2026-05-27
 
 - fix: route app-auth PR fallbacks through REST ([#315](https://github.com/danielraffel/Shipyard/pull/315))
