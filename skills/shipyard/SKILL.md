@@ -226,6 +226,38 @@ confirming a `*-studio-*` runner is on the Studio is `runner capacity`'s job
 (reads the host machine tag over SSH). Full design:
 `planning/2026-06-01-multi-mac-controller.md` (Shipyard #316).
 
+### Capacity (VM-slot accounting)
+
+```bash
+shipyard runner capacity --json   # exit 1 if any host unreadable
+```
+
+macOS caps **2 running VMs per host** (XNU kernel quota; Pulp plan Appendix D).
+`runner capacity` reads each `[host_class.<name>]`'s running macOS VMs (locally
+for the controller's own box, over SSH otherwise) via `tart list` and computes
+`free = Σ max(0, cap − running)`. **Fail-closed:** an unreadable host counts as
+0 free and the command exits non-zero — a silent host must never read as spare
+capacity. Configure host classes (operator-specific, so keep these in
+`~/.config/shipyard/config.toml` or `.shipyard.local/`, not the committed repo
+config):
+
+```toml
+[host_class.studio]
+# ssh omitted → the controller's own box, read locally
+cap = 2                                    # Studio may raise via Appendix-D override
+tart_bin = "/opt/homebrew/bin/tart"        # if tart isn't on the SSH PATH
+labels = ["self-hosted", "macos", "arm64", "shipyard-build-studio"]
+
+[host_class.m1]
+ssh = "Daniels-MacBook-Pro.local"
+cap = 2
+
+# [host_class.m5] arrives later — same shape, inherits cap = 2.
+```
+
+This free-slot count is what the cloud→local reroute watcher (#316 Part C) will
+gate on: drain a still-queued cloud macOS job to local only when `free > 0`.
+
 ### Gotchas
 
 - These four subcommands are newer than the watchdog set; an older installed

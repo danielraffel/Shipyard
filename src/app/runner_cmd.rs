@@ -151,6 +151,7 @@ pub(super) fn runner_command<W: Write>(
         RunnerCommand::Audit { repo } => {
             super::runner_provision_cmd::audit_command(cwd, &actions, &repo, json, stdout)
         }
+        RunnerCommand::Capacity => super::capacity_cmd::capacity_command(config, json, stdout),
         RunnerCommand::Remove {
             name,
             repo,
