@@ -297,7 +297,25 @@ pre-fix SHA).
 
 ## Validation Gates
 
-Prefer non-mutating checks first:
+**Before `shipyard pr` / `shipyard ship`, run the *exact* chain the `mac`
+target enforces** (`.shipyard/config.toml` `[targets.mac]`). `--lib`-scoped
+checks are NOT enough — `--all-targets -- -D warnings` and `cargo fmt` catch
+things the lib build won't, and a miss costs a full ship round-trip (the
+2026-06-01 runner-provisioning PR failed mac validation twice this way):
+
+```sh
+cargo fmt --all --check \
+  && cargo clippy --all-targets --locked -- -D warnings \
+  && cargo test --all-targets --locked
+```
+
+**`Cargo.lock` gotcha after a version bump:** `shipyard pr` rewrites
+`Cargo.toml` / `.claude-plugin/plugin.json` but does NOT touch `Cargo.lock`,
+so the `--locked` steps then fail with a lock-vs-manifest mismatch. After any
+bump, refresh the lock (`cargo build`/`cargo check`) and commit `Cargo.lock`
+in the same PR. (`cargo fmt --all` on new modules is the other easy miss.)
+
+Other non-mutating checks:
 
 ```sh
 cargo test --all-targets --locked
