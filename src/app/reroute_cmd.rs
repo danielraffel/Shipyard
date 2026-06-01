@@ -129,7 +129,7 @@ fn tick<W: Write>(
     // Perform the action (if applicable) before logging the outcome.
     let action = match &decision {
         RerouteDecision::Reroute(candidate) if args.apply => {
-            match perform_reroute(candidate, repo, &args.target) {
+            match perform_reroute(candidate, &args.target) {
                 Ok(()) => {
                     guard.record(candidate.pr, now);
                     "rerouted".to_owned()
@@ -283,7 +283,12 @@ fn macos_job_labels(actions: &GitHubActions, repo: &str, run_id: u64) -> String 
 /// Perform the reroute by shelling `shipyard cloud retarget … --provider local
 /// --apply` (reuses ship-state + dispatch safety). Mirrors Pulp's watcher
 /// shelling `pulp macos retarget`.
-fn perform_reroute(candidate: &RerouteCandidate, repo: &str, target: &str) -> Result<(), String> {
+///
+/// `cloud retarget` has no `--repo` flag — it resolves the repo from the
+/// current checkout (cwd) and ship-state — so `reroute-watch --apply` must run
+/// inside the target repo's checkout. We deliberately do not pass `--repo`
+/// (clap would reject it and every reroute would fail before acting).
+fn perform_reroute(candidate: &RerouteCandidate, target: &str) -> Result<(), String> {
     let exe = std::env::current_exe().unwrap_or_else(|_| "shipyard".into());
     let output = Command::new(exe)
         .args([
@@ -295,8 +300,6 @@ fn perform_reroute(candidate: &RerouteCandidate, repo: &str, target: &str) -> Re
             target,
             "--provider",
             "local",
-            "--repo",
-            repo,
             "--apply",
         ])
         .output()

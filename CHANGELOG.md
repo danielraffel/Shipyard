@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0650"></a>
+## [0.65.1]
+
 ## [0.65.0] - 2026-06-01
 
 - fix(build): sync Cargo.lock to 0.65.0 after version bump ([#329](https://github.com/danielraffel/Shipyard/pull/329))
