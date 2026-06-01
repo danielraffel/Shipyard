@@ -8,6 +8,8 @@ pub mod app;
 pub mod branch;
 /// Bundle transfer command construction and path normalization.
 pub mod bundle;
+/// VM-slot-aware macOS capacity accounting across host-class members.
+pub mod capacity;
 /// Changelog tag graph extraction and markdown rendering.
 pub mod changelog;
 /// Coarse failure classification shared by executors.

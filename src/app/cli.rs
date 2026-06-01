@@ -500,6 +500,9 @@ pub(super) enum RunnerCommand {
         #[arg(long)]
         repo: Vec<String>,
     },
+    /// Report VM-slot-aware free macOS capacity across `[host_class.*]` hosts
+    /// (`Σ max(0, cap − running tart VMs)`). Exit 1 if any host is unreadable.
+    Capacity,
     /// Deregister a runner: stop its launchd service and remove it from GitHub.
     Remove {
         /// Runner name, e.g. `pulp-studio-03`.

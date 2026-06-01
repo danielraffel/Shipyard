@@ -14,6 +14,7 @@ use clap::Parser;
 mod auth_cmd;
 mod auto_merge_cmd;
 mod branch_cmd;
+mod capacity_cmd;
 mod changelog_cmd;
 mod cleanup_cmd;
 mod cli;
