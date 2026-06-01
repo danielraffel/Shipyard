@@ -11,6 +11,7 @@ on:
         options:
           - github-hosted
           - namespace
+          - local
       linux_runner_selector_json:
         description: Optional JSON string/array for Linux runs-on
         required: false

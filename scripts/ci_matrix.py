@@ -2,8 +2,11 @@
 """Resolve GitHub Actions runner matrices for Shipyard workflows.
 
 GitHub-hosted runners are the safe default. Namespace remains an explicit
-opt-in provider for repos/accounts that still have access, and workflow inputs
-or repository variables can override defaults without editing YAML.
+opt-in provider for repos/accounts that still have access. The `local`
+provider routes to the maintainer's self-hosted Mac (label set
+`["self-hosted","local-mac"]`) for the macOS release/build leg, falling back
+to github-hosted for targets with no local box. Workflow inputs or repository
+variables can override defaults without editing YAML.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from pathlib import Path
 from typing import Mapping
 
 
-VALID_PROVIDERS = ("namespace", "github-hosted")
+VALID_PROVIDERS = ("namespace", "github-hosted", "local")
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,11 @@ class RunnerTarget:
     env_suffix: str
     github_hosted_label: str
     namespace_label: str | None
+    # Built-in runs-on selector for the `local` (self-hosted) provider. macOS
+    # is the only target with a local Mac to land on; every other target has no
+    # local box and falls back to github-hosted. May be a single label string
+    # or a list of labels (AND-matched by GitHub Actions). None = no local box.
+    local_label: str | list[str] | None = None
 
 
 TARGETS: dict[str, RunnerTarget] = {
@@ -50,6 +58,7 @@ TARGETS: dict[str, RunnerTarget] = {
         env_suffix="MACOS_ARM64",
         github_hosted_label="macos-15",
         namespace_label="namespace-profile-generouscorp-macos",
+        local_label=["self-hosted", "local-mac"],
     ),
     "windows": RunnerTarget(
         key="windows",
@@ -130,14 +139,14 @@ def resolve_runs_on(target_key: str, env: Mapping[str, str] = os.environ) -> dic
     target = TARGETS[target_key]
     provider = requested_provider(env)
     explicit_env = f"EXPLICIT_{target.env_suffix}_RUNNER_SELECTOR_JSON"
-    namespace_env = f"NAMESPACE_{target.env_suffix}_RUNS_ON_JSON"
 
     explicit = _env(env, explicit_env)
     if explicit:
         selector = _load_selector(explicit, target=target, source=explicit_env)
     elif provider == "github-hosted":
         selector = json.dumps(target.github_hosted_label)
-    else:
+    elif provider == "namespace":
+        namespace_env = f"NAMESPACE_{target.env_suffix}_RUNS_ON_JSON"
         namespace = _env(env, namespace_env)
         if namespace:
             selector = _load_selector(
@@ -148,6 +157,17 @@ def resolve_runs_on(target_key: str, env: Mapping[str, str] = os.environ) -> dic
         elif target.namespace_label is not None:
             selector = json.dumps(target.namespace_label)
         else:
+            provider = "github-hosted"
+            selector = json.dumps(target.github_hosted_label)
+    else:  # local — self-hosted runner on the maintainer's machine(s)
+        local_env = f"LOCAL_{target.env_suffix}_RUNS_ON_JSON"
+        local = _env(env, local_env)
+        if local:
+            selector = _load_selector(local, target=target, source=local_env)
+        elif target.local_label is not None:
+            selector = json.dumps(target.local_label)
+        else:
+            # No local box for this target (Linux/Windows) — degrade to hosted.
             provider = "github-hosted"
             selector = json.dumps(target.github_hosted_label)
 

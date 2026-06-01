@@ -219,6 +219,29 @@ and reconciles local `~/actions-runner-*` dirs against GitHub to flag orphans.
   bootstraps (`SSL: CERTIFICATE_VERIFY_FAILED`) — run the bundled
   `Install Certificates.command`.
 
+### Routing Shipyard CI to a registered Mac (the `local` provider)
+
+Registering a runner only stands up the machine; it does not move any job
+onto it. Shipyard's own workflows pick a runner via `scripts/ci_matrix.py`,
+which now understands a `local` provider in addition to `github-hosted` and
+`namespace`. Set repo variable `DEFAULT_RUNNER_PROVIDER=local` (or dispatch
+with `-f runner_provider=local`) and the **macOS ARM64** leg resolves to the
+label set `["self-hosted","local-mac"]`; Linux/Windows have no local box and
+fall back to GitHub-hosted. So to send Shipyard's macOS **release** build to
+the Mac Studio, register a Studio runner that carries those labels —
+
+```bash
+shipyard runner tag --set studio
+shipyard runner register --repo danielraffel/Shipyard --count 1 \
+  --labels self-hosted,macos,arm64,local-mac \
+  --ci-root /Volumes/Workshop/ci/shipyard
+```
+
+— then flip `DEFAULT_RUNNER_PROVIDER=local`. The signing identity already
+lives in the Studio keychain, so the signed/notarized dmg build skips
+GitHub's hosted-macOS queue. Full provider semantics:
+`skills/ci/SKILL.md` → "Runner Provider Defaults" → "The `local` provider".
+
 ## Supervised Subprocess Marker (issue #266)
 
 Every `git` / `gh` child process spawned by the supervised

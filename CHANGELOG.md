@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0610"></a>
+## [0.62.0]
+
 ## [0.61.0] - 2026-06-01
 
 - feat(runner): add register/list/remove/tag provisioning suite ([#323](https://github.com/danielraffel/Shipyard/pull/323))
