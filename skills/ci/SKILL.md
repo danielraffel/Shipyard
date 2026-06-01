@@ -154,6 +154,28 @@ GitHub-hosted default; a trusted self-hosted run should be an explicit per-run
 choice. GitHub dispatches by `runs-on` labels; SSH is only the management layer
 for those machines.
 
+### The `local` provider (self-hosted Mac)
+
+`scripts/ci_matrix.py` recognizes a third provider, `local`, alongside
+`namespace` and `github-hosted`. Set it the same way — repo variable
+`DEFAULT_RUNNER_PROVIDER=local` or per-dispatch `-f runner_provider=local`.
+It routes the **macOS ARM64** leg to the maintainer's self-hosted Mac via the
+built-in label set `["self-hosted","local-mac"]`; Linux and Windows have no
+local box, so they transparently degrade to their GitHub-hosted labels (the
+resolved `provider` for those rows reports `github-hosted`). Override the macOS
+selector with repo var `LOCAL_MACOS_ARM64_RUNS_ON_JSON` if a different label set
+is needed. An explicit `*_runner_selector_json` input still wins over the
+provider default. This is *not* a hidden fallback — `local` only takes effect
+when explicitly requested, and the default remains GitHub-hosted.
+
+To land jobs on the Mac, register a runner carrying the matching labels with
+`shipyard runner register --repo <owner/repo> --labels self-hosted,macos,arm64,local-mac`
+(see the runner-provisioning rows above). This is the mechanism behind routing
+macOS **release** builds to the Mac Studio so they skip GitHub's hosted-macOS
+queue — the Studio's keychain already holds the Developer ID signing identity.
+Use `local` only on private repos / the owner's own machine, never a public repo
+with untrusted PRs.
+
 ## Live mode (`shipyard daemon`) — when it helps and when to ignore it
 
 Shipyard has a long-running webhook receiver that converts GitHub
