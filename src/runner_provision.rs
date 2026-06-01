@@ -177,6 +177,196 @@ pub fn infer_machine_tag(name: &str, label_names: &[String]) -> Option<String> {
     None
 }
 
+/// The host class encoded in a conforming `<repo>-<class>-NN` runner name.
+///
+/// Conforming means: the lowercased name starts with `<repo>-`, ends with a
+/// purely-numeric index segment, and has a non-empty class in between. Returns
+/// `None` for anything else (wrong repo prefix, no numeric index, empty class),
+/// which the audit treats as a non-conforming name. The class is lowercased.
+#[must_use]
+pub fn class_from_name(name: &str, repo_short: &str) -> Option<String> {
+    let lower = name.to_lowercase();
+    let prefix = format!("{}-", repo_short.to_lowercase());
+    let rest = lower.strip_prefix(&prefix)?;
+    let (class, index) = rest.rsplit_once('-')?;
+    if class.is_empty() || index.is_empty() || !index.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(class.to_owned())
+}
+
+/// The host class declared by a `<repo>-build-<class>` label, if present.
+/// `label_names` are expected already lowercased (see [`ApiRunner::label_names`]).
+#[must_use]
+pub fn class_from_labels(label_names: &[String], repo_short: &str) -> Option<String> {
+    let prefix = format!("{}-build-", repo_short.to_lowercase());
+    label_names.iter().find_map(|label| {
+        let class = label.strip_prefix(&prefix)?;
+        (!class.is_empty()).then(|| class.to_owned())
+    })
+}
+
+/// Whether the runner carries the shared `<repo>-build` routing label.
+#[must_use]
+pub fn has_routing_label(label_names: &[String], repo_short: &str) -> bool {
+    let want = format!("{}-build", repo_short.to_lowercase());
+    label_names.contains(&want)
+}
+
+/// A specific kind of host-class naming/label drift on a runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditIssue {
+    /// Name is not `<repo>-<class>-NN`, so its host class can't be read from the name.
+    NonConformingName,
+    /// Missing the shared `<repo>-build` routing label.
+    MissingRoutingLabel,
+    /// Missing the `<repo>-build-<class>` host-class pin label.
+    MissingHostClassLabel,
+    /// The class in the name and the class in the labels disagree — the name
+    /// may be lying about which host the runner is on.
+    NameLabelClassMismatch,
+}
+
+impl AuditIssue {
+    /// Stable machine-readable code for `--json` consumers.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NonConformingName => "non_conforming_name",
+            Self::MissingRoutingLabel => "missing_routing_label",
+            Self::MissingHostClassLabel => "missing_host_class_label",
+            Self::NameLabelClassMismatch => "name_label_class_mismatch",
+        }
+    }
+
+    /// A class-vs-name mismatch is the only drift that means the name is
+    /// untrustworthy; everything else is a fixable label gap.
+    #[must_use]
+    pub fn is_drift(self) -> bool {
+        matches!(self, Self::NameLabelClassMismatch)
+    }
+
+    /// Human-readable description for the audit table.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::NonConformingName => "name is not <repo>-<class>-NN",
+            Self::MissingRoutingLabel => "missing shared <repo>-build routing label",
+            Self::MissingHostClassLabel => "missing <repo>-build-<class> pin label",
+            Self::NameLabelClassMismatch => "name class and label class disagree",
+        }
+    }
+}
+
+/// Audit result for one runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditFinding {
+    /// Runner name.
+    pub name: String,
+    /// Host class read from the name, if conforming.
+    pub name_class: Option<String>,
+    /// Host class declared by labels, if present.
+    pub label_class: Option<String>,
+    /// Issues found, in stable order. Empty means the runner conforms.
+    pub issues: Vec<AuditIssue>,
+}
+
+impl AuditFinding {
+    /// Whether this finding has any issue at all.
+    #[must_use]
+    pub fn has_issues(&self) -> bool {
+        !self.issues.is_empty()
+    }
+
+    /// Whether any issue is name-untrustworthy drift (vs a fixable label gap).
+    #[must_use]
+    pub fn is_drift(&self) -> bool {
+        self.issues.iter().any(|issue| issue.is_drift())
+    }
+}
+
+/// Audit a repo's runners for host-class naming/label drift. Each runner is
+/// checked for a conforming `<repo>-<class>-NN` name, the shared `<repo>-build`
+/// routing label, a `<repo>-build-<class>` pin label, and agreement between the
+/// class in the name and the class in the labels.
+///
+/// This is pure naming/label logic. Physically confirming that a `*-studio-*`
+/// runner is really on the Studio requires reading the host's machine tag over
+/// SSH (Part B / `runner capacity`); the audit surfaces the claimed class so
+/// that check has something to compare against.
+#[must_use]
+pub fn audit_runners(repo_short: &str, runners: &[ApiRunner]) -> Vec<AuditFinding> {
+    runners
+        .iter()
+        .map(|runner| {
+            let labels = runner.label_names();
+            let name_class = class_from_name(&runner.name, repo_short);
+            let label_class = class_from_labels(&labels, repo_short);
+            let mut issues = Vec::new();
+            if name_class.is_none() {
+                issues.push(AuditIssue::NonConformingName);
+            }
+            if !has_routing_label(&labels, repo_short) {
+                issues.push(AuditIssue::MissingRoutingLabel);
+            }
+            if label_class.is_none() {
+                issues.push(AuditIssue::MissingHostClassLabel);
+            }
+            if let (Some(name_c), Some(label_c)) = (&name_class, &label_class)
+                && name_c != label_c
+            {
+                issues.push(AuditIssue::NameLabelClassMismatch);
+            }
+            AuditFinding {
+                name: runner.name.clone(),
+                name_class,
+                label_class,
+                issues,
+            }
+        })
+        .collect()
+}
+
+/// Render audit findings as an aligned table. Conforming runners are shown as
+/// `ok`; runners with issues list their codes. Sorted by name for stable output.
+#[must_use]
+pub fn format_audit_table(findings: &[AuditFinding]) -> String {
+    if findings.is_empty() {
+        return "No self-hosted runners found.".to_owned();
+    }
+    let mut sorted = findings.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let name_w = sorted
+        .iter()
+        .map(|f| f.name.len())
+        .chain(std::iter::once("RUNNER".len()))
+        .max()
+        .unwrap_or(6);
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{:<name_w$}  {:<10}  ISSUES", "RUNNER", "CLASS");
+    for finding in &sorted {
+        let class = finding
+            .name_class
+            .clone()
+            .or_else(|| finding.label_class.clone())
+            .unwrap_or_else(|| "?".to_owned());
+        let issues = if finding.issues.is_empty() {
+            "ok".to_owned()
+        } else {
+            finding
+                .issues
+                .iter()
+                .map(|issue| issue.describe())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let _ = writeln!(out, "{:<name_w$}  {class:<10}  {issues}", finding.name);
+    }
+    out.trim_end().to_owned()
+}
+
 /// A single row in the `shipyard runner list` pool view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolRow {
@@ -456,6 +646,151 @@ mod tests {
     #[test]
     fn format_pool_table_empty_is_friendly() {
         assert_eq!(format_pool_table(&[]), "No self-hosted runners found.");
+    }
+
+    fn runner_with(name: &str, labels: &[&str]) -> ApiRunner {
+        ApiRunner {
+            name: name.to_owned(),
+            status: "online".to_owned(),
+            busy: false,
+            labels: labels
+                .iter()
+                .map(|l| ApiLabel {
+                    name: (*l).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn class_from_name_reads_conforming_names() {
+        assert_eq!(
+            class_from_name("Shipyard-studio-01", "Shipyard"),
+            Some("studio".to_owned())
+        );
+        assert_eq!(class_from_name("pulp-m1-02", "pulp"), Some("m1".to_owned()));
+        // Case-insensitive on the repo prefix.
+        assert_eq!(
+            class_from_name("SHIPYARD-m5-01", "shipyard"),
+            Some("m5".to_owned())
+        );
+    }
+
+    #[test]
+    fn class_from_name_rejects_non_conforming() {
+        assert_eq!(
+            class_from_name("daniels-macbook-shipyard", "Shipyard"),
+            None
+        );
+        assert_eq!(class_from_name("pulp-studio", "pulp"), None); // no index
+        assert_eq!(class_from_name("other-studio-01", "pulp"), None); // wrong repo
+    }
+
+    #[test]
+    fn class_from_labels_and_routing_label() {
+        let labels = vec![
+            "self-hosted".to_owned(),
+            "shipyard-build".to_owned(),
+            "shipyard-build-studio".to_owned(),
+        ];
+        assert_eq!(
+            class_from_labels(&labels, "Shipyard"),
+            Some("studio".to_owned())
+        );
+        assert!(has_routing_label(&labels, "Shipyard"));
+        assert!(!has_routing_label(&["local-mac".to_owned()], "Shipyard"));
+    }
+
+    #[test]
+    fn audit_clean_runner_has_no_issues() {
+        let runners = vec![runner_with(
+            "shipyard-studio-01",
+            &[
+                "self-hosted",
+                "macos",
+                "arm64",
+                "shipyard-build",
+                "shipyard-build-studio",
+            ],
+        )];
+        let findings = audit_runners("shipyard", &runners);
+        assert_eq!(findings.len(), 1);
+        assert!(!findings[0].has_issues(), "clean runner should pass");
+        assert_eq!(findings[0].name_class, Some("studio".to_owned()));
+    }
+
+    #[test]
+    fn audit_flags_missing_host_class_label_for_local_mac_runner() {
+        // The #325 Shipyard-studio-01: conforming name + local-mac, but missing
+        // the shipyard-build / shipyard-build-studio labels.
+        let runners = vec![runner_with(
+            "Shipyard-studio-01",
+            &["self-hosted", "macos", "arm64", "local-mac"],
+        )];
+        let findings = audit_runners("Shipyard", &runners);
+        assert_eq!(findings[0].name_class, Some("studio".to_owned()));
+        assert!(
+            findings[0]
+                .issues
+                .contains(&AuditIssue::MissingRoutingLabel)
+        );
+        assert!(
+            findings[0]
+                .issues
+                .contains(&AuditIssue::MissingHostClassLabel)
+        );
+        // Name is fine, so this is a fixable label gap, not name-drift.
+        assert!(!findings[0].is_drift());
+    }
+
+    #[test]
+    fn audit_flags_non_conforming_name() {
+        let runners = vec![runner_with(
+            "daniels-macbook-shipyard",
+            &["self-hosted", "macos", "arm64", "local-mac"],
+        )];
+        let findings = audit_runners("Shipyard", &runners);
+        assert!(findings[0].issues.contains(&AuditIssue::NonConformingName));
+        assert_eq!(findings[0].name_class, None);
+    }
+
+    #[test]
+    fn audit_flags_name_label_class_mismatch_as_drift() {
+        // Name says studio, label pins m1 — the name is untrustworthy.
+        let runners = vec![runner_with(
+            "shipyard-studio-01",
+            &["self-hosted", "shipyard-build", "shipyard-build-m1"],
+        )];
+        let findings = audit_runners("shipyard", &runners);
+        assert_eq!(findings[0].name_class, Some("studio".to_owned()));
+        assert_eq!(findings[0].label_class, Some("m1".to_owned()));
+        assert!(
+            findings[0]
+                .issues
+                .contains(&AuditIssue::NameLabelClassMismatch)
+        );
+        assert!(findings[0].is_drift());
+    }
+
+    #[test]
+    fn format_audit_table_shows_ok_and_issues() {
+        let findings = audit_runners(
+            "shipyard",
+            &[
+                runner_with(
+                    "shipyard-studio-01",
+                    &["shipyard-build", "shipyard-build-studio"],
+                ),
+                runner_with("daniels-macbook-shipyard", &["local-mac"]),
+            ],
+        );
+        let table = format_audit_table(&findings);
+        assert!(table.contains("ok"));
+        assert!(table.contains("name is not"));
+        // sorted by name: daniels- before shipyard-
+        let d = table.find("daniels-macbook").expect("row");
+        let s = table.find("shipyard-studio-01").expect("row");
+        assert!(d < s);
     }
 
     #[test]

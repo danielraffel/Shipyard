@@ -208,6 +208,24 @@ shipyard runner remove --name pulp-studio-03 --yes [--purge-dir]
 `list` aggregates across machines straight from GitHub (no controller needed)
 and reconciles local `~/actions-runner-*` dirs against GitHub to flag orphans.
 
+### Audit (host-class drift)
+
+```bash
+shipyard runner audit --repo danielraffel/Shipyard   # exit 1 on any drift
+```
+
+`audit` checks every runner against the host-class scheme — a conforming
+`<repo>-<class>-NN` name, the shared `<repo>-build` routing label, the
+`<repo>-build-<class>` pin label, and agreement between the class in the name
+and the class in the labels. It flags non-conforming names (e.g. a hand-named
+`daniels-macbook-shipyard`) and missing labels (e.g. a runner registered with a
+bespoke `--labels` that dropped `<repo>-build-<class>`), exiting non-zero so CI
+or a cron can gate on a clean fleet. This is the foundation for the M5 joining
+by class with zero bespoke setup. Pure naming/label logic; physically
+confirming a `*-studio-*` runner is on the Studio is `runner capacity`'s job
+(reads the host machine tag over SSH). Full design:
+`planning/2026-06-01-multi-mac-controller.md` (Shipyard #316).
+
 ### Gotchas
 
 - These four subcommands are newer than the watchdog set; an older installed

@@ -21,8 +21,9 @@ use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 use crate::runner_provision::{
-    PoolRow, default_labels, format_pool_table, next_index, orphan_local_runners,
-    parse_runners_response, pool_rows, runner_name, short_repo, validate_machine_tag,
+    AuditFinding, PoolRow, audit_runners, default_labels, format_audit_table, format_pool_table,
+    next_index, orphan_local_runners, parse_runners_response, pool_rows, runner_name, short_repo,
+    validate_machine_tag,
 };
 
 /// jq filter selecting the Apple-silicon macOS runner tarball download URL.
@@ -540,6 +541,128 @@ pub(super) fn list_command<W: Write>(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------- audit ----------
+
+/// Resolve the repo slugs to audit, mirroring `list_command`'s resolution:
+/// explicit `--repo`, local runner dirs, then the current checkout.
+fn resolve_audit_slugs(cwd: &Path, repo: &[String]) -> Result<Vec<String>, CliFailure> {
+    let locals = scan_local_runners();
+    let mut slugs: Vec<String> = Vec::new();
+    let mut push = |slug: String| {
+        if !slug.is_empty() && !slugs.iter().any(|s| s.eq_ignore_ascii_case(&slug)) {
+            slugs.push(slug);
+        }
+    };
+    for r in repo {
+        push(r.clone());
+    }
+    if repo.is_empty() {
+        for local in &locals {
+            push(local.repo_slug.clone());
+        }
+        if let Ok(current) = resolve_repo_slug(None, cwd) {
+            push(current);
+        }
+    }
+    if slugs.is_empty() {
+        return Err(CliFailure::new(
+            1,
+            "No repos to audit. Pass --repo OWNER/REPO, or run where local runner dirs exist.",
+        ));
+    }
+    Ok(slugs)
+}
+
+/// `shipyard runner audit` — flag host-class naming/label drift across a repo's
+/// runners. Exit 0 when every runner conforms; exit 1 when any drift is found
+/// (CI-friendly). Pure logic lives in [`crate::runner_provision::audit_runners`].
+pub(super) fn audit_command<W: Write>(
+    cwd: &Path,
+    actions: &GitHubActions,
+    repo: &[String],
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let slugs = resolve_audit_slugs(cwd, repo)?;
+
+    let mut findings: Vec<(String, AuditFinding)> = Vec::new();
+    for slug in &slugs {
+        let raw = actions
+            .run_gh(&[
+                "api".to_owned(),
+                format!("repos/{slug}/actions/runners?per_page=100"),
+            ])
+            .map_err(|e| CliFailure::new(2, format!("failed to list runners for {slug}: {e}")))?;
+        let parsed = parse_runners_response(&raw).map_err(|e| CliFailure::new(2, e))?;
+        let repo_short = short_repo(slug);
+        for finding in audit_runners(repo_short, &parsed.runners) {
+            findings.push((repo_short.to_owned(), finding));
+        }
+    }
+
+    let with_issues = findings.iter().filter(|(_, f)| f.has_issues()).count();
+    let drift = findings.iter().any(|(_, f)| f.is_drift());
+    let exit = if with_issues == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    };
+
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("repos".to_owned(), Value::from(slugs.clone()));
+        let finding_values: Vec<Value> = findings
+            .iter()
+            .map(|(repo_short, f)| {
+                let mut m = serde_json::Map::new();
+                m.insert("name".to_owned(), Value::from(f.name.clone()));
+                m.insert("repo".to_owned(), Value::from(repo_short.clone()));
+                m.insert(
+                    "name_class".to_owned(),
+                    f.name_class.clone().map_or(Value::Null, Value::from),
+                );
+                m.insert(
+                    "label_class".to_owned(),
+                    f.label_class.clone().map_or(Value::Null, Value::from),
+                );
+                m.insert("ok".to_owned(), Value::from(!f.has_issues()));
+                m.insert("drift".to_owned(), Value::from(f.is_drift()));
+                m.insert(
+                    "issues".to_owned(),
+                    Value::from(
+                        f.issues
+                            .iter()
+                            .map(|i| Value::from(i.code()))
+                            .collect::<Vec<_>>(),
+                    ),
+                );
+                Value::Object(m)
+            })
+            .collect();
+        data.insert("findings".to_owned(), Value::from(finding_values));
+        data.insert("with_issues".to_owned(), Value::from(with_issues));
+        data.insert("drift".to_owned(), Value::from(drift));
+        envelope(stdout, "runner.audit", data)?;
+        return Ok(exit);
+    }
+
+    let bare: Vec<AuditFinding> = findings.into_iter().map(|(_, f)| f).collect();
+    writeln!(stdout, "{}", format_audit_table(&bare)).ok();
+    if with_issues == 0 {
+        writeln!(stdout, "\n✓ All runners conform to the host-class scheme.").ok();
+    } else {
+        writeln!(
+            stdout,
+            "\n⚠︎ {with_issues} runner(s) drift from the host-class scheme \
+             (<repo>-<class>-NN + <repo>-build / <repo>-build-<class>).\n  \
+             Fix labels with `shipyard runner register --labels …` or re-tag/re-register \
+             the host; physical host class is confirmed by `shipyard runner capacity`."
+        )
+        .ok();
+    }
+    Ok(exit)
 }
 
 // ---------- remove ----------

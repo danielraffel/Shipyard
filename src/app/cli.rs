@@ -492,6 +492,14 @@ pub(super) enum RunnerCommand {
         #[arg(long = "all-repos")]
         all_repos: bool,
     },
+    /// Audit runners for host-class naming/label drift (`<repo>-<class>-NN` +
+    /// `<repo>-build` / `<repo>-build-<class>`). Exit 1 when any runner drifts.
+    Audit {
+        /// Owner/repo slug. Repeatable. Defaults to repos discovered from
+        /// local `actions-runner-*` dirs plus the current repo.
+        #[arg(long)]
+        repo: Vec<String>,
+    },
     /// Deregister a runner: stop its launchd service and remove it from GitHub.
     Remove {
         /// Runner name, e.g. `pulp-studio-03`.
