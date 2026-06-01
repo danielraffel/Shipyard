@@ -64,6 +64,15 @@ shipyard runner cleanup --stale-hours 4   # override threshold for this call
 shipyard runner watch                     # poll loop (default 5 min)
 shipyard runner watch --fix               # auto-cancel stale runs each tick
 
+# Self-hosted runner provisioning (register / list / remove on this machine)
+shipyard runner tag --set studio          # set this box's machine tag (m1, m5, …)
+shipyard runner tag                       # print the stored machine tag
+shipyard runner register --repo OWNER/REPO --count 3 --ci-root /path/ci/repo
+shipyard runner register --repo OWNER/REPO --count 3 --dry-run   # plan only
+shipyard runner list --repo OWNER/REPO    # live pool, grouped by machine
+shipyard runner list                      # discover repos from local runner dirs
+shipyard runner remove --name repo-studio-03 --yes   # add --purge-dir to delete the dir
+
 # Explicit Worker termination (snapshot + SIGTERM grace + SIGKILL + quarantine)
 shipyard runner kill --pid 59996 --reason "wedged on agentB/81"
 shipyard runner kill --pid 59996 --reason "..." --retrigger     # re-queue CI

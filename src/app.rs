@@ -34,6 +34,7 @@ mod rescue_cmd;
 mod run_cmd;
 mod runner_cmd;
 mod runner_kill_cmd;
+mod runner_provision_cmd;
 mod ship_cmd;
 mod ship_state_cmd;
 mod targets_cmd;
@@ -462,7 +463,7 @@ fn handle_runner_command<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let config = crate::config::LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    runner_command(command, &config, cwd, json, stdout)
+    runner_command(command, mode, &config, cwd, json, stdout)
 }
 
 struct AutoMergeInvocation {
