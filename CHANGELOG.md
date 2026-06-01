@@ -3,9 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0601"></a>
-## [0.61.0]
+<a id="v0610"></a>
+## [0.61.0] - 2026-06-01
 
+- feat(runner): add register/list/remove/tag provisioning suite ([#323](https://github.com/danielraffel/Shipyard/pull/323))
+- fix(auto-merge): abort when live PR head supersedes the validated SHA (#321) ([#322](https://github.com/danielraffel/Shipyard/pull/322))
+
+<a id="v0601"></a>
 ## [0.60.1] - 2026-05-27
 
 - fix: route app-auth PR fallbacks through REST ([#315](https://github.com/danielraffel/Shipyard/pull/315))
@@ -561,6 +565,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.61.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.61.0
 [0.60.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.60.1
 [0.60.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.60.0
 [0.59.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.59.0
