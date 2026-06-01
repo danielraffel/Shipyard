@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0650"></a>
-## [0.65.1]
+<a id="v0651"></a>
+## [0.65.1] - 2026-06-01
 
+- fix(runner): address Codex review on #316 PRs (paginate runners; drop bad retarget arg) ([#330](https://github.com/danielraffel/Shipyard/pull/330))
+
+<a id="v0650"></a>
 ## [0.65.0] - 2026-06-01
 
 - fix(build): sync Cargo.lock to 0.65.0 after version bump ([#329](https://github.com/danielraffel/Shipyard/pull/329))
@@ -587,6 +590,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.65.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.1
 [0.65.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.0
 [0.64.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.64.0
 [0.63.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.63.0
