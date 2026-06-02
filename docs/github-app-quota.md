@@ -132,8 +132,15 @@ https://github.com/settings/installations/<installation-id>
 ## Configure Shipyard
 
 Shipyard currently uses GitHub App installation tokens through a command helper.
-Use `.shipyard.local/config.toml` for personal paths so private-key locations do
-not land in tracked project config.
+Put the `[github.auth]` block in one of two places — never in the tracked
+project `.shipyard/config.toml`, since it points at private-key paths:
+
+- **Global (recommended for one credential across every repo on the machine):**
+  Shipyard's global config dir. Find it with `shipyard paths` (the `global_dir`
+  value) — on macOS it is `~/Library/Application Support/shipyard/config.toml`.
+  This is what you want when Shipyard inspects many repos from one Mac.
+- **Per-repo:** `.shipyard.local/config.toml` in a single repo, if you only want
+  the App credential for that one checkout.
 
 Example:
 
@@ -206,3 +213,56 @@ shipyard doctor --rate-limit
 The export contains the `[github.auth]` command configuration. It does not
 include GitHub tokens, token caches, private keys, Keychain items, or
 1Password sessions.
+
+## Additional clients (the same App across several Macs)
+
+One GitHub App installation covers every machine — the private key is the App's
+credential, not a per-host secret, so the same `.pem` works on an M1, a Studio,
+an M5, etc. Each additional client needs four things:
+
+1. **Shipyard installed** (`shipyard --version`) plus `python3` and `openssl`
+   (both stock on macOS — the helper signs the JWT with `openssl` and otherwise
+   uses only the Python standard library, so there is nothing to `pip install`).
+2. **The token helper** on disk. Either use a local Shipyard checkout's
+   `scripts/shipyard-github-app-token`, or fetch the standalone script:
+
+   ```bash
+   mkdir -p ~/.config/shipyard/bin
+   curl -fsSL https://raw.githubusercontent.com/danielraffel/Shipyard/main/scripts/shipyard-github-app-token \
+     -o ~/.config/shipyard/bin/shipyard-github-app-token
+   chmod +x ~/.config/shipyard/bin/shipyard-github-app-token
+   ```
+
+3. **The same private key**, transferred securely (AirDrop/`scp` — it cannot be
+   re-downloaded from GitHub). Store and lock it down exactly as above:
+
+   ```bash
+   mkdir -p ~/.config/shipyard/github-apps
+   chmod 700 ~/.config/shipyard ~/.config/shipyard/github-apps
+   # move shipyard-local.private-key.pem into place, then:
+   chmod 600 ~/.config/shipyard/github-apps/shipyard-local.private-key.pem
+   ```
+
+4. **The `[github.auth]` block** in this machine's global config dir (find it
+   with `shipyard paths`; on macOS `~/Library/Application Support/shipyard/config.toml`),
+   with absolute paths to the helper and key on *this* host:
+
+   ```toml
+   [github.auth]
+   source = "command"
+   token_command = [
+     "/Users/you/.config/shipyard/bin/shipyard-github-app-token",
+     "--app-id", "<your App ID>",
+     "--private-key", "/Users/you/.config/shipyard/github-apps/shipyard-local.private-key.pem",
+     "--repo", "{repo_slug}",
+   ]
+   refresh_skew_seconds = 60
+   ```
+
+The App must be installed on the account with access to the repos you target, so
+the helper's `--repo {repo_slug}` installation lookup resolves. Validate the same
+way: `shipyard auth doctor` → `command helper (github-app-installation)` and
+`shipyard doctor --rate-limit` → `.../12500 remaining`. `shipyard auth export`
+on the first machine plus `shipyard auth import` on the next copies the
+*non-secret* config shape, but you still transfer the key and adjust absolute
+paths per host.
