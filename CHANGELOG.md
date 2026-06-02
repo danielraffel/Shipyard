@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0654"></a>
+## [0.65.5]
+
 ## [0.65.4] - 2026-06-01
 
 - fix(reroute): compare --apply guard against the effective dispatch repo (Codex review on #332) ([#333](https://github.com/danielraffel/Shipyard/pull/333))
