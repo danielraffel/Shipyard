@@ -288,7 +288,9 @@ cloud retarget … --provider local --apply`, which works for PRs Shipyard is
 shipping (ship-state-backed). `cloud retarget` has no `--repo` flag — it
 resolves the repo from the current checkout — so run `reroute-watch --apply`
 inside the target repo's checkout (its `--repo` only scopes which queued runs
-are listed, not where the reroute acts). **Follow-up (Part C.2):** rerouting a PR with no
+are listed, not where the reroute acts). To prevent retargeting the wrong repo,
+`--apply` **fails fast** when the monitored `--repo` doesn't match the checkout;
+observe mode may monitor any repo. **Follow-up (Part C.2):** rerouting a PR with no
 ship-state, and spinning an ephemeral JIT VM runner on a free-slot host (drive
 Pulp's `tart-run-job.sh` equivalent) — until then a persistent host-class runner
 handles pickup. Full design: `planning/2026-06-01-multi-mac-controller.md`.

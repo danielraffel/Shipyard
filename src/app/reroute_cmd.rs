@@ -67,6 +67,25 @@ pub(super) fn reroute_watch_command<W: Write>(
         None => super::runner_cmd::resolve_repo_slug(None, cwd)?,
     };
 
+    // `--apply` shells `cloud retarget`, which resolves its repo from cwd (no
+    // `--repo` flag). Refuse to act when the monitored repo isn't this checkout,
+    // or we'd retarget the same-numbered PR in the wrong repo. Observe mode is
+    // unaffected (it only lists candidates).
+    if args.apply {
+        let checkout_repo = super::runner_cmd::resolve_repo_slug(None, cwd)?;
+        if !crate::reroute::apply_repo_is_safe(true, &repo, &checkout_repo) {
+            return Err(CliFailure::new(
+                1,
+                format!(
+                    "--apply monitors {repo} but the current checkout is {checkout_repo}; \
+                     `cloud retarget` resolves the repo from cwd, so run `reroute-watch --apply` \
+                     inside the monitored repo's checkout (or drop --repo). Refusing to retarget \
+                     the wrong repo."
+                ),
+            ));
+        }
+    }
+
     let classes = parse_host_classes(&config.data).map_err(|e| CliFailure::new(2, e))?;
     if classes.is_empty() {
         return Err(CliFailure::new(
