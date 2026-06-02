@@ -135,6 +135,15 @@ pub fn macos_job_targets_cloud(labels_csv: &str) -> bool {
     CLOUD_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
+/// Whether `--apply` is safe to act: `cloud retarget` has no `--repo` flag and
+/// resolves its repo from the current checkout, so the monitored repo must match
+/// the checkout — otherwise an `--apply` reroute would target the same-numbered
+/// PR in the *wrong* repo. Observe mode (no apply) may freely monitor any repo.
+#[must_use]
+pub fn apply_repo_is_safe(apply: bool, monitored_repo: &str, checkout_repo: &str) -> bool {
+    !apply || monitored_repo.eq_ignore_ascii_case(checkout_repo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +233,20 @@ mod tests {
             "namespace-profile-generouscorp-macos"
         ));
         assert!(macos_job_targets_cloud("nscloud-macos"));
+    }
+
+    #[test]
+    fn apply_repo_guard_blocks_cross_repo_apply_only() {
+        // Observe mode: any monitored repo is fine.
+        assert!(apply_repo_is_safe(false, "owner/other", "owner/here"));
+        // Apply + matching repo (case-insensitive): safe.
+        assert!(apply_repo_is_safe(
+            true,
+            "danielraffel/Shipyard",
+            "danielraffel/shipyard"
+        ));
+        // Apply + different repo: unsafe (would retarget the wrong repo's PR).
+        assert!(!apply_repo_is_safe(true, "owner/other", "owner/here"));
     }
 
     #[test]
