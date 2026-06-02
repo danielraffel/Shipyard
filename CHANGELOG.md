@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0652"></a>
+## [0.65.3]
+
 ## [0.65.2] - 2026-06-01
 
 - fix(pr): honor threaded github.auth in PR creation; document App-auth global config + multi-client ([#331](https://github.com/danielraffel/Shipyard/pull/331))
