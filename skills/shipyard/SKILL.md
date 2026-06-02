@@ -159,6 +159,25 @@ watch_interval_seconds = 300
 auto_fix = false
 ```
 
+## Profiles & per-machine routing
+
+`shipyard config profiles` lists profiles + the active one; `config use <profile>`
+switches it. The `--json` form reports `active_source` (`local` | `tracked` |
+`global` | `none`) and the resolved config paths.
+
+- `config use <profile>` writes the **tracked** `.shipyard/config.toml` — changes
+  the active profile for everyone (a committed change).
+- `config use <profile> --local` writes the per-machine `.shipyard.local/config.toml`
+  overlay instead: switches routing for **this machine only**, tracked config
+  untouched, nothing in `git status`. In a git worktree it writes the current
+  checkout's own overlay, never a borrowed main-checkout one.
+- `repo_root` now rides in `ship-state list --json` so a GUI (the menu-bar app)
+  can run repo-scoped config commands in the right checkout dir.
+
+GitHub repo Variables that route *everyone's* CI (e.g.
+`PULP_LOCAL_MACOS_RUNS_ON_JSON`) are a separate, repo-wide layer — manage those
+with `gh variable`, not `shipyard config`.
+
 ## Runner Provisioning (register / list / remove / tag)
 
 The `runner` family also *provisions* self-hosted GitHub Actions runners, not

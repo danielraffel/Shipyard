@@ -574,6 +574,17 @@ When multiple jobs are queued (common with parallel worktrees):
 - `shipyard bump <id> low` — deprioritize a job
 - `shipyard cancel <id>` — cancel a pending or running job
 
+## Profiles (`config use`, and `--local` for per-machine)
+
+`shipyard config use <profile>` switches the active validation profile by writing
+the tracked `.shipyard/config.toml`. Add `--local` to switch it for **this
+machine only** (writes the gitignored `.shipyard.local/config.toml` overlay,
+leaving the committed config untouched) — use this on a machine that should
+validate differently (e.g. a VM-only laptop routing to cloud) without changing CI
+for collaborators. `config use ... --json` and `config profiles --json` report
+`active_source` (`local`/`tracked`/`global`) so tooling can show which is in
+effect. See the `shipyard` skill for the full profile/routing model.
+
 ## Target configuration
 
 Targets are defined in `.shipyard/config.toml`:

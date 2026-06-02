@@ -767,6 +767,7 @@ mod tests {
                 request: QueuedExecutionRequest::Ship(QueuedShipRequest {
                     pr,
                     repo: repo.to_owned(),
+                    repo_root: String::new(),
                     branch: "feature".to_owned(),
                     base_branch: "main".to_owned(),
                     sha: "abc123".to_owned(),

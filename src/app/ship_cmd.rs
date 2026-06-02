@@ -101,9 +101,14 @@ pub(super) fn ship_command<W: Write>(
     let warm_pool = WarmPool::new(default_pool_path(&runtime_paths.state_dir));
     let dispatcher =
         ExecutorDispatcher::new_with_state_dir(Some(prepared), &runtime_paths.state_dir);
+    // Absolute repo checkout root (dir holding `.shipyard/`) so ship-state can
+    // tell a GUI where to run repo-scoped config commands. Re-derived on resume.
+    let repo_root = git_optional(cwd, &["rev-parse", "--show-toplevel"])
+        .unwrap_or_else(|| cwd.display().to_string());
     let request = ShipExecutionRequest {
         pr: pr_context.number,
         repo,
+        repo_root,
         branch,
         base_branch: pr_context.base_branch,
         sha,

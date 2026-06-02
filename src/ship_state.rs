@@ -59,6 +59,11 @@ pub struct ShipState {
     pub pr: u64,
     /// Repository slug.
     pub repo: String,
+    /// Absolute path to the repo checkout root (the dir that contains
+    /// `.shipyard/`). Lets a GUI run repo-scoped config commands in the right
+    /// directory. Empty (`""`) for legacy records written before this field.
+    #[serde(default)]
+    pub repo_root: String,
     /// Head branch name.
     pub branch: String,
     /// Base branch name.
@@ -108,6 +113,7 @@ impl ShipState {
             schema_version: SHIP_STATE_SCHEMA_VERSION,
             pr,
             repo: repo.into(),
+            repo_root: String::new(),
             branch: branch.into(),
             base_branch: base_branch.into(),
             head_sha: head_sha.into(),
@@ -740,5 +746,23 @@ mod tests {
         assert!(state.updated_at >= original);
         assert!(!state.is_sha_drift("abc"));
         assert!(state.is_sha_drift("def"));
+    }
+
+    #[test]
+    fn deserializes_legacy_state_without_repo_root() {
+        // A record written before the `repo_root` field must decode with
+        // `repo_root == ""` (serde default), not fail.
+        let json = r#"{
+            "pr": 7,
+            "repo": "danielraffel/pulp",
+            "branch": "feature/x",
+            "base_branch": "main",
+            "head_sha": "abc123",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let state: ShipState = serde_json::from_str(json).expect("decode legacy state");
+        assert_eq!(state.repo_root, "");
+        assert_eq!(state.repo, "danielraffel/pulp");
     }
 }

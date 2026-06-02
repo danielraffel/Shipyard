@@ -366,6 +366,10 @@ pub struct QueuedShipRequest {
     pub pr: u64,
     /// Repository slug.
     pub repo: String,
+    /// Absolute repo checkout root (dir containing `.shipyard/`); preserved so a
+    /// resumed ship keeps it. Empty for legacy snapshots written before this field.
+    #[serde(default)]
+    pub repo_root: String,
     /// Head branch.
     pub branch: String,
     /// Base branch.
@@ -399,6 +403,7 @@ impl From<&ShipExecutionRequest> for QueuedShipRequest {
         Self {
             pr: request.pr,
             repo: request.repo.clone(),
+            repo_root: request.repo_root.clone(),
             branch: request.branch.clone(),
             base_branch: request.base_branch.clone(),
             sha: request.sha.clone(),
@@ -422,6 +427,7 @@ impl QueuedShipRequest {
         Ok(ShipExecutionRequest {
             pr: self.pr,
             repo: self.repo.clone(),
+            repo_root: self.repo_root.clone(),
             branch: self.branch.clone(),
             base_branch: self.base_branch.clone(),
             sha: self.sha.clone(),
@@ -1584,6 +1590,7 @@ mod tests {
         ShipExecutionRequest {
             pr: 42,
             repo: "danielraffel/shipyard".to_owned(),
+            repo_root: "/tmp/shipyard".to_owned(),
             branch: "feat/ship".to_owned(),
             base_branch: "main".to_owned(),
             sha: "def456".to_owned(),
@@ -1687,6 +1694,7 @@ mod tests {
         let state = ShipState {
             pr: request.pr,
             repo: request.repo.clone(),
+            repo_root: request.repo_root.clone(),
             branch: request.branch.clone(),
             base_branch: request.base_branch.clone(),
             head_sha: request.sha.clone(),

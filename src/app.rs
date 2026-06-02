@@ -1317,6 +1317,170 @@ mod tests {
     }
 
     #[test]
+    fn config_use_local_creates_overlay_and_preserves_tracked_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join(".shipyard");
+        let tracked = project_dir.join("config.toml");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(
+            &tracked,
+            r#"
+            [project]
+            profile = "fast"
+
+            [profiles.fast]
+            targets = ["mac"]
+
+            [profiles.full]
+            targets = ["mac", "linux"]
+            "#,
+        )
+        .expect("config");
+        let tracked_before = std::fs::read_to_string(&tracked).expect("read tracked");
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "config",
+            "use",
+            "full",
+            "--local",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "config.use");
+        assert_eq!(value["scope"], "local");
+        assert_eq!(value["active_source"], "local");
+
+        // Central locked decision: the tracked config is byte-for-byte unchanged.
+        assert_eq!(
+            std::fs::read_to_string(&tracked).expect("read tracked after"),
+            tracked_before
+        );
+        // The per-machine overlay is created with the chosen profile.
+        let overlay = temp.path().join(".shipyard.local").join("config.toml");
+        let overlay_text = std::fs::read_to_string(&overlay).expect("read overlay");
+        assert!(overlay_text.contains("profile = \"full\""));
+    }
+
+    #[test]
+    fn config_profiles_json_reports_active_source_local_over_tracked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join(".shipyard");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(
+            project_dir.join("config.toml"),
+            r#"
+            [project]
+            profile = "fast"
+
+            [profiles.fast]
+            targets = ["mac"]
+
+            [profiles.full]
+            targets = ["mac", "linux"]
+            "#,
+        )
+        .expect("tracked");
+        let local_dir = temp.path().join(".shipyard.local");
+        std::fs::create_dir_all(&local_dir).expect("local dir");
+        std::fs::write(
+            local_dir.join("config.toml"),
+            "[project]\nprofile = \"full\"\n",
+        )
+        .expect("local");
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "config",
+            "profiles",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["active"], "full");
+        assert_eq!(value["active_source"], "local");
+        assert_eq!(value["local_overlay_source"], "direct");
+    }
+
+    #[test]
+    fn config_profiles_json_reports_tracked_active_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join(".shipyard");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(
+            project_dir.join("config.toml"),
+            "[project]\nprofile = \"fast\"\n\n[profiles.fast]\ntargets = [\"mac\"]\n",
+        )
+        .expect("tracked");
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "config",
+            "profiles",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["active"], "fast");
+        assert_eq!(value["active_source"], "tracked");
+    }
+
+    #[test]
+    fn config_use_local_rejects_unknown_profile_without_writing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join(".shipyard");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(
+            project_dir.join("config.toml"),
+            "[profiles.fast]\ntargets = [\"mac\"]\n",
+        )
+        .expect("tracked");
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "config",
+            "use",
+            "nope",
+            "--local",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_ne!(code, ExitCode::SUCCESS);
+        // Rejected before any write: no overlay created.
+        assert!(
+            !temp
+                .path()
+                .join(".shipyard.local")
+                .join("config.toml")
+                .exists()
+        );
+    }
+
+    #[test]
     fn queue_json_reports_empty_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cli = Cli::parse_from([

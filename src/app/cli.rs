@@ -632,6 +632,11 @@ pub(super) enum ConfigCommand {
     Use {
         /// Profile name to activate.
         profile_name: String,
+        /// Write the active profile to the per-machine repo overlay
+        /// (`.shipyard.local/config.toml`) instead of the tracked config, so the
+        /// switch is local to this machine and never dirties committed config.
+        #[arg(long)]
+        local: bool,
     },
 }
 

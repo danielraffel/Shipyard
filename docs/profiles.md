@@ -35,6 +35,24 @@ $ shipyard config use normal         # Mac + GitHub-hosted cloud
 $ shipyard config use full           # Mac + VMs + cloud fallback
 ```
 
+### Per-machine switching (`--local`)
+
+`config use` writes the **tracked** `.shipyard/config.toml` — a committed change
+that switches the profile for everyone. To switch only for **your machine**, add
+`--local`:
+
+```bash
+$ shipyard config use cloud --local  # this machine ships via cloud; repo default unchanged
+```
+
+`--local` writes the active profile to the gitignored `.shipyard.local/config.toml`
+overlay, which merges over the tracked config. Collaborators are unaffected, and
+nothing shows up in `git status`. `config profiles --json` reports
+`active_source` (`local` | `tracked` | `global`) so tooling (e.g. the menu-bar
+app) can show whether you're on a per-machine override or the repo default. In a
+git worktree, `--local` writes the current checkout's own overlay rather than a
+borrowed main-checkout overlay.
+
 ## See what's active
 
 ```bash

@@ -55,6 +55,9 @@ pub struct ShipExecutionRequest {
     pub pr: u64,
     /// Repository slug.
     pub repo: String,
+    /// Absolute path to the repo checkout root (dir containing `.shipyard/`),
+    /// carried into ship-state so a GUI can run repo-scoped config commands.
+    pub repo_root: String,
     /// Head branch.
     pub branch: String,
     /// Base branch.
@@ -774,6 +777,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
     let shim = ShipExecutionRequest {
         pr: 0,
         repo: String::new(),
+        repo_root: String::new(),
         branch: request.branch.clone(),
         base_branch: String::new(),
         sha: request.sha.clone(),
@@ -1265,6 +1269,7 @@ fn unsaved_ship_state(request: &ShipExecutionRequest, target_names: &[String]) -
         request.sha.clone(),
         policy_signature(&request.targets, target_names, request.mode),
     );
+    state.repo_root.clone_from(&request.repo_root);
     refresh_pr_metadata(&mut state, request);
     state
 }
@@ -1437,6 +1442,7 @@ fn load_or_create_state(
         request.sha.clone(),
         policy,
     );
+    state.repo_root.clone_from(&request.repo_root);
     refresh_pr_metadata(&mut state, request);
     if state.pr_url.is_empty() && !request.repo.is_empty() {
         state.pr_url = format!("https://github.com/{}/pull/{}", request.repo, request.pr);
@@ -1835,6 +1841,7 @@ mod tests {
         ShipExecutionRequest {
             pr: 42,
             repo: "danielraffel/pulp".to_owned(),
+            repo_root: String::new(),
             branch: "feature/test".to_owned(),
             base_branch: "main".to_owned(),
             sha: "abc".to_owned(),
