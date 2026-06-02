@@ -47,6 +47,10 @@ When debugging GitHub behavior:
 - Run `shipyard doctor --rate-limit --json` to see the effective auth source
   and REST/GraphQL buckets. This actively resolves configured auth, so command
   helpers may run and GitHub App helpers may mint installation tokens.
+- Optional-provider rows stay green when unused: `nsc` reads "not configured
+  (optional)" unless a Namespace provider is configured, and a `{repo_slug}`
+  `token_command` that can't resolve in a repo-less context (doctor/daemon) is
+  green with a "pin `--repo`" hint rather than a red "misconfigured".
 - Check `.shipyard/config.toml`, `.shipyard.local/config.toml`, and global
   config for `[github.auth]` before assuming ambient `gh auth status` explains
   the operation.

@@ -11,7 +11,9 @@ use crate::daemon_version::{DaemonVersionRelation, read_daemon_version_relation}
 use crate::executor::dispatch::{
     ExecutorDispatcher, ResolvedBackend, ResolvedTarget, resolve_targets,
 };
-use crate::gh::{GhAuthPolicy, GhAuthSourceSummary, GhAuthSummary, GhClient, GhSupervision};
+use crate::gh::{
+    GhAuthPolicy, GhAuthSourceSummary, GhAuthSummary, GhClient, GhPrepareError, GhSupervision,
+};
 use crate::identity::RuntimeMode;
 use crate::job::ValidationMode;
 
@@ -160,7 +162,13 @@ pub fn collect_report(
     {
         cloud.insert("gh-scope".to_owned(), entry);
     }
-    cloud.insert("nsc".to_owned(), check_command(probe, "nsc", &["version"]));
+    cloud.insert(
+        "nsc".to_owned(),
+        nsc_entry(
+            probe.probe("nsc", &["version"]),
+            namespace_in_use(mode, cwd),
+        ),
+    );
     checks.insert("Cloud providers".to_owned(), cloud);
 
     let mut release = BTreeMap::new();
@@ -218,6 +226,51 @@ fn check_command(probe: &impl CommandProbe, command: &str, args: &[&str]) -> Doc
     probe
         .probe(command, args)
         .map_or_else(DoctorEntry::missing, DoctorEntry::ok)
+}
+
+/// Doctor entry for the Namespace CLI (`nsc`).
+///
+/// `nsc` is only needed when CI runs on Namespace runners. Treat it as an
+/// optional provider: if it's installed, report its version; if it's absent and
+/// the user hasn't configured Namespace anywhere, report a calm "not configured
+/// (optional)" green row (same idiom as `rich-bundle`) rather than a red ✗.
+/// It only fails when Namespace IS configured but the CLI is missing.
+fn nsc_entry(version: Option<String>, namespace_configured: bool) -> DoctorEntry {
+    match version {
+        Some(version) => DoctorEntry::ok(version),
+        None if namespace_configured => DoctorEntry::missing(),
+        None => DoctorEntry {
+            ok: true,
+            version: Some("not configured (optional)".to_owned()),
+            detail: Some(
+                "Namespace Cloud CLI (nsc) is not installed. It's only needed if you run CI on Namespace runners; setups using GitHub-hosted or local runners can ignore this.".to_owned(),
+            ),
+            error: None,
+        },
+    }
+}
+
+/// Whether the merged config opts into Namespace anywhere — either the global
+/// `cloud.provider = "namespace"` or a per-target provider override. Used to
+/// decide whether a missing `nsc` is a real failure or just an unused optional.
+/// Returns false (treat as not in use) when config can't be loaded.
+fn namespace_in_use(mode: RuntimeMode, cwd: &Path) -> bool {
+    let Ok(config) = LoadedConfig::load_from_cwd(mode, cwd) else {
+        return false;
+    };
+    if config.get_str("cloud.provider") == Some("namespace") {
+        return true;
+    }
+    let Some(targets) = config.data.get("targets").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    targets.values().any(|target| {
+        target.as_table().is_some_and(|table| {
+            ["provider", "runner_provider"]
+                .iter()
+                .any(|key| table.get(*key).and_then(toml::Value::as_str) == Some("namespace"))
+        })
+    })
 }
 
 fn is_runner_target(target: &ResolvedTarget) -> bool {
@@ -646,21 +699,54 @@ pub fn check_github_auth(mode: RuntimeMode, cwd: &Path) -> DoctorEntry {
     github_auth_entry_result(&result)
 }
 
-fn github_auth_summary(mode: RuntimeMode, cwd: &Path) -> Result<GhAuthSummary, String> {
-    let client = GhClient::from_cwd(mode, cwd).map_err(|error| error.to_string())?;
-    client
-        .auth_summary(cwd, GhAuthPolicy::Default)
-        .map_err(|error| error.to_string())
+/// Why a configured `[github.auth]` source couldn't be summarized — kept typed
+/// so the doctor entry can distinguish a context-dependent placeholder (benign)
+/// from a genuinely broken source.
+enum GhAuthCheckError {
+    /// Couldn't even construct the gh client (config load / parse error).
+    Client(String),
+    /// The configured source failed to produce a token.
+    Prepare(GhPrepareError),
 }
 
-fn github_auth_entry_result(result: &Result<GhAuthSummary, String>) -> DoctorEntry {
+impl GhAuthCheckError {
+    fn message(&self) -> String {
+        match self {
+            Self::Client(error) => error.clone(),
+            Self::Prepare(error) => error.to_string(),
+        }
+    }
+}
+
+fn github_auth_summary(mode: RuntimeMode, cwd: &Path) -> Result<GhAuthSummary, GhAuthCheckError> {
+    let client = GhClient::from_cwd(mode, cwd)
+        .map_err(|error| GhAuthCheckError::Client(error.to_string()))?;
+    client
+        .auth_summary(cwd, GhAuthPolicy::Default)
+        .map_err(GhAuthCheckError::Prepare)
+}
+
+fn github_auth_entry_result(result: &Result<GhAuthSummary, GhAuthCheckError>) -> DoctorEntry {
     match result {
         Ok(summary) => github_auth_entry(summary),
+        // A repo-placeholder token_command can't be filled in a repo-less
+        // context (doctor/daemon run outside a checkout) — but it resolves fine
+        // when Shipyard runs inside a repo. That's expected, not broken, so keep
+        // it green with guidance rather than a red ✗.
+        Err(GhAuthCheckError::Prepare(GhPrepareError::RepoSlugRequired)) => DoctorEntry {
+            ok: true,
+            version: Some("configured (resolves inside a repo)".to_owned()),
+            detail: Some(
+                "A [github.auth] token_command is configured with a repo placeholder ({repo_slug}/{repo_name}), which can't be filled in a repo-less context like `doctor` or the daemon. It resolves normally when Shipyard runs inside a repo. To make it resolve everywhere (e.g. an account-wide GitHub App), pin a repo by replacing {repo_slug} with `--repo <owner>/<name>`.".to_owned(),
+            ),
+            error: None,
+        },
         Err(error) => DoctorEntry {
             ok: false,
             version: Some("misconfigured".to_owned()),
             detail: Some(format!(
-                "Configured [github.auth] could not be resolved: {error}. Shipyard fails closed and will not silently fall back to ambient gh auth."
+                "A [github.auth] token source is configured but couldn't produce a token: {}. This only affects setups that opt into a custom token source — if you authenticate with the GitHub CLI, remove the [github.auth] section and Shipyard will use your ambient `gh` login.",
+                error.message()
             )),
             error: Some("github auth unavailable".to_owned()),
         },
@@ -1019,15 +1105,16 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        CommandProbe, DoctorCommandOutput, DoctorReport, ReleaseBotSecretState,
+        CommandProbe, DoctorCommandOutput, DoctorReport, GhAuthCheckError, ReleaseBotSecretState,
         check_daemon_version_drift_with, check_gh_workflow_scope_for_auth,
         check_gh_workflow_scope_with, check_macos_gatekeeper_health_with,
         check_release_bot_token_with, check_shipyard_path_shadows_with, check_tag_drift_with,
-        collect_report, configured_token_scope_entry, github_auth_entry, is_runner_target,
-        parse_github_repo_slug, release_chain_result_entry, runner_check,
+        collect_report, configured_token_scope_entry, github_auth_entry, github_auth_entry_result,
+        is_runner_target, nsc_entry, parse_github_repo_slug, release_chain_result_entry,
+        runner_check,
     };
     use crate::executor::dispatch::{ExecutorDispatcher, resolve_targets_from_table};
-    use crate::gh::{GhAuthSourceSummary, GhAuthSummary};
+    use crate::gh::{GhAuthSourceSummary, GhAuthSummary, GhPrepareError};
     use crate::identity::RuntimeMode;
     use crate::job::ValidationMode;
 
@@ -1063,7 +1150,66 @@ mod tests {
         assert!(report.checks["Core"]["git"].ok);
         assert!(report.checks["Core"]["ssh"].ok);
         assert!(!report.checks["Cloud providers"]["gh"].ok);
-        assert!(!report.checks["Cloud providers"]["nsc"].ok);
+        // nsc is an optional provider: absent + unconfigured reads as a calm
+        // green "not configured (optional)", not a red ✗.
+        let nsc = &report.checks["Cloud providers"]["nsc"];
+        assert!(nsc.ok);
+        assert_eq!(nsc.version.as_deref(), Some("not configured (optional)"));
+    }
+
+    #[test]
+    fn nsc_entry_reports_version_when_installed() {
+        let entry = nsc_entry(Some("nsc 1.2.3".to_owned()), false);
+        assert!(entry.ok);
+        assert_eq!(entry.version.as_deref(), Some("nsc 1.2.3"));
+    }
+
+    #[test]
+    fn nsc_entry_is_optional_green_when_absent_and_unconfigured() {
+        let entry = nsc_entry(None, false);
+        assert!(entry.ok);
+        assert_eq!(entry.version.as_deref(), Some("not configured (optional)"));
+        assert!(entry.error.is_none());
+    }
+
+    #[test]
+    fn nsc_entry_fails_when_configured_but_missing() {
+        let entry = nsc_entry(None, true);
+        assert!(!entry.ok);
+        assert_eq!(entry.error.as_deref(), Some("not installed"));
+    }
+
+    #[test]
+    fn github_auth_repo_slug_in_repoless_context_is_green_not_misconfigured() {
+        let entry = github_auth_entry_result(&Err(GhAuthCheckError::Prepare(
+            GhPrepareError::RepoSlugRequired,
+        )));
+        assert!(
+            entry.ok,
+            "repo-context placeholder should not read as broken"
+        );
+        assert!(entry.error.is_none());
+        assert!(
+            entry
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("--repo <owner>/<name>"),
+            "should suggest pinning a repo"
+        );
+    }
+
+    #[test]
+    fn github_auth_broken_source_is_red_with_gh_fallback_hint() {
+        let entry = github_auth_entry_result(&Err(GhAuthCheckError::Prepare(
+            GhPrepareError::HelperStdoutEmpty,
+        )));
+        assert!(!entry.ok);
+        // No longer leads with the alarming "fails closed" wording; instead it
+        // tells gh-only users they can just drop [github.auth].
+        let detail = entry.detail.as_deref().unwrap();
+        assert!(detail.contains("ambient `gh`"));
+        assert!(!detail.contains("fails closed"));
     }
 
     #[test]
