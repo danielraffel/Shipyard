@@ -181,8 +181,8 @@ $ shipyard doctor
 
   Cloud providers:
     ✓ gh 2.62.0 (authenticated as danielraffel)
-    ✗ nsc — not installed
-      → Install with: brew install namespace-cli
+    ✓ nsc — not configured (optional)
+      Only needed for Namespace runners; install with: brew install namespace-cli
 
   SSH targets:
     ✓ ubuntu — reachable (847ms)
