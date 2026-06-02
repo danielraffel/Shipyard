@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0653"></a>
-## [0.65.4]
+<a id="v0654"></a>
+## [0.65.4] - 2026-06-01
 
+- fix(reroute): compare --apply guard against the effective dispatch repo (Codex review on #332) ([#333](https://github.com/danielraffel/Shipyard/pull/333))
+
+<a id="v0653"></a>
 ## [0.65.3] - 2026-06-01
 
 - fix(reroute): fail fast on cross-repo --apply (Codex review on #330) ([#332](https://github.com/danielraffel/Shipyard/pull/332))
@@ -602,6 +605,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.65.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.4
 [0.65.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.3
 [0.65.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.2
 [0.65.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.1
