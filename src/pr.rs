@@ -7,8 +7,8 @@ use std::process::Command;
 
 use serde_json::Value;
 
+use crate::config::LoadedConfig;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
-use crate::identity::RuntimeMode;
 
 /// GitHub pull request metadata needed by ship orchestration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,11 +73,12 @@ pub fn push_branch(cwd: &Path, branch: &str) -> Result<(), PrError> {
 
 /// Find the first open PR for `branch`.
 pub fn find_pr_for_branch(
+    config: &LoadedConfig,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
 ) -> Result<Option<PrInfo>, PrError> {
-    let client = gh_client(cwd)?;
+    let client = gh_client(config)?;
     let output = gh(&client, cwd, gh_command)?
         .args([
             "pr",
@@ -108,6 +109,7 @@ pub fn find_pr_for_branch(
 
 /// Create a PR and normalize its metadata through `gh pr view`.
 pub fn create_pr(
+    config: &LoadedConfig,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
@@ -115,7 +117,7 @@ pub fn create_pr(
     title: &str,
     body: &str,
 ) -> Result<PrInfo, PrError> {
-    let client = gh_client(cwd)?;
+    let client = gh_client(config)?;
     let output = gh(&client, cwd, gh_command)?
         .args([
             "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
@@ -149,11 +151,12 @@ pub fn create_pr(
 
 /// Return normalized PR metadata for a PR selector.
 pub fn get_pr_status(
+    config: &LoadedConfig,
     cwd: &Path,
     gh_command: Option<&Path>,
     selector: &str,
 ) -> Result<PrInfo, PrError> {
-    let client = gh_client(cwd)?;
+    let client = gh_client(config)?;
     get_pr_status_with_client(&client, cwd, gh_command, selector)
 }
 
@@ -180,8 +183,12 @@ fn get_pr_status_with_client(
 
 const PR_JSON_FIELDS: &str = "number,url,title,state,headRefName,baseRefName";
 
-fn gh_client(cwd: &Path) -> Result<GhClient, PrError> {
-    GhClient::from_cwd(RuntimeMode::Shipyard, cwd)
+fn gh_client(config: &LoadedConfig) -> Result<GhClient, PrError> {
+    // Build the gh client from the caller's already-resolved config (not a
+    // fresh `from_cwd` read of the real global dir) so PR creation honors the
+    // same `[github.auth]` the rest of the ship used — and so tests that pass an
+    // isolated config don't pick up the operator's global GitHub App auth.
+    GhClient::from_loaded_config(config)
         .map_err(|error| PrError::new(format!("github auth config failed: {error}")))
 }
 

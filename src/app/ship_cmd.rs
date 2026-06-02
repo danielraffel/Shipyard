@@ -82,6 +82,7 @@ pub(super) fn ship_command<W: Write>(
     }
     let lane_policy = resolve_lane_policy(config, cwd);
     let pr_context = resolve_pr_context(
+        config,
         args.pr,
         &args.base,
         cwd,
@@ -405,6 +406,7 @@ struct ResolvedPrContext {
 }
 
 fn resolve_pr_context(
+    config: &LoadedConfig,
     pr: Option<u64>,
     base: &str,
     cwd: &Path,
@@ -422,10 +424,10 @@ fn resolve_pr_context(
     }
 
     push_branch(cwd, branch).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let info = find_pr_for_branch(cwd, gh_command, branch)
+    let info = find_pr_for_branch(config, cwd, gh_command, branch)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .map_or_else(
-            || create_current_branch_pr(cwd, gh_command, branch, base, lane_policy),
+            || create_current_branch_pr(config, cwd, gh_command, branch, base, lane_policy),
             Ok::<PrInfo, CliFailure>,
         )?;
     Ok(ResolvedPrContext {
@@ -437,6 +439,7 @@ fn resolve_pr_context(
 }
 
 fn create_current_branch_pr(
+    config: &LoadedConfig,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
@@ -444,6 +447,7 @@ fn create_current_branch_pr(
     lane_policy: &LanePolicy,
 ) -> Result<PrInfo, CliFailure> {
     create_pr(
+        config,
         cwd,
         gh_command,
         branch,
