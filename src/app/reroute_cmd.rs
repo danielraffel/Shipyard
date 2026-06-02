@@ -67,20 +67,24 @@ pub(super) fn reroute_watch_command<W: Write>(
         None => super::runner_cmd::resolve_repo_slug(None, cwd)?,
     };
 
-    // `--apply` shells `cloud retarget`, which resolves its repo from cwd (no
-    // `--repo` flag). Refuse to act when the monitored repo isn't this checkout,
-    // or we'd retarget the same-numbered PR in the wrong repo. Observe mode is
-    // unaffected (it only lists candidates).
+    // `--apply` shells `cloud retarget`, which has no `--repo` flag and dispatches
+    // to its *effective* repo: the `[cloud].repository` override if set, else the
+    // current checkout. Refuse to act when the monitored repo isn't that dispatch
+    // target, or we'd retarget the same-numbered PR in the wrong repo. A
+    // configured `[cloud].repository` that matches `--repo` is a supported
+    // cross-repo controller setup and is allowed. Observe mode is unaffected.
     if args.apply {
-        let checkout_repo = super::runner_cmd::resolve_repo_slug(None, cwd)?;
-        if !crate::reroute::apply_repo_is_safe(true, &repo, &checkout_repo) {
+        let dispatch_repo = match config.get_str("cloud.repository") {
+            Some(configured) => configured.to_owned(),
+            None => super::runner_cmd::resolve_repo_slug(None, cwd)?,
+        };
+        if !crate::reroute::apply_repo_is_safe(true, &repo, &dispatch_repo) {
             return Err(CliFailure::new(
                 1,
                 format!(
-                    "--apply monitors {repo} but the current checkout is {checkout_repo}; \
-                     `cloud retarget` resolves the repo from cwd, so run `reroute-watch --apply` \
-                     inside the monitored repo's checkout (or drop --repo). Refusing to retarget \
-                     the wrong repo."
+                    "--apply monitors {repo} but `cloud retarget` would dispatch to {dispatch_repo} \
+                     (set `[cloud].repository` to {repo}, run inside that repo's checkout, or drop \
+                     --repo). Refusing to retarget the wrong repo."
                 ),
             ));
         }
