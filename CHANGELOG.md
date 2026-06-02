@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0651"></a>
+## [0.65.2]
+
 ## [0.65.1] - 2026-06-01
 
 - fix(runner): address Codex review on #316 PRs (paginate runners; drop bad retarget arg) ([#330](https://github.com/danielraffel/Shipyard/pull/330))

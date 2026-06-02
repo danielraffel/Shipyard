@@ -33,6 +33,15 @@ are injected only into child `gh` commands as `GH_TOKEN`; Shipyard must never
 write raw tokens, GitHub App private keys, Keychain items, 1Password sessions,
 or token caches to config, state, logs, or release artifacts.
 
+To raise the quota above the ambient `gh` user token's 5,000/hr, point
+`[github.auth]` at a GitHub App installation token helper
+(`scripts/shipyard-github-app-token`) for the 12,500/hr installation bucket.
+Put the block in the **global** config dir (find it with `shipyard paths`;
+macOS `~/Library/Application Support/shipyard/config.toml`) to cover every repo
+on the machine — not the tracked project config. The same App private key works
+across multiple Macs (M1/Studio/M5). Full setup, permissions, and the
+additional-client steps: [`docs/github-app-quota.md`](../../docs/github-app-quota.md).
+
 When debugging GitHub behavior:
 
 - Run `shipyard doctor --rate-limit --json` to see the effective auth source
