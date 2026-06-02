@@ -812,6 +812,11 @@ mod tests {
         assert!(parse_dot_runner("not json").is_none());
     }
 
+    // Runner provisioning targets self-hosted macOS runners and the env file's
+    // cache paths are built with `Path::join`, so the forward-slash assertions
+    // only hold on Unix. On a Windows CI build host the separators are `\`,
+    // which is a false failure — gate the path-format assertion to Unix.
+    #[cfg(unix)]
     #[test]
     fn runner_env_file_points_at_shared_caches() {
         let env = runner_env_file(
