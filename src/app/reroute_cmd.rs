@@ -114,7 +114,7 @@ pub(super) fn reroute_watch_command<W: Write>(
     let mut ticks: u32 = 0;
     loop {
         // A failed tick (gh hiccup) logs and continues — never crash the loop.
-        if let Err(e) = tick(args, config, actions, &repo, &mut guard, json, stdout) {
+        if let Err(e) = tick(args, config, actions, &repo, cwd, &mut guard, json, stdout) {
             if json {
                 let mut data = BTreeMap::new();
                 data.insert("error".to_owned(), Value::from(e.message.clone()));
@@ -133,11 +133,13 @@ pub(super) fn reroute_watch_command<W: Write>(
 }
 
 /// One decision tick: probe capacity, list candidates, decide, log, optionally act.
+#[allow(clippy::too_many_arguments)]
 fn tick<W: Write>(
     args: &RerouteWatchArgs,
     config: &LoadedConfig,
     actions: &GitHubActions,
     repo: &str,
+    cwd: &Path,
     guard: &mut FlapGuard,
     json: bool,
     stdout: &mut W,
@@ -152,7 +154,7 @@ fn tick<W: Write>(
     // Perform the action (if applicable) before logging the outcome.
     let action = match &decision {
         RerouteDecision::Reroute(candidate) if args.apply => {
-            match perform_reroute(candidate, &args.target) {
+            match perform_reroute(candidate, &args.target, cwd) {
                 Ok(()) => {
                     guard.record(candidate.pr, now);
                     "rerouted".to_owned()
@@ -307,11 +309,13 @@ fn macos_job_labels(actions: &GitHubActions, repo: &str, run_id: u64) -> String 
 /// --apply` (reuses ship-state + dispatch safety). Mirrors Pulp's watcher
 /// shelling `pulp macos retarget`.
 ///
-/// `cloud retarget` has no `--repo` flag — it resolves the repo from the
-/// current checkout (cwd) and ship-state — so `reroute-watch --apply` must run
-/// inside the target repo's checkout. We deliberately do not pass `--repo`
-/// (clap would reject it and every reroute would fail before acting).
-fn perform_reroute(candidate: &RerouteCandidate, target: &str) -> Result<(), String> {
+/// `cloud retarget` has no `--repo` flag — it resolves the repo from its working
+/// directory + ship-state. We run the child in `cwd` (the same directory the
+/// watcher loaded its config from and the `--apply` guard validated against), so
+/// the child resolves the identical dispatch repo even under a global `--cwd`.
+/// We deliberately do not pass `--repo` (clap would reject it and every reroute
+/// would fail before acting).
+fn perform_reroute(candidate: &RerouteCandidate, target: &str, cwd: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().unwrap_or_else(|_| "shipyard".into());
     let output = Command::new(exe)
         .args([
@@ -325,6 +329,7 @@ fn perform_reroute(candidate: &RerouteCandidate, target: &str) -> Result<(), Str
             "local",
             "--apply",
         ])
+        .current_dir(cwd)
         .output()
         .map_err(|e| format!("spawn failed: {e}"))?;
     if output.status.success() {
