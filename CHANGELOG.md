@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0653"></a>
+## [0.65.4]
+
 ## [0.65.3] - 2026-06-01
 
 - fix(reroute): fail fast on cross-repo --apply (Codex review on #330) ([#332](https://github.com/danielraffel/Shipyard/pull/332))

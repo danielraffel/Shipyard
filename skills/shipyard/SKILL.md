@@ -289,7 +289,9 @@ shipping (ship-state-backed). `cloud retarget` has no `--repo` flag — it
 resolves the repo from the current checkout — so run `reroute-watch --apply`
 inside the target repo's checkout (its `--repo` only scopes which queued runs
 are listed, not where the reroute acts). To prevent retargeting the wrong repo,
-`--apply` **fails fast** when the monitored `--repo` doesn't match the checkout;
+`--apply` **fails fast** unless the monitored `--repo` matches the repo
+`cloud retarget` will dispatch to — the `[cloud].repository` override if set,
+otherwise the checkout (so a configured cross-repo controller setup is allowed);
 observe mode may monitor any repo. **Follow-up (Part C.2):** rerouting a PR with no
 ship-state, and spinning an ephemeral JIT VM runner on a free-slot host (drive
 Pulp's `tart-run-job.sh` equivalent) — until then a persistent host-class runner
