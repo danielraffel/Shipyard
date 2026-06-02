@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0652"></a>
-## [0.65.3]
+<a id="v0653"></a>
+## [0.65.3] - 2026-06-01
 
+- fix(reroute): fail fast on cross-repo --apply (Codex review on #330) ([#332](https://github.com/danielraffel/Shipyard/pull/332))
+
+<a id="v0652"></a>
 ## [0.65.2] - 2026-06-01
 
 - fix(pr): honor threaded github.auth in PR creation; document App-auth global config + multi-client ([#331](https://github.com/danielraffel/Shipyard/pull/331))
@@ -597,6 +600,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.65.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.3
 [0.65.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.2
 [0.65.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.1
 [0.65.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.0
