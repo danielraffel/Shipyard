@@ -593,6 +593,22 @@ pub fn fetch_failed_job_diagnostics<F: DiagnosticsFetcher + ?Sized>(
         out.failure_summary
             .push("(diagnostics: job log unavailable)".to_owned());
     }
+    // #344: a self-hosted runner returns an EMPTY GitHub job log, so the footer
+    // parse above yields nothing and the failure block would be silent (only
+    // "exit code N" reaches the user). The per-test results DO exist — a
+    // well-behaved consuming workflow uploads them on failure (e.g. Pulp's
+    // `ctest-logs-*` artifact + a job-summary block, pulp #3392/#3394). Point
+    // there instead of emitting an empty summary. (A future enhancement can
+    // download + parse that artifact for a structured list; tracked in #344.)
+    if out.failure_summary.is_empty()
+        && job.runner_labels.iter().any(|label| label == "self-hosted")
+    {
+        out.failure_summary.push(format!(
+            "(self-hosted runner: GitHub job log is empty — open the run's job \
+             summary, or download per-test logs with \
+             `gh run download {run_id} -n ctest-logs-<key>`)"
+        ));
+    }
     out.job = Some(job);
     out
 }
@@ -875,6 +891,40 @@ The following tests FAILED:
         );
         assert_eq!(diag.failure_summary.len(), MAX_SUMMARY_LINES);
         assert!(diag.failure_summary_truncated);
+    }
+
+    #[test]
+    fn self_hosted_empty_log_points_to_ctest_artifact() {
+        // #344: a self-hosted leg returns an empty GitHub job log, so the footer
+        // parse yields nothing. Instead of a silent empty summary, point to the
+        // uploaded per-test logs.
+        let jobs = serde_json::json!({
+            "jobs": [{
+                "id": 1, "name": "macOS (ARM64) [local]",
+                "html_url": "https://example/runs/9/job/1",
+                "conclusion": "failure",
+                "steps": [{"name": "Test (non-Windows)", "conclusion": "failure"}],
+                "labels": ["self-hosted", "macOS", "ARM64"]
+            }]
+        });
+        let fetcher = FakeFetcher {
+            jobs_json: jobs.to_string(),
+            log: String::new(), // self-hosted: GitHub job log is empty
+        };
+        let diag = fetch_failed_job_diagnostics(
+            &fetcher,
+            "danielraffel/pulp",
+            9,
+            "mac",
+            &*select_parser(Some("ctest")),
+        );
+        assert_eq!(diag.failure_summary.len(), 1);
+        assert!(
+            diag.failure_summary[0].contains("self-hosted runner")
+                && diag.failure_summary[0].contains("ctest-logs"),
+            "expected a pointer to the ctest-logs artifact, got: {:?}",
+            diag.failure_summary
+        );
     }
 
     #[test]
