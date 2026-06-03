@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0656"></a>
+## [0.66.0]
+
 ## [0.65.6] - 2026-06-02
 
 - release: bump CLI to 0.65.6 to ship doctor UX fixes (#338, #339) ([#342](https://github.com/danielraffel/Shipyard/pull/342))
