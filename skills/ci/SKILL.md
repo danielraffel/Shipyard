@@ -54,6 +54,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
 | **Self-update: apply latest stable** | `shipyard update` (delegates to `install.sh`) |
 | **Self-update: pin / rollback to a specific tag** | `shipyard update --to v0.53.0` |
+| **Self-update hits "rate limit exceeded"** | v0.68.0+ auto-uses `gh`/`GITHUB_TOKEN` auth; if still rate-limited (60/hr unauth, no `gh` login), run `gh auth login` or export `GITHUB_TOKEN` and retry. Not a missing-`.dmg` error. |
 | **Stuck-runner: kill specific worker (with recovery)** | `shipyard runner kill --pid <pid> --reason "..." [--retrigger]` |
 | **Stuck-runner: review past kills** | `shipyard runner kill --history` |
 | **Stuck-runner: restore quarantined build after a misclick** | `shipyard runner kill --recover <event-id>` |

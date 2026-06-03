@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0680"></a>
+## [0.68.1]
+
 ## [0.68.0] - 2026-06-03
 
 - fix(queue): reap stale running ship jobs so a killed worker can't block retries ([#351](https://github.com/danielraffel/Shipyard/pull/351))

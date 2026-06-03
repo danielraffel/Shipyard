@@ -33,6 +33,15 @@ are injected only into child `gh` commands as `GH_TOKEN`; Shipyard must never
 write raw tokens, GitHub App private keys, Keychain items, 1Password sessions,
 or token caches to config, state, logs, or release artifacts.
 
+`shipyard update` reads public release metadata, so it works with no auth — but
+unauthenticated GitHub API calls are capped at 60/hr. As of v0.68.0 `update`
+opportunistically authenticates: it uses `SHIPYARD_GITHUB_TOKEN` / `GH_TOKEN` /
+`GITHUB_TOKEN` if set, else falls back to `gh auth token`, and threads that token
+into both its own `releases/latest` query and the `install.sh` it invokes. No
+token is ever required (the repo is public). If you see *"GitHub API rate limit
+exceeded"* from `update`/`install.sh`, that is the 60/hr unauthenticated cap, not
+a missing macOS `.dmg` — run `gh auth login` (or export `GITHUB_TOKEN`) and retry.
+
 To raise the quota above the ambient `gh` user token's 5,000/hr, point
 `[github.auth]` at a GitHub App installation token helper
 (`scripts/shipyard-github-app-token`) for the 12,500/hr installation bucket.
