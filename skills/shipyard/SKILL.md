@@ -50,7 +50,9 @@ When debugging GitHub behavior:
 - Optional-provider rows stay green when unused: `nsc` reads "not configured
   (optional)" unless a Namespace provider is configured, and a `{repo_slug}`
   `token_command` that can't resolve in a repo-less context (doctor/daemon) is
-  green with a "pin `--repo`" hint rather than a red "misconfigured".
+  green with a "pin `--repo`" hint rather than a red "misconfigured". The
+  `gh-scope` row is also green-informational for App/Env/helper tokens (scopes
+  not inspectable locally), keeping the "verify Actions: Read/write" reminder.
 - Check `.shipyard/config.toml`, `.shipyard.local/config.toml`, and global
   config for `[github.auth]` before assuming ambient `gh auth status` explains
   the operation.
