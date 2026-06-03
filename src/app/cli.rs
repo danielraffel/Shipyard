@@ -214,6 +214,11 @@ pub(super) enum Command {
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
+        /// Adopt the current head SHA when recorded ship-state drifted (amend /
+        /// force-push), re-validating the new head instead of failing on
+        /// SHA drift (Shipyard #346).
+        #[arg(long = "adopt-head")]
+        adopt_head: bool,
     },
     /// One-shot push-a-PR: skill-sync, version-bump, then ship.
     Pr {
@@ -244,6 +249,11 @@ pub(super) enum Command {
         /// Reason used with --skip-skill-update.
         #[arg(long = "skill-reason")]
         skill_reason: Option<String>,
+        /// Adopt the current head SHA when recorded ship-state drifted (amend /
+        /// force-push), re-validating the new head instead of failing on
+        /// SHA drift (Shipyard #346).
+        #[arg(long = "adopt-head")]
+        adopt_head: bool,
     },
     /// Cloud runner operations.
     Cloud {

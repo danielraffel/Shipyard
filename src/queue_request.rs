@@ -390,6 +390,10 @@ pub struct QueuedShipRequest {
     pub resume_from: Option<String>,
     /// Target names whose failures should not block merge.
     pub advisory_targets: BTreeSet<String>,
+    /// Adopt the current head SHA on recorded-state drift (amend/force-push),
+    /// clearing prior evidence so the new head re-validates. See Shipyard #346.
+    #[serde(default)]
+    pub adopt_head: bool,
     /// Ordered resolved target snapshots.
     pub targets: Vec<QueuedResolvedTarget>,
 }
@@ -411,6 +415,7 @@ impl From<&ShipExecutionRequest> for QueuedShipRequest {
             fail_fast: request.fail_fast,
             resume_from: request.resume_from.clone(),
             advisory_targets: request.advisory_targets.clone(),
+            adopt_head: request.adopt_head,
             targets: snapshot_targets(&request.targets),
         }
     }
@@ -434,6 +439,7 @@ impl QueuedShipRequest {
             fail_fast: self.fail_fast,
             resume_from: self.resume_from.clone(),
             advisory_targets: self.advisory_targets.clone(),
+            adopt_head: self.adopt_head,
             targets: restore_targets(&self.targets)?,
         })
     }
@@ -1596,6 +1602,7 @@ mod tests {
             fail_fast: false,
             resume_from: None,
             advisory_targets: BTreeSet::from(["mac".to_owned()]),
+            adopt_head: false,
             targets: vec![local_target()],
         }
     }
