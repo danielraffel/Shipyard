@@ -495,6 +495,7 @@ fn handle_ship_variant<W: Write>(
         resume_from,
         allow_unreachable_targets,
         skip_targets,
+        adopt_head,
     } = command
     else {
         unreachable!("ship variant required")
@@ -516,6 +517,7 @@ fn handle_ship_variant<W: Write>(
             pr_snapshot_file: None,
             allow_unreachable_targets,
             skip_targets,
+            adopt_head,
         },
         mode,
         cwd,
@@ -543,6 +545,7 @@ fn handle_pr_variant<W: Write>(
         bump_reason,
         skip_skill_update,
         skill_reason,
+        adopt_head,
     } = command
     else {
         unreachable!("pr variant required")
@@ -559,6 +562,7 @@ fn handle_pr_variant<W: Write>(
             bump_reason,
             skip_skill_update,
             skill_reason,
+            adopt_head,
             python_command: None,
         },
         &config,

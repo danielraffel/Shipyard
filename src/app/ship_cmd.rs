@@ -50,6 +50,10 @@ pub(super) struct ShipCommandArgs {
     pub(super) pr_snapshot_file: Option<PathBuf>,
     pub(super) allow_unreachable_targets: bool,
     pub(super) skip_targets: Vec<String>,
+    /// Adopt the current head SHA when recorded ship-state drifted (amend /
+    /// force-push), clearing prior evidence so the new head re-validates
+    /// instead of dead-ending on `ShaDrift`. See Shipyard #346.
+    pub(super) adopt_head: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -117,6 +121,7 @@ pub(super) fn ship_command<W: Write>(
         fail_fast: false,
         resume_from: args.resume_from,
         advisory_targets: lane_policy.advisory_targets.clone(),
+        adopt_head: args.adopt_head,
         targets,
     };
 
@@ -967,6 +972,7 @@ mod tests {
                 pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1042,6 +1048,7 @@ mod tests {
                 pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1089,6 +1096,7 @@ mod tests {
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &unreachable_ssh_config(temp.path()),
             &repo,
@@ -1135,6 +1143,7 @@ mod tests {
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
                 skip_targets: vec!["linux".to_owned()],
+                adopt_head: false,
             },
             &local_and_unreachable_config(temp.path()),
             &repo,
@@ -1197,6 +1206,7 @@ exit 2
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1297,6 +1307,7 @@ exit 2
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &loaded_config(temp.path()),
             &repo,

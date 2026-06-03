@@ -23,6 +23,9 @@ pub(super) struct PrCommandArgs {
     pub(super) bump_reason: Option<String>,
     pub(super) skip_skill_update: Vec<String>,
     pub(super) skill_reason: Option<String>,
+    /// Forwarded to `ship`: adopt the current head SHA on recorded-state drift
+    /// (amend / force-push) instead of failing. See Shipyard #346.
+    pub(super) adopt_head: bool,
     pub(super) python_command: Option<PathBuf>,
 }
 
@@ -118,6 +121,7 @@ pub(super) fn pr_command<W: Write>(
             pr_snapshot_file: None,
             allow_unreachable_targets: args.allow_unreachable_targets,
             skip_targets: args.skip_targets,
+            adopt_head: args.adopt_head,
         },
         config,
         cwd,
@@ -532,6 +536,7 @@ mod tests {
             bump_reason: None,
             skip_skill_update: Vec::new(),
             skill_reason: None,
+            adopt_head: false,
             python_command: None,
         }
     }

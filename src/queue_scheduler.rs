@@ -779,6 +779,7 @@ mod tests {
                     fail_fast: false,
                     resume_from: None,
                     advisory_targets: std::collections::BTreeSet::default(),
+                    adopt_head: false,
                     targets: Vec::new(),
                 }),
             })

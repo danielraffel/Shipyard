@@ -433,6 +433,17 @@ so the `--locked` steps then fail with a lock-vs-manifest mismatch. After any
 bump, refresh the lock (`cargo build`/`cargo check`) and commit `Cargo.lock`
 in the same PR. (`cargo fmt --all` on new modules is the other easy miss.)
 
+**Ship-state SHA drift recovery (`--adopt-head`, #346):** if you amend or
+force-push a PR's tip after Shipyard recorded ship-state (e.g. adding a
+required `Version-Bump: skip` trailer), the next `shipyard ship`/`pr` aborts
+with `ship state SHA drift: existing <old>, current <new>`. Re-run with
+`--adopt-head` (`shipyard ship --adopt-head` / `shipyard pr --adopt-head`): it
+adopts the current head and **clears the recorded remote runs + evidence** so
+the new head re-validates from scratch — it never blesses stale validation for
+a possibly-different tree. The policy-signature guard still applies (a changed
+merge policy is still refused). Without the flag the old dead-end (manual `gh pr
+merge`) stands.
+
 Other non-mutating checks:
 
 ```sh

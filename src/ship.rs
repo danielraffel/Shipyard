@@ -79,6 +79,12 @@ pub struct ShipExecutionRequest {
     pub resume_from: Option<String>,
     /// Target names whose failures should not block merge.
     pub advisory_targets: BTreeSet<String>,
+    /// Adopt the current head SHA when the recorded ship-state drifted — but
+    /// ONLY when the amended commit has the same tree (e.g. a trailer-only
+    /// `--amend`). The command layer verifies same-tree before setting this and
+    /// refuses a content change, so prior evidence is never blessed for a
+    /// different tree (Shipyard #346).
+    pub adopt_head: bool,
     /// Ordered target list.
     pub targets: Vec<ResolvedTarget>,
 }
@@ -786,6 +792,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         fail_fast: request.fail_fast,
         resume_from: request.resume_from.clone(),
         advisory_targets: BTreeSet::new(),
+        adopt_head: false,
         targets: request.targets.clone(),
     };
     job = ensure_worker_running_job(queue, &job)?;
@@ -1422,7 +1429,19 @@ fn load_or_create_state(
         |lock| store.get_locked(request.pr, lock),
     );
     if let Some(mut existing) = existing {
-        validate_existing_state(&existing, &request.sha, &policy)?;
+        validate_existing_state(&existing, &request.sha, &policy, request.adopt_head)?;
+        if request.adopt_head && existing.is_sha_drift(&request.sha) {
+            // Adopt the amended/force-pushed head. Clear prior remote runs and
+            // evidence so the new head is re-validated from scratch — never
+            // bless stale validation for a possibly-different tree. `head_sha`
+            // also gates auto-merge's live-head preflight, so it must track the
+            // SHA we actually validate (Shipyard #346; codex review). A
+            // same-tree fast path that preserves evidence for a trailer-only
+            // amend is a possible follow-up.
+            existing.head_sha.clone_from(&request.sha);
+            existing.dispatched_runs.clear();
+            existing.evidence_snapshot.clear();
+        }
         existing.commit_subject.clone_from(&request.commit_subject);
         refresh_pr_metadata(&mut existing, request);
         existing.touch();
@@ -1462,8 +1481,9 @@ fn validate_existing_state(
     state: &ShipState,
     sha: &str,
     policy: &str,
+    adopt_head: bool,
 ) -> Result<(), ShipExecutionError> {
-    if state.is_sha_drift(sha) {
+    if !adopt_head && state.is_sha_drift(sha) {
         return Err(ShipExecutionError::ShaDrift {
             existing: state.head_sha.clone(),
             current: sha.to_owned(),
@@ -1847,6 +1867,7 @@ mod tests {
             fail_fast: false,
             resume_from: None,
             advisory_targets: BTreeSet::new(),
+            adopt_head: false,
             targets,
         }
     }
@@ -2941,5 +2962,72 @@ mod tests {
                 if existing == "old" && current == "abc"
         ));
         assert!(queue.get_pending().expect("pending").is_empty());
+    }
+
+    #[test]
+    fn adopt_head_tolerates_sha_drift_but_still_enforces_policy() {
+        // #346: --adopt-head relaxes ONLY the SHA-drift guard (so an amend /
+        // force-push re-validates instead of dead-ending), and never relaxes
+        // the policy-signature guard — a changed merge policy must still fail.
+        let state = ShipState::new(
+            42,
+            "danielraffel/pulp",
+            "feature/test",
+            "main",
+            "old",
+            "policy",
+        );
+
+        // Without the flag, SHA drift is rejected.
+        assert!(matches!(
+            super::validate_existing_state(&state, "new", "policy", false),
+            Err(ShipExecutionError::ShaDrift { .. })
+        ));
+        // With the flag, the same SHA drift is tolerated...
+        assert!(super::validate_existing_state(&state, "new", "policy", true).is_ok());
+        // ...but a policy-signature change is STILL rejected even with the flag.
+        assert!(matches!(
+            super::validate_existing_state(&state, "new", "different-policy", true),
+            Err(ShipExecutionError::PolicyDrift { .. })
+        ));
+    }
+
+    #[test]
+    fn adopt_head_reconciles_drift_clearing_stale_evidence() {
+        // #346: adopting the new head must clear prior remote runs + evidence so
+        // the new head re-validates from scratch — never bless stale validation.
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("ship");
+        let mut seeded = ShipState::new(
+            42,
+            "danielraffel/pulp",
+            "feature/test",
+            "main",
+            "old",
+            "policy",
+        );
+        seeded
+            .evidence_snapshot
+            .insert("ssh".to_owned(), "passed-on-old-head".to_owned());
+        store.save(&seeded).expect("save");
+
+        // Build a request whose policy matches the seeded state so only SHA
+        // drift is in play, with adopt_head set and the live SHA = "abc".
+        let mut request = ship_request(vec![target]);
+        request.adopt_head = true;
+        let target_names = vec![request.targets[0].name.clone()];
+        let mut seeded = store.get(42).expect("seeded present");
+        seeded.policy_signature =
+            super::policy_signature(&request.targets, &target_names, request.mode);
+        store.save(&seeded).expect("re-save with matching policy");
+
+        let reconciled = super::load_or_create_state(&request, &target_names, &store, None)
+            .expect("adopt-head reconciles drift");
+        assert_eq!(reconciled.head_sha, "abc", "adopts the current head");
+        assert!(
+            reconciled.evidence_snapshot.is_empty(),
+            "stale evidence cleared so the new head re-validates"
+        );
     }
 }
