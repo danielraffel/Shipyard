@@ -75,6 +75,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider github-hosted]` (dry-run; add `--apply`) |
 | Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (cancels + redispatches; add `--dry-run` to preview, `--rerun-failed` for completed cancelled/failed/timed-out runs; omit `--to` to re-resolve a failed leg local-first, or pass `--to <provider>` to force) |
 | Rescue every stuck run repo-wide | `shipyard rescue --all-stuck` |
+| Same-PR ship refused by a killed worker (`SamePrShipRunning`) | v0.68.0+ auto-reaps the stale `running` queue job after ~180s — just retry `shipyard pr`. See the `shipyard` skill's "Durable Queue: killed-worker recovery". Don't run two `shipyard pr`s for one PR concurrently. |
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |
 | Deliberately skip one lane | `shipyard run --skip-target windows` (repeatable; no probe run) |

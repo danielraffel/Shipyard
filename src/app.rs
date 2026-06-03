@@ -1619,6 +1619,47 @@ mod tests {
     }
 
     #[test]
+    fn cancel_json_marks_running_job_cancelled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let job = queue
+            .enqueue(Job::create(
+                "abc123456789",
+                "feature/cancel-running",
+                vec!["linux".to_owned()],
+                ValidationMode::Full,
+                Priority::Normal,
+            ))
+            .expect("enqueue");
+        // Transition to Running first, to prove `cancel` reaches running jobs and
+        // not just pending ones — the manual escape hatch for a wedged ship.
+        let started = job.start().expect("start");
+        queue.update(&started).expect("update running");
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "cancel",
+            &job.id,
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "cancel");
+        assert_eq!(value["job"]["status"], "cancelled");
+        assert_eq!(
+            queue.get(&job.id).expect("get").expect("job").status,
+            crate::job::JobStatus::Cancelled
+        );
+    }
+
+    #[test]
     fn logs_prints_selected_target_log() {
         let temp = tempfile::tempdir().expect("tempdir");
         let log_path = temp.path().join("linux.log");

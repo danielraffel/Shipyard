@@ -8,8 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 
 use crate::host_pool::{HostPoolConfig, HostPoolLease};
-use crate::job::{Job, JobStatus};
-use crate::queue::{DrainLock, Queue, QueueError, QueuePendingCancellation};
+use crate::job::{DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus};
+use crate::queue::{
+    DrainLock, Queue, QueueError, QueuePendingCancellation, STALE_RUNNING_CANCEL_REASON,
+};
 use crate::queue_request::{
     HostPoolDemand, JobResourcePlan, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
     QueuedExecutionRequest,
@@ -114,6 +116,13 @@ pub struct AppliedAdmitPass {
     /// Whether starts were skipped because running request envelopes could not
     /// be loaded.
     pub skipped_starts_due_to_running_request_errors: bool,
+    /// Whether starts were skipped because a job planned as stale-running was no
+    /// longer stale at apply time (its worker resumed heartbeating). The plan is
+    /// then based on a freed claim that is actually still held, so starts are
+    /// deferred to the next pass, which replans against fresh liveness.
+    pub skipped_starts_due_to_revived_stale_running: bool,
+    /// Stale running same-PR ship jobs reaped during this pass.
+    pub stale_running_cancelled: Vec<Job>,
 }
 
 /// Same-PR `shipyard ship` admission decisions derived from queued request
@@ -125,6 +134,10 @@ pub struct SamePrShipAdmission {
     pub pending_cancellations: Vec<SamePrShipPendingCancellation>,
     /// Pending same-PR ship jobs blocked by an already-running ship job.
     pub running_conflicts: Vec<SamePrShipRunningConflict>,
+    /// Running same-PR ship jobs whose worker has gone silent past the
+    /// heartbeat-staleness threshold. They no longer block pending work and
+    /// should be reaped by the drain owner.
+    pub stale_running_cancellations: Vec<SamePrShipStaleRunningCancellation>,
 }
 
 /// Older pending same-PR ship job selected for cancellation.
@@ -134,6 +147,19 @@ pub struct SamePrShipPendingCancellation {
     pub job_id: String,
     /// Newer pending job id that supersedes this one.
     pub superseded_by_job_id: String,
+    /// Repository slug.
+    pub repo: String,
+    /// Pull request number.
+    pub pr: u64,
+    /// Cancellation reason to apply through the drain-owned queue primitive.
+    pub reason: String,
+}
+
+/// Running same-PR ship job reaped because its worker heartbeat went stale.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SamePrShipStaleRunningCancellation {
+    /// Running queue job id to cancel.
+    pub job_id: String,
     /// Repository slug.
     pub repo: String,
     /// Pull request number.
@@ -265,7 +291,8 @@ pub fn plan_admit_pass_from_jobs(
     leases: &[HostPoolLease],
     now: DateTime<Utc>,
 ) -> RequestBackedAdmitPass {
-    let same_pr_ship_admission = same_pr_ship_admission(jobs, request_store);
+    let stale_after = chrono::Duration::seconds(DEFAULT_RUNNING_JOB_STALE_SECONDS);
+    let same_pr_ship_admission = same_pr_ship_admission(jobs, request_store, now, stale_after);
     let same_pr_excluded = same_pr_ship_admission
         .pending_cancellations
         .iter()
@@ -282,9 +309,24 @@ pub fn plan_admit_pass_from_jobs(
         .filter(|job| !same_pr_excluded.contains(job.id.as_str()))
         .map(|job| pending_admission_request(job, request_store))
         .collect::<Vec<_>>();
+    // Only the stale running jobs this pass will actually reap (dead same-PR
+    // ship workers) are dropped from resource accounting — their claims are
+    // released in the apply pass, so they must not reserve capacity here too.
+    // Any other stale running job stays in accounting; its claims keep blocking
+    // until startup recovery clears it, which is the conservative, pre-existing
+    // behavior. Keeping the exclusion set equal to the reap set avoids freeing a
+    // claim for a job that is never cancelled.
+    let stale_reaped = same_pr_ship_admission
+        .stale_running_cancellations
+        .iter()
+        .map(|cancellation| cancellation.job_id.as_str())
+        .collect::<BTreeSet<_>>();
     let mut running = Vec::new();
     let mut running_request_errors = Vec::new();
-    for job in jobs.iter().filter(|job| job.status == JobStatus::Running) {
+    for job in jobs
+        .iter()
+        .filter(|job| job.status == JobStatus::Running && !stale_reaped.contains(job.id.as_str()))
+    {
         match load_resource_plan(&job.id, request_store) {
             Ok(Some(plan)) => running.push(plan),
             Ok(None) => running_request_errors.push(RequestLoadError {
@@ -316,8 +358,32 @@ pub fn apply_admit_pass_for_drain(
 ) -> Result<AppliedAdmitPass, QueueError> {
     let cancellations = admit_pass_cancellations(pass);
     let cancelled = queue.cancel_pending_jobs_for_drain(drain_lock, &cancellations)?;
+    // Reap stale running same-PR jobs (dead workers). `cancel_stale_running_jobs`
+    // re-checks staleness under the state lock with a fresh `now`, so a worker
+    // that resumed heartbeating between planning and apply is never reaped.
+    let stale_running_ids = pass
+        .same_pr_ship_admission
+        .stale_running_cancellations
+        .iter()
+        .map(|cancellation| cancellation.job_id.clone())
+        .collect::<Vec<_>>();
+    let stale_running_cancelled = queue.cancel_stale_running_jobs(
+        &stale_running_ids,
+        Utc::now(),
+        chrono::Duration::seconds(DEFAULT_RUNNING_JOB_STALE_SECONDS),
+        STALE_RUNNING_CANCEL_REASON,
+    )?;
+    // If a job planned as stale-running was not actually reaped, its worker
+    // resumed heartbeating between planning and apply. The plan freed that
+    // worker's claim and may have admitted a conflicting same-PR job on the
+    // strength of it, so starting now could double-run. Defer starts to the next
+    // pass, which replans against the revived worker's fresh liveness.
+    let skipped_starts_due_to_revived_stale_running =
+        stale_running_cancelled.len() < stale_running_ids.len();
     let skipped_starts_due_to_running_request_errors = !pass.running_request_errors.is_empty();
-    let started = if skipped_starts_due_to_running_request_errors {
+    let started = if skipped_starts_due_to_running_request_errors
+        || skipped_starts_due_to_revived_stale_running
+    {
         Vec::new()
     } else {
         queue.start_pending_jobs_for_drain(drain_lock, &pass.plan.admitted)?
@@ -326,6 +392,8 @@ pub fn apply_admit_pass_for_drain(
         started,
         cancelled,
         skipped_starts_due_to_running_request_errors,
+        skipped_starts_due_to_revived_stale_running,
+        stale_running_cancelled,
     })
 }
 
@@ -424,7 +492,12 @@ fn load_resource_plan(
         .map(|envelope| envelope.resource_plan))
 }
 
-fn same_pr_ship_admission(jobs: &[Job], request_store: &QueueRequestStore) -> SamePrShipAdmission {
+fn same_pr_ship_admission(
+    jobs: &[Job],
+    request_store: &QueueRequestStore,
+    now: DateTime<Utc>,
+    stale_after: chrono::Duration,
+) -> SamePrShipAdmission {
     let mut by_pr = BTreeMap::<(String, u64), SamePrShipGroup>::new();
     for job in jobs
         .iter()
@@ -436,6 +509,13 @@ fn same_pr_ship_admission(jobs: &[Job], request_store: &QueueRequestStore) -> Sa
         let group = by_pr.entry(ship_key).or_default();
         match job.status {
             JobStatus::Pending => group.pending.push(job.clone()),
+            // A running job only blocks pending same-PR work while its worker is
+            // alive. One whose heartbeat has gone stale was abandoned (e.g. the
+            // process was killed); set it aside for reaping so it never blocks
+            // forever.
+            JobStatus::Running if job.is_stale_running(now, stale_after) => {
+                group.stale_running.push(job.clone());
+            }
             JobStatus::Running => group.running.push(job.clone()),
             _ => {}
         }
@@ -453,6 +533,16 @@ fn same_pr_ship_admission(jobs: &[Job], request_store: &QueueRequestStore) -> Sa
                 .cmp(&right.created_at)
                 .then_with(|| left.id.cmp(&right.id))
         });
+        for stale in &group.stale_running {
+            admission
+                .stale_running_cancellations
+                .push(SamePrShipStaleRunningCancellation {
+                    job_id: stale.id.clone(),
+                    repo: repo.clone(),
+                    pr,
+                    reason: STALE_RUNNING_CANCEL_REASON.to_owned(),
+                });
+        }
         if let Some(running) = group.running.first() {
             admission
                 .running_conflicts
@@ -492,6 +582,7 @@ fn same_pr_ship_admission(jobs: &[Job], request_store: &QueueRequestStore) -> Sa
 struct SamePrShipGroup {
     pending: Vec<Job>,
     running: Vec<Job>,
+    stale_running: Vec<Job>,
 }
 
 fn load_ship_key(job_id: &str, request_store: &QueueRequestStore) -> Option<(String, u64)> {
@@ -1117,6 +1208,141 @@ mod tests {
             }]
         );
         assert!(pass.same_pr_ship_admission.pending_cancellations.is_empty());
+    }
+
+    #[test]
+    fn request_backed_admit_pass_reaps_stale_same_pr_running_and_admits_pending() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "stale-running", "danielraffel/shipyard", 42);
+        save_ship(&store, "pending", "danielraffel/shipyard", 42);
+        let mut stale = job("stale-running", JobStatus::Running, Priority::Normal, -20);
+        stale.started_at =
+            Some(Utc::now() - Duration::seconds(super::DEFAULT_RUNNING_JOB_STALE_SECONDS + 60));
+        let jobs = vec![
+            stale,
+            job("pending", JobStatus::Pending, Priority::Normal, -10),
+        ];
+
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+
+        // The stale running ship no longer blocks: the pending same-PR ship is
+        // admitted, no running conflict is reported, and the dead worker is
+        // surfaced for reaping (and so does not hold its pr-42 claim).
+        assert_eq!(pass.plan.admitted, ["pending"]);
+        assert!(pass.same_pr_ship_admission.running_conflicts.is_empty());
+        assert_eq!(
+            pass.same_pr_ship_admission.stale_running_cancellations,
+            [super::SamePrShipStaleRunningCancellation {
+                job_id: "stale-running".to_owned(),
+                repo: "danielraffel/shipyard".to_owned(),
+                pr: 42,
+                reason: super::STALE_RUNNING_CANCEL_REASON.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_admit_pass_reaps_stale_running_and_starts_admitted_pending() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "stale-running", "danielraffel/shipyard", 42);
+        save_ship(&store, "pending", "danielraffel/shipyard", 42);
+
+        let mut stale = job("stale-running", JobStatus::Running, Priority::Normal, -20);
+        stale.started_at =
+            Some(Utc::now() - Duration::seconds(super::DEFAULT_RUNNING_JOB_STALE_SECONDS + 60));
+        let pending = job("pending", JobStatus::Pending, Priority::Normal, -10);
+        queue.enqueue(stale).expect("enqueue stale");
+        queue.enqueue(pending).expect("enqueue pending");
+
+        let drain = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        let jobs = queue.get_all().expect("jobs");
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+        let applied = apply_admit_pass_for_drain(&mut queue, &drain, &pass).expect("apply");
+
+        // The dead worker's job is reaped to Cancelled, and the pending same-PR
+        // ship it was blocking is started.
+        assert_eq!(applied.stale_running_cancelled.len(), 1);
+        assert_eq!(applied.stale_running_cancelled[0].id, "stale-running");
+        assert_eq!(
+            applied
+                .started
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            ["pending"]
+        );
+        assert_eq!(
+            queue
+                .get("stale-running")
+                .expect("get")
+                .expect("job")
+                .status,
+            JobStatus::Cancelled
+        );
+        assert_eq!(
+            queue.get("pending").expect("get").expect("job").status,
+            JobStatus::Running
+        );
+    }
+
+    #[test]
+    fn apply_admit_pass_defers_starts_when_planned_stale_running_revived() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "running", "danielraffel/shipyard", 42);
+        save_ship(&store, "pending", "danielraffel/shipyard", 42);
+
+        let mut stale = job("running", JobStatus::Running, Priority::Normal, -20);
+        stale.started_at =
+            Some(Utc::now() - Duration::seconds(super::DEFAULT_RUNNING_JOB_STALE_SECONDS + 60));
+        let pending = job("pending", JobStatus::Pending, Priority::Normal, -10);
+        queue.enqueue(stale).expect("enqueue running");
+        queue.enqueue(pending).expect("enqueue pending");
+
+        // Plan while the worker looks stale: pending is admitted, the running job
+        // is queued for reaping.
+        let jobs = queue.get_all().expect("jobs");
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+        assert_eq!(pass.plan.admitted, ["pending"]);
+        assert_eq!(
+            pass.same_pr_ship_admission
+                .stale_running_cancellations
+                .len(),
+            1
+        );
+
+        // The worker resumes heartbeating before apply (it was only quiet, not
+        // dead).
+        let mut revived = queue.get("running").expect("get").expect("job");
+        revived.started_at = Some(Utc::now());
+        queue.update(&revived).expect("revive");
+
+        let drain = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        let applied = apply_admit_pass_for_drain(&mut queue, &drain, &pass).expect("apply");
+
+        // The revived worker is not reaped, and the conflicting pending start is
+        // deferred to the next pass rather than double-running the PR.
+        assert!(applied.stale_running_cancelled.is_empty());
+        assert!(applied.skipped_starts_due_to_revived_stale_running);
+        assert!(applied.started.is_empty());
+        assert_eq!(
+            queue.get("running").expect("get").expect("job").status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            queue.get("pending").expect("get").expect("job").status,
+            JobStatus::Pending
+        );
     }
 
     #[test]

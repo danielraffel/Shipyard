@@ -174,6 +174,39 @@ watch_interval_seconds = 300
 auto_fix = false
 ```
 
+## Durable Queue: killed-worker recovery (stale-running reaping)
+
+A `shipyard ship` / `shipyard pr` worker that is killed (SIGTERM, crash,
+`kill <pid>`) leaves its job `status: running` in the durable queue
+(`queue.json`). Before v0.68.0 this wedged the PR: every later same-PR ship was
+refused with `SamePrShipRunning`, and there was no clean way out — `shipyard
+cancel <id>` only handled pending jobs, `shipyard ship-state discard <pr>` left
+the queue job intact, and the startup reaper
+(`recover_stale_running_jobs_for_drain`) only fires on daemon restart, so a
+long-lived daemon never recovered. The only fix was hand-editing `queue.json`.
+
+As of v0.68.0 the queue auto-recovers: a `Running` job whose freshest heartbeat
+is older than `DEFAULT_RUNNING_JOB_STALE_SECONDS` (180s) is treated as a dead
+worker and reaped to `Cancelled` — at ship-submit time
+(`refuse_same_pr_running_ship` reaps the stale job, then proceeds) and on every
+drain admission pass (`apply_admit_pass_for_drain`). The reap re-checks
+staleness under the queue lock, so a worker merely between heartbeats is never
+killed; a "stale" job that revived between plan and apply defers conflicting
+starts to the next pass rather than double-running the PR.
+
+### Gotchas
+
+- Recovery is heartbeat-age based, so a retry waits up to ~180s after the
+  worker dies before it goes through. That is intentional — it must not reap a
+  slow-but-live worker. Don't shorten it below the ~15s heartbeat interval's
+  safety margin.
+- Do NOT launch a second `shipyard pr` for the same PR while the first is still
+  alive. That is what strands a `running` job in the first place — one ship per
+  PR at a time.
+- On a pre-0.68.0 binary the manual recovery is still: `shipyard ship-state
+  discard <pr>`, then mark the stuck `queue.json` job terminal (or restart the
+  daemon to trigger startup recovery).
+
 ## Runner Provisioning (register / list / remove / tag)
 
 The `runner` family also *provisions* self-hosted GitHub Actions runners, not
