@@ -1041,10 +1041,15 @@ pub(super) struct RescueArgs {
     /// Rescue every stuck queued run in the repo regardless of PR.
     #[arg(long = "all-stuck", action = ArgAction::SetTrue, conflicts_with = "pr")]
     pub(super) all_stuck: bool,
-    /// Runner provider to redispatch to.
-    #[arg(long = "to", default_value = "github-hosted")]
-    pub(super) provider: String,
-    /// Also re-arm completed-as-cancelled runs (e.g. ones a watchdog sweep marked failed) before handoff.
+    /// Runner provider to redispatch to. Omit to let resolution decide per
+    /// candidate: stuck-queued runs fall back to `github-hosted` (move off the
+    /// wedged runner), while re-run failed runs RE-RESOLVE the provider
+    /// (local-first with overflow) so a leg that overflowed to a GPU-less
+    /// hosted runner can return local. Pass `--to <provider>` to force one.
+    #[arg(long = "to")]
+    pub(super) provider: Option<String>,
+    /// Also re-dispatch completed runs that ended cancelled / failed / timed-out
+    /// (e.g. a watchdog sweep, or a flaky required leg) before handoff.
     #[arg(long = "rerun-failed", action = ArgAction::SetTrue)]
     pub(super) rerun_failed: bool,
     /// Plan the rescue without acting.

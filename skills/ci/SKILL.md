@@ -73,7 +73,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Global warm-pool kill switch | `SHIPYARD_NO_WARM_POOL=1` in the environment |
 | Retarget one lane on an in-flight PR | `shipyard cloud retarget --pr <n> --target macos --provider github-hosted` (dry-run; add `--apply`) |
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider github-hosted]` (dry-run; add `--apply`) |
-| Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (cancels + redispatches queued runs to `github-hosted`; add `--dry-run` to preview, `--rerun-failed` for watchdog-cancelled runs) |
+| Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (cancels + redispatches; add `--dry-run` to preview, `--rerun-failed` for completed cancelled/failed/timed-out runs; omit `--to` to re-resolve a failed leg local-first, or pass `--to <provider>` to force) |
 | Rescue every stuck run repo-wide | `shipyard rescue --all-stuck` |
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |
@@ -360,27 +360,29 @@ process, queued runs sitting >30m, repo PRs all in
 provider in one shot:
 
 ```sh
-# Most common case: one PR is stuck. Rescue it (default target is github-hosted):
+# Most common case: one PR is stuck. Rescue it (omit --to → provider is
+# resolved per candidate; see below):
 shipyard rescue 286
 
 # Preview without acting:
 shipyard rescue 286 --dry-run
 
-# Also re-arm runs a watchdog sweep marked failed/cancelled, then hand them off:
+# Also re-dispatch completed runs that ended cancelled / FAILED / timed-out
+# (e.g. a flaky required leg, or a watchdog-cancelled run):
 shipyard rescue 286 --rerun-failed
 
 # Repo-wide: rescue every queued run older than 30m:
 shipyard rescue --all-stuck
 
-# Override the queue-age threshold or destination provider:
-shipyard rescue 286 --threshold 10m --to github-hosted
+# Force a specific destination provider (e.g. pin a re-run to local):
+shipyard rescue 286 --rerun-failed --to local
 ```
 
 What it does:
 1. Resolves the PR's head branch (skipped under `--all-stuck`).
 2. Lists queued workflow runs and filters to (a) the PR's branch and (b) ones older than `--threshold` (default `30m`).
-3. With `--rerun-failed`, additionally pulls `status=completed conclusion=cancelled` runs on that branch — these get `gh run rerun --failed` first, then the same cancel+redispatch handoff.
-4. For each candidate, cancels the existing run and dispatches a fresh one with `--to <provider>` as the provider override.
+3. With `--rerun-failed`, additionally pulls `status=completed` runs whose conclusion is `cancelled`, `failure`, or `timed_out` on that branch (#345 — previously cancelled-only, so a plain failed leg was never a candidate) — these get `gh run rerun --failed` first, then the same cancel+redispatch handoff.
+4. For each candidate, cancels the existing run and dispatches a fresh one. **Provider resolution is kind-aware when `--to` is omitted (#345):** a wedged *stuck-queued* run falls back to `github-hosted` (move off the stuck local runner), while a re-run *failed* run RE-RESOLVES the provider (config/default — local-first with overflow) so a leg that overflowed to a GPU-less hosted runner can return to a real local runner. An explicit `--to <provider>` forces the destination for any candidate.
 5. Emits a per-run summary (`applied`, `rerun+applied`, `planned`, `skipped-completed`, `skipped-no-plan`, `failed`) with a top-level `event=cloud.rescue` JSON envelope under `--json`.
 
 **Do not reach for `runner-watchdog.sh --fix` instead of `shipyard rescue`.**
