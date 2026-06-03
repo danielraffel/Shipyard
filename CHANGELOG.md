@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0680"></a>
-## [0.68.1]
+<a id="v0681"></a>
+## [0.68.1] - 2026-06-03
 
+- fix(update): authenticate release queries opportunistically + clearer rate-limit error ([#353](https://github.com/danielraffel/Shipyard/pull/353))
+
+<a id="v0680"></a>
 ## [0.68.0] - 2026-06-03
 
 - fix(queue): reap stale running ship jobs so a killed worker can't block retries ([#351](https://github.com/danielraffel/Shipyard/pull/351))
@@ -627,6 +630,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.68.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.68.1
 [0.68.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.68.0
 [0.65.6]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.6
 [0.65.5]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.5
