@@ -3,6 +3,15 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0656"></a>
+## [0.65.6] - 2026-06-02
+
+- release: bump CLI to 0.65.6 to ship doctor UX fixes (#338, #339) ([#342](https://github.com/danielraffel/Shipyard/pull/342))
+- release: ship doctor UX fixes (#338, #339) to a CLI release ([#341](https://github.com/danielraffel/Shipyard/pull/341))
+- release: ship doctor UX fixes to a CLI release ([#340](https://github.com/danielraffel/Shipyard/pull/340))
+- fix(doctor): gh-scope is green-informational for configured tokens ([#339](https://github.com/danielraffel/Shipyard/pull/339))
+- fix(doctor): make nsc optional and de-alarm github-auth message ([#338](https://github.com/danielraffel/Shipyard/pull/338))
+
 <a id="v0655"></a>
 ## [0.65.5] - 2026-06-01
 
@@ -610,6 +619,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.65.6]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.6
 [0.65.5]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.5
 [0.65.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.4
 [0.65.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.3
