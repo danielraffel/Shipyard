@@ -825,12 +825,14 @@ fn check_gh_workflow_scope_for_auth(
 }
 
 fn configured_token_scope_entry(summary: &GhAuthSummary) -> DoctorEntry {
+    let is_app = matches!(&summary.source, GhAuthSourceSummary::Command)
+        && summary.token_kind.as_deref() == Some("github-app-installation");
     let detail = match &summary.source {
         GhAuthSourceSummary::Env { token_env } => format!(
             "Configured auth comes from {token_env} and is injected as GH_TOKEN. `gh auth status` reports the ambient login, so Shipyard does not use it as a scope check for this token. Confirm the token has Actions: Read and write when using cloud retarget/handoff."
         ),
         GhAuthSourceSummary::Command => {
-            if summary.token_kind.as_deref() == Some("github-app-installation") {
+            if is_app {
                 "Configured auth comes from a GitHub App installation token. `gh auth status` cannot inspect App installation permissions locally; confirm Actions: Read and write on the App installation when using cloud retarget/handoff.".to_owned()
             } else {
                 "Configured auth comes from a token helper and is injected as GH_TOKEN. `gh auth status` reports the ambient login, so Shipyard does not use it as a scope check for this token. Confirm the helper-issued token has Actions: Read and write when using cloud retarget/handoff.".to_owned()
@@ -838,11 +840,19 @@ fn configured_token_scope_entry(summary: &GhAuthSummary) -> DoctorEntry {
         }
         GhAuthSourceSummary::GhCli => unreachable!("ambient gh auth is handled by gh auth status"),
     };
+    // Not a failure — a configured Env/App/helper token simply can't have its
+    // scopes inspected locally (same situation as a fine-grained/app token under
+    // ambient gh, which is already reported green). Surface it as a calm
+    // informational row with the "verify Actions: Read/write" reminder in detail,
+    // not an alarming red ✗ that only appears for the rare configured-token user.
+    let label = if is_app {
+        "app token - verify Actions: Read/write (not inspectable locally)"
+    } else {
+        "configured token - verify Actions: Read/write (not inspectable locally)"
+    };
     DoctorEntry {
-        ok: false,
-        version: Some(
-            "manual verification required - permissions not inspectable locally".to_owned(),
-        ),
+        ok: true,
+        version: Some(label.to_owned()),
         detail: Some(detail),
         error: None,
     }
@@ -1417,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_token_scope_entry_marks_permissions_uninspectable() {
+    fn configured_token_scope_entry_is_green_informational_for_app_token() {
         let summary = GhAuthSummary {
             source: GhAuthSourceSummary::Command,
             token_kind: Some("github-app-installation".to_owned()),
@@ -1426,21 +1436,17 @@ mod tests {
 
         let entry = configured_token_scope_entry(&summary);
 
-        assert!(!entry.ok);
-        assert!(
-            entry
-                .version
-                .as_deref()
-                .expect("version")
-                .contains("not inspectable locally")
-        );
-        assert!(
-            entry
-                .detail
-                .as_deref()
-                .expect("detail")
-                .contains("App installation permissions")
-        );
+        // App-token scopes can't be inspected locally — that's informational
+        // (green), matching the ambient fine-grained/app path, not a red ✗.
+        assert!(entry.ok);
+        assert!(entry.error.is_none());
+        let version = entry.version.as_deref().expect("version");
+        assert!(version.contains("app token"));
+        assert!(version.contains("not inspectable locally"));
+        // The actionable "verify Actions: Read/write" guidance is retained.
+        let detail = entry.detail.as_deref().expect("detail");
+        assert!(detail.contains("App installation permissions"));
+        assert!(detail.contains("Actions: Read and write"));
     }
 
     #[test]
