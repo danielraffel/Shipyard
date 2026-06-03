@@ -22,6 +22,12 @@ pub const WINDOWS_REPLACE_ATTEMPTS: usize = 18;
 /// Base backoff delay. Attempt `n` sleeps in `[0.5*base*n, 1.5*base*n]`.
 pub const WINDOWS_REPLACE_BASE_DELAY: Duration = Duration::from_millis(50);
 const STALE_RECOVERY_MESSAGE: &str = "Process died mid-validation; job recovered on startup";
+/// Reason recorded when a `Running` job is reaped because its worker went
+/// silent past the heartbeat-staleness threshold (e.g. the worker process was
+/// killed). Shared by the ship-time same-PR preflight and the drain admission
+/// pass so the durable cancellation reads consistently wherever it originates.
+pub const STALE_RUNNING_CANCEL_REASON: &str =
+    "Running worker heartbeat stale; cancelled to unblock queued work";
 const ORPHAN_REQUEST_MESSAGE: &str = "Queued request envelope missing or unreadable";
 const SUPERSEDED_MESSAGE: &str =
     "Superseded by a newer queued job for the same branch, targets, and mode.";
@@ -322,6 +328,48 @@ impl Queue {
                     continue;
                 };
                 if let Ok(cancelled) = job.cancel_with_reason(Some(cancellation.reason.clone())) {
+                    *job = cancelled.clone();
+                    cancelled_jobs.push(cancelled);
+                }
+            }
+            let _ = trim_terminal(jobs);
+            Ok(cancelled_jobs)
+        })
+    }
+
+    /// Cancel the given jobs only if, re-checked under the state lock, they are
+    /// still `Running` and still stale by heartbeat age. Returns the jobs that
+    /// were actually cancelled (terminal `Cancelled`, with `reason`).
+    ///
+    /// Unlike [`recover_stale_running_jobs_for_drain`], this is safe to call
+    /// while workers may be alive — the under-lock staleness re-check means a
+    /// job that produced a fresh heartbeat after the caller's snapshot is never
+    /// cancelled, so a live worker is not reaped out from under itself. It does
+    /// not require the drain lock: it is a recovery action keyed on per-job
+    /// liveness, not a drain-owned scheduling decision.
+    ///
+    /// [`recover_stale_running_jobs_for_drain`]: Self::recover_stale_running_jobs_for_drain
+    pub fn cancel_stale_running_jobs(
+        &mut self,
+        job_ids: &[String],
+        now: DateTime<Utc>,
+        stale_after: chrono::Duration,
+        reason: &str,
+    ) -> QueueResult<Vec<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let mut cancelled_jobs = Vec::new();
+            let mut seen = BTreeSet::new();
+            for job_id in job_ids {
+                if !seen.insert(job_id.as_str()) {
+                    continue;
+                }
+                let Some(job) = jobs
+                    .iter_mut()
+                    .find(|job| job.id == *job_id && job.is_stale_running(now, stale_after))
+                else {
+                    continue;
+                };
+                if let Ok(cancelled) = job.cancel_with_reason(Some(reason.to_owned())) {
                     *job = cancelled.clone();
                     cancelled_jobs.push(cancelled);
                 }
@@ -769,8 +817,9 @@ mod tests {
 
     use super::{
         KEEP_COMPLETED, ORPHAN_REQUEST_MESSAGE, Queue, QueueDeferredRequeue,
-        QueuePendingCancellation, ReplaceRetryPolicy, STALE_RECOVERY_MESSAGE, SUPERSEDED_MESSAGE,
-        WINDOWS_REPLACE_ATTEMPTS, retry_replace_with_strategy, scaled_delay,
+        QueuePendingCancellation, ReplaceRetryPolicy, STALE_RECOVERY_MESSAGE,
+        STALE_RUNNING_CANCEL_REASON, SUPERSEDED_MESSAGE, WINDOWS_REPLACE_ATTEMPTS,
+        retry_replace_with_strategy, scaled_delay,
     };
 
     fn queue_dir() -> TempDir {
@@ -791,6 +840,76 @@ mod tests {
         job = job.start().expect("start").complete().expect("complete");
         job.completed_at = Some(Utc::now() - chrono::Duration::seconds(seconds_ago));
         job
+    }
+
+    fn running_aged(branch: &str, sha: &str, started_secs_ago: i64) -> Job {
+        let mut running = job(branch, sha, &["mac"]).start().expect("start");
+        running.started_at = Some(Utc::now() - chrono::Duration::seconds(started_secs_ago));
+        running
+    }
+
+    #[test]
+    fn cancel_stale_running_jobs_cancels_only_stale_running() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let stale = running_aged("main", "stale", 1000);
+        let fresh = running_aged("main", "fresh", 5);
+        let stale_id = stale.id.clone();
+        let fresh_id = fresh.id.clone();
+        queue.enqueue(stale).expect("stale");
+        queue.enqueue(fresh).expect("fresh");
+
+        let cancelled = queue
+            .cancel_stale_running_jobs(
+                &[stale_id.clone(), fresh_id.clone()],
+                Utc::now(),
+                chrono::Duration::seconds(180),
+                STALE_RUNNING_CANCEL_REASON,
+            )
+            .expect("cancel");
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, stale_id);
+        let stale_job = queue.get(&stale_id).expect("get").expect("job");
+        assert_eq!(stale_job.status, JobStatus::Cancelled);
+        assert_eq!(
+            stale_job.cancellation_reason.as_deref(),
+            Some(STALE_RUNNING_CANCEL_REASON)
+        );
+        // The fresh running job is left untouched — no live worker is reaped.
+        let fresh_job = queue.get(&fresh_id).expect("get").expect("job");
+        assert_eq!(fresh_job.status, JobStatus::Running);
+    }
+
+    #[test]
+    fn cancel_stale_running_jobs_ignores_non_running_and_dedupes() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        // Distinct branch/targets so enqueue supersession never touches it.
+        let pending = job("feat-other", "pending", &["linux"]);
+        let stale = running_aged("main", "stale", 1000);
+        let pending_id = pending.id.clone();
+        let stale_id = stale.id.clone();
+        queue.enqueue(pending).expect("pending");
+        queue.enqueue(stale).expect("stale");
+
+        let cancelled = queue
+            .cancel_stale_running_jobs(
+                &[pending_id.clone(), stale_id.clone(), stale_id.clone()],
+                Utc::now(),
+                chrono::Duration::seconds(180),
+                STALE_RUNNING_CANCEL_REASON,
+            )
+            .expect("cancel");
+
+        // Pending is never cancelled by this path; the stale running job is
+        // cancelled exactly once despite the duplicate id.
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, stale_id);
+        assert_eq!(
+            queue.get(&pending_id).expect("get").expect("job").status,
+            JobStatus::Pending
+        );
     }
 
     fn read_queue_json(path: &Path) -> Value {

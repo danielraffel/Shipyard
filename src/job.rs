@@ -6,6 +6,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Default age, in seconds, past which a `Running` job whose worker has gone
+/// silent is treated as abandoned by a dead worker. Mirrors the host-pool
+/// lease-staleness convention (`host_pool::DEFAULT_LEASE_STALE_SECONDS`); kept
+/// as an independent constant so the core job domain does not depend on the
+/// resource subsystem. A live worker heartbeats roughly every 15s, so 180s of
+/// silence is well past any healthy gap.
+pub const DEFAULT_RUNNING_JOB_STALE_SECONDS: i64 = 180;
+
 /// Job scheduling priority.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -453,6 +461,44 @@ impl Job {
             && self.results.values().all(TargetResult::is_terminal)
     }
 
+    /// Most recent liveness signal for the job: the newest of every per-target
+    /// heartbeat and `started_at`. Returns `None` for a job that has neither
+    /// (e.g. a pending job), which callers treat as "no liveness anchor".
+    ///
+    /// `started_at` is included in the max — not just used as a fallback —
+    /// because `defer_for_scheduler` retains terminal target results, so a
+    /// requeued-and-restarted job can carry an old heartbeat that predates its
+    /// new `started_at`. Taking the max keeps that freshly restarted live job
+    /// from being misread as stale.
+    #[must_use]
+    pub fn last_liveness_at(&self) -> Option<DateTime<Utc>> {
+        self.results
+            .values()
+            .filter_map(|result| result.last_heartbeat_at)
+            .chain(self.started_at)
+            .max()
+    }
+
+    /// Whether this is a `Running` job whose worker appears dead: its freshest
+    /// liveness signal is older than `stale_after`. Only ever true for
+    /// `Running` jobs; a job with no liveness anchor or a future-dated anchor
+    /// (clock skew) is conservatively treated as not stale.
+    ///
+    /// This is heartbeat-age based on purpose — unlike the startup recovery in
+    /// `Queue::recover_stale_running_jobs_for_drain`, which completes every
+    /// running job unconditionally because it only runs when no worker can have
+    /// survived. This predicate is safe to consult while workers may be live.
+    #[must_use]
+    pub fn is_stale_running(&self, now: DateTime<Utc>, stale_after: chrono::Duration) -> bool {
+        if self.status != JobStatus::Running || stale_after <= chrono::Duration::zero() {
+            return false;
+        }
+        match self.last_liveness_at() {
+            Some(anchor) => now.signed_duration_since(anchor) >= stale_after,
+            None => false,
+        }
+    }
+
     /// Convert to Python-compatible JSON value.
     #[must_use]
     pub fn to_json_value(&self) -> serde_json::Value {
@@ -604,6 +650,112 @@ mod tests {
         assert_eq!(job.mode, ValidationMode::Full);
         assert_eq!(job.priority, Priority::Normal);
         assert_eq!(job.target_names, vec!["mac", "linux"]);
+    }
+
+    fn running_with_heartbeat(
+        now: chrono::DateTime<chrono::Utc>,
+        started_offset_secs: i64,
+        heartbeat_offset_secs: Option<i64>,
+    ) -> Job {
+        let mut running = job().start().expect("pending job starts");
+        running.started_at = Some(now - chrono::Duration::seconds(started_offset_secs));
+        if let Some(offset) = heartbeat_offset_secs {
+            let mut result = TargetResult::new("mac", "macos", TargetStatus::Running, "local");
+            result.last_heartbeat_at = Some(now - chrono::Duration::seconds(offset));
+            running.results.insert("mac".to_owned(), result);
+        }
+        running
+    }
+
+    #[test]
+    fn last_liveness_at_prefers_newest_heartbeat_then_started_at() {
+        let now = chrono::Utc::now();
+        let mut running = running_with_heartbeat(now, 600, None);
+        // No heartbeats yet -> falls back to started_at.
+        assert_eq!(running.last_liveness_at(), running.started_at);
+
+        let mut older = TargetResult::new("mac", "macos", TargetStatus::Running, "local");
+        older.last_heartbeat_at = Some(now - chrono::Duration::seconds(300));
+        let mut newer = TargetResult::new("linux", "linux", TargetStatus::Running, "local");
+        newer.last_heartbeat_at = Some(now - chrono::Duration::seconds(30));
+        running.results.insert("mac".to_owned(), older);
+        running.results.insert("linux".to_owned(), newer);
+        // Freshest heartbeat wins over started_at and the older heartbeat.
+        assert_eq!(
+            running.last_liveness_at(),
+            Some(now - chrono::Duration::seconds(30))
+        );
+    }
+
+    #[test]
+    fn last_liveness_at_includes_started_at_over_stale_retained_heartbeat() {
+        let now = chrono::Utc::now();
+        // A requeued-then-restarted job: a fresh `started_at` but an old
+        // terminal-result heartbeat retained from the prior run. Liveness is the
+        // newer `started_at`, so the restarted live job is not stale.
+        let restarted = running_with_heartbeat(now, 5, Some(1000));
+        assert_eq!(restarted.last_liveness_at(), restarted.started_at);
+        assert!(!restarted.is_stale_running(now, chrono::Duration::seconds(180)));
+    }
+
+    #[test]
+    fn is_stale_running_only_for_running_jobs() {
+        let now = chrono::Utc::now();
+        let stale_after = chrono::Duration::seconds(180);
+        // Pending job: never stale, even though created_at is "now".
+        assert!(!job().is_stale_running(now, stale_after));
+        // Cancelled job: never stale.
+        let cancelled = job().cancel().expect("pending job cancels");
+        assert!(!cancelled.is_stale_running(now, stale_after));
+        // Completed job: never stale.
+        let completed = job()
+            .start()
+            .and_then(|running| running.complete())
+            .expect("pending -> running -> completed");
+        assert!(!completed.is_stale_running(now, stale_after));
+    }
+
+    #[test]
+    fn is_stale_running_uses_heartbeat_age_threshold() {
+        let now = chrono::Utc::now();
+        let stale_after = chrono::Duration::seconds(180);
+        // Ancient started_at but a fresh heartbeat -> not stale.
+        let fresh = running_with_heartbeat(now, 1000, Some(30));
+        assert!(!fresh.is_stale_running(now, stale_after));
+        // Just under the threshold -> not stale.
+        let almost = running_with_heartbeat(now, 1000, Some(179));
+        assert!(!almost.is_stale_running(now, stale_after));
+        // At/over the threshold -> stale.
+        let stale = running_with_heartbeat(now, 1000, Some(200));
+        assert!(stale.is_stale_running(now, stale_after));
+    }
+
+    #[test]
+    fn is_stale_running_uses_started_at_when_no_heartbeat() {
+        let now = chrono::Utc::now();
+        let stale_after = chrono::Duration::seconds(180);
+        // Running, never heartbeat, started long ago -> stale via started_at.
+        let stale = running_with_heartbeat(now, 1000, None);
+        assert!(stale.is_stale_running(now, stale_after));
+        // Running, never heartbeat, started recently -> not stale.
+        let fresh = running_with_heartbeat(now, 5, None);
+        assert!(!fresh.is_stale_running(now, stale_after));
+    }
+
+    #[test]
+    fn is_stale_running_handles_no_anchor_skew_and_zero_threshold() {
+        let now = chrono::Utc::now();
+        let stale_after = chrono::Duration::seconds(180);
+        // No anchor at all (no started_at, no heartbeat) -> not stale.
+        let mut no_anchor = running_with_heartbeat(now, 1000, None);
+        no_anchor.started_at = None;
+        assert!(!no_anchor.is_stale_running(now, stale_after));
+        // Future-dated heartbeat (clock skew) -> not stale.
+        let skewed = running_with_heartbeat(now, 0, Some(-60));
+        assert!(!skewed.is_stale_running(now, stale_after));
+        // Zero/negative threshold -> never stale.
+        let ancient = running_with_heartbeat(now, 10_000, Some(10_000));
+        assert!(!ancient.is_stale_running(now, chrono::Duration::zero()));
     }
 
     #[test]

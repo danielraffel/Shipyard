@@ -24,10 +24,10 @@ use crate::host_pool::{
     HostPoolConfig, HostPoolLeaseStore, HostPoolMemberConfig, default_lease_path,
 };
 use crate::job::{
-    Job, JobKind, JobStatus, JobTransitionError, Priority, TargetResult, TargetStatus,
-    ValidationMode,
+    DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobKind, JobStatus, JobTransitionError, Priority,
+    TargetResult, TargetStatus, ValidationMode,
 };
-use crate::queue::{Queue, QueueDeferredRequeue, QueueError};
+use crate::queue::{Queue, QueueDeferredRequeue, QueueError, STALE_RUNNING_CANCEL_REASON};
 use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
     QueuedExecutionKind, QueuedExecutionOutcome,
@@ -1229,6 +1229,7 @@ fn refuse_same_pr_running_ship(
     request: &ShipExecutionRequest,
 ) -> Result<(), ShipExecutionError> {
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
+    let stale_after = chrono::Duration::seconds(DEFAULT_RUNNING_JOB_STALE_SECONDS);
     for running in queue.get_running()? {
         let Some(envelope) = request_store.load(&running.id)? else {
             continue;
@@ -1240,13 +1241,41 @@ fn refuse_same_pr_running_ship(
         else {
             continue;
         };
-        if existing.repo == request.repo && existing.pr == request.pr {
-            return Err(ShipExecutionError::SamePrShipRunning {
-                repo: request.repo.clone(),
-                pr: request.pr,
-                running_job_id: running.id,
-            });
+        if existing.repo != request.repo || existing.pr != request.pr {
+            continue;
         }
+
+        // A same-PR ship is already running. If its worker has gone silent past
+        // the heartbeat-staleness threshold it was abandoned (e.g. the process
+        // was killed) and must not block this retry forever — reap it and move
+        // on. `cancel_stale_running_jobs` re-checks staleness under the queue
+        // lock, so a worker that is merely between heartbeats is never reaped
+        // out from under itself.
+        let now = Utc::now();
+        if running.is_stale_running(now, stale_after) {
+            let reaped = queue.cancel_stale_running_jobs(
+                std::slice::from_ref(&running.id),
+                now,
+                stale_after,
+                STALE_RUNNING_CANCEL_REASON,
+            )?;
+            if !reaped.is_empty() {
+                continue;
+            }
+            // The under-lock re-check disagreed — a heartbeat landed between the
+            // snapshot and the reap, so the worker is live after all. Fall
+            // through to refuse only if it is genuinely still running.
+            match queue.get(&running.id)? {
+                Some(job) if job.status == JobStatus::Running => {}
+                _ => continue,
+            }
+        }
+
+        return Err(ShipExecutionError::SamePrShipRunning {
+            repo: request.repo.clone(),
+            pr: request.pr,
+            running_job_id: running.id,
+        });
     }
     Ok(())
 }
@@ -2698,6 +2727,52 @@ mod tests {
                 ..
             } if running_job_id == running_job.id
         ));
+    }
+
+    #[test]
+    fn submit_ship_reaps_stale_same_pr_running_ship_and_enqueues_retry() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let request = ship_request(vec![target.clone()]);
+        let running_job =
+            submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit existing");
+        let drain = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain, std::slice::from_ref(&running_job.id))
+            .expect("start");
+        assert_eq!(started.len(), 1);
+
+        // Age the started worker past the staleness threshold to simulate a
+        // killed worker that stopped heartbeating.
+        let mut aged = queue.get(&running_job.id).expect("get").expect("running");
+        aged.started_at = Some(
+            Utc::now() - Duration::seconds(crate::job::DEFAULT_RUNNING_JOB_STALE_SECONDS + 60),
+        );
+        queue.update(&aged).expect("age running job");
+
+        // The retry now succeeds: the stale running job is reaped rather than
+        // blocking the same PR forever.
+        let retry = submit_ship(
+            &ship_request(vec![target]),
+            &mut queue,
+            temp.path(),
+            &state_dir,
+        )
+        .expect("retry submits after reaping stale same-PR ship");
+        assert_ne!(retry.id, running_job.id);
+        assert_eq!(retry.status, crate::job::JobStatus::Pending);
+
+        let reaped = queue.get(&running_job.id).expect("get").expect("reaped");
+        assert_eq!(reaped.status, crate::job::JobStatus::Cancelled);
+        assert_eq!(
+            reaped.cancellation_reason.as_deref(),
+            Some(crate::queue::STALE_RUNNING_CANCEL_REASON)
+        );
     }
 
     #[test]
