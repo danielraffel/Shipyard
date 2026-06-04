@@ -26,6 +26,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Inspect one PR's ship state | `shipyard ship-state show <pr> --json` |
 | Live-tail the active ship | `shipyard watch` (or `shipyard watch --pr <n>`) |
 | One-shot snapshot | `shipyard watch --no-follow --json` |
+| Watch a long local/SSH VM build | `shipyard watch local --target <name> --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'` |
 | Merge on green (cron-safe one-shot) | `shipyard auto-merge <pr>` (0=merged, 1=fail, 2=not-found, 3=in-flight) |
 | Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` |
 | Configure RELEASE_BOT_TOKEN | `shipyard release-bot setup` (guided) |

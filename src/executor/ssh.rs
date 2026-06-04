@@ -1383,6 +1383,7 @@ mod tests {
             phase: None,
             contract_markers_seen,
             last_heartbeat_at: Some(now),
+            termination_reason: None,
         }
     }
 

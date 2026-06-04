@@ -43,6 +43,7 @@ mod targets_cmd;
 mod update_cmd;
 mod wait_cmd;
 mod watch_cmd;
+mod watch_local_cmd;
 
 use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
@@ -51,7 +52,9 @@ use self::changelog_cmd::changelog_command;
 use self::cleanup_cmd::{
     CleanupCommandOptions, CleanupMode, CleanupOutput, CleanupScope, cleanup_command,
 };
-use self::cli::{Cli, Command, MergeMethod, MergeResult, ShipStateCommand, TargetsCommand};
+use self::cli::{
+    Cli, Command, MergeMethod, MergeResult, ShipStateCommand, TargetsCommand, WatchSubcommand,
+};
 use self::cloud_cmd::cloud_command;
 use self::config_cmd::config_command;
 use self::daemon_cmd::daemon_command;
@@ -80,6 +83,7 @@ use self::targets_cmd::targets_command;
 use self::update_cmd::update_command;
 use self::wait_cmd::wait_command;
 use self::watch_cmd::{WatchCommandContext, WatchCommandOptions, watch};
+use self::watch_local_cmd::watch_local_command;
 
 #[derive(Debug)]
 pub(super) struct CliFailure {
@@ -277,7 +281,7 @@ fn handle_operational_variant<W: Write>(
             handle_auto_merge_variant(command, &runtime_paths.state_dir, cwd, json, stdout)
         }
         command @ Command::Watch { .. } => {
-            handle_watch_variant(&command, &runtime_paths.state_dir, cwd, json, stdout)
+            handle_watch_variant(command, mode, &runtime_paths.state_dir, cwd, json, stdout)
         }
         command @ Command::ShipState { .. } => {
             handle_ship_state_variant(&command, mode, cwd, &runtime_paths.state_dir, json, stdout)?;
@@ -671,21 +675,28 @@ fn handle_auto_merge_variant<W: Write>(
 }
 
 fn handle_watch_variant<W: Write>(
-    command: &Command,
+    command: Command,
+    mode: RuntimeMode,
     state_dir: &Path,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let Command::Watch {
+        command,
         pr,
         follow,
         no_follow,
         interval,
-    } = *command
+    } = command
     else {
         unreachable!("watch variant required")
     };
+    if let Some(WatchSubcommand::Local(args)) = command {
+        let config = LoadedConfig::load_from_cwd(mode, cwd)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return watch_local_command(&args, &config, cwd, state_dir, json, stdout);
+    }
     handle_watch_command(
         WatchInvocation {
             pr,
@@ -1027,6 +1038,19 @@ mod tests {
         git(&["commit", "-q", "-m", "seed"], root);
     }
 
+    fn write_local_watch_config(root: &std::path::Path) {
+        let project_dir = root.join(".shipyard");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(
+            project_dir.join("config.toml"),
+            format!(
+                "[targets.local]\nbackend = \"local\"\nplatform = \"linux\"\ncwd = {:?}\n",
+                root.display().to_string()
+            ),
+        )
+        .expect("watch config");
+    }
+
     #[test]
     fn ship_state_list_json_matches_command_envelope_shape() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1078,6 +1102,84 @@ mod tests {
             value["states"][0]["dispatched_runs"][0]["run_id"],
             "24446948064"
         );
+    }
+
+    #[test]
+    fn watch_local_streams_milestones_and_process_exit_terminal_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_local_watch_config(temp.path());
+        let state_dir = temp.path().join("state");
+        let log_path = temp.path().join("watch.log");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "--cwd",
+            temp.path().to_str().expect("cwd path"),
+            "watch",
+            "local",
+            "--target",
+            "local",
+            "--command",
+            "printf '[1/3] compile\\nok\\n'",
+            "--milestone-regex",
+            r"\[[0-9]+/[0-9]+\]",
+            "--log-path",
+            log_path.to_str().expect("log path"),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let text = String::from_utf8(stdout).expect("utf8");
+        assert!(text.contains("[1/3] compile"));
+        assert!(text.contains("shipyard milestone"));
+        assert!(text.contains("shipyard terminal [process_exit]: returncode=0"));
+        assert!(
+            std::fs::read_to_string(log_path)
+                .expect("log")
+                .contains("[1/3] compile")
+        );
+    }
+
+    #[test]
+    fn watch_local_terminal_regex_stops_with_failure_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_local_watch_config(temp.path());
+        let state_dir = temp.path().join("state");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "--cwd",
+            temp.path().to_str().expect("cwd path"),
+            "watch",
+            "local",
+            "--target",
+            "local",
+            "--command",
+            "printf 'AUDIT FAIL bad\\n'",
+            "--terminal-regex",
+            "AUDIT FAIL",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stderr.is_empty());
+        let text = String::from_utf8(stdout).expect("utf8");
+        assert!(text.contains("AUDIT FAIL bad"));
+        assert!(text.contains("shipyard terminal [AUDIT FAIL]: AUDIT FAIL bad"));
+        assert!(!text.contains("process_exit"));
     }
 
     #[test]

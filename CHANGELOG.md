@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0681"></a>
+## [0.69.0]
+
 ## [0.68.1] - 2026-06-03
 
 - fix(update): authenticate release queries opportunistically + clearer rate-limit error ([#353](https://github.com/danielraffel/Shipyard/pull/353))

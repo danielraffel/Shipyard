@@ -25,6 +25,8 @@ shipyard ship --base develop   # target a different branch
 
 # Monitor
 shipyard status                # dashboard: queue + targets + evidence
+shipyard watch                 # live-tail an in-flight ship
+shipyard watch local --target linux-vm --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'
 shipyard queue                 # show all jobs with priorities
 shipyard logs <id>             # per-target logs
 shipyard logs <id> --target windows

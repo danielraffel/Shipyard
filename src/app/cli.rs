@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use crate::identity::RuntimeMode;
 
@@ -307,6 +307,9 @@ pub(super) enum Command {
     },
     /// Live view of an in-flight ship.
     Watch {
+        /// Watch subcommand. Omit for PR ship-state watch.
+        #[command(subcommand)]
+        command: Option<WatchSubcommand>,
         /// PR number to watch. Defaults to the active ship for the current branch.
         #[arg(long)]
         pr: Option<u64>,
@@ -333,6 +336,37 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: RunnerCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum WatchSubcommand {
+    /// Run and watch a command on a local or POSIX SSH target.
+    Local(WatchLocalArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct WatchLocalArgs {
+    /// Configured Shipyard target to run on.
+    #[arg(long)]
+    pub(super) target: String,
+    /// Shell command to run on the target.
+    #[arg(long)]
+    pub(super) command: String,
+    /// Override the target work directory.
+    #[arg(long)]
+    pub(super) target_cwd: Option<String>,
+    /// Regex emitted as a milestone event when it matches an output line.
+    #[arg(long = "milestone-regex")]
+    pub(super) milestone_regex: Vec<String>,
+    /// Regex emitted as the terminal event and used to stop the command early.
+    #[arg(long = "terminal-regex")]
+    pub(super) terminal_regex: Vec<String>,
+    /// Write the full target output to this log path.
+    #[arg(long = "log-path")]
+    pub(super) log_path: Option<PathBuf>,
+    /// Stop the command after this many seconds.
+    #[arg(long = "timeout-secs")]
+    pub(super) timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
