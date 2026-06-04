@@ -4,7 +4,9 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0700"></a>
-## [0.70.0]
+## [0.70.0] - 2026-06-04
+
+- feat(run): add command evidence bundles ([#356](https://github.com/danielraffel/Shipyard/pull/356))
 
 <a id="v0690"></a>
 ## [0.69.0] - 2026-06-04
@@ -639,6 +641,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.70.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.70.0
 [0.69.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.69.0
 [0.68.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.68.1
 [0.68.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.68.0
