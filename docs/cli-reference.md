@@ -18,6 +18,7 @@ shipyard run --smoke               # fast smoke check
 shipyard run --targets mac         # single target
 shipyard run --resume-from test    # skip setup/configure/build (where supported)
 shipyard run --continue            # don't stop at first failure
+shipyard run command --target linux-vm --artifact 'build/linux-x64/lib/libv8.so' -- bash -lc './build-v8.py --target linux-x64'
 
 # Ship
 shipyard ship                  # PR → validate → merge on green
@@ -31,6 +32,8 @@ shipyard queue                 # show all jobs with priorities
 shipyard logs <id>             # per-target logs
 shipyard logs <id> --target windows
 shipyard evidence              # last-good SHA per platform
+shipyard evidence command      # latest workload-agnostic command-evidence bundle
+shipyard evidence command --list
 
 # Manage
 shipyard bump <id> high        # reprioritize a pending job

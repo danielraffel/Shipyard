@@ -91,6 +91,9 @@ pub(super) enum Command {
     Status,
     /// Show last-good-SHA evidence per target.
     Evidence {
+        /// Evidence subcommand.
+        #[command(subcommand)]
+        command: Option<EvidenceCommand>,
         /// Branch to inspect. Defaults to current git branch or main.
         branch: Option<String>,
     },
@@ -156,6 +159,9 @@ pub(super) enum Command {
     },
     /// Validate current HEAD on configured targets.
     Run {
+        /// Run subcommand.
+        #[command(subcommand)]
+        command: Option<RunSubcommand>,
         /// Comma-separated target names. Defaults to all configured targets.
         #[arg(long)]
         targets: Option<String>,
@@ -336,6 +342,55 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: RunnerCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum EvidenceCommand {
+    /// Show command-evidence bundles produced by `shipyard run command`.
+    Command {
+        /// Evidence id. Defaults to the most recent command-evidence bundle.
+        id: Option<String>,
+        /// Show all command-evidence bundle summaries.
+        #[arg(long)]
+        list: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum RunSubcommand {
+    /// Run an arbitrary command on one local or POSIX SSH target and store typed evidence.
+    Command(RunCommandEvidenceArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct RunCommandEvidenceArgs {
+    /// Target name from `[targets.<name>]`.
+    #[arg(long)]
+    pub(super) target: String,
+    /// Stable evidence name. Defaults to the target name.
+    #[arg(long)]
+    pub(super) name: Option<String>,
+    /// Expected process exit code.
+    #[arg(long = "expect-code", default_value_t = 0)]
+    pub(super) expect_code: i32,
+    /// Override the target working directory.
+    #[arg(long = "target-cwd")]
+    pub(super) target_cwd: Option<String>,
+    /// Artifact glob relative to the target working directory. May be repeated.
+    #[arg(long = "artifact")]
+    pub(super) artifacts: Vec<String>,
+    /// Local log file path. Defaults under Shipyard state logs.
+    #[arg(long = "log-path")]
+    pub(super) log_path: Option<PathBuf>,
+    /// Wall-clock timeout in seconds.
+    #[arg(long = "timeout-secs")]
+    pub(super) timeout_secs: Option<u64>,
+    /// Environment variable name to fingerprint without recording its value. May be repeated.
+    #[arg(long = "env-fingerprint")]
+    pub(super) env_fingerprints: Vec<String>,
+    /// Command and arguments to execute after `--`.
+    #[arg(required = true, trailing_var_arg = true)]
+    pub(super) command: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]

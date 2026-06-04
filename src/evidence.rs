@@ -57,6 +57,160 @@ pub struct EvidenceRecord {
     pub stages_signature: Option<String>,
 }
 
+/// Artifact captured for a workload-agnostic command-evidence bundle.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CommandEvidenceArtifact {
+    /// Glob that selected this artifact.
+    pub pattern: String,
+    /// Path on the target, relative to the command working directory.
+    pub source: String,
+    /// Local path where Shipyard stored the artifact.
+    pub path: String,
+    /// Captured file size in bytes.
+    pub size_bytes: u64,
+}
+
+/// Typed evidence for one arbitrary command run on a local or POSIX SSH target.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CommandEvidenceRecord {
+    /// Record schema version.
+    pub schema_version: u8,
+    /// Stable command-evidence id.
+    pub id: String,
+    /// User-facing workload name.
+    pub name: String,
+    /// Git branch associated with the command, when run inside a checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Git SHA associated with the command, when run inside a checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    /// Logical target name.
+    #[serde(rename = "target")]
+    pub target_name: String,
+    /// Concrete platform label.
+    pub platform: String,
+    /// Backend that ran the command.
+    pub backend: String,
+    /// Optional host identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Working directory on the target.
+    pub workdir: String,
+    /// Command argv.
+    pub command: Vec<String>,
+    /// Expected process exit code.
+    pub expected_exit_code: i32,
+    /// Observed process exit code.
+    pub exit_code: i32,
+    /// `pass` when the observed exit code matches the expected code, otherwise `fail`.
+    pub status: String,
+    /// Process start timestamp.
+    pub started_at: DateTime<Utc>,
+    /// Process completion timestamp.
+    pub completed_at: DateTime<Utc>,
+    /// Wall-clock duration in seconds.
+    pub duration_secs: f64,
+    /// Local log path.
+    pub log_path: String,
+    /// Bounded log excerpt captured from command output.
+    pub log_excerpt: String,
+    /// Environment variable fingerprints keyed by variable name.
+    pub env_fingerprint: BTreeMap<String, String>,
+    /// Captured artifacts.
+    pub artifacts: Vec<CommandEvidenceArtifact>,
+    /// Artifact collection errors. A non-empty list makes the evidence fail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_errors: Vec<String>,
+    /// Bundle directory containing `evidence.json` and captured artifacts.
+    pub bundle_path: String,
+}
+
+impl CommandEvidenceRecord {
+    /// Whether the command evidence passed its exit-code assertion.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.status == "pass"
+    }
+}
+
+/// Persistent store for command-evidence bundles.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandEvidenceStore {
+    path: PathBuf,
+}
+
+impl CommandEvidenceStore {
+    /// Open a command-evidence store at the given path.
+    pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    /// Backing path of the command-evidence store.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the bundle directory for an evidence id.
+    #[must_use]
+    pub fn bundle_dir(&self, id: &str) -> PathBuf {
+        self.path.join(sanitize_component(id))
+    }
+
+    /// Return the artifact directory for an evidence id.
+    #[must_use]
+    pub fn artifact_dir(&self, id: &str) -> PathBuf {
+        self.bundle_dir(id).join("artifacts")
+    }
+
+    /// Store or replace a command-evidence record.
+    pub fn record(
+        &self,
+        evidence: &CommandEvidenceRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bundle_dir = self.bundle_dir(&evidence.id);
+        fs::create_dir_all(&bundle_dir)?;
+        let payload = serde_json::to_string_pretty(evidence)?;
+        let temp = tempfile::NamedTempFile::new_in(&bundle_dir)?;
+        fs::write(temp.path(), format!("{payload}\n"))?;
+        temp.persist(bundle_dir.join("evidence.json"))?;
+        Ok(())
+    }
+
+    /// Return a command-evidence record by id.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<CommandEvidenceRecord> {
+        Self::load_record(&self.bundle_dir(id).join("evidence.json")).ok()
+    }
+
+    /// Return all readable command-evidence records sorted newest first.
+    #[must_use]
+    pub fn list(&self) -> Vec<CommandEvidenceRecord> {
+        let Ok(entries) = fs::read_dir(&self.path) else {
+            return Vec::new();
+        };
+        let mut records = entries
+            .flatten()
+            .filter_map(|entry| Self::load_record(&entry.path().join("evidence.json")).ok())
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| std::cmp::Reverse(record.completed_at));
+        records
+    }
+
+    /// Return the newest readable command-evidence record.
+    #[must_use]
+    pub fn latest(&self) -> Option<CommandEvidenceRecord> {
+        self.list().into_iter().next()
+    }
+
+    fn load_record(path: &Path) -> Result<CommandEvidenceRecord, Box<dyn std::error::Error>> {
+        let contents = fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&contents)?)
+    }
+}
+
 impl EvidenceRecord {
     /// Whether this record is a passing validation.
     #[must_use]
@@ -258,6 +412,24 @@ impl Drop for StoreLock {
 
 fn sanitize_branch(branch: &str) -> String {
     branch.replace(['/', '\\'], "--")
+}
+
+fn sanitize_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "command-evidence".to_owned()
+    } else {
+        sanitized
+    }
 }
 
 #[cfg(test)]

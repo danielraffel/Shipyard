@@ -42,6 +42,36 @@ match, and prints exactly one `shipyard terminal [...]` line when the process
 exits or a terminal regex matches. A terminal regex stops the command early and
 exits nonzero; otherwise Shipyard exits with the process status.
 
+## Run a target command and keep typed evidence
+
+Use `shipyard run command` when a local or POSIX SSH target should run one
+workload-specific command and return a durable evidence bundle, without making
+that command count as merge-ready validation evidence.
+
+```sh
+shipyard run command \
+  --target linux-vm \
+  --name v8-linux-x64-seal \
+  --expect-code 0 \
+  --artifact 'build/linux-x64/lib/libv8.so' \
+  --artifact 'logs/v8-audit.log' \
+  --env-fingerprint PATH \
+  -- bash -lc './build-v8.py --target linux-x64 --seal --audit'
+```
+
+Local targets run in their configured `cwd`; SSH targets run in `repo_path`.
+Override that with `--target-cwd` for worktrees or mounted VM paths. Artifact
+globs are relative to that target working directory and are copied into
+`command-evidence/<id>/artifacts/` under Shipyard state. The record stores the
+command argv, expected and observed exit code, duration, target/backend/host,
+bounded log excerpt, optional environment fingerprints, artifact metadata, and
+the bundle path. Query the newest bundle with:
+
+```sh
+shipyard evidence command --json
+shipyard evidence command --list
+```
+
 ## Fallback when a machine is down
 
 Each target can have a fallback chain. When the primary is unreachable,

@@ -43,6 +43,28 @@ streams target output, emits milestone lines for matching regexes, emits exactly
 one terminal line on process exit or terminal-regex match, and exits with the
 process status unless a terminal regex stops it early.
 
+## Target Command Evidence
+
+Use `shipyard run command` when a local or POSIX SSH target should run a single
+workload-specific command, assert its exit code, pull declared artifact globs
+back to the host, and store a typed evidence bundle that is separate from
+merge-ready validation evidence:
+
+```sh
+shipyard run command \
+  --target linux-vm \
+  --name v8-linux-x64-seal \
+  --expect-code 0 \
+  --artifact 'build/linux-x64/lib/libv8.so' \
+  --artifact 'logs/v8-audit.log' \
+  -- bash -lc './build-v8.py --target linux-x64 --seal --audit'
+```
+
+Query the newest bundle with `shipyard evidence command --json` or list stored
+bundles with `shipyard evidence command --list`. Artifact globs are relative to
+the target working directory (`cwd` for local targets, `repo_path` for SSH
+targets, or `--target-cwd` when overridden).
+
 ## GitHub Auth And Quota
 
 Shipyard's operational GitHub calls can be configured with `[github.auth]`.

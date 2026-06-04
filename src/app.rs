@@ -20,6 +20,7 @@ mod cleanup_cmd;
 mod cli;
 mod cloud_cmd;
 mod cloud_read_cmd;
+mod command_evidence_cmd;
 mod config_cmd;
 mod daemon_cmd;
 mod doctor_cmd;
@@ -53,9 +54,11 @@ use self::cleanup_cmd::{
     CleanupCommandOptions, CleanupMode, CleanupOutput, CleanupScope, cleanup_command,
 };
 use self::cli::{
-    Cli, Command, MergeMethod, MergeResult, ShipStateCommand, TargetsCommand, WatchSubcommand,
+    Cli, Command, EvidenceCommand, MergeMethod, MergeResult, RunSubcommand, ShipStateCommand,
+    TargetsCommand, WatchSubcommand,
 };
 use self::cloud_cmd::cloud_command;
+use self::command_evidence_cmd::{run_command_evidence, show_command_evidence};
 use self::config_cmd::config_command;
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
@@ -366,7 +369,12 @@ fn handle_state_command<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     match command {
         Command::Status => status_command(mode, cwd, state_dir, json, stdout),
-        Command::Evidence { branch } => evidence_command(branch, cwd, state_dir, json, stdout),
+        Command::Evidence { command, branch } => match command {
+            Some(EvidenceCommand::Command { id, list }) => {
+                show_command_evidence(id, list, state_dir, json, stdout)
+            }
+            None => evidence_command(branch, cwd, state_dir, json, stdout),
+        },
         Command::Logs { job_id, target } => logs_command(&job_id, target, state_dir, stdout),
         Command::Cancel { job_id } => cancel_command(&job_id, state_dir, json, stdout),
         Command::Bump { job_id, priority } => {
@@ -586,6 +594,7 @@ fn handle_run_variant<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let Command::Run {
+        command: subcommand,
         targets,
         smoke,
         fail_fast,
@@ -599,6 +608,11 @@ fn handle_run_variant<W: Write>(
     else {
         unreachable!("run variant required")
     };
+    if let Some(RunSubcommand::Command(args)) = subcommand {
+        let config = LoadedConfig::load_from_cwd(mode, cwd)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return run_command_evidence(&args, &config, cwd, runtime_paths, json, stdout);
+    }
     handle_run_command(
         RunCommandArgs {
             targets,
