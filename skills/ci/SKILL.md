@@ -15,6 +15,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Validate specific targets | `shipyard run --targets mac,ubuntu --json` |
 | Iterate on one platform's CI failure | `shipyard run --skip-target <others>` (see [Iterating on a single-platform failure](#iterating-on-a-single-platform-failure)) |
 | Fast smoke check | `shipyard run --smoke --json` |
+| Run one target command and store typed evidence/artifacts | `shipyard run command --target <name> --artifact '<glob>' -- <argv...>` |
 | Start the live-mode webhook daemon | `shipyard daemon start` |
 | Inspect the daemon | `shipyard daemon status --json` |
 | Stop the daemon | `shipyard daemon stop` |
@@ -61,6 +62,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Stuck-runner: restore quarantined build after a misclick** | `shipyard runner kill --recover <event-id>` |
 | Show logs for one target | `shipyard logs <job_id> --target windows` |
 | Check merge readiness | `shipyard evidence --json` |
+| Show latest command-evidence bundle | `shipyard evidence command --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
 | Cancel a job | `shipyard cancel <job_id>` |
 | List cloud workflows | `shipyard cloud workflows --json` |
