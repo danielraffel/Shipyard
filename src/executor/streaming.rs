@@ -52,6 +52,15 @@ pub enum StreamingCommandSpec {
     Args(Vec<String>),
 }
 
+/// Action requested by a decoded output-line observer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamLineAction {
+    /// Continue streaming the process.
+    Continue,
+    /// Stop the process and return a completed streaming result.
+    Terminate(String),
+}
+
 /// Streaming command request.
 pub struct StreamingCommand<'a> {
     /// Command or argv to execute.
@@ -74,6 +83,8 @@ pub struct StreamingCommand<'a> {
     pub required_contract_markers: Vec<String>,
     /// Optional progress callback.
     pub progress_callback: Option<&'a mut dyn FnMut(ProgressEvent)>,
+    /// Optional decoded output-line callback.
+    pub line_callback: Option<&'a mut dyn FnMut(&str) -> StreamLineAction>,
 }
 
 impl StreamingCommand<'_> {
@@ -91,6 +102,7 @@ impl StreamingCommand<'_> {
             stuck_idle: DEFAULT_STUCK_IDLE,
             required_contract_markers: Vec::new(),
             progress_callback: None,
+            line_callback: None,
         }
     }
 }
@@ -116,6 +128,8 @@ pub struct StreamingCommandResult {
     pub contract_markers_seen: Vec<String>,
     /// Timestamp of latest output or idle heartbeat.
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    /// Reason the process was stopped before natural exit, when applicable.
+    pub termination_reason: Option<String>,
 }
 
 /// Streaming command failure.
@@ -174,6 +188,7 @@ pub fn run_streaming_command(
     let mut readers = spawn_readers(sender, stdout, stderr);
     let mut log = open_log(&request)?;
     let mut state = StreamState::new(request.phase.take());
+    let mut termination_reason = None;
 
     loop {
         if let Some(timeout) = request.timeout
@@ -191,6 +206,16 @@ pub fn run_streaming_command(
             Ok(StreamMessage::Line(line)) => {
                 state.record_line(&line, &mut log, &mut request.progress_callback)?;
                 state.scan_markers(&line, &request.required_contract_markers);
+                if let Some(callback) = request.line_callback.as_mut() {
+                    match callback(&line) {
+                        StreamLineAction::Continue => {}
+                        StreamLineAction::Terminate(reason) => {
+                            termination_reason = Some(reason);
+                            kill_child(&mut child);
+                            break;
+                        }
+                    }
+                }
             }
             Ok(StreamMessage::Eof) => {
                 state.active_readers = state.active_readers.saturating_sub(1);
@@ -226,6 +251,7 @@ pub fn run_streaming_command(
         phase: state.phase,
         contract_markers_seen: state.seen_markers,
         last_heartbeat_at: state.last_heartbeat_at,
+        termination_reason,
     })
 }
 
@@ -485,7 +511,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ProgressEvent, StreamingCommand, StreamingCommandSpec, StreamingError,
+        ProgressEvent, StreamLineAction, StreamingCommand, StreamingCommandSpec, StreamingError,
         run_streaming_command,
     };
 
@@ -530,6 +556,24 @@ mod tests {
     }
 
     #[test]
+    fn streaming_command_line_callback_can_stop_process() {
+        let mut request = StreamingCommand::shell("printf 'start\\nSTOP\\nafter\\n'; sleep 3");
+        let mut callback = |line: &str| {
+            if line.contains("STOP") {
+                StreamLineAction::Terminate("matched STOP".to_owned())
+            } else {
+                StreamLineAction::Continue
+            }
+        };
+        request.line_callback = Some(&mut callback);
+
+        let result = run_streaming_command(request).expect("run");
+
+        assert_eq!(result.termination_reason.as_deref(), Some("matched STOP"));
+        assert!(result.output.contains("STOP"));
+    }
+
+    #[test]
     fn argv_command_rejects_empty_argv() {
         let request = StreamingCommand {
             command: StreamingCommandSpec::Args(Vec::new()),
@@ -542,6 +586,7 @@ mod tests {
             stuck_idle: Duration::from_secs(90),
             required_contract_markers: Vec::new(),
             progress_callback: None,
+            line_callback: None,
         };
 
         assert!(matches!(

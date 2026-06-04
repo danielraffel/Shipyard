@@ -25,6 +25,24 @@ go/no-go for that operation.
 4. Use `--mode isolated`, temporary install directories, and sandbox HOME/PATH
    roots for rehearsals that must not touch the active production state.
 
+## Local/SSH VM Watch
+
+Use `shipyard watch local` for long target-backed jobs that are not GitHub
+Actions runs, such as following a build inside a Tart Linux VM:
+
+```sh
+shipyard watch local \
+  --target linux-vm \
+  --command './build-v8.py --target linux-x64 --seal --audit' \
+  --milestone-regex '\[[0-9]+/[0-9]+\]' \
+  --terminal-regex 'AUDIT FAIL|ld\.lld: error'
+```
+
+This mode supports `backend = "local"` and POSIX `backend = "ssh"` targets. It
+streams target output, emits milestone lines for matching regexes, emits exactly
+one terminal line on process exit or terminal-regex match, and exits with the
+process status unless a terminal regex stops it early.
+
 ## GitHub Auth And Quota
 
 Shipyard's operational GitHub calls can be configured with `[github.auth]`.

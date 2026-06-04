@@ -18,6 +18,30 @@ whatever you want and can have as many as you need.
 You don't need all of these. Use what matches your project — one target
 is fine, six is fine. Add more any time with `shipyard targets add`.
 
+## Watch a local VM or SSH build
+
+`shipyard watch` also has a target-backed mode for long local/SSH VM jobs that
+are not GitHub Actions runs. Use it when you would otherwise hand-roll
+`ssh ... | tee ... | grep ...` loops to follow a build inside a Tart Linux VM.
+
+```sh
+shipyard watch local \
+  --target linux-vm \
+  --command './build-v8.py --target linux-x64 --seal --audit' \
+  --milestone-regex '\[[0-9]+/[0-9]+\]' \
+  --milestone-regex 'AUDIT (PASS|FAIL)' \
+  --terminal-regex 'AUDIT FAIL|ld\.lld: error' \
+  --log-path .shipyard.local/logs/v8-linux-x64.log
+```
+
+The target must resolve to `backend = "local"` or `backend = "ssh"`. Local
+targets run in their configured `cwd`; SSH targets run in `repo_path`. Override
+that with `--cwd` when the workload lives somewhere else. Human output streams
+the target output, prints `shipyard milestone [...]` for each milestone regex
+match, and prints exactly one `shipyard terminal [...]` line when the process
+exits or a terminal regex matches. A terminal regex stops the command early and
+exits nonzero; otherwise Shipyard exits with the process status.
+
 ## Fallback when a machine is down
 
 Each target can have a fallback chain. When the primary is unreachable,
