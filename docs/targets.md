@@ -145,6 +145,67 @@ The standard capability vocabulary is `gpu`, `arm64`, `x86_64`,
 your own strings — the matcher is pure set containment, so unknown
 capabilities work as long as the target and the provider agree.
 
+## Emulated x86_64 smoke (local, via tartci)
+
+On an Apple-Silicon Mac the local VM lanes are **ARM64** — there is no x86 guest
+(Apple Virtualization and QEMU-on-hvf are both ARM64). You can still get a *local
+x86_64 signal* by cross-compiling in the guest and running the tests under
+emulation (qemu-user on Linux, Prism on Windows-ARM). Wire it as a plain
+`backend = "local"` target whose validation command shells out to
+[tartci](https://github.com/danielraffel/tartci)'s cross lane — no new Shipyard
+config field is needed, because a target is just a machine + a command:
+
+```toml
+# Emulated x86_64 Linux smoke. Cross-builds x64 and runs the test subset under
+# qemu-user-static inside an ephemeral Tart Linux clone, then discards it.
+[targets.linux-x64-smoke]
+backend  = "local"
+platform = "linux-x64"
+
+[targets.linux-x64-smoke.validation]
+command = "tartci up linux --target-arch x86_64"
+```
+
+```toml
+# Prove just the toolchain + emulator chain (golden-agnostic, no checkout):
+[targets.x64-selftest]
+backend  = "local"
+platform = "linux-x64"
+
+[targets.x64-selftest.validation]
+command = "tartci up linux --target-arch x86_64 --self-test"
+```
+
+This is a **smoke / debug** signal, not a gate: sanitizers, SIMD/Highway
+dispatch, and RT timing are unreliable under emulation. Keep a real x86_64 runner
+(GitHub-hosted, an SSH x64 box, or a Namespace cloud profile) as the
+authoritative x64 gate, and model it as a **separate target** — do **not** chain
+the smoke target to the gate with `fallback`. Fallback fires only when a machine
+is *unreachable* (an infrastructure failure), not when validation *fails* (see
+"Fallback is for infrastructure failures" above), so a failing emulated smoke
+must surface as a failure, never silently fall through to cloud:
+
+```toml
+# Fast local pre-check (manual / pre-push): emulated x64 via tartci, above.
+[targets.linux-x64-smoke]
+backend  = "local"
+platform = "linux-x64"
+
+[targets.linux-x64-smoke.validation]
+command = "tartci up linux --target-arch x86_64"
+
+# The authoritative x64 gate — a real x86_64 runner, an independent target.
+[targets.linux]
+backend  = "cloud"
+platform = "linux-x64"
+```
+
+Run the smoke target when you want a fast local signal; the gate target stays
+the one your PR must pass. The GPU-on cross build needs a separate x86_64 Skia
+tree (both Linux arches collide on one `libskia.a` path); the tartci lane
+defaults GPU-off for the smoke and documents the `--skia-dir` opt-in. See
+tartci's runbook §3.8.
+
 Capabilities are resolved in this order for each backend:
 
 1. An inline `capabilities = [...]` list on the backend entry.

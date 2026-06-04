@@ -19,6 +19,14 @@ which recovers stuck runners. Pure naming/index/label/table logic lives in
   is once per machine and is the repo's own concern (e.g. pulp's
   `tools/ci/bootstrap-macos-host.sh`). Registering *runners* is once per repo
   per machine and is what this command does. It assumes a buildable host.
+- **Non-macOS + emulated lanes are tartci targets, not `shipyard runner`
+  registrations.** This command provisions native macOS Actions runners. Local
+  Linux / Windows build VMs (and the emulated **x86_64** smoke lane —
+  cross-compile + qemu-user / Prism) are driven by
+  [tartci](https://github.com/danielraffel/tartci) and wired into Shipyard as
+  ordinary `backend = "local"` targets whose validation command shells to
+  `tartci up <os> [--target-arch x86_64]` — see
+  [targets.md](./targets.md#emulated-x86_64-smoke-local-via-tartci).
 
 ## Machine tag
 
