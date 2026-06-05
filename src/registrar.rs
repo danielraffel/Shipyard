@@ -168,7 +168,7 @@ impl Registrar {
         url: &str,
         secret: &str,
     ) -> Result<u64, RegistrarError> {
-        let client = self.configured_gh_client()?;
+        let client = self.configured_gh_client(repo)?;
         self.ensure_registered_with_client(repo, url, secret, &client, None)
     }
 
@@ -209,7 +209,7 @@ impl Registrar {
         let Some(hook_id) = self.by_repo.get(repo).copied() else {
             return Ok(());
         };
-        if let Some(client) = self.configured_gh_client_optional()? {
+        if let Some(client) = self.configured_gh_client_optional(Some(repo))? {
             delete_hook(&client, &self.cwd, None, repo, hook_id)?;
         }
         self.by_repo.remove(repo);
@@ -256,22 +256,32 @@ impl Registrar {
         Ok(())
     }
 
-    fn configured_gh_client(&self) -> Result<GhClient, RegistrarError> {
-        self.configured_gh_client_optional()?
+    fn configured_gh_client(&self, repo: &str) -> Result<GhClient, RegistrarError> {
+        self.configured_gh_client_optional(Some(repo))?
             .ok_or_else(|| RegistrarError::GhUnavailable("gh CLI not found on PATH".to_owned()))
     }
 
+    /// Build the configured `gh` client, hinting `repo` for a `{repo_slug}`
+    /// token-command placeholder (the daemon's CWD isn't a GitHub checkout).
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
-    fn configured_gh_client_optional(&self) -> Result<Option<GhClient>, RegistrarError> {
+    fn configured_gh_client_optional(
+        &self,
+        repo: Option<&str>,
+    ) -> Result<Option<GhClient>, RegistrarError> {
         #[cfg(test)]
         {
+            let _ = repo;
             Ok(None)
         }
         #[cfg(not(test))]
         {
-            GhClient::from_cwd(self.mode, &self.cwd)
-                .map(Some)
-                .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))
+            let client = GhClient::from_cwd(self.mode, &self.cwd)
+                .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))?;
+            let client = match repo {
+                Some(slug) => client.with_repo_hint(slug),
+                None => client,
+            };
+            Ok(Some(client))
         }
     }
 }

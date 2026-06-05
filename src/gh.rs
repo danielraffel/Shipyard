@@ -22,6 +22,11 @@ const GH_TOKEN_ENV: &str = "GH_TOKEN";
 pub struct GhClient {
     auth: GhAuthConfig,
     cache: Arc<Mutex<Option<CachedToken>>>,
+    /// Repo to use for a `{repo_slug}` token-command placeholder when the
+    /// working directory has no GitHub remote. The daemon serves explicit
+    /// `--repo` values but runs from a non-repo CWD, so without this a
+    /// `token_command` using `{repo_slug}` could never mint a token.
+    repo_hint: Option<RepoIdentity>,
 }
 
 impl Debug for GhClient {
@@ -49,6 +54,15 @@ impl GhClient {
     #[must_use]
     pub fn ambient() -> Self {
         Self::new(GhAuthConfig::ambient())
+    }
+
+    /// Set the repo a `{repo_slug}` token-command placeholder should expand to
+    /// when the working directory isn't a GitHub checkout (the daemon case).
+    /// A non-GitHub slug is ignored (the CWD path still applies).
+    #[must_use]
+    pub fn with_repo_hint(mut self, slug: &str) -> Self {
+        self.repo_hint = RepoIdentity::from_slug(slug);
+        self
     }
 
     /// Prepare a `gh` command with the requested supervision and auth policy.
@@ -125,6 +139,7 @@ impl GhClient {
         Self {
             auth,
             cache: Arc::new(Mutex::new(None)),
+            repo_hint: None,
         }
     }
 
@@ -147,7 +162,7 @@ impl GhClient {
         token_command: &[String],
         cache_ttl_seconds: Option<u64>,
     ) -> Result<TokenResolution, GhPrepareError> {
-        let expanded = expand_token_command(token_command, cwd)?;
+        let expanded = expand_token_command(token_command, cwd, self.repo_hint.as_ref())?;
         let now = Utc::now();
         if let Some(cached) = self.cached_token(&expanded, now)? {
             return Ok(cached);
@@ -612,7 +627,11 @@ fn parse_json_helper_stdout(
     Ok(token)
 }
 
-fn expand_token_command(args: &[String], cwd: &Path) -> Result<Vec<String>, GhPrepareError> {
+fn expand_token_command(
+    args: &[String],
+    cwd: &Path,
+    repo_hint: Option<&RepoIdentity>,
+) -> Result<Vec<String>, GhPrepareError> {
     if args.is_empty() {
         return Err(GhPrepareError::EmptyTokenCommand);
     }
@@ -624,7 +643,7 @@ fn expand_token_command(args: &[String], cwd: &Path) -> Result<Vec<String>, GhPr
                 let identity = if let Some(identity) = &repo {
                     identity
                 } else {
-                    repo = Some(resolve_repo_identity(cwd)?);
+                    repo = Some(resolve_repo_placeholder(cwd, repo_hint)?);
                     repo.as_ref().expect("repo identity should be set")
                 };
                 expanded = expanded
@@ -637,6 +656,23 @@ fn expand_token_command(args: &[String], cwd: &Path) -> Result<Vec<String>, GhPr
         .collect()
 }
 
+/// Resolve the repo for a `{repo_slug}`-style placeholder: prefer the CWD's
+/// GitHub remote (the interactive CLI case), but fall back to an explicit hint
+/// when the CWD isn't a GitHub checkout (the daemon serves explicit `--repo`
+/// values from a non-repo CWD).
+fn resolve_repo_placeholder(
+    cwd: &Path,
+    repo_hint: Option<&RepoIdentity>,
+) -> Result<RepoIdentity, GhPrepareError> {
+    match resolve_repo_identity(cwd) {
+        Ok(identity) => Ok(identity),
+        Err(GhPrepareError::RepoSlugRequired) if repo_hint.is_some() => {
+            Ok(repo_hint.expect("repo hint present").clone())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn needs_repo_placeholder(value: &str) -> bool {
     value.contains("{repo_slug}") || value.contains("{repo_owner}") || value.contains("{repo_name}")
 }
@@ -646,6 +682,23 @@ struct RepoIdentity {
     slug: String,
     owner: String,
     name: String,
+}
+
+impl RepoIdentity {
+    /// Build from an `owner/name` slug. Returns `None` if it isn't a
+    /// well-formed `owner/name` (so a bogus hint can't poison expansion).
+    fn from_slug(slug: &str) -> Option<Self> {
+        let slug = slug.trim();
+        let (owner, name) = slug.split_once('/')?;
+        if owner.is_empty() || name.is_empty() || name.contains('/') {
+            return None;
+        }
+        Some(Self {
+            slug: slug.to_owned(),
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+        })
+    }
 }
 
 fn resolve_repo_identity(cwd: &Path) -> Result<RepoIdentity, GhPrepareError> {
@@ -975,11 +1028,43 @@ mod tests {
             "--cwd".to_owned(),
             "{cwd}".to_owned(),
         ];
-        let expanded = expand_token_command(&command, repo.path()).expect("expanded");
+        // The CWD's GitHub remote wins even when a hint is present.
+        let hint = RepoIdentity::from_slug("hintowner/hintrepo");
+        let expanded =
+            expand_token_command(&command, repo.path(), hint.as_ref()).expect("expanded");
         assert_eq!(expanded[2], "owner/repo");
         assert_eq!(expanded[4], "owner");
         assert_eq!(expanded[6], "repo");
         assert_eq!(expanded[8], repo.path().display().to_string());
+    }
+
+    #[test]
+    fn repo_placeholder_falls_back_to_hint_when_cwd_is_not_a_repo() {
+        // The daemon case: CWD has no GitHub remote, so `{repo_slug}` must come
+        // from the explicit hint (the served `--repo`) instead of erroring.
+        let not_a_repo = TempDir::new().expect("tempdir");
+        let command = vec![
+            "helper".to_owned(),
+            "--repo".to_owned(),
+            "{repo_slug}".to_owned(),
+        ];
+        let hint = RepoIdentity::from_slug("danielraffel/pulp").expect("valid slug");
+        let expanded =
+            expand_token_command(&command, not_a_repo.path(), Some(&hint)).expect("expanded");
+        assert_eq!(expanded[2], "danielraffel/pulp");
+
+        // Without a hint, it still errors (unchanged behavior).
+        let err = expand_token_command(&command, not_a_repo.path(), None);
+        assert!(matches!(err, Err(GhPrepareError::RepoSlugRequired)));
+    }
+
+    #[test]
+    fn repo_identity_from_slug_rejects_malformed() {
+        assert!(RepoIdentity::from_slug("owner/name").is_some());
+        assert!(RepoIdentity::from_slug("nope").is_none());
+        assert!(RepoIdentity::from_slug("owner/").is_none());
+        assert!(RepoIdentity::from_slug("/name").is_none());
+        assert!(RepoIdentity::from_slug("a/b/c").is_none());
     }
 
     #[test]

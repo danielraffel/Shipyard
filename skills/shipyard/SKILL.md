@@ -98,8 +98,13 @@ When debugging GitHub behavior:
   helpers may run and GitHub App helpers may mint installation tokens.
 - Optional-provider rows stay green when unused: `nsc` reads "not configured
   (optional)" unless a Namespace provider is configured, and a `{repo_slug}`
-  `token_command` that can't resolve in a repo-less context (doctor/daemon) is
+  `token_command` that can't resolve in a repo-less context (doctor) is
   green with a "pin `--repo`" hint rather than a red "misconfigured". The
+  **daemon** no longer hits this: webhook registration passes the served
+  `--repo` as a `{repo_slug}` hint (`GhClient::with_repo_hint`), so a
+  `{repo_slug}` `token_command` mints a token from the daemon's repo-less CWD
+  instead of looping on "placeholder requires remote.origin.url" with live mode
+  stuck on "updates paused". The
   `gh-scope` row is also green-informational for App/Env/helper tokens (scopes
   not inspectable locally), keeping the "verify Actions: Read/write" reminder.
 - Check `.shipyard/config.toml`, `.shipyard.local/config.toml`, and global
