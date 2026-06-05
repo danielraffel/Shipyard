@@ -115,9 +115,13 @@ run and GitHub App helpers may mint installation tokens.
 The `github-auth` doctor row distinguishes a context-dependent placeholder from
 a genuinely broken source (presentation only — operational auth still never
 silently falls back). A `token_command` using `{repo_slug}`/`{repo_name}` that
-can't resolve in a repo-less context (`doctor`/daemon) reads as **green** with a
+can't resolve in a repo-less context (`doctor`) reads as **green** with a
 hint to pin `--repo <owner>/<name>` for account-wide Apps, because it resolves
-normally inside a repo. Any other resolution failure stays **red** and now tells
+normally inside a repo. The **daemon** resolves `{repo_slug}` from its served
+`--repo` (the registrar hints it), so live-mode webhook registration mints a
+token from a repo-less CWD instead of failing on "placeholder requires
+remote.origin.url" (which left live mode stuck on "updates paused"). Any other
+resolution failure stays **red** and now tells
 gh-only users they can simply drop `[github.auth]` to use ambient `gh`. The
 `nsc` row is likewise optional: green "not configured (optional)" unless a
 Namespace provider is configured (`cloud.provider` or a per-target `provider`).
