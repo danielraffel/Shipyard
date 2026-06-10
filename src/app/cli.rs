@@ -641,7 +641,7 @@ pub(super) enum RunnerCommand {
         repo: Vec<String>,
     },
     /// Report VM-slot-aware free macOS capacity across `[host_class.*]` hosts
-    /// (`Σ max(0, cap − running tart VMs)`). Exit 1 if any host is unreadable.
+    /// (`Σ max(0, cap − running macOS Tart VMs)`). Exit 1 if any host is unreadable.
     Capacity,
     /// Watch for cloud-queued macOS jobs and drain them to a local runner when
     /// a VM slot frees up. Observe-only unless `--apply`.

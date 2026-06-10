@@ -21,9 +21,9 @@ back to local when a slot frees up. This plan adds three primitives, smallest-fi
 
 | Host class | Hostname | Runs | VM pool | cap (macOS VMs) |
 |---|---|---|---|---|
-| `studio` | `Daniels-Mac-Studio.local` | pulp-studio-01/02/03, `Shipyard-studio-01`, Tart pool | yes (`/Volumes/Workshop/VMs`) | 2 (kernel quota; raisable per Appendix D, Studio-only) |
-| `m1` | `Daniels-MacBook-Pro.local` (alias `macpro`) | pulp-m1-01/02, `daniels-macbook-shipyard` | dev | 2 |
-| `m5` | (arriving) | — | — | 2 (inherits) |
+| `studio` | controller / local host | pulp-studio-01/02/03, `Shipyard-studio-01`, Tart pool | yes (`/Volumes/Workshop/VMs`) | 2 (kernel quota; raisable per Appendix D, Studio-only) |
+| `m1` | operator-local SSH alias | pulp-m1-01/02, Shipyard runner | dev | 2 |
+| `m5` | operator-local SSH alias | project-specific runners | host-backed Tart store | 2 (inherits) |
 
 The 2-VM cap is the XNU kernel `hv_apple_isa_vm_quota` (Appendix D), **not** Tart or a
 license limit. Default `cap = 2` everywhere; only the dedicated Studio may override
@@ -63,22 +63,29 @@ New config section, parsed like `parse_host_pools` (`src/host_pool.rs`):
 
 ```toml
 [host_class.studio]
-ssh = "Daniels-Mac-Studio.local"   # or user@host; omit for the controller's own box
+ssh = "studio-ci.local"            # or user@host; omit for the controller's own box
 cap = 2                            # macOS VM slots (kernel quota); Studio may raise
+tart_bin = "/opt/homebrew/bin/tart"
+tart_home = "/Users/ci/VMs"         # absolute path; no shell/tilde expansion
 labels = ["self-hosted", "macos", "arm64", "shipyard-build-studio"]
 
 [host_class.m1]
-ssh = "Daniels-MacBook-Pro.local"
+ssh = "m1-ci.local"
 cap = 2
+tart_bin = "/opt/homebrew/bin/tart"
+tart_home = "/Users/ci/VMs"
 labels = ["self-hosted", "macos", "arm64", "shipyard-build-m1"]
 
 # [host_class.m5] added when it arrives — same shape, inherits cap = 2.
 ```
 
 `shipyard runner capacity [--json]`:
-1. For each configured host class, read `running_macos_vms` by SSH'ing the host and
-   running `tart list` (count VMs in the `running` state). The controller's own box is
-   read locally (no SSH).
+1. For each configured host class, read running VM names by SSH'ing the host and
+   running `tart list`, then enrich each running VM with `tart get <name> --format
+   json` and count only OS `darwin`/macOS VMs as `running_macos_vms`. The
+   controller's own box is read locally (no SSH). When `tart_home` is set, the
+   probe runs with `TART_HOME=<absolute-path>` so it reads the same home-backed
+   store the launchd supervisors use.
 2. `free_host = max(0, cap_host − running_macos_vms_host)`; `free = Σ free_host`.
 3. **Fail-closed:** an unreadable host (SSH/`tart` error, unparseable output) contributes
    `free_host = 0` and is flagged `readable = false` — never counted as free capacity.
@@ -86,10 +93,11 @@ labels = ["self-hosted", "macos", "arm64", "shipyard-build-m1"]
    **Log every capacity decision** (host, cap, running, free) — silence must not read as
    success.
 
-Pure-logic core (`compute_free_slots`, `parse_tart_running`) is unit-tested with injected
-`tart list` output; SSH is the only impure edge. Note the Studio also hosts the long-lived
-pulp/Shipyard runner agents and any ephemeral builders — those consume its slots, so the
-`running` count from `tart list` is the truth, not a static assumption.
+Pure-logic core (`compute_free_slots`, running-name parsing, and `tart get` OS parsing) is
+unit-tested with injected Tart JSON output; SSH and `tart get` enrichment are the impure
+edge. Note the Studio also hosts the long-lived pulp/Shipyard runner agents and any
+ephemeral macOS builders — those consume its slots, so the OS-enriched live count is the
+truth, not a static assumption. Linux/Windows Tart VMs must not reduce macOS free slots.
 
 ## Part C — cloud→local queue-drain watcher
 
