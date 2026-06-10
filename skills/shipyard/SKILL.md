@@ -664,6 +664,12 @@ serialize when they claim the same checkout, PR state, evidence lane, or
 exhausted pool capacity. See `docs/local-mac-pool.md` before claiming
 multi-Mac throughput.
 
+For Pulp/tartci macOS VM work, prefer local queueing over hosted overflow: a
+full local fleet should leave jobs queued on the self-hosted VM labels until a
+controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an
+explicit operator fallback when fleet status says the local Macs are
+offline/unhealthy, or when the workflow intentionally asks for hosted coverage.
+
 ## Cloud Retargeting
 
 `shipyard cloud retarget --apply` is intentionally fail-closed. It cancels

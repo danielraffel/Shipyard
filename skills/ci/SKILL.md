@@ -680,6 +680,12 @@ evidence lane, or exhausted pool capacity. Use `shipyard targets test mac` and
 then `shipyard run --targets mac` when bringing the Mac Studio online. See
 `docs/local-mac-pool.md`.
 
+For Pulp/tartci macOS VM lanes, local queueing is preferred over hosted
+overflow. A full local fleet should leave jobs queued on the VM self-hosted
+labels until a controller/secondary Mac slot opens. Use GitHub-hosted macOS only
+as an explicit operator fallback for local-fleet outage/unhealthiness or for a
+workflow that deliberately requests hosted coverage.
+
 ### Locality routing (`requires`)
 
 Targets can declare capability constraints with `requires = [...]`; the

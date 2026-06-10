@@ -114,9 +114,12 @@ The first concurrency release uses a conservative worker cap, so host-pool
 throughput is bounded by both configured pool capacity and the queue worker
 limit.
 
-## Explicit Cloud Overflow
+## Explicit Cloud Fallback
 
-GitHub-hosted macOS overflow must be explicit:
+GitHub-hosted macOS fallback must be explicit and should be reserved for a local
+fleet outage/unhealthy fleet or a workflow that deliberately wants hosted
+coverage. Do not send macOS jobs to hosted runners just because all local VM
+slots are temporarily full; leave them queued for the next local slot.
 
 ```toml
 [targets.mac]

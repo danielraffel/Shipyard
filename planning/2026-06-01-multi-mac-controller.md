@@ -12,7 +12,8 @@ Pulp `tools/ci/tart-*.sh` (golden image + ephemeral runner).
 The operating model is now multi-Mac: an always-on **Mac Studio** (primary capacity +
 Tart VM pool under `/Volumes/Workshop/VMs`), an **M1 MacBook Pro** (dev machine that
 sometimes contributes capacity), and a **future M5** that must inherit policy with zero
-bespoke setup. GitHub-hosted macOS is overflow. Today Shipyard can route the macOS lane
+bespoke setup. GitHub-hosted macOS is explicit outage/operator fallback, not automatic
+overflow just because local slots are full. Today Shipyard can route the macOS lane
 to a `local` self-hosted runner (#325) but has **no notion of how much local macOS
 capacity exists** across hosts, and no automatic way to claw a cloud-queued macOS job
 back to local when a slot frees up. This plan adds three primitives, smallest-first.
@@ -129,6 +130,12 @@ Each tick:
 4. Preserve the four safety properties: **flap-guard** (one PR per `--flap-window`),
    **one reroute per tick** (natural pacing), **idle/slot-safe** (only when `free > 0`),
    **fail-closed** on unreadable host state.
+
+Local macOS VM labels are the preferred queue. Do not push jobs to GitHub-hosted
+macOS merely because the local fleet is full; leave them queued for the next
+controller/secondary host slot. Hosted macOS should be selected only by an
+explicit operator fallback or when fleet status says the local Macs are
+offline/unhealthy.
 
 **Ephemeral VM runner** (avoid double-pickup): Shipyard drives Pulp's
 `tart-run-job.sh`-equivalent (mint a JIT runner via `gh ... generate-jitconfig`, clone the
