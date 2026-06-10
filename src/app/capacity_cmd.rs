@@ -259,6 +259,7 @@ mod tests {
             ssh: Some("m5-ci".to_owned()),
             cap: 2,
             tart_bin: "/opt/homebrew/bin/tart".to_owned(),
+            tartci_bin: "/Users/ci/.local/bin/tartci".to_owned(),
             tart_home: Some("/Users/ci user/VMs".to_owned()),
             labels: Vec::new(),
         };

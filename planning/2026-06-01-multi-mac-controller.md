@@ -66,6 +66,7 @@ New config section, parsed like `parse_host_pools` (`src/host_pool.rs`):
 ssh = "studio-ci.local"            # or user@host; omit for the controller's own box
 cap = 2                            # macOS VM slots (kernel quota); Studio may raise
 tart_bin = "/opt/homebrew/bin/tart"
+tartci_bin = "/Users/ci/.local/bin/tartci"
 tart_home = "/Users/ci/VMs"         # absolute path; no shell/tilde expansion
 labels = ["self-hosted", "macos", "arm64", "shipyard-build-studio"]
 
@@ -73,6 +74,7 @@ labels = ["self-hosted", "macos", "arm64", "shipyard-build-studio"]
 ssh = "m1-ci.local"
 cap = 2
 tart_bin = "/opt/homebrew/bin/tart"
+tartci_bin = "/Users/ci/.local/bin/tartci"
 tart_home = "/Users/ci/VMs"
 labels = ["self-hosted", "macos", "arm64", "shipyard-build-m1"]
 
@@ -98,6 +100,15 @@ unit-tested with injected Tart JSON output; SSH and `tart get` enrichment are th
 edge. Note the Studio also hosts the long-lived pulp/Shipyard runner agents and any
 ephemeral macOS builders — those consume its slots, so the OS-enriched live count is the
 truth, not a static assumption. Linux/Windows Tart VMs must not reduce macOS free slots.
+
+`shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` is the
+operator-level visibility command. It aggregates `runner capacity`, host-local
+`tartci doctor --reap --json` via `tartci_bin`, supervisor heartbeat freshness,
+and queued macOS job age. A host is routable only when capacity is readable,
+free slots exist, `tartci doctor` is readable/clean, and at least one supervisor
+heartbeat is fresh. The command exits non-zero on unreadable/problem hosts or
+`queued_age_with_capacity`, separating "no slot exists" from "slots exist but
+queued macOS jobs are not draining."
 
 ## Part C — cloud→local queue-drain watcher
 

@@ -152,6 +152,24 @@ pub(super) fn runner_command<W: Write>(
             super::runner_provision_cmd::audit_command(cwd, &actions, &repo, json, stdout)
         }
         RunnerCommand::Capacity => super::capacity_cmd::capacity_command(config, json, stdout),
+        RunnerCommand::FleetStatus {
+            repo,
+            target,
+            queued_age_threshold_secs,
+            queue_run_limit,
+        } => super::fleet_status_cmd::fleet_status_command(
+            super::fleet_status_cmd::FleetStatusArgs {
+                repo,
+                target,
+                queued_age_threshold_secs,
+                queue_run_limit,
+            },
+            config,
+            cwd,
+            &actions,
+            json,
+            stdout,
+        ),
         RunnerCommand::RerouteWatch {
             repo,
             target,

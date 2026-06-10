@@ -352,6 +352,7 @@ config):
 # ssh omitted → the controller's own box, read locally
 cap = 2                                    # Studio may raise via Appendix-D override
 tart_bin = "/opt/homebrew/bin/tart"        # if tart isn't on the SSH PATH
+tartci_bin = "/Users/ci/.local/bin/tartci" # for fleet-status doctor probes
 tart_home = "/Users/ci/VMs"                # absolute path; no shell/tilde expansion
 labels = ["self-hosted", "macos", "arm64", "shipyard-build-studio"]
 
@@ -359,6 +360,7 @@ labels = ["self-hosted", "macos", "arm64", "shipyard-build-studio"]
 ssh = "m1-ci.local"
 cap = 2
 tart_bin = "/opt/homebrew/bin/tart"
+tartci_bin = "/Users/ci/.local/bin/tartci"
 tart_home = "/Users/ci/VMs"
 
 # [host_class.m5] arrives later — same shape, inherits cap = 2.
@@ -366,6 +368,14 @@ tart_home = "/Users/ci/VMs"
 
 This free-slot count is what the cloud→local reroute watcher (#316 Part C)
 gates on: drain a still-queued cloud macOS job to local only when `free > 0`.
+
+Use `shipyard runner fleet-status --repo <owner/repo> --target macos --json`
+for the operator view that answers "can queued jobs actually drain?" It combines
+capacity with host-local `tartci doctor --reap --json`, supervisor heartbeat
+freshness, per-host routability, and oldest queued macOS age. It is read-only
+and exits non-zero when a host is unreadable/unhealthy or when queued macOS work
+is older than `--queued-age-threshold-secs` while routable capacity exists. Use
+`--queue-run-limit N` to keep live debugging snappy on a large queued backlog.
 
 ### Reroute watcher (cloud→local drain)
 

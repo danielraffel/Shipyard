@@ -643,6 +643,22 @@ pub(super) enum RunnerCommand {
     /// Report VM-slot-aware free macOS capacity across `[host_class.*]` hosts
     /// (`Σ max(0, cap − running macOS Tart VMs)`). Exit 1 if any host is unreadable.
     Capacity,
+    /// Read fleet capacity, tartci supervisor freshness, and queued macOS age.
+    /// Exit 1 on unreadable hosts or queued-age-with-capacity alerts.
+    FleetStatus {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Job-name substring used to identify macOS queued work.
+        #[arg(long, default_value = "macos")]
+        target: String,
+        /// Alert when queued macOS work is older than this and a routable slot exists.
+        #[arg(long = "queued-age-threshold-secs", default_value_t = 900)]
+        queued_age_threshold_secs: i64,
+        /// Maximum queued workflow runs to inspect for matching macOS jobs.
+        #[arg(long = "queue-run-limit", default_value_t = 100)]
+        queue_run_limit: u32,
+    },
     /// Watch for cloud-queued macOS jobs and drain them to a local runner when
     /// a VM slot frees up. Observe-only unless `--apply`.
     RerouteWatch {

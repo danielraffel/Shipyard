@@ -25,6 +25,7 @@ mod command_evidence_cmd;
 mod config_cmd;
 mod daemon_cmd;
 mod doctor_cmd;
+mod fleet_status_cmd;
 mod governance_cmd;
 mod init_cmd;
 mod paths_cmd;

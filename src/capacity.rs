@@ -44,6 +44,9 @@ pub struct HostClassConfig {
     /// The `tart` binary to invoke. Defaults to `tart`; override when it is not
     /// on a non-interactive SSH `PATH`.
     pub tart_bin: String,
+    /// The `tartci` binary/wrapper to invoke for host-local doctor/fleet
+    /// probes. Defaults to `tartci`; override for non-interactive SSH.
+    pub tartci_bin: String,
     /// Optional Tart store to expose as `TART_HOME` while reading this host.
     /// Use an absolute path; shell expansion is intentionally not performed.
     pub tart_home: Option<String>,
@@ -57,8 +60,8 @@ pub struct HostClassConfig {
 ///
 /// # Errors
 /// Returns a human-readable message when a class entry is malformed (not a
-/// table, non-string `ssh`/`tart_bin`/`tart_home`, non-integer/negative `cap`,
-/// or a `labels` that is not an array of strings).
+/// table, non-string `ssh`/`tart_bin`/`tartci_bin`/`tart_home`,
+/// non-integer/negative `cap`, or a `labels` that is not an array of strings).
 pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> {
     let Some(classes) = data.get("host_class").and_then(TomlValue::as_table) else {
         return Ok(Vec::new());
@@ -89,6 +92,11 @@ pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> 
             Some(TomlValue::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
             Some(_) => return Err(format!("host_class.{class}.tart_bin must be a string")),
         };
+        let tartci_bin = match table.get("tartci_bin") {
+            None => "tartci".to_owned(),
+            Some(TomlValue::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
+            Some(_) => return Err(format!("host_class.{class}.tartci_bin must be a string")),
+        };
         let tart_home = match table.get("tart_home") {
             Some(TomlValue::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
             None | Some(TomlValue::String(_)) => None,
@@ -111,6 +119,7 @@ pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> 
             ssh,
             cap,
             tart_bin,
+            tartci_bin,
             tart_home,
             labels,
         });
@@ -276,6 +285,7 @@ mod tests {
         assert_eq!(classes[0].class, "m1");
         assert_eq!(classes[0].cap, DEFAULT_CAP);
         assert_eq!(classes[0].tart_bin, "tart");
+        assert_eq!(classes[0].tartci_bin, "tartci");
         assert_eq!(classes[1].class, "studio");
         assert_eq!(classes[1].cap, 4);
         assert_eq!(classes[1].ssh.as_deref(), Some("studio-ci.local"));
@@ -313,6 +323,12 @@ mod tests {
     #[test]
     fn parse_host_classes_rejects_bad_tart_home() {
         let cfg = table("[host_class.studio]\ntart_home = 123\n");
+        assert!(parse_host_classes(&cfg).is_err());
+    }
+
+    #[test]
+    fn parse_host_classes_rejects_bad_tartci_bin() {
+        let cfg = table("[host_class.studio]\ntartci_bin = []\n");
         assert!(parse_host_classes(&cfg).is_err());
     }
 
