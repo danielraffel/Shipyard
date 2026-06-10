@@ -137,6 +137,14 @@ controller/secondary host slot. Hosted macOS should be selected only by an
 explicit operator fallback or when fleet status says the local Macs are
 offline/unhealthy.
 
+The controller and secondary Apple Silicon hosts are allowed to be multi-role
+CI hosts. They can serve macOS Tart runners and also Linux Tart / Windows QEMU
+lanes when those supervisors are enabled, but the scheduler must keep lane
+capacity separate: macOS jobs consume `macos` VM slots; Linux/Windows jobs use
+their own labels and caps and do not decrement macOS free slots. Physical
+CPU/RAM contention is handled with host reservations or route weights, not by
+collapsing every OS into the macOS VM-slot counter.
+
 **Ephemeral VM runner** (avoid double-pickup): Shipyard drives Pulp's
 `tart-run-job.sh`-equivalent (mint a JIT runner via `gh ... generate-jitconfig`, clone the
 golden, boot, run one job, destroy). First slice may target an already-registered

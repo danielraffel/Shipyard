@@ -114,6 +114,17 @@ The first concurrency release uses a conservative worker cap, so host-pool
 throughput is bounded by both configured pool capacity and the queue worker
 limit.
 
+## Mixed OS VM Lanes
+
+A host can serve more than one VM lane. For Pulp/tartci, the same controller and
+secondary Apple Silicon hosts may participate in the macOS pool and also serve
+Linux Tart or Windows QEMU jobs when those supervisors are enabled. Capacity is
+accounted per lane: macOS jobs consume `macos` VM slots, while Linux and Windows
+jobs use their own labels, supervisors, and caps. A running Linux or Windows VM
+must not reduce Shipyard's macOS free-slot count, although operators should
+still set host route weights or reservations if shared CPU/RAM becomes the real
+bottleneck.
+
 ## Explicit Cloud Fallback
 
 GitHub-hosted macOS fallback must be explicit and should be reserved for a local
