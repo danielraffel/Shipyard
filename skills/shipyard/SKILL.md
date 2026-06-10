@@ -383,7 +383,8 @@ in `src/reroute.rs`): **slot-safe/fail-closed** (unreadable hosts count as 0
 free, so an all-unreadable fleet does nothing), **flap-guard** (skip a PR
 rerouted within `--flap-window`), **one reroute per tick** (natural pacing), and
 **deterministic** oldest-run-first choice. **Observe by default** — without
-`--apply` it logs each decision but acts on nothing. `--apply` shells `shipyard
+`--apply` it logs each decision, per-host capacity, and the candidate list but
+acts on nothing. `--apply` shells `shipyard
 cloud retarget … --provider local --apply`, which works for PRs Shipyard is
 shipping (ship-state-backed). `cloud retarget` has no `--repo` flag — it
 resolves the repo from the current checkout — so run `reroute-watch --apply`

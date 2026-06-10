@@ -27,7 +27,7 @@ use chrono::Utc;
 use serde_json::Value;
 
 use super::CliFailure;
-use crate::capacity::{any_unreadable, parse_host_classes, total_free};
+use crate::capacity::{HostCapacity, any_unreadable, parse_host_classes, total_free};
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::output::write_json_envelope;
@@ -172,6 +172,7 @@ fn tick<W: Write>(
         repo,
         free,
         unreadable,
+        &hosts,
         &candidates,
         &decision,
         &action,
@@ -186,6 +187,7 @@ fn log_tick<W: Write>(
     repo: &str,
     free: u32,
     unreadable: bool,
+    hosts: &[HostCapacity],
     candidates: &[RerouteCandidate],
     decision: &RerouteDecision,
     action: &str,
@@ -202,7 +204,15 @@ fn log_tick<W: Write>(
         data.insert("repo".to_owned(), Value::from(repo.to_owned()));
         data.insert("free_slots".to_owned(), Value::from(free));
         data.insert("any_unreadable".to_owned(), Value::from(unreadable));
-        data.insert("candidates".to_owned(), Value::from(candidates.len()));
+        data.insert(
+            "hosts".to_owned(),
+            Value::from(hosts.iter().map(host_to_json).collect::<Vec<_>>()),
+        );
+        data.insert("candidate_count".to_owned(), Value::from(candidates.len()));
+        data.insert(
+            "candidates".to_owned(),
+            Value::from(candidates.iter().map(candidate_to_json).collect::<Vec<_>>()),
+        );
         data.insert("decision".to_owned(), Value::from(reason));
         data.insert("action".to_owned(), Value::from(action.to_owned()));
         data.insert(
@@ -219,13 +229,15 @@ fn log_tick<W: Write>(
 
     let detail = match chosen {
         Some(c) => format!(
-            "free={free} candidates={} → PR #{} (run {}) [{action}]",
+            "free={free} hosts=[{}] candidates={} → PR #{} (run {}) [{action}]",
+            host_summary(hosts),
             candidates.len(),
             c.pr,
             c.run_id
         ),
         None => format!(
-            "free={free} candidates={} → {reason}{}",
+            "free={free} hosts=[{}] candidates={} → {reason}{}",
+            host_summary(hosts),
             candidates.len(),
             if unreadable {
                 " (some hosts unreadable; free is a lower bound)"
@@ -236,6 +248,46 @@ fn log_tick<W: Write>(
     };
     writeln!(stdout, "{detail}").ok();
     Ok(())
+}
+
+fn host_to_json(host: &HostCapacity) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("class".to_owned(), Value::from(host.class.clone()));
+    m.insert(
+        "ssh".to_owned(),
+        host.ssh.clone().map_or(Value::Null, Value::from),
+    );
+    m.insert("cap".to_owned(), Value::from(host.cap));
+    m.insert(
+        "running".to_owned(),
+        host.running.map_or(Value::Null, Value::from),
+    );
+    m.insert("free".to_owned(), Value::from(host.free()));
+    m.insert("readable".to_owned(), Value::from(host.readable()));
+    m.insert("source".to_owned(), Value::from(host.source.clone()));
+    Value::Object(m)
+}
+
+fn candidate_to_json(candidate: &RerouteCandidate) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("pr".to_owned(), Value::from(candidate.pr));
+    m.insert("run_id".to_owned(), Value::from(candidate.run_id));
+    m.insert(
+        "head_branch".to_owned(),
+        Value::from(candidate.head_branch.clone()),
+    );
+    Value::Object(m)
+}
+
+fn host_summary(hosts: &[HostCapacity]) -> String {
+    hosts
+        .iter()
+        .map(|host| match host.running {
+            Some(running) => format!("{}:{running}/{} free={}", host.class, host.cap, host.free()),
+            None => format!("{}:?/{} free=0 unreadable", host.class, host.cap),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// List cloud-queued macOS jobs as reroute candidates, sorted oldest-run-first
