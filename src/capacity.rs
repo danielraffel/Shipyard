@@ -25,8 +25,12 @@
 //! parsing, `tart get` OS parsing, and the free-slot math. SSH'ing each host and
 //! shelling `tart` is the impure edge in the CLI handler.
 
+use std::process::Command;
+
 use serde::Deserialize;
 use toml::{Table, Value as TomlValue};
+
+use crate::executor::ssh::shlex_quote;
 
 /// Default macOS VM slots per host: the XNU kernel quota (Appendix D).
 pub const DEFAULT_CAP: u32 = 2;
@@ -257,6 +261,119 @@ pub fn any_unreadable(hosts: &[HostCapacity]) -> bool {
     hosts.iter().any(|host| !host.readable())
 }
 
+/// Gather per-host capacity for every configured `[host_class.*]`, probing each
+/// host locally or over SSH. Shared by runner commands and queue admission so
+/// reporting and scheduling use the same live snapshot.
+///
+/// # Errors
+/// Returns a config parse error before probing when the host-class section is
+/// malformed. Individual host probe failures are folded into unreadable
+/// [`HostCapacity`] rows instead of failing the whole snapshot.
+pub fn gather_configured_host_capacities(data: &Table) -> Result<Vec<HostCapacity>, String> {
+    let classes = parse_host_classes(data)?;
+    Ok(classes.iter().map(probe_host_capacity).collect())
+}
+
+/// Probe one host class and fold the result into a [`HostCapacity`].
+pub fn probe_host_capacity(class: &HostClassConfig) -> HostCapacity {
+    let (running, source) = match read_running(class) {
+        Ok(count) => (
+            Some(count),
+            if class.ssh.is_some() { "ssh" } else { "local" }.to_owned(),
+        ),
+        Err(reason) => (None, reason),
+    };
+    HostCapacity {
+        class: class.class.clone(),
+        ssh: class.ssh.clone(),
+        cap: class.cap,
+        running,
+        source,
+    }
+}
+
+/// SSH options for non-interactive, fail-fast capacity probes.
+pub fn ssh_probe_options() -> Vec<String> {
+    [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect()
+}
+
+/// Render the remote `tart` command used for one host-class probe.
+pub fn remote_tart_command(class: &HostClassConfig, args: &[&str]) -> String {
+    let mut parts = Vec::new();
+    if let Some(tart_home) = &class.tart_home {
+        parts.push("env".to_owned());
+        parts.push(format!("TART_HOME={}", shlex_quote(tart_home)));
+    }
+    parts.push(shlex_quote(&class.tart_bin));
+    parts.extend(args.iter().map(|arg| shlex_quote(arg)));
+    parts.join(" ")
+}
+
+/// Execute `tart` for one host class, locally or over SSH.
+fn run_tart(class: &HostClassConfig, args: &[&str], label: &str) -> Result<String, String> {
+    let output = if let Some(host) = &class.ssh {
+        Command::new("ssh")
+            .args(ssh_probe_options())
+            .arg(host)
+            .arg(remote_tart_command(class, args))
+            .output()
+    } else {
+        let mut command = Command::new(&class.tart_bin);
+        if let Some(tart_home) = &class.tart_home {
+            command.env("TART_HOME", tart_home);
+        }
+        command.args(args).output()
+    };
+
+    let output = output.map_err(|error| {
+        if class.ssh.is_some() {
+            format!("ssh spawn failed: {error}")
+        } else {
+            format!("`{}` spawn failed: {error}", class.tart_bin)
+        }
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            format!("exit {}", output.status.code().unwrap_or(-1))
+        } else {
+            detail.lines().next().unwrap_or(detail).to_owned()
+        };
+        return Err(format!("{label} failed: {detail}"));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Read the running macOS-VM count for one host class.
+fn read_running(class: &HostClassConfig) -> Result<u32, String> {
+    let list_stdout = run_tart(class, &["list", "--format", "json"], "tart list")?;
+    let running_names = parse_tart_running_names(&list_stdout)?;
+    let mut running_macos: u32 = 0;
+    for name in running_names {
+        let get_stdout = run_tart(class, &["get", &name, "--format", "json"], "tart get")?;
+        let os = parse_tart_get_os(&get_stdout)?;
+        if is_macos_os(&os) {
+            running_macos = running_macos
+                .checked_add(1)
+                .ok_or_else(|| "implausibly many running macOS VMs".to_owned())?;
+        }
+    }
+    Ok(running_macos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +574,29 @@ mod tests {
         };
         assert!(!any_unreadable(std::slice::from_ref(&ok)));
         assert!(any_unreadable(&[ok, bad]));
+    }
+
+    #[test]
+    fn ssh_probe_options_are_noninteractive() {
+        let opts = ssh_probe_options();
+        assert!(opts.iter().any(|o| o == "BatchMode=yes"));
+        assert!(opts.iter().any(|o| o.starts_with("ConnectTimeout")));
+    }
+
+    #[test]
+    fn remote_tart_command_sets_tart_home_and_quotes_args() {
+        let class = HostClassConfig {
+            class: "m5".to_owned(),
+            ssh: Some("m5-ci".to_owned()),
+            cap: 2,
+            tart_bin: "/opt/homebrew/bin/tart".to_owned(),
+            tartci_bin: "/Users/ci/.local/bin/tartci".to_owned(),
+            tart_home: Some("/Users/ci user/VMs".to_owned()),
+            labels: Vec::new(),
+        };
+        assert_eq!(
+            remote_tart_command(&class, &["get", "vm one", "--format", "json"]),
+            "env TART_HOME='/Users/ci user/VMs' /opt/homebrew/bin/tart get 'vm one' --format json"
+        );
     }
 }

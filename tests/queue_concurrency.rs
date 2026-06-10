@@ -7,6 +7,7 @@ use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use shipyard::config::{LoadedConfig, LocalOverlaySource};
 use shipyard::evidence::EvidenceStore;
 use shipyard::executor::dispatch::{
     DispatchValidationRequest, ResolvedBackend, ResolvedTarget, ResolvedValidation,
@@ -90,6 +91,7 @@ fn run_stores<'a>(
     warm_pool: &'a WarmPool,
     cwd: &'a Path,
     state_dir: &'a Path,
+    config: &'a LoadedConfig,
 ) -> RunStores<'a> {
     RunStores {
         queue,
@@ -97,6 +99,7 @@ fn run_stores<'a>(
         warm_pool,
         cwd,
         state_dir,
+        config,
     }
 }
 
@@ -107,6 +110,7 @@ fn ship_stores<'a>(
     warm_pool: &'a WarmPool,
     cwd: &'a Path,
     state_dir: &'a Path,
+    config: &'a LoadedConfig,
 ) -> ShipStores<'a> {
     ShipStores {
         queue,
@@ -115,6 +119,17 @@ fn ship_stores<'a>(
         warm_pool,
         cwd,
         state_dir,
+        config,
+    }
+}
+
+fn empty_config(root: &Path) -> LoadedConfig {
+    LoadedConfig {
+        data: toml::Table::new(),
+        global_dir: root.join("global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: LocalOverlaySource::None,
     }
 }
 
@@ -214,6 +229,7 @@ fn drain_owner_runs_non_conflicting_jobs_concurrently() {
     let mut queue = Queue::new(&state_dir).expect("queue");
     let evidence = EvidenceStore::new(state_dir.join("evidence")).expect("evidence");
     let warm_pool = WarmPool::new(state_dir.join("warm_pool.json"));
+    let config = empty_config(temp.path());
     let dispatcher = ProbeDispatcher::new(true, Duration::from_millis(20));
     let request_a = run_request("feature/a", "sha-a", local_target("mac-a", &cwd_a));
     let request_b = run_request("feature/b", "sha-b", local_target("mac-b", &cwd_b));
@@ -223,7 +239,14 @@ fn drain_owner_runs_non_conflicting_jobs_concurrently() {
     let outcome = drain_or_wait_run(
         &request_a,
         job_a.clone(),
-        run_stores(&mut queue, &evidence, &warm_pool, temp.path(), &state_dir),
+        run_stores(
+            &mut queue,
+            &evidence,
+            &warm_pool,
+            temp.path(),
+            &state_dir,
+            &config,
+        ),
         &dispatcher,
     )
     .expect("drain");
@@ -264,10 +287,11 @@ fn conflicting_jobs_serialize_across_submitters() {
         let mut queue = Queue::new(&state_a).expect("queue a");
         let evidence = EvidenceStore::new(state_a.join("evidence")).expect("evidence a");
         let warm_pool = WarmPool::new(state_a.join("warm_pool.json"));
+        let config = empty_config(&cwd_a);
         drain_or_wait_run(
             &request_a_thread,
             job_a,
-            run_stores(&mut queue, &evidence, &warm_pool, &cwd_a, &state_a),
+            run_stores(&mut queue, &evidence, &warm_pool, &cwd_a, &state_a, &config),
             dispatcher_a.as_ref(),
         )
         .expect("drain a")
@@ -276,10 +300,11 @@ fn conflicting_jobs_serialize_across_submitters() {
         let mut queue = Queue::new(&state_b).expect("queue b");
         let evidence = EvidenceStore::new(state_b.join("evidence")).expect("evidence b");
         let warm_pool = WarmPool::new(state_b.join("warm_pool.json"));
+        let config = empty_config(&cwd_b);
         drain_or_wait_run(
             &request_b_thread,
             job_b,
-            run_stores(&mut queue, &evidence, &warm_pool, &cwd_b, &state_b),
+            run_stores(&mut queue, &evidence, &warm_pool, &cwd_b, &state_b, &config),
             dispatcher_b.as_ref(),
         )
         .expect("drain b")
@@ -321,10 +346,18 @@ fn losing_submitter_waits_without_dispatching_targets() {
         let mut queue = Queue::new(&owner_state).expect("owner queue");
         let evidence = EvidenceStore::new(owner_state.join("evidence")).expect("owner evidence");
         let warm_pool = WarmPool::new(owner_state.join("warm_pool.json"));
+        let config = empty_config(&owner_cwd);
         drain_or_wait_run(
             &owner_request,
             job_a,
-            run_stores(&mut queue, &evidence, &warm_pool, &owner_cwd, &owner_state),
+            run_stores(
+                &mut queue,
+                &evidence,
+                &warm_pool,
+                &owner_cwd,
+                &owner_state,
+                &config,
+            ),
             owner_dispatcher.as_ref(),
         )
         .expect("owner drain")
@@ -339,10 +372,18 @@ fn losing_submitter_waits_without_dispatching_targets() {
         let mut queue = Queue::new(&loser_state).expect("loser queue");
         let evidence = EvidenceStore::new(loser_state.join("evidence")).expect("loser evidence");
         let warm_pool = WarmPool::new(loser_state.join("warm_pool.json"));
+        let config = empty_config(&loser_cwd);
         let outcome = drain_or_wait_run(
             &loser_request,
             job_b,
-            run_stores(&mut queue, &evidence, &warm_pool, &loser_cwd, &loser_state),
+            run_stores(
+                &mut queue,
+                &evidence,
+                &warm_pool,
+                &loser_cwd,
+                &loser_state,
+                &config,
+            ),
             loser_dispatcher.as_ref(),
         )
         .expect("loser wait");
@@ -375,6 +416,7 @@ fn same_pr_pending_ship_is_superseded_by_newer_ship() {
     let evidence = EvidenceStore::new(state_dir.join("evidence")).expect("evidence");
     let ship_state = ShipStateStore::new(state_dir.join("ship")).expect("ship state");
     let warm_pool = WarmPool::new(state_dir.join("warm_pool.json"));
+    let config = empty_config(temp.path());
     let dispatcher = ProbeDispatcher::new(false, Duration::ZERO);
     let old_request = ship_request("feature/old", "sha-old", 42, local_target("mac-old", &cwd));
     let new_request = ship_request("feature/new", "sha-new", 42, local_target("mac-new", &cwd));
@@ -391,6 +433,7 @@ fn same_pr_pending_ship_is_superseded_by_newer_ship() {
             &warm_pool,
             temp.path(),
             &state_dir,
+            &config,
         ),
         &dispatcher,
     )
@@ -416,6 +459,7 @@ fn abandoned_drain_after_start_is_recovered_with_outcome() {
     let mut queue = Queue::new(&state_dir).expect("queue");
     let evidence = EvidenceStore::new(state_dir.join("evidence")).expect("evidence");
     let warm_pool = WarmPool::new(state_dir.join("warm_pool.json"));
+    let config = empty_config(temp.path());
     let dispatcher = ProbeDispatcher::new(false, Duration::ZERO);
     let request = run_request("feature/recover", "sha-recover", local_target("mac", &cwd));
     let job = submit_run(&request, &mut queue, temp.path(), &state_dir).expect("submit");
@@ -433,7 +477,14 @@ fn abandoned_drain_after_start_is_recovered_with_outcome() {
     let outcome = drain_or_wait_run(
         &request,
         job.clone(),
-        run_stores(&mut queue, &evidence, &warm_pool, temp.path(), &state_dir),
+        run_stores(
+            &mut queue,
+            &evidence,
+            &warm_pool,
+            temp.path(),
+            &state_dir,
+            &config,
+        ),
         &dispatcher,
     )
     .expect("recover");

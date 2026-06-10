@@ -125,6 +125,12 @@ must not reduce Shipyard's macOS free-slot count, although operators should
 still set host route weights or reservations if shared CPU/RAM becomes the real
 bottleneck.
 
+When `[host_class.*]` entries are configured, the cooperative queue scheduler
+uses the same live Tart capacity probe as `runner capacity` / `runner
+fleet-status` before admitting jobs that claim a macOS VM slot. If every local
+macOS slot is occupied, the macOS job stays queued; Linux/Windows/cloud jobs do
+not consume that `macos` slot and can still run.
+
 ## Explicit Cloud Fallback
 
 GitHub-hosted macOS fallback must be explicit and should be reserved for a local

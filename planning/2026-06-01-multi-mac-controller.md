@@ -145,6 +145,11 @@ their own labels and caps and do not decrement macOS free slots. Physical
 CPU/RAM contention is handled with host reservations or route weights, not by
 collapsing every OS into the macOS VM-slot counter.
 
+Implementation note 2026-06-10: the cooperative queue scheduler now feeds the
+live `[host_class.*]` Tart capacity snapshot into VM-slot admission for macOS
+jobs. The capacity probe is skipped for queues without macOS VM-slot demand, so
+Linux/Windows-only queues do not wait on macOS Tart/SSH probes.
+
 **Ephemeral VM runner** (avoid double-pickup): Shipyard drives Pulp's
 `tart-run-job.sh`-equivalent (mint a JIT runner via `gh ... generate-jitconfig`, clone the
 golden, boot, run one job, destroy). First slice may target an already-registered

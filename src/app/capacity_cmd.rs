@@ -13,127 +13,16 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use serde_json::Value;
 
 use super::CliFailure;
 use crate::capacity::{
-    HostCapacity, HostClassConfig, any_unreadable, is_macos_os, parse_host_classes,
-    parse_tart_get_os, parse_tart_running_names, total_free,
+    HostCapacity, any_unreadable, gather_configured_host_capacities, total_free,
 };
 use crate::config::LoadedConfig;
-use crate::executor::ssh::shlex_quote;
 use crate::output::write_json_envelope;
-
-/// SSH options for a non-interactive, fail-fast probe: no prompts, short
-/// connect timeout, accept new host keys so a fresh host doesn't hang.
-fn ssh_probe_options() -> Vec<String> {
-    [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=8",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect()
-}
-
-fn remote_tart_command(class: &HostClassConfig, args: &[&str]) -> String {
-    let mut parts = Vec::new();
-    if let Some(tart_home) = &class.tart_home {
-        parts.push("env".to_owned());
-        parts.push(format!("TART_HOME={}", shlex_quote(tart_home)));
-    }
-    parts.push(shlex_quote(&class.tart_bin));
-    parts.extend(args.iter().map(|arg| shlex_quote(arg)));
-    parts.join(" ")
-}
-
-/// Execute `tart` for one host class, locally or over SSH.
-fn run_tart(class: &HostClassConfig, args: &[&str], label: &str) -> Result<String, String> {
-    let output = if let Some(host) = &class.ssh {
-        Command::new("ssh")
-            .args(ssh_probe_options())
-            .arg(host)
-            .arg(remote_tart_command(class, args))
-            .output()
-    } else {
-        let mut command = Command::new(&class.tart_bin);
-        if let Some(tart_home) = &class.tart_home {
-            command.env("TART_HOME", tart_home);
-        }
-        command.args(args).output()
-    };
-
-    let output = output.map_err(|error| {
-        if class.ssh.is_some() {
-            format!("ssh spawn failed: {error}")
-        } else {
-            format!("`{}` spawn failed: {error}", class.tart_bin)
-        }
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        let detail = if detail.is_empty() {
-            format!("exit {}", output.status.code().unwrap_or(-1))
-        } else {
-            detail.lines().next().unwrap_or(detail).to_owned()
-        };
-        return Err(format!("{label} failed: {detail}"));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Read the running macOS-VM count for one host class. Returns `Ok(count)` or
-/// an `Err(reason)` that the caller records as an unreadable host
-/// (fail-closed).
-fn read_running(class: &HostClassConfig) -> Result<u32, String> {
-    let list_stdout = run_tart(class, &["list", "--format", "json"], "tart list")?;
-    let running_names = parse_tart_running_names(&list_stdout)?;
-    let mut running_macos: u32 = 0;
-    for name in running_names {
-        let get_stdout = run_tart(class, &["get", &name, "--format", "json"], "tart get")?;
-        let os = parse_tart_get_os(&get_stdout)?;
-        if is_macos_os(&os) {
-            running_macos = running_macos
-                .checked_add(1)
-                .ok_or_else(|| "implausibly many running macOS VMs".to_owned())?;
-        }
-    }
-    Ok(running_macos)
-}
-
-/// Gather per-host capacity for every configured `[host_class.*]` (probing each
-/// host). Shared by `runner capacity` and the reroute watcher (#316 Part C).
-pub(super) fn gather(config: &LoadedConfig) -> Result<Vec<HostCapacity>, CliFailure> {
-    let classes = parse_host_classes(&config.data).map_err(|e| CliFailure::new(2, e))?;
-    Ok(classes.iter().map(probe).collect())
-}
-
-/// Probe one host class and fold the result into a [`HostCapacity`].
-fn probe(class: &HostClassConfig) -> HostCapacity {
-    let (running, source) = match read_running(class) {
-        Ok(count) => (
-            Some(count),
-            if class.ssh.is_some() { "ssh" } else { "local" }.to_owned(),
-        ),
-        Err(reason) => (None, reason),
-    };
-    HostCapacity {
-        class: class.class.clone(),
-        ssh: class.ssh.clone(),
-        cap: class.cap,
-        running,
-        source,
-    }
-}
 
 fn host_to_json(host: &HostCapacity) -> Value {
     let mut m = serde_json::Map::new();
@@ -161,9 +50,10 @@ pub(super) fn capacity_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let classes = parse_host_classes(&config.data).map_err(|e| CliFailure::new(2, e))?;
+    let hosts =
+        gather_configured_host_capacities(&config.data).map_err(|e| CliFailure::new(2, e))?;
 
-    if classes.is_empty() {
+    if hosts.is_empty() {
         let msg = "No [host_class.<name>] entries configured. Add e.g.\n\n  \
                    [host_class.studio]\n  # ssh omitted for the controller's own box\n  \
                    cap = 2\n  tart_bin = \"/opt/homebrew/bin/tart\"\n  tart_home = \"/Users/<you>/VMs\"\n  \
@@ -182,7 +72,6 @@ pub(super) fn capacity_command<W: Write>(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let hosts: Vec<HostCapacity> = classes.iter().map(probe).collect();
     let free = total_free(&hosts);
     let unreadable = any_unreadable(&hosts);
     let exit = if unreadable {
@@ -244,30 +133,6 @@ pub(super) fn capacity_command<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ssh_probe_options_are_noninteractive() {
-        let opts = ssh_probe_options();
-        assert!(opts.iter().any(|o| o == "BatchMode=yes"));
-        assert!(opts.iter().any(|o| o.starts_with("ConnectTimeout")));
-    }
-
-    #[test]
-    fn remote_tart_command_sets_tart_home_and_quotes_args() {
-        let class = HostClassConfig {
-            class: "m5".to_owned(),
-            ssh: Some("m5-ci".to_owned()),
-            cap: 2,
-            tart_bin: "/opt/homebrew/bin/tart".to_owned(),
-            tartci_bin: "/Users/ci/.local/bin/tartci".to_owned(),
-            tart_home: Some("/Users/ci user/VMs".to_owned()),
-            labels: Vec::new(),
-        };
-        assert_eq!(
-            remote_tart_command(&class, &["get", "vm one", "--format", "json"]),
-            "env TART_HOME='/Users/ci user/VMs' /opt/homebrew/bin/tart get 'vm one' --format json"
-        );
-    }
 
     #[test]
     fn host_to_json_marks_unreadable_host() {

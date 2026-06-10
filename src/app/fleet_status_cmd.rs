@@ -15,7 +15,8 @@ use serde_json::Value;
 
 use super::CliFailure;
 use crate::capacity::{
-    HostCapacity, HostClassConfig, any_unreadable, parse_host_classes, total_free,
+    HostCapacity, HostClassConfig, any_unreadable, gather_configured_host_capacities,
+    parse_host_classes, total_free,
 };
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
@@ -64,7 +65,8 @@ pub(super) fn fleet_status_command<W: Write>(
         ));
     }
 
-    let capacities = super::capacity_cmd::gather(config)?;
+    let capacities =
+        gather_configured_host_capacities(&config.data).map_err(|e| CliFailure::new(2, e))?;
     let mut hosts = Vec::new();
     for class in &classes {
         let capacity = capacities

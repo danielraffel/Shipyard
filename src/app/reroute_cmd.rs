@@ -27,7 +27,9 @@ use chrono::Utc;
 use serde_json::Value;
 
 use super::CliFailure;
-use crate::capacity::{HostCapacity, any_unreadable, parse_host_classes, total_free};
+use crate::capacity::{
+    HostCapacity, any_unreadable, gather_configured_host_capacities, parse_host_classes, total_free,
+};
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::output::write_json_envelope;
@@ -144,7 +146,8 @@ fn tick<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    let hosts = super::capacity_cmd::gather(config)?;
+    let hosts =
+        gather_configured_host_capacities(&config.data).map_err(|e| CliFailure::new(2, e))?;
     let free = total_free(&hosts);
     let unreadable = any_unreadable(&hosts);
     let candidates = list_cloud_queued_macos(actions, repo, &args.target)?;
