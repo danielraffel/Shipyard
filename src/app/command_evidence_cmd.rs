@@ -340,7 +340,7 @@ fn collect_local_artifacts(
                 .strip_prefix(cwd)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             let relative = safe_relative_path(relative)?;
-            let source = relative.display().to_string();
+            let source = slash_relative_path(&relative);
             if !seen.insert(source.clone()) {
                 matched = true;
                 continue;
@@ -513,6 +513,13 @@ fn safe_relative_path(path: &Path) -> Result<PathBuf, CliFailure> {
         return Err(CliFailure::new(1, "artifact path cannot be empty"));
     }
     Ok(output)
+}
+
+fn slash_relative_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn git_identity(cwd: &Path) -> (Option<String>, Option<String>) {

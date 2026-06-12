@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0700"></a>
+## [0.71.0]
+
 ## [0.70.0] - 2026-06-04
 
 - feat(run): add command evidence bundles ([#356](https://github.com/danielraffel/Shipyard/pull/356))

@@ -424,6 +424,16 @@ lives in the Studio keychain, so the signed/notarized dmg build skips
 GitHub's hosted-macOS queue. Full provider semantics:
 `skills/ci/SKILL.md` → "Runner Provider Defaults" → "The `local` provider".
 
+### CI routing profiles
+
+Use `shipyard ci profile show <name>` and
+`shipyard ci profile plan <name> --repo owner/repo` to inspect repo-owned CI
+routing profiles without requiring Tart or any provider-specific CLI. The
+planner reads `.tartci/<name>.toml`, `.shipyard/ci-profiles/<name>.toml`, or
+`ci-profiles/<name>.toml`, then prints the ordered target chain and the GitHub
+variables that would route each lane. It is intentionally read-only; live
+capacity resolution and variable writes happen outside this command.
+
 ## Supervised Subprocess Marker (issue #266)
 
 Every `git` / `gh` child process spawned by the supervised

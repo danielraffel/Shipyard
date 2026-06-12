@@ -127,7 +127,7 @@ It calls your build commands and cares about one thing: did they pass?
 - [Security & Governance](docs/governance.md) — `solo` vs `multi`
   profiles, branch protection, tag protection.
 - [Profiles & Configuration](docs/profiles.md) — switch between local /
-  cloud / full setups with one command.
+  cloud / full setups with one command, plus repo-owned CI routing profiles.
 - [Manual CLI Workflows](docs/workflows.md) — debugging failed runs,
   managing the queue, partial reruns.
 - [Resuming an interrupted ship](docs/ship-resume.md) — how `shipyard ship`

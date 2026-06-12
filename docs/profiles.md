@@ -153,6 +153,19 @@ tartci profile plan normal-local-fast --repo danielraffel/pulp --json
 tartci status --json
 ```
 
+Shipyard can also read the same profile vocabulary directly from a repo checkout
+without requiring tartci:
+
+```bash
+shipyard ci profile show normal-local-fast
+shipyard ci profile plan normal-local-fast --repo danielraffel/pulp --json
+```
+
+The Shipyard command searches `.tartci/<name>.toml`,
+`.shipyard/ci-profiles/<name>.toml`, then `ci-profiles/<name>.toml`. It is
+read-only: it explains the selected target and exact GitHub variable values, but
+does not apply variables or dispatch work.
+
 The tartci profile file describes PR, release, coverage, and scheduled policies
 in commented TOML. Its target IDs are stable routing vocabulary, not GitHub
 labels. Each target maps to a concrete `runs-on` selector such as

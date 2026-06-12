@@ -50,6 +50,12 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: Option<ConfigCommand>,
     },
+    /// Inspect CI routing profiles and repo runner-placement plans.
+    Ci {
+        /// CI subcommand.
+        #[command(subcommand)]
+        command: CiCommand,
+    },
     /// Inspect and move Shipyard GitHub auth config without secrets.
     Auth {
         /// Auth subcommand.
@@ -353,6 +359,41 @@ pub(super) enum EvidenceCommand {
         /// Show all command-evidence bundle summaries.
         #[arg(long)]
         list: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum CiCommand {
+    /// Inspect CI routing profiles.
+    Profile {
+        /// Profile subcommand.
+        #[command(subcommand)]
+        command: CiProfileCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum CiProfileCommand {
+    /// Print a profile file.
+    Show {
+        /// Profile name.
+        name: String,
+        /// Explicit profile TOML path. Defaults to .tartci/<name>.toml,
+        /// .shipyard/ci-profiles/<name>.toml, then ci-profiles/<name>.toml.
+        #[arg(long = "profile-file")]
+        profile_file: Option<PathBuf>,
+    },
+    /// Produce a read-only plan of concrete GitHub variables/selectors.
+    Plan {
+        /// Profile name.
+        name: String,
+        /// Owner/repo slug.
+        #[arg(long)]
+        repo: String,
+        /// Explicit profile TOML path. Defaults to .tartci/<name>.toml,
+        /// .shipyard/ci-profiles/<name>.toml, then ci-profiles/<name>.toml.
+        #[arg(long = "profile-file")]
+        profile_file: Option<PathBuf>,
     },
 }
 

@@ -44,6 +44,8 @@ shipyard cleanup --apply       # prune old logs and artifacts
 shipyard config profiles       # list defined profiles
 shipyard config use <profile>  # switch active profile
 shipyard config show           # dump effective merged config
+shipyard ci profile show normal-local-fast
+shipyard ci profile plan normal-local-fast --repo OWNER/REPO --json
 
 # Governance
 shipyard governance status     # declared vs live drift
@@ -98,10 +100,16 @@ schema, intended for AI agent consumption:
 shipyard run --json
 shipyard ship --json
 shipyard status --json
+shipyard ci profile plan normal-local-fast --repo OWNER/REPO --json
 ```
 
 The envelope always carries `schema_version: 1` and the command name, so
 agents can pin to a stable contract.
+
+`shipyard ci profile plan` is provider-neutral and read-only. It parses a
+repo-owned TOML profile from `.tartci/`, `.shipyard/ci-profiles/`, or
+`ci-profiles/`, then reports the concrete GitHub runner variables/selectors
+that would be used for each lane. It does not require tartci to be installed.
 
 `shipyard status` is intentionally limited to queue/target state and does not
 probe GitHub quota. Use `shipyard doctor --rate-limit` when you need to confirm
