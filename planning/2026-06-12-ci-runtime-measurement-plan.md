@@ -4,21 +4,23 @@ Date: 2026-06-12
 
 ## Goal
 
-Quantify, per repo, whether local runner work is actually improving developer
-cycle time and reliability. The measurement system should answer whether each
-repo should run a lane on local hardware (`macstudio`, `m5`, Tart VMs) or
-GitHub-hosted runners, and whether recent cache, VM, or routing tweaks helped.
+Service agents with enough historical runner data to validate whether our
+runners are performing at a high bar consistently. Per repo, the measurement
+system should show whether local hardware (`macstudio`, `m5`, Tart VMs) and
+GitHub-hosted runners are fast, healthy, and reliable enough for the lanes they
+are assigned.
 
 This should stay small: enough history and basic stats to guide routing profiles,
 without committing Shipyard to a metrics platform. If an existing tool already
 solves the storage/reporting layer cleanly, integrate with it instead of
 rebuilding it.
 
-The near-term output is operational and repo-specific: make it obvious how,
-where, and when each lane should run for Pulp, Shipyard, tartci, or any other
-repo using Shipyard. Longer term, the same data can inform whether it is worth
-owning more of the stack, such as a private Git server with GitHub as a backup
-push target, but that is an evaluation input, not Phase 1 scope.
+The near-term output is an agent-readable runner performance service. It should
+make it obvious when a runner, VM image, cache, or route is degrading, improving,
+or failing to justify its place in a repo's profile. Longer term, the same data
+can inform whether it is worth owning more of the stack, such as a private Git
+server with GitHub as a backup push target, but that is an evaluation input, not
+Phase 1 scope.
 
 Keep the bar intentionally modest. We need enough data to decide whether to
 tweak a repo's profiles, caches, VM sizing, or fallback timing. We do not need a
@@ -60,6 +62,15 @@ The main service this provides to agents is historical context: enough structure
 data to validate whether runners are consistently performing at a high bar,
 communicate trends, and spot regressions or optimization opportunities that are
 hard to see from one CI run.
+
+High-bar signals should include:
+
+- low and stable queue time for lanes expected to run locally.
+- low and stable boot/readiness time for VM lanes.
+- stable p50 and p90 total duration per repo/lane/runner.
+- acceptable failure rate after separating source failures from runner failures.
+- cache behavior that matches expectations after a cache optimization.
+- enough samples to avoid overreacting to one slow or flaky run.
 
 ## Prior Art To Check First
 
