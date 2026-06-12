@@ -10,7 +10,10 @@ system should show whether local hardware (`macstudio`, `m5`, Tart VMs) and
 GitHub-hosted runners are fast, healthy, and reliable enough for the lanes they
 are assigned.
 
-This should stay small: enough history and basic stats to guide routing profiles,
+Build duration matters, but it is raw material rather than the product. The
+customer is an agent deciding whether CI/local runners are healthy, whether a
+lane needs closer monitoring, and whether a change is worth investigating. This
+should stay small: enough history and basic stats to guide those agent decisions
 without committing Shipyard to a metrics platform. If an existing tool already
 solves the storage/reporting layer cleanly, integrate with it instead of
 rebuilding it.
@@ -71,6 +74,17 @@ High-bar signals should include:
 - acceptable failure rate after separating source failures from runner failures.
 - cache behavior that matches expectations after a cache optimization.
 - enough samples to avoid overreacting to one slow or flaky run.
+
+Agents should use these historical baselines to choose monitoring behavior:
+
+- poll less aggressively when lanes are within normal historical bounds.
+- poll more frequently when queue time, boot time, run time, or failure rate
+  starts drifting.
+- escalate only when a change is material relative to that repo/lane's baseline.
+- distinguish "still within normal variance" from "worth investigating" without
+  requiring a human to remember prior timings.
+- identify when a recent optimization is still settling versus clearly helping
+  or hurting.
 
 ## Prior Art To Check First
 
@@ -287,7 +301,7 @@ Acceptance:
 
 ## Reporting Views
 
-Minimum useful views:
+Minimum useful views for humans and agents:
 
 - Last 20 runs for one lane.
 - p50/p90 successful duration by target/backend/host over 7/14/30 days.
@@ -296,6 +310,9 @@ Minimum useful views:
 - failure rate by lane and host.
 - before/after comparison for a repo-specific optimization label.
 - "Should this lane run locally?" advisory summary.
+
+Human-readable tables are convenience output. JSON findings, confidence, and
+suggested next actions are the product surface.
 
 ## Agent Contract
 
@@ -314,6 +331,7 @@ shipyard metrics compare --project pulp --lane windows-arm64 --before 7d --after
 - `summary`
 - `findings[]`
 - `confidence`
+- `suggested_poll_interval_secs`
 - `recommended_actions[]`
 - `evidence[]` with query parameters, sample counts, and representative run ids
 
@@ -327,6 +345,7 @@ Example finding shape:
   "message": "Windows ARM64 p90 increased 42% after the latest golden image tag.",
   "baseline": {"window": "previous_14d", "samples": 12, "p90_ms": 1840000},
   "current": {"window": "last_14d", "samples": 10, "p90_ms": 2610000},
+  "suggested_poll_interval_secs": 300,
   "recommended_actions": [
     "Check tartci boot/setup timing split.",
     "Verify sccache hit rate and cache path.",
