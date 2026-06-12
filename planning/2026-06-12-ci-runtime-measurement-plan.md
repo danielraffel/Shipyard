@@ -4,19 +4,62 @@ Date: 2026-06-12
 
 ## Goal
 
-Quantify whether a project should run each validation lane on local hardware
-(`macstudio`, `m5`, Tart VMs) or GitHub-hosted runners by collecting comparable
-runtime, queue, boot, and outcome data over time.
+Quantify, per repo, whether local runner work is actually improving developer
+cycle time and reliability. The measurement system should answer whether each
+repo should run a lane on local hardware (`macstudio`, `m5`, Tart VMs) or
+GitHub-hosted runners, and whether recent cache, VM, or routing tweaks helped.
 
 This should stay small: enough history and basic stats to guide routing profiles,
 without committing Shipyard to a metrics platform. If an existing tool already
 solves the storage/reporting layer cleanly, integrate with it instead of
 rebuilding it.
 
-The near-term output is operational: make it obvious how, where, and when each
-lane should run. Longer term, the same data can inform whether it is worth
+The near-term output is operational and repo-specific: make it obvious how,
+where, and when each lane should run for Pulp, Shipyard, tartci, or any other
+repo using Shipyard. Longer term, the same data can inform whether it is worth
 owning more of the stack, such as a private Git server with GitHub as a backup
 push target, but that is an evaluation input, not Phase 1 scope.
+
+Keep the bar intentionally modest. We need enough data to decide whether to
+tweak a repo's profiles, caches, VM sizing, or fallback timing. We do not need a
+general observability system.
+
+The primary consumer should be an agent. Humans should be able to inspect the
+same data occasionally, but the default workflow is:
+
+1. Agent imports or records recent runs.
+2. Agent asks Shipyard for material changes and optimization opportunities.
+3. Shipyard returns structured JSON with evidence, thresholds, and suggested
+   next actions.
+4. Agent files an issue, updates a plan, or recommends a config change only when
+   the signal is strong enough.
+
+## Ownership And Integration Boundary
+
+This should be optional infrastructure, not a hard dependency on tartci.
+
+Shipyard is the natural place for the normalized store and the agent-facing
+query commands because it already coordinates local, SSH, host-pool, and cloud
+targets. tartci can integrate by emitting VM-specific timing and metadata when a
+lane runs inside Tart, but projects that only use GitHub-hosted runners, plain
+SSH targets, local commands, or another VM manager should still be able to record
+and query metrics.
+
+The contract should be:
+
+- Shipyard owns `metrics.db`, imports, summaries, drift detection, and stable
+  JSON output for agents.
+- tartci optionally emits timing events such as VM boot, readiness, setup,
+  cache-restore, cache-save, and shutdown.
+- Repos optionally annotate runs with profile/lane/tweak labels so agents can
+  evaluate per-repo decisions.
+- External tools such as Hyperfine or Bencher can import/export through JSON, but
+  are not required.
+
+The main service this provides to agents is historical context: enough structured
+data to validate whether runners are consistently performing at a high bar,
+communicate trends, and spot regressions or optimization opportunities that are
+hard to see from one CI run.
 
 ## Prior Art To Check First
 
@@ -31,15 +74,100 @@ push target, but that is an evaluation input, not Phase 1 scope.
   as a reference if we later want a dashboard, but it is still GitHub-focused.
 
 Conclusion for Phase 1: use Shipyard's existing command evidence and run outcome
-records as the canonical local data source, then add GitHub import so the same
-summary command can compare both worlds.
+records as inputs, but store normalized metrics in a small SQLite database first.
+Keep JSON import/export so CI artifacts and third-party benchmark tools can feed
+the same store without requiring a service.
 
 ## Data Model
 
-Start with append-only JSONL in Shipyard state. Add SQLite only if query speed or
-retention makes JSONL painful.
+Use SQLite as the primary store in Shipyard state, with append/import/export
+commands. JSONL remains useful as a wire format and artifact format, but the
+interactive product is querying trends; SQL should be the default rather than a
+later migration.
 
-Record one row per target/job attempt:
+Minimum tables:
+
+```sql
+CREATE TABLE machines (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  os TEXT,
+  arch TEXT,
+  cpu_count INTEGER,
+  ram_mb INTEGER,
+  labels_json TEXT,
+  UNIQUE(name, kind, os, arch)
+);
+
+CREATE TABLE runs (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  project TEXT NOT NULL,
+  repo TEXT,
+  branch TEXT,
+  sha TEXT,
+  pr INTEGER,
+  workflow TEXT,
+  profile TEXT,
+  routing_decision TEXT,
+  status TEXT NOT NULL
+);
+
+CREATE TABLE jobs (
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER NOT NULL REFERENCES runs(id),
+  machine_id INTEGER REFERENCES machines(id),
+  job TEXT NOT NULL,
+  target TEXT,
+  platform TEXT,
+  backend TEXT,
+  provider TEXT,
+  queued_at TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  queue_ms INTEGER,
+  boot_ms INTEGER,
+  setup_ms INTEGER,
+  run_ms INTEGER,
+  total_ms INTEGER,
+  status TEXT NOT NULL,
+  exit_code INTEGER,
+  failure_class TEXT,
+  external_id TEXT,
+  UNIQUE(provider, external_id)
+);
+
+CREATE TABLE steps (
+  id INTEGER PRIMARY KEY,
+  job_id INTEGER NOT NULL REFERENCES jobs(id),
+  step TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT,
+  duration_ms INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  cache_key TEXT,
+  cache_hit INTEGER,
+  artifact_path TEXT
+);
+```
+
+The CLI should also accept a single step-style record for very low-friction
+instrumentation:
+
+```sh
+shipyard metrics record \
+  --runner macstudio \
+  --workflow build \
+  --job linux-arm64 \
+  --step compile \
+  --duration-ms 18423
+```
+
+Normalize that into `runs/jobs/steps` rather than forcing every caller to know
+the full schema.
+
+Record these fields when available:
 
 - `schema_version`
 - `project`, `repo`, `branch`, `sha`, `pr`
@@ -58,14 +186,18 @@ Link to existing evidence/log paths instead.
 
 ## Phase 1: Local Timing Baseline
 
-Extend existing Shipyard records before adding a new subsystem:
+Build the tiny Shipyard metrics subsystem before doing routing advice:
 
-- Teach `shipyard run command` / local target evidence to emit an optional
-  metrics JSONL row beside the existing evidence bundle.
+- Add `shipyard metrics record` for explicit step/job timing writes.
+- Teach `shipyard run command` / local target evidence to emit normalized rows
+  into `metrics.db`.
 - Include backend, target, host, command name, duration, exit status, and artifact
   cache annotations.
-- Add `shipyard metrics list --project <name>` and `shipyard metrics summary`
-  with p50/p90/min/max/count/failure-rate grouped by `project,target,backend,host`.
+- Add `shipyard metrics list --project <name>`, `shipyard metrics summary`,
+  `shipyard metrics compare`, `shipyard metrics slowest`, and
+  `shipyard metrics trend`.
+- Summary should expose p50/p90/min/max/count/failure-rate grouped by
+  `project,target,backend,host`.
 - Keep output available as human table and JSON so agents, plugins, and CI can
   parse the same truth.
 
@@ -74,6 +206,8 @@ Acceptance:
 - Running the same local command on `macstudio` and `m5` creates comparable rows.
 - Summary can answer: "For Pulp `linux-arm64`, which host is faster over the last
   N successful runs?"
+- A basic SQL query can answer average compile time by runner without bespoke
+  report code.
 
 ## Phase 2: GitHub Import
 
@@ -97,9 +231,19 @@ Acceptance:
 Use observed metrics to inform but not automatically rewrite routing profiles:
 
 - Add `shipyard metrics advise --project pulp --profile normal`.
+- Add `shipyard metrics watch --project pulp --json` for agent-oriented drift
+  detection.
 - Recommend preferred location per lane when enough samples exist.
 - Include confidence guardrails: minimum sample count, recent failure rate, stale
   data age, resource capacity, and queue/backlog signals.
+- Compare before/after windows for a named tweak, for example `windows-sccache`,
+  `linux-vm-cpu12`, or `macstudio-primary`.
+- Mark findings by materiality:
+  - `info`: visible trend, no action.
+  - `watch`: continue monitoring; sample size or magnitude is borderline.
+  - `investigate`: likely regression, broken cache, queue issue, or runner drift.
+  - `optimize`: clear opportunity where a different target/profile/cache appears
+    materially better.
 - Emit explicit fallback reasoning such as:
   - `macstudio` primary: fastest p50 and healthy success rate.
   - `m5` fallback: slower but available when Mac Studio has no free slots.
@@ -110,6 +254,10 @@ Acceptance:
 
 - Advice is explainable from the metrics rows and never changes config unless a
   later explicit `--apply` mode is designed.
+- A repo owner can answer: "Did this optimization make Pulp PR validation
+  materially faster, or should we revert/retune it?"
+- An agent can answer: "Is anything materially worse or better this week, and
+  what should be investigated?"
 
 ## Phase 4: Project Profiles
 
@@ -135,17 +283,98 @@ Minimum useful views:
 - queue time vs run time split for GitHub-hosted and self-hosted jobs.
 - boot/setup/run split for Tart VM lanes.
 - failure rate by lane and host.
+- before/after comparison for a repo-specific optimization label.
 - "Should this lane run locally?" advisory summary.
+
+## Agent Contract
+
+Agent-facing commands should be stable and terse:
+
+```sh
+shipyard metrics watch --project pulp --since 14d --json
+shipyard metrics advise --project pulp --profile normal --json
+shipyard metrics compare --project pulp --lane windows-arm64 --before 7d --after 7d --json
+```
+
+`metrics watch --json` should return:
+
+- `project`
+- `window`
+- `summary`
+- `findings[]`
+- `confidence`
+- `recommended_actions[]`
+- `evidence[]` with query parameters, sample counts, and representative run ids
+
+Example finding shape:
+
+```json
+{
+  "severity": "investigate",
+  "lane": "windows-arm64",
+  "signal": "p90_total_ms_regression",
+  "message": "Windows ARM64 p90 increased 42% after the latest golden image tag.",
+  "baseline": {"window": "previous_14d", "samples": 12, "p90_ms": 1840000},
+  "current": {"window": "last_14d", "samples": 10, "p90_ms": 2610000},
+  "recommended_actions": [
+    "Check tartci boot/setup timing split.",
+    "Verify sccache hit rate and cache path.",
+    "Compare against GitHub-hosted Windows x64 for the same PR set."
+  ]
+}
+```
+
+Default thresholds should be conservative and repo-configurable:
+
+- alert on p50 or p90 duration regression >= 25% with enough samples.
+- alert on failure-rate increase >= 10 percentage points.
+- alert on queue-time increase when local capacity exists.
+- suggest optimization when another configured runner is >= 20% faster with
+  comparable or better failure rate.
+- suppress findings when sample count is too low unless the change is extreme.
+
+Example queries the CLI should make easy:
+
+```sql
+SELECT machines.name, AVG(steps.duration_ms)
+FROM steps
+JOIN jobs ON jobs.id = steps.job_id
+JOIN machines ON machines.id = jobs.machine_id
+WHERE steps.step = 'compile' AND steps.status = 'pass'
+GROUP BY machines.name;
+```
+
+```sql
+SELECT target, backend, provider, COUNT(*), AVG(total_ms), MAX(total_ms)
+FROM jobs
+WHERE status = 'pass'
+GROUP BY target, backend, provider;
+```
+
+## Optional Tool Integrations
+
+- `hyperfine`: use for controlled local benchmarks and import
+  `--export-json` results into `metrics.db`. This is good for comparing a single
+  command across Mac Studio, M5, and VM configurations.
+- Bencher: evaluate for benchmark regression detection and trend charts when the
+  measured thing is a real benchmark. It should be an exporter/importer target,
+  not a dependency for answering runner-routing questions.
+- BuildPulse: useful reference for CI time/flakiness analysis, but it is
+  SaaS-oriented and should not be required for the local-first measurement loop.
+- OpenTelemetry: defer. Spans map well to configure/compile/link/test, but the
+  collector/exporter stack is more surface area than Phase 1 needs.
 
 ## Open Questions
 
 - Whether Tart should emit boot/setup timing directly, or Shipyard should infer it
-  from wrapper milestones.
+  from wrapper milestones. Prefer direct Tart fields if tartci can emit them.
 - Whether Windows cache timing belongs in Shipyard metrics, tartci timings, or
   both with a shared field name.
-- Whether a third-party dashboard is worth adopting after Phase 2. Until local
-  Tart/SSH timings exist in the same shape as GitHub jobs, external dashboards
-  are likely to answer only half the routing question.
+- Whether agent consumption should be only CLI JSON at first, or whether a small
+  read-only local API/MCP surface is worthwhile later. Start with CLI JSON unless
+  an agent integration needs more.
+- Whether Bencher is worth adopting for benchmark-style measurements after the
+  local/GitHub runner timing data exists in one store.
 
 ## Initial Pulp Evaluation Matrix
 
