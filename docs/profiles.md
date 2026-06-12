@@ -138,3 +138,55 @@ Profiles work at both levels:
 
 Switch profiles globally or per-project. `shipyard status` always shows
 which profile is active and exactly where each target will run.
+
+## tartci routing profiles
+
+For local VM fleets, Shipyard should treat tartci as the host/provider source of
+truth and keep Shipyard as the fleet/router layer.
+
+tartci exposes read-only profile and host status commands:
+
+```bash
+tartci profile list
+tartci profile explain normal-local-fast --repo danielraffel/pulp --json
+tartci profile plan normal-local-fast --repo danielraffel/pulp --json
+tartci status --json
+```
+
+Shipyard can also read the same profile vocabulary directly from a repo checkout
+without requiring tartci:
+
+```bash
+shipyard ci profile show normal-local-fast
+shipyard ci profile plan normal-local-fast --repo danielraffel/pulp --json
+```
+
+The Shipyard command searches `.tartci/<name>.toml`,
+`.shipyard/ci-profiles/<name>.toml`, then `ci-profiles/<name>.toml`. It is
+read-only: it explains the selected target and exact GitHub variable values, but
+does not apply variables or dispatch work.
+
+The tartci profile file describes PR, release, coverage, and scheduled policies
+in commented TOML. Its target IDs are stable routing vocabulary, not GitHub
+labels. Each target maps to a concrete `runs-on` selector such as
+`["self-hosted","Windows","ARM64","pulp-build-windows"]` or `"windows-latest"`.
+
+Shipyard's job is to consume those facts across hosts:
+
+1. Read `tartci status --json` from each configured host.
+2. Read `tartci profile explain ... --json` for the repo policy.
+3. Resolve ordered fallback before dispatch, using live capacity.
+4. Apply or pass one concrete GitHub `runs-on` selector per workflow run.
+5. Keep GitHub-hosted x64 scheduled validation authoritative until local x64
+   emulation is explicitly proven.
+
+GitHub Actions cannot change `runs-on` once a job is queued. Do not pass an
+ordered fallback chain into a Pulp workflow and expect GitHub to handle it.
+Fallback must be resolved before repo variables or `workflow_dispatch` inputs are
+set.
+
+For Pulp, the normal fast profile is expected to route PR macOS/Linux/Windows to
+local ARM64 VMs first, then fall back to GitHub where configured, while scheduled
+nightly Intel Linux/Windows validation stays on GitHub-hosted x64 runners.
+Coverage targets must use dedicated ephemeral labels; do not route coverage to a
+warm bare-metal build pool.

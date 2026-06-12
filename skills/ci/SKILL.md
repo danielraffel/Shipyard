@@ -100,6 +100,31 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Quarantine a flaky target | `shipyard quarantine add <target> --reason "..."` |
 | Remove from quarantine | `shipyard quarantine remove <target>` |
 
+## tartci local VM routing profiles
+
+When a repo uses tartci-backed local VM lanes, inspect the profile before
+changing GitHub variables or dispatch inputs:
+
+```sh
+tartci profile explain normal-local-fast --repo danielraffel/pulp --json
+tartci profile plan normal-local-fast --repo danielraffel/pulp --json
+tartci status --json
+```
+
+tartci owns host-local facts: Tart/QEMU providers, capacity, golden/cache
+state, and target-to-`runs-on` mappings. Shipyard owns fleet routing: read each
+host's tartci status, choose one concrete target from the ordered fallback chain,
+then apply that selector through repo variables or `workflow_dispatch`.
+
+Do not pass a fallback chain into GitHub Actions. GitHub cannot change `runs-on`
+after a job queues. Pulp workflows should receive one concrete selector per run.
+
+For Pulp's normal fast profile, local ARM64 PR lanes are fast feedback and
+GitHub-hosted nightly Intel Linux/Windows lanes are compatibility surveillance.
+Windows QEMU on Apple Silicon is Windows ARM64; x64 MSVC/Prism execution is
+smoke/debug until proven and should not replace `windows-latest` authority.
+Coverage must use dedicated ephemeral labels, not warm bare-metal build pools.
+
 ## GitHub Auth Diagnostics
 
 Before blaming ambient `gh auth status`, check whether the repo config has

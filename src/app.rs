@@ -16,6 +16,7 @@ mod auto_merge_cmd;
 mod branch_cmd;
 mod capacity_cmd;
 mod changelog_cmd;
+mod ci_cmd;
 mod cleanup_cmd;
 mod cli;
 mod cloud_cmd;
@@ -50,6 +51,7 @@ use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
 use self::branch_cmd::branch_command;
 use self::changelog_cmd::changelog_command;
+use self::ci_cmd::ci_command;
 use self::cleanup_cmd::{
     CleanupCommandOptions, CleanupMode, CleanupOutput, CleanupScope, cleanup_command,
 };
@@ -153,6 +155,9 @@ fn dispatch<W: Write, E: Write>(
         Command::Update(args) => return update_command(&args, cli.json, stdout),
         Command::Config { command } => {
             return config_command(command, cli.mode.into(), &cwd, cli.json, stdout);
+        }
+        Command::Ci { command } => {
+            return ci_command(command, &cwd, cli.json, stdout);
         }
         Command::Auth { command } => {
             return auth_command(
@@ -294,6 +299,7 @@ fn handle_operational_variant<W: Write>(
         Command::Paths
         | Command::Pin { .. }
         | Command::Config { .. }
+        | Command::Ci { .. }
         | Command::Auth { .. }
         | Command::Init { .. }
         | Command::Changelog { .. }
