@@ -3,9 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0700"></a>
-## [0.71.0]
+<a id="v0710"></a>
+## [0.71.0] - 2026-06-11
 
+- feat: add CI routing profile planner ([#360](https://github.com/danielraffel/Shipyard/pull/360))
+- fix(gh): expand {repo_slug} from the served repo, not just the daemon CWD ([#357](https://github.com/danielraffel/Shipyard/pull/357))
+
+<a id="v0700"></a>
 ## [0.70.0] - 2026-06-04
 
 - feat(run): add command evidence bundles ([#356](https://github.com/danielraffel/Shipyard/pull/356))
@@ -643,6 +647,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.71.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.71.0
 [0.70.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.70.0
 [0.69.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.69.0
 [0.68.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.68.1
