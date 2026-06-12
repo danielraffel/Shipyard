@@ -119,53 +119,125 @@ pub(super) fn fleet_status_command<W: Write>(
         || queued_age_with_capacity;
 
     if json {
-        let mut data = BTreeMap::new();
-        data.insert("repo".to_owned(), Value::from(repo));
-        data.insert("target".to_owned(), Value::from(args.target));
-        data.insert("free_slots".to_owned(), Value::from(free));
-        data.insert(
-            "routable_free_slots".to_owned(),
-            Value::from(routable_free_slots),
+        write_fleet_json(
+            stdout,
+            &FleetJsonView {
+                repo: &repo,
+                target: &args.target,
+                free,
+                routable_free_slots,
+                capacity_unreadable,
+                doctor_unreadable,
+                supervisor_unhealthy,
+                problem_hosts,
+                queued_age_threshold_secs,
+                queue_run_limit,
+                queued_age_with_capacity,
+                queue: &queue,
+                hosts: &hosts,
+            },
+        )?;
+    } else {
+        write_fleet_text(
+            stdout,
+            &FleetTextView {
+                repo: &repo,
+                target: &args.target,
+                free,
+                routable_free_slots,
+                queued_age_threshold_secs,
+                should_fail,
+                queue: &queue,
+                hosts: &hosts,
+            },
         );
-        data.insert(
-            "any_unreadable".to_owned(),
-            Value::from(capacity_unreadable || doctor_unreadable || !queue.readable),
-        );
-        data.insert(
-            "supervisor_unhealthy".to_owned(),
-            Value::from(supervisor_unhealthy),
-        );
-        data.insert("problem_hosts".to_owned(), Value::from(problem_hosts));
-        data.insert(
-            "queued_age_threshold_secs".to_owned(),
-            Value::from(queued_age_threshold_secs),
-        );
-        data.insert("queue_run_limit".to_owned(), Value::from(queue_run_limit));
-        data.insert(
-            "queued_age_with_capacity".to_owned(),
-            Value::from(queued_age_with_capacity),
-        );
-        data.insert("queue".to_owned(), queue_to_json(&queue));
-        data.insert(
-            "hosts".to_owned(),
-            Value::from(hosts.iter().map(host_to_json).collect::<Vec<_>>()),
-        );
-        write_json_envelope(stdout, "runner.fleet-status", data)
-            .map_err(|e| CliFailure::new(1, format!("failed to write JSON: {e}")))?;
-        return Ok(if should_fail {
-            ExitCode::from(1)
-        } else {
-            ExitCode::SUCCESS
-        });
     }
 
+    Ok(if should_fail {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+#[allow(clippy::struct_excessive_bools)]
+struct FleetJsonView<'a> {
+    repo: &'a str,
+    target: &'a str,
+    free: u32,
+    routable_free_slots: u32,
+    capacity_unreadable: bool,
+    doctor_unreadable: bool,
+    supervisor_unhealthy: bool,
+    problem_hosts: bool,
+    queued_age_threshold_secs: i64,
+    queue_run_limit: u32,
+    queued_age_with_capacity: bool,
+    queue: &'a QueuedSummary,
+    hosts: &'a [HostFleetStatus],
+}
+
+fn write_fleet_json<W: Write>(stdout: &mut W, view: &FleetJsonView<'_>) -> Result<(), CliFailure> {
+    let mut data = BTreeMap::new();
+    data.insert("repo".to_owned(), Value::from(view.repo));
+    data.insert("target".to_owned(), Value::from(view.target));
+    data.insert("free_slots".to_owned(), Value::from(view.free));
+    data.insert(
+        "routable_free_slots".to_owned(),
+        Value::from(view.routable_free_slots),
+    );
+    data.insert(
+        "any_unreadable".to_owned(),
+        Value::from(view.capacity_unreadable || view.doctor_unreadable || !view.queue.readable),
+    );
+    data.insert(
+        "supervisor_unhealthy".to_owned(),
+        Value::from(view.supervisor_unhealthy),
+    );
+    data.insert("problem_hosts".to_owned(), Value::from(view.problem_hosts));
+    data.insert(
+        "queued_age_threshold_secs".to_owned(),
+        Value::from(view.queued_age_threshold_secs),
+    );
+    data.insert(
+        "queue_run_limit".to_owned(),
+        Value::from(view.queue_run_limit),
+    );
+    data.insert(
+        "queued_age_with_capacity".to_owned(),
+        Value::from(view.queued_age_with_capacity),
+    );
+    data.insert("queue".to_owned(), queue_to_json(view.queue));
+    data.insert(
+        "hosts".to_owned(),
+        Value::from(view.hosts.iter().map(host_to_json).collect::<Vec<_>>()),
+    );
+    write_json_envelope(stdout, "runner.fleet-status", data)
+        .map_err(|e| CliFailure::new(1, format!("failed to write JSON: {e}")))
+}
+
+struct FleetTextView<'a> {
+    repo: &'a str,
+    target: &'a str,
+    free: u32,
+    routable_free_slots: u32,
+    queued_age_threshold_secs: i64,
+    should_fail: bool,
+    queue: &'a QueuedSummary,
+    hosts: &'a [HostFleetStatus],
+}
+
+fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetTextView<'_>) {
     writeln!(
         stdout,
         "fleet-status repo={repo} target={} free={free} routable_free={routable_free_slots}",
-        args.target
+        view.target,
+        repo = view.repo,
+        free = view.free,
+        routable_free_slots = view.routable_free_slots
     )
     .ok();
-    for host in &hosts {
+    for host in view.hosts {
         let running = host
             .capacity
             .running
@@ -189,26 +261,21 @@ pub(super) fn fleet_status_command<W: Write>(
     writeln!(
         stdout,
         "  queued macOS: count={} oldest_age_secs={} threshold={} readable={}",
-        queue.count,
-        queue
+        view.queue.count,
+        view.queue
             .oldest_age_secs
             .map_or_else(|| "-".to_owned(), |age| age.to_string()),
-        queued_age_threshold_secs,
-        queue.readable
+        view.queued_age_threshold_secs,
+        view.queue.readable
     )
     .ok();
-    if should_fail {
+    if view.should_fail {
         writeln!(
             stdout,
             "fleet-status: attention required (see fields above)"
         )
         .ok();
     }
-    Ok(if should_fail {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
 }
 
 fn probe_doctor(class: &HostClassConfig) -> DoctorProbe {
@@ -275,8 +342,10 @@ fn doctor_probe_from_output(output: &Output, base_source: &str) -> DoctorProbe {
                 .lines()
                 .next()
                 .filter(|line| !line.trim().is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("tartci doctor failed; JSON parse error: {error}"));
+                .map_or_else(
+                    || format!("tartci doctor failed; JSON parse error: {error}"),
+                    str::to_owned,
+                );
             DoctorProbe {
                 readable: false,
                 source,
@@ -308,12 +377,11 @@ fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe) -> HostFleetStatus 
     let stale_vm_count = digest
         .and_then(|value| value.get("vms"))
         .and_then(Value::as_array)
-        .map(|vms| {
+        .map_or(0, |vms| {
             vms.iter()
                 .filter(|vm| vm.get("stale").and_then(Value::as_bool).unwrap_or(false))
                 .count()
-        })
-        .unwrap_or(0);
+        });
     let routable = capacity.readable()
         && capacity.free() > 0
         && doctor.readable
@@ -419,11 +487,11 @@ fn queued_macos_summary(
             continue;
         }
         count += 1;
-        if let Some(created_at) = run.get("created_at").and_then(Value::as_str) {
-            if let Ok(ts) = DateTime::parse_from_rfc3339(created_at) {
-                let age = (now - ts.with_timezone(&Utc)).num_seconds().max(0);
-                oldest_age_secs = Some(oldest_age_secs.map_or(age, |oldest| oldest.max(age)));
-            }
+        if let Some(created_at) = run.get("created_at").and_then(Value::as_str)
+            && let Ok(ts) = DateTime::parse_from_rfc3339(created_at)
+        {
+            let age = (now - ts.with_timezone(&Utc)).num_seconds().max(0);
+            oldest_age_secs = Some(oldest_age_secs.map_or(age, |oldest| oldest.max(age)));
         }
     }
     Ok(QueuedSummary {
@@ -440,12 +508,11 @@ fn run_has_queued_target_job(
     run_id: u64,
     target: &str,
 ) -> bool {
-    let raw = match actions.run_gh(&[
+    let Ok(raw) = actions.run_gh(&[
         "api".to_owned(),
         format!("repos/{repo}/actions/runs/{run_id}/jobs"),
-    ]) {
-        Ok(raw) => raw,
-        Err(_) => return false,
+    ]) else {
+        return false;
     };
     let Ok(value) = serde_json::from_str::<Value>(&raw) else {
         return false;

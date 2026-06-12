@@ -275,6 +275,7 @@ pub fn gather_configured_host_capacities(data: &Table) -> Result<Vec<HostCapacit
 }
 
 /// Probe one host class and fold the result into a [`HostCapacity`].
+#[must_use]
 pub fn probe_host_capacity(class: &HostClassConfig) -> HostCapacity {
     let (running, source) = match read_running(class) {
         Ok(count) => (
@@ -293,6 +294,7 @@ pub fn probe_host_capacity(class: &HostClassConfig) -> HostCapacity {
 }
 
 /// SSH options for non-interactive, fail-fast capacity probes.
+#[must_use]
 pub fn ssh_probe_options() -> Vec<String> {
     [
         "-o",
@@ -308,6 +310,7 @@ pub fn ssh_probe_options() -> Vec<String> {
 }
 
 /// Render the remote `tart` command used for one host-class probe.
+#[must_use]
 pub fn remote_tart_command(class: &HostClassConfig, args: &[&str]) -> String {
     let mut parts = Vec::new();
     if let Some(tart_home) = &class.tart_home {

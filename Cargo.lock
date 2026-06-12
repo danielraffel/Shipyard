@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "base64",
  "chrono",

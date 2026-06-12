@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0710"></a>
+## [0.72.0]
+
 ## [0.71.0] - 2026-06-11
 
 - feat: add CI routing profile planner ([#360](https://github.com/danielraffel/Shipyard/pull/360))
