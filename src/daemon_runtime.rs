@@ -652,19 +652,11 @@ pub fn stop_running(state_dir: &Path) -> bool {
         && pid_alive(pid)
         && process_looks_like_shipyard_daemon(pid)
     {
-        if signal_pid(pid, "-TERM") && wait_until_pid_stops(pid, Duration::from_secs(3)) {
+        let stopped = terminate_daemon_pid(pid, Duration::from_secs(3));
+        if stopped {
             let _ = cleanup_stale_runtime_files(&daemon_dir);
-            return true;
         }
-        if pid_alive(pid) {
-            let _ = signal_pid(pid, "-KILL");
-            let _ = wait_until_pid_stops(pid, Duration::from_secs(1));
-        }
-        if pid_alive(pid) {
-            return false;
-        }
-        let _ = cleanup_stale_runtime_files(&daemon_dir);
-        return true;
+        return stopped;
     }
 
     if pid_path.exists() || socket_path.exists() {
