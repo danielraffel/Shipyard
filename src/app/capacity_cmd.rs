@@ -2,105 +2,27 @@
 //!
 //! Reads each configured `[host_class.<name>]`'s running macOS VMs (locally for
 //! the controller's own box, over SSH for the others), computes free slots
-//! `Σ max(0, cap − running)`, and reports per-host + total. Fail-closed: an
-//! unreadable host contributes 0 free and exits non-zero so a cron/script
-//! notices — silence must not read as success.
+//! `Σ max(0, cap − running)`, and reports per-host + total. `tart list` does
+//! not reliably include OS, so every running VM is enriched with
+//! `tart get <name> --format json`; only macOS/darwin VMs consume this quota.
+//! Fail-closed: an unreadable host contributes 0 free and exits non-zero so a
+//! cron/script notices — silence must not read as success.
 //!
 //! All capacity math + parsing is the pure code in [`crate::capacity`]; this
 //! module is the only place that shells out to `tart` and `ssh`.
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use serde_json::Value;
 
 use super::CliFailure;
 use crate::capacity::{
-    HostCapacity, HostClassConfig, any_unreadable, parse_host_classes, parse_tart_running,
-    total_free,
+    HostCapacity, any_unreadable, gather_configured_host_capacities, total_free,
 };
 use crate::config::LoadedConfig;
 use crate::output::write_json_envelope;
-
-/// SSH options for a non-interactive, fail-fast probe: no prompts, short
-/// connect timeout, accept new host keys so a fresh host doesn't hang.
-fn ssh_probe_options() -> Vec<String> {
-    [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=8",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect()
-}
-
-/// Read the running-VM count for one host class. Returns `Ok(count)` or an
-/// `Err(reason)` that the caller records as an unreadable host (fail-closed).
-fn read_running(class: &HostClassConfig) -> Result<u32, String> {
-    let tart_args = ["list", "--format", "json"];
-    let output = if let Some(host) = &class.ssh {
-        let remote = format!("{} list --format json", class.tart_bin);
-        Command::new("ssh")
-            .args(ssh_probe_options())
-            .arg(host)
-            .arg(&remote)
-            .output()
-    } else {
-        Command::new(&class.tart_bin).args(tart_args).output()
-    };
-
-    let output = output.map_err(|error| {
-        if class.ssh.is_some() {
-            format!("ssh spawn failed: {error}")
-        } else {
-            format!("`{}` spawn failed: {error}", class.tart_bin)
-        }
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        let detail = if detail.is_empty() {
-            format!("exit {}", output.status.code().unwrap_or(-1))
-        } else {
-            detail.lines().next().unwrap_or(detail).to_owned()
-        };
-        return Err(format!("tart list failed: {detail}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_tart_running(&stdout)
-}
-
-/// Gather per-host capacity for every configured `[host_class.*]` (probing each
-/// host). Shared by `runner capacity` and the reroute watcher (#316 Part C).
-pub(super) fn gather(config: &LoadedConfig) -> Result<Vec<HostCapacity>, CliFailure> {
-    let classes = parse_host_classes(&config.data).map_err(|e| CliFailure::new(2, e))?;
-    Ok(classes.iter().map(probe).collect())
-}
-
-/// Probe one host class and fold the result into a [`HostCapacity`].
-fn probe(class: &HostClassConfig) -> HostCapacity {
-    let (running, source) = match read_running(class) {
-        Ok(count) => (
-            Some(count),
-            if class.ssh.is_some() { "ssh" } else { "local" }.to_owned(),
-        ),
-        Err(reason) => (None, reason),
-    };
-    HostCapacity {
-        class: class.class.clone(),
-        ssh: class.ssh.clone(),
-        cap: class.cap,
-        running,
-        source,
-    }
-}
 
 fn host_to_json(host: &HostCapacity) -> Value {
     let mut m = serde_json::Map::new();
@@ -128,12 +50,14 @@ pub(super) fn capacity_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let classes = parse_host_classes(&config.data).map_err(|e| CliFailure::new(2, e))?;
+    let hosts =
+        gather_configured_host_capacities(&config.data).map_err(|e| CliFailure::new(2, e))?;
 
-    if classes.is_empty() {
+    if hosts.is_empty() {
         let msg = "No [host_class.<name>] entries configured. Add e.g.\n\n  \
-                   [host_class.studio]\n  ssh = \"Daniels-Mac-Studio.local\"  # omit for this box\n  \
-                   cap = 2\n  labels = [\"self-hosted\", \"macos\", \"arm64\", \"shipyard-build-studio\"]\n";
+                   [host_class.studio]\n  # ssh omitted for the controller's own box\n  \
+                   cap = 2\n  tart_bin = \"/opt/homebrew/bin/tart\"\n  tart_home = \"/Users/<you>/VMs\"\n  \
+                   labels = [\"self-hosted\", \"macos\", \"arm64\", \"shipyard-build-studio\"]\n";
         if json {
             let mut data = BTreeMap::new();
             data.insert("hosts".to_owned(), Value::Array(Vec::new()));
@@ -148,7 +72,6 @@ pub(super) fn capacity_command<W: Write>(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let hosts: Vec<HostCapacity> = classes.iter().map(probe).collect();
     let free = total_free(&hosts);
     let unreadable = any_unreadable(&hosts);
     let exit = if unreadable {
@@ -210,13 +133,6 @@ pub(super) fn capacity_command<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ssh_probe_options_are_noninteractive() {
-        let opts = ssh_probe_options();
-        assert!(opts.iter().any(|o| o == "BatchMode=yes"));
-        assert!(opts.iter().any(|o| o.starts_with("ConnectTimeout")));
-    }
 
     #[test]
     fn host_to_json_marks_unreadable_host() {

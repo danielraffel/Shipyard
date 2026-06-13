@@ -141,8 +141,13 @@ which profile is active and exactly where each target will run.
 
 ## tartci routing profiles
 
-For local VM fleets, Shipyard should treat tartci as the host/provider source of
-truth and keep Shipyard as the fleet/router layer.
+For local VM fleets, Shipyard can integrate with
+[tartci](https://github.com/danielraffel/tartci) without making tartci a
+requirement for ordinary Shipyard use. tartci owns the local VM facts: which
+goldens exist, which hosts can serve them, what labels a per-job runner uses,
+and how much capacity each host currently has. Shipyard stays the orchestrator:
+it reads those facts, combines them with the active project profile, and
+dispatches one concrete GitHub runner selector.
 
 tartci exposes read-only profile and host status commands:
 
@@ -166,10 +171,11 @@ The Shipyard command searches `.tartci/<name>.toml`,
 read-only: it explains the selected target and exact GitHub variable values, but
 does not apply variables or dispatch work.
 
-The tartci profile file describes PR, release, coverage, and scheduled policies
-in commented TOML. Its target IDs are stable routing vocabulary, not GitHub
-labels. Each target maps to a concrete `runs-on` selector such as
-`["self-hosted","Windows","ARM64","pulp-build-windows"]` or `"windows-latest"`.
+The profile file describes PR, release, coverage, scheduled, and
+issue-on-failure policies in commented TOML. Its target IDs are stable routing
+vocabulary, not GitHub labels. Each target maps to a concrete `runs-on` selector
+such as `["self-hosted","Windows","ARM64","pulp-build-windows"]` or
+`"windows-latest"`.
 
 Shipyard's job is to consume those facts across hosts:
 
@@ -186,7 +192,9 @@ Fallback must be resolved before repo variables or `workflow_dispatch` inputs ar
 set.
 
 For Pulp, the normal fast profile is expected to route PR macOS/Linux/Windows to
-local ARM64 VMs first, then fall back to GitHub where configured, while scheduled
-nightly Intel Linux/Windows validation stays on GitHub-hosted x64 runners.
-Coverage targets must use dedicated ephemeral labels; do not route coverage to a
-warm bare-metal build pool.
+local ARM64 VMs first where those lanes are enabled, then fall back to GitHub
+where configured, while scheduled nightly Intel Linux/Windows validation stays
+on GitHub-hosted x64 runners. Coverage targets must use dedicated ephemeral
+labels; do not route coverage to a warm bare-metal build pool. Pulp's current
+repo-specific variables and labels live in Pulp's own docs and
+`.shipyard/ci-profiles/` files so Shipyard docs do not stale on Pulp operations.

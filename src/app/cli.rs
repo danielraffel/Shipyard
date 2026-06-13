@@ -56,6 +56,12 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: CiCommand,
     },
+    /// Record, import, and inspect runner performance metrics.
+    Metrics {
+        /// Metrics subcommand.
+        #[command(subcommand)]
+        command: Box<MetricsCommand>,
+    },
     /// Inspect and move Shipyard GitHub auth config without secrets.
     Auth {
         /// Auth subcommand.
@@ -398,6 +404,198 @@ pub(super) enum CiProfileCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub(crate) enum MetricsCommand {
+    /// Record one explicit step/job timing sample.
+    Record(Box<MetricsRecordArgs>),
+    /// Import metrics from an external source.
+    Import {
+        /// Import source.
+        #[command(subcommand)]
+        source: MetricsImportCommand,
+    },
+    /// List recent job rows.
+    List(MetricsListArgs),
+    /// Summarize p50/p90/min/max/failure-rate by project,target,backend,host.
+    Summary(MetricsProjectArgs),
+    /// Show slowest successful jobs.
+    Slowest(MetricsListArgs),
+    /// Compare before/after timing windows.
+    Compare(MetricsCompareArgs),
+    /// Show simple trend rows.
+    Trend(MetricsListArgs),
+    /// Emit agent-oriented drift findings.
+    Watch(MetricsWatchArgs),
+    /// Emit agent-oriented placement advice.
+    Advise(MetricsAdviseArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum MetricsImportCommand {
+    /// Import tartci runtime export JSON/JSONL.
+    Tartci(MetricsImportTartciArgs),
+    /// Import GitHub Actions jobs for recent workflow runs.
+    Github(MetricsImportGithubArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsRecordArgs {
+    /// Project key, for example `pulp`.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Owner/repo slug.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Git branch.
+    #[arg(long)]
+    pub(crate) branch: Option<String>,
+    /// Git commit SHA.
+    #[arg(long)]
+    pub(crate) sha: Option<String>,
+    /// Pull request number.
+    #[arg(long)]
+    pub(crate) pr: Option<i64>,
+    /// Workflow name.
+    #[arg(long)]
+    pub(crate) workflow: Option<String>,
+    /// Routing profile name.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+    /// Routing decision, for example primary/fallback/forced.
+    #[arg(long = "routing-decision")]
+    pub(crate) routing_decision: Option<String>,
+    /// Job/lane name.
+    #[arg(long)]
+    pub(crate) job: String,
+    /// Target/lane key.
+    #[arg(long)]
+    pub(crate) target: Option<String>,
+    /// Platform, for example macos/linux/windows.
+    #[arg(long)]
+    pub(crate) platform: Option<String>,
+    /// Backend, for example local/cloud/vm/ssh.
+    #[arg(long)]
+    pub(crate) backend: Option<String>,
+    /// Provider, for example github-hosted/tart-macos/qemu-windows.
+    #[arg(long)]
+    pub(crate) provider: Option<String>,
+    /// Runner or machine name.
+    #[arg(long)]
+    pub(crate) runner: Option<String>,
+    /// Host name.
+    #[arg(long)]
+    pub(crate) host: Option<String>,
+    /// Step name. Defaults to `total`.
+    #[arg(long)]
+    pub(crate) step: Option<String>,
+    /// Duration in milliseconds.
+    #[arg(long = "duration-ms", conflicts_with = "duration")]
+    pub(crate) duration_ms: Option<i64>,
+    /// Duration with units, for example `18423ms` or `18.4s`.
+    #[arg(long)]
+    pub(crate) duration: Option<String>,
+    /// Status, for example pass/fail/success/failure.
+    #[arg(long, default_value = "pass")]
+    pub(crate) status: String,
+    /// Process exit code.
+    #[arg(long = "exit-code")]
+    pub(crate) exit_code: Option<i64>,
+    /// Failure class when status is not healthy.
+    #[arg(long = "failure-class")]
+    pub(crate) failure_class: Option<String>,
+    /// External dedupe key, for example github:run/job/attempt.
+    #[arg(long = "external-id")]
+    pub(crate) external_id: Option<String>,
+    /// RFC3339 start timestamp.
+    #[arg(long = "started-at")]
+    pub(crate) started_at: Option<String>,
+    /// RFC3339 completion timestamp.
+    #[arg(long = "completed-at")]
+    pub(crate) completed_at: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsImportTartciArgs {
+    /// Read tartci runtime export JSON/JSONL from this file. Omit or pass `-` for stdin.
+    #[arg(long)]
+    pub(crate) file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsImportGithubArgs {
+    /// Owner/repo slug.
+    #[arg(long)]
+    pub(crate) repo: String,
+    /// Project key. Defaults to the repo name.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+    /// Workflow filename or id to list runs for.
+    #[arg(long)]
+    pub(crate) workflow: Option<String>,
+    /// Branch/ref filter.
+    #[arg(long)]
+    pub(crate) branch: Option<String>,
+    /// Number of recent runs to import.
+    #[arg(long, default_value_t = 10)]
+    pub(crate) limit: u32,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsProjectArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsListArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+    /// Maximum rows.
+    #[arg(long, default_value_t = 20)]
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsCompareArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Optional lane key for agent context.
+    #[arg(long)]
+    pub(crate) lane: Option<String>,
+    /// Before window, for example `7d`.
+    #[arg(long)]
+    pub(crate) before: Option<String>,
+    /// After window, for example `7d`.
+    #[arg(long)]
+    pub(crate) after: Option<String>,
+    /// Split point in days ago. Older rows are before; newer rows are after.
+    #[arg(long = "split-days-ago", default_value_t = 7)]
+    pub(crate) split_days_ago: i64,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsWatchArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Recent window, for example `14d`.
+    #[arg(long = "since", default_value = "14d")]
+    pub(crate) since: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsAdviseArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Profile name used by the caller; included for agent context.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
 pub(super) enum RunSubcommand {
     /// Run an arbitrary command on one local or POSIX SSH target and store typed evidence.
     Command(RunCommandEvidenceArgs),
@@ -641,8 +839,24 @@ pub(super) enum RunnerCommand {
         repo: Vec<String>,
     },
     /// Report VM-slot-aware free macOS capacity across `[host_class.*]` hosts
-    /// (`Σ max(0, cap − running tart VMs)`). Exit 1 if any host is unreadable.
+    /// (`Σ max(0, cap − running macOS Tart VMs)`). Exit 1 if any host is unreadable.
     Capacity,
+    /// Read fleet capacity, tartci supervisor freshness, and queued macOS age.
+    /// Exit 1 on unreadable hosts or queued-age-with-capacity alerts.
+    FleetStatus {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Job-name substring used to identify macOS queued work.
+        #[arg(long, default_value = "macos")]
+        target: String,
+        /// Alert when queued macOS work is older than this and a routable slot exists.
+        #[arg(long = "queued-age-threshold-secs", default_value_t = 900)]
+        queued_age_threshold_secs: i64,
+        /// Maximum queued workflow runs to inspect for matching macOS jobs.
+        #[arg(long = "queue-run-limit", default_value_t = 100)]
+        queue_run_limit: u32,
+    },
     /// Watch for cloud-queued macOS jobs and drain them to a local runner when
     /// a VM slot frees up. Observe-only unless `--apply`.
     RerouteWatch {

@@ -2,7 +2,8 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use wait_timeout::ChildExt;
@@ -11,6 +12,8 @@ use crate::governance::{BranchProtectionRules, GovernanceGh, put_branch_protecti
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_PUSH_TIMEOUT: Duration = Duration::from_mins(1);
+const GIT_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(25);
+const GIT_SPAWN_ATTEMPTS: usize = 3;
 
 /// Outcome status for `shipyard branch apply`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,9 +295,8 @@ fn run_git(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to run git: {error}"))?;
+    let mut child =
+        spawn_git(&mut command).map_err(|error| format!("failed to run git: {error}"))?;
     let mut stdout = child
         .stdout
         .take()
@@ -324,6 +326,25 @@ fn run_git(
         stdout: stdout_text,
         stderr: stderr_text,
     })
+}
+
+fn spawn_git(command: &mut Command) -> std::io::Result<Child> {
+    let mut last_error = None;
+    for attempt in 1..=GIT_SPAWN_ATTEMPTS {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if is_text_file_busy(&error) && attempt < GIT_SPAWN_ATTEMPTS => {
+                last_error = Some(error);
+                thread::sleep(GIT_SPAWN_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("spawn retry loop should retain the last error"))
+}
+
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(26)
 }
 
 fn first_sha(stdout: &str) -> Option<String> {

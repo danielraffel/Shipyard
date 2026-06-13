@@ -460,6 +460,9 @@ pub struct JobResourcePlan {
     /// Host-pool lease demands.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_pools: Vec<HostPoolDemand>,
+    /// VM-slot demands, currently used for local macOS VM admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vm_slots: Vec<VmSlotDemand>,
 }
 
 impl JobResourcePlan {
@@ -497,6 +500,7 @@ impl JobResourcePlan {
             exclusive_claims: Vec::new(),
             cloud_targets: Vec::new(),
             host_pools: Vec::new(),
+            vm_slots: Vec::new(),
         };
         if let Some((repo, pr)) = ship_scope {
             plan.exclusive_claims
@@ -522,6 +526,8 @@ impl JobResourcePlan {
         plan.cloud_targets.dedup();
         plan.host_pools
             .sort_by(|left, right| left.pool_name.cmp(&right.pool_name));
+        plan.vm_slots
+            .sort_by(|left, right| left.key.cmp(&right.key));
         plan
     }
 }
@@ -540,6 +546,16 @@ pub struct HostPoolDemand {
     /// Stable capability key used by scheduler capacity accounting.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub capability_key: String,
+}
+
+/// One VM-slot demand.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct VmSlotDemand {
+    /// Stable slot key. Today `macos` is the only slot-capped OS.
+    pub key: String,
+    /// Number of VM slots required by this logical target.
+    #[serde(default = "default_vm_slots")]
+    pub slots: u32,
 }
 
 /// Durable resolved target snapshot.
@@ -1301,6 +1317,7 @@ fn collect_backend_resource_demands(
         }
         ResolvedBackend::Cloud(_) => plan.cloud_targets.push(target.name.clone()),
         ResolvedBackend::HostPool(pool) => {
+            push_target_vm_slot_demand(target, plan);
             let mut requires = pool.requires.clone();
             requires.sort();
             requires.dedup();
@@ -1320,6 +1337,12 @@ fn collect_backend_resource_demands(
             }
         }
     }
+    if matches!(
+        target.backend,
+        ResolvedBackend::Local(_) | ResolvedBackend::Ssh(_) | ResolvedBackend::Windows(_)
+    ) {
+        push_target_vm_slot_demand(target, plan);
+    }
 }
 
 fn push_host_pool_demand(plan: &mut JobResourcePlan, demand: HostPoolDemand) {
@@ -1336,6 +1359,43 @@ fn push_host_pool_demand(plan: &mut JobResourcePlan, demand: HostPoolDemand) {
 
 fn default_host_pool_slots() -> u32 {
     1
+}
+
+fn default_vm_slots() -> u32 {
+    1
+}
+
+fn push_target_vm_slot_demand(target: &ResolvedTarget, plan: &mut JobResourcePlan) {
+    let Some(key) = vm_slot_key(&target.platform) else {
+        return;
+    };
+    push_vm_slot_demand(plan, VmSlotDemand { key, slots: 1 });
+}
+
+fn push_vm_slot_demand(plan: &mut JobResourcePlan, demand: VmSlotDemand) {
+    if let Some(existing) = plan
+        .vm_slots
+        .iter_mut()
+        .find(|existing| existing.key == demand.key)
+    {
+        existing.slots = existing.slots.saturating_add(demand.slots);
+        return;
+    }
+    plan.vm_slots.push(demand);
+}
+
+fn vm_slot_key(platform: &str) -> Option<String> {
+    let os = platform
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(platform)
+        .trim()
+        .to_ascii_lowercase();
+    if os == "macos" || os == "darwin" {
+        Some("macos".to_owned())
+    } else {
+        None
+    }
 }
 
 fn capability_key(requires: &[String]) -> String {
@@ -1445,7 +1505,7 @@ mod tests {
     use super::{
         HostPoolDemand, JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION, QueueOutcomeStore,
         QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind,
-        QueuedExecutionOutcome, QueuedExecutionRequest,
+        QueuedExecutionOutcome, QueuedExecutionRequest, VmSlotDemand,
     };
     use crate::executor::cloud::CloudTargetConfig;
     use crate::executor::dispatch::{
@@ -1549,15 +1609,19 @@ mod tests {
     }
 
     fn cloud_target(name: &str) -> ResolvedTarget {
+        cloud_target_with_platform(name, "linux")
+    }
+
+    fn cloud_target_with_platform(name: &str, platform: &str) -> ResolvedTarget {
         ResolvedTarget {
             name: name.to_owned(),
-            platform: "linux".to_owned(),
+            platform: platform.to_owned(),
             backend_name: "cloud".to_owned(),
             warm_keepalive_seconds: 0,
             host: None,
             backend: ResolvedBackend::Cloud(CloudTargetConfig {
                 name: name.to_owned(),
-                platform: "linux".to_owned(),
+                platform: platform.to_owned(),
                 workflow: "ci.yml".to_owned(),
                 repository: None,
                 runner_provider: None,
@@ -1866,6 +1930,13 @@ mod tests {
         assert_eq!(plan.targets, ["mac"]);
         assert!(plan.cloud_targets.is_empty());
         assert!(plan.host_pools.is_empty());
+        assert_eq!(
+            plan.vm_slots,
+            [VmSlotDemand {
+                key: "macos".to_owned(),
+                slots: 1,
+            }]
+        );
         assert!(plan.exclusive_claims.contains(&format!(
             "local-cwd:{}",
             temp.path().canonicalize().expect("canonical").display()
@@ -1929,6 +2000,7 @@ mod tests {
         let plan = JobResourcePlan::from_run_request(Path::new("/work/repo"), &request);
 
         assert_eq!(plan.cloud_targets, ["ubuntu"]);
+        assert!(plan.vm_slots.is_empty());
         assert!(
             plan.exclusive_claims
                 .contains(&"evidence:feat/run:ubuntu".to_owned())
@@ -1939,6 +2011,17 @@ mod tests {
                 .iter()
                 .any(|claim| claim.contains("cloud"))
         );
+    }
+
+    #[test]
+    fn github_hosted_macos_resource_plan_has_no_local_vm_slot_claim() {
+        let mut request = run_request();
+        request.targets = vec![cloud_target_with_platform("macos-15", "macos-arm64")];
+
+        let plan = JobResourcePlan::from_run_request(Path::new("/work/repo"), &request);
+
+        assert_eq!(plan.cloud_targets, ["macos-15"]);
+        assert!(plan.vm_slots.is_empty());
     }
 
     #[test]
@@ -1980,6 +2063,13 @@ mod tests {
                 requires: vec!["arm64".to_owned(), "xcode".to_owned()],
                 slots: 2,
                 capability_key: "arm64+xcode".to_owned(),
+            }]
+        );
+        assert_eq!(
+            plan.vm_slots,
+            [VmSlotDemand {
+                key: "macos".to_owned(),
+                slots: 2,
             }]
         );
         assert!(

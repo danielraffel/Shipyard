@@ -335,11 +335,15 @@ shipyard runner capacity --json   # exit 1 if any host unreadable
 ```
 
 macOS caps **2 running VMs per host** (XNU kernel quota; Pulp plan Appendix D).
-`runner capacity` reads each `[host_class.<name>]`'s running macOS VMs (locally
-for the controller's own box, over SSH otherwise) via `tart list` and computes
-`free = Σ max(0, cap − running)`. **Fail-closed:** an unreadable host counts as
-0 free and the command exits non-zero — a silent host must never read as spare
-capacity. Configure host classes (operator-specific, so keep these in
+`runner capacity` reads each `[host_class.<name>]`'s running Tart VMs (locally
+for the controller's own box, over SSH otherwise), enriches each running VM with
+`tart get <name> --format json`, and counts only macOS/darwin VMs as consuming
+the macOS quota. Set `tart_home` when launchd supervisors use a non-default Tart
+store; the probe then runs with `TART_HOME=<absolute-path>` and reads the same
+store. Linux/Windows Tart VMs do not reduce this free-slot count.
+**Fail-closed:** an unreadable host or VM OS counts the host as 0 free and the
+command exits non-zero — a silent host must never read as spare capacity.
+Configure host classes (operator-specific, so keep these in
 `~/.config/shipyard/config.toml` or `.shipyard.local/`, not the committed repo
 config):
 
@@ -348,17 +352,30 @@ config):
 # ssh omitted → the controller's own box, read locally
 cap = 2                                    # Studio may raise via Appendix-D override
 tart_bin = "/opt/homebrew/bin/tart"        # if tart isn't on the SSH PATH
+tartci_bin = "/Users/ci/.local/bin/tartci" # for fleet-status doctor probes
+tart_home = "/Users/ci/VMs"                # absolute path; no shell/tilde expansion
 labels = ["self-hosted", "macos", "arm64", "shipyard-build-studio"]
 
 [host_class.m1]
-ssh = "Daniels-MacBook-Pro.local"
+ssh = "m1-ci.local"
 cap = 2
+tart_bin = "/opt/homebrew/bin/tart"
+tartci_bin = "/Users/ci/.local/bin/tartci"
+tart_home = "/Users/ci/VMs"
 
 # [host_class.m5] arrives later — same shape, inherits cap = 2.
 ```
 
 This free-slot count is what the cloud→local reroute watcher (#316 Part C)
 gates on: drain a still-queued cloud macOS job to local only when `free > 0`.
+
+Use `shipyard runner fleet-status --repo <owner/repo> --target macos --json`
+for the operator view that answers "can queued jobs actually drain?" It combines
+capacity with host-local `tartci doctor --reap --json`, supervisor heartbeat
+freshness, per-host routability, and oldest queued macOS age. It is read-only
+and exits non-zero when a host is unreadable/unhealthy or when queued macOS work
+is older than `--queued-age-threshold-secs` while routable capacity exists. Use
+`--queue-run-limit N` to keep live debugging snappy on a large queued backlog.
 
 ### Reroute watcher (cloud→local drain)
 
@@ -376,7 +393,8 @@ in `src/reroute.rs`): **slot-safe/fail-closed** (unreadable hosts count as 0
 free, so an all-unreadable fleet does nothing), **flap-guard** (skip a PR
 rerouted within `--flap-window`), **one reroute per tick** (natural pacing), and
 **deterministic** oldest-run-first choice. **Observe by default** — without
-`--apply` it logs each decision but acts on nothing. `--apply` shells `shipyard
+`--apply` it logs each decision, per-host capacity, and the candidate list but
+acts on nothing. `--apply` shells `shipyard
 cloud retarget … --provider local --apply`, which works for PRs Shipyard is
 shipping (ship-state-backed). `cloud retarget` has no `--repo` flag — it
 resolves the repo from the current checkout — so run `reroute-watch --apply`
@@ -645,6 +663,12 @@ owner, but they still do not interrupt running GitHub-hosted macOS jobs. Jobs
 serialize when they claim the same checkout, PR state, evidence lane, or
 exhausted pool capacity. See `docs/local-mac-pool.md` before claiming
 multi-Mac throughput.
+
+For Pulp/tartci macOS VM work, prefer local queueing over hosted overflow: a
+full local fleet should leave jobs queued on the self-hosted VM labels until a
+controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an
+explicit operator fallback when fleet status says the local Macs are
+offline/unhealthy, or when the workflow intentionally asks for hosted coverage.
 
 ## Cloud Retargeting
 

@@ -114,9 +114,29 @@ The first concurrency release uses a conservative worker cap, so host-pool
 throughput is bounded by both configured pool capacity and the queue worker
 limit.
 
-## Explicit Cloud Overflow
+## Mixed OS VM Lanes
 
-GitHub-hosted macOS overflow must be explicit:
+A host can serve more than one VM lane. For Pulp/tartci, the same controller and
+secondary Apple Silicon hosts may participate in the macOS pool and also serve
+Linux Tart or Windows QEMU jobs when those supervisors are enabled. Capacity is
+accounted per lane: macOS jobs consume `macos` VM slots, while Linux and Windows
+jobs use their own labels, supervisors, and caps. A running Linux or Windows VM
+must not reduce Shipyard's macOS free-slot count, although operators should
+still set host route weights or reservations if shared CPU/RAM becomes the real
+bottleneck.
+
+When `[host_class.*]` entries are configured, the cooperative queue scheduler
+uses the same live Tart capacity probe as `runner capacity` / `runner
+fleet-status` before admitting jobs that claim a macOS VM slot. If every local
+macOS slot is occupied, the macOS job stays queued; Linux/Windows/cloud jobs do
+not consume that `macos` slot and can still run.
+
+## Explicit Cloud Fallback
+
+GitHub-hosted macOS fallback must be explicit and should be reserved for a local
+fleet outage/unhealthy fleet or a workflow that deliberately wants hosted
+coverage. Do not send macOS jobs to hosted runners just because all local VM
+slots are temporarily full; leave them queued for the next local slot.
 
 ```toml
 [targets.mac]

@@ -59,6 +59,16 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   and `shipyard wait pr` fall back to REST automatically when
   GraphQL exhausts (separate 5000/hr bucket). `shipyard doctor
   --rate-limit` shows both buckets so you can see which one is hot.
+- **Optional tartci VM integration.** Projects with Apple Silicon VM fleets can
+  keep local VM images, caches, and per-host capacity in
+  [tartci](https://github.com/danielraffel/tartci), then let Shipyard resolve
+  the active profile into one concrete GitHub runner selector before each
+  dispatch.
+- **Agent-readable runner metrics.** `shipyard metrics` records local command
+  timings, imports GitHub Actions jobs, and imports optional tartci VM timing
+  exports into a small SQLite store. Agents can ask for summaries, drift
+  findings, and placement advice without requiring tartci or any observability
+  service.
 
 ## Installation
 
@@ -127,7 +137,10 @@ It calls your build commands and cares about one thing: did they pass?
 - [Security & Governance](docs/governance.md) — `solo` vs `multi`
   profiles, branch protection, tag protection.
 - [Profiles & Configuration](docs/profiles.md) — switch between local /
-  cloud / full setups with one command, plus repo-owned CI routing profiles.
+  cloud / full setups with one command, plus repo-owned CI routing profiles
+  and optional tartci-backed local VM routing.
+- [CLI Reference](docs/cli-reference.md#runner-metrics) — record/import/query
+  runner performance metrics for agent monitoring.
 - [Manual CLI Workflows](docs/workflows.md) — debugging failed runs,
   managing the queue, partial reruns.
 - [Resuming an interrupted ship](docs/ship-resume.md) — how `shipyard ship`

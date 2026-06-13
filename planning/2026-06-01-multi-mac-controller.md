@@ -12,7 +12,8 @@ Pulp `tools/ci/tart-*.sh` (golden image + ephemeral runner).
 The operating model is now multi-Mac: an always-on **Mac Studio** (primary capacity +
 Tart VM pool under `/Volumes/Workshop/VMs`), an **M1 MacBook Pro** (dev machine that
 sometimes contributes capacity), and a **future M5** that must inherit policy with zero
-bespoke setup. GitHub-hosted macOS is overflow. Today Shipyard can route the macOS lane
+bespoke setup. GitHub-hosted macOS is explicit outage/operator fallback, not automatic
+overflow just because local slots are full. Today Shipyard can route the macOS lane
 to a `local` self-hosted runner (#325) but has **no notion of how much local macOS
 capacity exists** across hosts, and no automatic way to claw a cloud-queued macOS job
 back to local when a slot frees up. This plan adds three primitives, smallest-first.
@@ -21,9 +22,9 @@ back to local when a slot frees up. This plan adds three primitives, smallest-fi
 
 | Host class | Hostname | Runs | VM pool | cap (macOS VMs) |
 |---|---|---|---|---|
-| `studio` | `Daniels-Mac-Studio.local` | pulp-studio-01/02/03, `Shipyard-studio-01`, Tart pool | yes (`/Volumes/Workshop/VMs`) | 2 (kernel quota; raisable per Appendix D, Studio-only) |
-| `m1` | `Daniels-MacBook-Pro.local` (alias `macpro`) | pulp-m1-01/02, `daniels-macbook-shipyard` | dev | 2 |
-| `m5` | (arriving) | — | — | 2 (inherits) |
+| `studio` | controller / local host | pulp-studio-01/02/03, `Shipyard-studio-01`, Tart pool | yes (`/Volumes/Workshop/VMs`) | 2 (kernel quota; raisable per Appendix D, Studio-only) |
+| `m1` | operator-local SSH alias | pulp-m1-01/02, Shipyard runner | dev | 2 |
+| `m5` | operator-local SSH alias | project-specific runners | host-backed Tart store | 2 (inherits) |
 
 The 2-VM cap is the XNU kernel `hv_apple_isa_vm_quota` (Appendix D), **not** Tart or a
 license limit. Default `cap = 2` everywhere; only the dedicated Studio may override
@@ -63,22 +64,31 @@ New config section, parsed like `parse_host_pools` (`src/host_pool.rs`):
 
 ```toml
 [host_class.studio]
-ssh = "Daniels-Mac-Studio.local"   # or user@host; omit for the controller's own box
+ssh = "studio-ci.local"            # or user@host; omit for the controller's own box
 cap = 2                            # macOS VM slots (kernel quota); Studio may raise
+tart_bin = "/opt/homebrew/bin/tart"
+tartci_bin = "/Users/ci/.local/bin/tartci"
+tart_home = "/Users/ci/VMs"         # absolute path; no shell/tilde expansion
 labels = ["self-hosted", "macos", "arm64", "shipyard-build-studio"]
 
 [host_class.m1]
-ssh = "Daniels-MacBook-Pro.local"
+ssh = "m1-ci.local"
 cap = 2
+tart_bin = "/opt/homebrew/bin/tart"
+tartci_bin = "/Users/ci/.local/bin/tartci"
+tart_home = "/Users/ci/VMs"
 labels = ["self-hosted", "macos", "arm64", "shipyard-build-m1"]
 
 # [host_class.m5] added when it arrives — same shape, inherits cap = 2.
 ```
 
 `shipyard runner capacity [--json]`:
-1. For each configured host class, read `running_macos_vms` by SSH'ing the host and
-   running `tart list` (count VMs in the `running` state). The controller's own box is
-   read locally (no SSH).
+1. For each configured host class, read running VM names by SSH'ing the host and
+   running `tart list`, then enrich each running VM with `tart get <name> --format
+   json` and count only OS `darwin`/macOS VMs as `running_macos_vms`. The
+   controller's own box is read locally (no SSH). When `tart_home` is set, the
+   probe runs with `TART_HOME=<absolute-path>` so it reads the same home-backed
+   store the launchd supervisors use.
 2. `free_host = max(0, cap_host − running_macos_vms_host)`; `free = Σ free_host`.
 3. **Fail-closed:** an unreadable host (SSH/`tart` error, unparseable output) contributes
    `free_host = 0` and is flagged `readable = false` — never counted as free capacity.
@@ -86,10 +96,20 @@ labels = ["self-hosted", "macos", "arm64", "shipyard-build-m1"]
    **Log every capacity decision** (host, cap, running, free) — silence must not read as
    success.
 
-Pure-logic core (`compute_free_slots`, `parse_tart_running`) is unit-tested with injected
-`tart list` output; SSH is the only impure edge. Note the Studio also hosts the long-lived
-pulp/Shipyard runner agents and any ephemeral builders — those consume its slots, so the
-`running` count from `tart list` is the truth, not a static assumption.
+Pure-logic core (`compute_free_slots`, running-name parsing, and `tart get` OS parsing) is
+unit-tested with injected Tart JSON output; SSH and `tart get` enrichment are the impure
+edge. Note the Studio also hosts the long-lived pulp/Shipyard runner agents and any
+ephemeral macOS builders — those consume its slots, so the OS-enriched live count is the
+truth, not a static assumption. Linux/Windows Tart VMs must not reduce macOS free slots.
+
+`shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` is the
+operator-level visibility command. It aggregates `runner capacity`, host-local
+`tartci doctor --reap --json` via `tartci_bin`, supervisor heartbeat freshness,
+and queued macOS job age. A host is routable only when capacity is readable,
+free slots exist, `tartci doctor` is readable/clean, and at least one supervisor
+heartbeat is fresh. The command exits non-zero on unreadable/problem hosts or
+`queued_age_with_capacity`, separating "no slot exists" from "slots exist but
+queued macOS jobs are not draining."
 
 ## Part C — cloud→local queue-drain watcher
 
@@ -110,6 +130,25 @@ Each tick:
 4. Preserve the four safety properties: **flap-guard** (one PR per `--flap-window`),
    **one reroute per tick** (natural pacing), **idle/slot-safe** (only when `free > 0`),
    **fail-closed** on unreadable host state.
+
+Local macOS VM labels are the preferred queue. Do not push jobs to GitHub-hosted
+macOS merely because the local fleet is full; leave them queued for the next
+controller/secondary host slot. Hosted macOS should be selected only by an
+explicit operator fallback or when fleet status says the local Macs are
+offline/unhealthy.
+
+The controller and secondary Apple Silicon hosts are allowed to be multi-role
+CI hosts. They can serve macOS Tart runners and also Linux Tart / Windows QEMU
+lanes when those supervisors are enabled, but the scheduler must keep lane
+capacity separate: macOS jobs consume `macos` VM slots; Linux/Windows jobs use
+their own labels and caps and do not decrement macOS free slots. Physical
+CPU/RAM contention is handled with host reservations or route weights, not by
+collapsing every OS into the macOS VM-slot counter.
+
+Implementation note 2026-06-10: the cooperative queue scheduler now feeds the
+live `[host_class.*]` Tart capacity snapshot into VM-slot admission for macOS
+jobs. The capacity probe is skipped for queues without macOS VM-slot demand, so
+Linux/Windows-only queues do not wait on macOS Tart/SSH probes.
 
 **Ephemeral VM runner** (avoid double-pickup): Shipyard drives Pulp's
 `tart-run-job.sh`-equivalent (mint a JIT runner via `gh ... generate-jitconfig`, clone the

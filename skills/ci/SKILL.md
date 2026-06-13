@@ -50,8 +50,9 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Runner provisioning: dry-run the registration plan** | `shipyard runner register --repo <owner/repo> --count <N> --dry-run` |
 | **Runner provisioning: live cross-repo pool view** | `shipyard runner list [--repo <owner/repo>]` (groups by machine; flags orphaned local dirs) |
 | **Runner provisioning: audit host-class naming/label drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels; exit 1 on drift) |
-| **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` per `[host_class.*]`; `free = Σ max(0, cap − running)`; fail-closed, exit 1 if any host unreadable) |
-| **Drain cloud-queued macOS jobs to local when a slot frees** | `shipyard runner reroute-watch [--apply] [--once] [--interval N] [--flap-window N]` (observe-only without `--apply`; flap-guard, one-reroute-per-tick, slot/fail-closed) |
+| **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` + `tart get` per `[host_class.*]`, using configured `tart_home` as `TART_HOME`; counts only running macOS/darwin VMs; `free = Σ max(0, cap − running_macos)`; fail-closed, exit 1 if any host/VM OS unreadable) |
+| **Runner fleet visibility: capacity + tartci health + queue age** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (runs host-local `tartci doctor --reap --json` via configured `tartci_bin`, checks supervisor freshness, per-host routability, and oldest queued macOS age; exits 1 on unreadable/problem hosts or queued-age-with-capacity) |
+| **Drain cloud-queued macOS jobs to local when a slot frees** | `shipyard runner reroute-watch [--apply] [--once] [--interval N] [--flap-window N]` (observe-only without `--apply`; logs per-host capacity + candidate list; flap-guard, one-reroute-per-tick, slot/fail-closed) |
 | **Runner provisioning: deregister a runner** | `shipyard runner remove --name <repo>-<tag>-NN --yes [--purge-dir]` |
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
 | **Self-update: apply latest stable** | `shipyard update` (delegates to `install.sh`) |
@@ -678,6 +679,12 @@ owner; jobs still serialize when they claim the same checkout, PR state,
 evidence lane, or exhausted pool capacity. Use `shipyard targets test mac` and
 then `shipyard run --targets mac` when bringing the Mac Studio online. See
 `docs/local-mac-pool.md`.
+
+For Pulp/tartci macOS VM lanes, local queueing is preferred over hosted
+overflow. A full local fleet should leave jobs queued on the VM self-hosted
+labels until a controller/secondary Mac slot opens. Use GitHub-hosted macOS only
+as an explicit operator fallback for local-fleet outage/unhealthiness or for a
+workflow that deliberately requests hosted coverage.
 
 ### Locality routing (`requires`)
 

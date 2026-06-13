@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::capacity::{gather_configured_host_capacities, total_free};
+use crate::config::LoadedConfig;
 use crate::evidence::{EvidenceRecord, EvidenceStore};
 use crate::executor::dispatch::{
     DispatchValidationRequest, ExecutorDispatcher, ResolvedBackend, ResolvedHostPoolConfig,
@@ -32,7 +34,9 @@ use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
     QueuedExecutionKind, QueuedExecutionOutcome,
 };
-use crate::queue_scheduler::{apply_admit_pass_for_drain, plan_admit_pass_from_jobs};
+use crate::queue_scheduler::{
+    VmSlotCapacity, apply_admit_pass_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
+};
 use crate::ship_state::{
     DispatchedRun, ShipState, ShipStatePrLock, ShipStateStore, compute_policy_signature,
 };
@@ -124,6 +128,8 @@ pub struct ShipStores<'a> {
     pub cwd: &'a Path,
     /// State directory used for target logs.
     pub state_dir: &'a Path,
+    /// Loaded Shipyard config used for cooperative scheduler admission.
+    pub config: &'a LoadedConfig,
 }
 
 /// Durable stores needed by `shipyard run` execution.
@@ -138,6 +144,8 @@ pub struct RunStores<'a> {
     pub cwd: &'a Path,
     /// State directory used for target logs.
     pub state_dir: &'a Path,
+    /// Loaded Shipyard config used for cooperative scheduler admission.
+    pub config: &'a LoadedConfig,
 }
 
 /// Outcome of one ship execution pass.
@@ -225,6 +233,8 @@ pub enum ShipExecutionError {
     SchedulerDeferred(String),
     /// Host-pool lease inspection failed during scheduler admission.
     HostPool(String),
+    /// VM-slot capacity inspection failed during scheduler admission.
+    VmSlot(String),
     /// A spawned drain worker failed to join.
     WorkerJoin(String),
     /// A matching same-PR ship job is already running.
@@ -274,6 +284,7 @@ impl Display for ShipExecutionError {
                 write!(formatter, "scheduler deferred validation: {reason}")
             }
             Self::HostPool(error) => write!(formatter, "host-pool scheduler read failed: {error}"),
+            Self::VmSlot(error) => write!(formatter, "VM-slot scheduler read failed: {error}"),
             Self::WorkerJoin(job_id) => write!(formatter, "worker thread for {job_id} panicked"),
             Self::SamePrShipRunning {
                 repo,
@@ -315,6 +326,7 @@ impl Error for ShipExecutionError {
             | Self::ShipState(_)
             | Self::SchedulerDeferred(_)
             | Self::HostPool(_)
+            | Self::VmSlot(_)
             | Self::WorkerJoin(_)
             | Self::SamePrShipRunning { .. }
             | Self::MissingQueuedOutcome(_)
@@ -368,6 +380,7 @@ pub fn execute_ship<D: ShipTargetDispatcher>(
         warm_pool,
         cwd,
         state_dir,
+        config,
     } = stores;
     let job = submit_ship(request, queue, cwd, state_dir)?;
     execute_ship_worker(
@@ -380,6 +393,7 @@ pub fn execute_ship<D: ShipTargetDispatcher>(
             warm_pool,
             cwd,
             state_dir,
+            config,
         },
         dispatcher,
     )
@@ -478,6 +492,7 @@ fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
         warm_pool,
         cwd,
         state_dir,
+        config,
     } = stores;
     let mut wait_iterations = 0usize;
     loop {
@@ -498,6 +513,7 @@ fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
                 warm_pool,
                 cwd,
                 state_dir,
+                config,
                 dispatcher,
             )?;
         }
@@ -623,6 +639,7 @@ pub fn execute_run<D: ShipTargetDispatcher>(
         warm_pool,
         cwd,
         state_dir,
+        config,
     } = stores;
     let job = submit_run(request, queue, cwd, state_dir)?;
     execute_run_worker(
@@ -634,6 +651,7 @@ pub fn execute_run<D: ShipTargetDispatcher>(
             warm_pool,
             cwd,
             state_dir,
+            config,
         },
         dispatcher,
     )
@@ -721,6 +739,7 @@ fn drain_or_wait_run_with_options<D: ShipTargetDispatcher + Sync>(
         warm_pool,
         cwd,
         state_dir,
+        config,
     } = stores;
     let mut wait_iterations = 0usize;
     loop {
@@ -743,6 +762,7 @@ fn drain_or_wait_run_with_options<D: ShipTargetDispatcher + Sync>(
                 warm_pool,
                 cwd,
                 state_dir,
+                config,
                 dispatcher,
             )?;
         }
@@ -842,6 +862,43 @@ fn durable_cancelled_job(queue: &mut Queue, job: &Job) -> Result<Option<Job>, Sh
     }
 }
 
+fn scheduler_vm_slots(
+    config: &LoadedConfig,
+    jobs: &[Job],
+    request_store: &QueueRequestStore,
+) -> Result<Vec<VmSlotCapacity>, ShipExecutionError> {
+    if !jobs_use_vm_slot(jobs, request_store, "macos") {
+        return Ok(Vec::new());
+    }
+    let hosts =
+        gather_configured_host_capacities(&config.data).map_err(ShipExecutionError::VmSlot)?;
+    if hosts.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![VmSlotCapacity {
+        key: "macos".to_owned(),
+        slots: total_free(&hosts),
+    }])
+}
+
+fn jobs_use_vm_slot(jobs: &[Job], request_store: &QueueRequestStore, key: &str) -> bool {
+    jobs.iter()
+        .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
+        .any(|job| {
+            request_store
+                .load(&job.id)
+                .ok()
+                .flatten()
+                .is_some_and(|envelope| {
+                    envelope
+                        .resource_plan
+                        .vm_slots
+                        .iter()
+                        .any(|slot| slot.key == key)
+                })
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
     queue: &mut Queue,
@@ -851,6 +908,7 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
     warm_pool: &WarmPool,
     cwd: &Path,
     state_dir: &Path,
+    config: &LoadedConfig,
     dispatcher: &D,
 ) -> Result<(), ShipExecutionError> {
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
@@ -862,7 +920,15 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
     let leases = HostPoolLeaseStore::new(default_lease_path(state_dir))
         .leases()
         .map_err(|error| ShipExecutionError::HostPool(error.to_string()))?;
-    let mut pass = plan_admit_pass_from_jobs(&jobs, &request_store, &pools, &leases, Utc::now());
+    let vm_slots = scheduler_vm_slots(config, &jobs, &request_store)?;
+    let mut pass = plan_admit_pass_from_jobs_with_vm_slots(
+        &jobs,
+        &request_store,
+        &pools,
+        &leases,
+        &vm_slots,
+        Utc::now(),
+    );
     cap_admit_pass_workers(&jobs, &mut pass, DEFAULT_DRAIN_MAX_WORKERS);
     let applied = apply_admit_pass_for_drain(queue, drain_lock, &pass)?;
     if applied.started.is_empty() {
@@ -903,6 +969,7 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
                         &fallback_cwd,
                         &queue_state_dir,
                         &state_dir,
+                        config,
                         dispatcher,
                     )
                 }),
@@ -1008,6 +1075,7 @@ fn run_started_worker<D: ShipTargetDispatcher>(
     fallback_cwd: &Path,
     queue_state_dir: &Path,
     state_dir: &Path,
+    config: &LoadedConfig,
     dispatcher: &D,
 ) -> Result<(), ShipExecutionError> {
     let worker_cwd = envelope.cwd.as_path();
@@ -1029,6 +1097,7 @@ fn run_started_worker<D: ShipTargetDispatcher>(
                     warm_pool,
                     cwd,
                     state_dir,
+                    config,
                 },
                 dispatcher,
                 true,
@@ -1046,6 +1115,7 @@ fn run_started_worker<D: ShipTargetDispatcher>(
                     warm_pool,
                     cwd,
                     state_dir,
+                    config,
                 },
                 dispatcher,
                 true,
@@ -1846,6 +1916,7 @@ mod tests {
         execute_run_worker, execute_ship, execute_ship_worker, execute_targets_with_options,
         load_run_outcome, load_ship_outcome, submit_run, submit_ship, update_warm_pool_after_run,
     };
+    use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::EvidenceStore;
     use crate::executor::dispatch::{
         DispatchValidationRequest, ResolvedTarget, resolve_targets_from_table,
@@ -1864,6 +1935,32 @@ mod tests {
         input.parse::<Table>().expect("valid TOML")
     }
 
+    fn empty_config(root: &std::path::Path) -> LoadedConfig {
+        LoadedConfig {
+            data: Table::new(),
+            global_dir: root.join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        }
+    }
+
+    fn macos_zero_capacity_config(root: &std::path::Path) -> LoadedConfig {
+        LoadedConfig {
+            data: table(
+                r#"
+                [host_class.studio]
+                cap = 0
+                tart_bin = "/bin/echo"
+                "#,
+            ),
+            global_dir: root.join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        }
+    }
+
     fn ssh_target() -> ResolvedTarget {
         let config = table(
             r#"
@@ -1875,6 +1972,29 @@ mod tests {
             warm_keepalive_seconds = 600
             "#,
         );
+        resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0)
+    }
+
+    fn local_target(name: &str, platform: &str, cwd: &std::path::Path) -> ResolvedTarget {
+        let cwd = cwd
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let config = format!(
+            r#"
+            [validation.default]
+            command = "true"
+
+            [targets.{name}]
+            backend = "local"
+            platform = "{platform}"
+            cwd = "{cwd}"
+            "#
+        )
+        .parse::<Table>()
+        .expect("config");
         resolve_targets_from_table(&config, ValidationMode::Full)
             .expect("targets")
             .remove(0)
@@ -2168,6 +2288,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2258,6 +2379,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2364,6 +2486,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2414,6 +2537,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: &state_dir,
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
             CooperativeDrainOptions {
@@ -2428,6 +2552,86 @@ mod tests {
             ShipExecutionError::CooperativeWaitTimedOut(_)
         ));
         assert_eq!(dispatcher.seen_count(), 0);
+    }
+
+    #[test]
+    fn drain_admission_defers_macos_when_vm_slots_exhausted_but_runs_linux() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mac_cwd = temp.path().join("mac");
+        let linux_cwd = temp.path().join("linux");
+        std::fs::create_dir_all(&mac_cwd).expect("mac cwd");
+        std::fs::create_dir_all(&linux_cwd).expect("linux cwd");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let config = macos_zero_capacity_config(temp.path());
+        let mac_request = RunExecutionRequest {
+            branch: "feature/mac".to_owned(),
+            sha: "mac".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![local_target("mac", "macos-arm64", &mac_cwd)],
+        };
+        let linux_request = RunExecutionRequest {
+            branch: "feature/linux".to_owned(),
+            sha: "linux".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![local_target("linux", "linux-x64", &linux_cwd)],
+        };
+        let mac_job =
+            submit_run(&mac_request, &mut queue, temp.path(), &state_dir).expect("submit mac");
+        let linux_job =
+            submit_run(&linux_request, &mut queue, temp.path(), &state_dir).expect("submit linux");
+
+        let error = drain_or_wait_run_with_options(
+            &mac_request,
+            mac_job.clone(),
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: &state_dir,
+                config: &config,
+            },
+            &dispatcher,
+            CooperativeDrainOptions {
+                poll_interval: StdDuration::ZERO,
+                max_wait_iterations: Some(0),
+            },
+        )
+        .expect_err("mac job remains queued");
+
+        assert!(matches!(
+            error,
+            ShipExecutionError::CooperativeWaitTimedOut(job_id) if job_id == mac_job.id
+        ));
+        assert_eq!(
+            queue
+                .get(&mac_job.id)
+                .expect("queue")
+                .expect("mac job")
+                .status,
+            JobStatus::Pending
+        );
+        assert_eq!(
+            queue
+                .get(&linux_job.id)
+                .expect("queue")
+                .expect("linux job")
+                .status,
+            JobStatus::Completed
+        );
+        assert_eq!(dispatcher.seen_count(), 1);
     }
 
     #[test]
@@ -2463,6 +2667,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2511,6 +2716,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: &state_dir,
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2571,6 +2777,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: &state_dir,
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2801,6 +3008,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2851,6 +3059,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: &state_dir,
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2883,6 +3092,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2924,6 +3134,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: &state_dir,
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -2972,6 +3183,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -3026,6 +3238,7 @@ mod tests {
                 warm_pool: &warm_pool,
                 cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )

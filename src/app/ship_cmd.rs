@@ -137,6 +137,7 @@ pub(super) fn ship_command<W: Write>(
             warm_pool: &warm_pool,
             cwd,
             state_dir: &runtime_paths.state_dir,
+            config,
         },
         &dispatcher,
     )

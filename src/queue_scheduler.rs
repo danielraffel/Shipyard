@@ -14,7 +14,7 @@ use crate::queue::{
 };
 use crate::queue_request::{
     HostPoolDemand, JobResourcePlan, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
-    QueuedExecutionRequest,
+    QueuedExecutionRequest, VmSlotDemand,
 };
 
 /// Standard cancellation reason for pending jobs whose durable request envelope
@@ -193,6 +193,8 @@ pub enum SchedulerAdmissionBlocker {
     },
     /// Host-pool capacity is not available for the candidate.
     HostPoolCapacity(HostPoolCapacityDeficit),
+    /// VM-slot capacity is not available for the candidate.
+    VmSlotCapacity(VmSlotCapacityDeficit),
 }
 
 /// One host-pool capacity deficit that prevents admission.
@@ -208,6 +210,27 @@ pub struct HostPoolCapacityDeficit {
     pub available_slots: u32,
 }
 
+/// Available VM slots for one slot key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmSlotCapacity {
+    /// Stable slot key, e.g. `macos`.
+    pub key: String,
+    /// Slots available to the scheduler before accounting for running queued
+    /// jobs and newly admitted jobs in this pass.
+    pub slots: u32,
+}
+
+/// One VM-slot capacity deficit that prevents admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmSlotCapacityDeficit {
+    /// Stable slot key, e.g. `macos`.
+    pub key: String,
+    /// Candidate slots requested for this slot key.
+    pub requested_slots: u32,
+    /// Slots left after running reservations.
+    pub available_slots: u32,
+}
+
 /// Return every blocker for admitting `candidate` alongside currently running
 /// resource plans and active host-pool leases.
 #[must_use]
@@ -218,11 +241,30 @@ pub fn admission_blockers(
     leases: &[HostPoolLease],
     now: DateTime<Utc>,
 ) -> Vec<SchedulerAdmissionBlocker> {
+    admission_blockers_with_vm_slots(candidate, running, pools, leases, &[], now)
+}
+
+/// Return every blocker for admitting `candidate`, including VM-slot capacity
+/// when a capacity snapshot is supplied.
+#[must_use]
+pub fn admission_blockers_with_vm_slots(
+    candidate: &JobResourcePlan,
+    running: &[&JobResourcePlan],
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    vm_slots: &[VmSlotCapacity],
+    now: DateTime<Utc>,
+) -> Vec<SchedulerAdmissionBlocker> {
     let mut blockers = exclusive_claim_blockers(candidate, running);
     blockers.extend(
         host_pool_capacity_deficits(candidate, running, pools, leases, now)
             .into_iter()
             .map(SchedulerAdmissionBlocker::HostPoolCapacity),
+    );
+    blockers.extend(
+        vm_slot_capacity_deficits(candidate, running, vm_slots)
+            .into_iter()
+            .map(SchedulerAdmissionBlocker::VmSlotCapacity),
     );
     blockers
 }
@@ -236,7 +278,7 @@ pub fn can_admit(
     leases: &[HostPoolLease],
     now: DateTime<Utc>,
 ) -> bool {
-    admission_blockers(candidate, running, pools, leases, now).is_empty()
+    admission_blockers_with_vm_slots(candidate, running, pools, leases, &[], now).is_empty()
 }
 
 /// Greedily plan one scheduler admission pass without mutating queue state.
@@ -252,6 +294,20 @@ pub fn plan_admit_pass(
     leases: &[HostPoolLease],
     now: DateTime<Utc>,
 ) -> AdmitPassPlan {
+    plan_admit_pass_with_vm_slots(pending, running, pools, leases, &[], now)
+}
+
+/// Greedily plan one scheduler admission pass, including VM-slot capacity when
+/// a capacity snapshot is supplied.
+#[must_use]
+pub fn plan_admit_pass_with_vm_slots(
+    pending: &[PendingAdmissionRequest],
+    running: &[JobResourcePlan],
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    vm_slots: &[VmSlotCapacity],
+    now: DateTime<Utc>,
+) -> AdmitPassPlan {
     let mut plan = AdmitPassPlan::default();
     let mut occupied = running.to_vec();
     for candidate in pending {
@@ -263,7 +319,14 @@ pub fn plan_admit_pass(
             continue;
         };
         let occupied_refs = occupied.iter().collect::<Vec<_>>();
-        let blockers = admission_blockers(resource_plan, &occupied_refs, pools, leases, now);
+        let blockers = admission_blockers_with_vm_slots(
+            resource_plan,
+            &occupied_refs,
+            pools,
+            leases,
+            vm_slots,
+            now,
+        );
         if blockers.is_empty() {
             plan.admitted.push(candidate.job_id.clone());
             occupied.push(resource_plan.clone());
@@ -289,6 +352,20 @@ pub fn plan_admit_pass_from_jobs(
     request_store: &QueueRequestStore,
     pools: &[HostPoolConfig],
     leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> RequestBackedAdmitPass {
+    plan_admit_pass_from_jobs_with_vm_slots(jobs, request_store, pools, leases, &[], now)
+}
+
+/// Load request envelopes for queue jobs and run a pure scheduler admit pass,
+/// including VM-slot capacity when a capacity snapshot is supplied.
+#[must_use]
+pub fn plan_admit_pass_from_jobs_with_vm_slots(
+    jobs: &[Job],
+    request_store: &QueueRequestStore,
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    vm_slots: &[VmSlotCapacity],
     now: DateTime<Utc>,
 ) -> RequestBackedAdmitPass {
     let stale_after = chrono::Duration::seconds(DEFAULT_RUNNING_JOB_STALE_SECONDS);
@@ -340,7 +417,7 @@ pub fn plan_admit_pass_from_jobs(
         }
     }
     RequestBackedAdmitPass {
-        plan: plan_admit_pass(&pending, &running, pools, leases, now),
+        plan: plan_admit_pass_with_vm_slots(&pending, &running, pools, leases, vm_slots, now),
         running_request_errors,
         same_pr_ship_admission,
     }
@@ -440,6 +517,40 @@ pub fn host_pool_capacity_deficits(
                 capability_key: demand.capability_key,
                 requested_slots: demand.slots,
                 available_slots: capacity,
+            });
+        }
+    }
+    deficits
+}
+
+/// Return VM-slot deficits for admitting `candidate` alongside already running
+/// resource plans. An empty capacity snapshot disables VM-slot gating for
+/// backwards compatibility with projects that have not configured Tart slots.
+#[must_use]
+pub fn vm_slot_capacity_deficits(
+    candidate: &JobResourcePlan,
+    running: &[&JobResourcePlan],
+    capacities: &[VmSlotCapacity],
+) -> Vec<VmSlotCapacityDeficit> {
+    if capacities.is_empty() || candidate.vm_slots.is_empty() {
+        return Vec::new();
+    }
+    let capacity = capacities
+        .iter()
+        .map(|slot| (slot.key.as_str(), slot.slots))
+        .collect::<BTreeMap<_, _>>();
+    let mut deficits = Vec::new();
+    for demand in combined_vm_demands(&candidate.vm_slots) {
+        let available = capacity
+            .get(demand.key.as_str())
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(running_vm_reservations(running, &demand.key));
+        if demand.slots > available {
+            deficits.push(VmSlotCapacityDeficit {
+                key: demand.key,
+                requested_slots: demand.slots,
+                available_slots: available,
             });
         }
     }
@@ -700,6 +811,30 @@ fn combined_demands(demands: &[HostPoolDemand]) -> Vec<HostPoolDemand> {
     combined
 }
 
+fn combined_vm_demands(demands: &[VmSlotDemand]) -> Vec<VmSlotDemand> {
+    let mut combined = Vec::<VmSlotDemand>::new();
+    for demand in demands {
+        if let Some(existing) = combined
+            .iter_mut()
+            .find(|existing| existing.key == demand.key)
+        {
+            existing.slots = existing.slots.saturating_add(demand.slots);
+            continue;
+        }
+        combined.push(demand.clone());
+    }
+    combined
+}
+
+fn running_vm_reservations(running: &[&JobResourcePlan], key: &str) -> u32 {
+    running
+        .iter()
+        .flat_map(|plan| plan.vm_slots.iter())
+        .filter(|demand| demand.key == key)
+        .map(|demand| demand.slots)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -718,7 +853,7 @@ mod tests {
     use crate::queue_request::{
         HostPoolDemand, JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION, QueueRequestStore,
         QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest, QueuedRunRequest,
-        QueuedShipRequest,
+        QueuedShipRequest, VmSlotDemand,
     };
 
     fn pool() -> HostPoolConfig {
@@ -761,6 +896,7 @@ mod tests {
                 slots,
                 capability_key: "arm64+macos".to_owned(),
             }],
+            vm_slots: Vec::new(),
         }
     }
 
@@ -770,6 +906,7 @@ mod tests {
             exclusive_claims: claims.iter().map(|claim| (*claim).to_owned()).collect(),
             cloud_targets: Vec::new(),
             host_pools: Vec::new(),
+            vm_slots: Vec::new(),
         }
     }
 
@@ -779,6 +916,20 @@ mod tests {
             exclusive_claims: Vec::new(),
             cloud_targets: vec![target.to_owned()],
             host_pools: Vec::new(),
+            vm_slots: Vec::new(),
+        }
+    }
+
+    fn vm_plan(key: &str, slots: u32) -> JobResourcePlan {
+        JobResourcePlan {
+            targets: Vec::new(),
+            exclusive_claims: Vec::new(),
+            cloud_targets: Vec::new(),
+            host_pools: Vec::new(),
+            vm_slots: vec![VmSlotDemand {
+                key: key.to_owned(),
+                slots,
+            }],
         }
     }
 
@@ -996,6 +1147,74 @@ mod tests {
             blockers.as_slice(),
             [SchedulerAdmissionBlocker::HostPoolCapacity(deficit)]
                 if deficit.pool_name == "local_macs" && deficit.available_slots == 0
+        ));
+    }
+
+    #[test]
+    fn admission_blocks_macos_vm_slot_when_capacity_exhausted() {
+        let now = Utc::now();
+        let running = vm_plan("macos", 2);
+        let candidate = vm_plan("macos", 1);
+        let capacities = [super::VmSlotCapacity {
+            key: "macos".to_owned(),
+            slots: 2,
+        }];
+
+        let blockers = super::admission_blockers_with_vm_slots(
+            &candidate,
+            &[&running],
+            &[],
+            &[],
+            &capacities,
+            now,
+        );
+
+        assert!(matches!(
+            blockers.as_slice(),
+            [SchedulerAdmissionBlocker::VmSlotCapacity(deficit)]
+                if deficit.key == "macos" && deficit.available_slots == 0
+        ));
+    }
+
+    #[test]
+    fn admit_pass_vm_slots_defer_macos_but_not_linux() {
+        let now = Utc::now();
+        let capacities = [super::VmSlotCapacity {
+            key: "macos".to_owned(),
+            slots: 1,
+        }];
+        let first = PendingAdmissionRequest {
+            job_id: "mac-a".to_owned(),
+            resource_plan: Some(vm_plan("macos", 1)),
+            missing_request_reason: None,
+        };
+        let second = PendingAdmissionRequest {
+            job_id: "mac-b".to_owned(),
+            resource_plan: Some(vm_plan("macos", 1)),
+            missing_request_reason: None,
+        };
+        let linux = PendingAdmissionRequest {
+            job_id: "linux".to_owned(),
+            resource_plan: Some(cloud_plan("linux")),
+            missing_request_reason: None,
+        };
+
+        let plan = super::plan_admit_pass_with_vm_slots(
+            &[first, second, linux],
+            &[],
+            &[],
+            &[],
+            &capacities,
+            now,
+        );
+
+        assert_eq!(plan.admitted, ["mac-a", "linux"]);
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.deferred[0].job_id, "mac-b");
+        assert!(matches!(
+            plan.deferred[0].blockers.as_slice(),
+            [SchedulerAdmissionBlocker::VmSlotCapacity(deficit)]
+                if deficit.key == "macos" && deficit.available_slots == 0
         ));
     }
 
