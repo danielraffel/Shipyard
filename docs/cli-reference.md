@@ -35,6 +35,16 @@ shipyard evidence              # last-good SHA per platform
 shipyard evidence command      # latest workload-agnostic command-evidence bundle
 shipyard evidence command --list
 
+# Runner metrics
+shipyard metrics record --project pulp --job linux-arm64 --step compile --duration 18.4s --target linux-arm64 --backend local --provider tart-linux --host macstudio
+shipyard metrics import github --repo danielraffel/pulp --workflow build.yml --limit 10
+tartci runtime export --repo danielraffel/pulp | shipyard metrics import tartci
+shipyard metrics summary --project pulp --json
+shipyard metrics slowest --project pulp --limit 20
+shipyard metrics watch --project pulp --since 14d --json
+shipyard metrics advise --project pulp --profile normal --json
+shipyard metrics compare --project pulp --lane windows-arm64 --before 7d --after 7d --json
+
 # Manage
 shipyard bump <id> high        # reprioritize a pending job
 shipyard cancel <id>           # cancel a job
@@ -110,6 +120,24 @@ agents can pin to a stable contract.
 repo-owned TOML profile from `.tartci/`, `.shipyard/ci-profiles/`, or
 `ci-profiles/`, then reports the concrete GitHub runner variables/selectors
 that would be used for each lane. It does not require tartci to be installed.
+
+## Runner Metrics
+
+`shipyard metrics` stores normalized runner timing rows in
+`$SHIPYARD_STATE_DIR/metrics/metrics.db` using SQLite. The feature is optional
+and provider-neutral:
+
+- `shipyard metrics record` writes one explicit job/step sample.
+- `shipyard run command` writes a best-effort metrics row automatically when it
+  stores command evidence.
+- `shipyard metrics import github` imports recent GitHub Actions job timings
+  through `gh api`.
+- `shipyard metrics import tartci` imports JSON/JSONL from
+  `tartci runtime export` when a project uses tartci VM lanes.
+
+The agent-facing queries are `summary`, `slowest`, `watch`, `advise`, and
+`compare`. Human tables are available by default; `--json` returns structured
+rows or findings for plugins, MCP tools, and monitoring agents.
 
 `shipyard status` is intentionally limited to queue/target state and does not
 probe GitHub quota. Use `shipyard doctor --rate-limit` when you need to confirm

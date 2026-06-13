@@ -52,6 +52,8 @@ pub mod init_config;
 pub mod job;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
+/// Runner and CI timing metrics store and analysis helpers.
+pub mod metrics;
 /// Structured JSON output helpers.
 pub mod output;
 /// Filesystem path resolution for isolated and compatible modes.

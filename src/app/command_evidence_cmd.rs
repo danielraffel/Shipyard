@@ -20,6 +20,7 @@ use crate::executor::streaming::{
     StreamingCommand, StreamingCommandResult, StreamingCommandSpec, run_streaming_command,
 };
 use crate::job::ValidationMode;
+use crate::metrics::{MetricRecordInput, MetricsStore};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 
@@ -92,12 +93,55 @@ pub(super) fn run_command_evidence<W: Write>(
     store
         .record(&record)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let _ = record_command_metric(config, runtime_paths, &record);
     emit_run_command_evidence(stdout, &record, json_mode)?;
     Ok(if record.passed() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     })
+}
+
+fn record_command_metric(
+    config: &LoadedConfig,
+    runtime_paths: &RuntimePaths,
+    record: &CommandEvidenceRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = MetricsStore::open(&runtime_paths.state_dir)?;
+    let project = config
+        .get_str("project.name")
+        .map_or_else(|| record.name.clone(), str::to_owned);
+    let duration_ms = record
+        .completed_at
+        .signed_duration_since(record.started_at)
+        .num_milliseconds();
+    store.record(&MetricRecordInput {
+        project,
+        branch: record.branch.clone(),
+        sha: record.sha.clone(),
+        workflow: Some("run command".to_owned()),
+        job: record.name.clone(),
+        target: Some(record.target_name.clone()),
+        platform: Some(record.platform.clone()),
+        backend: Some(record.backend.clone()),
+        provider: Some(record.backend.clone()),
+        runner: record.host.clone(),
+        host: record.host.clone(),
+        step: Some("command".to_owned()),
+        duration_ms,
+        status: record.status.clone(),
+        exit_code: Some(i64::from(record.exit_code)),
+        failure_class: if record.passed() {
+            None
+        } else {
+            Some("command_failed".to_owned())
+        },
+        external_id: Some(format!("shipyard-command:{}", record.id)),
+        started_at: Some(record.started_at),
+        completed_at: Some(record.completed_at),
+        ..MetricRecordInput::default()
+    })?;
+    Ok(())
 }
 
 pub(super) fn show_command_evidence<W: Write>(

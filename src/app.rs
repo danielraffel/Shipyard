@@ -28,6 +28,7 @@ mod doctor_cmd;
 mod fleet_status_cmd;
 mod governance_cmd;
 mod init_cmd;
+mod metrics_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
@@ -67,6 +68,7 @@ use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
 use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
+use self::metrics_cmd::metrics_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
 use self::pr_cmd::{PrCommandArgs, pr_command};
@@ -159,6 +161,9 @@ fn dispatch<W: Write, E: Write>(
         }
         Command::Ci { command } => {
             return ci_command(command, &cwd, cli.json, stdout);
+        }
+        Command::Metrics { command } => {
+            return metrics_command(*command, &runtime_paths.state_dir, cli.json, stdout);
         }
         Command::Auth { command } => {
             return auth_command(
@@ -301,6 +306,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Pin { .. }
         | Command::Config { .. }
         | Command::Ci { .. }
+        | Command::Metrics { .. }
         | Command::Auth { .. }
         | Command::Init { .. }
         | Command::Changelog { .. }
