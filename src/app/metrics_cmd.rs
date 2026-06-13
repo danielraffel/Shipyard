@@ -255,13 +255,11 @@ fn import_github(
     store: &MetricsStore,
     args: &MetricsImportGithubArgs,
 ) -> Result<usize, CliFailure> {
-    let workflow_path = args.workflow.as_ref().map_or_else(
-        || "/actions/runs".to_owned(),
-        |workflow| format!("/actions/workflows/{workflow}/runs"),
-    );
     let mut run_args = vec![
         "api".to_owned(),
-        format!("repos/{repo}{workflow_path}", repo = args.repo),
+        "-X".to_owned(),
+        "GET".to_owned(),
+        github_runs_api_path(&args.repo, args.workflow.as_deref()),
         "-f".to_owned(),
         format!("per_page={}", args.limit),
     ];
@@ -288,7 +286,9 @@ fn import_github(
     for run_id in run_ids {
         let jobs = gh_json(&[
             "api".to_owned(),
-            format!("repos/{}/actions/runs/{run_id}/jobs", args.repo),
+            "-X".to_owned(),
+            "GET".to_owned(),
+            github_jobs_api_path(&args.repo, run_id),
             "-f".to_owned(),
             "per_page=100".to_owned(),
         ])?;
@@ -307,6 +307,17 @@ fn import_github(
         }
     }
     Ok(imported)
+}
+
+fn github_runs_api_path(repo: &str, workflow: Option<&str>) -> String {
+    workflow.map_or_else(
+        || format!("/repos/{repo}/actions/runs"),
+        |workflow| format!("/repos/{repo}/actions/workflows/{workflow}/runs"),
+    )
+}
+
+fn github_jobs_api_path(repo: &str, run_id: i64) -> String {
+    format!("/repos/{repo}/actions/runs/{run_id}/jobs")
 }
 
 fn gh_json(args: &[String]) -> Result<Value, CliFailure> {
@@ -463,4 +474,25 @@ fn io_error(error: std::io::Error) -> CliFailure {
 #[allow(dead_code)]
 fn _json_debug(value: &impl Serialize) -> Value {
     json!(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_api_paths_are_absolute() {
+        assert_eq!(
+            github_runs_api_path("danielraffel/pulp", None),
+            "/repos/danielraffel/pulp/actions/runs"
+        );
+        assert_eq!(
+            github_runs_api_path("danielraffel/pulp", Some("build.yml")),
+            "/repos/danielraffel/pulp/actions/workflows/build.yml/runs"
+        );
+        assert_eq!(
+            github_jobs_api_path("danielraffel/pulp", 123),
+            "/repos/danielraffel/pulp/actions/runs/123/jobs"
+        );
+    }
 }
