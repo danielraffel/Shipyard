@@ -2,6 +2,43 @@
 
 Date: 2026-06-12
 
+Status update, 2026-06-13:
+
+- Phase 1 has a first implementation on branch `codex/macos-vm-pool-phase5`:
+  `shipyard metrics record/list/summary/slowest/trend/compare/watch/advise`
+  backed by `metrics/metrics.db`, plus automatic best-effort metrics capture
+  from `shipyard run command` command-evidence rows.
+- Phase 2 has a first implementation: `shipyard metrics import github` imports
+  recent GitHub Actions run jobs via `gh api` and stores them with GitHub
+  `run_id/job_id/attempt` external IDs.
+- Phase 3 has a first implementation: `watch`, `advise`, and `compare` emit
+  JSON findings with conservative insufficient-sample behavior and no config
+  mutation.
+- Phase 4 is partially connected: profile policy remains explicit in
+  `shipyard ci profile ...`; metrics-backed recommendations are queryable, but
+  profile docs do not yet embed live recommendations.
+- tartci integration is optional and pull-based: `tartci runtime export` can
+  pipe into `shipyard metrics import tartci`. Shipyard does not require tartci.
+
+Validation so far:
+
+- `cargo test metrics:: --locked`
+- `cargo test command_evidence --locked`
+- isolated CLI smoke for `metrics record`, `metrics import tartci`,
+  `metrics summary`, `metrics watch`, `metrics advise`
+- isolated CLI smoke proving `shipyard run command` writes a metrics summary row
+
+Still required before calling the whole project complete:
+
+- Run the full Shipyard validation suite/CI.
+- Import live Pulp GitHub jobs and at least one live tartci runtime export into
+  the same store, then compare GitHub-hosted Windows/Linux against local VM
+  rows.
+- Collect enough samples from `macstudio` and `m5` for the Phase 1 acceptance
+  question to be meaningful.
+- Decide whether profile documentation should reference static example metrics
+  queries only, or add a live recommendation command to `shipyard ci profile`.
+
 ## Goal
 
 Service agents with enough historical runner data to validate whether our
