@@ -65,6 +65,38 @@ bundles with `shipyard evidence command --list`. Artifact globs are relative to
 the target working directory (`cwd` for local targets, `repo_path` for SSH
 targets, or `--target-cwd` when overridden).
 
+## Runner Metrics
+
+Use `shipyard metrics` when an agent needs historical runner timing, queue, and
+health context before recommending a routing, cache, or monitoring change. The
+metrics store is optional and local to Shipyard state; projects do not need
+tartci to participate. GitHub-hosted workflows, local commands, SSH targets, and
+other VM managers can all record or import rows.
+
+`shipyard run command` writes a best-effort metrics row alongside command
+evidence. Import cloud and VM history explicitly when comparing local hardware
+with GitHub-hosted runners:
+
+```sh
+shipyard metrics import github --repo danielraffel/pulp --limit 50 --json
+tartci runtime export --repo danielraffel/pulp |
+  shipyard metrics import tartci --json
+shipyard metrics summary --project pulp --json
+shipyard metrics watch --project pulp --since 14d --json
+shipyard metrics advise --project pulp --json
+shipyard metrics compare --project pulp --baseline github-hosted --candidate macstudio --json
+```
+
+The agent-facing commands return conservative JSON findings. Low sample counts
+are a collection gap, not a regression. Prefer filing issues or changing
+profiles only when `watch`, `advise`, or `compare` reports enough samples and a
+material delta relative to that repo's baseline.
+
+When fixing GitHub importer bugs, keep Actions list endpoints absolute
+(`/repos/<owner>/<repo>/...`) and force `gh api -X GET` whenever `-f` supplies
+query parameters. `gh api -f` defaults to POST, which can turn a valid list
+endpoint into a misleading 404.
+
 ## GitHub Auth And Quota
 
 Shipyard's operational GitHub calls can be configured with `[github.auth]`.

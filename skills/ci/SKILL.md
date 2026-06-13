@@ -64,6 +64,11 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Show logs for one target | `shipyard logs <job_id> --target windows` |
 | Check merge readiness | `shipyard evidence --json` |
 | Show latest command-evidence bundle | `shipyard evidence command --json` |
+| Import recent GitHub Actions timing into runner metrics | `shipyard metrics import github --repo <owner/repo> --limit 20 --json` |
+| Import tartci VM timing into runner metrics | `tartci runtime export --repo <owner/repo> | shipyard metrics import tartci --json` |
+| Summarize runner timing history | `shipyard metrics summary --project <name> --json` |
+| Ask for agent-readable runner health findings | `shipyard metrics watch --project <name> --since 14d --json` |
+| Compare local vs GitHub runner timing | `shipyard metrics compare --project <name> --baseline github-hosted --candidate macstudio --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
 | Cancel a job | `shipyard cancel <job_id>` |
 | List cloud workflows | `shipyard cloud workflows --json` |
@@ -125,6 +130,38 @@ GitHub-hosted nightly Intel Linux/Windows lanes are compatibility surveillance.
 Windows QEMU on Apple Silicon is Windows ARM64; x64 MSVC/Prism execution is
 smoke/debug until proven and should not replace `windows-latest` authority.
 Coverage must use dedicated ephemeral labels, not warm bare-metal build pools.
+
+## Runner Metrics For Agents
+
+Runner metrics are optional and provider-neutral. Use them when an agent needs
+historical context before changing CI routing, cache policy, or monitoring
+cadence. Shipyard owns the local SQLite store and query surface; tartci, GitHub
+Actions, local commands, SSH targets, or other VM managers can feed the store.
+
+For GitHub-hosted history, import recent job timings:
+
+```sh
+shipyard metrics import github --repo danielraffel/pulp --limit 50 --json
+shipyard metrics watch --project pulp --since 14d --json
+```
+
+For tartci VM history, export runtime records from tartci and import them into
+Shipyard:
+
+```sh
+tartci runtime export --repo danielraffel/pulp |
+  shipyard metrics import tartci --json
+shipyard metrics summary --project pulp --json
+```
+
+The `summary`, `watch`, `advise`, and `compare` commands return structured JSON
+intended for agents. Treat insufficient-sample findings as "keep collecting",
+not as proof of a regression. Escalate only when the finding includes enough
+samples and a material delta for that repo/lane.
+
+When debugging GitHub imports, remember that Shipyard invokes `gh api` with
+absolute `/repos/...` paths and forces `-X GET` when query parameters are passed
+with `-f`; without `-X GET`, `gh api -f` can POST and produce misleading 404s.
 
 ## GitHub Auth Diagnostics
 
