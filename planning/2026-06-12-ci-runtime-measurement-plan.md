@@ -27,13 +27,16 @@ Validation so far:
 - isolated CLI smoke for `metrics record`, `metrics import tartci`,
   `metrics summary`, `metrics watch`, `metrics advise`
 - isolated CLI smoke proving `shipyard run command` writes a metrics summary row
+- merged PR #361: all GitHub checks green
+- merged-code proof: imported 2 real backfilled tartci timing records and 6 live
+  Pulp GitHub Actions job rows into one isolated `metrics.db`; `summary` and
+  `watch` returned agent-readable JSON
 
 Still required before calling the whole project complete:
 
-- Run the full Shipyard validation suite/CI.
-- Import live Pulp GitHub jobs and at least one live tartci runtime export into
-  the same store, then compare GitHub-hosted Windows/Linux against local VM
-  rows.
+- Run a live measured tartci VM job with `TARTCI_RUNTIME_MEASURE=1`; current
+  cross-repo proof uses real historical `timing.tsv` backfill plus live GitHub
+  job import, not a newly emitted VM runtime record.
 - Collect enough samples from `macstudio` and `m5` for the Phase 1 acceptance
   question to be meaningful.
 - Decide whether profile documentation should reference static example metrics
