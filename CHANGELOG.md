@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0750"></a>
+## [0.76.0]
+
 ## [0.75.0] - 2026-07-01
 
 - feat(ship-state): liveness-aware, configurable, status-surfaced orphan detection ([#367](https://github.com/danielraffel/Shipyard/pull/367))
