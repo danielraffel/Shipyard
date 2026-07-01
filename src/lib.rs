@@ -42,6 +42,8 @@ pub mod gate_scripts;
 pub mod gh;
 /// Branch governance profiles and GitHub branch-protection helpers.
 pub mod governance;
+/// Optional host-health pre-dispatch gate (reads the `host_vitals` signal).
+pub mod host_health;
 /// Local host-pool configuration and lease state.
 pub mod host_pool;
 /// Product naming and runtime-mode identity.

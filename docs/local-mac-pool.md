@@ -154,3 +154,44 @@ fallback = [
 Do not rely on hidden repository variables or stale self-hosted runner labels
 to steal default GitHub-hosted jobs. Local capacity should be visible in
 Shipyard config.
+
+## Host-Health Pre-Dispatch Gate (optional)
+
+When a self-hosted runner is *co-located with heavy interactive work* (an agent
+session, a large MCP/editor stack), RAM can exhaust → macOS jetsam →
+WindowServer crash → **unclean reboot**, which kills the in-flight required-gate
+job and fails the leg for an *infra* reason, not the code. Shipyard can read a
+shared host-health signal during preflight and surface — or, opt-in, hard-stop
+on — a saturated host **before** a ship runs into that failure.
+
+**Off by default. Fails open.** With no `[host_health]` block, or no signal file
+present, nothing changes and nothing is read. A missing or unreadable signal is
+treated as "no opinion" (the ship proceeds) — a broken probe must never wedge a
+ship. This is the deliberate inverse of backend-reachability preflight, which
+fails closed: reachability gates correctness, host-health gates only
+crash-avoidance.
+
+```toml
+[host_health]
+gate = true                # master opt-in; when false the signal is never read
+block_on_critical = false  # true = a `critical` reading hard-stops preflight (exit 4)
+                           #        (default: surface a warning and proceed)
+# file = "/custom/path/host_vitals.json"   # default: ~/.local/state/pulp/host_vitals.json
+```
+
+**The signal** is any JSON file matching the `host_vitals` contract — a numeric
+`code` (`0` green / `10` warn / `20` critical) and/or a string `level`
+(`green` / `warn` / `critical`), plus an optional human `reason`. `code` wins
+when both are present. Shipyard does **not** ship a producer; bring your own.
+Pulp publishes one (`tools/scripts/host_vitals.sh` plus a 60 s launchd sensor
+that writes `~/.local/state/pulp/host_vitals.json` — the default path here).
+
+**Behavior** when `gate = true`:
+
+| Signal level | `block_on_critical = false` (default) | `block_on_critical = true` |
+|---|---|---|
+| green / absent / unreadable | proceed silently | proceed silently |
+| warn | proceed, print a warning | proceed, print a warning |
+| critical | proceed, print a warning | **fail preflight (exit 4)** |
+
+The `SHIPYARD_HOST_VITALS_FILE` env var overrides the path (primarily for tests).

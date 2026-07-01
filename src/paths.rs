@@ -112,7 +112,7 @@ impl RuntimePaths {
     }
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))

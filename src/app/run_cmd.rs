@@ -15,7 +15,7 @@ use crate::job::{Priority, ValidationMode};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 use crate::preflight::{
-    EXIT_BACKEND_UNREACHABLE, ShipPreflightError, ShipPreflightOptions,
+    EXIT_BACKEND_UNREACHABLE, EXIT_HOST_UNHEALTHY, ShipPreflightError, ShipPreflightOptions,
     collect_ship_preflight_with_options,
 };
 use crate::prepared_state::PreparedStateStore;
@@ -221,6 +221,7 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
     let code = match error {
         ShipPreflightError::RootMismatch { .. } => 1,
         ShipPreflightError::BackendUnreachable { .. } => EXIT_BACKEND_UNREACHABLE,
+        ShipPreflightError::HostUnhealthy { .. } => EXIT_HOST_UNHEALTHY,
     };
     CliFailure::new(code, error.to_string())
 }

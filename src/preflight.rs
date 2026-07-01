@@ -12,6 +12,9 @@ use crate::executor::dispatch::{ExecutorDispatcher, ResolvedTarget};
 /// Exit code used when a backend is unreachable before submission.
 pub const EXIT_BACKEND_UNREACHABLE: u8 = 3;
 
+/// Exit code used when the opt-in host-health gate hard-stops a saturated host.
+pub const EXIT_HOST_UNHEALTHY: u8 = 4;
+
 /// One unreachable target discovered during preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetPreflightFailure {
@@ -115,6 +118,13 @@ pub enum ShipPreflightError {
         /// Optional daemon-version-skew hypothesis.
         skew_note: Option<String>,
     },
+    /// The opt-in host-health gate hard-stopped a saturated self-hosted host.
+    HostUnhealthy {
+        /// Level label (currently always `critical`).
+        level: String,
+        /// Human reason from the `host_vitals` signal.
+        reason: String,
+    },
 }
 
 /// Optional bypasses for explicit operator-controlled validation runs.
@@ -179,6 +189,14 @@ impl Display for ShipPreflightError {
                     "  - Skip the target(s) that don't apply to this change: {skip_flags}"
                 )
             }
+            Self::HostUnhealthy { level, reason } => write!(
+                formatter,
+                "Host-health {level} before dispatch: {reason}\n\n\
+                 The self-hosted runner is saturated; validating here risks an infra failure \
+                 (memory pressure / jetsam / reboot), not a code failure. Options:\n\
+                 \x20 - Wait for the host to recover, or ship via GitHub-native auto-merge, OR\n\
+                 \x20 - Set host_health.block_on_critical=false to warn instead of block."
+            ),
         }
     }
 }
@@ -245,6 +263,16 @@ pub fn collect_ship_preflight_with_options(
                 git_root: git_root.clone(),
                 expected_root: expected_root.clone(),
             });
+        }
+    }
+
+    // Opt-in host-health gate (off by default, fails open). Surfaces a saturated
+    // self-hosted host before we spend target probes / mutate ship state.
+    match crate::host_health::evaluate(config) {
+        crate::host_health::HostHealthOutcome::Ok => {}
+        crate::host_health::HostHealthOutcome::Warn(message) => warnings.push(message),
+        crate::host_health::HostHealthOutcome::Block { level, reason } => {
+            return Err(ShipPreflightError::HostUnhealthy { level, reason });
         }
     }
 
@@ -375,8 +403,8 @@ mod tests {
     use toml::Table;
 
     use super::{
-        ShipPreflightError, TargetPreflightFailure, daemon_skew_note_from_relation,
-        run_ship_preflight,
+        ShipPreflightError, ShipPreflightOptions, TargetPreflightFailure,
+        collect_ship_preflight_with_options, daemon_skew_note_from_relation, run_ship_preflight,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::daemon_version::DaemonVersionRelation;
@@ -461,6 +489,116 @@ mod tests {
             &ExecutorDispatcher::new(None),
         )
         .expect("preflight");
+    }
+
+    /// Write a synthetic `host_vitals` file and return a TOML-safe path string
+    /// (forward slashes so a Windows tempdir path stays a valid TOML string and
+    /// a readable path). Proves the gate is wired through real preflight.
+    fn write_vitals(dir: &std::path::Path, code: i64) -> String {
+        let path = dir.join("host_vitals.json");
+        std::fs::write(
+            &path,
+            format!(r#"{{"code":{code},"reason":"synthetic {code}"}}"#),
+        )
+        .expect("write vitals");
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    fn host_health_config(vitals: &str, gate: bool, block_on_critical: bool) -> LoadedConfig {
+        config(
+            &format!(
+                r#"
+                [validation.default]
+                command = "true"
+
+                [targets.mac]
+                backend = "local"
+                platform = "macos-arm64"
+
+                [host_health]
+                gate = {gate}
+                block_on_critical = {block_on_critical}
+                file = "{vitals}"
+                "#
+            ),
+            None,
+        )
+    }
+
+    #[test]
+    fn host_health_gate_blocks_on_critical_when_opted_in() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vitals = write_vitals(temp.path(), 20);
+        let config = host_health_config(&vitals, true, true);
+        let targets =
+            resolve_targets_from_table(&config.data, ValidationMode::Full).expect("targets");
+
+        let error = run_ship_preflight(
+            &config,
+            temp.path(),
+            temp.path(),
+            &targets,
+            &ExecutorDispatcher::new(None),
+        )
+        .expect_err("critical host must block when block_on_critical is set");
+
+        assert!(matches!(
+            error,
+            ShipPreflightError::HostUnhealthy { ref level, .. } if level == "critical"
+        ));
+        assert!(error.to_string().contains("synthetic 20"));
+    }
+
+    #[test]
+    fn host_health_gate_warns_on_critical_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vitals = write_vitals(temp.path(), 20);
+        // gate on, block_on_critical OFF → surface a warning, do not block.
+        let config = host_health_config(&vitals, true, false);
+        let targets =
+            resolve_targets_from_table(&config.data, ValidationMode::Full).expect("targets");
+
+        let report = collect_ship_preflight_with_options(
+            &config,
+            temp.path(),
+            temp.path(),
+            &targets,
+            &ExecutorDispatcher::new(None),
+            ShipPreflightOptions::default(),
+        )
+        .expect("default critical must warn, not block");
+
+        assert!(
+            report.warnings.iter().any(|w| w.contains("CRITICAL")),
+            "expected a host-health CRITICAL warning; got {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn host_health_gate_off_ignores_a_critical_signal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vitals = write_vitals(temp.path(), 20);
+        // gate OFF (default) → the critical signal is never read.
+        let config = host_health_config(&vitals, false, true);
+        let targets =
+            resolve_targets_from_table(&config.data, ValidationMode::Full).expect("targets");
+
+        let report = collect_ship_preflight_with_options(
+            &config,
+            temp.path(),
+            temp.path(),
+            &targets,
+            &ExecutorDispatcher::new(None),
+            ShipPreflightOptions::default(),
+        )
+        .expect("gate off must pass");
+
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("Host-health")),
+            "gate off must not surface any host-health warning; got {:?}",
+            report.warnings
+        );
     }
 
     #[test]

@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0730"></a>
+## [0.73.0]
+
+- feat(preflight): opt-in host-health pre-dispatch gate — read a shared `host_vitals` signal during ship/run preflight and surface (or, opt-in, hard-stop) a saturated self-hosted host before a ship runs into a jetsam/reboot failure. Off by default, fails open. ([#364](https://github.com/danielraffel/Shipyard/pull/364))
+
 <a id="v0720"></a>
 ## [0.72.0] - 2026-06-12
 

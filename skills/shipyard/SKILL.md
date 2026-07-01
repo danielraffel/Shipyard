@@ -260,6 +260,33 @@ watch_interval_seconds = 300
 auto_fix = false
 ```
 
+## Host-Health Pre-Dispatch Gate (optional)
+
+For self-hosted runners *co-located with heavy interactive work*: read a shared
+`host_vitals` signal during ship/run preflight and surface — or, opt-in,
+hard-stop on — a saturated host before a ship runs into a jetsam/reboot failure
+that reds the required gate for an *infra* reason.
+
+**Off by default, fails open.** No `[host_health]` block or no signal file → no
+read, no change. Missing/unreadable signal → treated as "no opinion", the ship
+proceeds. (Inverse of backend-reachability preflight, which fails closed:
+reachability gates correctness, host-health gates only crash-avoidance.)
+
+```toml
+[host_health]
+gate = true                # master opt-in
+block_on_critical = false  # true → `critical` hard-stops preflight (exit 4); default warns
+# file = "/custom/host_vitals.json"   # default: ~/.local/state/pulp/host_vitals.json
+```
+
+Signal contract: JSON with numeric `code` (0/10/20) and/or string `level`
+(green/warn/critical) + optional `reason`; `code` wins. Shipyard ships no
+producer — bring your own (Pulp's `tools/scripts/host_vitals.sh` + its launchd
+sensor writes the default path). `SHIPYARD_HOST_VITALS_FILE` overrides the path.
+Behavior when `gate=true`: green/absent → silent; warn → warn + proceed;
+critical → warn + proceed, or fail (exit 4) when `block_on_critical`. Full table:
+`docs/local-mac-pool.md` § Host-Health Pre-Dispatch Gate.
+
 ## Durable Queue: killed-worker recovery (stale-running reaping)
 
 A `shipyard ship` / `shipyard pr` worker that is killed (SIGTERM, crash,
