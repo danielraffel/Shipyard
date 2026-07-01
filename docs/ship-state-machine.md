@@ -357,6 +357,29 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   - Ancestor SHA unknown or diff check fails → falls through to normal dispatch. No false-PASS risk from the reuse path itself.
   - Stage-list drift or validation-contract drift → reuse is refused by `reuse.py`; normal dispatch runs.
 
+## Diagnostic: orphan reporting (no transition)
+
+`STATE_IN_FLIGHT` has no self-healing exit when the owning process dies
+mid-validation (host reboot from a jetsam kill, daemon crash, `cmux` relaunch):
+nothing advances the state, `ship_terminal_verdict` stays `None`, and auto-merge
+reports `InFlight` forever without merging. The queue's killed-worker reaper
+(#351) recovers the sibling `queue.json` `Job`, but the ship-state store has no
+equivalent lifecycle.
+
+`shipyard ship-state list` surfaces these as a **read-only** diagnostic (no state
+transition, no write). A state is reported orphaned when `ship_terminal_verdict`
+is `None` (in flight — the exact predicate the auto-merge gate uses) *and*
+`updated_at` has been idle ≥ 45 minutes (`last_heartbeat_at` is unpopulated on
+ship-state, so `updated_at` is the only liveness signal). It is a staleness
+heuristic, not proof of death — ship-state is written once before a leg runs and
+not again until it reports, so a genuinely slow live leg can also trip it; the
+threshold is chosen above a normally-paced leg to keep that rare, and a false
+positive only invites an operator to look. Human output adds an `ORPHANED?:`
+line; JSON adds an `orphaned: [{pr, stalled_minutes}]` array. It cannot affect merge
+readiness — an orphan is by definition not a terminal `pass`. Recovery stays
+operator-driven (`shipyard ship <pr>` to re-validate, or `ship-state discard`);
+automatic resume is a deferred follow-up (`src/app/ship_state_cmd.rs`).
+
 ## External dependency matrix
 
 | External                               | Transitions         | Failure class               | Symptom + audit note                                                                                                 |

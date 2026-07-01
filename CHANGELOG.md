@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0730"></a>
+## [0.74.0]
+
 ## [0.73.0] - 2026-07-01
 
 - feat(preflight): opt-in host-health pre-dispatch gate ([#364](https://github.com/danielraffel/Shipyard/pull/364))

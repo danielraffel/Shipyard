@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::identity::RuntimeMode;
@@ -11,6 +11,42 @@ use crate::reconcile::{
 };
 use crate::ship_state::ShipState;
 use crate::ship_state::ShipStateStore;
+use crate::watch::ship_terminal_verdict;
+
+/// Minutes of `updated_at` staleness past which an in-flight ship state is
+/// treated as (probably) orphaned. When a ship's owning process dies
+/// mid-validation (host reboot from a jetsam kill, daemon crash, `cmux`
+/// relaunch) nothing advances the durable ship state and it stalls in an
+/// in-flight verdict forever.
+///
+/// This is a staleness heuristic, not proof of process death: ship-state is
+/// written once before a target runs and not again until the leg reports, so a
+/// *live* ship whose single leg runs longer than this (heavy validation under
+/// host saturation) can also be flagged. The threshold is chosen well above a
+/// normally-paced leg to keep that rare. The false positive is acceptable
+/// because this is a report-only diagnostic: it costs an operator a second look,
+/// never a wrong merge (an orphan is in-flight, which auto-merge already
+/// refuses).
+const ORPHAN_STALE_MINUTES: i64 = 45;
+
+/// Report-only orphan check for the `ship-state list` diagnostic.
+///
+/// Returns `Some(stalled_minutes)` when a state is still in flight yet has not
+/// been touched for at least [`ORPHAN_STALE_MINUTES`], otherwise `None`.
+///
+/// "In flight" reuses [`ship_terminal_verdict`] — the exact predicate the
+/// auto-merge gate uses — so a flagged state can never be mistaken for
+/// merge-ready: `ship_terminal_verdict` returns `None`, so auto-merge reports
+/// `InFlight` and refuses to merge. Surfacing it here does not resume,
+/// re-dispatch, or mutate anything; it only makes the silent stall visible so
+/// an operator can re-run `shipyard ship`.
+fn orphan_stalled_minutes(state: &ShipState, now: DateTime<Utc>) -> Option<i64> {
+    if ship_terminal_verdict(state).is_some() {
+        return None;
+    }
+    let stalled = now.signed_duration_since(state.updated_at).num_minutes();
+    (stalled >= ORPHAN_STALE_MINUTES).then_some(stalled)
+}
 
 pub(super) fn ship_state_list<W: Write>(
     store: &ShipStateStore,
@@ -18,9 +54,19 @@ pub(super) fn ship_state_list<W: Write>(
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let states = store.list_active();
+    let now = Utc::now();
     if json {
+        let orphaned = states
+            .iter()
+            .filter_map(|state| {
+                orphan_stalled_minutes(state, now).map(
+                    |stalled| serde_json::json!({ "pr": state.pr, "stalled_minutes": stalled }),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut data = BTreeMap::new();
-        data.insert("states".to_owned(), serde_json::to_value(states)?);
+        data.insert("states".to_owned(), serde_json::to_value(&states)?);
+        data.insert("orphaned".to_owned(), Value::Array(orphaned));
         write_json_envelope(stdout, "ship-state:list", data)?;
         return Ok(());
     }
@@ -28,8 +74,7 @@ pub(super) fn ship_state_list<W: Write>(
         writeln!(stdout, "No active ship state.")?;
         return Ok(());
     }
-    let now = Utc::now();
-    for state in states {
+    for state in &states {
         let age = now
             .signed_duration_since(state.updated_at)
             .num_minutes()
@@ -51,6 +96,14 @@ pub(super) fn ship_state_list<W: Write>(
             age,
             title
         )?;
+        if let Some(stalled) = orphan_stalled_minutes(state, now) {
+            writeln!(
+                stdout,
+                "    ORPHANED?: in flight with no update for {stalled}m (owning process may \
+                 have died mid-validation); auto-merge will not fire until it reaches a verdict \
+                 — re-run `shipyard ship`, or `ship-state discard` if it is truly dead."
+            )?;
+        }
         if !state.pr_url.is_empty() {
             writeln!(stdout, "    {}", state.pr_url)?;
         }
@@ -292,8 +345,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        abbreviate_sha, ship_state_discard, ship_state_list, ship_state_reconcile_with,
-        ship_state_show,
+        ORPHAN_STALE_MINUTES, abbreviate_sha, orphan_stalled_minutes, ship_state_discard,
+        ship_state_list, ship_state_reconcile_with, ship_state_show,
     };
     use crate::reconcile::ReconcileFetchError;
     use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
@@ -388,6 +441,82 @@ mod tests {
         assert_eq!(payload["schema_version"], 1);
         assert_eq!(payload["states"][0]["pr"], 2);
         assert_eq!(payload["states"][1]["pr"], 9);
+    }
+
+    /// A ship that reached a terminal verdict (all required evidence `pass`) is
+    /// never orphaned, no matter how old — its stall would be a merge/cleanup
+    /// gap, not a dead-process orphan.
+    #[test]
+    fn orphan_ignores_terminal_verdict_states() {
+        let mut state = sample_state(1, "1111111111111111111111111111111111111111");
+        state.update_evidence("linux", "pass");
+        state.dispatched_runs.push(sample_run("linux", "run-1"));
+        state.updated_at = Utc::now() - Duration::hours(6);
+
+        assert!(orphan_stalled_minutes(&state, Utc::now()).is_none());
+    }
+
+    /// A freshly-touched in-flight ship (empty evidence) is in flight but not
+    /// yet stale — a live validation, not an orphan.
+    #[test]
+    fn orphan_ignores_fresh_in_flight_states() {
+        let mut state = sample_state(2, "2222222222222222222222222222222222222222");
+        state.updated_at = Utc::now() - Duration::minutes(ORPHAN_STALE_MINUTES - 5);
+
+        assert!(orphan_stalled_minutes(&state, Utc::now()).is_none());
+    }
+
+    /// An in-flight ship untouched past the threshold is orphaned; the reported
+    /// stall reflects the `updated_at` age.
+    #[test]
+    fn orphan_flags_stale_in_flight_states() {
+        let mut state = sample_state(3, "3333333333333333333333333333333333333333");
+        state.updated_at = Utc::now() - Duration::minutes(ORPHAN_STALE_MINUTES + 20);
+
+        let stalled = orphan_stalled_minutes(&state, Utc::now()).expect("should be orphaned");
+        assert!(stalled >= ORPHAN_STALE_MINUTES + 19, "stalled={stalled}");
+    }
+
+    #[test]
+    fn list_json_reports_orphaned_prs() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        // Stale in-flight → orphaned.
+        let mut orphan = sample_state(3, "3333333333333333333333333333333333333333");
+        orphan.updated_at = Utc::now() - Duration::minutes(ORPHAN_STALE_MINUTES + 10);
+        store.save(&orphan).expect("state should save");
+        // Terminal verdict → not orphaned even though also old.
+        let mut done = sample_state(4, "4444444444444444444444444444444444444444");
+        done.update_evidence("linux", "pass");
+        done.dispatched_runs.push(sample_run("linux", "run-4"));
+        done.updated_at = Utc::now() - Duration::hours(3);
+        store.save(&done).expect("state should save");
+        let mut out = Vec::new();
+
+        ship_state_list(&store, true, &mut out).expect("list should render");
+
+        let payload: Value = serde_json::from_slice(&out).expect("json payload");
+        let orphaned = payload["orphaned"].as_array().expect("orphaned array");
+        assert_eq!(orphaned.len(), 1, "only the stale in-flight PR is orphaned");
+        assert_eq!(orphaned[0]["pr"], 3);
+        assert!(orphaned[0]["stalled_minutes"].as_i64().unwrap() >= ORPHAN_STALE_MINUTES);
+    }
+
+    #[test]
+    fn list_human_marks_orphaned_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let mut state = sample_state(5, "5555555555555555555555555555555555555555");
+        state.updated_at = Utc::now() - Duration::minutes(ORPHAN_STALE_MINUTES + 30);
+        store.save(&state).expect("state should save");
+        let mut out = Vec::new();
+
+        ship_state_list(&store, false, &mut out).expect("list should render");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("PR #5"));
+        assert!(text.contains("ORPHANED"), "text was: {text}");
+        assert!(text.contains("re-run `shipyard ship`"));
     }
 
     #[test]
