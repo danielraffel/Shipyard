@@ -751,7 +751,7 @@ fn handle_ship_state_variant<W: Write>(
     };
     let store = ShipStateStore::new(state_dir.join("ship"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    handle_ship_state_command(command, &store, mode, cwd, json, stdout)
+    handle_ship_state_command(command, &store, mode, cwd, state_dir, json, stdout)
 }
 
 #[derive(Clone, Copy)]
@@ -866,13 +866,19 @@ fn handle_ship_state_command<W: Write>(
     store: &ShipStateStore,
     mode: RuntimeMode,
     cwd: &Path,
+    state_dir: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
     match command {
         ShipStateCommand::List => {
-            ship_state_list(store, json, stdout)
+            let config = LoadedConfig::load_from_cwd(mode, cwd)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            let stale_after = crate::ship_liveness::orphan_stale_after(&config);
+            crate::ship_liveness::with_liveness_context(state_dir, stale_after, |liveness| {
+                ship_state_list(store, liveness, json, stdout)
+            })
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Show { pr } => {
             ship_state_show(store, pr, json, stdout)

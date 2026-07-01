@@ -366,19 +366,25 @@ reports `InFlight` forever without merging. The queue's killed-worker reaper
 (#351) recovers the sibling `queue.json` `Job`, but the ship-state store has no
 equivalent lifecycle.
 
-`shipyard ship-state list` surfaces these as a **read-only** diagnostic (no state
-transition, no write). A state is reported orphaned when `ship_terminal_verdict`
-is `None` (in flight — the exact predicate the auto-merge gate uses) *and*
-`updated_at` has been idle ≥ 45 minutes (`last_heartbeat_at` is unpopulated on
-ship-state, so `updated_at` is the only liveness signal). It is a staleness
-heuristic, not proof of death — ship-state is written once before a leg runs and
-not again until it reports, so a genuinely slow live leg can also trip it; the
-threshold is chosen above a normally-paced leg to keep that rare, and a false
-positive only invites an operator to look. Human output adds an `ORPHANED?:`
-line; JSON adds an `orphaned: [{pr, stalled_minutes}]` array. It cannot affect merge
-readiness — an orphan is by definition not a terminal `pass`. Recovery stays
-operator-driven (`shipyard ship <pr>` to re-validate, or `ship-state discard`);
-automatic resume is a deferred follow-up (`src/app/ship_state_cmd.rs`).
+`shipyard ship-state list` and `shipyard status` surface these as a **read-only**
+diagnostic (no state transition, no write; `src/ship_liveness.rs`). A state is
+reported orphaned when `ship_terminal_verdict` is `None` (in flight — the exact
+predicate the auto-merge gate uses) **and** a single queue snapshot confirms — or
+cannot disprove — a dead worker. The signal is source-labeled, strongest to
+weakest: `queue_stale` (a matching running job whose heartbeat is dead past the
+reaper's 180s window — flagged immediately), `queue_terminal` (a matching job
+already terminal while the ship-state never finalized — immediate), `queue_absent`
+(queue consulted, no matching job — the ship-state has no job id, so this is
+time-gated), and `time_fallback` (queue unavailable — pure `updated_at`
+staleness, time-gated). A live-running (fresh heartbeat) or pending job is never
+flagged. The time threshold gates only the weak signals, defaults to 45 minutes,
+and is configurable via `[ship_state] orphan_stale_minutes`. Human output adds an
+`ORPHANED? [<evidence>]:` line; JSON adds `orphaned: [{pr, stalled_minutes,
+evidence}]` (`ship-state list`) / `orphaned_ship_states` (`status`). It cannot
+affect merge readiness — a flagged state is in flight, which auto-merge already
+refuses. Recovery stays operator-driven (`shipyard ship <pr>` to re-validate, or
+`ship-state discard`); automatic resume is a deferred follow-up, and the
+`QueueMatch` the classifier returns already carries the owning `Job` for it.
 
 ## External dependency matrix
 

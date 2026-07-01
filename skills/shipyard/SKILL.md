@@ -338,31 +338,57 @@ a jetsam kill, daemon crash, `cmux` relaunch), the ship-state freezes in an
 in-flight verdict forever. `ship_terminal_verdict` returns `None`, so auto-merge
 reports `InFlight` and refuses to merge — the PR silently stalls with no signal.
 
-`shipyard ship-state list` now flags these. A state is **orphaned** when it is
-still in flight (same `ship_terminal_verdict` predicate the auto-merge gate uses,
-so the two never drift) *and* its `updated_at` has been idle for at least 45
-minutes. It's a staleness heuristic, not proof of death: ship-state is written
-once before a leg runs and not again until the leg reports, so a genuinely slow
-live leg (>45m under saturation) can also be flagged — `last_heartbeat_at` is
-unpopulated on ship-state, so `updated_at` is the only liveness signal. The
-human listing prints an `ORPHANED?: ...` line under the PR; the JSON envelope
-gains an `orphaned: [{pr, stalled_minutes}]` array.
+Both `shipyard ship-state list` and `shipyard status` flag these. A state is
+reported orphaned when it is still in flight (the same `ship_terminal_verdict`
+predicate the auto-merge gate uses, so the two never drift) **and** the queue
+confirms — or fails to disprove — a dead worker. The signal is **source-aware**,
+established by cross-referencing a single queue snapshot (module
+`src/ship_liveness.rs`), strongest to weakest:
 
-This is **report-only** — it never resumes, re-dispatches, or mutates the store,
-and cannot affect merge readiness (an orphan is by definition not `pass`).
-Recovery is still operator-driven: re-run `shipyard ship <pr>` to re-validate
-the head, or `shipyard ship-state discard <pr>` to drop a dead entry. Automatic
-resume is a deliberately deferred follow-up.
+| Evidence | Meaning | When flagged |
+|----------|---------|--------------|
+| `queue_stale` | matching *running* job whose heartbeat is dead past the reaper's 180s window (`is_stale_running`) — a provably gone worker | immediately (no time gate) |
+| `queue_terminal` | matching job already terminal while the ship-state never finalized | immediately |
+| `queue_absent` | queue consulted, no matching job (ship-state stores no job id → absence is *inferred*) | time-gated |
+| `time_fallback` | queue unavailable — pure `updated_at` staleness | time-gated |
+
+A live worker (running with a fresh heartbeat) or a *pending* (queued,
+not-yet-started) job is never flagged, however old `updated_at` looks. The
+`queue_stale`/`queue_terminal` signals surface a genuinely dead ship in ~3
+minutes; the weak (`queue_absent`/`time_fallback`) signals require the staleness
+threshold. Human output prints `ORPHANED? [<evidence>]: ...`; JSON gains
+`orphaned: [{pr, stalled_minutes, evidence}]` (`ship-state list`) /
+`orphaned_ship_states: [...]` (`status`).
+
+The threshold defaults to 45 minutes and is configurable:
+
+```toml
+[ship_state]
+orphan_stale_minutes = 45   # clamped to [1, 525600]
+```
+
+This is **report-only** — it never resumes, re-dispatches, or mutates the queue
+or ship-state, and cannot affect merge readiness (a flagged state is in flight,
+which auto-merge already refuses; the harm it surfaces is the *inverse* — a PR
+that silently never merges). Recovery is operator-driven: re-run
+`shipyard ship <pr>` to re-validate the head, or `shipyard ship-state discard
+<pr>` to drop a dead entry. Automatic resume is a deliberately deferred
+follow-up; the `QueueMatch` returned by `LivenessContext::match_job` already
+carries the owning `Job` so a future retry/resume can act on it.
 
 ### Gotchas
 
-- The 45-minute threshold trades a rare false positive (a genuinely slow live
-  ship idle >45m between evidence writes) for never mislabeling a normal ship.
-  A false positive is harmless here — it only invites an operator to look; it
-  cannot merge or cancel anything. Don't shorten it toward normal leg durations.
-- Orphan status is computed lazily at `ship-state list` time; there is no daemon
-  startup sweep and nothing is written back. A state stops being reported the
-  moment a live ship touches it again or it reaches a verdict.
+- Only the strong signals (`queue_stale`/`queue_terminal`) are proof of a dead
+  worker; the weak ones are staleness heuristics. The time threshold only gates
+  the weak signals, so don't shorten it toward normal leg durations — a false
+  positive is harmless (it just invites an operator to look; it cannot merge or
+  cancel anything), but the weak signals are the noisy ones.
+- Classification is lazy and read-only: computed at `ship-state list` / `status`
+  time from one queue snapshot, with no daemon startup sweep and no write-back.
+  The module opens the queue/ship stores only when they already exist, so
+  running a diagnostic in a fresh directory materializes nothing.
+- A state stops being reported the moment a live worker touches it or it reaches
+  a verdict.
 
 ## Runner Provisioning (register / list / remove / tag)
 
