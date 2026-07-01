@@ -11,48 +11,64 @@ use crate::paths::RuntimePaths;
 use crate::ship_state::ShipStateStore;
 use clap::Parser;
 
+mod auth_cmd;
 mod auto_merge_cmd;
 mod branch_cmd;
+mod capacity_cmd;
 mod changelog_cmd;
+mod ci_cmd;
 mod cleanup_cmd;
 mod cli;
 mod cloud_cmd;
 mod cloud_read_cmd;
+mod command_evidence_cmd;
 mod config_cmd;
 mod daemon_cmd;
 mod doctor_cmd;
+mod fleet_status_cmd;
 mod governance_cmd;
 mod init_cmd;
+mod metrics_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
 mod quarantine_cmd;
 mod queue_cmd;
 mod release_bot_cmd;
+mod reroute_cmd;
 mod rescue_cmd;
 mod run_cmd;
 mod runner_cmd;
 mod runner_kill_cmd;
+mod runner_provision_cmd;
 mod ship_cmd;
 mod ship_state_cmd;
 mod targets_cmd;
 mod update_cmd;
 mod wait_cmd;
 mod watch_cmd;
+mod watch_local_cmd;
 
+use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
 use self::branch_cmd::branch_command;
 use self::changelog_cmd::changelog_command;
+use self::ci_cmd::ci_command;
 use self::cleanup_cmd::{
     CleanupCommandOptions, CleanupMode, CleanupOutput, CleanupScope, cleanup_command,
 };
-use self::cli::{Cli, Command, MergeMethod, MergeResult, ShipStateCommand, TargetsCommand};
+use self::cli::{
+    Cli, Command, EvidenceCommand, MergeMethod, MergeResult, RunSubcommand, ShipStateCommand,
+    TargetsCommand, WatchSubcommand,
+};
 use self::cloud_cmd::cloud_command;
+use self::command_evidence_cmd::{run_command_evidence, show_command_evidence};
 use self::config_cmd::config_command;
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
 use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
+use self::metrics_cmd::metrics_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
 use self::pr_cmd::{PrCommandArgs, pr_command};
@@ -75,6 +91,7 @@ use self::targets_cmd::targets_command;
 use self::update_cmd::update_command;
 use self::wait_cmd::wait_command;
 use self::watch_cmd::{WatchCommandContext, WatchCommandOptions, watch};
+use self::watch_local_cmd::watch_local_command;
 
 #[derive(Debug)]
 pub(super) struct CliFailure {
@@ -136,11 +153,27 @@ fn dispatch<W: Write, E: Write>(
             handle_paths_command(cli.json, &runtime_paths, stdout)?;
         }
         Command::Pin { command } => {
-            return pin_command(command, &cwd, cli.json, stdout);
+            return pin_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Update(args) => return update_command(&args, cli.json, stdout),
         Command::Config { command } => {
             return config_command(command, cli.mode.into(), &cwd, cli.json, stdout);
+        }
+        Command::Ci { command } => {
+            return ci_command(command, &cwd, cli.json, stdout);
+        }
+        Command::Metrics { command } => {
+            return metrics_command(*command, &runtime_paths.state_dir, cli.json, stdout);
+        }
+        Command::Auth { command } => {
+            return auth_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.global_dir,
+                cli.json,
+                stdout,
+            );
         }
         command @ (Command::Init { .. }
         | Command::Changelog { .. }
@@ -262,16 +295,19 @@ fn handle_operational_variant<W: Write>(
             handle_auto_merge_variant(command, &runtime_paths.state_dir, cwd, json, stdout)
         }
         command @ Command::Watch { .. } => {
-            handle_watch_variant(&command, &runtime_paths.state_dir, cwd, json, stdout)
+            handle_watch_variant(command, mode, &runtime_paths.state_dir, cwd, json, stdout)
         }
         command @ Command::ShipState { .. } => {
-            handle_ship_state_variant(&command, &runtime_paths.state_dir, json, stdout)?;
+            handle_ship_state_variant(&command, mode, cwd, &runtime_paths.state_dir, json, stdout)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Runner { command } => handle_runner_command(command, mode, cwd, json, stdout),
         Command::Paths
         | Command::Pin { .. }
         | Command::Config { .. }
+        | Command::Ci { .. }
+        | Command::Metrics { .. }
+        | Command::Auth { .. }
         | Command::Init { .. }
         | Command::Changelog { .. }
         | Command::Branch { .. }
@@ -346,7 +382,12 @@ fn handle_state_command<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     match command {
         Command::Status => status_command(mode, cwd, state_dir, json, stdout),
-        Command::Evidence { branch } => evidence_command(branch, cwd, state_dir, json, stdout),
+        Command::Evidence { command, branch } => match command {
+            Some(EvidenceCommand::Command { id, list }) => {
+                show_command_evidence(id, list, state_dir, json, stdout)
+            }
+            None => evidence_command(branch, cwd, state_dir, json, stdout),
+        },
         Command::Logs { job_id, target } => logs_command(&job_id, target, state_dir, stdout),
         Command::Cancel { job_id } => cancel_command(&job_id, state_dir, json, stdout),
         Command::Bump { job_id, priority } => {
@@ -359,6 +400,8 @@ fn handle_state_command<W: Write>(
             ship_state,
         } => cleanup_command(
             state_dir,
+            mode,
+            cwd,
             CleanupCommandOptions {
                 mode: CleanupMode::from_flags(dry_run, apply),
                 scope: CleanupScope::from_flag(ship_state),
@@ -447,7 +490,7 @@ fn handle_runner_command<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let config = crate::config::LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    runner_command(command, &config, cwd, json, stdout)
+    runner_command(command, mode, &config, cwd, json, stdout)
 }
 
 struct AutoMergeInvocation {
@@ -477,6 +520,7 @@ fn handle_ship_variant<W: Write>(
         resume_from,
         allow_unreachable_targets,
         skip_targets,
+        adopt_head,
     } = command
     else {
         unreachable!("ship variant required")
@@ -498,6 +542,7 @@ fn handle_ship_variant<W: Write>(
             pr_snapshot_file: None,
             allow_unreachable_targets,
             skip_targets,
+            adopt_head,
         },
         mode,
         cwd,
@@ -525,6 +570,7 @@ fn handle_pr_variant<W: Write>(
         bump_reason,
         skip_skill_update,
         skill_reason,
+        adopt_head,
     } = command
     else {
         unreachable!("pr variant required")
@@ -541,6 +587,7 @@ fn handle_pr_variant<W: Write>(
             bump_reason,
             skip_skill_update,
             skill_reason,
+            adopt_head,
             python_command: None,
         },
         &config,
@@ -560,6 +607,7 @@ fn handle_run_variant<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let Command::Run {
+        command: subcommand,
         targets,
         smoke,
         fail_fast,
@@ -573,6 +621,11 @@ fn handle_run_variant<W: Write>(
     else {
         unreachable!("run variant required")
     };
+    if let Some(RunSubcommand::Command(args)) = subcommand {
+        let config = LoadedConfig::load_from_cwd(mode, cwd)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return run_command_evidence(&args, &config, cwd, runtime_paths, json, stdout);
+    }
     handle_run_command(
         RunCommandArgs {
             targets,
@@ -649,21 +702,28 @@ fn handle_auto_merge_variant<W: Write>(
 }
 
 fn handle_watch_variant<W: Write>(
-    command: &Command,
+    command: Command,
+    mode: RuntimeMode,
     state_dir: &Path,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let Command::Watch {
+        command,
         pr,
         follow,
         no_follow,
         interval,
-    } = *command
+    } = command
     else {
         unreachable!("watch variant required")
     };
+    if let Some(WatchSubcommand::Local(args)) = command {
+        let config = LoadedConfig::load_from_cwd(mode, cwd)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return watch_local_command(&args, &config, cwd, state_dir, json, stdout);
+    }
     handle_watch_command(
         WatchInvocation {
             pr,
@@ -680,6 +740,8 @@ fn handle_watch_variant<W: Write>(
 
 fn handle_ship_state_variant<W: Write>(
     command: &Command,
+    mode: RuntimeMode,
+    cwd: &Path,
     state_dir: &Path,
     json: bool,
     stdout: &mut W,
@@ -689,7 +751,7 @@ fn handle_ship_state_variant<W: Write>(
     };
     let store = ShipStateStore::new(state_dir.join("ship"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    handle_ship_state_command(command, &store, json, stdout)
+    handle_ship_state_command(command, &store, mode, cwd, state_dir, json, stdout)
 }
 
 #[derive(Clone, Copy)]
@@ -802,13 +864,21 @@ fn handle_watch_command<W: Write>(
 fn handle_ship_state_command<W: Write>(
     command: ShipStateCommand,
     store: &ShipStateStore,
+    mode: RuntimeMode,
+    cwd: &Path,
+    state_dir: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
     match command {
         ShipStateCommand::List => {
-            ship_state_list(store, json, stdout)
+            let config = LoadedConfig::load_from_cwd(mode, cwd)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            let stale_after = crate::ship_liveness::orphan_stale_after(&config);
+            crate::ship_liveness::with_liveness_context(state_dir, stale_after, |liveness| {
+                ship_state_list(store, liveness, json, stdout)
+            })
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Show { pr } => {
             ship_state_show(store, pr, json, stdout)
@@ -828,7 +898,7 @@ fn handle_ship_state_command<W: Write>(
                     "Usage: shipyard ship-state reconcile <pr> | --all",
                 ));
             }
-            ship_state_reconcile(store, pr, all, json, stdout)
+            ship_state_reconcile(store, mode, cwd, pr, all, json, stdout)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
     }
@@ -1001,6 +1071,19 @@ mod tests {
         git(&["commit", "-q", "-m", "seed"], root);
     }
 
+    fn write_local_watch_config(root: &std::path::Path) {
+        let project_dir = root.join(".shipyard");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(
+            project_dir.join("config.toml"),
+            format!(
+                "[targets.local]\nbackend = \"local\"\nplatform = \"linux\"\ncwd = {:?}\n",
+                root.display().to_string()
+            ),
+        )
+        .expect("watch config");
+    }
+
     #[test]
     fn ship_state_list_json_matches_command_envelope_shape() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1052,6 +1135,84 @@ mod tests {
             value["states"][0]["dispatched_runs"][0]["run_id"],
             "24446948064"
         );
+    }
+
+    #[test]
+    fn watch_local_streams_milestones_and_process_exit_terminal_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_local_watch_config(temp.path());
+        let state_dir = temp.path().join("state");
+        let log_path = temp.path().join("watch.log");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "--cwd",
+            temp.path().to_str().expect("cwd path"),
+            "watch",
+            "local",
+            "--target",
+            "local",
+            "--command",
+            "printf '[1/3] compile\\nok\\n'",
+            "--milestone-regex",
+            r"\[[0-9]+/[0-9]+\]",
+            "--log-path",
+            log_path.to_str().expect("log path"),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let text = String::from_utf8(stdout).expect("utf8");
+        assert!(text.contains("[1/3] compile"));
+        assert!(text.contains("shipyard milestone"));
+        assert!(text.contains("shipyard terminal [process_exit]: returncode=0"));
+        assert!(
+            std::fs::read_to_string(log_path)
+                .expect("log")
+                .contains("[1/3] compile")
+        );
+    }
+
+    #[test]
+    fn watch_local_terminal_regex_stops_with_failure_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_local_watch_config(temp.path());
+        let state_dir = temp.path().join("state");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "--cwd",
+            temp.path().to_str().expect("cwd path"),
+            "watch",
+            "local",
+            "--target",
+            "local",
+            "--command",
+            "printf 'AUDIT FAIL bad\\n'",
+            "--terminal-regex",
+            "AUDIT FAIL",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stderr.is_empty());
+        let text = String::from_utf8(stdout).expect("utf8");
+        assert!(text.contains("AUDIT FAIL bad"));
+        assert!(text.contains("shipyard terminal [AUDIT FAIL]: AUDIT FAIL bad"));
+        assert!(!text.contains("process_exit"));
     }
 
     #[test]
@@ -1315,6 +1476,10 @@ mod tests {
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "queue");
         assert!(value["active"].is_null());
+        assert_eq!(
+            value["active_runs"].as_array().expect("active_runs").len(),
+            0
+        );
         assert_eq!(value["pending"].as_array().expect("pending").len(), 0);
         assert_eq!(value["recent"].as_array().expect("recent").len(), 0);
     }
@@ -1341,7 +1506,113 @@ mod tests {
         assert_eq!(value["command"], "status");
         assert_eq!(value["queue"]["pending"], 0);
         assert_eq!(value["queue"]["running"], 0);
+        assert_eq!(
+            value["active_runs"].as_array().expect("active_runs").len(),
+            0
+        );
         assert!(value["targets"].as_object().expect("targets").is_empty());
+    }
+
+    #[test]
+    fn queue_json_reports_multiple_active_runs_additively() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let first = queue
+            .enqueue(Job::create(
+                "abc123456789",
+                "feature/first",
+                vec!["linux".to_owned()],
+                ValidationMode::Full,
+                Priority::Normal,
+            ))
+            .expect("enqueue first")
+            .start()
+            .expect("start first");
+        queue.update(&first).expect("update first");
+        let second = queue
+            .enqueue(Job::create(
+                "def987654321",
+                "feature/second",
+                vec!["mac".to_owned()],
+                ValidationMode::Full,
+                Priority::Normal,
+            ))
+            .expect("enqueue second")
+            .start()
+            .expect("start second");
+        queue.update(&second).expect("update second");
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "queue",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "queue");
+        assert_eq!(value["active"]["id"], first.id);
+        assert_eq!(
+            value["active_runs"].as_array().expect("active_runs").len(),
+            2
+        );
+        assert_eq!(value["active_runs"][0]["id"], first.id);
+        assert_eq!(value["active_runs"][1]["id"], second.id);
+    }
+
+    #[test]
+    fn status_json_reports_multiple_active_runs_additively() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        for (sha, branch, target) in [
+            ("abc123456789", "feature/first", "linux"),
+            ("def987654321", "feature/second", "mac"),
+        ] {
+            let running = queue
+                .enqueue(Job::create(
+                    sha,
+                    branch,
+                    vec![target.to_owned()],
+                    ValidationMode::Full,
+                    Priority::Normal,
+                ))
+                .expect("enqueue")
+                .start()
+                .expect("start");
+            queue.update(&running).expect("update");
+        }
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "status",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "status");
+        assert_eq!(value["queue"]["running"], 2);
+        assert_eq!(value["active_run"]["branch"], "feature/first");
+        assert_eq!(
+            value["active_runs"].as_array().expect("active_runs").len(),
+            2
+        );
     }
 
     #[test]
@@ -1480,6 +1751,47 @@ mod tests {
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "cancel");
         assert_eq!(value["job"]["status"], "cancelled");
+    }
+
+    #[test]
+    fn cancel_json_marks_running_job_cancelled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let job = queue
+            .enqueue(Job::create(
+                "abc123456789",
+                "feature/cancel-running",
+                vec!["linux".to_owned()],
+                ValidationMode::Full,
+                Priority::Normal,
+            ))
+            .expect("enqueue");
+        // Transition to Running first, to prove `cancel` reaches running jobs and
+        // not just pending ones — the manual escape hatch for a wedged ship.
+        let started = job.start().expect("start");
+        queue.update(&started).expect("update running");
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "cancel",
+            &job.id,
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "cancel");
+        assert_eq!(value["job"]["status"], "cancelled");
+        assert_eq!(
+            queue.get(&job.id).expect("get").expect("job").status,
+            crate::job::JobStatus::Cancelled
+        );
     }
 
     #[test]
@@ -2192,6 +2504,16 @@ mod tests {
                 &[("macos", "pass"), ("linux", "pass")],
             ))
             .expect("save");
+        // The auto-merge preflight (issue #321) verifies the live PR head
+        // matches the validated SHA before merging. `auto_merge_state` seeds
+        // `head_sha = "a"*40`; pin the live head to the same value so the
+        // happy-path merge proceeds.
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"headRefOid":"{}"}}"#, "a".repeat(40)),
+        )
+        .expect("write snapshot");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
@@ -2204,6 +2526,8 @@ mod tests {
             "--admin",
             "--merge-result",
             "success",
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
         ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2217,6 +2541,107 @@ mod tests {
         assert_eq!(value["pr"], 12);
         assert!(store.get(12).is_none());
         assert_eq!(store.list_archived().len(), 1);
+    }
+
+    #[test]
+    fn auto_merge_green_refuses_when_live_head_supersedes_validated_sha() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        // `auto_merge_state` seeds the validated `head_sha = "a"*40`.
+        store
+            .save(&auto_merge_state(
+                42,
+                &[("macos", "pass"), ("linux", "pass")],
+            ))
+            .expect("save");
+        // Live head advanced to a different SHA after validation.
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"headRefOid":"{}"}}"#, "b".repeat(40)),
+        )
+        .expect("write snapshot");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "auto-merge",
+            "42",
+            // Prove the merge WOULD have succeeded if the preflight let it
+            // through — the refusal must come from the SHA check, not a
+            // simulated merge failure.
+            "--merge-result",
+            "success",
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "auto-merge");
+        assert_eq!(value["event"], "superseded-sha");
+        assert_eq!(value["pr"], 42);
+        assert_eq!(value["validated"], "a".repeat(40));
+        assert_eq!(value["current"], "b".repeat(40));
+        // State must stay active (not archived) so the new head can be
+        // re-validated.
+        assert!(store.get(42).is_some());
+        assert_eq!(store.list_archived().len(), 0);
+    }
+
+    #[test]
+    fn auto_merge_green_fails_closed_when_live_head_is_unreadable() {
+        // The single most important property: if the live PR head cannot be
+        // verified (network error, missing/empty head field), the preflight
+        // must NOT merge blind — it fails closed. Here the snapshot has no
+        // readable head, so `fetch_live_head_sha` returns None even though the
+        // merge itself is told to succeed.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        store
+            .save(&auto_merge_state(
+                7,
+                &[("macos", "pass"), ("linux", "pass")],
+            ))
+            .expect("save");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(&snapshot, r#"{"headRefOid":""}"#).expect("write snapshot");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "auto-merge",
+            "7",
+            "--merge-result",
+            "success",
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "auto-merge");
+        assert_eq!(value["event"], "merge-failed");
+        assert_eq!(value["pr"], 7);
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("verify live PR head"),
+            "error should explain the fail-closed head verification: {value:?}"
+        );
+        // State stays active for a retry once the head can be verified.
+        assert!(store.get(7).is_some());
+        assert_eq!(store.list_archived().len(), 0);
     }
 
     #[cfg(unix)]
@@ -2234,6 +2659,15 @@ mod tests {
         )
         .expect("merge script");
         make_executable(&merge);
+        // Satisfy the issue #321 preflight: pin the live head to the validated
+        // SHA ("a"*40 from `auto_merge_state`) so the custom merge command runs
+        // and exercises the already-merged archive escape hatch.
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"headRefOid":"{}"}}"#, "a".repeat(40)),
+        )
+        .expect("write snapshot");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
@@ -2243,6 +2677,8 @@ mod tests {
             "13",
             "--merge-command",
             merge.to_str().expect("merge script"),
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
         ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2275,8 +2711,16 @@ mod tests {
         store
             .save(&auto_merge_state(14, &[("macos", "pass")]))
             .expect("save");
+        // `state:OPEN` keeps the failure-path `pr_is_merged` escape hatch
+        // closed; `headRefOid` matching the validated SHA ("a"*40) lets the
+        // issue #321 preflight pass so the `--merge-result failure` path is
+        // the thing under test.
         let snapshot = temp.path().join("pr.json");
-        std::fs::write(&snapshot, r#"{"state":"OPEN"}"#).expect("write snapshot");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"state":"OPEN","headRefOid":"{}"}}"#, "a".repeat(40)),
+        )
+        .expect("write snapshot");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",

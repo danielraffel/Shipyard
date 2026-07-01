@@ -1,12 +1,16 @@
 //! Branch governance profiles and GitHub branch-protection application.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use toml::{Table, Value};
+
+use crate::config::LoadedConfig;
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 
 /// Branch-protection rules resolved from Shipyard governance config.
 #[allow(clippy::struct_excessive_bools)]
@@ -34,6 +38,65 @@ pub struct BranchProtectionRules {
     pub require_linear_history: bool,
     /// Require conversation resolution before merging.
     pub required_conversation_resolution: bool,
+}
+
+/// Config-aware GitHub CLI boundary for governance API calls.
+#[derive(Clone, Debug)]
+pub struct GovernanceGh {
+    cwd: PathBuf,
+    client: GhClient,
+    binary_override: Option<PathBuf>,
+}
+
+impl GovernanceGh {
+    /// Build from already loaded Shipyard config.
+    pub fn from_loaded_config(
+        cwd: &Path,
+        config: &LoadedConfig,
+        binary_override: Option<&Path>,
+    ) -> Result<Self, String> {
+        let client = GhClient::from_loaded_config(config).map_err(|error| error.to_string())?;
+        Ok(Self {
+            cwd: cwd.to_path_buf(),
+            client,
+            binary_override: binary_override.map(Path::to_path_buf),
+        })
+    }
+
+    /// Build by loading Shipyard config from `cwd`.
+    pub fn from_cwd(
+        mode: RuntimeMode,
+        cwd: &Path,
+        binary_override: Option<&Path>,
+    ) -> Result<Self, String> {
+        let client = GhClient::from_cwd(mode, cwd).map_err(|error| error.to_string())?;
+        Ok(Self {
+            cwd: cwd.to_path_buf(),
+            client,
+            binary_override: binary_override.map(Path::to_path_buf),
+        })
+    }
+
+    /// Build an ambient-auth client for tests or already classified callers.
+    #[must_use]
+    pub fn ambient(cwd: &Path, binary_override: Option<&Path>) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            client: GhClient::ambient(),
+            binary_override: binary_override.map(Path::to_path_buf),
+        }
+    }
+
+    fn command(&self) -> Result<Command, String> {
+        self.client
+            .prepare_command(
+                &self.cwd,
+                self.binary_override.as_deref(),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+            )
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// A field-level drift status for one branch-protection knob.
@@ -234,11 +297,11 @@ pub fn put_branch_protection(
     repo: &str,
     branch: &str,
     rules: &BranchProtectionRules,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> Result<(), String> {
     let payload = serde_json::to_vec(&api_payload_from_rules(rules))
         .map_err(|error| format!("failed to encode branch protection payload: {error}"))?;
-    let mut command = gh(gh_command);
+    let mut command = gh.command()?;
     command.args([
         "api",
         "-X",
@@ -287,9 +350,10 @@ pub fn put_branch_protection(
 pub fn get_branch_protection(
     repo: &str,
     branch: &str,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> Result<Option<BranchProtectionRules>, String> {
-    let output = gh(gh_command)
+    let output = gh
+        .command()?
         .args(["api", &format!("repos/{repo}/branches/{branch}/protection")])
         .output()
         .map_err(|error| format!("failed to run gh api: {error}"))?;
@@ -323,7 +387,7 @@ pub fn build_status(
     repo: &str,
     data: &Table,
     branches: &[String],
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> GovernanceStatus {
     let profile_name = resolved_profile_name(data);
     let profile_rules = resolve_profile_rules(data).unwrap_or_default();
@@ -338,7 +402,7 @@ pub fn build_status(
                 continue;
             }
         };
-        let live_rules = match get_branch_protection(repo, branch, gh_command) {
+        let live_rules = match get_branch_protection(repo, branch, gh) {
             Ok(rules) => rules,
             Err(error) => {
                 errors.push(format!("{branch}: {error}"));
@@ -432,11 +496,7 @@ pub fn build_apply_plan(
 
 /// Execute an apply plan.
 #[must_use]
-pub fn execute_apply_plan(
-    plan: ApplyPlan,
-    dry_run: bool,
-    gh_command: Option<&Path>,
-) -> ApplyResult {
+pub fn execute_apply_plan(plan: ApplyPlan, dry_run: bool, gh: &GovernanceGh) -> ApplyResult {
     if plan.is_noop() || dry_run {
         return ApplyResult {
             plan,
@@ -444,7 +504,7 @@ pub fn execute_apply_plan(
             error_message: None,
         };
     }
-    match put_branch_protection(&plan.repo, &plan.branch, &plan.declared_rules, gh_command) {
+    match put_branch_protection(&plan.repo, &plan.branch, &plan.declared_rules, gh) {
         Ok(()) => ApplyResult {
             plan,
             executed: true,
@@ -892,10 +952,6 @@ fn glob_matches_bytes(pattern: &[u8], text: &[u8]) -> bool {
         }
         _ => false,
     }
-}
-
-fn gh(gh_command: Option<&Path>) -> Command {
-    gh_command.map_or_else(|| Command::new("gh"), Command::new)
 }
 
 #[cfg(test)]

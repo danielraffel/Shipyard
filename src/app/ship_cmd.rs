@@ -18,7 +18,7 @@ use crate::diagnostics::{
 };
 use crate::evidence::EvidenceStore;
 use crate::executor::dispatch::{ExecutorDispatcher, ResolvedTarget, resolve_targets};
-use crate::governance::{put_branch_protection, resolve_branch_rules};
+use crate::governance::{GovernanceGh, put_branch_protection, resolve_branch_rules};
 use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
 use crate::lane_policy::{LanePolicy, resolve_lane_policy};
 use crate::output::write_json_envelope;
@@ -26,12 +26,12 @@ use crate::paths::RuntimePaths;
 use crate::pr::{PrInfo, create_pr, find_pr_for_branch, push_branch};
 use crate::pr_text::{compose_pr_body_with_policy, compose_pr_title};
 use crate::preflight::{
-    EXIT_BACKEND_UNREACHABLE, ShipPreflightError, ShipPreflightOptions,
+    EXIT_BACKEND_UNREACHABLE, EXIT_HOST_UNHEALTHY, ShipPreflightError, ShipPreflightOptions,
     collect_ship_preflight_with_options,
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
-use crate::ship::{ShipExecutionRequest, ShipStores, execute_ship};
+use crate::ship::{ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_ship};
 use crate::ship_state::ShipStateStore;
 use crate::warm_pool::{WarmPool, default_pool_path};
 
@@ -50,8 +50,13 @@ pub(super) struct ShipCommandArgs {
     pub(super) pr_snapshot_file: Option<PathBuf>,
     pub(super) allow_unreachable_targets: bool,
     pub(super) skip_targets: Vec<String>,
+    /// Adopt the current head SHA when recorded ship-state drifted (amend /
+    /// force-push), clearing prior evidence so the new head re-validates
+    /// instead of dead-ending on `ShaDrift`. See Shipyard #346.
+    pub(super) adopt_head: bool,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn ship_command<W: Write>(
     args: ShipCommandArgs,
     config: &LoadedConfig,
@@ -81,6 +86,7 @@ pub(super) fn ship_command<W: Write>(
     }
     let lane_policy = resolve_lane_policy(config, cwd);
     let pr_context = resolve_pr_context(
+        config,
         args.pr,
         &args.base,
         cwd,
@@ -98,7 +104,8 @@ pub(super) fn ship_command<W: Write>(
     let prepared = PreparedStateStore::new(runtime_paths.state_dir.join("prepared"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let warm_pool = WarmPool::new(default_pool_path(&runtime_paths.state_dir));
-    let dispatcher = ExecutorDispatcher::new(Some(prepared));
+    let dispatcher =
+        ExecutorDispatcher::new_with_state_dir(Some(prepared), &runtime_paths.state_dir);
     let request = ShipExecutionRequest {
         pr: pr_context.number,
         repo,
@@ -114,17 +121,23 @@ pub(super) fn ship_command<W: Write>(
         fail_fast: false,
         resume_from: args.resume_from,
         advisory_targets: lane_policy.advisory_targets.clone(),
+        adopt_head: args.adopt_head,
         targets,
     };
 
-    let outcome = execute_ship(
+    let job = submit_ship(&request, &mut queue, cwd, &runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let outcome = drain_or_wait_ship(
         &request,
+        job.clone(),
         ShipStores {
             queue: &mut queue,
             evidence: &evidence,
             ship_state: &ship_state,
             warm_pool: &warm_pool,
+            cwd,
             state_dir: &runtime_paths.state_dir,
+            config,
         },
         &dispatcher,
     )
@@ -143,7 +156,7 @@ pub(super) fn ship_command<W: Write>(
     // before we render so the human / JSON output points the user at the
     // failing test list, not just "Validation failed".
     let diagnostics = if render_state == ShipRenderState::ValidationFailed {
-        collect_failure_diagnostics(&request.repo, &outcome.job)
+        collect_failure_diagnostics(&request.repo, &outcome.job, cwd, config)
     } else {
         Vec::new()
     };
@@ -173,8 +186,13 @@ pub(super) struct RenderedDiagnostics {
     pub(super) details: Option<FailureDiagnostics>,
 }
 
-fn collect_failure_diagnostics(repo: &str, job: &Job) -> Vec<RenderedDiagnostics> {
-    let fetcher = GhDiagnosticsFetcher;
+fn collect_failure_diagnostics(
+    repo: &str,
+    job: &Job,
+    cwd: &Path,
+    config: &LoadedConfig,
+) -> Vec<RenderedDiagnostics> {
+    let fetcher = GhDiagnosticsFetcher::from_loaded_config(cwd, config);
     let mut out = Vec::new();
     for result in job.results.values() {
         if matches!(
@@ -274,6 +292,7 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
     let code = match error {
         ShipPreflightError::RootMismatch { .. } => 1,
         ShipPreflightError::BackendUnreachable { .. } => EXIT_BACKEND_UNREACHABLE,
+        ShipPreflightError::HostUnhealthy { .. } => EXIT_HOST_UNHEALTHY,
     };
     CliFailure::new(code, error.to_string())
 }
@@ -353,7 +372,10 @@ fn maybe_auto_create_base_branch(
     let Ok(rules) = resolve_branch_rules(&config.data, base) else {
         return;
     };
-    let _ = put_branch_protection(&repo, base, &rules, gh_command);
+    let Ok(gh) = GovernanceGh::from_loaded_config(cwd, config, gh_command) else {
+        return;
+    };
+    let _ = put_branch_protection(&repo, base, &rules, &gh);
 }
 
 fn origin_branch_exists(cwd: &Path, branch: &str) -> Option<bool> {
@@ -391,6 +413,7 @@ struct ResolvedPrContext {
 }
 
 fn resolve_pr_context(
+    config: &LoadedConfig,
     pr: Option<u64>,
     base: &str,
     cwd: &Path,
@@ -408,10 +431,10 @@ fn resolve_pr_context(
     }
 
     push_branch(cwd, branch).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let info = find_pr_for_branch(cwd, gh_command, branch)
+    let info = find_pr_for_branch(config, cwd, gh_command, branch)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .map_or_else(
-            || create_current_branch_pr(cwd, gh_command, branch, base, lane_policy),
+            || create_current_branch_pr(config, cwd, gh_command, branch, base, lane_policy),
             Ok::<PrInfo, CliFailure>,
         )?;
     Ok(ResolvedPrContext {
@@ -423,6 +446,7 @@ fn resolve_pr_context(
 }
 
 fn create_current_branch_pr(
+    config: &LoadedConfig,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
@@ -430,6 +454,7 @@ fn create_current_branch_pr(
     lane_policy: &LanePolicy,
 ) -> Result<PrInfo, CliFailure> {
     create_pr(
+        config,
         cwd,
         gh_command,
         branch,
@@ -487,6 +512,15 @@ fn post_run_merge_state(
             Ok(ShipRenderState::Merged)
         }
         AutoMergeOutcome::MergeFailed { error } => Ok(ShipRenderState::GreenNotMerged(error)),
+        // Validation passed but the live head advanced past the validated SHA
+        // (issue #321). Report green-not-merged so `shipyard ship` surfaces
+        // merged:false / status:"green_not_merged" and the operator re-ships
+        // to validate the new head.
+        AutoMergeOutcome::SupersededSha { validated, current } => {
+            Ok(ShipRenderState::GreenNotMerged(format!(
+                "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
+            )))
+        }
         AutoMergeOutcome::PrNotFound
         | AutoMergeOutcome::InFlight { .. }
         | AutoMergeOutcome::TargetFailed { .. } => Err(CliFailure::new(
@@ -777,6 +811,19 @@ mod tests {
         assert!(status.success(), "git command failed: {args:?}");
     }
 
+    /// Capture a git command's trimmed stdout (e.g. `rev-parse HEAD`) so a
+    /// test can pin the issue #321 merge preflight's live-head snapshot to
+    /// the seeded repo's real HEAD SHA.
+    fn git_capture(args: &[&str], cwd: &std::path::Path) -> String {
+        let output = crate::supervised::git_supervised()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git command should run");
+        assert!(output.status.success(), "git command failed: {args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
     fn seed_repo(repo: &std::path::Path) {
         std::fs::create_dir_all(repo).expect("repo dir");
         git(&["init", "--quiet", "--initial-branch=main"], repo);
@@ -906,6 +953,12 @@ mod tests {
             Some(temp.path().join("global")),
             Some(temp.path().join("state")),
         );
+        // The issue #321 merge preflight verifies the live PR head matches
+        // the validated SHA. Pin the live head to the seeded repo's real HEAD
+        // so the happy-path merge proceeds.
+        let head = git_capture(&["rev-parse", "HEAD"], &repo);
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{head}"}}"#)).expect("write snapshot");
         let mut stdout = Vec::new();
 
         let code = ship_command(
@@ -918,9 +971,10 @@ mod tests {
                 merge_command: None,
                 merge_result: Some(MergeResult::Success),
                 gh_command: None,
-                pr_snapshot_file: None,
+                pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -970,8 +1024,17 @@ mod tests {
             Some(temp.path().join("global")),
             Some(temp.path().join("state")),
         );
+        // `state:OPEN` keeps the failure-path `pr_is_merged` escape hatch
+        // closed; `headRefOid` matching the seeded HEAD lets the issue #321
+        // preflight pass so the injected `MergeResult::Failure` is the thing
+        // under test.
+        let head = git_capture(&["rev-parse", "HEAD"], &repo);
         let snapshot = temp.path().join("pr.json");
-        std::fs::write(&snapshot, r#"{"state":"OPEN"}"#).expect("write snapshot");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"state":"OPEN","headRefOid":"{head}"}}"#),
+        )
+        .expect("write snapshot");
         let mut stdout = Vec::new();
 
         let code = ship_command(
@@ -987,6 +1050,7 @@ mod tests {
                 pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1034,6 +1098,7 @@ mod tests {
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &unreachable_ssh_config(temp.path()),
             &repo,
@@ -1080,6 +1145,7 @@ mod tests {
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
                 skip_targets: vec!["linux".to_owned()],
+                adopt_head: false,
             },
             &local_and_unreachable_config(temp.path()),
             &repo,
@@ -1142,6 +1208,7 @@ exit 2
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1242,6 +1309,7 @@ exit 2
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
+                adopt_head: false,
             },
             &loaded_config(temp.path()),
             &repo,

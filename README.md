@@ -59,6 +59,16 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   and `shipyard wait pr` fall back to REST automatically when
   GraphQL exhausts (separate 5000/hr bucket). `shipyard doctor
   --rate-limit` shows both buckets so you can see which one is hot.
+- **Optional tartci VM integration.** Projects with Apple Silicon VM fleets can
+  keep local VM images, caches, and per-host capacity in
+  [tartci](https://github.com/danielraffel/tartci), then let Shipyard resolve
+  the active profile into one concrete GitHub runner selector before each
+  dispatch.
+- **Agent-readable runner metrics.** `shipyard metrics` records local command
+  timings, imports GitHub Actions jobs, and imports optional tartci VM timing
+  exports into a small SQLite store. Agents can ask for summaries, drift
+  findings, and placement advice without requiring tartci or any observability
+  service.
 
 ## Installation
 
@@ -127,7 +137,10 @@ It calls your build commands and cares about one thing: did they pass?
 - [Security & Governance](docs/governance.md) — `solo` vs `multi`
   profiles, branch protection, tag protection.
 - [Profiles & Configuration](docs/profiles.md) — switch between local /
-  cloud / full setups with one command.
+  cloud / full setups with one command, plus repo-owned CI routing profiles
+  and optional tartci-backed local VM routing.
+- [CLI Reference](docs/cli-reference.md#runner-metrics) — record/import/query
+  runner performance metrics for agent monitoring.
 - [Manual CLI Workflows](docs/workflows.md) — debugging failed runs,
   managing the queue, partial reruns.
 - [Resuming an interrupted ship](docs/ship-resume.md) — how `shipyard ship`
@@ -282,6 +295,18 @@ Live mode requires the `shipyard` CLI to be installed on the Mac running the app
 ### Will pushing without `shipyard ship` break anything I've already shipped?
 
 No. A branch force-push or one-off commit on a tracked PR leaves the existing ship-state entry as-is (still scoped to the old SHA) until you explicitly re-ship or archive it. The app may show stale evidence for that PR until then. [Issue #128](https://github.com/danielraffel/Shipyard/issues/128) tracks improving this with passive observer mode.
+
+### Can Shipyard use a larger GitHub API quota?
+
+Yes. Shipyard can authenticate its GitHub calls with a GitHub App installation
+token instead of your normal `gh` user token. For non-Enterprise GitHub App
+installations, GitHub starts at 5,000 REST requests/hour and scales by
+repository count after 20 repositories, up to 12,500 requests/hour. In practice,
+an installation with access to 170+ repositories reaches the cap. GitHub Pro is
+not the important factor; using an installation access token is.
+
+See [`docs/github-app-quota.md`](docs/github-app-quota.md) for the setup fields,
+permissions, Shipyard config, and quota validation commands.
 
 ## Learn more
 

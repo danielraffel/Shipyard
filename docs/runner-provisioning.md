@@ -1,0 +1,125 @@
+# Self-Hosted Runner Provisioning
+
+`shipyard runner register | list | remove | tag` brings a Mac into a repo's
+GitHub Actions CI fleet and lets you see/manage that fleet across machines. It
+is the provisioning complement to the [runner watchdog](./runner-watchdog.md),
+which recovers stuck runners. Pure naming/index/label/table logic lives in
+`src/runner_provision.rs`; the shell side (talks to `gh`, the runner's
+`config.sh`/`svc.sh`, and local `~/actions-runner-*` dirs) is
+`src/app/runner_provision_cmd.rs`.
+
+## Mental model
+
+- **GitHub is the cross-machine registry.** Every runner on every Mac reports
+  to GitHub, so "X jobs on the Studio, Y on the laptop" is just "register X
+  runner services on the Studio and Y on the laptop" — GitHub schedules each
+  queued job onto any idle runner whose labels match. No controller, no
+  inbound networking between your Macs.
+- **Two phases.** Provisioning the *host* (Xcode, Homebrew deps, caches, Skia)
+  is once per machine and is the repo's own concern (e.g. pulp's
+  `tools/ci/bootstrap-macos-host.sh`). Registering *runners* is once per repo
+  per machine and is what this command does. It assumes a buildable host.
+- **Non-macOS + emulated lanes are tartci targets, not `shipyard runner`
+  registrations.** This command provisions native macOS Actions runners. Local
+  Linux / Windows build VMs (and the emulated **x86_64** smoke lane —
+  cross-compile + qemu-user / Prism) are driven by
+  [tartci](https://github.com/danielraffel/tartci) and wired into Shipyard as
+  ordinary `backend = "local"` targets whose validation command shells to
+  `tartci up <os> [--target-arch x86_64]` — see
+  [targets.md](./targets.md#emulated-x86_64-smoke-local-via-tartci).
+
+## Machine tag
+
+Runners are named `<repo>-<machine-tag>-NN`, e.g. `pulp-studio-01`. The tag is
+an explicit per-box value stored at `<state_dir>/machine-tag`, **never derived
+from the hostname** — two MacBook Pros can share a hostname, so a
+hostname-derived tag would collide and clobber runner names.
+
+```bash
+shipyard runner tag --set studio   # one-time, per machine (studio | m1 | m5 | …)
+shipyard runner tag                # print the stored tag
+```
+
+Tags must be lowercase letters, digits, and dashes (no leading/trailing/doubled
+dash).
+
+## Register
+
+```bash
+shipyard runner register --repo danielraffel/pulp --count 3 \
+  --ci-root /Volumes/Workshop/ci/pulp [--machine-tag studio] [--labels a,b,c] [--dry-run]
+```
+
+What it does per runner:
+
+1. Computes the next free index by listing the repo's existing runners (any
+   machine) and continuing past the highest `<repo>-<tag>-NN`. Re-running
+   appends capacity (`-04`, `-05`) without collisions.
+2. Downloads the `osx-arm64` runner tarball once into
+   `<ci-root>/cache/actions-runner-pkg/` and extracts it into
+   `~/actions-runner-<name>`.
+3. Writes a per-runner `.env` pointing ccache + FetchContent at the shared
+   caches and isolating each runner's `_work` for cross-worktree cache hits
+   (`CCACHE_BASEDIR` + `CCACHE_NOHASHDIR`). Cache **size** is owned by the
+   host's `ccache.conf`, not this command.
+4. Fetches a registration token, runs `config.sh --unattended --replace`, then
+   `svc.sh install && svc.sh start` (a user LaunchAgent — no sudo).
+
+### Labels
+
+Default: `self-hosted,macos,arm64,<repo>-build,<repo>-build-<tag>`.
+
+- `<repo>-build` — the shared routing label a repo's workflow selects (e.g.
+  pulp's `PULP_LOCAL_MACOS_RUNS_ON_JSON=["self-hosted","pulp-build"]`). Carry it
+  so the new runners immediately join the pool.
+- `<repo>-build-<tag>` — host pin label, to force work onto one machine.
+
+Override the whole set with `--labels` when a repo's workflow selects something
+else (e.g. Shipyard's own CI currently selects `local-mac`).
+
+### Paths
+
+| Path | What |
+|------|------|
+| `~/actions-runner-<name>` | the runner install + its `.env` |
+| `<ci-root>/work/<name>` | that runner's `_work` (isolated per runner) |
+| `<ci-root>/cache/ccache` | shared ccache (size set by host `ccache.conf`) |
+| `<ci-root>/cache/fetchcontent-src` | shared CMake FetchContent sources |
+
+`--dry-run` prints the full plan (names, work dirs, labels, parallelism)
+without downloading, configuring, or starting anything.
+
+## List
+
+```bash
+shipyard runner list                       # repos discovered from local dirs + cwd
+shipyard runner list --repo danielraffel/pulp [--repo …] [--all-repos]
+```
+
+Renders the live pool grouped by machine tag, pulled straight from GitHub (so a
+laptop's runners show up even when you run it on the Studio). It also scans this
+machine's `~/actions-runner-*` dirs and flags **orphans** — local runner dirs
+whose configured name is no longer registered on GitHub (e.g. a deregistered
+runner whose directory lingers).
+
+## Remove
+
+```bash
+shipyard runner remove --name pulp-studio-03 --yes [--purge-dir]
+```
+
+Stops the LaunchAgent, fetches a removal token, and runs `config.sh remove`.
+`--purge-dir` also deletes `~/actions-runner-<name>`. Requires `--yes`.
+
+## Adding a brand-new machine (e.g. an M5 laptop)
+
+1. Provision the host for the repo (its own bootstrap: Xcode, Homebrew deps,
+   Skia, ccache). For a fresh python.org Python, run its bundled
+   `Install Certificates.command` first or asset downloads fail with
+   `SSL: CERTIFICATE_VERIFY_FAILED`.
+2. `shipyard runner tag --set m5`
+3. `shipyard runner register --repo <owner/repo> --count <N> --ci-root <dir>`
+4. `shipyard runner list --repo <owner/repo>` to confirm `<repo>-m5-NN` online.
+
+The index continues from any existing runners on other machines, so the M5's
+runners never collide with the Studio's or the laptop's.

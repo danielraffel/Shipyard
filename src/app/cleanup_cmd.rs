@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::CliFailure;
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::ship_state::ShipStateStore;
 
@@ -72,13 +74,15 @@ impl CleanupOutput {
 
 pub(super) fn cleanup_command<W: Write>(
     state_dir: &Path,
+    mode: RuntimeMode,
+    cwd: &Path,
     options: CleanupCommandOptions,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let dry_run = options.mode.is_dry_run();
     let result = cleanup_retention(state_dir, dry_run)?;
     let ship_state_report = if options.scope == CleanupScope::IncludeShipState {
-        Some(cleanup_ship_state(state_dir, dry_run)?)
+        Some(cleanup_ship_state(state_dir, mode, cwd, dry_run)?)
     } else {
         None
     };
@@ -249,6 +253,8 @@ fn scan_evidence(
 
 fn cleanup_ship_state(
     state_dir: &Path,
+    mode: RuntimeMode,
+    cwd: &Path,
     dry_run: bool,
 ) -> Result<ShipStateCleanupReport, CliFailure> {
     let store = ShipStateStore::new(state_dir.join("ship"))
@@ -265,7 +271,9 @@ fn cleanup_ship_state(
 
     let now = Utc::now();
     let active_cutoff = now - Duration::days(ACTIVE_SHIP_STATE_DAYS);
-    let closed_prs = gather_closed_prs(&store);
+    let gh_client =
+        GhClient::from_cwd(mode, cwd).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let closed_prs = gather_closed_prs(&store, cwd, &gh_client)?;
     let mut deleted_active = Vec::new();
     for state in store.list_active() {
         if closed_prs.contains(&state.pr) && state.updated_at <= active_cutoff {
@@ -310,31 +318,42 @@ fn prune_archived_ship_state(store: &ShipStateStore) -> Result<Vec<String>, CliF
     Ok(deleted)
 }
 
-fn gather_closed_prs(store: &ShipStateStore) -> Vec<u64> {
-    store
-        .list_active()
-        .into_iter()
-        .filter_map(|state| pr_is_closed(state.pr).then_some(state.pr))
-        .collect()
+fn gather_closed_prs(
+    store: &ShipStateStore,
+    cwd: &Path,
+    gh_client: &GhClient,
+) -> Result<Vec<u64>, CliFailure> {
+    let mut closed = Vec::new();
+    for state in store.list_active() {
+        if pr_is_closed(state.pr, cwd, gh_client)? {
+            closed.push(state.pr);
+        }
+    }
+    Ok(closed)
 }
 
-fn pr_is_closed(pr: u64) -> bool {
-    let Ok(output) = Command::new("gh")
+fn pr_is_closed(pr: u64, cwd: &Path, gh_client: &GhClient) -> Result<bool, CliFailure> {
+    let output = gh_client
+        .prepare_command(
+            cwd,
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
         .args(["pr", "view", &pr.to_string(), "--json", "state"])
         .output()
-    else {
-        return false;
-    };
+        .map_err(|error| CliFailure::new(1, format!("failed to run gh pr view: {error}")))?;
     if !output.status.success() {
-        return false;
+        return Ok(false);
     }
     let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return false;
+        return Ok(false);
     };
-    matches!(
+    Ok(matches!(
         value.get("state").and_then(Value::as_str),
         Some("MERGED" | "CLOSED")
-    )
+    ))
 }
 
 fn write_cleanup_json<W: Write>(

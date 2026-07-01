@@ -13,12 +13,16 @@ use toml::{Table, Value as TomlValue};
 
 use super::{
     CliFailure,
-    cli::{TargetBackend, TargetsCommand, TargetsWarmCommand},
+    cli::{TargetBackend, TargetsCommand, TargetsPoolCommand, TargetsWarmCommand},
 };
 use crate::config::LoadedConfig;
 use crate::executor::dispatch::{
     ExecutorDispatcher, ResolvedBackend, ResolvedTarget, resolve_targets,
     resolve_targets_from_table,
+};
+use crate::host_pool::{
+    HostPoolConfig, HostPoolLease, HostPoolLeaseStore, HostPoolMemberConfig, default_lease_path,
+    parse_host_pools,
 };
 use crate::identity::RuntimeMode;
 use crate::job::ValidationMode;
@@ -60,6 +64,9 @@ pub(super) fn targets_command<W: Write>(
         TargetsCommand::Remove { name } => targets_remove(&config, &name, json_mode, stdout)?,
         TargetsCommand::Warm { command } => {
             targets_warm(command, state_dir, json_mode, stdout)?;
+        }
+        TargetsCommand::Pool { command } => {
+            targets_pool(command, &config, state_dir, json_mode, stdout)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -341,6 +348,92 @@ fn targets_warm_drain<W: Write>(
     Ok(())
 }
 
+fn targets_pool<W: Write>(
+    command: Option<TargetsPoolCommand>,
+    config: &LoadedConfig,
+    state_dir: &Path,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    match command.unwrap_or(TargetsPoolCommand::Status) {
+        TargetsPoolCommand::Status => targets_pool_status(config, state_dir, json_mode, stdout),
+        TargetsPoolCommand::Cleanup { dry_run, fix } => {
+            targets_pool_cleanup(state_dir, dry_run || !fix, json_mode, stdout)
+        }
+    }
+}
+
+fn targets_pool_status<W: Write>(
+    config: &LoadedConfig,
+    state_dir: &Path,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let pools =
+        parse_host_pools(&config.data).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let store = HostPoolLeaseStore::new(default_lease_path(state_dir));
+    let leases = store
+        .leases()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let rows = host_pool_rows(&pools, &leases, Utc::now());
+
+    if json_mode {
+        let mut data = BTreeMap::new();
+        data.insert(
+            "pools".to_owned(),
+            serde_json::to_value(&rows).map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        write_json_envelope(stdout, "targets.pool.status", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return Ok(());
+    }
+
+    write_host_pool_status_human(stdout, &rows)
+}
+
+fn targets_pool_cleanup<W: Write>(
+    state_dir: &Path,
+    dry_run: bool,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    let now = Utc::now();
+    let store = HostPoolLeaseStore::new(default_lease_path(state_dir));
+    let leases = store
+        .leases()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let stale_leases = leases.iter().filter(|lease| lease.is_stale(now)).count();
+    let removed = if dry_run {
+        0
+    } else {
+        store
+            .prune_stale(now)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?
+    };
+
+    if json_mode {
+        let mut data = BTreeMap::new();
+        data.insert("dry_run".to_owned(), json!(dry_run));
+        data.insert("stale_leases".to_owned(), json!(stale_leases));
+        data.insert("removed".to_owned(), json!(removed));
+        write_json_envelope(stdout, "targets.pool.cleanup", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return Ok(());
+    }
+
+    if dry_run {
+        writeln!(
+            stdout,
+            "Would remove {stale_leases} stale host-pool lease record(s)."
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        writeln!(stdout, "Removed {removed} stale host-pool lease record(s).")
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Eq, PartialEq, Serialize)]
 struct TargetRow {
     name: String,
@@ -378,6 +471,51 @@ struct WarmEntryRow {
     ttl_remaining_secs: f64,
     expires_at: String,
     created_at: String,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct HostPoolStatusRow {
+    name: String,
+    strategy: String,
+    lease_stale_seconds: u64,
+    heartbeat_interval_seconds: u64,
+    members: Vec<HostPoolMemberStatusRow>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct HostPoolMemberStatusRow {
+    id: String,
+    #[serde(rename = "type")]
+    backend_type: String,
+    host: Option<String>,
+    repo_path: Option<String>,
+    cwd: Option<String>,
+    max_concurrency: u32,
+    available_slots: u32,
+    capabilities: Vec<String>,
+    state: String,
+    active_leases: usize,
+    stale_leases: usize,
+    leases: Vec<HostPoolLeaseStatusRow>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct HostPoolLeaseStatusRow {
+    lease_id: String,
+    target: String,
+    backend: String,
+    host: Option<String>,
+    job_id: Option<String>,
+    branch: String,
+    sha: String,
+    short_sha: String,
+    owner_pid: u32,
+    acquired_at: DateTime<Utc>,
+    heartbeat_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    stale: bool,
+    age_seconds: i64,
+    heartbeat_age_seconds: i64,
 }
 
 fn target_tables(config: &LoadedConfig) -> Option<&Table> {
@@ -481,6 +619,160 @@ fn write_targets_list_human<W: Write>(
     writeln!(stdout).map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
+fn host_pool_rows(
+    pools: &[HostPoolConfig],
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> Vec<HostPoolStatusRow> {
+    pools
+        .iter()
+        .map(|pool| HostPoolStatusRow {
+            name: pool.name.clone(),
+            strategy: pool.strategy.clone(),
+            lease_stale_seconds: pool.lease_stale_seconds,
+            heartbeat_interval_seconds: pool.heartbeat_interval_seconds,
+            members: pool
+                .members
+                .iter()
+                .map(|member| host_pool_member_row(pool, member, leases, now))
+                .collect(),
+        })
+        .collect()
+}
+
+fn host_pool_member_row(
+    pool: &HostPoolConfig,
+    member: &HostPoolMemberConfig,
+    leases: &[HostPoolLease],
+    now: DateTime<Utc>,
+) -> HostPoolMemberStatusRow {
+    let member_leases = leases
+        .iter()
+        .filter(|lease| lease.pool_name == pool.name && lease.member_id == member.id)
+        .collect::<Vec<_>>();
+    let active_leases = member_leases
+        .iter()
+        .filter(|lease| !lease.is_stale(now))
+        .count();
+    let stale_leases = member_leases.len() - active_leases;
+    let available_slots = member
+        .max_concurrency
+        .saturating_sub(u32::try_from(active_leases).unwrap_or(u32::MAX));
+    HostPoolMemberStatusRow {
+        id: member.id.clone(),
+        backend_type: member.backend_type.clone(),
+        host: member.host.clone(),
+        repo_path: member.repo_path.clone(),
+        cwd: member.cwd.as_ref().map(|path| path.display().to_string()),
+        max_concurrency: member.max_concurrency,
+        available_slots,
+        capabilities: member.capabilities.clone(),
+        state: if active_leases > 0 { "busy" } else { "idle" }.to_owned(),
+        active_leases,
+        stale_leases,
+        leases: member_leases
+            .into_iter()
+            .map(|lease| host_pool_lease_row(lease, now))
+            .collect(),
+    }
+}
+
+fn host_pool_lease_row(lease: &HostPoolLease, now: DateTime<Utc>) -> HostPoolLeaseStatusRow {
+    HostPoolLeaseStatusRow {
+        lease_id: lease.lease_id.clone(),
+        target: lease.target_name.clone(),
+        backend: lease.backend.clone(),
+        host: lease.host.clone(),
+        job_id: lease.job_id.clone(),
+        branch: lease.branch.clone(),
+        sha: lease.sha.clone(),
+        short_sha: short_sha(&lease.sha).to_owned(),
+        owner_pid: lease.owner_pid,
+        acquired_at: lease.acquired_at,
+        heartbeat_at: lease.heartbeat_at,
+        expires_at: lease.expires_at,
+        stale: lease.is_stale(now),
+        age_seconds: seconds_since(now, lease.acquired_at),
+        heartbeat_age_seconds: seconds_since(now, lease.heartbeat_at),
+    }
+}
+
+fn write_host_pool_status_human<W: Write>(
+    stdout: &mut W,
+    rows: &[HostPoolStatusRow],
+) -> Result<(), CliFailure> {
+    if rows.is_empty() {
+        writeln!(stdout, "No host pools configured.")
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        return Ok(());
+    }
+
+    writeln!(stdout).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    writeln!(stdout, "Host pools").map_err(|error| CliFailure::new(1, error.to_string()))?;
+    for pool in rows {
+        writeln!(
+            stdout,
+            "  {} strategy={} stale={}s heartbeat={}s",
+            pool.name, pool.strategy, pool.lease_stale_seconds, pool.heartbeat_interval_seconds
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        for member in &pool.members {
+            writeln!(
+                stdout,
+                "    {:<16} {:<5} {:<4} active={} stale={} slots={}/{} {} caps={}",
+                member.id,
+                member.backend_type,
+                member.state,
+                member.active_leases,
+                member.stale_leases,
+                member.available_slots,
+                member.max_concurrency,
+                host_pool_member_location(member),
+                display_pool_capabilities(&member.capabilities)
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            for lease in &member.leases {
+                writeln!(
+                    stdout,
+                    "      lease={} target={} sha={} branch={} age={}s heartbeat={}s{}{}",
+                    lease.lease_id,
+                    lease.target,
+                    lease.short_sha,
+                    lease.branch,
+                    lease.age_seconds,
+                    lease.heartbeat_age_seconds,
+                    lease
+                        .job_id
+                        .as_ref()
+                        .map(|job| format!(" job={job}"))
+                        .unwrap_or_default(),
+                    if lease.stale { " stale" } else { "" }
+                )
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            }
+        }
+    }
+    writeln!(stdout).map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+fn host_pool_member_location(member: &HostPoolMemberStatusRow) -> String {
+    if let Some(host) = &member.host {
+        return format!("host={host}");
+    }
+    if let Some(cwd) = &member.cwd {
+        return format!("cwd={cwd}");
+    }
+    "-".to_owned()
+}
+
+fn display_pool_capabilities(capabilities: &[String]) -> String {
+    if capabilities.is_empty() {
+        "-".to_owned()
+    } else {
+        capabilities.join(",")
+    }
+}
+
 fn append_target_section(
     config_path: &Path,
     name: &str,
@@ -561,4 +853,163 @@ fn round_one(value: f64) -> f64 {
 
 fn short_sha(sha: &str) -> &str {
     sha.get(..8).unwrap_or(sha)
+}
+
+fn seconds_since(now: DateTime<Utc>, then: DateTime<Utc>) -> i64 {
+    now.signed_duration_since(then).num_seconds().max(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use chrono::Duration as ChronoDuration;
+    use serde_json::Value;
+    use tempfile::TempDir;
+    use toml::Table;
+
+    use super::{LoadedConfig, targets_pool_cleanup, targets_pool_status};
+    use crate::config::LocalOverlaySource;
+    use crate::host_pool::{HostPoolLeaseRequest, HostPoolLeaseStore, default_lease_path};
+
+    fn table(input: &str) -> Table {
+        input.parse::<Table>().expect("toml")
+    }
+
+    fn loaded_config(data: Table) -> LoadedConfig {
+        LoadedConfig {
+            data,
+            global_dir: PathBuf::from("/tmp/global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        }
+    }
+
+    #[test]
+    fn pool_status_reports_no_configured_pools() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = loaded_config(Table::new());
+        let mut output = Vec::new();
+
+        targets_pool_status(&config, temp.path(), false, &mut output).expect("status");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf8"),
+            "No host pools configured.\n"
+        );
+    }
+
+    #[test]
+    fn pool_status_json_reports_active_and_stale_leases() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = loaded_config(table(
+            r#"
+            [host_pools.local_macs]
+
+            [[host_pools.local_macs.members]]
+            id = "mac-studio"
+            type = "ssh"
+            host = "mac-studio"
+            max_concurrency = 1
+            capabilities = ["macos", "arm64"]
+
+            [[host_pools.local_macs.members]]
+            id = "local"
+            type = "local"
+            cwd = "/repo"
+            max_concurrency = 1
+            capabilities = ["macos", "arm64"]
+            "#,
+        ));
+        let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        let active = store
+            .acquire(&lease_request("mac-studio", 180))
+            .expect("acquire")
+            .expect("active lease");
+        let stale = store
+            .acquire(&lease_request("local", 1))
+            .expect("acquire stale candidate")
+            .expect("stale lease");
+        let mut leases = store.leases().expect("leases");
+        for lease in &mut leases {
+            if lease.lease_id == stale.lease_id {
+                lease.expires_at = lease.acquired_at - ChronoDuration::seconds(1);
+            }
+        }
+        std::fs::write(
+            default_lease_path(temp.path()),
+            serde_json::to_string_pretty(&serde_json::json!({ "leases": leases })).expect("json"),
+        )
+        .expect("write leases");
+        let mut output = Vec::new();
+
+        targets_pool_status(&config, temp.path(), true, &mut output).expect("status");
+
+        let value: Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(value["command"], "targets.pool.status");
+        let members = value["pools"][0]["members"].as_array().expect("members");
+        assert_eq!(members[0]["id"], "mac-studio");
+        assert_eq!(members[0]["state"], "busy");
+        assert_eq!(members[0]["active_leases"], 1);
+        assert_eq!(members[1]["id"], "local");
+        assert_eq!(members[1]["state"], "idle");
+        assert_eq!(members[1]["stale_leases"], 1);
+        assert_eq!(members[0]["leases"][0]["lease_id"], active.lease_id);
+    }
+
+    #[test]
+    fn pool_cleanup_dry_run_then_fix_prunes_stale_leases() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        let stale = store
+            .acquire(&lease_request("local", 1))
+            .expect("acquire stale candidate")
+            .expect("stale lease");
+        let mut leases = store.leases().expect("leases");
+        for lease in &mut leases {
+            if lease.lease_id == stale.lease_id {
+                lease.expires_at = lease.acquired_at - ChronoDuration::seconds(1);
+            }
+        }
+        std::fs::write(
+            default_lease_path(temp.path()),
+            serde_json::to_string_pretty(&serde_json::json!({ "leases": leases })).expect("json"),
+        )
+        .expect("write leases");
+        let mut dry_run_output = Vec::new();
+
+        targets_pool_cleanup(temp.path(), true, true, &mut dry_run_output).expect("dry run");
+
+        let dry_run: Value = serde_json::from_slice(&dry_run_output).expect("json");
+        assert_eq!(dry_run["command"], "targets.pool.cleanup");
+        assert_eq!(dry_run["dry_run"], true);
+        assert_eq!(dry_run["stale_leases"], 1);
+        assert_eq!(dry_run["removed"], 0);
+        assert_eq!(store.leases().expect("leases").len(), 1);
+
+        let mut fix_output = Vec::new();
+        targets_pool_cleanup(temp.path(), false, true, &mut fix_output).expect("fix");
+
+        let fix: Value = serde_json::from_slice(&fix_output).expect("json");
+        assert_eq!(fix["dry_run"], false);
+        assert_eq!(fix["stale_leases"], 1);
+        assert_eq!(fix["removed"], 1);
+        assert!(store.leases().expect("leases").is_empty());
+    }
+
+    fn lease_request(member_id: &str, lease_stale_seconds: u64) -> HostPoolLeaseRequest {
+        HostPoolLeaseRequest {
+            pool_name: "local_macs".to_owned(),
+            member_id: member_id.to_owned(),
+            target_name: "mac".to_owned(),
+            backend: "ssh".to_owned(),
+            host: Some(member_id.to_owned()),
+            job_id: Some("job-1".to_owned()),
+            branch: "main".to_owned(),
+            sha: "abcdef123456".to_owned(),
+            max_concurrency: 1,
+            lease_stale_seconds,
+        }
+    }
 }

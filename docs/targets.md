@@ -8,6 +8,7 @@ whatever you want and can have as many as you need.
 | Target name | Platform | Backend | What it is |
 |------------|----------|---------|------------|
 | `mac` | macos-arm64 | local | Your Apple Silicon Mac |
+| `mac-pool` | macos-arm64 | host-pool | Ordered local Mac pool with leases |
 | `mac-intel` | macos-x64 | local | Your Intel Mac (if you have one) |
 | `ubuntu` | linux-x64 | ssh | Ubuntu VM running on your Mac |
 | `ubuntu-arm` | linux-arm64 | ssh | ARM64 Linux server |
@@ -16,6 +17,60 @@ whatever you want and can have as many as you need.
 
 You don't need all of these. Use what matches your project — one target
 is fine, six is fine. Add more any time with `shipyard targets add`.
+
+## Watch a local VM or SSH build
+
+`shipyard watch` also has a target-backed mode for long local/SSH VM jobs that
+are not GitHub Actions runs. Use it when you would otherwise hand-roll
+`ssh ... | tee ... | grep ...` loops to follow a build inside a Tart Linux VM.
+
+```sh
+shipyard watch local \
+  --target linux-vm \
+  --command './build-v8.py --target linux-x64 --seal --audit' \
+  --milestone-regex '\[[0-9]+/[0-9]+\]' \
+  --milestone-regex 'AUDIT (PASS|FAIL)' \
+  --terminal-regex 'AUDIT FAIL|ld\.lld: error' \
+  --log-path .shipyard.local/logs/v8-linux-x64.log
+```
+
+The target must resolve to `backend = "local"` or `backend = "ssh"`. Local
+targets run in their configured `cwd`; SSH targets run in `repo_path`. Override
+that with `--cwd` when the workload lives somewhere else. Human output streams
+the target output, prints `shipyard milestone [...]` for each milestone regex
+match, and prints exactly one `shipyard terminal [...]` line when the process
+exits or a terminal regex matches. A terminal regex stops the command early and
+exits nonzero; otherwise Shipyard exits with the process status.
+
+## Run a target command and keep typed evidence
+
+Use `shipyard run command` when a local or POSIX SSH target should run one
+workload-specific command and return a durable evidence bundle, without making
+that command count as merge-ready validation evidence.
+
+```sh
+shipyard run command \
+  --target linux-vm \
+  --name v8-linux-x64-seal \
+  --expect-code 0 \
+  --artifact 'build/linux-x64/lib/libv8.so' \
+  --artifact 'logs/v8-audit.log' \
+  --env-fingerprint PATH \
+  -- bash -lc './build-v8.py --target linux-x64 --seal --audit'
+```
+
+Local targets run in their configured `cwd`; SSH targets run in `repo_path`.
+Override that with `--target-cwd` for worktrees or mounted VM paths. Artifact
+globs are relative to that target working directory and are copied into
+`command-evidence/<id>/artifacts/` under Shipyard state. The record stores the
+command argv, expected and observed exit code, duration, target/backend/host,
+bounded log excerpt, optional environment fingerprints, artifact metadata, and
+the bundle path. Query the newest bundle with:
+
+```sh
+shipyard evidence command --json
+shipyard evidence command --list
+```
 
 ## Fallback when a machine is down
 
@@ -58,6 +113,69 @@ fallback = [
 This keeps things predictable. You always know exactly what Shipyard will
 do because you configured it.
 
+## Prefer a Mac Studio with local fallback
+
+For a two-Mac setup, make the network Mac the primary target and this Mac the
+fallback. This gives you an explicit Mac Studio first path without adding a
+scheduler or hidden self-hosted runner behavior:
+
+```toml
+[targets.mac]
+backend = "ssh"
+host = "mac-studio"
+platform = "macos-arm64"
+repo_path = "/Users/shipyard/work/shipyard"
+warm_keepalive_seconds = 1800
+
+fallback = [
+  { type = "local", cwd = "/Users/danielraffel/Code/shipyard" },
+]
+```
+
+Fallback is for infrastructure failures. If the Mac Studio is reachable and
+the validation command fails, Shipyard reports that failure instead of trying
+to make it pass elsewhere. See [`docs/local-mac-pool.md`](./local-mac-pool.md)
+for the Phase 1 setup checklist and current queue limits.
+
+## Host-pool Mac targets
+
+For a named local Mac pool, configure `[host_pools]` and point a target at it:
+
+```toml
+[host_pools.local_macs]
+strategy = "ordered"
+lease_stale_seconds = 180
+heartbeat_interval_seconds = 15
+
+[[host_pools.local_macs.members]]
+id = "mac-studio"
+type = "ssh"
+host = "mac-studio"
+repo_path = "/Users/shipyard/work/shipyard"
+capabilities = ["macos", "arm64"]
+
+[[host_pools.local_macs.members]]
+id = "local"
+type = "local"
+cwd = "/Users/danielraffel/Code/shipyard"
+capabilities = ["macos", "arm64"]
+
+[targets.mac]
+backend = "host-pool"
+pool = "local_macs"
+platform = "macos-arm64"
+requires = ["macos", "arm64"]
+```
+
+`shipyard targets pool status` shows configured members, active leases, stale
+leases, available slots, and queue job ownership when a pool member is leased.
+`shipyard targets pool cleanup --fix` removes stale lease records from Shipyard
+state; it does not delete remote workdirs. The queue can run multiple
+non-conflicting jobs under one local drain owner, so separate jobs may use
+different available host-pool members concurrently. Jobs still serialize when
+they claim the same checkout, PR state, evidence lane, or exhausted pool
+capacity.
+
 ## Locality routing (`requires`)
 
 Targets can declare capability constraints with `requires = [...]`.
@@ -80,6 +198,67 @@ The standard capability vocabulary is `gpu`, `arm64`, `x86_64`,
 `macos`, `linux`, `windows`, `nested_virt`, `privileged`. You can add
 your own strings — the matcher is pure set containment, so unknown
 capabilities work as long as the target and the provider agree.
+
+## Emulated x86_64 smoke (local, via tartci)
+
+On an Apple-Silicon Mac the local VM lanes are **ARM64** — there is no x86 guest
+(Apple Virtualization and QEMU-on-hvf are both ARM64). You can still get a *local
+x86_64 signal* by cross-compiling in the guest and running the tests under
+emulation (qemu-user on Linux, Prism on Windows-ARM). Wire it as a plain
+`backend = "local"` target whose validation command shells out to
+[tartci](https://github.com/danielraffel/tartci)'s cross lane — no new Shipyard
+config field is needed, because a target is just a machine + a command:
+
+```toml
+# Emulated x86_64 Linux smoke. Cross-builds x64 and runs the test subset under
+# qemu-user-static inside an ephemeral Tart Linux clone, then discards it.
+[targets.linux-x64-smoke]
+backend  = "local"
+platform = "linux-x64"
+
+[targets.linux-x64-smoke.validation]
+command = "tartci up linux --target-arch x86_64"
+```
+
+```toml
+# Prove just the toolchain + emulator chain (golden-agnostic, no checkout):
+[targets.x64-selftest]
+backend  = "local"
+platform = "linux-x64"
+
+[targets.x64-selftest.validation]
+command = "tartci up linux --target-arch x86_64 --self-test"
+```
+
+This is a **smoke / debug** signal, not a gate: sanitizers, SIMD/Highway
+dispatch, and RT timing are unreliable under emulation. Keep a real x86_64 runner
+(GitHub-hosted, an SSH x64 box, or a Namespace cloud profile) as the
+authoritative x64 gate, and model it as a **separate target** — do **not** chain
+the smoke target to the gate with `fallback`. Fallback fires only when a machine
+is *unreachable* (an infrastructure failure), not when validation *fails* (see
+"Fallback is for infrastructure failures" above), so a failing emulated smoke
+must surface as a failure, never silently fall through to cloud:
+
+```toml
+# Fast local pre-check (manual / pre-push): emulated x64 via tartci, above.
+[targets.linux-x64-smoke]
+backend  = "local"
+platform = "linux-x64"
+
+[targets.linux-x64-smoke.validation]
+command = "tartci up linux --target-arch x86_64"
+
+# The authoritative x64 gate — a real x86_64 runner, an independent target.
+[targets.linux]
+backend  = "cloud"
+platform = "linux-x64"
+```
+
+Run the smoke target when you want a fast local signal; the gate target stays
+the one your PR must pass. The GPU-on cross build needs a separate x86_64 Skia
+tree (both Linux arches collide on one `libskia.a` path); the tartci lane
+defaults GPU-off for the smoke and documents the `--skia-dir` opt-in. See
+tartci's runbook §3.8.
 
 Capabilities are resolved in this order for each backend:
 
@@ -117,8 +296,8 @@ $ shipyard doctor
 
   Cloud providers:
     ✓ gh 2.62.0 (authenticated as danielraffel)
-    ✗ nsc — not installed
-      → Install with: brew install namespace-cli
+    ✓ nsc — not configured (optional)
+      Only needed for Namespace runners; install with: brew install namespace-cli
 
   SSH targets:
     ✓ ubuntu — reachable (847ms)

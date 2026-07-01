@@ -21,6 +21,7 @@ use super::CliFailure;
 use super::cli::RunnerCommand;
 use crate::cloud::{GitHubActions, QueuedRun};
 use crate::config::LoadedConfig;
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::runner_watchdog::{
     DEFAULT_MAX_JOB_MIN, DEFAULT_MAX_QUEUE_AGE_HOURS, DEFAULT_REAP_IN_PROGRESS_MAX_MIN,
@@ -38,14 +39,16 @@ const QUEUED_RUNS_LIMIT: u32 = 100;
 const REAP_RUNS_MAX_PAGES: u32 = 5;
 
 /// Entry point dispatched from `src/app.rs`.
+#[allow(clippy::too_many_lines)]
 pub(super) fn runner_command<W: Write>(
     command: RunnerCommand,
+    mode: RuntimeMode,
     config: &LoadedConfig,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let actions = GitHubActions::new(cwd);
+    let actions = GitHubActions::from_loaded_config(cwd, config);
     match command {
         RunnerCommand::Status {
             runner_id,
@@ -123,6 +126,88 @@ pub(super) fn runner_command<W: Write>(
                 json,
             },
             stdout,
+        ),
+        RunnerCommand::Tag { set } => {
+            super::runner_provision_cmd::tag_command(mode, set, json, stdout)
+        }
+        RunnerCommand::Register {
+            repo,
+            count,
+            machine_tag,
+            labels,
+            ci_root,
+            dry_run,
+        } => super::runner_provision_cmd::register_command(
+            super::runner_provision_cmd::RegisterArgs {
+                mode,
+                cwd,
+                actions: &actions,
+                repo,
+                count,
+                machine_tag,
+                labels,
+                ci_root,
+                dry_run,
+                json,
+            },
+            stdout,
+        ),
+        RunnerCommand::List { repo, all_repos } => {
+            super::runner_provision_cmd::list_command(cwd, &actions, &repo, all_repos, json, stdout)
+        }
+        RunnerCommand::Audit { repo } => {
+            super::runner_provision_cmd::audit_command(cwd, &actions, &repo, json, stdout)
+        }
+        RunnerCommand::Capacity => super::capacity_cmd::capacity_command(config, json, stdout),
+        RunnerCommand::FleetStatus {
+            repo,
+            target,
+            queued_age_threshold_secs,
+            queue_run_limit,
+        } => super::fleet_status_cmd::fleet_status_command(
+            super::fleet_status_cmd::FleetStatusArgs {
+                repo,
+                target,
+                queued_age_threshold_secs,
+                queue_run_limit,
+            },
+            config,
+            cwd,
+            &actions,
+            json,
+            stdout,
+        ),
+        RunnerCommand::RerouteWatch {
+            repo,
+            target,
+            interval,
+            flap_window,
+            once,
+            max_ticks,
+            apply,
+        } => super::reroute_cmd::reroute_watch_command(
+            &super::reroute_cmd::RerouteWatchArgs {
+                repo,
+                target,
+                interval_secs: interval,
+                flap_window_secs: flap_window,
+                once,
+                max_ticks,
+                apply,
+            },
+            config,
+            cwd,
+            &actions,
+            json,
+            stdout,
+        ),
+        RunnerCommand::Remove {
+            name,
+            repo,
+            purge_dir,
+            yes,
+        } => super::runner_provision_cmd::remove_command(
+            cwd, &actions, name, repo, purge_dir, yes, json, stdout,
         ),
     }
 }
@@ -1062,7 +1147,7 @@ fn default_runner_dir() -> PathBuf {
     }
 }
 
-fn resolve_repo_slug(repo: Option<String>, cwd: &Path) -> Result<String, CliFailure> {
+pub(super) fn resolve_repo_slug(repo: Option<String>, cwd: &Path) -> Result<String, CliFailure> {
     if let Some(repo) = repo.filter(|value| !value.trim().is_empty()) {
         return Ok(repo);
     }
@@ -1083,7 +1168,7 @@ fn resolve_repo_slug(repo: Option<String>, cwd: &Path) -> Result<String, CliFail
     ))
 }
 
-fn parse_github_repo_slug(remote: &str) -> Option<String> {
+pub(super) fn parse_github_repo_slug(remote: &str) -> Option<String> {
     // Mirrors crate::app::wait_cmd::parse_github_repo_slug but kept local so
     // this module has no cross-module visibility creep.
     let trimmed = remote.trim().trim_end_matches('/').trim_end_matches(".git");
@@ -1147,36 +1232,13 @@ fn gh_api_runner(
     repo: &str,
     runner_id: u64,
 ) -> Result<String, CliFailure> {
-    // We do not have a typed `gh api` helper for a single runner on
-    // `GitHubActions`, but every other call shells out to `gh` from the same
-    // cwd, so do the same here.
-    let output = Command::new("gh")
-        .args(["api", &format!("repos/{repo}/actions/runners/{runner_id}")])
-        .current_dir(actions_cwd(actions))
-        .output()
-        .map_err(|error| {
-            CliFailure::new(
-                2,
-                format!("failed to run gh api runners/{runner_id}: {error}"),
-            )
-        })?;
-    if !output.status.success() {
-        return Err(CliFailure::new(
-            2,
-            format!(
-                "gh api runners/{runner_id} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn actions_cwd(_actions: &GitHubActions) -> PathBuf {
-    // GitHubActions::cwd is private; fall back to the process cwd. The
-    // command-line layer always invokes us with the right CWD already, so
-    // this matches the existing usage pattern in cloud_cmd.rs.
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let args = vec![
+        "api".to_owned(),
+        format!("repos/{repo}/actions/runners/{runner_id}"),
+    ];
+    actions
+        .run_gh(&args)
+        .map_err(|error| CliFailure::new(2, error.to_string()))
 }
 
 fn fetch_queued_runs(

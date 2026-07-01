@@ -34,7 +34,7 @@ pub(super) fn watch<W: Write>(
     options: WatchCommandOptions,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let fetcher = GhDiagnosticsFetcher;
+    let fetcher = GhDiagnosticsFetcher::new(context.cwd);
     watch_with_fetcher(context, options, &fetcher, stdout)
 }
 

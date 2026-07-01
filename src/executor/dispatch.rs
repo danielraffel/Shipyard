@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread::{self, JoinHandle};
+use std::time::Duration as StdDuration;
 
 use chrono::Utc;
 use toml::{Table, Value};
@@ -26,6 +29,10 @@ use crate::executor::ssh_windows::{
     self, WindowsExecutor, WindowsTargetConfig, WindowsValidation, WindowsValidationRequest,
 };
 use crate::executor::streaming::ProgressEvent;
+use crate::host_pool::{
+    HostPoolLeaseRequest, HostPoolLeaseStore, HostPoolMemberConfig, default_lease_path,
+    parse_host_pools,
+};
 use crate::job::{TargetResult, ValidationMode};
 use crate::prepared_state::PreparedStateStore;
 use crate::warm_pool::extract_warm_keepalive_seconds;
@@ -67,6 +74,10 @@ impl ResolvedTarget {
             ResolvedBackend::Ssh(target) => Some(target.repo_path.clone()),
             ResolvedBackend::Windows(target) => Some(target.repo_path.clone()),
             ResolvedBackend::Cloud(_) => None,
+            ResolvedBackend::HostPool(pool) => pool
+                .members
+                .first()
+                .and_then(|member| member.target.workdir()),
             ResolvedBackend::Fallback(chain) => chain
                 .backends
                 .first()
@@ -91,6 +102,12 @@ impl ResolvedTarget {
                 target.repo_path = workdir;
             }
             ResolvedBackend::Cloud(_) => {}
+            ResolvedBackend::HostPool(pool) => {
+                if let Some(primary) = pool.members.first_mut() {
+                    let updated = primary.target.as_ref().clone().with_workdir(workdir);
+                    *primary.target = updated;
+                }
+            }
             ResolvedBackend::Fallback(chain) => {
                 if let Some(primary) = chain.backends.first_mut() {
                     let updated = primary.target.as_ref().clone().with_workdir(workdir);
@@ -113,6 +130,8 @@ pub enum ResolvedBackend {
     Windows(WindowsTargetConfig),
     /// GitHub Actions cloud execution.
     Cloud(CloudTargetConfig),
+    /// Ordered local host-pool execution.
+    HostPool(ResolvedHostPoolConfig),
     /// Ordered fallback chain.
     Fallback(FallbackTargetConfig),
 }
@@ -138,6 +157,9 @@ pub enum ResolvedValidation {
     },
     /// Cloud validation settings.
     Cloud,
+    /// Host-pool validation settings. Concrete member targets own the real
+    /// local or SSH validation config.
+    HostPool,
     /// Fallback validation settings.
     Fallback,
 }
@@ -163,6 +185,40 @@ pub struct FallbackBackend {
     /// User-facing profile label for capability mismatch errors.
     pub profile_label: String,
     /// Inline backend capabilities.
+    pub capabilities: Vec<String>,
+}
+
+/// One resolved host-pool target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedHostPoolConfig {
+    /// Pool name from `[host_pools.<name>]`.
+    pub pool_name: String,
+    /// Member selection strategy.
+    pub strategy: String,
+    /// Seconds after which an unrefreshed lease is stale.
+    pub lease_stale_seconds: u64,
+    /// Seconds between lease heartbeat refreshes.
+    pub heartbeat_interval_seconds: u64,
+    /// Capabilities required by the target.
+    pub requires: Vec<String>,
+    /// Resolved concrete member targets in selection order.
+    pub members: Vec<ResolvedHostPoolMember>,
+}
+
+/// One resolved member in a host pool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedHostPoolMember {
+    /// Stable member id.
+    pub id: String,
+    /// Concrete target used by the existing local or SSH executor.
+    pub target: Box<ResolvedTarget>,
+    /// User-facing member label.
+    pub label: String,
+    /// User-facing profile label for capability mismatch errors.
+    pub profile_label: String,
+    /// Max concurrent leases for this member.
+    pub max_concurrency: u32,
+    /// Member capabilities.
     pub capabilities: Vec<String>,
 }
 
@@ -221,6 +277,11 @@ impl Error for DispatchError {}
 
 /// Input to one backend dispatch.
 pub struct DispatchValidationRequest<'target, 'callback> {
+    /// Queue job id when the target is run from a queued job.
+    pub job_id: Option<String>,
+    /// Return scheduler-owned deferral results for transient host-pool lease
+    /// contention instead of final busy target results.
+    pub defer_host_pool_lease_unavailable: bool,
     /// Commit SHA under validation.
     pub sha: String,
     /// Branch under validation.
@@ -276,12 +337,34 @@ pub struct ExecutorDispatcher {
     ssh: SshExecutor,
     windows: WindowsExecutor,
     cloud: CloudExecutor,
+    host_pool_store: Option<HostPoolLeaseStore>,
 }
 
 impl ExecutorDispatcher {
     /// Construct a dispatcher with production executors.
     #[must_use]
     pub fn new(prepared_state_store: Option<PreparedStateStore>) -> Self {
+        Self::new_with_host_pool_store(prepared_state_store, None)
+    }
+
+    /// Construct a dispatcher that can lease host-pool members from `state_dir`.
+    #[must_use]
+    pub fn new_with_state_dir(
+        prepared_state_store: Option<PreparedStateStore>,
+        state_dir: &std::path::Path,
+    ) -> Self {
+        Self::new_with_host_pool_store(
+            prepared_state_store,
+            Some(HostPoolLeaseStore::new(default_lease_path(state_dir))),
+        )
+    }
+
+    /// Construct a dispatcher with an explicit host-pool store.
+    #[must_use]
+    pub fn new_with_host_pool_store(
+        prepared_state_store: Option<PreparedStateStore>,
+        host_pool_store: Option<HostPoolLeaseStore>,
+    ) -> Self {
         Self {
             local: LocalExecutor::new(prepared_state_store),
             ssh: SshExecutor::new(),
@@ -289,6 +372,7 @@ impl ExecutorDispatcher {
             cloud: CloudExecutor::new(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ),
+            host_pool_store,
         }
     }
 
@@ -351,6 +435,9 @@ impl ExecutorDispatcher {
                 cloud_request.progress_callback = request.progress_callback.take();
                 self.cloud.validate(cloud_request)
             }
+            (ResolvedBackend::HostPool(pool), ResolvedValidation::HostPool) => {
+                self.validate_host_pool(&mut request, pool)
+            }
             (ResolvedBackend::Fallback(chain), ResolvedValidation::Fallback) => {
                 self.validate_fallback(&mut request, chain)
             }
@@ -386,6 +473,7 @@ impl ExecutorDispatcher {
                     }
                 }
             }
+            ResolvedBackend::HostPool(pool) => self.diagnose_host_pool(pool),
             ResolvedBackend::Fallback(chain) => chain
                 .backends
                 .first()
@@ -419,6 +507,8 @@ impl ExecutorDispatcher {
             }
 
             let result = self.validate(DispatchValidationRequest {
+                job_id: request.job_id.clone(),
+                defer_host_pool_lease_unavailable: request.defer_host_pool_lease_unavailable,
                 sha: request.sha.clone(),
                 branch: request.branch.clone(),
                 target: &backend.target,
@@ -450,6 +540,150 @@ impl ExecutorDispatcher {
         }
 
         exhausted_result(request.target, &primary_label, last_result)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_host_pool(
+        &self,
+        request: &mut DispatchValidationRequest<'_, '_>,
+        pool: &ResolvedHostPoolConfig,
+    ) -> TargetResult {
+        let filtered = filter_host_pool_members_by_requires(pool);
+        let Some(primary) = filtered.first() else {
+            return host_pool_capability_mismatch_result(request.target, pool);
+        };
+        let Some(store) = self.host_pool_store.clone() else {
+            return host_pool_error_result(
+                request.target,
+                &primary.label,
+                &request.log_path,
+                "host-pool lease store is unavailable",
+            );
+        };
+        let primary_label = primary.label.clone();
+        let mut last_result = None;
+
+        for (attempt, member) in filtered.into_iter().enumerate() {
+            let attempt_log = attempt_log_path(&request.log_path, attempt);
+            if !self.probe(&member.target) {
+                last_result = Some(probe_failed_result(
+                    &member.target,
+                    &member.label,
+                    &attempt_log,
+                ));
+                continue;
+            }
+
+            let lease_request = HostPoolLeaseRequest {
+                pool_name: pool.pool_name.clone(),
+                member_id: member.id.clone(),
+                target_name: request.target.name.clone(),
+                backend: member.target.backend_name.clone(),
+                host: member.target.host.clone(),
+                job_id: request.job_id.clone(),
+                branch: request.branch.clone(),
+                sha: request.sha.clone(),
+                max_concurrency: member.max_concurrency,
+                lease_stale_seconds: pool.lease_stale_seconds.max(1),
+            };
+            let lease = match store.acquire(&lease_request) {
+                Ok(Some(lease)) => lease,
+                Ok(None) => {
+                    last_result = Some(if request.defer_host_pool_lease_unavailable {
+                        host_pool_lease_unavailable_result(
+                            &member.target,
+                            &member.label,
+                            &attempt_log,
+                        )
+                    } else {
+                        host_pool_busy_result(&member.target, &member.label, &attempt_log)
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    last_result = Some(host_pool_error_result(
+                        &member.target,
+                        &member.label,
+                        &attempt_log,
+                        &error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+            let _lease_guard = HostPoolLeaseGuard::new(
+                store.clone(),
+                lease.lease_id,
+                pool.heartbeat_interval_seconds.max(1),
+                pool.lease_stale_seconds.max(1),
+            );
+
+            let mut result = self.validate(DispatchValidationRequest {
+                job_id: request.job_id.clone(),
+                defer_host_pool_lease_unavailable: request.defer_host_pool_lease_unavailable,
+                sha: request.sha.clone(),
+                branch: request.branch.clone(),
+                target: &member.target,
+                log_path: attempt_log,
+                resume_from: request.resume_from.clone(),
+                mode: request.mode,
+                progress_callback: request
+                    .progress_callback
+                    .as_mut()
+                    .map(|callback| &mut **callback as &mut dyn FnMut(ProgressEvent)),
+            });
+
+            if result.status == crate::job::TargetStatus::Fail {
+                result.backend.clone_from(&member.label);
+                return result;
+            }
+            if result.status == crate::job::TargetStatus::Pass {
+                if attempt == 0 {
+                    result.backend.clone_from(&member.label);
+                    return result;
+                }
+                return failover_pass_result(
+                    result,
+                    &member.label,
+                    &primary_label,
+                    last_result.as_ref(),
+                );
+            }
+            result.backend.clone_from(&member.label);
+            last_result = Some(result);
+        }
+
+        if last_result
+            .as_ref()
+            .is_some_and(crate::job::TargetResult::is_scheduler_deferred)
+        {
+            return last_result.expect("checked present");
+        }
+
+        exhausted_result(request.target, &primary_label, last_result)
+    }
+
+    fn diagnose_host_pool(&self, pool: &ResolvedHostPoolConfig) -> ReachabilityDiagnostic {
+        let filtered = filter_host_pool_members_by_requires(pool);
+        if filtered.is_empty() {
+            return ReachabilityDiagnostic {
+                reachable: false,
+                message: Some("no host-pool member satisfies target requirements".to_owned()),
+                category: Some("configuration".to_owned()),
+            };
+        }
+        let mut last = None;
+        for member in filtered {
+            let diagnostic = self.diagnose(&member.target);
+            if diagnostic.reachable {
+                return diagnostic;
+            }
+            last = Some(diagnostic);
+        }
+        last.unwrap_or_else(|| ReachabilityDiagnostic {
+            reachable: false,
+            message: Some("host pool has no reachable members".to_owned()),
+            category: Some("configuration".to_owned()),
+        })
     }
 }
 
@@ -521,6 +755,7 @@ fn resolve_backend_target(
         "ssh" => resolved_ssh(name, platform, backend_name, table, validation_table),
         "ssh-windows" => resolved_windows(name, platform, backend_name, table, validation_table),
         "cloud" => resolved_cloud(data, name, platform, table),
+        "host-pool" => resolved_host_pool(data, name, platform, table, validation_table),
         backend => Err(DispatchError::UnsupportedBackend {
             target: name.to_owned(),
             backend: backend.to_owned(),
@@ -689,6 +924,111 @@ fn resolved_cloud(
     })
 }
 
+fn resolved_host_pool(
+    data: &Table,
+    name: &str,
+    platform: &str,
+    table: &Table,
+    validation_table: &Table,
+) -> Result<ResolvedTarget, DispatchError> {
+    let pool_name = optional_string(table, "pool").ok_or_else(|| {
+        invalid_target(
+            name,
+            "`pool` is required when backend = \"host-pool\"".to_owned(),
+        )
+    })?;
+    let pools = parse_host_pools(data).map_err(|error| invalid_target(name, error.to_string()))?;
+    let pool = pools
+        .iter()
+        .find(|pool| pool.name == pool_name)
+        .ok_or_else(|| {
+            invalid_target(
+                name,
+                format!("host pool {pool_name:?} is not configured under [host_pools]"),
+            )
+        })?;
+    let members = pool
+        .members
+        .iter()
+        .map(|member| resolved_host_pool_member(name, platform, table, validation_table, member))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ResolvedTarget {
+        name: name.to_owned(),
+        platform: platform.to_owned(),
+        backend_name: "host-pool".to_owned(),
+        warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
+        host: None,
+        backend: ResolvedBackend::HostPool(ResolvedHostPoolConfig {
+            pool_name,
+            strategy: pool.strategy.clone(),
+            lease_stale_seconds: pool.lease_stale_seconds,
+            heartbeat_interval_seconds: pool.heartbeat_interval_seconds,
+            requires: string_array(table, "requires"),
+            members,
+        }),
+        validation: ResolvedValidation::HostPool,
+        failure_parser: parse_failure_parser_field(name, table)?,
+    })
+}
+
+fn resolved_host_pool_member(
+    name: &str,
+    platform: &str,
+    table: &Table,
+    validation_table: &Table,
+    member: &HostPoolMemberConfig,
+) -> Result<ResolvedHostPoolMember, DispatchError> {
+    let mut member_table = table.clone();
+    member_table.remove("fallback");
+    member_table.remove("host");
+    member_table.remove("repo_path");
+    member_table.remove("cwd");
+    member_table.insert(
+        "type".to_owned(),
+        Value::String(member.backend_type.clone()),
+    );
+    member_table.insert(
+        "backend".to_owned(),
+        Value::String(member.backend_type.clone()),
+    );
+    if let Some(host) = &member.host {
+        member_table.insert("host".to_owned(), Value::String(host.clone()));
+    }
+    if let Some(repo_path) = &member.repo_path {
+        member_table.insert("repo_path".to_owned(), Value::String(repo_path.clone()));
+    }
+    if let Some(cwd) = &member.cwd {
+        member_table.insert(
+            "cwd".to_owned(),
+            Value::String(cwd.to_string_lossy().into_owned()),
+        );
+    }
+
+    let target = match member.backend_type.as_str() {
+        "local" => resolved_local(name, platform, &member_table, validation_table)?,
+        "ssh" => resolved_ssh(name, platform, "ssh", &member_table, validation_table)?,
+        backend => {
+            return Err(invalid_target(
+                name,
+                format!("host-pool member backend {backend:?} is unsupported"),
+            ));
+        }
+    };
+    let label = format!(
+        "host-pool:{}/{}",
+        table_str(table, "pool").unwrap_or("?"),
+        member.id
+    );
+    Ok(ResolvedHostPoolMember {
+        id: member.id.clone(),
+        target: Box::new(target),
+        profile_label: label.clone(),
+        label,
+        max_concurrency: member.max_concurrency,
+        capabilities: member.capabilities.clone(),
+    })
+}
+
 fn resolved_fallback(
     data: &Table,
     name: &str,
@@ -803,6 +1143,7 @@ fn backend_label(target: &ResolvedTarget) -> String {
         ResolvedBackend::Cloud(target) => {
             format!("cloud:{}", target.runner_provider.as_deref().unwrap_or("?"))
         }
+        ResolvedBackend::HostPool(pool) => format!("host-pool:{}", pool.pool_name),
         ResolvedBackend::Fallback(_) => target.backend_name.clone(),
     }
 }
@@ -814,6 +1155,7 @@ fn profile_label(target: &ResolvedTarget) -> String {
             target.runner_provider.as_deref().unwrap_or("?"),
             target.runner_selector.as_deref().unwrap_or("default")
         ),
+        ResolvedBackend::HostPool(pool) => format!("host-pool:{}", pool.pool_name),
         _ => backend_label(target),
     }
 }
@@ -1071,6 +1413,31 @@ fn filter_backends_by_requires(chain: &FallbackTargetConfig) -> Vec<&FallbackBac
         .collect()
 }
 
+fn filter_host_pool_members_by_requires(
+    pool: &ResolvedHostPoolConfig,
+) -> Vec<&ResolvedHostPoolMember> {
+    let requires = pool
+        .requires
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if requires.is_empty() {
+        return pool.members.iter().collect();
+    }
+    pool.members
+        .iter()
+        .filter(|member| {
+            requires.iter().all(|required| {
+                member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.trim() == *required)
+            })
+        })
+        .collect()
+}
+
 fn capability_mismatch_result(
     target: &ResolvedTarget,
     chain: &FallbackTargetConfig,
@@ -1106,6 +1473,41 @@ fn capability_mismatch_result(
     result
 }
 
+fn host_pool_capability_mismatch_result(
+    target: &ResolvedTarget,
+    pool: &ResolvedHostPoolConfig,
+) -> TargetResult {
+    let mut requires = pool
+        .requires
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    requires.sort();
+    let tried = pool
+        .members
+        .iter()
+        .map(|member| member.profile_label.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let backend = pool
+        .members
+        .first()
+        .map_or_else(|| "none".to_owned(), |member| member.label.clone());
+    let mut result = TargetResult::new(
+        &target.name,
+        &target.platform,
+        crate::job::TargetStatus::Error,
+        backend,
+    );
+    result.error_message = Some(format!(
+        "no host-pool member satisfies requires={requires:?}: tried [{tried}]"
+    ));
+    result.failure_class = Some(crate::classify::FailureClass::Infra.as_str().to_owned());
+    result
+}
+
 fn probe_failed_result(
     target: &ResolvedTarget,
     label: &str,
@@ -1122,6 +1524,68 @@ fn probe_failed_result(
     result.completed_at = Some(now);
     result.log_path = Some(log_path.to_string_lossy().into_owned());
     result.error_message = Some(format!("Probe failed for {label}"));
+    result.failure_class = Some(crate::classify::FailureClass::Infra.as_str().to_owned());
+    result
+}
+
+fn host_pool_busy_result(
+    target: &ResolvedTarget,
+    label: &str,
+    log_path: &std::path::Path,
+) -> TargetResult {
+    let now = Utc::now();
+    let mut result = TargetResult::new(
+        &target.name,
+        &target.platform,
+        crate::job::TargetStatus::Unreachable,
+        label,
+    );
+    result.started_at = Some(now);
+    result.completed_at = Some(now);
+    result.log_path = Some(log_path.to_string_lossy().into_owned());
+    result.error_message = Some(format!("No host-pool lease available for {label}"));
+    result.failure_class = Some(crate::classify::FailureClass::Infra.as_str().to_owned());
+    result
+}
+
+fn host_pool_lease_unavailable_result(
+    target: &ResolvedTarget,
+    label: &str,
+    log_path: &std::path::Path,
+) -> TargetResult {
+    let now = Utc::now();
+    let mut result = TargetResult::new(
+        &target.name,
+        &target.platform,
+        crate::job::TargetStatus::Pending,
+        label,
+    );
+    result.started_at = Some(now);
+    result.log_path = Some(log_path.to_string_lossy().into_owned());
+    result.error_message = Some(format!(
+        "Host-pool lease unavailable for {label}; defer job"
+    ));
+    result.scheduler_defer_reason = Some("host_pool_lease_unavailable".to_owned());
+    result
+}
+
+fn host_pool_error_result(
+    target: &ResolvedTarget,
+    label: &str,
+    log_path: &std::path::Path,
+    message: &str,
+) -> TargetResult {
+    let now = Utc::now();
+    let mut result = TargetResult::new(
+        &target.name,
+        &target.platform,
+        crate::job::TargetStatus::Error,
+        label,
+    );
+    result.started_at = Some(now);
+    result.completed_at = Some(now);
+    result.log_path = Some(log_path.to_string_lossy().into_owned());
+    result.error_message = Some(message.to_owned());
     result.failure_class = Some(crate::classify::FailureClass::Infra.as_str().to_owned());
     result
 }
@@ -1211,6 +1675,56 @@ fn invalid_target(target: &str, reason: String) -> DispatchError {
     }
 }
 
+struct HostPoolLeaseGuard {
+    store: HostPoolLeaseStore,
+    lease_id: String,
+    stop: Option<Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl HostPoolLeaseGuard {
+    fn new(
+        store: HostPoolLeaseStore,
+        lease_id: String,
+        heartbeat_interval_seconds: u64,
+        lease_stale_seconds: u64,
+    ) -> Self {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let heartbeat_store = store.clone();
+        let heartbeat_lease_id = lease_id.clone();
+        let interval = StdDuration::from_secs(heartbeat_interval_seconds.max(1));
+        let handle = thread::spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(interval) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        let _ = heartbeat_store
+                            .heartbeat(&heartbeat_lease_id, lease_stale_seconds.max(1));
+                    }
+                }
+            }
+        });
+        Self {
+            store,
+            lease_id,
+            stop: Some(stop_tx),
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for HostPoolLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let _ = self.store.release(&self.lease_id);
+    }
+}
+
 /// Parse `[targets.<name>] failure_parser = "..."` against Shipyard's
 /// allow-list. See `crate::diagnostics::ALLOWED_PARSERS`. Returns `Ok(None)`
 /// when unset and `Err(_)` when set to a value not in the registry.
@@ -1240,10 +1754,27 @@ mod tests {
     use super::{ResolvedBackend, ResolvedValidation, resolve_targets_from_table};
     use crate::executor::ssh::SshValidation;
     use crate::executor::ssh_windows::WindowsValidation;
+    use crate::host_pool::{HostPoolLeaseRequest, HostPoolLeaseStore, default_lease_path};
     use crate::job::{TargetResult, TargetStatus, ValidationMode};
 
     fn table(input: &str) -> Table {
         input.parse::<Table>().expect("valid TOML")
+    }
+
+    fn toml_string(value: impl AsRef<str>) -> String {
+        let mut escaped = String::from("\"");
+        for ch in value.as_ref().chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped.push('"');
+        escaped
     }
 
     #[test]
@@ -1400,6 +1931,60 @@ mod tests {
     }
 
     #[test]
+    fn resolves_host_pool_target_members() {
+        let config = table(
+            r#"
+            [validation.default]
+            command = "make ci"
+
+            [host_pools.local_macs]
+            lease_stale_seconds = 120
+            heartbeat_interval_seconds = 5
+
+            [[host_pools.local_macs.members]]
+            id = "mac-studio"
+            type = "ssh"
+            host = "mac-studio"
+            repo_path = "/Users/shipyard/work/shipyard"
+            capabilities = ["macos", "arm64"]
+
+            [[host_pools.local_macs.members]]
+            id = "local"
+            type = "local"
+            cwd = "/repo"
+            capabilities = ["macos", "arm64"]
+
+            [targets.mac]
+            backend = "host-pool"
+            pool = "local_macs"
+            platform = "macos-arm64"
+            requires = ["macos", "arm64"]
+            "#,
+        );
+
+        let targets = resolve_targets_from_table(&config, ValidationMode::Full).expect("targets");
+        let mac = &targets[0];
+
+        assert_eq!(mac.backend_name, "host-pool");
+        assert!(matches!(mac.validation, ResolvedValidation::HostPool));
+        let ResolvedBackend::HostPool(pool) = &mac.backend else {
+            panic!("host-pool backend");
+        };
+        assert_eq!(pool.pool_name, "local_macs");
+        assert_eq!(pool.lease_stale_seconds, 120);
+        assert_eq!(pool.heartbeat_interval_seconds, 5);
+        assert_eq!(pool.requires, ["macos", "arm64"]);
+        assert_eq!(pool.members[0].id, "mac-studio");
+        assert_eq!(pool.members[0].label, "host-pool:local_macs/mac-studio");
+        assert!(
+            matches!(&pool.members[0].target.backend, ResolvedBackend::Ssh(target) if target.host.as_deref() == Some("mac-studio") && target.repo_path == "/Users/shipyard/work/shipyard")
+        );
+        assert!(
+            matches!(&pool.members[1].target.backend, ResolvedBackend::Local(target) if target.cwd == Some(PathBuf::from("/repo")))
+        );
+    }
+
+    #[test]
     fn fallback_helpers_preserve_python_result_provenance() {
         let pass = TargetResult::new("linux", "linux-x64", TargetStatus::Pass, "cloud");
         let mut last =
@@ -1508,6 +2093,8 @@ mod tests {
             };
             super::ExecutorDispatcher::new(None)
                 .validate(super::DispatchValidationRequest {
+                    job_id: None,
+                    defer_host_pool_lease_unavailable: false,
                     sha: "abc1234".to_owned(),
                     branch: "main".to_owned(),
                     target: &target,
@@ -1521,6 +2108,216 @@ mod tests {
 
         assert_eq!(status, TargetStatus::Pass);
         assert!(phases.iter().any(|phase| phase == "build"));
+    }
+
+    #[test]
+    fn host_pool_dispatch_acquires_and_releases_local_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let config = table(&format!(
+            r#"
+            [validation.default]
+            command = "echo __SHIPYARD_PHASE__:lease-check"
+
+            [host_pools.local_macs]
+
+            [[host_pools.local_macs.members]]
+            id = "local"
+            type = "local"
+            cwd = {}
+            capabilities = ["macos", "arm64"]
+
+            [targets.mac]
+            backend = "host-pool"
+            pool = "local_macs"
+            platform = "macos-arm64"
+            requires = ["macos", "arm64"]
+            "#,
+            toml_string(repo.display().to_string())
+        ));
+        let target = resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0);
+        let dispatcher = super::ExecutorDispatcher::new_with_state_dir(None, temp.path());
+        let lease_store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        let observed_job_id = std::cell::Cell::new(false);
+        let mut callback = |event: crate::executor::streaming::ProgressEvent| {
+            if event.phase.as_deref() == Some("lease-check") {
+                let leases = lease_store.leases().expect("leases");
+                assert_eq!(leases.len(), 1);
+                assert_eq!(leases[0].job_id.as_deref(), Some("job-host-pool"));
+                observed_job_id.set(true);
+            }
+        };
+
+        let result = dispatcher.validate(super::DispatchValidationRequest {
+            job_id: Some("job-host-pool".to_owned()),
+            defer_host_pool_lease_unavailable: false,
+            sha: "abc1234".to_owned(),
+            branch: "main".to_owned(),
+            target: &target,
+            log_path: temp.path().join("host-pool.log"),
+            resume_from: None,
+            mode: ValidationMode::Full,
+            progress_callback: Some(&mut callback),
+        });
+
+        assert_eq!(result.status, TargetStatus::Pass);
+        assert_eq!(result.backend, "host-pool:local_macs/local");
+        assert!(observed_job_id.get());
+        let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        assert!(store.leases().expect("leases").is_empty());
+    }
+
+    #[test]
+    fn host_pool_dispatch_skips_busy_member() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let config = table(&format!(
+            r#"
+            [validation.default]
+            command = "echo ok"
+
+            [host_pools.local_macs]
+
+            [[host_pools.local_macs.members]]
+            id = "mac-studio"
+            type = "local"
+            cwd = {}
+            capabilities = ["macos", "arm64"]
+
+            [[host_pools.local_macs.members]]
+            id = "local"
+            type = "local"
+            cwd = {}
+            capabilities = ["macos", "arm64"]
+
+            [targets.mac]
+            backend = "host-pool"
+            pool = "local_macs"
+            platform = "macos-arm64"
+            requires = ["macos", "arm64"]
+            "#,
+            toml_string(repo.display().to_string()),
+            toml_string(repo.display().to_string())
+        ));
+        let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        let busy = store
+            .acquire(&HostPoolLeaseRequest {
+                pool_name: "local_macs".to_owned(),
+                member_id: "mac-studio".to_owned(),
+                target_name: "mac".to_owned(),
+                backend: "local".to_owned(),
+                host: None,
+                job_id: Some("existing".to_owned()),
+                branch: "main".to_owned(),
+                sha: "busy".to_owned(),
+                max_concurrency: 1,
+                lease_stale_seconds: 180,
+            })
+            .expect("acquire")
+            .expect("busy lease");
+        let target = resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0);
+        let dispatcher =
+            super::ExecutorDispatcher::new_with_host_pool_store(None, Some(store.clone()));
+
+        let result = dispatcher.validate(super::DispatchValidationRequest {
+            job_id: None,
+            defer_host_pool_lease_unavailable: false,
+            sha: "abc1234".to_owned(),
+            branch: "main".to_owned(),
+            target: &target,
+            log_path: temp.path().join("host-pool-busy.log"),
+            resume_from: None,
+            mode: ValidationMode::Full,
+            progress_callback: None,
+        });
+
+        assert_eq!(result.status, TargetStatus::Pass);
+        assert_eq!(result.backend, "host-pool:local_macs/local-failover");
+        assert_eq!(
+            result.primary_backend.as_deref(),
+            Some("host-pool:local_macs/mac-studio")
+        );
+        let leases = store.leases().expect("leases");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].lease_id, busy.lease_id);
+        store.release(&busy.lease_id).expect("release busy");
+    }
+
+    #[test]
+    fn scheduler_host_pool_dispatch_defers_when_lease_unavailable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let config = table(&format!(
+            r#"
+            [validation.default]
+            command = "echo ok"
+
+            [host_pools.local_macs]
+
+            [[host_pools.local_macs.members]]
+            id = "local"
+            type = "local"
+            cwd = {}
+            capabilities = ["macos", "arm64"]
+
+            [targets.mac]
+            backend = "host-pool"
+            pool = "local_macs"
+            platform = "macos-arm64"
+            requires = ["macos", "arm64"]
+            "#,
+            toml_string(repo.display().to_string())
+        ));
+        let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        let busy = store
+            .acquire(&HostPoolLeaseRequest {
+                pool_name: "local_macs".to_owned(),
+                member_id: "local".to_owned(),
+                target_name: "mac".to_owned(),
+                backend: "local".to_owned(),
+                host: None,
+                job_id: Some("existing".to_owned()),
+                branch: "main".to_owned(),
+                sha: "busy".to_owned(),
+                max_concurrency: 1,
+                lease_stale_seconds: 180,
+            })
+            .expect("acquire")
+            .expect("busy lease");
+        let target = resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0);
+        let dispatcher =
+            super::ExecutorDispatcher::new_with_host_pool_store(None, Some(store.clone()));
+
+        let result = dispatcher.validate(super::DispatchValidationRequest {
+            job_id: Some("job-waiting".to_owned()),
+            defer_host_pool_lease_unavailable: true,
+            sha: "abc1234".to_owned(),
+            branch: "main".to_owned(),
+            target: &target,
+            log_path: temp.path().join("host-pool-deferred.log"),
+            resume_from: None,
+            mode: ValidationMode::Full,
+            progress_callback: None,
+        });
+
+        assert_eq!(result.status, TargetStatus::Pending);
+        assert_eq!(
+            result.scheduler_defer_reason.as_deref(),
+            Some("host_pool_lease_unavailable")
+        );
+        assert!(!result.is_terminal());
+        assert!(result.failure_class.is_none());
+        assert_eq!(store.leases().expect("leases")[0].lease_id, busy.lease_id);
+        store.release(&busy.lease_id).expect("release busy");
     }
 
     #[test]

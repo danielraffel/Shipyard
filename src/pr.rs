@@ -7,6 +7,9 @@ use std::process::Command;
 
 use serde_json::Value;
 
+use crate::config::LoadedConfig;
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+
 /// GitHub pull request metadata needed by ship orchestration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrInfo {
@@ -35,6 +38,10 @@ impl PrError {
         Self {
             message: message.into(),
         }
+    }
+
+    fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -66,11 +73,13 @@ pub fn push_branch(cwd: &Path, branch: &str) -> Result<(), PrError> {
 
 /// Find the first open PR for `branch`.
 pub fn find_pr_for_branch(
+    config: &LoadedConfig,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
 ) -> Result<Option<PrInfo>, PrError> {
-    let output = gh(gh_command)
+    let client = gh_client(config)?;
+    let output = gh(&client, cwd, gh_command)?
         .args([
             "pr",
             "list",
@@ -89,8 +98,8 @@ pub fn find_pr_for_branch(
     if !output.status.success() {
         let message = stderr_or_stdout(&output);
         if is_graphql_rate_limited(&message) {
-            report_rate_limit_fallback("gh pr list", cwd);
-            return find_pr_for_branch_rest(cwd, gh_command, branch);
+            report_rate_limit_fallback_with_client(&client, "gh pr list", cwd);
+            return find_pr_for_branch_rest(&client, cwd, gh_command, branch);
         }
         return Err(PrError::new(format!("gh pr list failed: {message}")));
     }
@@ -100,6 +109,7 @@ pub fn find_pr_for_branch(
 
 /// Create a PR and normalize its metadata through `gh pr view`.
 pub fn create_pr(
+    config: &LoadedConfig,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
@@ -107,18 +117,28 @@ pub fn create_pr(
     title: &str,
     body: &str,
 ) -> Result<PrInfo, PrError> {
-    let output = gh(gh_command)
+    let client = gh_client(config)?;
+    let output = gh(&client, cwd, gh_command)?
         .args([
             "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
         ])
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh pr create failed to start: {error}")))?;
     if !output.status.success() {
         let message = stderr_or_stdout(&output);
         if is_graphql_rate_limited(&message) {
-            report_rate_limit_fallback("gh pr create", cwd);
-            return create_pr_rest(cwd, gh_command, branch, base, title, body);
+            report_graphql_pr_create_fallback_with_client(&client, &message, cwd);
+            return create_pr_rest(&client, cwd, gh_command, branch, base, title, body);
+        }
+        if is_graphql_pr_create_integration_blocked(&message) {
+            report_graphql_pr_create_fallback_with_client(&client, &message, cwd);
+            return match create_pr_rest(&client, cwd, gh_command, branch, base, title, body) {
+                Ok(info) => Ok(info),
+                Err(error) if is_integration_blocked(error.message()) => {
+                    create_pr_with_ambient_gh(cwd, gh_command, branch, base, title, body)
+                }
+                Err(error) => Err(error),
+            };
         }
         return Err(PrError::new(format!("gh pr create failed: {message}")));
     }
@@ -126,25 +146,35 @@ pub fn create_pr(
     if selector.is_empty() {
         return Err(PrError::new("gh pr create did not print a PR URL"));
     }
-    get_pr_status(cwd, gh_command, &selector)
+    get_pr_status_with_client(&client, cwd, gh_command, &selector)
 }
 
 /// Return normalized PR metadata for a PR selector.
 pub fn get_pr_status(
+    config: &LoadedConfig,
     cwd: &Path,
     gh_command: Option<&Path>,
     selector: &str,
 ) -> Result<PrInfo, PrError> {
-    let output = gh(gh_command)
+    let client = gh_client(config)?;
+    get_pr_status_with_client(&client, cwd, gh_command, selector)
+}
+
+fn get_pr_status_with_client(
+    client: &GhClient,
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    selector: &str,
+) -> Result<PrInfo, PrError> {
+    let output = gh(client, cwd, gh_command)?
         .args(["pr", "view", selector, "--json", PR_JSON_FIELDS])
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh pr view failed to start: {error}")))?;
     if !output.status.success() {
         let message = stderr_or_stdout(&output);
         if is_graphql_rate_limited(&message) {
-            report_rate_limit_fallback("gh pr view", cwd);
-            return get_pr_status_rest(cwd, gh_command, selector);
+            report_rate_limit_fallback_with_client(client, "gh pr view", cwd);
+            return get_pr_status_rest(client, cwd, gh_command, selector);
         }
         return Err(PrError::new(format!("gh pr view failed: {message}")));
     }
@@ -153,11 +183,28 @@ pub fn get_pr_status(
 
 const PR_JSON_FIELDS: &str = "number,url,title,state,headRefName,baseRefName";
 
-fn gh(gh_command: Option<&Path>) -> Command {
-    // Mark every supervised `gh` invocation with SHIPYARD_PR_RUNNING=1
-    // so downstream pre-push hooks can detect Shipyard-orchestrated
-    // pushes (issue #266).
-    crate::supervised::gh_supervised(gh_command)
+fn gh_client(config: &LoadedConfig) -> Result<GhClient, PrError> {
+    // Build the gh client from the caller's already-resolved config (not a
+    // fresh `from_cwd` read of the real global dir) so PR creation honors the
+    // same `[github.auth]` the rest of the ship used — and so tests that pass an
+    // isolated config don't pick up the operator's global GitHub App auth.
+    GhClient::from_loaded_config(config)
+        .map_err(|error| PrError::new(format!("github auth config failed: {error}")))
+}
+
+fn gh(client: &GhClient, cwd: &Path, gh_command: Option<&Path>) -> Result<Command, PrError> {
+    gh_with_policy(client, cwd, gh_command, GhAuthPolicy::Default)
+}
+
+fn gh_with_policy(
+    client: &GhClient,
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    auth_policy: GhAuthPolicy,
+) -> Result<Command, PrError> {
+    client
+        .prepare_command(cwd, gh_command, GhSupervision::Supervised, auth_policy)
+        .map_err(|error| PrError::new(format!("gh command preparation failed: {error}")))
 }
 
 fn stderr_or_stdout(output: &std::process::Output) -> String {
@@ -178,6 +225,7 @@ fn parse_pr_list(text: &str) -> Result<Option<PrInfo>, PrError> {
 }
 
 fn find_pr_for_branch_rest(
+    client: &GhClient,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
@@ -204,9 +252,8 @@ fn find_pr_for_branch_rest(
         "GET".to_owned(),
         endpoint,
     ];
-    let output = gh(gh_command)
+    let output = gh(client, cwd, gh_command)?
         .args(args)
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh REST PR lookup failed to start: {error}")))?;
     if !output.status.success() {
@@ -219,6 +266,7 @@ fn find_pr_for_branch_rest(
 }
 
 fn create_pr_rest(
+    client: &GhClient,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
@@ -242,9 +290,8 @@ fn create_pr_rest(
         "-f".to_owned(),
         format!("body={body}"),
     ];
-    let output = gh(gh_command)
+    let output = gh(client, cwd, gh_command)?
         .args(args)
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh REST PR create failed to start: {error}")))?;
     if !output.status.success() {
@@ -256,7 +303,41 @@ fn create_pr_rest(
     parse_pr_rest_info(&String::from_utf8_lossy(&output.stdout))
 }
 
+fn create_pr_with_ambient_gh(
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    branch: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+) -> Result<PrInfo, PrError> {
+    eprintln!(
+        "shipyard: GitHub App token cannot create this pull request through GraphQL or REST. Falling back to ambient gh auth for PR creation only."
+    );
+    let client = GhClient::ambient();
+    let output = gh_with_policy(&client, cwd, gh_command, GhAuthPolicy::AmbientOnly)?
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .args([
+            "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
+        ])
+        .output()
+        .map_err(|error| PrError::new(format!("ambient gh pr create failed to start: {error}")))?;
+    if !output.status.success() {
+        return Err(PrError::new(format!(
+            "ambient gh pr create failed after GitHub App fallback was blocked: {}",
+            stderr_or_stdout(&output)
+        )));
+    }
+    let selector = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if selector.is_empty() {
+        return Err(PrError::new("ambient gh pr create did not print a PR URL"));
+    }
+    get_pr_status_with_client(&client, cwd, gh_command, &selector)
+}
+
 fn get_pr_status_rest(
+    client: &GhClient,
     cwd: &Path,
     gh_command: Option<&Path>,
     selector: &str,
@@ -265,9 +346,8 @@ fn get_pr_status_rest(
     let number = selector_pr_number(selector)
         .ok_or_else(|| PrError::new(format!("could not parse PR selector {selector:?}")))?;
     let endpoint = format!("repos/{repo}/pulls/{number}");
-    let output = gh(gh_command)
+    let output = gh(client, cwd, gh_command)?
         .args(["api", &endpoint])
-        .current_dir(cwd)
         .output()
         .map_err(|error| PrError::new(format!("gh REST PR view failed to start: {error}")))?;
     if !output.status.success() {
@@ -321,21 +401,7 @@ fn url_encode(value: &str) -> String {
 }
 
 fn parse_github_remote_slug(remote: &str) -> Option<String> {
-    let mut slug = remote
-        .strip_prefix("git@github.com:")
-        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| remote.strip_prefix("https://github.com/"))
-        .or_else(|| remote.strip_prefix("http://github.com/"))?
-        .trim_end_matches(".git")
-        .trim_matches('/')
-        .to_owned();
-    if slug.split('/').count() != 2 {
-        return None;
-    }
-    if slug.starts_with('/') {
-        slug.remove(0);
-    }
-    (!slug.is_empty()).then_some(slug)
+    crate::gh::parse_github_remote_slug(remote)
 }
 
 fn selector_pr_number(selector: &str) -> Option<u64> {
@@ -353,8 +419,30 @@ fn selector_pr_number(selector: &str) -> Option<u64> {
 /// budget.
 #[must_use]
 pub(crate) fn is_graphql_rate_limited(message: &str) -> bool {
+    crate::gh::is_graphql_rate_limited(message)
+}
+
+fn is_graphql_pr_create_integration_blocked(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("graphql") && lower.contains("rate limit")
+    lower.contains("graphql")
+        && lower.contains("resource not accessible by integration")
+        && lower.contains("createpullrequest")
+}
+
+fn is_integration_blocked(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("resource not accessible by integration")
+}
+
+fn report_graphql_pr_create_fallback_with_client(client: &GhClient, message: &str, cwd: &Path) {
+    if is_graphql_rate_limited(message) {
+        report_rate_limit_fallback_with_client(client, "gh pr create", cwd);
+        return;
+    }
+    eprintln!(
+        "shipyard: GraphQL PR creation is unavailable for this GitHub identity. Falling back to REST."
+    );
 }
 
 /// Print a one-line user-facing notice that GraphQL is exhausted and
@@ -366,8 +454,12 @@ pub(crate) fn is_graphql_rate_limited(message: &str) -> bool {
 /// Issue #266: prior to v0.56.x the fallback happened silently so
 /// users couldn't tell GraphQL had bailed. Surfacing this on stderr
 /// keeps the operation succeeding while making the cost visible.
-pub(crate) fn report_rate_limit_fallback(operation: &str, cwd: &std::path::Path) {
-    let reset_suffix = fetch_graphql_reset_unix(cwd)
+pub(crate) fn report_rate_limit_fallback_with_client(
+    client: &GhClient,
+    operation: &str,
+    cwd: &Path,
+) {
+    let reset_suffix = fetch_graphql_reset_unix(client, cwd)
         .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
         .map(|dt| format!("; reset at {} UTC", dt.format("%H:%M:%S")))
         .unwrap_or_default();
@@ -385,10 +477,10 @@ pub(crate) fn report_rate_limit_fallback(operation: &str, cwd: &std::path::Path)
 /// REST core bucket), so this probe does NOT itself consume GraphQL
 /// budget and is safe to call from inside a GraphQL-rate-limited
 /// recovery path.
-fn fetch_graphql_reset_unix(cwd: &std::path::Path) -> Option<i64> {
-    let output = crate::supervised::gh_supervised(None)
+fn fetch_graphql_reset_unix(client: &GhClient, cwd: &Path) -> Option<i64> {
+    let output = gh(client, cwd, None)
+        .ok()?
         .args(["api", "rate_limit", "--jq", ".resources.graphql.reset"])
-        .current_dir(cwd)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -471,7 +563,8 @@ fn nested_string_field(value: &Value, path: &[&str]) -> Result<String, PrError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        PrInfo, is_graphql_rate_limited, parse_github_remote_slug, parse_pr_info, parse_pr_list,
+        PrInfo, is_graphql_pr_create_integration_blocked, is_graphql_rate_limited,
+        is_integration_blocked, parse_github_remote_slug, parse_pr_info, parse_pr_list,
         parse_pr_rest_info, parse_pr_rest_list, selector_pr_number, url_encode,
     };
 
@@ -529,6 +622,22 @@ mod tests {
             "GraphQL: API rate limit already exceeded for user ID 123"
         ));
         assert!(!is_graphql_rate_limited("HTTP 500: something else failed"));
+    }
+
+    #[test]
+    fn detects_graphql_pr_create_app_integration_block() {
+        assert!(is_graphql_pr_create_integration_blocked(
+            "pull request create failed: GraphQL: Resource not accessible by integration (createPullRequest)"
+        ));
+        assert!(!is_graphql_pr_create_integration_blocked(
+            "GraphQL: Resource not accessible by integration (mergePullRequest)"
+        ));
+        assert!(!is_graphql_pr_create_integration_blocked(
+            "REST: Resource not accessible by integration (createPullRequest)"
+        ));
+        assert!(is_integration_blocked(
+            "gh: Resource not accessible by integration (HTTP 403)"
+        ));
     }
 
     #[test]

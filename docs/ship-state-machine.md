@@ -63,9 +63,9 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 | Field                | Purpose                                                                            |
 |----------------------|------------------------------------------------------------------------------------|
 | `target`             | Lane name (`macos`, `ubuntu`, …) — matches `[targets.<name>]` in `.shipyard/config.toml`. |
-| `provider`           | Dispatch channel: `namespace`, `github-hosted`, `ssh`, `ssh-windows`, or a local job id for the queue path. |
-| `run_id`             | GH Actions run ID for cloud, Shipyard job id for local/ssh, or `pending-<target>` when `cloud add-lane` couldn't discover the real run id. **No code backfills this sentinel today** — `watch` is read-only with respect to ship state (cli.py:3497). |
-| `status`             | Last observed lifecycle string: `queued`, `in_progress`, `completed`, `failed`, `cancelled`. `reused` is **not** a valid `DispatchedRun.status` — cross-PR evidence reuse synthesizes a `TargetStatus.PASS` with `backend="reused"` (cli.py:4510) and persists it as `status="completed"` (cli.py:4586). |
+| `provider`           | Dispatch channel or backend label: `namespace`, `github-hosted`, `ssh`, `ssh-windows`, `local`, `host_pool`, etc. |
+| `run_id`             | GH Actions run ID for cloud, Shipyard job id for local/SSH/host-pool work, or `pending-<target>` when `cloud add-lane` couldn't discover the real run id. **No code backfills this sentinel today** — `watch` is read-only with respect to ship state (cli.py:3497). |
+| `status`             | Last observed lifecycle string. `cloud add-lane` records `queued`; the Rust ship worker mirrors terminal target results as `completed` or `failed`. `reused` is **not** a valid `DispatchedRun.status` — cross-PR evidence reuse synthesizes a `TargetStatus.PASS` with `backend="reused"` (cli.py:4510) and persists it as `status="completed"` (cli.py:4586). |
 | `attempt`            | `ShipState.attempt` at dispatch time. Intended to survive resume so old attempts don't reattach, but coupled to the broken `attempt` counter from T8. |
 | `last_heartbeat_at`  | Additive liveness signal (default `None`) — written by the poller via `_update_ship_state_from_job`, used by `watch` to mark `stale` runs. |
 | `phase`              | Additive validation-phase tag (setup/configure/build/test, default `None`), same source as `last_heartbeat_at`. |
@@ -208,6 +208,14 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **Trigger:** `_execute_job` per-target loop; or `shipyard cloud add-lane --apply`; or `shipyard cloud retarget --apply` (see T9 — retarget does NOT advance ship state)
 - **Writes for the `ship` path:** `_execute_job` does NOT save `ShipState` at each target boundary. It only calls `_update_ship_state_from_job` **once** after `job.complete()` (cli.py:4345), which performs one `save()` for the whole batch (cli.py:4595). Within the loop, only the per-job `queue.update(job)` is written.
 - **Writes for `cloud add-lane --apply`:** `append_run(DispatchedRun(..., run_id=discovered or f"pending-{target}"))` then `save`.
+- **Queue scheduler note:** The Rust queue path persists a durable
+  `QueuedExecutionRequest` next to each queued job. A drain owner may move
+  admitted jobs from `Pending` to `Running` before a worker process observes
+  them. Workers now accept a job already transitioned to `Running` by the
+  drain owner and execute it, instead of trying to start it again. If the
+  scheduler starts a job only to defer it for host-pool capacity or an
+  unavailable local lease, the drain owner requeues that transient `Running`
+  job so a later local macOS slot can pick it up.
 - **Externals:** `workflow_dispatch` (cloud), `find_dispatched_run` (best-effort run id discovery), `ExecutorDispatcher.{probe,diagnose,validate}`.
 - **Failure modes**
   - `workflow_dispatch` fails in add-lane → `sys.exit(1)` at cli.py:2328 before any DispatchedRun is appended. *Recovery: retry.*
@@ -244,6 +252,8 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **Failure-handling split:**
   - `shipyard ship` treats merge-command failure as "green but not merged" and leaves the state file active for retry.
   - `shipyard auto-merge` returns `merge-failed` only when the PR is still unmerged. If `gh pr merge --delete-branch` exits nonzero after GitHub has already merged the PR (for example, local branch deletion failed because another worktree has it checked out), Shipyard archives state and exits 0 with a `cleanup_warning`.
+- **GraphQL/App-token fallback:** if `gh pr merge` fails because GraphQL is rate-limited or because the App installation token cannot access `mergePullRequest`, Shipyard falls through to `merge_pr_rest` with the same configured `GhClient`. This preserves App-token quota and avoids silently switching to ambient user auth. If GitHub rejects the REST merge endpoint too, the merge remains a normal T5 failure for retry or manual/user-auth merge.
+- **Superseded-SHA preflight (#321).** Before `merge_pr` runs, `execute_auto_merge` reads the live PR head via `fetch_live_head_sha` (snapshot or fresh `gh`/REST; accepts `headRefOid` or `head.sha`) and compares it with `shas_match` against `state.head_sha` (the SHA Shipyard actually validated). If they differ, it returns `AutoMergeOutcome::SupersededSha { validated, current }` and does **not** merge — `ship_cmd`'s `post_run_merge_state` records this as `GreenNotMerged` (state file stays active for a re-validated retry, not `STATE_MERGED`). Fail-closed: an unreadable live head does not assume safety. This client-side guard sits in front of the server-side `--match-head-commit` / `-f sha=<oid>` race-guard on the PUT, because GraphQL auto-merge can otherwise land a commit pushed *after* validation completed (the regression that merged pulp #3128 at a pre-fix SHA).
 - **Archive failure remains a store error.** If `archive(pr)` itself fails after GitHub merge succeeds, the active state file remains and the command exits nonzero. A later retry can still recover if `gh pr merge` reports "already merged" or PR-state lookup confirms `MERGED`.
 
 ### T6 — Refuse to merge on FAIL
@@ -262,7 +272,7 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **Writes:** refreshes `pr_url` / `pr_title` / `commit_subject`; then runs `_execute_job` which iterates **every** `job.target_names` at cli.py:4219 regardless of the existing `evidence_snapshot`.
 - **Externals:** `git rev-parse HEAD` (drift check) — the check only runs after `ship` has already confirmed branch/SHA exist (cli.py:2582); a missing HEAD aborts before drift detection, not after.
 - **Failure modes**
-  - SHA drift (`is_sha_drift`): ship refuses to resume. *Recovery: `--no-resume`.*
+  - SHA drift (`is_sha_drift`): ship refuses to resume. *Recovery: `--no-resume`, or `--adopt-head` (#346) to adopt the current head when you amended/force-pushed the tip (e.g. added a required trailer). `--adopt-head` updates `head_sha` to the live SHA and **clears `dispatched_runs` + `evidence_snapshot`** so the new head re-validates from scratch — it never preserves evidence across a possibly-different tree, and the policy-signature guard below still applies. The Rust path implements this in `load_or_create_state` (`ship.rs`), gated by the flag plumbed through `ShipExecutionRequest`/`QueuedShipRequest`.*
   - Policy drift: required-platforms / target-list / mode changed. *Recovery: same.*
   - State file is corrupt → `ShipStateStore.get` catches `JSONDecodeError`/`KeyError`/`ValueError` and returns None; the caller creates a fresh state and overwrites the corrupt file.
 - **Observation for Phase B:** resume does NOT skip a lane that already passed. A Phase B test that asserts lane-skip-on-resume would be asserting behavior that doesn't exist today. That may itself be a bug (double-work on resume) — if so, file it as a Phase B-adjacent issue rather than codifying the wrong expectation.
@@ -347,6 +357,35 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   - Ancestor SHA unknown or diff check fails → falls through to normal dispatch. No false-PASS risk from the reuse path itself.
   - Stage-list drift or validation-contract drift → reuse is refused by `reuse.py`; normal dispatch runs.
 
+## Diagnostic: orphan reporting (no transition)
+
+`STATE_IN_FLIGHT` has no self-healing exit when the owning process dies
+mid-validation (host reboot from a jetsam kill, daemon crash, `cmux` relaunch):
+nothing advances the state, `ship_terminal_verdict` stays `None`, and auto-merge
+reports `InFlight` forever without merging. The queue's killed-worker reaper
+(#351) recovers the sibling `queue.json` `Job`, but the ship-state store has no
+equivalent lifecycle.
+
+`shipyard ship-state list` and `shipyard status` surface these as a **read-only**
+diagnostic (no state transition, no write; `src/ship_liveness.rs`). A state is
+reported orphaned when `ship_terminal_verdict` is `None` (in flight — the exact
+predicate the auto-merge gate uses) **and** a single queue snapshot confirms — or
+cannot disprove — a dead worker. The signal is source-labeled, strongest to
+weakest: `queue_stale` (a matching running job whose heartbeat is dead past the
+reaper's 180s window — flagged immediately), `queue_terminal` (a matching job
+already terminal while the ship-state never finalized — immediate), `queue_absent`
+(queue consulted, no matching job — the ship-state has no job id, so this is
+time-gated), and `time_fallback` (queue unavailable — pure `updated_at`
+staleness, time-gated). A live-running (fresh heartbeat) or pending job is never
+flagged. The time threshold gates only the weak signals, defaults to 45 minutes,
+and is configurable via `[ship_state] orphan_stale_minutes`. Human output adds an
+`ORPHANED? [<evidence>]:` line; JSON adds `orphaned: [{pr, stalled_minutes,
+evidence}]` (`ship-state list`) / `orphaned_ship_states` (`status`). It cannot
+affect merge readiness — a flagged state is in flight, which auto-merge already
+refuses. Recovery stays operator-driven (`shipyard ship <pr>` to re-validate, or
+`ship-state discard`); automatic resume is a deferred follow-up, and the
+`QueueMatch` the classifier returns already carries the owning `Job` for it.
+
 ## External dependency matrix
 
 | External                               | Transitions         | Failure class               | Symptom + audit note                                                                                                 |
@@ -360,7 +399,7 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 | `workflow_dispatch`                    | T2, T9, T10         | 404 / 5xx / rate-limit       | Add-lane: exits before mutation. Retarget: if dispatch fails after cancel succeeded, the old lane is gone and no new lane exists. `ship` path goes through `CloudExecutor` inside `_execute_job`. |
 | `find_dispatched_run`                  | T2, T10             | timeout                      | DispatchedRun persisted with `pending-<target>` sentinel. **No backfill path exists.**                              |
 | GitHub Actions cancel (retarget)       | T9                  | race / auth / scope / unsupported / not-found | If cancellation is not proven complete, retarget aborts before dispatch with `event=cancel_failed`. Partial cancellation no longer dispatches additively. Whole-run fallback is used only when every active job matches the target. |
-| `gh pr merge`                          | T5                  | branch protection / auth / already-merged / cleanup failure / GraphQL rate-limit / 405 base-modified | `auto-merge` treats "already merged" or post-error `MERGED` PR state as success with `cleanup_warning`; genuine unmerged failures still return `merge-failed`. GraphQL-rate-limit failures fall through to `merge_pr_rest` (`src/app/auto_merge_cmd.rs:311`) which issues `PUT /repos/:r/pulls/:n/merge` with `sha=<head_sha>` as a server-side race-guard. On a `405 Base branch was modified` response, `merge_pr_rest` refetches head info and retries exactly once iff `headRefOid` is unchanged (a real new commit on the head refuses the retry and surfaces a `head moved from <abc> to <def>` error). Issue #266 / PR #302. |
+| `gh pr merge`                          | T5                  | branch protection / auth / already-merged / cleanup failure / GraphQL rate-limit / App-token GraphQL denial / 405 base-modified | `auto-merge` treats "already merged" or post-error `MERGED` PR state as success with `cleanup_warning`; genuine unmerged failures still return `merge-failed`. GraphQL-rate-limit failures and App-token `mergePullRequest` denial fall through to `merge_pr_rest` (`src/app/auto_merge_cmd.rs`) which issues `PUT /repos/:r/pulls/:n/merge` with `sha=<head_sha>` as a server-side race-guard. On a `405 Base branch was modified` response, `merge_pr_rest` refetches head info and retries exactly once iff `headRefOid` is unchanged (a real new commit on the head refuses the retry and surfaces a `head moved from <abc> to <def>` error). Issue #266 / PR #302. |
 | SSH backend probe                      | T2 (preflight)      | network / auth / host_key     | Pre-#100: silent hang. Post-#100: exit 3 with classified error inside 10s.                                           |
 | `git rev-parse HEAD` (branch/SHA)      | T1, T7              | worktree gone                 | `ship` aborts at cli.py:2582 before drift detection if branch or SHA is unavailable.                                 |
 

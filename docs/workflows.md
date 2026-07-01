@@ -80,6 +80,67 @@ Agent 2 (worktree: ~/Code/my-plugin-delay):
 
 No collisions. No manual coordination. The queue is machine-global.
 
+## Prefer a network Mac for macOS jobs
+
+If you have a Mac Studio on the network, configure the macOS target so the Mac
+Studio is primary and the controller Mac is fallback:
+
+```toml
+[targets.mac]
+backend = "ssh"
+host = "mac-studio"
+platform = "macos-arm64"
+repo_path = "/Users/shipyard/work/shipyard"
+warm_keepalive_seconds = 1800
+
+fallback = [
+  { type = "local", cwd = "/Users/danielraffel/Code/shipyard" },
+]
+```
+
+Then validate only that lane while bringing the machine online:
+
+```
+$ shipyard targets test mac
+$ shipyard run --targets mac
+```
+
+This fallback form does not add pool scheduling; the Mac Studio simply becomes
+the first place Shipyard tries macOS work.
+
+When you want named members and lease visibility, use a host-pool target:
+
+```toml
+[host_pools.local_macs]
+strategy = "ordered"
+
+[[host_pools.local_macs.members]]
+id = "mac-studio"
+type = "ssh"
+host = "mac-studio"
+repo_path = "/Users/shipyard/work/shipyard"
+capabilities = ["macos", "arm64"]
+
+[[host_pools.local_macs.members]]
+id = "local"
+type = "local"
+cwd = "/Users/danielraffel/Code/shipyard"
+capabilities = ["macos", "arm64"]
+
+[targets.mac]
+backend = "host-pool"
+pool = "local_macs"
+platform = "macos-arm64"
+requires = ["macos", "arm64"]
+```
+
+Use `shipyard targets pool status` to inspect active and stale leases, and
+`shipyard targets pool cleanup --dry-run` before pruning stale lease records.
+With a host-pool target, the queue can drain multiple non-conflicting jobs
+across available members under one local drain owner. Jobs still serialize when
+they need the same checkout, PR ship-state, evidence lane, or exhausted pool
+capacity.
+
 ## Prioritizing one job over another
 
 Two jobs are queued. The delay feature is urgent. Bump it up.

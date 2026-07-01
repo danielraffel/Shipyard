@@ -14,6 +14,7 @@ use super::{
     cli::{ReleaseBotCommand, ReleaseBotHookCommand},
 };
 use crate::config::LoadedConfig;
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 
@@ -972,7 +973,14 @@ fn run_git_owned(cwd: &Path, args: &[String]) -> Result<(), String> {
 }
 
 fn gh(gh_command: Option<&Path>) -> Command {
-    gh_command.map_or_else(|| Command::new("gh"), Command::new)
+    GhClient::ambient()
+        .prepare_command(
+            Path::new("."),
+            gh_command,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::AmbientOnly,
+        )
+        .expect("ambient gh command preparation should not fail")
 }
 
 fn parse_time(value: &str) -> Option<DateTime<Utc>> {
@@ -1082,16 +1090,16 @@ mod tests {
             &script,
             r#"#!/bin/sh
 case "$*" in
-  "api repos/owner/repo/actions/secrets --paginate")
+  api\ repos/owner/repo/actions/secrets*)
     printf '%s\n' '{"secrets":[{"name":"RELEASE_BOT_TOKEN","updated_at":"2026-04-25T09:30:00Z"}]}'
     ;;
-  "api repos/owner/other/actions/secrets --paginate")
+  api\ repos/owner/other/actions/secrets*)
     printf '%s\n' '{"secrets":[{"name":"RELEASE_BOT_TOKEN","updated_at":"2026-04-25T08:00:00Z"}]}'
     ;;
-  "run list --workflow auto-release.yml --repo owner/repo --limit 1 --json databaseId,status,conclusion,createdAt")
+  run\ list\ --workflow\ auto-release.yml\ --repo\ owner/repo*)
     printf '%s\n' '[{"databaseId":123,"status":"completed","conclusion":"failure","createdAt":"2026-04-25T10:00:00Z"}]'
     ;;
-  "run view 123 --repo owner/repo --log-failed")
+  run\ view\ 123\ --repo\ owner/repo\ --log-failed*)
     printf '%s\n' 'fatal: Authentication failed'
     ;;
   *)

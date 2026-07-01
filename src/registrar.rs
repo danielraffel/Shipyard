@@ -8,12 +8,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wait_timeout::ChildExt;
+
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 
 /// GitHub webhook events Shipyard subscribes to.
 pub const SUBSCRIBED_EVENTS: [&str; 6] = [
@@ -123,17 +126,32 @@ impl From<serde_json::Error> for RegistrarError {
 pub struct Registrar {
     state_path: PathBuf,
     by_repo: BTreeMap<String, u64>,
+    #[cfg_attr(test, allow(dead_code))]
+    mode: RuntimeMode,
+    cwd: PathBuf,
 }
 
 impl Registrar {
     /// Load registrar state from `<state_dir>/daemon/registrations.json`.
     #[must_use]
     pub fn new(state_dir: &Path) -> Self {
+        Self::new_with_context(
+            RuntimeMode::Shipyard,
+            state_dir,
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+    }
+
+    /// Load registrar state with explicit runtime context for configured auth.
+    #[must_use]
+    pub fn new_with_context(mode: RuntimeMode, state_dir: &Path, cwd: &Path) -> Self {
         let state_path = state_dir.join("daemon").join("registrations.json");
         let by_repo = load_registrations(&state_path);
         Self {
             state_path,
             by_repo,
+            mode,
+            cwd: cwd.to_path_buf(),
         }
     }
 
@@ -150,9 +168,8 @@ impl Registrar {
         url: &str,
         secret: &str,
     ) -> Result<u64, RegistrarError> {
-        let gh_binary = resolve_gh_binary()
-            .ok_or_else(|| RegistrarError::GhUnavailable("gh CLI not found on PATH".to_owned()))?;
-        self.ensure_registered_with_gh(repo, url, secret, &gh_binary)
+        let client = self.configured_gh_client(repo)?;
+        self.ensure_registered_with_client(repo, url, secret, &client, None)
     }
 
     /// Idempotently create or update a webhook with an explicit `gh` binary.
@@ -164,12 +181,24 @@ impl Registrar {
         gh_binary: &Path,
     ) -> Result<u64, RegistrarError> {
         validate_gh_binary(gh_binary)?;
+        let client = GhClient::ambient();
+        self.ensure_registered_with_client(repo, url, secret, &client, Some(gh_binary))
+    }
+
+    fn ensure_registered_with_client(
+        &mut self,
+        repo: &str,
+        url: &str,
+        secret: &str,
+        client: &GhClient,
+        gh_binary: Option<&Path>,
+    ) -> Result<u64, RegistrarError> {
         if let Some(hook_id) = self.by_repo.get(repo).copied() {
-            update_hook(gh_binary, repo, hook_id, url, secret)?;
+            update_hook(client, &self.cwd, gh_binary, repo, hook_id, url, secret)?;
             return Ok(hook_id);
         }
 
-        let hook_id = create_hook(gh_binary, repo, url, secret)?;
+        let hook_id = create_hook(client, &self.cwd, gh_binary, repo, url, secret)?;
         self.by_repo.insert(repo.to_owned(), hook_id);
         self.save()?;
         Ok(hook_id)
@@ -180,8 +209,8 @@ impl Registrar {
         let Some(hook_id) = self.by_repo.get(repo).copied() else {
             return Ok(());
         };
-        if let Some(gh_binary) = resolve_gh_binary() {
-            delete_hook(&gh_binary, repo, hook_id)?;
+        if let Some(client) = self.configured_gh_client_optional(Some(repo))? {
+            delete_hook(&client, &self.cwd, None, repo, hook_id)?;
         }
         self.by_repo.remove(repo);
         self.save()
@@ -197,7 +226,8 @@ impl Registrar {
             return Ok(());
         };
         validate_gh_binary(gh_binary)?;
-        delete_hook(gh_binary, repo, hook_id)?;
+        let client = GhClient::ambient();
+        delete_hook(&client, &self.cwd, Some(gh_binary), repo, hook_id)?;
         self.by_repo.remove(repo);
         self.save()
     }
@@ -225,6 +255,35 @@ impl Registrar {
         fs::write(&self.state_path, serde_json::to_string_pretty(&payload)?)?;
         Ok(())
     }
+
+    fn configured_gh_client(&self, repo: &str) -> Result<GhClient, RegistrarError> {
+        self.configured_gh_client_optional(Some(repo))?
+            .ok_or_else(|| RegistrarError::GhUnavailable("gh CLI not found on PATH".to_owned()))
+    }
+
+    /// Build the configured `gh` client, hinting `repo` for a `{repo_slug}`
+    /// token-command placeholder (the daemon's CWD isn't a GitHub checkout).
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn configured_gh_client_optional(
+        &self,
+        repo: Option<&str>,
+    ) -> Result<Option<GhClient>, RegistrarError> {
+        #[cfg(test)]
+        {
+            let _ = repo;
+            Ok(None)
+        }
+        #[cfg(not(test))]
+        {
+            let client = GhClient::from_cwd(self.mode, &self.cwd)
+                .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))?;
+            let client = match repo {
+                Some(slug) => client.with_repo_hint(slug),
+                None => client,
+            };
+            Ok(Some(client))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -248,7 +307,9 @@ fn load_registrations(state_path: &Path) -> BTreeMap<String, u64> {
 }
 
 fn create_hook(
-    gh_binary: &Path,
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
     repo: &str,
     url: &str,
     secret: &str,
@@ -265,6 +326,8 @@ fn create_hook(
         },
     });
     let output = run_gh(
+        client,
+        cwd,
         gh_binary,
         &[
             "api",
@@ -290,7 +353,9 @@ fn create_hook(
 }
 
 fn update_hook(
-    gh_binary: &Path,
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
     repo: &str,
     hook_id: u64,
     url: &str,
@@ -306,6 +371,8 @@ fn update_hook(
         "active": true,
     });
     let output = run_gh(
+        client,
+        cwd,
         gh_binary,
         &[
             "api",
@@ -325,8 +392,16 @@ fn update_hook(
     Err(classify_gh_failure("patch", output.combined_output()))
 }
 
-fn delete_hook(gh_binary: &Path, repo: &str, hook_id: u64) -> Result<(), RegistrarError> {
+fn delete_hook(
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
+    repo: &str,
+    hook_id: u64,
+) -> Result<(), RegistrarError> {
     let output = run_gh(
+        client,
+        cwd,
         gh_binary,
         &[
             "api",
@@ -380,11 +455,20 @@ impl GhOutput {
 }
 
 fn run_gh(
-    gh_binary: &Path,
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
     args: &[&str],
     stdin: Option<&str>,
 ) -> Result<GhOutput, RegistrarError> {
-    let mut command = Command::new(gh_binary);
+    let mut command = client
+        .prepare_command(
+            cwd,
+            gh_binary,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))?;
     command
         .args(args)
         .stdin(if stdin.is_some() {
@@ -395,7 +479,13 @@ fn run_gh(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn()?;
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            RegistrarError::GhUnavailable("gh CLI not found on PATH".to_owned())
+        } else {
+            RegistrarError::Io(error)
+        }
+    })?;
     if let Some(stdin) = stdin
         && let Some(mut writer) = child.stdin.take()
     {
@@ -413,33 +503,6 @@ fn run_gh(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
-}
-
-fn resolve_gh_binary() -> Option<PathBuf> {
-    #[cfg(test)]
-    {
-        None
-    }
-    #[cfg(not(test))]
-    {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .flat_map(|dir| {
-                gh_candidate_names()
-                    .into_iter()
-                    .map(move |name| dir.join(name))
-            })
-            .find(|candidate| validate_gh_binary(candidate).is_ok())
-    }
-}
-
-#[cfg(not(test))]
-fn gh_candidate_names() -> Vec<&'static str> {
-    if cfg!(windows) {
-        vec!["gh.exe", "gh"]
-    } else {
-        vec!["gh"]
-    }
 }
 
 fn validate_gh_binary(path: &Path) -> Result<(), RegistrarError> {

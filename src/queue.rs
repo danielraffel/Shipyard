@@ -1,6 +1,7 @@
 //! Durable machine-global job queue.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -21,9 +22,38 @@ pub const WINDOWS_REPLACE_ATTEMPTS: usize = 18;
 /// Base backoff delay. Attempt `n` sleeps in `[0.5*base*n, 1.5*base*n]`.
 pub const WINDOWS_REPLACE_BASE_DELAY: Duration = Duration::from_millis(50);
 const STALE_RECOVERY_MESSAGE: &str = "Process died mid-validation; job recovered on startup";
+/// Reason recorded when a `Running` job is reaped because its worker went
+/// silent past the heartbeat-staleness threshold (e.g. the worker process was
+/// killed). Shared by the ship-time same-PR preflight and the drain admission
+/// pass so the durable cancellation reads consistently wherever it originates.
+pub const STALE_RUNNING_CANCEL_REASON: &str =
+    "Running worker heartbeat stale; cancelled to unblock queued work";
+const ORPHAN_REQUEST_MESSAGE: &str = "Queued request envelope missing or unreadable";
+const SUPERSEDED_MESSAGE: &str =
+    "Superseded by a newer queued job for the same branch, targets, and mode.";
 
 /// Fallible queue operation result.
 pub type QueueResult<T> = Result<T, QueueError>;
+
+/// Drain-owned pending job cancellation request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuePendingCancellation {
+    /// Queue job id.
+    pub job_id: String,
+    /// Cancellation reason persisted on the job.
+    pub reason: String,
+}
+
+/// Drain-owned request to return a transiently deferred running job to pending.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueDeferredRequeue {
+    /// Queue job id.
+    pub job_id: String,
+    /// Scheduler deferral reason persisted on the job.
+    pub reason: String,
+    /// Earliest retry time for the scheduler.
+    pub defer_until: Option<DateTime<Utc>>,
+}
 
 /// Durable queue operation error.
 #[derive(Debug)]
@@ -68,8 +98,6 @@ impl From<serde_json::Error> for QueueError {
 #[derive(Debug)]
 pub struct Queue {
     state_dir: PathBuf,
-    jobs: Vec<Job>,
-    loaded: bool,
 }
 
 impl Queue {
@@ -77,11 +105,7 @@ impl Queue {
     pub fn new(state_dir: impl Into<PathBuf>) -> io::Result<Self> {
         let state_dir = state_dir.into();
         fs::create_dir_all(&state_dir)?;
-        Ok(Self {
-            state_dir,
-            jobs: Vec::new(),
-            loaded: false,
-        })
+        Ok(Self { state_dir })
     }
 
     /// Queue state directory.
@@ -102,62 +126,67 @@ impl Queue {
         self.state_dir.join("queue.lock")
     }
 
+    /// Short-lived queue state lock file path.
+    #[must_use]
+    pub fn state_lock_file(&self) -> PathBuf {
+        self.state_dir.join("queue.state.lock")
+    }
+
     /// Add a job, superseding pending jobs for the same branch, target list, and mode.
     pub fn enqueue(&mut self, job: Job) -> QueueResult<Job> {
-        self.ensure_loaded()?;
-        self.jobs.retain(|queued| {
-            queued.branch != job.branch
-                || queued.status != JobStatus::Pending
-                || queued.target_names != job.target_names
-                || queued.mode != job.mode
-        });
-        self.jobs.push(job.clone());
-        self.save()?;
+        self.with_jobs_locked(|jobs| {
+            cancel_superseded_pending(jobs, &job);
+            jobs.push(job.clone());
+            Ok(())
+        })?;
         Ok(job)
     }
 
     /// Return the highest-priority pending job, preserving FIFO within each priority.
     pub fn next_pending(&mut self) -> QueueResult<Option<Job>> {
-        self.ensure_loaded()?;
-        Ok(self.pending_jobs_sorted().into_iter().next())
+        let mut pending = self.get_pending()?;
+        Ok(pending.drain(..).next())
     }
 
     /// Replace a queued job matched by id, then trim old completed jobs.
     pub fn update(&mut self, job: &Job) -> QueueResult<()> {
-        self.ensure_loaded()?;
-        for queued in &mut self.jobs {
-            if queued.id == job.id {
-                *queued = job.clone();
+        self.with_jobs_locked(|jobs| {
+            for queued in jobs.iter_mut() {
+                if queued.id == job.id {
+                    *queued = job.clone();
+                }
             }
-        }
-        self.trim_completed();
-        self.save()
+            let _ = trim_terminal(jobs);
+            Ok(())
+        })
     }
 
     /// Look up a job by id.
     pub fn get(&mut self, job_id: &str) -> QueueResult<Option<Job>> {
-        self.ensure_loaded()?;
-        Ok(self.jobs.iter().find(|job| job.id == job_id).cloned())
+        let jobs = self.read_jobs_locked()?;
+        Ok(jobs.iter().find(|job| job.id == job_id).cloned())
     }
 
     /// Return the currently running job, if any.
     pub fn get_active(&mut self) -> QueueResult<Option<Job>> {
-        self.ensure_loaded()?;
-        Ok(self
-            .jobs
-            .iter()
-            .find(|job| job.status == JobStatus::Running)
-            .cloned())
+        Ok(self.get_running()?.into_iter().next())
     }
 
-    /// Return completed jobs newest first.
+    /// Return running jobs in queue storage order.
+    pub fn get_running(&mut self) -> QueueResult<Vec<Job>> {
+        let jobs = self.read_jobs_locked()?;
+        Ok(jobs
+            .into_iter()
+            .filter(|job| job.status == JobStatus::Running)
+            .collect())
+    }
+
+    /// Return completed or cancelled jobs newest first.
     pub fn get_recent(&mut self, limit: usize) -> QueueResult<Vec<Job>> {
-        self.ensure_loaded()?;
-        let mut completed = self
-            .jobs
-            .iter()
-            .filter(|job| job.status == JobStatus::Completed)
-            .cloned()
+        let jobs = self.read_jobs_locked()?;
+        let mut completed = jobs
+            .into_iter()
+            .filter(|job| is_terminal_job(job.status))
             .collect::<Vec<_>>();
         sort_recent_completed(&mut completed);
         completed.truncate(limit);
@@ -166,15 +195,19 @@ impl Queue {
 
     /// Return pending jobs sorted by priority descending, then FIFO.
     pub fn get_pending(&mut self) -> QueueResult<Vec<Job>> {
-        self.ensure_loaded()?;
-        Ok(self.pending_jobs_sorted())
+        let jobs = self.read_jobs_locked()?;
+        Ok(pending_jobs_sorted(&jobs))
+    }
+
+    /// Return all durable jobs in queue storage order.
+    pub fn get_all(&mut self) -> QueueResult<Vec<Job>> {
+        self.read_jobs_locked()
     }
 
     /// Count pending jobs.
     pub fn pending_count(&mut self) -> QueueResult<usize> {
-        self.ensure_loaded()?;
-        Ok(self
-            .jobs
+        let jobs = self.read_jobs_locked()?;
+        Ok(jobs
             .iter()
             .filter(|job| job.status == JobStatus::Pending)
             .count())
@@ -182,9 +215,8 @@ impl Queue {
 
     /// Count running jobs.
     pub fn running_count(&mut self) -> QueueResult<usize> {
-        self.ensure_loaded()?;
-        Ok(self
-            .jobs
+        let jobs = self.read_jobs_locked()?;
+        Ok(jobs
             .iter()
             .filter(|job| job.status == JobStatus::Running)
             .count())
@@ -195,21 +227,204 @@ impl Queue {
         DrainLock::acquire(self.lock_file()).map_err(QueueError::Io)
     }
 
-    fn ensure_loaded(&mut self) -> QueueResult<()> {
-        if self.loaded {
-            return Ok(());
-        }
-        self.load()
+    /// Recover stale running jobs. The caller must hold the drain lock.
+    pub fn recover_stale_running_jobs_for_drain(
+        &mut self,
+        _drain_lock: &DrainLock,
+    ) -> QueueResult<Vec<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let recovered = recover_stale_running_jobs(jobs);
+            let _ = trim_terminal(jobs);
+            Ok(recovered)
+        })
     }
 
-    fn load(&mut self) -> QueueResult<()> {
-        self.jobs = self.read_jobs_from_disk()?;
-        if self.jobs.iter().any(|job| job.status == JobStatus::Running) && !self.is_drain_active() {
-            self.recover_stale_running_jobs();
-            self.save()?;
-        }
-        self.loaded = true;
-        Ok(())
+    /// Trim old terminal jobs from durable queue state and return ids removed
+    /// from `queue.json`. The caller must hold the drain lock.
+    pub fn trim_terminal_jobs_for_drain(
+        &mut self,
+        _drain_lock: &DrainLock,
+    ) -> QueueResult<Vec<String>> {
+        self.with_jobs_locked(|jobs| Ok(trim_terminal(jobs)))
+    }
+
+    /// Cancel pending jobs whose durable request envelope is missing or unreadable.
+    ///
+    /// The caller must hold the drain lock and provide a request-envelope probe.
+    pub fn cancel_orphan_pending_jobs_for_drain(
+        &mut self,
+        _drain_lock: &DrainLock,
+        mut request_status: impl FnMut(&Job) -> Result<bool, String>,
+    ) -> QueueResult<Vec<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let mut cancelled_jobs = Vec::new();
+            for job in jobs.iter_mut() {
+                if job.status != JobStatus::Pending {
+                    continue;
+                }
+
+                let reason = match request_status(job) {
+                    Ok(true) => continue,
+                    Ok(false) => ORPHAN_REQUEST_MESSAGE.to_owned(),
+                    Err(error) => format!("{ORPHAN_REQUEST_MESSAGE}: {error}"),
+                };
+
+                if let Ok(cancelled) = job.cancel_with_reason(Some(reason)) {
+                    *job = cancelled.clone();
+                    cancelled_jobs.push(cancelled);
+                }
+            }
+            let _ = trim_terminal(jobs);
+            Ok(cancelled_jobs)
+        })
+    }
+
+    /// Transition selected pending jobs to running. The caller must hold the
+    /// drain lock.
+    pub fn start_pending_jobs_for_drain(
+        &mut self,
+        _drain_lock: &DrainLock,
+        job_ids: &[String],
+    ) -> QueueResult<Vec<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let mut started_jobs = Vec::new();
+            let mut seen = BTreeSet::new();
+            for job_id in job_ids {
+                if !seen.insert(job_id.as_str()) {
+                    continue;
+                }
+                let Some(job) = jobs
+                    .iter_mut()
+                    .find(|job| job.id == *job_id && job.status == JobStatus::Pending)
+                else {
+                    continue;
+                };
+                if let Ok(started) = job.start() {
+                    *job = started.clone();
+                    started_jobs.push(started);
+                }
+            }
+            Ok(started_jobs)
+        })
+    }
+
+    /// Cancel selected pending jobs by id. The caller must hold the drain lock.
+    pub fn cancel_pending_jobs_for_drain(
+        &mut self,
+        _drain_lock: &DrainLock,
+        cancellations: &[QueuePendingCancellation],
+    ) -> QueueResult<Vec<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let mut cancelled_jobs = Vec::new();
+            let mut seen = BTreeSet::new();
+            for cancellation in cancellations {
+                if !seen.insert(cancellation.job_id.as_str()) {
+                    continue;
+                }
+                let Some(job) = jobs
+                    .iter_mut()
+                    .find(|job| job.id == cancellation.job_id && job.status == JobStatus::Pending)
+                else {
+                    continue;
+                };
+                if let Ok(cancelled) = job.cancel_with_reason(Some(cancellation.reason.clone())) {
+                    *job = cancelled.clone();
+                    cancelled_jobs.push(cancelled);
+                }
+            }
+            let _ = trim_terminal(jobs);
+            Ok(cancelled_jobs)
+        })
+    }
+
+    /// Cancel the given jobs only if, re-checked under the state lock, they are
+    /// still `Running` and still stale by heartbeat age. Returns the jobs that
+    /// were actually cancelled (terminal `Cancelled`, with `reason`).
+    ///
+    /// Unlike [`recover_stale_running_jobs_for_drain`], this is safe to call
+    /// while workers may be alive — the under-lock staleness re-check means a
+    /// job that produced a fresh heartbeat after the caller's snapshot is never
+    /// cancelled, so a live worker is not reaped out from under itself. It does
+    /// not require the drain lock: it is a recovery action keyed on per-job
+    /// liveness, not a drain-owned scheduling decision.
+    ///
+    /// [`recover_stale_running_jobs_for_drain`]: Self::recover_stale_running_jobs_for_drain
+    pub fn cancel_stale_running_jobs(
+        &mut self,
+        job_ids: &[String],
+        now: DateTime<Utc>,
+        stale_after: chrono::Duration,
+        reason: &str,
+    ) -> QueueResult<Vec<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let mut cancelled_jobs = Vec::new();
+            let mut seen = BTreeSet::new();
+            for job_id in job_ids {
+                if !seen.insert(job_id.as_str()) {
+                    continue;
+                }
+                let Some(job) = jobs
+                    .iter_mut()
+                    .find(|job| job.id == *job_id && job.is_stale_running(now, stale_after))
+                else {
+                    continue;
+                };
+                if let Ok(cancelled) = job.cancel_with_reason(Some(reason.to_owned())) {
+                    *job = cancelled.clone();
+                    cancelled_jobs.push(cancelled);
+                }
+            }
+            let _ = trim_terminal(jobs);
+            Ok(cancelled_jobs)
+        })
+    }
+
+    /// Return selected running jobs to pending after scheduler-owned transient
+    /// deferrals. The caller must hold the drain lock.
+    pub fn requeue_deferred_running_jobs_for_drain(
+        &mut self,
+        _drain_lock: &DrainLock,
+        requeues: &[QueueDeferredRequeue],
+    ) -> QueueResult<Vec<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let mut requeued_jobs = Vec::new();
+            let mut seen = BTreeSet::new();
+            for requeue in requeues {
+                if !seen.insert(requeue.job_id.as_str()) {
+                    continue;
+                }
+                let Some(job) = jobs
+                    .iter_mut()
+                    .find(|job| job.id == requeue.job_id && job.status == JobStatus::Running)
+                else {
+                    continue;
+                };
+                if let Ok(deferred) =
+                    job.defer_for_scheduler(requeue.reason.clone(), requeue.defer_until)
+                {
+                    *job = deferred.clone();
+                    requeued_jobs.push(deferred);
+                }
+            }
+            Ok(requeued_jobs)
+        })
+    }
+
+    /// Mutate the queue under the short-lived state lock.
+    pub fn with_jobs_locked<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<Job>) -> QueueResult<T>,
+    ) -> QueueResult<T> {
+        let _lock = StateLock::acquire(self.state_lock_file())?;
+        let mut jobs = self.read_jobs_from_disk()?;
+        let output = f(&mut jobs)?;
+        self.save_jobs_to_disk(&jobs)?;
+        Ok(output)
+    }
+
+    fn read_jobs_locked(&self) -> QueueResult<Vec<Job>> {
+        let _lock = StateLock::acquire(self.state_lock_file())?;
+        self.read_jobs_from_disk()
     }
 
     fn read_jobs_from_disk(&self) -> QueueResult<Vec<Job>> {
@@ -222,12 +437,12 @@ impl Queue {
         Ok(parse_jobs_payload(&raw))
     }
 
-    fn save(&self) -> QueueResult<()> {
+    fn save_jobs_to_disk(&self, jobs: &[Job]) -> QueueResult<()> {
         fs::create_dir_all(&self.state_dir)?;
         self.sweep_legacy_tmp();
 
         let payload = json!({
-            "jobs": self.jobs.iter().map(Job::to_json_value).collect::<Vec<_>>(),
+            "jobs": jobs.iter().map(Job::to_json_value).collect::<Vec<_>>(),
         });
         let payload = format!("{}\n", serde_json::to_string_pretty(&payload)?);
         let (temp_path, mut temp_file) = create_unique_temp_file(&self.state_dir)?;
@@ -253,66 +468,109 @@ impl Queue {
         legacy_tmp.set_extension("json.tmp");
         let _ = fs::remove_file(legacy_tmp);
     }
+}
 
-    fn is_drain_active(&self) -> bool {
-        let lock_file = self.lock_file();
-        let Ok(file) = OpenOptions::new().read(true).write(true).open(lock_file) else {
-            return false;
-        };
-        match file.try_lock_exclusive() {
-            Ok(()) => {
-                let _ = file.unlock();
-                false
-            }
-            Err(_) => true,
+fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {
+    for queued in jobs.iter_mut().filter(|queued| {
+        queued.branch == job.branch
+            && queued.status == JobStatus::Pending
+            && queued.target_names == job.target_names
+            && queued.mode == job.mode
+    }) {
+        if let Ok(cancelled) = queued.cancel_with_reason(Some(SUPERSEDED_MESSAGE.to_owned())) {
+            *queued = cancelled;
         }
     }
+}
 
-    fn recover_stale_running_jobs(&mut self) {
-        for job in self
-            .jobs
-            .iter_mut()
-            .filter(|job| job.status == JobStatus::Running)
-        {
-            for target_name in &job.target_names {
-                job.results
-                    .entry(target_name.clone())
-                    .or_insert_with(|| stale_recovery_result(target_name));
-            }
-            job.status = JobStatus::Completed;
-            job.completed_at = Some(Utc::now());
+fn recover_stale_running_jobs(jobs: &mut [Job]) -> Vec<Job> {
+    let mut recovered = Vec::new();
+    for job in jobs
+        .iter_mut()
+        .filter(|job| job.status == JobStatus::Running)
+    {
+        for target_name in &job.target_names {
+            job.results
+                .entry(target_name.clone())
+                .or_insert_with(|| stale_recovery_result(target_name));
         }
+        job.status = JobStatus::Completed;
+        job.completed_at = Some(Utc::now());
+        recovered.push(job.clone());
     }
+    recovered
+}
 
-    fn pending_jobs_sorted(&self) -> Vec<Job> {
-        let mut pending = self
-            .jobs
-            .iter()
-            .filter(|job| job.status == JobStatus::Pending)
-            .cloned()
-            .collect::<Vec<_>>();
-        pending.sort_by(compare_pending_jobs);
-        pending
+fn pending_jobs_sorted(jobs: &[Job]) -> Vec<Job> {
+    let mut pending = jobs
+        .iter()
+        .filter(|job| job.status == JobStatus::Pending)
+        .cloned()
+        .collect::<Vec<_>>();
+    pending.sort_by(compare_pending_jobs);
+    pending
+}
+
+fn trim_terminal(jobs: &mut Vec<Job>) -> Vec<String> {
+    let before_terminal = jobs
+        .iter()
+        .filter(|job| is_terminal_job(job.status))
+        .map(|job| job.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut completed = jobs
+        .iter()
+        .filter(|job| is_terminal_job(job.status))
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_recent_completed(&mut completed);
+    completed.truncate(KEEP_COMPLETED);
+
+    let mut retained = jobs
+        .iter()
+        .filter(|job| !is_terminal_job(job.status))
+        .cloned()
+        .collect::<Vec<_>>();
+    let retained_terminal = completed
+        .iter()
+        .map(|job| job.id.clone())
+        .collect::<BTreeSet<_>>();
+    retained.extend(completed);
+    *jobs = retained;
+    before_terminal
+        .difference(&retained_terminal)
+        .cloned()
+        .collect()
+}
+
+fn is_terminal_job(status: JobStatus) -> bool {
+    matches!(status, JobStatus::Completed | JobStatus::Cancelled)
+}
+
+/// Short-lived queue state mutation lock.
+#[derive(Debug)]
+struct StateLock {
+    file: File,
+}
+
+impl StateLock {
+    fn acquire(path: PathBuf) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.lock_exclusive()?;
+        Ok(Self { file })
     }
+}
 
-    fn trim_completed(&mut self) {
-        let mut completed = self
-            .jobs
-            .iter()
-            .filter(|job| job.status == JobStatus::Completed)
-            .cloned()
-            .collect::<Vec<_>>();
-        sort_recent_completed(&mut completed);
-        completed.truncate(KEEP_COMPLETED);
-
-        let mut retained = self
-            .jobs
-            .iter()
-            .filter(|job| job.status != JobStatus::Completed)
-            .cloned()
-            .collect::<Vec<_>>();
-        retained.extend(completed);
-        self.jobs = retained;
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -558,8 +816,10 @@ mod tests {
     use crate::job::{Job, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
 
     use super::{
-        KEEP_COMPLETED, Queue, ReplaceRetryPolicy, STALE_RECOVERY_MESSAGE,
-        WINDOWS_REPLACE_ATTEMPTS, retry_replace_with_strategy, scaled_delay,
+        KEEP_COMPLETED, ORPHAN_REQUEST_MESSAGE, Queue, QueueDeferredRequeue,
+        QueuePendingCancellation, ReplaceRetryPolicy, STALE_RECOVERY_MESSAGE,
+        STALE_RUNNING_CANCEL_REASON, SUPERSEDED_MESSAGE, WINDOWS_REPLACE_ATTEMPTS,
+        retry_replace_with_strategy, scaled_delay,
     };
 
     fn queue_dir() -> TempDir {
@@ -580,6 +840,76 @@ mod tests {
         job = job.start().expect("start").complete().expect("complete");
         job.completed_at = Some(Utc::now() - chrono::Duration::seconds(seconds_ago));
         job
+    }
+
+    fn running_aged(branch: &str, sha: &str, started_secs_ago: i64) -> Job {
+        let mut running = job(branch, sha, &["mac"]).start().expect("start");
+        running.started_at = Some(Utc::now() - chrono::Duration::seconds(started_secs_ago));
+        running
+    }
+
+    #[test]
+    fn cancel_stale_running_jobs_cancels_only_stale_running() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let stale = running_aged("main", "stale", 1000);
+        let fresh = running_aged("main", "fresh", 5);
+        let stale_id = stale.id.clone();
+        let fresh_id = fresh.id.clone();
+        queue.enqueue(stale).expect("stale");
+        queue.enqueue(fresh).expect("fresh");
+
+        let cancelled = queue
+            .cancel_stale_running_jobs(
+                &[stale_id.clone(), fresh_id.clone()],
+                Utc::now(),
+                chrono::Duration::seconds(180),
+                STALE_RUNNING_CANCEL_REASON,
+            )
+            .expect("cancel");
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, stale_id);
+        let stale_job = queue.get(&stale_id).expect("get").expect("job");
+        assert_eq!(stale_job.status, JobStatus::Cancelled);
+        assert_eq!(
+            stale_job.cancellation_reason.as_deref(),
+            Some(STALE_RUNNING_CANCEL_REASON)
+        );
+        // The fresh running job is left untouched — no live worker is reaped.
+        let fresh_job = queue.get(&fresh_id).expect("get").expect("job");
+        assert_eq!(fresh_job.status, JobStatus::Running);
+    }
+
+    #[test]
+    fn cancel_stale_running_jobs_ignores_non_running_and_dedupes() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        // Distinct branch/targets so enqueue supersession never touches it.
+        let pending = job("feat-other", "pending", &["linux"]);
+        let stale = running_aged("main", "stale", 1000);
+        let pending_id = pending.id.clone();
+        let stale_id = stale.id.clone();
+        queue.enqueue(pending).expect("pending");
+        queue.enqueue(stale).expect("stale");
+
+        let cancelled = queue
+            .cancel_stale_running_jobs(
+                &[pending_id.clone(), stale_id.clone(), stale_id.clone()],
+                Utc::now(),
+                chrono::Duration::seconds(180),
+                STALE_RUNNING_CANCEL_REASON,
+            )
+            .expect("cancel");
+
+        // Pending is never cancelled by this path; the stale running job is
+        // cancelled exactly once despite the duplicate id.
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, stale_id);
+        assert_eq!(
+            queue.get(&pending_id).expect("get").expect("job").status,
+            JobStatus::Pending
+        );
     }
 
     fn read_queue_json(path: &Path) -> Value {
@@ -649,6 +979,16 @@ mod tests {
         assert!(pending.iter().any(|job| job.sha == "narrow"));
         assert!(pending.iter().any(|job| job.sha == "smoke"));
         assert!(!pending.iter().any(|job| job.sha == "old"));
+        let recent = queue.get_recent(5).expect("recent");
+        let superseded = recent
+            .iter()
+            .find(|job| job.sha == "old")
+            .expect("superseded job retained");
+        assert_eq!(superseded.status, JobStatus::Cancelled);
+        assert_eq!(
+            superseded.cancellation_reason.as_deref(),
+            Some(SUPERSEDED_MESSAGE)
+        );
     }
 
     #[test]
@@ -671,7 +1011,7 @@ mod tests {
         let mut reopened = Queue::new(&state_dir).expect("reopen");
         assert_eq!(
             reopened.get(&id).expect("get").expect("job").status,
-            JobStatus::Completed
+            JobStatus::Running
         );
     }
 
@@ -695,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_running_jobs_recover_when_no_drain_lock_is_held() {
+    fn non_drain_open_does_not_recover_or_mutate_running_jobs() {
         let temp = queue_dir();
         let state_dir = temp.path().to_path_buf();
         let mut queue = Queue::new(&state_dir).expect("queue");
@@ -711,9 +1051,38 @@ mod tests {
         let id = started.id.clone();
         queue.enqueue(started).expect("enqueue");
         drop(queue);
+        let before = fs::read_to_string(state_dir.join("queue.json")).expect("before");
 
         let mut reopened = Queue::new(&state_dir).expect("reopen");
-        let recovered = reopened.get(&id).expect("get").expect("job");
+        let still_running = reopened.get(&id).expect("get").expect("job");
+        let after = fs::read_to_string(state_dir.join("queue.json")).expect("after");
+
+        assert_eq!(still_running.status, JobStatus::Running);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn drain_owner_recovers_stale_running_jobs() {
+        let temp = queue_dir();
+        let state_dir = temp.path().to_path_buf();
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let started = job("main", "abc", &["mac", "linux"])
+            .start()
+            .expect("start")
+            .with_result(TargetResult::new(
+                "mac",
+                "macos",
+                TargetStatus::Pass,
+                "local",
+            ));
+        let id = started.id.clone();
+        queue.enqueue(started).expect("enqueue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("held");
+
+        queue
+            .recover_stale_running_jobs_for_drain(&lock)
+            .expect("recover");
+        let recovered = queue.get(&id).expect("get").expect("job");
 
         assert_eq!(recovered.status, JobStatus::Completed);
         assert_eq!(recovered.results["mac"].status, TargetStatus::Pass);
@@ -722,6 +1091,324 @@ mod tests {
             recovered.results["linux"].error_message.as_deref(),
             Some(STALE_RECOVERY_MESSAGE)
         );
+    }
+
+    #[test]
+    fn drain_owner_cancels_orphan_pending_jobs() {
+        let temp = queue_dir();
+        let state_dir = temp.path().to_path_buf();
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let present = job("main", "present", &["mac"]);
+        let missing = job("main", "missing", &["linux"]);
+        let unreadable = job("main", "unreadable", &["windows"]);
+        let running = job("running", "running", &["mac"]).start().expect("start");
+        let completed = job("done", "complete", &["linux"])
+            .start()
+            .expect("start")
+            .complete()
+            .expect("complete");
+        let present_id = present.id.clone();
+        let missing_id = missing.id.clone();
+        let unreadable_id = unreadable.id.clone();
+        let running_id = running.id.clone();
+        let completed_id = completed.id.clone();
+
+        queue.enqueue(present).expect("present");
+        queue.enqueue(missing).expect("missing");
+        queue.enqueue(unreadable).expect("unreadable");
+        queue.enqueue(running).expect("running");
+        queue.enqueue(completed).expect("completed");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("held");
+
+        let cancelled = queue
+            .cancel_orphan_pending_jobs_for_drain(&lock, |job| match job.sha.as_str() {
+                "present" => Ok(true),
+                "missing" => Ok(false),
+                "unreadable" => Err("permission denied".to_owned()),
+                other => panic!("unexpected probe for {other}"),
+            })
+            .expect("cancel orphans");
+
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(
+            queue
+                .get(&present_id)
+                .expect("present")
+                .expect("job")
+                .status,
+            JobStatus::Pending
+        );
+        assert_eq!(
+            queue
+                .get(&running_id)
+                .expect("running")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            queue
+                .get(&completed_id)
+                .expect("completed")
+                .expect("job")
+                .status,
+            JobStatus::Completed
+        );
+
+        let missing = queue.get(&missing_id).expect("missing").expect("job");
+        let unreadable = queue.get(&unreadable_id).expect("unreadable").expect("job");
+        assert_eq!(missing.status, JobStatus::Cancelled);
+        assert_eq!(
+            missing.cancellation_reason.as_deref(),
+            Some(ORPHAN_REQUEST_MESSAGE)
+        );
+        assert_eq!(unreadable.status, JobStatus::Cancelled);
+        assert_eq!(
+            unreadable.cancellation_reason.as_deref(),
+            Some("Queued request envelope missing or unreadable: permission denied")
+        );
+        assert!(
+            !queue
+                .get_pending()
+                .expect("pending")
+                .iter()
+                .any(|job| job.id == missing_id || job.id == unreadable_id)
+        );
+        let recent = queue.get_recent(10).expect("recent");
+        assert!(recent.iter().any(|job| job.id == missing_id));
+        assert!(recent.iter().any(|job| job.id == unreadable_id));
+    }
+
+    #[test]
+    fn drain_owner_starts_selected_pending_jobs_in_requested_order() {
+        let temp = queue_dir();
+        let state_dir = temp.path().to_path_buf();
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let first = job("main", "first", &["mac"]);
+        let second = job("main", "second", &["linux"]);
+        let running = job("main", "running", &["windows"]).start().expect("start");
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        let running_id = running.id.clone();
+
+        queue.enqueue(first).expect("first");
+        queue.enqueue(second).expect("second");
+        queue.enqueue(running).expect("running");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("held");
+
+        let started = queue
+            .start_pending_jobs_for_drain(
+                &lock,
+                &[
+                    second_id.clone(),
+                    first_id.clone(),
+                    second_id.clone(),
+                    running_id.clone(),
+                ],
+            )
+            .expect("start selected");
+
+        assert_eq!(
+            started
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            [second_id.as_str(), first_id.as_str()]
+        );
+        assert!(started.iter().all(|job| job.status == JobStatus::Running));
+        assert_eq!(
+            queue.get(&first_id).expect("first").expect("job").status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            queue.get(&second_id).expect("second").expect("job").status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            queue
+                .get(&running_id)
+                .expect("running")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+    }
+
+    #[test]
+    fn drain_owner_cancels_selected_pending_jobs_by_id() {
+        let temp = queue_dir();
+        let state_dir = temp.path().to_path_buf();
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let cancel = job("main", "cancel", &["mac"]);
+        let keep = job("main", "keep", &["linux"]);
+        let running = job("main", "running", &["windows"]).start().expect("start");
+        let cancel_id = cancel.id.clone();
+        let keep_id = keep.id.clone();
+        let running_id = running.id.clone();
+
+        queue.enqueue(cancel).expect("cancel");
+        queue.enqueue(keep).expect("keep");
+        queue.enqueue(running).expect("running");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("held");
+
+        let cancelled = queue
+            .cancel_pending_jobs_for_drain(
+                &lock,
+                &[
+                    QueuePendingCancellation {
+                        job_id: cancel_id.clone(),
+                        reason: "same PR superseded".to_owned(),
+                    },
+                    QueuePendingCancellation {
+                        job_id: cancel_id.clone(),
+                        reason: "duplicate ignored".to_owned(),
+                    },
+                    QueuePendingCancellation {
+                        job_id: running_id.clone(),
+                        reason: "running ignored".to_owned(),
+                    },
+                ],
+            )
+            .expect("cancel selected");
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, cancel_id);
+        assert_eq!(cancelled[0].status, JobStatus::Cancelled);
+        assert_eq!(
+            cancelled[0].cancellation_reason.as_deref(),
+            Some("same PR superseded")
+        );
+        assert_eq!(
+            queue.get(&keep_id).expect("keep").expect("job").status,
+            JobStatus::Pending
+        );
+        assert_eq!(
+            queue
+                .get(&running_id)
+                .expect("running")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+        let recent = queue.get_recent(10).expect("recent");
+        assert!(recent.iter().any(|job| job.id == cancel_id));
+    }
+
+    #[test]
+    fn drain_owner_requeues_scheduler_deferred_running_jobs() {
+        let temp = queue_dir();
+        let state_dir = temp.path().to_path_buf();
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let running = job("main", "running", &["mac", "linux"])
+            .start()
+            .expect("start")
+            .with_result(TargetResult::new(
+                "mac",
+                "macos",
+                TargetStatus::Running,
+                "host-pool:local_macs/mac",
+            ))
+            .with_result(TargetResult::new(
+                "linux",
+                "linux",
+                TargetStatus::Pass,
+                "local",
+            ));
+        let pending = job("main", "pending", &["windows"]);
+        let running_id = running.id.clone();
+        let pending_id = pending.id.clone();
+        let retry_at = Utc::now();
+
+        queue.enqueue(running).expect("running");
+        queue.enqueue(pending).expect("pending");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("held");
+
+        let requeued = queue
+            .requeue_deferred_running_jobs_for_drain(
+                &lock,
+                &[
+                    QueueDeferredRequeue {
+                        job_id: running_id.clone(),
+                        reason: "host_pool_lease_unavailable".to_owned(),
+                        defer_until: Some(retry_at),
+                    },
+                    QueueDeferredRequeue {
+                        job_id: running_id.clone(),
+                        reason: "duplicate ignored".to_owned(),
+                        defer_until: None,
+                    },
+                    QueueDeferredRequeue {
+                        job_id: pending_id.clone(),
+                        reason: "pending ignored".to_owned(),
+                        defer_until: None,
+                    },
+                ],
+            )
+            .expect("requeue selected");
+
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].id, running_id);
+        assert_eq!(requeued[0].status, JobStatus::Pending);
+        assert_eq!(requeued[0].started_at, None);
+        assert_eq!(
+            requeued[0].scheduler_defer_reason.as_deref(),
+            Some("host_pool_lease_unavailable")
+        );
+        assert_eq!(requeued[0].scheduler_defer_count, 1);
+        assert_eq!(requeued[0].scheduler_defer_until, Some(retry_at));
+        assert!(!requeued[0].results.contains_key("mac"));
+        assert_eq!(
+            requeued[0].results.get("linux").map(|result| result.status),
+            Some(TargetStatus::Pass)
+        );
+        assert_eq!(
+            queue
+                .get(&pending_id)
+                .expect("pending")
+                .expect("job")
+                .status,
+            JobStatus::Pending
+        );
+    }
+
+    #[test]
+    fn two_queue_handles_preserve_independent_progress_updates() {
+        let temp = queue_dir();
+        let state_dir = temp.path().to_path_buf();
+        let mut first = Queue::new(&state_dir).expect("first queue");
+        let mut second = Queue::new(&state_dir).expect("second queue");
+        let mac_job = job("main", "abc", &["mac"]);
+        let linux_job = job("feature", "def", &["linux"]);
+        let mac_id = mac_job.id.clone();
+        let linux_id = linux_job.id.clone();
+
+        first.enqueue(mac_job.clone()).expect("enqueue mac");
+        first.enqueue(linux_job.clone()).expect("enqueue linux");
+        let mac_started = mac_job.start().expect("start mac");
+        let linux_started = linux_job.start().expect("start linux");
+        first.update(&mac_started).expect("start mac update");
+        second.update(&linux_started).expect("start linux update");
+
+        let mac = mac_started.with_result(TargetResult::new(
+            "mac",
+            "macos",
+            TargetStatus::Pass,
+            "local",
+        ));
+        first.update(&mac).expect("mac update");
+
+        let linux = linux_started.with_result(TargetResult::new(
+            "linux",
+            "linux",
+            TargetStatus::Pass,
+            "ssh",
+        ));
+        second.update(&linux).expect("linux update");
+
+        let final_mac = first.get(&mac_id).expect("get mac").expect("mac job");
+        let final_linux = first.get(&linux_id).expect("get linux").expect("linux job");
+        assert_eq!(final_mac.results["mac"].status, TargetStatus::Pass);
+        assert_eq!(final_linux.results["linux"].status, TargetStatus::Pass);
     }
 
     #[test]
@@ -742,6 +1429,46 @@ mod tests {
         let recent = queue.get_recent(100).expect("recent");
         assert_eq!(recent.len(), KEEP_COMPLETED);
         assert_eq!(recent.first().expect("first").sha, "sha34");
+    }
+
+    #[test]
+    fn drain_owned_terminal_trim_returns_removed_job_ids() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        for index in 0..(KEEP_COMPLETED + 2) {
+            let pending = job(&format!("feat/{index}"), &format!("sha{index}"), &["mac"]);
+            let completed = completed_from(
+                pending.clone(),
+                i64::try_from(KEEP_COMPLETED + 2 - index).expect("seconds"),
+            );
+            queue.enqueue(pending).expect("enqueue");
+            queue.update(&completed).expect("update");
+        }
+
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("acquired");
+        let removed = queue
+            .trim_terminal_jobs_for_drain(&drain_lock)
+            .expect("trim");
+
+        assert!(removed.is_empty());
+
+        let stale = completed_from(job("old", "sha-old", &["mac"]), 10_000);
+        let stale_id = stale.id.clone();
+        queue
+            .with_jobs_locked(|jobs| {
+                jobs.push(stale);
+                Ok(())
+            })
+            .expect("inject stale");
+
+        let removed = queue
+            .trim_terminal_jobs_for_drain(&drain_lock)
+            .expect("trim stale");
+        assert_eq!(removed, vec![stale_id]);
+        assert_eq!(queue.get_recent(100).expect("recent").len(), KEEP_COMPLETED);
     }
 
     #[test]

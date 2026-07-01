@@ -103,6 +103,71 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual(json.loads(values["linux_runs_on_json"]), "ubuntu-latest")
         self.assertEqual(values["linux_provider"], "github-hosted")
 
+    def test_local_provider_routes_macos_to_self_hosted_local_mac(self) -> None:
+        row = ci_matrix.resolve_runs_on(
+            "macos-arm64", {"REQUESTED_PROVIDER": "local"}
+        )
+        self.assertEqual(row["provider"], "local")
+        self.assertEqual(
+            json.loads(row["runs_on_json"]),
+            ["self-hosted", "local-mac"],
+        )
+
+    def test_local_provider_falls_back_to_hosted_for_targets_without_local_box(
+        self,
+    ) -> None:
+        for target_key, hosted in (
+            ("linux", "ubuntu-latest"),
+            ("linux-arm64", "ubuntu-24.04-arm"),
+            ("windows", "windows-latest"),
+        ):
+            row = ci_matrix.resolve_runs_on(
+                target_key, {"REQUESTED_PROVIDER": "local"}
+            )
+            self.assertEqual(row["provider"], "github-hosted", target_key)
+            self.assertEqual(json.loads(row["runs_on_json"]), hosted, target_key)
+
+    def test_local_repo_var_overrides_builtin_local_label(self) -> None:
+        row = ci_matrix.resolve_runs_on(
+            "macos-arm64",
+            {
+                "REQUESTED_PROVIDER": "local",
+                "LOCAL_MACOS_ARM64_RUNS_ON_JSON": '["self-hosted","studio"]',
+            },
+        )
+        self.assertEqual(row["provider"], "local")
+        self.assertEqual(
+            json.loads(row["runs_on_json"]),
+            ["self-hosted", "studio"],
+        )
+
+    def test_explicit_selector_wins_over_local_provider(self) -> None:
+        row = ci_matrix.resolve_runs_on(
+            "macos-arm64",
+            {
+                "REQUESTED_PROVIDER": "local",
+                "EXPLICIT_MACOS_ARM64_RUNNER_SELECTOR_JSON": '["self-hosted","macos","arm64"]',
+            },
+        )
+        self.assertEqual(
+            json.loads(row["runs_on_json"]),
+            ["self-hosted", "macos", "arm64"],
+        )
+
+    def test_release_matrix_local_provider_routes_only_macos(self) -> None:
+        matrix = ci_matrix.workflow_matrix(
+            "release", {"REQUESTED_PROVIDER": "local"}
+        )
+        rows = {row["key"]: row for row in matrix["include"]}
+        self.assertEqual(rows["macos-arm64"]["provider"], "local")
+        self.assertEqual(
+            json.loads(rows["macos-arm64"]["runs_on_json"]),
+            ["self-hosted", "local-mac"],
+        )
+        self.assertEqual(rows["linux"]["provider"], "github-hosted")
+        self.assertEqual(rows["linux-arm64"]["provider"], "github-hosted")
+        self.assertEqual(rows["windows"]["provider"], "github-hosted")
+
     def test_workflows_do_not_implicitly_route_macos_to_local_runner(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow_dir = root / ".github" / "workflows"

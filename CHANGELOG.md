@@ -3,15 +3,135 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0600"></a>
-## [0.60.0]
+<a id="v0750"></a>
+## [0.75.0] - 2026-07-01
 
-- feat(runner): `runner watch --reap-stale-runs` — on every watch tick, cancel stale GitHub Actions workflow *runs* repo-wide: runs stuck `in_progress` past `--reap-in-progress-max-min` (default ~5h, hung) and runs stuck `queued` past `--reap-queued-max-min` (default ~8h, orphaned). The run-level complement to `--kill-hung-workers`. Supports `--dry-run` and emits `event=reap_stale_run` JSON envelopes (`phase ∈ {attempt,cancelled,failed,skipped}`). Thresholds are overridable via flag or `[runner.watchdog]` config keys `reap_in_progress_max_min` / `reap_queued_max_min`. Closes #312.
+- feat(ship-state): liveness-aware, configurable, status-surfaced orphan detection ([#367](https://github.com/danielraffel/Shipyard/pull/367))
+
+<a id="v0740"></a>
+## [0.74.0] - 2026-07-01
+
+- feat(ship-state): report orphaned in-flight states in `ship-state list` ([#366](https://github.com/danielraffel/Shipyard/pull/366))
+- feat(classify): opt-in infra-vs-code failure reclassification ([#365](https://github.com/danielraffel/Shipyard/pull/365))
+
+<a id="v0730"></a>
+## [0.73.0] - 2026-07-01
+
+- feat(preflight): opt-in host-health pre-dispatch gate ([#364](https://github.com/danielraffel/Shipyard/pull/364))
+- fix: use GET for metrics GitHub import ([#362](https://github.com/danielraffel/Shipyard/pull/362))
+
+<a id="v0720"></a>
+## [0.72.0] - 2026-06-12
+
+- feat: add runner metrics store and VM profile planning ([#361](https://github.com/danielraffel/Shipyard/pull/361))
+
+<a id="v0710"></a>
+## [0.71.0] - 2026-06-11
+
+- feat: add CI routing profile planner ([#360](https://github.com/danielraffel/Shipyard/pull/360))
+- fix(gh): expand {repo_slug} from the served repo, not just the daemon CWD ([#357](https://github.com/danielraffel/Shipyard/pull/357))
+
+<a id="v0700"></a>
+## [0.70.0] - 2026-06-04
+
+- feat(run): add command evidence bundles ([#356](https://github.com/danielraffel/Shipyard/pull/356))
+
+<a id="v0690"></a>
+## [0.69.0] - 2026-06-04
+
+- feat(watch): add local VM command watcher ([#355](https://github.com/danielraffel/Shipyard/pull/355))
+- docs(targets): wire emulated x86_64 smoke as a local tartci target ([#354](https://github.com/danielraffel/Shipyard/pull/354))
+
+<a id="v0681"></a>
+## [0.68.1] - 2026-06-03
+
+- fix(update): authenticate release queries opportunistically + clearer rate-limit error ([#353](https://github.com/danielraffel/Shipyard/pull/353))
+
+<a id="v0680"></a>
+## [0.68.0] - 2026-06-03
+
+- fix(queue): reap stale running ship jobs so a killed worker can't block retries ([#351](https://github.com/danielraffel/Shipyard/pull/351))
+- feat(diagnostics): point self-hosted empty-log failures at the ctest artifact ([#349](https://github.com/danielraffel/Shipyard/pull/349))
+
+<a id="v0656"></a>
+## [0.65.6] - 2026-06-02
+
+- release: bump CLI to 0.65.6 to ship doctor UX fixes (#338, #339) ([#342](https://github.com/danielraffel/Shipyard/pull/342))
+- release: ship doctor UX fixes (#338, #339) to a CLI release ([#341](https://github.com/danielraffel/Shipyard/pull/341))
+- release: ship doctor UX fixes to a CLI release ([#340](https://github.com/danielraffel/Shipyard/pull/340))
+- fix(doctor): gh-scope is green-informational for configured tokens ([#339](https://github.com/danielraffel/Shipyard/pull/339))
+- fix(doctor): make nsc optional and de-alarm github-auth message ([#338](https://github.com/danielraffel/Shipyard/pull/338))
+
+<a id="v0655"></a>
+## [0.65.5] - 2026-06-01
+
+- fix(reroute): run the cloud-retarget child in the watcher's cwd (Codex review on #333) ([#334](https://github.com/danielraffel/Shipyard/pull/334))
+
+<a id="v0654"></a>
+## [0.65.4] - 2026-06-01
+
+- fix(reroute): compare --apply guard against the effective dispatch repo (Codex review on #332) ([#333](https://github.com/danielraffel/Shipyard/pull/333))
+
+<a id="v0653"></a>
+## [0.65.3] - 2026-06-01
+
+- fix(reroute): fail fast on cross-repo --apply (Codex review on #330) ([#332](https://github.com/danielraffel/Shipyard/pull/332))
+
+<a id="v0652"></a>
+## [0.65.2] - 2026-06-01
+
+- fix(pr): honor threaded github.auth in PR creation; document App-auth global config + multi-client ([#331](https://github.com/danielraffel/Shipyard/pull/331))
+
+<a id="v0651"></a>
+## [0.65.1] - 2026-06-01
+
+- fix(runner): address Codex review on #316 PRs (paginate runners; drop bad retarget arg) ([#330](https://github.com/danielraffel/Shipyard/pull/330))
+
+<a id="v0650"></a>
+## [0.65.0] - 2026-06-01
+
+- fix(build): sync Cargo.lock to 0.65.0 after version bump ([#329](https://github.com/danielraffel/Shipyard/pull/329))
+
+<a id="v0640"></a>
+## [0.64.0] - 2026-06-01
+
+- feat(runner): add VM-slot-aware capacity accounting (#316 Part B) ([#328](https://github.com/danielraffel/Shipyard/pull/328))
+
+<a id="v0630"></a>
+## [0.63.0] - 2026-06-01
+
+- feat(runner): add `runner audit` for host-class naming/label drift (#316 Part A) ([#327](https://github.com/danielraffel/Shipyard/pull/327))
+
+<a id="v0620"></a>
+## [0.62.0] - 2026-06-01
+
+- feat(ci): add `local` runner provider to route macOS jobs to a self-hosted Mac ([#326](https://github.com/danielraffel/Shipyard/pull/326))
+
+<a id="v0610"></a>
+## [0.61.0] - 2026-06-01
+
+- feat(runner): add register/list/remove/tag provisioning suite ([#323](https://github.com/danielraffel/Shipyard/pull/323))
+- fix(auto-merge): abort when live PR head supersedes the validated SHA (#321) ([#322](https://github.com/danielraffel/Shipyard/pull/322))
+
+<a id="v0601"></a>
+## [0.60.1] - 2026-05-27
+
+- fix: route app-auth PR fallbacks through REST ([#315](https://github.com/danielraffel/Shipyard/pull/315))
+
+<a id="v0600"></a>
+## [0.60.0] - 2026-05-27
+
+- feat: add app auth and local mac queue concurrency ([#314](https://github.com/danielraffel/Shipyard/pull/314))
 
 <a id="v0590"></a>
-## [0.59.0]
+## [0.59.0] - 2026-05-18
 
-- feat(watch): Phase 2 failure diagnostics — render the Phase 1 failing-job URL + step + parsed test footer on every `shipyard watch --pr N --follow` transition where a target enters a terminal failure state.
+- feat(watch): Phase 2 — diagnostics block on terminal-failure transitions ([#310](https://github.com/danielraffel/Shipyard/pull/310))
+- fix(ship): pin auto-merge failure-path probe to a snapshot (closes #296) ([#309](https://github.com/danielraffel/Shipyard/pull/309))
+- fix(preflight): name --skip-target flag in unreachable error (#301 3/3) ([#308](https://github.com/danielraffel/Shipyard/pull/308))
+- fix(ship): stop claiming "all green" when merge was rejected (#301 2/3) ([#307](https://github.com/danielraffel/Shipyard/pull/307))
+- fix(windows): gate WEBHOOK_REGISTRATION_RETRY_INTERVAL on cfg(unix) ([#305](https://github.com/danielraffel/Shipyard/pull/305))
+- fix(pr): accept `--base origin/main`, not just `--base main` (#301 1/3) ([#306](https://github.com/danielraffel/Shipyard/pull/306))
 
 <a id="v0580"></a>
 ## [0.58.0] - 2026-05-18
@@ -549,6 +669,29 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.75.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.75.0
+[0.74.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.74.0
+[0.73.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.73.0
+[0.72.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.72.0
+[0.71.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.71.0
+[0.70.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.70.0
+[0.69.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.69.0
+[0.68.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.68.1
+[0.68.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.68.0
+[0.65.6]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.6
+[0.65.5]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.5
+[0.65.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.4
+[0.65.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.3
+[0.65.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.2
+[0.65.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.1
+[0.65.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.65.0
+[0.64.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.64.0
+[0.63.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.63.0
+[0.62.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.62.0
+[0.61.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.61.0
+[0.60.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.60.1
+[0.60.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.60.0
+[0.59.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.59.0
 [0.58.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.58.0
 [0.57.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.57.0
 [0.56.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.56.2

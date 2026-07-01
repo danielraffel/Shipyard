@@ -65,7 +65,7 @@ pub(super) fn rescue_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let actions = GitHubActions::new(cwd);
+    let actions = GitHubActions::from_loaded_config(cwd, config);
     rescue_with_actions(args, config, cwd, &actions, json, stdout, Utc::now())
 }
 
@@ -171,13 +171,18 @@ fn collect_candidates(
         if !matches_branch(&run, branch) {
             continue;
         }
+        // A watchdog sweep marks a wedged run `cancelled`; a flaky or
+        // genuinely-failed required leg ends `failure`/`timed_out`. All three
+        // are re-dispatchable under --rerun-failed (#345) — the previous code
+        // only caught `cancelled`, so a plain failed macOS leg was never a
+        // rescue candidate.
         if run
             .conclusion
             .as_deref()
-            .is_some_and(|value| value == "cancelled")
+            .is_some_and(|value| matches!(value, "cancelled" | "failure" | "timed_out"))
         {
             candidates.push(Candidate {
-                kind: CandidateKind::CompletedCancelled,
+                kind: CandidateKind::CompletedRerunnable,
                 run,
             });
         }
@@ -202,7 +207,12 @@ fn rescue_envelope_data(
         branch.map_or(Value::Null, |value| Value::from(value.to_owned())),
     );
     data.insert("all_stuck".to_owned(), Value::Bool(args.all_stuck));
-    data.insert("provider".to_owned(), Value::from(args.provider.clone()));
+    data.insert(
+        "provider".to_owned(),
+        args.provider
+            .clone()
+            .map_or_else(|| Value::from("auto"), Value::from),
+    );
     data.insert("rerun_failed".to_owned(), Value::Bool(args.rerun_failed));
     data.insert("dry_run".to_owned(), Value::Bool(args.dry_run));
     data.insert("threshold_secs".to_owned(), Value::from(threshold_secs));
@@ -227,7 +237,23 @@ struct Candidate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CandidateKind {
     QueuedStuck,
-    CompletedCancelled,
+    CompletedRerunnable,
+}
+
+/// Resolve the provider to redispatch a rescue candidate to.
+///
+/// An explicit `--to` forces the provider for any candidate. Without it,
+/// resolution is kind-aware (#345): a wedged stuck-queued run falls back to
+/// `github-hosted` (move off the stuck local runner — the original rescue
+/// intent), while a re-run failed/cancelled/timed-out run RE-RESOLVES
+/// (`None` → config/default, i.e. local-first with overflow) so a leg that
+/// overflowed to a GPU-less hosted runner can return to a real local runner.
+fn rescue_provider_override(explicit: Option<&str>, kind: CandidateKind) -> Option<String> {
+    match (explicit, kind) {
+        (Some(provider), _) => Some(provider.to_owned()),
+        (None, CandidateKind::QueuedStuck) => Some("github-hosted".to_owned()),
+        (None, CandidateKind::CompletedRerunnable) => None,
+    }
 }
 
 fn process_candidate(
@@ -238,7 +264,7 @@ fn process_candidate(
     actions: &GitHubActions,
     repo_slug: &str,
 ) -> RunOutcome {
-    if matches!(candidate.kind, CandidateKind::CompletedCancelled) && !args.rerun_failed {
+    if matches!(candidate.kind, CandidateKind::CompletedRerunnable) && !args.rerun_failed {
         return RunOutcome::SkippedCompleted;
     }
     let run = &candidate.run;
@@ -250,12 +276,13 @@ fn process_candidate(
     let Some(workflow_key) = workflow_key else {
         return RunOutcome::SkippedNoPlan(format!("no local workflow key matches {workflow_file}"));
     };
+    let provider_override = rescue_provider_override(args.provider.as_deref(), candidate.kind);
     let plan = match resolve_cloud_dispatch_plan(
         config,
         workflows,
         &workflow_key,
         &run.head_branch,
-        Some(&args.provider),
+        provider_override.as_deref(),
     ) {
         Ok(plan) => plan,
         Err(error) => {
@@ -266,7 +293,7 @@ fn process_candidate(
     };
 
     match candidate.kind {
-        CandidateKind::CompletedCancelled => {
+        CandidateKind::CompletedRerunnable => {
             if args.dry_run {
                 return RunOutcome::Planned;
             }
@@ -323,7 +350,7 @@ fn candidate_row(candidate: &Candidate, outcome: &RunOutcome) -> BTreeMap<String
         "kind".to_owned(),
         Value::from(match candidate.kind {
             CandidateKind::QueuedStuck => "queued-stuck",
-            CandidateKind::CompletedCancelled => "completed-cancelled",
+            CandidateKind::CompletedRerunnable => "completed-cancelled",
         }),
     );
     row.insert("status".to_owned(), Value::from(outcome.label()));
@@ -367,13 +394,13 @@ fn render_human_summary(
     }
 
     let mut lines = Vec::new();
+    let provider_label = args.provider.as_deref().unwrap_or("auto");
     let header = if args.dry_run {
         format!(
-            "Rescue plan for {scope} (provider: {}). Dry-run; re-run without --dry-run to apply.",
-            args.provider
+            "Rescue plan for {scope} (provider: {provider_label}). Dry-run; re-run without --dry-run to apply."
         )
     } else {
-        format!("Rescued {scope} (provider: {}).", args.provider)
+        format!("Rescued {scope} (provider: {provider_label}).")
     };
     lines.push(header);
     for row in rows {
@@ -585,7 +612,7 @@ mod tests {
         let args = RescueArgs {
             pr: Some(7),
             all_stuck: false,
-            provider: "github-hosted".to_owned(),
+            provider: Some("github-hosted".to_owned()),
             rerun_failed: false,
             dry_run: true,
             threshold: "30m".to_owned(),
@@ -609,7 +636,7 @@ mod tests {
         let args = RescueArgs {
             pr: Some(7),
             all_stuck: false,
-            provider: "github-hosted".to_owned(),
+            provider: Some("github-hosted".to_owned()),
             rerun_failed: false,
             dry_run: false,
             threshold: "30m".to_owned(),
@@ -643,7 +670,7 @@ mod tests {
         let args = RescueArgs {
             pr: Some(7),
             all_stuck: false,
-            provider: "github-hosted".to_owned(),
+            provider: Some("github-hosted".to_owned()),
             rerun_failed: false,
             dry_run: true,
             threshold: "30m".to_owned(),
@@ -653,6 +680,30 @@ mod tests {
         let outcome =
             process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
         assert_eq!(outcome, RunOutcome::Planned);
+    }
+
+    #[test]
+    fn rescue_provider_override_is_kind_aware_without_explicit_to() {
+        // #345: explicit --to forces the provider for any candidate kind.
+        assert_eq!(
+            rescue_provider_override(Some("local"), CandidateKind::QueuedStuck),
+            Some("local".to_owned())
+        );
+        assert_eq!(
+            rescue_provider_override(Some("github-hosted"), CandidateKind::CompletedRerunnable),
+            Some("github-hosted".to_owned())
+        );
+        // Without --to: a wedged stuck-queued run moves OFF the local runner to
+        // github-hosted; a re-run failed run RE-RESOLVES (None → local-first
+        // with overflow) so an overflowed-to-hosted leg can return local.
+        assert_eq!(
+            rescue_provider_override(None, CandidateKind::QueuedStuck),
+            Some("github-hosted".to_owned())
+        );
+        assert_eq!(
+            rescue_provider_override(None, CandidateKind::CompletedRerunnable),
+            None
+        );
     }
 
     #[test]
@@ -668,13 +719,13 @@ mod tests {
             Some("cancelled"),
         );
         let candidate = Candidate {
-            kind: CandidateKind::CompletedCancelled,
+            kind: CandidateKind::CompletedRerunnable,
             run,
         };
         let args = RescueArgs {
             pr: Some(7),
             all_stuck: false,
-            provider: "github-hosted".to_owned(),
+            provider: Some("github-hosted".to_owned()),
             rerun_failed: false,
             dry_run: true,
             threshold: "30m".to_owned(),
@@ -700,7 +751,7 @@ mod tests {
         let args = RescueArgs {
             pr: Some(7),
             all_stuck: false,
-            provider: "github-hosted".to_owned(),
+            provider: Some("github-hosted".to_owned()),
             rerun_failed: false,
             dry_run: true,
             threshold: "30m".to_owned(),

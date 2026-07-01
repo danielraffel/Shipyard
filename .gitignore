@@ -46,3 +46,6 @@ CHANGELOG.md.pre-shipyard.bak
 
 # PyInstaller
 *.spec
+
+# Claude Code transient scheduler lock
+.claude/scheduled_tasks.lock

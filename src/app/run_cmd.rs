@@ -15,12 +15,12 @@ use crate::job::{Priority, ValidationMode};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 use crate::preflight::{
-    EXIT_BACKEND_UNREACHABLE, ShipPreflightError, ShipPreflightOptions,
+    EXIT_BACKEND_UNREACHABLE, EXIT_HOST_UNHEALTHY, ShipPreflightError, ShipPreflightOptions,
     collect_ship_preflight_with_options,
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
-use crate::ship::{RunExecutionRequest, RunStores, execute_run};
+use crate::ship::{RunExecutionRequest, RunStores, drain_or_wait_run, submit_run};
 use crate::warm_pool::{WarmPool, default_pool_path};
 
 pub(super) struct RunCommandArgs {
@@ -168,24 +168,31 @@ pub(super) fn run_command<W: Write>(
     let prepared = PreparedStateStore::new(runtime_paths.state_dir.join("prepared"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let warm_pool = WarmPool::new(default_pool_path(&runtime_paths.state_dir));
-    let dispatcher = ExecutorDispatcher::new(Some(prepared));
+    let dispatcher =
+        ExecutorDispatcher::new_with_state_dir(Some(prepared), &runtime_paths.state_dir);
 
-    let outcome = execute_run(
-        &RunExecutionRequest {
-            branch,
-            sha,
-            mode,
-            priority: Priority::Normal,
-            warm_disabled: args.warm == WarmPolicy::Disabled,
-            fail_fast: args.fail_fast == FailFastMode::StopOnFirstFailure,
-            resume_from: args.resume_from,
-            targets,
-        },
+    let request = RunExecutionRequest {
+        branch,
+        sha,
+        mode,
+        priority: Priority::Normal,
+        warm_disabled: args.warm == WarmPolicy::Disabled,
+        fail_fast: args.fail_fast == FailFastMode::StopOnFirstFailure,
+        resume_from: args.resume_from,
+        targets,
+    };
+    let job = submit_run(&request, &mut queue, cwd, &runtime_paths.state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let outcome = drain_or_wait_run(
+        &request,
+        job.clone(),
         RunStores {
             queue: &mut queue,
             evidence: &evidence,
             warm_pool: &warm_pool,
+            cwd,
             state_dir: &runtime_paths.state_dir,
+            config,
         },
         &dispatcher,
     )
@@ -214,6 +221,7 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
     let code = match error {
         ShipPreflightError::RootMismatch { .. } => 1,
         ShipPreflightError::BackendUnreachable { .. } => EXIT_BACKEND_UNREACHABLE,
+        ShipPreflightError::HostUnhealthy { .. } => EXIT_HOST_UNHEALTHY,
     };
     CliFailure::new(code, error.to_string())
 }

@@ -8,6 +8,8 @@ pub mod app;
 pub mod branch;
 /// Bundle transfer command construction and path normalization.
 pub mod bundle;
+/// VM-slot-aware macOS capacity accounting across host-class members.
+pub mod capacity;
 /// Changelog tag graph extraction and markdown rendering.
 pub mod changelog;
 /// Coarse failure classification shared by executors.
@@ -36,8 +38,14 @@ pub mod evidence;
 pub mod executor;
 /// Repo-local gate script resolution for `shipyard pr`.
 pub mod gate_scripts;
+/// Shared GitHub CLI command boundary and auth resolution.
+pub mod gh;
 /// Branch governance profiles and GitHub branch-protection helpers.
 pub mod governance;
+/// Optional host-health pre-dispatch gate (reads the `host_vitals` signal).
+pub mod host_health;
+/// Local host-pool configuration and lease state.
+pub mod host_pool;
 /// Product naming and runtime-mode identity.
 pub mod identity;
 /// Project initialization and ecosystem detection.
@@ -46,6 +54,8 @@ pub mod init_config;
 pub mod job;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
+/// Runner and CI timing metrics store and analysis helpers.
+pub mod metrics;
 /// Structured JSON output helpers.
 pub mod output;
 /// Filesystem path resolution for isolated and compatible modes.
@@ -64,14 +74,26 @@ pub mod preflight;
 pub mod prepared_state;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
+/// Durable queued execution request and outcome stores.
+pub mod queue_request;
+/// Cooperative queue scheduler planning primitives.
+pub mod queue_scheduler;
 /// Best-effort reconciliation of durable ship-state against GitHub truth.
 pub mod reconcile;
 /// GitHub webhook registration through the user's existing `gh` auth.
 pub mod registrar;
+/// Cloud→local macOS reroute decision logic (#316 Part C).
+pub mod reroute;
+/// Self-hosted runner provisioning (register/list/remove) pure logic.
+pub mod runner_provision;
 /// Self-hosted runner watchdog detection logic.
 pub mod runner_watchdog;
 /// Ship execution orchestration helpers.
 pub mod ship;
+/// Read-only orphan/liveness classification for in-flight ship states.
+pub mod ship_liveness;
+/// Opt-in, default-off same-backend retry policy for transient local legs.
+pub mod ship_retry;
 /// Durable in-flight ship-state model and store.
 pub mod ship_state;
 /// Subprocess helpers that mark supervised child processes with

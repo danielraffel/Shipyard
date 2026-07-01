@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use crate::identity::RuntimeMode;
 
@@ -50,6 +50,24 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: Option<ConfigCommand>,
     },
+    /// Inspect CI routing profiles and repo runner-placement plans.
+    Ci {
+        /// CI subcommand.
+        #[command(subcommand)]
+        command: CiCommand,
+    },
+    /// Record, import, and inspect runner performance metrics.
+    Metrics {
+        /// Metrics subcommand.
+        #[command(subcommand)]
+        command: Box<MetricsCommand>,
+    },
+    /// Inspect and move Shipyard GitHub auth config without secrets.
+    Auth {
+        /// Auth subcommand.
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Configure Shipyard for the current project.
     Init {
         /// Show detected config output; preserves Python's current write behavior.
@@ -85,6 +103,9 @@ pub(super) enum Command {
     Status,
     /// Show last-good-SHA evidence per target.
     Evidence {
+        /// Evidence subcommand.
+        #[command(subcommand)]
+        command: Option<EvidenceCommand>,
         /// Branch to inspect. Defaults to current git branch or main.
         branch: Option<String>,
     },
@@ -134,7 +155,7 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: Option<QuarantineCommand>,
     },
-    /// Check environment, dependencies, and targets.
+    /// Check environment, dependencies, targets, and effective GitHub auth.
     Doctor {
         /// Additionally dispatch auto-release.yml to verify the release-bot chain.
         #[arg(long = "release-chain")]
@@ -142,14 +163,17 @@ pub(super) enum Command {
         /// Probe configured non-local runner targets for reachability.
         #[arg(long)]
         runners: bool,
-        /// Probe GitHub's REST and GraphQL rate-limit buckets and report
-        /// both separately. Useful when one bucket is exhausted but the other
-        /// has budget.
+        /// Probe the effective GitHub auth source plus REST and GraphQL
+        /// rate-limit buckets. Shows whether Shipyard is using ambient `gh`,
+        /// an env token, or a command helper such as a GitHub App installation.
         #[arg(long = "rate-limit")]
         rate_limit: bool,
     },
     /// Validate current HEAD on configured targets.
     Run {
+        /// Run subcommand.
+        #[command(subcommand)]
+        command: Option<RunSubcommand>,
         /// Comma-separated target names. Defaults to all configured targets.
         #[arg(long)]
         targets: Option<String>,
@@ -208,6 +232,11 @@ pub(super) enum Command {
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
+        /// Adopt the current head SHA when recorded ship-state drifted (amend /
+        /// force-push), re-validating the new head instead of failing on
+        /// SHA drift (Shipyard #346).
+        #[arg(long = "adopt-head")]
+        adopt_head: bool,
     },
     /// One-shot push-a-PR: skill-sync, version-bump, then ship.
     Pr {
@@ -238,6 +267,11 @@ pub(super) enum Command {
         /// Reason used with --skip-skill-update.
         #[arg(long = "skill-reason")]
         skill_reason: Option<String>,
+        /// Adopt the current head SHA when recorded ship-state drifted (amend /
+        /// force-push), re-validating the new head instead of failing on
+        /// SHA drift (Shipyard #346).
+        #[arg(long = "adopt-head")]
+        adopt_head: bool,
     },
     /// Cloud runner operations.
     Cloud {
@@ -291,6 +325,9 @@ pub(super) enum Command {
     },
     /// Live view of an in-flight ship.
     Watch {
+        /// Watch subcommand. Omit for PR ship-state watch.
+        #[command(subcommand)]
+        command: Option<WatchSubcommand>,
         /// PR number to watch. Defaults to the active ship for the current branch.
         #[arg(long)]
         pr: Option<u64>,
@@ -317,6 +354,313 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: RunnerCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum EvidenceCommand {
+    /// Show command-evidence bundles produced by `shipyard run command`.
+    Command {
+        /// Evidence id. Defaults to the most recent command-evidence bundle.
+        id: Option<String>,
+        /// Show all command-evidence bundle summaries.
+        #[arg(long)]
+        list: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum CiCommand {
+    /// Inspect CI routing profiles.
+    Profile {
+        /// Profile subcommand.
+        #[command(subcommand)]
+        command: CiProfileCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum CiProfileCommand {
+    /// Print a profile file.
+    Show {
+        /// Profile name.
+        name: String,
+        /// Explicit profile TOML path. Defaults to .tartci/<name>.toml,
+        /// .shipyard/ci-profiles/<name>.toml, then ci-profiles/<name>.toml.
+        #[arg(long = "profile-file")]
+        profile_file: Option<PathBuf>,
+    },
+    /// Produce a read-only plan of concrete GitHub variables/selectors.
+    Plan {
+        /// Profile name.
+        name: String,
+        /// Owner/repo slug.
+        #[arg(long)]
+        repo: String,
+        /// Explicit profile TOML path. Defaults to .tartci/<name>.toml,
+        /// .shipyard/ci-profiles/<name>.toml, then ci-profiles/<name>.toml.
+        #[arg(long = "profile-file")]
+        profile_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum MetricsCommand {
+    /// Record one explicit step/job timing sample.
+    Record(Box<MetricsRecordArgs>),
+    /// Import metrics from an external source.
+    Import {
+        /// Import source.
+        #[command(subcommand)]
+        source: MetricsImportCommand,
+    },
+    /// List recent job rows.
+    List(MetricsListArgs),
+    /// Summarize p50/p90/min/max/failure-rate by project,target,backend,host.
+    Summary(MetricsProjectArgs),
+    /// Show slowest successful jobs.
+    Slowest(MetricsListArgs),
+    /// Compare before/after timing windows.
+    Compare(MetricsCompareArgs),
+    /// Show simple trend rows.
+    Trend(MetricsListArgs),
+    /// Emit agent-oriented drift findings.
+    Watch(MetricsWatchArgs),
+    /// Emit agent-oriented placement advice.
+    Advise(MetricsAdviseArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum MetricsImportCommand {
+    /// Import tartci runtime export JSON/JSONL.
+    Tartci(MetricsImportTartciArgs),
+    /// Import GitHub Actions jobs for recent workflow runs.
+    Github(MetricsImportGithubArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsRecordArgs {
+    /// Project key, for example `pulp`.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Owner/repo slug.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Git branch.
+    #[arg(long)]
+    pub(crate) branch: Option<String>,
+    /// Git commit SHA.
+    #[arg(long)]
+    pub(crate) sha: Option<String>,
+    /// Pull request number.
+    #[arg(long)]
+    pub(crate) pr: Option<i64>,
+    /// Workflow name.
+    #[arg(long)]
+    pub(crate) workflow: Option<String>,
+    /// Routing profile name.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+    /// Routing decision, for example primary/fallback/forced.
+    #[arg(long = "routing-decision")]
+    pub(crate) routing_decision: Option<String>,
+    /// Job/lane name.
+    #[arg(long)]
+    pub(crate) job: String,
+    /// Target/lane key.
+    #[arg(long)]
+    pub(crate) target: Option<String>,
+    /// Platform, for example macos/linux/windows.
+    #[arg(long)]
+    pub(crate) platform: Option<String>,
+    /// Backend, for example local/cloud/vm/ssh.
+    #[arg(long)]
+    pub(crate) backend: Option<String>,
+    /// Provider, for example github-hosted/tart-macos/qemu-windows.
+    #[arg(long)]
+    pub(crate) provider: Option<String>,
+    /// Runner or machine name.
+    #[arg(long)]
+    pub(crate) runner: Option<String>,
+    /// Host name.
+    #[arg(long)]
+    pub(crate) host: Option<String>,
+    /// Step name. Defaults to `total`.
+    #[arg(long)]
+    pub(crate) step: Option<String>,
+    /// Duration in milliseconds.
+    #[arg(long = "duration-ms", conflicts_with = "duration")]
+    pub(crate) duration_ms: Option<i64>,
+    /// Duration with units, for example `18423ms` or `18.4s`.
+    #[arg(long)]
+    pub(crate) duration: Option<String>,
+    /// Status, for example pass/fail/success/failure.
+    #[arg(long, default_value = "pass")]
+    pub(crate) status: String,
+    /// Process exit code.
+    #[arg(long = "exit-code")]
+    pub(crate) exit_code: Option<i64>,
+    /// Failure class when status is not healthy.
+    #[arg(long = "failure-class")]
+    pub(crate) failure_class: Option<String>,
+    /// External dedupe key, for example github:run/job/attempt.
+    #[arg(long = "external-id")]
+    pub(crate) external_id: Option<String>,
+    /// RFC3339 start timestamp.
+    #[arg(long = "started-at")]
+    pub(crate) started_at: Option<String>,
+    /// RFC3339 completion timestamp.
+    #[arg(long = "completed-at")]
+    pub(crate) completed_at: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsImportTartciArgs {
+    /// Read tartci runtime export JSON/JSONL from this file. Omit or pass `-` for stdin.
+    #[arg(long)]
+    pub(crate) file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsImportGithubArgs {
+    /// Owner/repo slug.
+    #[arg(long)]
+    pub(crate) repo: String,
+    /// Project key. Defaults to the repo name.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+    /// Workflow filename or id to list runs for.
+    #[arg(long)]
+    pub(crate) workflow: Option<String>,
+    /// Branch/ref filter.
+    #[arg(long)]
+    pub(crate) branch: Option<String>,
+    /// Number of recent runs to import.
+    #[arg(long, default_value_t = 10)]
+    pub(crate) limit: u32,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsProjectArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsListArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+    /// Maximum rows.
+    #[arg(long, default_value_t = 20)]
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsCompareArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Optional lane key for agent context.
+    #[arg(long)]
+    pub(crate) lane: Option<String>,
+    /// Before window, for example `7d`.
+    #[arg(long)]
+    pub(crate) before: Option<String>,
+    /// After window, for example `7d`.
+    #[arg(long)]
+    pub(crate) after: Option<String>,
+    /// Split point in days ago. Older rows are before; newer rows are after.
+    #[arg(long = "split-days-ago", default_value_t = 7)]
+    pub(crate) split_days_ago: i64,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsWatchArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Recent window, for example `14d`.
+    #[arg(long = "since", default_value = "14d")]
+    pub(crate) since: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsAdviseArgs {
+    /// Project key.
+    #[arg(long)]
+    pub(crate) project: String,
+    /// Profile name used by the caller; included for agent context.
+    #[arg(long)]
+    pub(crate) profile: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum RunSubcommand {
+    /// Run an arbitrary command on one local or POSIX SSH target and store typed evidence.
+    Command(RunCommandEvidenceArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct RunCommandEvidenceArgs {
+    /// Target name from `[targets.<name>]`.
+    #[arg(long)]
+    pub(super) target: String,
+    /// Stable evidence name. Defaults to the target name.
+    #[arg(long)]
+    pub(super) name: Option<String>,
+    /// Expected process exit code.
+    #[arg(long = "expect-code", default_value_t = 0)]
+    pub(super) expect_code: i32,
+    /// Override the target working directory.
+    #[arg(long = "target-cwd")]
+    pub(super) target_cwd: Option<String>,
+    /// Artifact glob relative to the target working directory. May be repeated.
+    #[arg(long = "artifact")]
+    pub(super) artifacts: Vec<String>,
+    /// Local log file path. Defaults under Shipyard state logs.
+    #[arg(long = "log-path")]
+    pub(super) log_path: Option<PathBuf>,
+    /// Wall-clock timeout in seconds.
+    #[arg(long = "timeout-secs")]
+    pub(super) timeout_secs: Option<u64>,
+    /// Environment variable name to fingerprint without recording its value. May be repeated.
+    #[arg(long = "env-fingerprint")]
+    pub(super) env_fingerprints: Vec<String>,
+    /// Command and arguments to execute after `--`.
+    #[arg(required = true, trailing_var_arg = true)]
+    pub(super) command: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum WatchSubcommand {
+    /// Run and watch a command on a local or POSIX SSH target.
+    Local(WatchLocalArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct WatchLocalArgs {
+    /// Configured Shipyard target to run on.
+    #[arg(long)]
+    pub(super) target: String,
+    /// Shell command to run on the target.
+    #[arg(long)]
+    pub(super) command: String,
+    /// Override the target work directory.
+    #[arg(long)]
+    pub(super) target_cwd: Option<String>,
+    /// Regex emitted as a milestone event when it matches an output line.
+    #[arg(long = "milestone-regex")]
+    pub(super) milestone_regex: Vec<String>,
+    /// Regex emitted as the terminal event and used to stop the command early.
+    #[arg(long = "terminal-regex")]
+    pub(super) terminal_regex: Vec<String>,
+    /// Write the full target output to this log path.
+    #[arg(long = "log-path")]
+    pub(super) log_path: Option<PathBuf>,
+    /// Stop the command after this many seconds.
+    #[arg(long = "timeout-secs")]
+    pub(super) timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -459,6 +803,118 @@ pub(super) enum RunnerCommand {
         #[arg(long = "no-wait-github", hide = true)]
         no_wait_github: bool,
     },
+    /// Show or set this machine's runner tag (e.g. `studio`, `m1`, `m5`).
+    /// The tag names runners `<repo>-<tag>-NN`; it is stored per-box in
+    /// Shipyard state and is never derived from the hostname (two laptops
+    /// can share a hostname, which would collide).
+    Tag {
+        /// New tag to store. Omit to print the current tag.
+        #[arg(long)]
+        set: Option<String>,
+    },
+    /// Register N self-hosted GitHub Actions runners on this machine for a
+    /// repo. Names continue from the highest existing `<repo>-<tag>-NN` so
+    /// re-running appends capacity without collisions.
+    Register {
+        /// Owner/repo slug. Defaults to the current git repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Number of runners to register.
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        /// Machine tag override. Defaults to the stored per-box tag.
+        #[arg(long = "machine-tag")]
+        machine_tag: Option<String>,
+        /// Comma-separated labels override. Defaults to
+        /// `self-hosted,macos,arm64,<repo>-build,<repo>-build-<tag>`.
+        #[arg(long, value_delimiter = ',')]
+        labels: Vec<String>,
+        /// CI root holding per-runner `_work` and shared caches. Defaults to
+        /// `runner.provision.ci_root` or `$HOME/actions-ci`.
+        #[arg(long = "ci-root")]
+        ci_root: Option<PathBuf>,
+        /// Print the plan without downloading, configuring, or starting.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// List self-hosted runners across repos, grouped by machine, reconciling
+    /// local runner directories against GitHub to flag orphans.
+    List {
+        /// Owner/repo slug. Repeatable. Defaults to repos discovered from
+        /// local `actions-runner-*` dirs plus the current repo.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Query every repo with a local runner dir on this machine.
+        #[arg(long = "all-repos")]
+        all_repos: bool,
+    },
+    /// Audit runners for host-class naming/label drift (`<repo>-<class>-NN` +
+    /// `<repo>-build` / `<repo>-build-<class>`). Exit 1 when any runner drifts.
+    Audit {
+        /// Owner/repo slug. Repeatable. Defaults to repos discovered from
+        /// local `actions-runner-*` dirs plus the current repo.
+        #[arg(long)]
+        repo: Vec<String>,
+    },
+    /// Report VM-slot-aware free macOS capacity across `[host_class.*]` hosts
+    /// (`Σ max(0, cap − running macOS Tart VMs)`). Exit 1 if any host is unreadable.
+    Capacity,
+    /// Read fleet capacity, tartci supervisor freshness, and queued macOS age.
+    /// Exit 1 on unreadable hosts or queued-age-with-capacity alerts.
+    FleetStatus {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Job-name substring used to identify macOS queued work.
+        #[arg(long, default_value = "macos")]
+        target: String,
+        /// Alert when queued macOS work is older than this and a routable slot exists.
+        #[arg(long = "queued-age-threshold-secs", default_value_t = 900)]
+        queued_age_threshold_secs: i64,
+        /// Maximum queued workflow runs to inspect for matching macOS jobs.
+        #[arg(long = "queue-run-limit", default_value_t = 100)]
+        queue_run_limit: u32,
+    },
+    /// Watch for cloud-queued macOS jobs and drain them to a local runner when
+    /// a VM slot frees up. Observe-only unless `--apply`.
+    RerouteWatch {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Lane/job-name substring passed to `cloud retarget --target`.
+        #[arg(long, default_value = "macos")]
+        target: String,
+        /// Seconds between polling ticks.
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+        /// Suppress re-routing the same PR within this many seconds.
+        #[arg(long = "flap-window", default_value_t = 300)]
+        flap_window: i64,
+        /// Run a single tick and exit.
+        #[arg(long)]
+        once: bool,
+        /// Stop after N ticks (mainly for testing).
+        #[arg(long = "max-ticks")]
+        max_ticks: Option<u32>,
+        /// Actually perform reroutes (default: observe and log only).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Deregister a runner: stop its launchd service and remove it from GitHub.
+    Remove {
+        /// Runner name, e.g. `pulp-studio-03`.
+        #[arg(long)]
+        name: String,
+        /// Owner/repo slug. Defaults to the current git repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Also delete the local `actions-runner-<name>` directory.
+        #[arg(long = "purge-dir")]
+        purge_dir: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Subcommand)]
@@ -549,6 +1005,36 @@ pub(super) enum ConfigCommand {
         /// Profile name to activate.
         profile_name: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum AuthCommand {
+    /// Show the effective GitHub auth source Shipyard will use.
+    Doctor,
+    /// Export sanitized GitHub auth config without tokens or private keys.
+    Export {
+        /// Write the bundle to a file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Import sanitized GitHub auth config without moving secrets.
+    Import {
+        /// Bundle previously produced by `shipyard auth export`.
+        input: PathBuf,
+        /// Destination config layer.
+        #[arg(long, value_enum, default_value_t = AuthConfigScope::Local)]
+        scope: AuthConfigScope,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(super) enum AuthConfigScope {
+    /// Machine-global config.
+    Global,
+    /// Tracked project config.
+    Project,
+    /// Per-project local overlay config.
+    Local,
 }
 
 #[derive(Debug, Subcommand)]
@@ -744,6 +1230,12 @@ pub(super) enum TargetsCommand {
         #[command(subcommand)]
         command: Option<TargetsWarmCommand>,
     },
+    /// Inspect local host-pool capacity and leases.
+    Pool {
+        /// Host-pool subcommand. Defaults to `status`.
+        #[command(subcommand)]
+        command: Option<TargetsPoolCommand>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -775,6 +1267,21 @@ pub(super) enum TargetsWarmCommand {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum TargetsPoolCommand {
+    /// Show configured host pools and lease state.
+    Status,
+    /// Remove stale host-pool lease records from Shipyard state.
+    Cleanup {
+        /// Show what would be removed.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Actually remove stale lease records.
+        #[arg(long)]
+        fix: bool,
     },
 }
 
@@ -896,10 +1403,15 @@ pub(super) struct RescueArgs {
     /// Rescue every stuck queued run in the repo regardless of PR.
     #[arg(long = "all-stuck", action = ArgAction::SetTrue, conflicts_with = "pr")]
     pub(super) all_stuck: bool,
-    /// Runner provider to redispatch to.
-    #[arg(long = "to", default_value = "github-hosted")]
-    pub(super) provider: String,
-    /// Also re-arm completed-as-cancelled runs (e.g. ones a watchdog sweep marked failed) before handoff.
+    /// Runner provider to redispatch to. Omit to let resolution decide per
+    /// candidate: stuck-queued runs fall back to `github-hosted` (move off the
+    /// wedged runner), while re-run failed runs RE-RESOLVE the provider
+    /// (local-first with overflow) so a leg that overflowed to a GPU-less
+    /// hosted runner can return local. Pass `--to <provider>` to force one.
+    #[arg(long = "to")]
+    pub(super) provider: Option<String>,
+    /// Also re-dispatch completed runs that ended cancelled / failed / timed-out
+    /// (e.g. a watchdog sweep, or a flaky required leg) before handoff.
     #[arg(long = "rerun-failed", action = ArgAction::SetTrue)]
     pub(super) rerun_failed: bool,
     /// Plan the rescue without acting.

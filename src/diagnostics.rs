@@ -5,15 +5,19 @@
 //! The intent is to replace the lossy `Validation failed. PR #N not merged.`
 //! emit with a structured block that names the failing GitHub job, its URL,
 //! the failing step, and a bounded list of failing tests extracted from the
-//! job log tail. We rely on the same `gh` CLI surface the rest of Shipyard
-//! already uses (`crate::cloud::GitHubActions::run_gh`), so no new dependency
-//! is introduced. Network failure is treated as best-effort; the renderer
-//! degrades to the metadata-only block when the log can't be fetched.
+//! job log tail. We rely on Shipyard's shared `GhClient` CLI boundary, so no
+//! new transport dependency is introduced. Network failure is treated as
+//! best-effort; the renderer degrades to the metadata-only block when the log
+//! can't be fetched.
 
 use std::fmt;
-use std::process::Command;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::config::LoadedConfig;
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::identity::RuntimeMode;
 
 /// Default tail size in bytes when scanning a job log.
 pub const DEFAULT_LOG_TAIL_BYTES: usize = 262_144;
@@ -384,36 +388,79 @@ pub trait DiagnosticsFetcher {
 }
 
 /// `gh api`-backed [`DiagnosticsFetcher`].
-#[derive(Clone, Debug, Default)]
-pub struct GhDiagnosticsFetcher;
+#[derive(Clone, Debug)]
+pub struct GhDiagnosticsFetcher {
+    cwd: PathBuf,
+    gh: Result<GhClient, String>,
+}
+
+impl GhDiagnosticsFetcher {
+    /// Build a diagnostics fetcher that loads Shipyard config from `cwd`.
+    #[must_use]
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        let cwd = cwd.into();
+        let gh = GhClient::from_cwd(RuntimeMode::Shipyard, &cwd)
+            .map_err(|error| format!("failed to load GitHub auth config for diagnostics: {error}"));
+        Self { cwd, gh }
+    }
+
+    /// Build a diagnostics fetcher from an already loaded Shipyard config.
+    #[must_use]
+    pub fn from_loaded_config(cwd: impl Into<PathBuf>, config: &LoadedConfig) -> Self {
+        let cwd = cwd.into();
+        let gh = GhClient::from_loaded_config(config)
+            .map_err(|error| format!("failed to load GitHub auth config for diagnostics: {error}"));
+        Self { cwd, gh }
+    }
+
+    fn run_gh_api(&self, args: &[String]) -> Result<String, String> {
+        let client = self.gh.as_ref().map_err(Clone::clone)?;
+        let output = client
+            .prepare_command(
+                &self.cwd,
+                None,
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+            )
+            .map_err(|error| format!("failed to prepare gh: {error}"))?
+            .args(args)
+            .output()
+            .map_err(|error| format!("failed to spawn gh: {error}"))?;
+        if !output.status.success() {
+            let code = output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(format!("gh exited with status {code}: {stderr}"));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+impl Default for GhDiagnosticsFetcher {
+    fn default() -> Self {
+        Self::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+}
 
 impl DiagnosticsFetcher for GhDiagnosticsFetcher {
     fn fetch_jobs_json(&self, repo: &str, run_id: u64) -> Result<String, DiagnosticsError> {
         let path = format!("/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100");
-        run_gh_api(&["api", "-H", "Accept: application/vnd.github+json", &path])
-            .map_err(DiagnosticsError::GhApi)
+        let args = vec![
+            "api".to_owned(),
+            "-H".to_owned(),
+            "Accept: application/vnd.github+json".to_owned(),
+            path,
+        ];
+        self.run_gh_api(&args).map_err(DiagnosticsError::GhApi)
     }
 
     fn fetch_job_log(&self, repo: &str, job_id: u64) -> Result<String, DiagnosticsError> {
         let path = format!("/repos/{repo}/actions/jobs/{job_id}/logs");
-        run_gh_api(&["api", &path]).map_err(DiagnosticsError::LogFetch)
+        let args = vec!["api".to_owned(), path];
+        self.run_gh_api(&args).map_err(DiagnosticsError::LogFetch)
     }
-}
-
-fn run_gh_api(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|error| format!("failed to spawn gh: {error}"))?;
-    if !output.status.success() {
-        let code = output
-            .status
-            .code()
-            .map_or_else(|| "signal".to_owned(), |c| c.to_string());
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(format!("gh exited with status {code}: {stderr}"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 // --- end-to-end orchestrator ---------------------------------------------
@@ -545,6 +592,22 @@ pub fn fetch_failed_job_diagnostics<F: DiagnosticsFetcher + ?Sized>(
     } else if log_raw.is_none() {
         out.failure_summary
             .push("(diagnostics: job log unavailable)".to_owned());
+    }
+    // #344: a self-hosted runner returns an EMPTY GitHub job log, so the footer
+    // parse above yields nothing and the failure block would be silent (only
+    // "exit code N" reaches the user). The per-test results DO exist — a
+    // well-behaved consuming workflow uploads them on failure (e.g. Pulp's
+    // `ctest-logs-*` artifact + a job-summary block, pulp #3392/#3394). Point
+    // there instead of emitting an empty summary. (A future enhancement can
+    // download + parse that artifact for a structured list; tracked in #344.)
+    if out.failure_summary.is_empty()
+        && job.runner_labels.iter().any(|label| label == "self-hosted")
+    {
+        out.failure_summary.push(format!(
+            "(self-hosted runner: GitHub job log is empty — open the run's job \
+             summary, or download per-test logs with \
+             `gh run download {run_id} -n ctest-logs-<key>`)"
+        ));
     }
     out.job = Some(job);
     out
@@ -828,6 +891,40 @@ The following tests FAILED:
         );
         assert_eq!(diag.failure_summary.len(), MAX_SUMMARY_LINES);
         assert!(diag.failure_summary_truncated);
+    }
+
+    #[test]
+    fn self_hosted_empty_log_points_to_ctest_artifact() {
+        // #344: a self-hosted leg returns an empty GitHub job log, so the footer
+        // parse yields nothing. Instead of a silent empty summary, point to the
+        // uploaded per-test logs.
+        let jobs = serde_json::json!({
+            "jobs": [{
+                "id": 1, "name": "macOS (ARM64) [local]",
+                "html_url": "https://example/runs/9/job/1",
+                "conclusion": "failure",
+                "steps": [{"name": "Test (non-Windows)", "conclusion": "failure"}],
+                "labels": ["self-hosted", "macOS", "ARM64"]
+            }]
+        });
+        let fetcher = FakeFetcher {
+            jobs_json: jobs.to_string(),
+            log: String::new(), // self-hosted: GitHub job log is empty
+        };
+        let diag = fetch_failed_job_diagnostics(
+            &fetcher,
+            "danielraffel/pulp",
+            9,
+            "mac",
+            &*select_parser(Some("ctest")),
+        );
+        assert_eq!(diag.failure_summary.len(), 1);
+        assert!(
+            diag.failure_summary[0].contains("self-hosted runner")
+                && diag.failure_summary[0].contains("ctest-logs"),
+            "expected a pointer to the ctest-logs artifact, got: {:?}",
+            diag.failure_summary
+        );
     }
 
     #[test]

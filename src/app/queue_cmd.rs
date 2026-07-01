@@ -35,12 +35,14 @@ pub(super) fn status_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let mut queue = open_queue(state_dir)?;
-    let active = queue.get_active()?;
+    let active_runs = queue.get_running()?;
+    let active = active_runs.first();
     let pending = queue.pending_count()?;
     let recent = queue.get_recent(5)?;
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let targets = target_statuses(&config)?;
+    let orphaned = collect_orphaned_ship_states(state_dir, &config);
 
     if json_mode {
         let mut data = BTreeMap::new();
@@ -48,20 +50,65 @@ pub(super) fn status_command<W: Write>(
             "queue".to_owned(),
             json!({
                 "pending": pending,
-                "running": usize::from(active.is_some()),
+                "running": active_runs.len(),
                 "completed_recent": recent.len(),
             }),
         );
         if let Some(active) = active.as_ref() {
             data.insert("active_run".to_owned(), active.to_json_value());
         }
+        data.insert("active_runs".to_owned(), jobs_value(&active_runs)?);
         data.insert("targets".to_owned(), serde_json::to_value(targets)?);
+        data.insert(
+            "orphaned_ship_states".to_owned(),
+            Value::Array(
+                orphaned
+                    .iter()
+                    .map(|(pr, report)| {
+                        json!({
+                            "pr": pr,
+                            "stalled_minutes": report.stalled_minutes,
+                            "evidence": report.evidence.as_str(),
+                        })
+                    })
+                    .collect(),
+            ),
+        );
         write_json_envelope(stdout, "status", data)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     } else {
-        write_status_human(stdout, active.as_ref(), pending, &recent, &targets)?;
+        write_status_human(
+            stdout,
+            active_runs.len(),
+            pending,
+            &recent,
+            &targets,
+            &orphaned,
+        )?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Classify every active ship-state against the queue for orphan reporting.
+/// Best-effort and strictly read-only: only reads the ship-state store when it
+/// already exists (so `status` never materializes state in a fresh directory),
+/// and yields nothing on any read failure rather than failing `status`.
+fn collect_orphaned_ship_states(
+    state_dir: &Path,
+    config: &LoadedConfig,
+) -> Vec<(u64, crate::ship_liveness::OrphanReport)> {
+    let ship_dir = state_dir.join("ship");
+    if !ship_dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(store) = crate::ship_state::ShipStateStore::new(ship_dir) else {
+        return Vec::new();
+    };
+    let stale_after = crate::ship_liveness::orphan_stale_after(config);
+    let now = chrono::Utc::now();
+    crate::ship_liveness::with_liveness_context(state_dir, stale_after, |liveness| {
+        crate::ship_liveness::collect_orphans(&store, liveness, now)
+    })
 }
 
 pub(super) fn evidence_command<W: Write>(
@@ -193,18 +240,20 @@ pub(super) fn queue_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let mut queue = open_queue(state_dir)?;
-    let active = queue.get_active()?;
+    let active_runs = queue.get_running()?;
+    let active = active_runs.first().cloned();
     let pending = queue.get_pending()?;
     let recent = queue.get_recent(5)?;
     if json_mode {
         let mut data = BTreeMap::new();
         data.insert("active".to_owned(), queue_value(active)?);
+        data.insert("active_runs".to_owned(), jobs_value(&active_runs)?);
         data.insert("pending".to_owned(), jobs_value(&pending)?);
         data.insert("recent".to_owned(), jobs_value(&recent)?);
         write_json_envelope(stdout, "queue", data)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     } else {
-        write_queue_human(stdout, active.as_ref(), &pending, &recent)?;
+        write_queue_human(stdout, &active_runs, &pending, &recent)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -238,13 +287,14 @@ fn target_statuses(config: &LoadedConfig) -> Result<BTreeMap<String, TargetStatu
 
 fn write_status_human<W: Write>(
     stdout: &mut W,
-    active: Option<&Job>,
+    running: usize,
     pending: usize,
     recent: &[Job],
     targets: &BTreeMap<String, TargetStatusRow>,
+    orphaned: &[(u64, crate::ship_liveness::OrphanReport)],
 ) -> Result<(), CliFailure> {
     writeln!(stdout, "Status").map_err(|error| CliFailure::new(1, error.to_string()))?;
-    writeln!(stdout, "  running: {}", usize::from(active.is_some()))
+    writeln!(stdout, "  running: {running}")
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     writeln!(stdout, "  pending: {pending}")
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -261,26 +311,46 @@ fn write_status_human<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
     }
+    if !orphaned.is_empty() {
+        writeln!(
+            stdout,
+            "Orphaned ship states (in flight, worker likely gone)"
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        for (pr, report) in orphaned {
+            writeln!(
+                stdout,
+                "  PR #{pr}: {} ({}m stalled) — re-run `shipyard ship {pr}` or `ship-state discard {pr}`",
+                report.evidence.cause(),
+                report.stalled_minutes,
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
     Ok(())
 }
 
 fn write_queue_human<W: Write>(
     stdout: &mut W,
-    active: Option<&Job>,
+    active_runs: &[Job],
     pending: &[Job],
     recent: &[Job],
 ) -> Result<(), CliFailure> {
     writeln!(stdout, "Queue").map_err(|error| CliFailure::new(1, error.to_string()))?;
-    if let Some(active) = active {
-        writeln!(
-            stdout,
-            "  Running: {} {} @ {} [{}]",
-            active.id,
-            active.branch,
-            short_sha(&active.sha),
-            priority_name(active.priority)
-        )
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if !active_runs.is_empty() {
+        writeln!(stdout, "  Running ({})", active_runs.len())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        for active in active_runs {
+            writeln!(
+                stdout,
+                "    {} {} @ {} [{}]",
+                active.id,
+                active.branch,
+                short_sha(&active.sha),
+                priority_name(active.priority)
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
     }
     if pending.is_empty() {
         writeln!(stdout, "  No pending jobs")

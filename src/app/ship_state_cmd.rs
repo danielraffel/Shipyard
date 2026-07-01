@@ -4,20 +4,38 @@ use std::io::Write;
 use chrono::Utc;
 use serde_json::Value;
 
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
-use crate::reconcile::{ReconcileFetchError, fetch_status_check_rollup, reconcile_ship_state};
-use crate::ship_state::ShipState;
-use crate::ship_state::ShipStateStore;
+use crate::reconcile::{
+    ReconcileFetchError, fetch_status_check_rollup_with_cwd, reconcile_ship_state,
+};
+use crate::ship_liveness::LivenessContext;
+use crate::ship_state::{ShipState, ShipStateStore};
 
 pub(super) fn ship_state_list<W: Write>(
     store: &ShipStateStore,
+    liveness: &LivenessContext<'_>,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let states = store.list_active();
+    let now = Utc::now();
     if json {
+        let orphaned = states
+            .iter()
+            .filter_map(|state| {
+                liveness.classify(state, now).map(|report| {
+                    serde_json::json!({
+                        "pr": state.pr,
+                        "stalled_minutes": report.stalled_minutes,
+                        "evidence": report.evidence.as_str(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
         let mut data = BTreeMap::new();
-        data.insert("states".to_owned(), serde_json::to_value(states)?);
+        data.insert("states".to_owned(), serde_json::to_value(&states)?);
+        data.insert("orphaned".to_owned(), Value::Array(orphaned));
         write_json_envelope(stdout, "ship-state:list", data)?;
         return Ok(());
     }
@@ -25,8 +43,7 @@ pub(super) fn ship_state_list<W: Write>(
         writeln!(stdout, "No active ship state.")?;
         return Ok(());
     }
-    let now = Utc::now();
-    for state in states {
+    for state in &states {
         let age = now
             .signed_duration_since(state.updated_at)
             .num_minutes()
@@ -48,6 +65,17 @@ pub(super) fn ship_state_list<W: Write>(
             age,
             title
         )?;
+        if let Some(report) = liveness.classify(state, now) {
+            writeln!(
+                stdout,
+                "    ORPHANED? [{}]: in flight, {} ({}m stalled); auto-merge will not fire \
+                 until it reaches a verdict — re-run `shipyard ship`, or `ship-state discard` \
+                 if it is truly dead.",
+                report.evidence.as_str(),
+                report.evidence.cause(),
+                report.stalled_minutes,
+            )?;
+        }
         if !state.pr_url.is_empty() {
             writeln!(stdout, "    {}", state.pr_url)?;
         }
@@ -150,13 +178,15 @@ pub(super) fn ship_state_discard<W: Write>(
 
 pub(super) fn ship_state_reconcile<W: Write>(
     store: &ShipStateStore,
+    mode: RuntimeMode,
+    cwd: &std::path::Path,
     pr: Option<u64>,
     reconcile_all: bool,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ship_state_reconcile_with(store, pr, reconcile_all, json, stdout, |state| {
-        fetch_status_check_rollup(&state.repo, state.pr)
+        fetch_status_check_rollup_with_cwd(mode, cwd, &state.repo, state.pr)
     })
 }
 
@@ -197,11 +227,19 @@ where
     for state in targets {
         match fetch(&state) {
             Ok(rollup) => {
-                let reconciled = reconcile_ship_state(&state, &rollup, now);
-                if !reconciled.changes.is_empty() {
-                    store.save(&reconciled.state)?;
-                }
-                results.push(reconcile_success(state.pr, reconciled.changes));
+                let mut changes = Vec::new();
+                store.with_pr_state_locked(state.pr, |current| {
+                    let Some(current_state) = current.as_ref() else {
+                        return Ok(());
+                    };
+                    let reconciled = reconcile_ship_state(current_state, &rollup, now);
+                    if !reconciled.changes.is_empty() {
+                        changes = reconciled.changes;
+                        *current = Some(reconciled.state);
+                    }
+                    Ok(())
+                })?;
+                results.push(reconcile_success(state.pr, changes));
             }
             Err(error) => {
                 results.push(reconcile_error(state.pr, error.to_string()));
@@ -283,10 +321,18 @@ mod tests {
         ship_state_show,
     };
     use crate::reconcile::ReconcileFetchError;
+    use crate::ship_liveness::{DEFAULT_ORPHAN_STALE_MINUTES, LivenessContext};
     use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
 
     fn store(temp: &TempDir) -> ShipStateStore {
         ShipStateStore::new(temp.path().to_path_buf()).expect("state store should open")
+    }
+
+    /// Queue-free liveness context: pure `updated_at` staleness (`time_fallback`
+    /// evidence). The queue-backed classification paths are covered in
+    /// `crate::ship_liveness` unit tests.
+    fn time_ctx() -> LivenessContext<'static> {
+        LivenessContext::time_only(Duration::minutes(DEFAULT_ORPHAN_STALE_MINUTES))
     }
 
     fn sample_state(pr: u64, sha: &str) -> ShipState {
@@ -326,7 +372,7 @@ mod tests {
         let store = store(&temp);
         let mut out = Vec::new();
 
-        ship_state_list(&store, false, &mut out).expect("list should render");
+        ship_state_list(&store, &time_ctx(), false, &mut out).expect("list should render");
 
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
@@ -345,7 +391,7 @@ mod tests {
         store.save(&state).expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_list(&store, false, &mut out).expect("list should render");
+        ship_state_list(&store, &time_ctx(), false, &mut out).expect("list should render");
 
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("PR #42"));
@@ -368,13 +414,59 @@ mod tests {
             .expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_list(&store, true, &mut out).expect("list should render");
+        ship_state_list(&store, &time_ctx(), true, &mut out).expect("list should render");
 
         let payload: Value = serde_json::from_slice(&out).expect("json payload");
         assert_eq!(payload["command"], "ship-state:list");
         assert_eq!(payload["schema_version"], 1);
         assert_eq!(payload["states"][0]["pr"], 2);
         assert_eq!(payload["states"][1]["pr"], 9);
+    }
+
+    #[test]
+    fn list_json_reports_orphaned_prs() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        // Stale in-flight → orphaned via the time fallback (no queue context).
+        let mut orphan = sample_state(3, "3333333333333333333333333333333333333333");
+        orphan.updated_at = Utc::now() - Duration::minutes(DEFAULT_ORPHAN_STALE_MINUTES + 10);
+        store.save(&orphan).expect("state should save");
+        // Terminal verdict → not orphaned even though also old.
+        let mut done = sample_state(4, "4444444444444444444444444444444444444444");
+        done.update_evidence("linux", "pass");
+        done.dispatched_runs.push(sample_run("linux", "run-4"));
+        done.updated_at = Utc::now() - Duration::hours(3);
+        store.save(&done).expect("state should save");
+        let mut out = Vec::new();
+
+        ship_state_list(&store, &time_ctx(), true, &mut out).expect("list should render");
+
+        let payload: Value = serde_json::from_slice(&out).expect("json payload");
+        let orphaned = payload["orphaned"].as_array().expect("orphaned array");
+        assert_eq!(orphaned.len(), 1, "only the stale in-flight PR is orphaned");
+        assert_eq!(orphaned[0]["pr"], 3);
+        assert_eq!(orphaned[0]["evidence"], "time_fallback");
+        assert!(orphaned[0]["stalled_minutes"].as_i64().unwrap() >= DEFAULT_ORPHAN_STALE_MINUTES);
+    }
+
+    #[test]
+    fn list_human_marks_orphaned_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let mut state = sample_state(5, "5555555555555555555555555555555555555555");
+        state.updated_at = Utc::now() - Duration::minutes(DEFAULT_ORPHAN_STALE_MINUTES + 30);
+        store.save(&state).expect("state should save");
+        let mut out = Vec::new();
+
+        ship_state_list(&store, &time_ctx(), false, &mut out).expect("list should render");
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("PR #5"));
+        assert!(
+            text.contains("ORPHANED? [time_fallback]"),
+            "text was: {text}"
+        );
+        assert!(text.contains("re-run `shipyard ship`"));
     }
 
     #[test]

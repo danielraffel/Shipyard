@@ -9,15 +9,37 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
+use crate::capacity::{gather_configured_host_capacities, total_free};
+use crate::config::LoadedConfig;
 use crate::evidence::{EvidenceRecord, EvidenceStore};
-use crate::executor::dispatch::{DispatchValidationRequest, ExecutorDispatcher, ResolvedTarget};
+use crate::executor::dispatch::{
+    DispatchValidationRequest, ExecutorDispatcher, ResolvedBackend, ResolvedHostPoolConfig,
+    ResolvedHostPoolMember, ResolvedTarget,
+};
 use crate::executor::streaming::ProgressEvent;
-use crate::job::{Job, JobTransitionError, Priority, TargetResult, TargetStatus, ValidationMode};
-use crate::queue::{Queue, QueueError};
-use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore, compute_policy_signature};
+use crate::host_pool::{
+    HostPoolConfig, HostPoolLeaseStore, HostPoolMemberConfig, default_lease_path,
+};
+use crate::job::{
+    DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobKind, JobStatus, JobTransitionError, Priority,
+    TargetResult, TargetStatus, ValidationMode,
+};
+use crate::queue::{Queue, QueueDeferredRequeue, QueueError, STALE_RUNNING_CANCEL_REASON};
+use crate::queue_request::{
+    QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
+    QueuedExecutionKind, QueuedExecutionOutcome,
+};
+use crate::queue_scheduler::{
+    VmSlotCapacity, apply_admit_pass_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
+};
+use crate::ship_state::{
+    DispatchedRun, ShipState, ShipStatePrLock, ShipStateStore, compute_policy_signature,
+};
 use crate::warm_pool::{
     PoolEntry, WarmPool, compute_expires_at, is_backend_eligible, warm_host_key,
 };
@@ -25,6 +47,10 @@ use crate::warm_pool::{
 const RESUME_ORDER: [&str; 4] = ["setup", "configure", "build", "test"];
 const WARM_DEFAULT_RESUME_FROM: &str = "configure";
 const DEFAULT_WORKDIR: &str = "~/repo";
+const DEFAULT_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_DRAIN_MAX_WORKERS: usize = 2;
+#[allow(clippy::duration_suboptimal_units)]
+const QUEUE_ENVELOPE_SWEEP_GRACE: Duration = Duration::from_secs(60);
 
 /// Resolved inputs for one `ship` execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,6 +83,12 @@ pub struct ShipExecutionRequest {
     pub resume_from: Option<String>,
     /// Target names whose failures should not block merge.
     pub advisory_targets: BTreeSet<String>,
+    /// Adopt the current head SHA when the recorded ship-state drifted — but
+    /// ONLY when the amended commit has the same tree (e.g. a trailer-only
+    /// `--amend`). The command layer verifies same-tree before setting this and
+    /// refuses a content change, so prior evidence is never blessed for a
+    /// different tree (Shipyard #346).
+    pub adopt_head: bool,
     /// Ordered target list.
     pub targets: Vec<ResolvedTarget>,
 }
@@ -92,8 +124,12 @@ pub struct ShipStores<'a> {
     pub ship_state: &'a ShipStateStore,
     /// Warm-pool store.
     pub warm_pool: &'a WarmPool,
+    /// Original CLI working directory.
+    pub cwd: &'a Path,
     /// State directory used for target logs.
     pub state_dir: &'a Path,
+    /// Loaded Shipyard config used for cooperative scheduler admission.
+    pub config: &'a LoadedConfig,
 }
 
 /// Durable stores needed by `shipyard run` execution.
@@ -104,8 +140,12 @@ pub struct RunStores<'a> {
     pub evidence: &'a EvidenceStore,
     /// Warm-pool store.
     pub warm_pool: &'a WarmPool,
+    /// Original CLI working directory.
+    pub cwd: &'a Path,
     /// State directory used for target logs.
     pub state_dir: &'a Path,
+    /// Loaded Shipyard config used for cooperative scheduler admission.
+    pub config: &'a LoadedConfig,
 }
 
 /// Outcome of one ship execution pass.
@@ -124,6 +164,40 @@ pub struct ShipExecutionOutcome {
 pub struct RunExecutionOutcome {
     /// Final job.
     pub job: Job,
+}
+
+/// Wait/retry controls for the cooperative drain loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CooperativeDrainOptions {
+    /// Sleep duration between durable-state polls when another process owns
+    /// the drain lock.
+    pub poll_interval: Duration,
+    /// Optional test/diagnostic cap on wait iterations.
+    pub max_wait_iterations: Option<usize>,
+}
+
+impl Default for CooperativeDrainOptions {
+    fn default() -> Self {
+        Self {
+            poll_interval: DEFAULT_DRAIN_POLL_INTERVAL,
+            max_wait_iterations: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TargetExecutionOutcome {
+    Completed(Job),
+    Deferred { job: Job, reason: String },
+}
+
+impl TargetExecutionOutcome {
+    fn into_completed(self) -> Result<Job, ShipExecutionError> {
+        match self {
+            Self::Completed(job) => Ok(job),
+            Self::Deferred { reason, .. } => Err(ShipExecutionError::SchedulerDeferred(reason)),
+        }
+    }
 }
 
 /// Errors from ship execution orchestration.
@@ -147,12 +221,44 @@ pub enum ShipExecutionError {
     JobTransition(JobTransitionError),
     /// Queue persistence failed.
     Queue(QueueError),
+    /// Queue request/outcome persistence failed.
+    QueueRequest(QueueRequestError),
     /// Evidence persistence failed.
     Evidence(String),
     /// Ship-state persistence failed.
     ShipState(String),
     /// Warm-pool persistence failed.
     WarmPool(std::io::Error),
+    /// Worker observed a scheduler-owned transient deferral.
+    SchedulerDeferred(String),
+    /// Host-pool lease inspection failed during scheduler admission.
+    HostPool(String),
+    /// VM-slot capacity inspection failed during scheduler admission.
+    VmSlot(String),
+    /// A spawned drain worker failed to join.
+    WorkerJoin(String),
+    /// A matching same-PR ship job is already running.
+    SamePrShipRunning {
+        /// Repository slug.
+        repo: String,
+        /// Pull request number.
+        pr: u64,
+        /// Running queue job id.
+        running_job_id: String,
+    },
+    /// Durable outcome was not found for a submitted job.
+    MissingQueuedOutcome(String),
+    /// Durable queue job was not found for a stored outcome.
+    MissingQueuedJob(String),
+    /// Durable outcome kind did not match the expected command.
+    UnexpectedQueuedOutcome {
+        /// Queue job id.
+        job_id: String,
+        /// Expected outcome kind.
+        expected: &'static str,
+    },
+    /// Cooperative wait reached its configured limit.
+    CooperativeWaitTimedOut(String),
 }
 
 impl Display for ShipExecutionError {
@@ -170,9 +276,39 @@ impl Display for ShipExecutionError {
             ),
             Self::JobTransition(error) => write!(formatter, "{error}"),
             Self::Queue(error) => write!(formatter, "{error}"),
+            Self::QueueRequest(error) => write!(formatter, "{error}"),
             Self::Evidence(error) => write!(formatter, "evidence write failed: {error}"),
             Self::ShipState(error) => write!(formatter, "ship-state write failed: {error}"),
             Self::WarmPool(error) => write!(formatter, "warm-pool write failed: {error}"),
+            Self::SchedulerDeferred(reason) => {
+                write!(formatter, "scheduler deferred validation: {reason}")
+            }
+            Self::HostPool(error) => write!(formatter, "host-pool scheduler read failed: {error}"),
+            Self::VmSlot(error) => write!(formatter, "VM-slot scheduler read failed: {error}"),
+            Self::WorkerJoin(job_id) => write!(formatter, "worker thread for {job_id} panicked"),
+            Self::SamePrShipRunning {
+                repo,
+                pr,
+                running_job_id,
+            } => write!(
+                formatter,
+                "same-PR ship already running for {repo}#{pr} ({running_job_id}); use shipyard watch --pr {pr} or inspect shipyard queue/status"
+            ),
+            Self::MissingQueuedOutcome(job_id) => {
+                write!(formatter, "queued outcome missing for job {job_id}")
+            }
+            Self::MissingQueuedJob(job_id) => {
+                write!(formatter, "queued job missing for outcome {job_id}")
+            }
+            Self::UnexpectedQueuedOutcome { job_id, expected } => {
+                write!(
+                    formatter,
+                    "queued outcome for job {job_id} is not a {expected} outcome"
+                )
+            }
+            Self::CooperativeWaitTimedOut(job_id) => {
+                write!(formatter, "timed out waiting for queued job {job_id}")
+            }
         }
     }
 }
@@ -182,11 +318,21 @@ impl Error for ShipExecutionError {
         match self {
             Self::JobTransition(error) => Some(error),
             Self::Queue(error) => Some(error),
+            Self::QueueRequest(error) => Some(error),
             Self::WarmPool(error) => Some(error),
             Self::ShaDrift { .. }
             | Self::PolicyDrift { .. }
             | Self::Evidence(_)
-            | Self::ShipState(_) => None,
+            | Self::ShipState(_)
+            | Self::SchedulerDeferred(_)
+            | Self::HostPool(_)
+            | Self::VmSlot(_)
+            | Self::WorkerJoin(_)
+            | Self::SamePrShipRunning { .. }
+            | Self::MissingQueuedOutcome(_)
+            | Self::MissingQueuedJob(_)
+            | Self::UnexpectedQueuedOutcome { .. }
+            | Self::CooperativeWaitTimedOut(_) => None,
         }
     }
 }
@@ -200,6 +346,12 @@ impl From<JobTransitionError> for ShipExecutionError {
 impl From<QueueError> for ShipExecutionError {
     fn from(error: QueueError) -> Self {
         Self::Queue(error)
+    }
+}
+
+impl From<QueueRequestError> for ShipExecutionError {
+    fn from(error: QueueRequestError) -> Self {
+        Self::QueueRequest(error)
     }
 }
 
@@ -226,34 +378,254 @@ pub fn execute_ship<D: ShipTargetDispatcher>(
         evidence,
         ship_state,
         warm_pool,
+        cwd,
         state_dir,
+        config,
     } = stores;
-    let target_names = target_names(&request.targets);
-    let resumed_existing_state = ship_state.get(request.pr).is_some();
-    let mut state = load_or_create_state(request, &target_names, ship_state)?;
-    ship_state
-        .save(&state)
-        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+    let job = submit_ship(request, queue, cwd, state_dir)?;
+    execute_ship_worker(
+        request,
+        job,
+        ShipStores {
+            queue,
+            evidence,
+            ship_state,
+            warm_pool,
+            cwd,
+            state_dir,
+            config,
+        },
+        dispatcher,
+    )
+}
 
-    let mut job = Job::create(
+/// Submit a `shipyard ship` request as a pending durable job.
+pub fn submit_ship(
+    request: &ShipExecutionRequest,
+    queue: &mut Queue,
+    cwd: &Path,
+    state_dir: &Path,
+) -> Result<Job, ShipExecutionError> {
+    refuse_same_pr_running_ship(queue, state_dir, request)?;
+    let target_names = target_names(&request.targets);
+    let job = Job::create(
         request.sha.clone(),
         request.branch.clone(),
         target_names,
         request.mode,
         request.priority,
-    );
+    )
+    .with_kind(JobKind::Ship);
+    QueueRequestStore::new(state_dir)
+        .map_err(QueueRequestError::from)?
+        .save(&QueuedExecutionEnvelope::from_ship_request(
+            job.id.clone(),
+            cwd,
+            request,
+        ))?;
     queue.enqueue(job.clone())?;
-    job = job.start()?;
-    queue.update(&job)?;
+    Ok(job)
+}
 
-    job = execute_targets(request, state_dir, queue, warm_pool, dispatcher, job)?;
+/// Load a completed `shipyard ship` outcome through the durable outcome store.
+pub fn load_ship_outcome(
+    queue: &mut Queue,
+    state_dir: &Path,
+    job_id: &str,
+) -> Result<ShipExecutionOutcome, ShipExecutionError> {
+    let Some(outcome) = QueueOutcomeStore::new(state_dir)
+        .map_err(QueueRequestError::from)?
+        .load(job_id)?
+    else {
+        return Err(ShipExecutionError::MissingQueuedOutcome(job_id.to_owned()));
+    };
+    let QueuedExecutionOutcome::Ship {
+        ship_state,
+        resumed_existing_state,
+        ..
+    } = outcome
+    else {
+        return Err(ShipExecutionError::UnexpectedQueuedOutcome {
+            job_id: job_id.to_owned(),
+            expected: "ship",
+        });
+    };
+    let Some(job) = queue.get(job_id)? else {
+        return Err(ShipExecutionError::MissingQueuedJob(job_id.to_owned()));
+    };
+    Ok(ShipExecutionOutcome {
+        job,
+        ship_state,
+        resumed_existing_state,
+    })
+}
+
+/// Wait for a submitted `shipyard ship` job, becoming the cooperative drain
+/// owner when possible.
+pub fn drain_or_wait_ship<D: ShipTargetDispatcher + Sync>(
+    request: &ShipExecutionRequest,
+    #[allow(clippy::needless_pass_by_value)] job: Job,
+    stores: ShipStores<'_>,
+    dispatcher: &D,
+) -> Result<ShipExecutionOutcome, ShipExecutionError> {
+    drain_or_wait_ship_with_options(
+        request,
+        job,
+        stores,
+        dispatcher,
+        CooperativeDrainOptions::default(),
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
+    request: &ShipExecutionRequest,
+    job: Job,
+    stores: ShipStores<'_>,
+    dispatcher: &D,
+    options: CooperativeDrainOptions,
+) -> Result<ShipExecutionOutcome, ShipExecutionError> {
+    let ShipStores {
+        queue,
+        evidence,
+        ship_state,
+        warm_pool,
+        cwd,
+        state_dir,
+        config,
+    } = stores;
+    let mut wait_iterations = 0usize;
+    loop {
+        if let Some(outcome) = terminal_ship_outcome(queue, state_dir, request, &job.id)? {
+            return Ok(outcome);
+        }
+        if let Some(drain_lock) = queue.acquire_drain_lock()? {
+            let recovered = queue.recover_stale_running_jobs_for_drain(&drain_lock)?;
+            persist_recovered_outcomes(&recovered, state_dir, ship_state)?;
+            if let Some(outcome) = terminal_ship_outcome(queue, state_dir, request, &job.id)? {
+                return Ok(outcome);
+            }
+            run_drain_worker_cycle(
+                queue,
+                &drain_lock,
+                evidence,
+                ship_state,
+                warm_pool,
+                cwd,
+                state_dir,
+                config,
+                dispatcher,
+            )?;
+        }
+        wait_or_timeout(&job.id, &mut wait_iterations, options)?;
+    }
+}
+
+/// Execute a previously submitted `shipyard ship` job.
+pub fn execute_ship_worker<D: ShipTargetDispatcher>(
+    request: &ShipExecutionRequest,
+    job: Job,
+    stores: ShipStores<'_>,
+    dispatcher: &D,
+) -> Result<ShipExecutionOutcome, ShipExecutionError> {
+    execute_ship_worker_with_options(request, job, stores, dispatcher, false)
+}
+
+fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
+    request: &ShipExecutionRequest,
+    mut job: Job,
+    stores: ShipStores<'_>,
+    dispatcher: &D,
+    defer_host_pool_lease_unavailable: bool,
+) -> Result<ShipExecutionOutcome, ShipExecutionError> {
+    let ShipStores {
+        queue,
+        evidence,
+        ship_state,
+        warm_pool,
+        state_dir,
+        config,
+        ..
+    } = stores;
+    let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
+    let transient_retry = crate::ship_retry::transient_local_retry_policy(config);
+    if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
+        return Ok(ShipExecutionOutcome {
+            job: cancelled,
+            ship_state: unsaved_ship_state(request, &job.target_names),
+            resumed_existing_state: false,
+        });
+    }
+    let ship_state_lock = ship_state
+        .lock_pr(request.pr)
+        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+    let resumed_existing_state = ship_state
+        .get_locked(request.pr, &ship_state_lock)
+        .is_some();
+    let mut state = match load_or_create_state(
+        request,
+        &job.target_names,
+        ship_state,
+        Some(&ship_state_lock),
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            cancel_refused_job(queue, &job, &error)?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = ship_state.save_locked(&state, &ship_state_lock) {
+        let execution_error = ShipExecutionError::ShipState(error.to_string());
+        cancel_refused_job(queue, &job, &execution_error)?;
+        return Err(execution_error);
+    }
+
+    job = ensure_worker_running_job(queue, &job)?;
+
+    job = execute_targets_with_options(
+        request,
+        state_dir,
+        queue,
+        warm_pool,
+        dispatcher,
+        job,
+        TargetExecOptions {
+            defer_host_pool_lease_unavailable,
+            reclassify_vitals_path: reclassify_vitals_path.as_deref(),
+            transient_retry,
+        },
+    )?
+    .into_completed()?;
+    if job.status == JobStatus::Cancelled {
+        QueueOutcomeStore::new(state_dir)
+            .map_err(QueueRequestError::from)?
+            .save(&QueuedExecutionOutcome::ship(
+                job.id.clone(),
+                request.pr,
+                state.clone(),
+                resumed_existing_state,
+            ))?;
+        return Ok(ShipExecutionOutcome {
+            job,
+            ship_state: state,
+            resumed_existing_state,
+        });
+    }
     job = job.complete()?;
-    queue.update(&job)?;
     record_evidence(evidence, request, &job)?;
     update_ship_state_from_job(&mut state, request, &job);
     ship_state
-        .save(&state)
+        .save_locked(&state, &ship_state_lock)
         .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+    QueueOutcomeStore::new(state_dir)
+        .map_err(QueueRequestError::from)?
+        .save(&QueuedExecutionOutcome::ship(
+            job.id.clone(),
+            request.pr,
+            state.clone(),
+            resumed_existing_state,
+        ))?;
+    queue.update(&job)?;
 
     Ok(ShipExecutionOutcome {
         job,
@@ -272,9 +644,169 @@ pub fn execute_run<D: ShipTargetDispatcher>(
         queue,
         evidence,
         warm_pool,
+        cwd,
         state_dir,
+        config,
     } = stores;
+    let job = submit_run(request, queue, cwd, state_dir)?;
+    execute_run_worker(
+        request,
+        job,
+        RunStores {
+            queue,
+            evidence,
+            warm_pool,
+            cwd,
+            state_dir,
+            config,
+        },
+        dispatcher,
+    )
+}
+
+/// Submit a `shipyard run` request as a pending durable job.
+pub fn submit_run(
+    request: &RunExecutionRequest,
+    queue: &mut Queue,
+    cwd: &Path,
+    state_dir: &Path,
+) -> Result<Job, ShipExecutionError> {
     let target_names = target_names(&request.targets);
+    let job = Job::create(
+        request.sha.clone(),
+        request.branch.clone(),
+        target_names,
+        request.mode,
+        request.priority,
+    )
+    .with_kind(JobKind::Run);
+    QueueRequestStore::new(state_dir)
+        .map_err(QueueRequestError::from)?
+        .save(&QueuedExecutionEnvelope::from_run_request(
+            job.id.clone(),
+            cwd,
+            request,
+        ))?;
+    queue.enqueue(job.clone())?;
+    Ok(job)
+}
+
+/// Load a completed `shipyard run` outcome through the durable outcome store.
+pub fn load_run_outcome(
+    queue: &mut Queue,
+    state_dir: &Path,
+    job_id: &str,
+) -> Result<RunExecutionOutcome, ShipExecutionError> {
+    let Some(outcome) = QueueOutcomeStore::new(state_dir)
+        .map_err(QueueRequestError::from)?
+        .load(job_id)?
+    else {
+        return Err(ShipExecutionError::MissingQueuedOutcome(job_id.to_owned()));
+    };
+    if !matches!(outcome, QueuedExecutionOutcome::Run { .. }) {
+        return Err(ShipExecutionError::UnexpectedQueuedOutcome {
+            job_id: job_id.to_owned(),
+            expected: "run",
+        });
+    }
+    let Some(job) = queue.get(job_id)? else {
+        return Err(ShipExecutionError::MissingQueuedJob(job_id.to_owned()));
+    };
+    Ok(RunExecutionOutcome { job })
+}
+
+/// Wait for a submitted `shipyard run` job, becoming the cooperative drain
+/// owner when possible.
+pub fn drain_or_wait_run<D: ShipTargetDispatcher + Sync>(
+    request: &RunExecutionRequest,
+    job: Job,
+    stores: RunStores<'_>,
+    dispatcher: &D,
+) -> Result<RunExecutionOutcome, ShipExecutionError> {
+    drain_or_wait_run_with_options(
+        request,
+        job,
+        stores,
+        dispatcher,
+        CooperativeDrainOptions::default(),
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn drain_or_wait_run_with_options<D: ShipTargetDispatcher + Sync>(
+    _request: &RunExecutionRequest,
+    job: Job,
+    stores: RunStores<'_>,
+    dispatcher: &D,
+    options: CooperativeDrainOptions,
+) -> Result<RunExecutionOutcome, ShipExecutionError> {
+    let RunStores {
+        queue,
+        evidence,
+        warm_pool,
+        cwd,
+        state_dir,
+        config,
+    } = stores;
+    let mut wait_iterations = 0usize;
+    loop {
+        if let Some(outcome) = terminal_run_outcome(queue, state_dir, &job.id)? {
+            return Ok(outcome);
+        }
+        if let Some(drain_lock) = queue.acquire_drain_lock()? {
+            let ship_state = ShipStateStore::new(state_dir.join("ship"))
+                .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+            let recovered = queue.recover_stale_running_jobs_for_drain(&drain_lock)?;
+            persist_recovered_outcomes(&recovered, state_dir, &ship_state)?;
+            if let Some(outcome) = terminal_run_outcome(queue, state_dir, &job.id)? {
+                return Ok(outcome);
+            }
+            run_drain_worker_cycle(
+                queue,
+                &drain_lock,
+                evidence,
+                &ship_state,
+                warm_pool,
+                cwd,
+                state_dir,
+                config,
+                dispatcher,
+            )?;
+        }
+        wait_or_timeout(&job.id, &mut wait_iterations, options)?;
+    }
+}
+
+/// Execute a previously submitted `shipyard run` job.
+pub fn execute_run_worker<D: ShipTargetDispatcher>(
+    request: &RunExecutionRequest,
+    job: Job,
+    stores: RunStores<'_>,
+    dispatcher: &D,
+) -> Result<RunExecutionOutcome, ShipExecutionError> {
+    execute_run_worker_with_options(request, job, stores, dispatcher, false)
+}
+
+fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
+    request: &RunExecutionRequest,
+    mut job: Job,
+    stores: RunStores<'_>,
+    dispatcher: &D,
+    defer_host_pool_lease_unavailable: bool,
+) -> Result<RunExecutionOutcome, ShipExecutionError> {
+    let RunStores {
+        queue,
+        evidence,
+        warm_pool,
+        state_dir,
+        config,
+        ..
+    } = stores;
+    let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
+    let transient_retry = crate::ship_retry::transient_local_retry_policy(config);
+    if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
+        return Ok(RunExecutionOutcome { job: cancelled });
+    }
     let shim = ShipExecutionRequest {
         pr: 0,
         repo: String::new(),
@@ -290,41 +822,617 @@ pub fn execute_run<D: ShipTargetDispatcher>(
         fail_fast: request.fail_fast,
         resume_from: request.resume_from.clone(),
         advisory_targets: BTreeSet::new(),
+        adopt_head: false,
         targets: request.targets.clone(),
     };
-    let mut job = Job::create(
-        request.sha.clone(),
-        request.branch.clone(),
-        target_names,
-        request.mode,
-        request.priority,
-    );
-    queue.enqueue(job.clone())?;
-    job = job.start()?;
-    queue.update(&job)?;
-    job = execute_targets(&shim, state_dir, queue, warm_pool, dispatcher, job)?;
+    job = ensure_worker_running_job(queue, &job)?;
+    job = execute_targets_with_options(
+        &shim,
+        state_dir,
+        queue,
+        warm_pool,
+        dispatcher,
+        job,
+        TargetExecOptions {
+            defer_host_pool_lease_unavailable,
+            reclassify_vitals_path: reclassify_vitals_path.as_deref(),
+            transient_retry,
+        },
+    )?
+    .into_completed()?;
+    if job.status == JobStatus::Cancelled {
+        QueueOutcomeStore::new(state_dir)
+            .map_err(QueueRequestError::from)?
+            .save(&QueuedExecutionOutcome::run(job.id.clone()))?;
+        return Ok(RunExecutionOutcome { job });
+    }
     job = job.complete()?;
-    queue.update(&job)?;
     record_evidence(evidence, &shim, &job)?;
+    QueueOutcomeStore::new(state_dir)
+        .map_err(QueueRequestError::from)?
+        .save(&QueuedExecutionOutcome::run(job.id.clone()))?;
+    queue.update(&job)?;
     Ok(RunExecutionOutcome { job })
 }
 
-fn execute_targets<D: ShipTargetDispatcher>(
+fn cancel_refused_job(
+    queue: &mut Queue,
+    job: &Job,
+    error: &ShipExecutionError,
+) -> Result<(), ShipExecutionError> {
+    let cancelled = job.cancel_with_reason(Some(error.to_string()))?;
+    queue.update(&cancelled)?;
+    Ok(())
+}
+
+fn durable_cancelled_job(queue: &mut Queue, job: &Job) -> Result<Option<Job>, ShipExecutionError> {
+    let Some(durable) = queue.get(&job.id)? else {
+        return Ok(None);
+    };
+    if durable.status == JobStatus::Cancelled {
+        Ok(Some(durable))
+    } else {
+        Ok(None)
+    }
+}
+
+fn scheduler_vm_slots(
+    config: &LoadedConfig,
+    jobs: &[Job],
+    request_store: &QueueRequestStore,
+) -> Result<Vec<VmSlotCapacity>, ShipExecutionError> {
+    if !jobs_use_vm_slot(jobs, request_store, "macos") {
+        return Ok(Vec::new());
+    }
+    let hosts =
+        gather_configured_host_capacities(&config.data).map_err(ShipExecutionError::VmSlot)?;
+    if hosts.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![VmSlotCapacity {
+        key: "macos".to_owned(),
+        slots: total_free(&hosts),
+    }])
+}
+
+fn jobs_use_vm_slot(jobs: &[Job], request_store: &QueueRequestStore, key: &str) -> bool {
+    jobs.iter()
+        .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
+        .any(|job| {
+            request_store
+                .load(&job.id)
+                .ok()
+                .flatten()
+                .is_some_and(|envelope| {
+                    envelope
+                        .resource_plan
+                        .vm_slots
+                        .iter()
+                        .any(|slot| slot.key == key)
+                })
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
+    queue: &mut Queue,
+    drain_lock: &crate::queue::DrainLock,
+    evidence: &EvidenceStore,
+    ship_state: &ShipStateStore,
+    warm_pool: &WarmPool,
+    cwd: &Path,
+    state_dir: &Path,
+    config: &LoadedConfig,
+    dispatcher: &D,
+) -> Result<(), ShipExecutionError> {
+    let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
+    let outcome_store = QueueOutcomeStore::new(state_dir).map_err(QueueRequestError::from)?;
+    let _trimmed_job_ids = queue.trim_terminal_jobs_for_drain(drain_lock)?;
+    let jobs = queue.get_all()?;
+    sweep_absent_queue_envelopes(&jobs, &request_store, &outcome_store)?;
+    let pools = scheduler_host_pools(&jobs, &request_store)?;
+    let leases = HostPoolLeaseStore::new(default_lease_path(state_dir))
+        .leases()
+        .map_err(|error| ShipExecutionError::HostPool(error.to_string()))?;
+    let vm_slots = scheduler_vm_slots(config, &jobs, &request_store)?;
+    let mut pass = plan_admit_pass_from_jobs_with_vm_slots(
+        &jobs,
+        &request_store,
+        &pools,
+        &leases,
+        &vm_slots,
+        Utc::now(),
+    );
+    cap_admit_pass_workers(&jobs, &mut pass, DEFAULT_DRAIN_MAX_WORKERS);
+    let applied = apply_admit_pass_for_drain(queue, drain_lock, &pass)?;
+    if applied.started.is_empty() {
+        return Ok(());
+    }
+
+    let worker_inputs = applied
+        .started
+        .into_iter()
+        .map(|job| {
+            let envelope = request_store
+                .load(&job.id)?
+                .ok_or_else(|| ShipExecutionError::MissingQueuedJob(job.id.clone()))?;
+            Ok((job, envelope))
+        })
+        .collect::<Result<Vec<_>, ShipExecutionError>>()?;
+
+    let queue_state_dir = queue.state_dir().to_path_buf();
+    let mut worker_results = Vec::new();
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (job, envelope) in worker_inputs {
+            let evidence = evidence.clone();
+            let ship_state = ship_state.clone();
+            let warm_pool = warm_pool.clone();
+            let state_dir = state_dir.to_path_buf();
+            let queue_state_dir = queue_state_dir.clone();
+            let fallback_cwd = cwd.to_path_buf();
+            handles.push((
+                job.id.clone(),
+                scope.spawn(move || {
+                    run_started_worker(
+                        job,
+                        envelope,
+                        &evidence,
+                        &ship_state,
+                        &warm_pool,
+                        &fallback_cwd,
+                        &queue_state_dir,
+                        &state_dir,
+                        config,
+                        dispatcher,
+                    )
+                }),
+            ));
+        }
+        for (job_id, handle) in handles {
+            let result = match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err(ShipExecutionError::WorkerJoin(job_id.clone())),
+            };
+            worker_results.push((job_id, result));
+        }
+    });
+
+    let requeues = worker_results
+        .into_iter()
+        .filter_map(|(job_id, result)| match result {
+            Ok(()) => None,
+            Err(ShipExecutionError::SchedulerDeferred(reason)) => Some(Ok(QueueDeferredRequeue {
+                job_id,
+                reason,
+                defer_until: Some(defer_until(Utc::now())),
+            })),
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, ShipExecutionError>>()?;
+    if !requeues.is_empty() {
+        queue.requeue_deferred_running_jobs_for_drain(drain_lock, &requeues)?;
+    }
+    Ok(())
+}
+
+fn sweep_absent_queue_envelopes(
+    jobs: &[Job],
+    request_store: &QueueRequestStore,
+    outcome_store: &QueueOutcomeStore,
+) -> Result<(), ShipExecutionError> {
+    let active_job_ids = jobs
+        .iter()
+        .map(|job| job.id.clone())
+        .collect::<BTreeSet<_>>();
+    request_store.sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
+    outcome_store.sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
+    Ok(())
+}
+
+fn persist_recovered_outcomes(
+    recovered: &[Job],
+    state_dir: &Path,
+    ship_state: &ShipStateStore,
+) -> Result<(), ShipExecutionError> {
+    if recovered.is_empty() {
+        return Ok(());
+    }
+    let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
+    let outcome_store = QueueOutcomeStore::new(state_dir).map_err(QueueRequestError::from)?;
+    for job in recovered {
+        let Some(envelope) = request_store.load(&job.id)? else {
+            continue;
+        };
+        match envelope.kind {
+            QueuedExecutionKind::Run => {
+                outcome_store.save(&QueuedExecutionOutcome::run(job.id.clone()))?;
+            }
+            QueuedExecutionKind::Ship => {
+                let request = envelope.to_ship_request()?;
+                let existing = ship_state.get(request.pr);
+                let resumed_existing_state = existing.is_some();
+                let state =
+                    existing.unwrap_or_else(|| unsaved_ship_state(&request, &job.target_names));
+                outcome_store.save(&QueuedExecutionOutcome::ship(
+                    job.id.clone(),
+                    request.pr,
+                    state,
+                    resumed_existing_state,
+                ))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cap_admit_pass_workers(
+    jobs: &[Job],
+    pass: &mut crate::queue_scheduler::RequestBackedAdmitPass,
+    max_workers: usize,
+) {
+    let running = jobs
+        .iter()
+        .filter(|job| job.status == JobStatus::Running)
+        .count();
+    let available = max_workers.saturating_sub(running);
+    pass.plan.admitted.truncate(available);
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+fn run_started_worker<D: ShipTargetDispatcher>(
+    job: Job,
+    envelope: QueuedExecutionEnvelope,
+    evidence: &EvidenceStore,
+    ship_state: &ShipStateStore,
+    warm_pool: &WarmPool,
+    fallback_cwd: &Path,
+    queue_state_dir: &Path,
+    state_dir: &Path,
+    config: &LoadedConfig,
+    dispatcher: &D,
+) -> Result<(), ShipExecutionError> {
+    let worker_cwd = envelope.cwd.as_path();
+    let cwd = if worker_cwd.as_os_str().is_empty() {
+        fallback_cwd
+    } else {
+        worker_cwd
+    };
+    let mut worker_queue = Queue::new(queue_state_dir).map_err(QueueError::from)?;
+    match envelope.kind {
+        QueuedExecutionKind::Run => {
+            let request = envelope.to_run_request()?;
+            execute_run_worker_with_options(
+                &request,
+                job,
+                RunStores {
+                    queue: &mut worker_queue,
+                    evidence,
+                    warm_pool,
+                    cwd,
+                    state_dir,
+                    config,
+                },
+                dispatcher,
+                true,
+            )?;
+        }
+        QueuedExecutionKind::Ship => {
+            let request = envelope.to_ship_request()?;
+            execute_ship_worker_with_options(
+                &request,
+                job,
+                ShipStores {
+                    queue: &mut worker_queue,
+                    evidence,
+                    ship_state,
+                    warm_pool,
+                    cwd,
+                    state_dir,
+                    config,
+                },
+                dispatcher,
+                true,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn defer_until(now: DateTime<Utc>) -> DateTime<Utc> {
+    now + chrono::Duration::seconds(5)
+}
+
+fn scheduler_host_pools(
+    jobs: &[Job],
+    request_store: &QueueRequestStore,
+) -> Result<Vec<HostPoolConfig>, ShipExecutionError> {
+    let mut pools = BTreeMap::<String, HostPoolConfig>::new();
+    for job in jobs
+        .iter()
+        .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
+    {
+        let Some(envelope) = request_store.load(&job.id)? else {
+            continue;
+        };
+        let targets = match envelope.kind {
+            QueuedExecutionKind::Run => envelope.to_run_request()?.targets,
+            QueuedExecutionKind::Ship => envelope.to_ship_request()?.targets,
+        };
+        for target in &targets {
+            collect_target_host_pools(target, &mut pools);
+        }
+    }
+    Ok(pools.into_values().collect())
+}
+
+fn collect_target_host_pools(
+    target: &ResolvedTarget,
+    pools: &mut BTreeMap<String, HostPoolConfig>,
+) {
+    match &target.backend {
+        ResolvedBackend::HostPool(pool) => {
+            pools
+                .entry(pool.pool_name.clone())
+                .or_insert_with(|| host_pool_config_from_resolved(pool));
+        }
+        ResolvedBackend::Fallback(chain) => {
+            for backend in &chain.backends {
+                collect_target_host_pools(&backend.target, pools);
+            }
+        }
+        ResolvedBackend::Local(_)
+        | ResolvedBackend::Ssh(_)
+        | ResolvedBackend::Windows(_)
+        | ResolvedBackend::Cloud(_) => {}
+    }
+}
+
+fn host_pool_config_from_resolved(pool: &ResolvedHostPoolConfig) -> HostPoolConfig {
+    HostPoolConfig {
+        name: pool.pool_name.clone(),
+        strategy: pool.strategy.clone(),
+        lease_stale_seconds: pool.lease_stale_seconds,
+        heartbeat_interval_seconds: pool.heartbeat_interval_seconds,
+        members: pool
+            .members
+            .iter()
+            .map(host_pool_member_config_from_resolved)
+            .collect(),
+    }
+}
+
+fn host_pool_member_config_from_resolved(member: &ResolvedHostPoolMember) -> HostPoolMemberConfig {
+    match &member.target.backend {
+        ResolvedBackend::Local(config) => HostPoolMemberConfig {
+            id: member.id.clone(),
+            backend_type: "local".to_owned(),
+            host: None,
+            repo_path: None,
+            cwd: config.cwd.clone(),
+            max_concurrency: member.max_concurrency,
+            capabilities: member.capabilities.clone(),
+        },
+        ResolvedBackend::Ssh(config) => HostPoolMemberConfig {
+            id: member.id.clone(),
+            backend_type: "ssh".to_owned(),
+            host: config.host.clone(),
+            repo_path: Some(config.repo_path.clone()),
+            cwd: None,
+            max_concurrency: member.max_concurrency,
+            capabilities: member.capabilities.clone(),
+        },
+        ResolvedBackend::Windows(config) => HostPoolMemberConfig {
+            id: member.id.clone(),
+            backend_type: "ssh".to_owned(),
+            host: config.host.clone(),
+            repo_path: Some(config.repo_path.clone()),
+            cwd: None,
+            max_concurrency: member.max_concurrency,
+            capabilities: member.capabilities.clone(),
+        },
+        ResolvedBackend::Cloud(_) | ResolvedBackend::HostPool(_) | ResolvedBackend::Fallback(_) => {
+            HostPoolMemberConfig {
+                id: member.id.clone(),
+                backend_type: member.target.backend_name.clone(),
+                host: member.target.host.clone(),
+                repo_path: member.target.workdir(),
+                cwd: None,
+                max_concurrency: member.max_concurrency,
+                capabilities: member.capabilities.clone(),
+            }
+        }
+    }
+}
+
+fn terminal_run_outcome(
+    queue: &mut Queue,
+    state_dir: &Path,
+    job_id: &str,
+) -> Result<Option<RunExecutionOutcome>, ShipExecutionError> {
+    let Some(job) = queue.get(job_id)? else {
+        return Ok(None);
+    };
+    match job.status {
+        JobStatus::Cancelled => Ok(Some(RunExecutionOutcome { job })),
+        JobStatus::Completed => load_run_outcome(queue, state_dir, job_id).map(Some),
+        JobStatus::Pending | JobStatus::Running => Ok(None),
+    }
+}
+
+fn terminal_ship_outcome(
+    queue: &mut Queue,
+    state_dir: &Path,
+    request: &ShipExecutionRequest,
+    job_id: &str,
+) -> Result<Option<ShipExecutionOutcome>, ShipExecutionError> {
+    let Some(job) = queue.get(job_id)? else {
+        return Ok(None);
+    };
+    match job.status {
+        JobStatus::Cancelled => {
+            let loaded = QueueOutcomeStore::new(state_dir)
+                .map_err(QueueRequestError::from)?
+                .load(job_id)?;
+            if loaded.is_some() {
+                return load_ship_outcome(queue, state_dir, job_id).map(Some);
+            }
+            Ok(Some(ShipExecutionOutcome {
+                job,
+                ship_state: unsaved_ship_state(request, &target_names(&request.targets)),
+                resumed_existing_state: false,
+            }))
+        }
+        JobStatus::Completed => load_ship_outcome(queue, state_dir, job_id).map(Some),
+        JobStatus::Pending | JobStatus::Running => Ok(None),
+    }
+}
+
+fn wait_or_timeout(
+    job_id: &str,
+    wait_iterations: &mut usize,
+    options: CooperativeDrainOptions,
+) -> Result<(), ShipExecutionError> {
+    *wait_iterations = wait_iterations.saturating_add(1);
+    if let Some(max) = options.max_wait_iterations
+        && *wait_iterations > max
+    {
+        return Err(ShipExecutionError::CooperativeWaitTimedOut(
+            job_id.to_owned(),
+        ));
+    }
+    if !options.poll_interval.is_zero() {
+        thread::sleep(options.poll_interval);
+    }
+    Ok(())
+}
+
+fn refuse_same_pr_running_ship(
+    queue: &mut Queue,
+    state_dir: &Path,
+    request: &ShipExecutionRequest,
+) -> Result<(), ShipExecutionError> {
+    let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
+    let stale_after = chrono::Duration::seconds(DEFAULT_RUNNING_JOB_STALE_SECONDS);
+    for running in queue.get_running()? {
+        let Some(envelope) = request_store.load(&running.id)? else {
+            continue;
+        };
+        let QueuedExecutionEnvelope {
+            request: crate::queue_request::QueuedExecutionRequest::Ship(existing),
+            ..
+        } = envelope
+        else {
+            continue;
+        };
+        if existing.repo != request.repo || existing.pr != request.pr {
+            continue;
+        }
+
+        // A same-PR ship is already running. If its worker has gone silent past
+        // the heartbeat-staleness threshold it was abandoned (e.g. the process
+        // was killed) and must not block this retry forever — reap it and move
+        // on. `cancel_stale_running_jobs` re-checks staleness under the queue
+        // lock, so a worker that is merely between heartbeats is never reaped
+        // out from under itself.
+        let now = Utc::now();
+        if running.is_stale_running(now, stale_after) {
+            let reaped = queue.cancel_stale_running_jobs(
+                std::slice::from_ref(&running.id),
+                now,
+                stale_after,
+                STALE_RUNNING_CANCEL_REASON,
+            )?;
+            if !reaped.is_empty() {
+                continue;
+            }
+            // The under-lock re-check disagreed — a heartbeat landed between the
+            // snapshot and the reap, so the worker is live after all. Fall
+            // through to refuse only if it is genuinely still running.
+            match queue.get(&running.id)? {
+                Some(job) if job.status == JobStatus::Running => {}
+                _ => continue,
+            }
+        }
+
+        return Err(ShipExecutionError::SamePrShipRunning {
+            repo: request.repo.clone(),
+            pr: request.pr,
+            running_job_id: running.id,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_worker_running_job(queue: &mut Queue, job: &Job) -> Result<Job, ShipExecutionError> {
+    match job.status {
+        JobStatus::Pending => {
+            let started = job.start()?;
+            queue.update(&started)?;
+            Ok(started)
+        }
+        JobStatus::Running => Ok(queue.get(&job.id)?.unwrap_or_else(|| job.clone())),
+        status => Err(JobTransitionError::InvalidStart(status).into()),
+    }
+}
+
+fn unsaved_ship_state(request: &ShipExecutionRequest, target_names: &[String]) -> ShipState {
+    let mut state = ShipState::new(
+        request.pr,
+        request.repo.clone(),
+        request.branch.clone(),
+        request.base_branch.clone(),
+        request.sha.clone(),
+        policy_signature(&request.targets, target_names, request.mode),
+    );
+    refresh_pr_metadata(&mut state, request);
+    state
+}
+
+#[allow(clippy::too_many_lines)]
+// This internal execution loop threads several heterogeneous handles (stores,
+/// Mostly default-off knobs for one target-execution pass. Bundled so the
+/// execution seam takes a single cohesive options value rather than a growing
+/// list of loose booleans and paths — and so a new opt-in is one field, not one
+/// more positional argument. Resolved once at the command layer.
+#[derive(Clone, Copy)]
+struct TargetExecOptions<'a> {
+    /// Return scheduler-owned deferral results for transient host-pool lease
+    /// contention instead of final busy target results.
+    defer_host_pool_lease_unavailable: bool,
+    /// When set, a local `TEST` failure overlapping a host infra incident is
+    /// relabeled `INFRA` (opt-in host-vitals reclassification); `None` = off.
+    reclassify_vitals_path: Option<&'a Path>,
+    /// Same-backend retry budget for transient local `INFRA` blips (default off).
+    transient_retry: crate::ship_retry::TransientRetryPolicy,
+}
+
+// The per-target retry loop keeps the cancellation-sensitive dispatch +
+// progress-callback block inline (it borrows `job`/`queue` mutably and early-
+// returns on Deferred/Cancelled). Extracting the per-target body into its own
+// runner is the right next step, but as a separate no-behavior-change refactor
+// so a cancellation regression stays bisectable — not bundled with this opt-in.
+#[allow(clippy::too_many_lines)]
+fn execute_targets_with_options<D: ShipTargetDispatcher>(
     request: &ShipExecutionRequest,
     state_dir: &Path,
     queue: &mut Queue,
     warm_pool: &WarmPool,
     dispatcher: &D,
     mut job: Job,
-) -> Result<Job, ShipExecutionError> {
+    options: TargetExecOptions<'_>,
+) -> Result<TargetExecutionOutcome, ShipExecutionError> {
     let mut had_failure = false;
     for target in &request.targets {
+        if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
+            return Ok(TargetExecutionOutcome::Completed(cancelled));
+        }
         if had_failure && request.fail_fast {
             job = job.with_result(cancelled_result(target, job.started_at));
             queue.update(&job)?;
             continue;
         }
-        let log_path = target_log_path(state_dir, &job.id, &target.name);
+        let base_log_path = target_log_path(state_dir, &job.id, &target.name);
         let decision = apply_warm_reuse(
             warm_pool,
             target,
@@ -333,34 +1441,111 @@ fn execute_targets<D: ShipTargetDispatcher>(
             request.warm_disabled,
             crate::warm_pool::now_epoch_secs(),
         );
-        job = job.with_result(running_result(&decision.target, &log_path, job.started_at));
-        queue.update(&job)?;
 
-        let progress_log_path = log_path.clone();
-        let mut progress_error = None;
-        let result = {
-            let mut progress_callback = |event: ProgressEvent| {
-                if progress_error.is_some() {
-                    return;
-                }
-                apply_progress_event(&mut job, &decision.target, &progress_log_path, event);
-                if let Err(error) = queue.update(&job) {
-                    progress_error = Some(error);
-                }
+        // Same-backend retry loop for transient local INFRA blips. When the
+        // policy is disabled (the default) this runs exactly once against the
+        // base log path — byte-identical to the non-retry behavior.
+        let mut attempt: u32 = 0;
+        let mut prior_transient: Vec<String> = Vec::new();
+        let result = loop {
+            let attempt_log_path = retry_attempt_log_path(&base_log_path, attempt);
+            job = job.with_result(running_result(
+                &decision.target,
+                &attempt_log_path,
+                job.started_at,
+            ));
+            queue.update(&job)?;
+
+            let dispatch_job_id = job.id.clone();
+            let progress_log_path = attempt_log_path.clone();
+            let mut progress_error = None;
+            let mut progress_cancelled = None;
+            let mut result = {
+                let mut progress_callback = |event: ProgressEvent| {
+                    if progress_error.is_some() || progress_cancelled.is_some() {
+                        return;
+                    }
+                    match durable_cancelled_job(queue, &job) {
+                        Ok(Some(cancelled)) => {
+                            progress_cancelled = Some(cancelled);
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            progress_error = Some(error);
+                            return;
+                        }
+                    }
+                    apply_progress_event(&mut job, &decision.target, &progress_log_path, event);
+                    if let Err(error) = queue.update(&job) {
+                        progress_error = Some(ShipExecutionError::Queue(error));
+                        return;
+                    }
+                    match durable_cancelled_job(queue, &job) {
+                        Ok(Some(cancelled)) => {
+                            progress_cancelled = Some(cancelled);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            progress_error = Some(error);
+                        }
+                    }
+                };
+                dispatcher.validate(DispatchValidationRequest {
+                    job_id: Some(dispatch_job_id),
+                    defer_host_pool_lease_unavailable: options.defer_host_pool_lease_unavailable,
+                    sha: request.sha.clone(),
+                    branch: request.branch.clone(),
+                    target: &decision.target,
+                    log_path: attempt_log_path,
+                    resume_from: decision.resume_from.clone(),
+                    mode: request.mode,
+                    progress_callback: Some(&mut progress_callback),
+                })
             };
-            dispatcher.validate(DispatchValidationRequest {
-                sha: request.sha.clone(),
-                branch: request.branch.clone(),
-                target: &decision.target,
-                log_path,
-                resume_from: decision.resume_from.clone(),
-                mode: request.mode,
-                progress_callback: Some(&mut progress_callback),
-            })
+            if let Some(error) = progress_error {
+                return Err(error);
+            }
+            if let Some(cancelled) = progress_cancelled {
+                return Ok(TargetExecutionOutcome::Completed(cancelled));
+            }
+            if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
+                return Ok(TargetExecutionOutcome::Completed(cancelled));
+            }
+            // A scheduler-deferred result is never terminal — it must not be
+            // retried or persisted as a failure; hand it back on the defer path.
+            if result.is_scheduler_deferred() {
+                let reason = result
+                    .scheduler_defer_reason
+                    .clone()
+                    .unwrap_or_else(|| "scheduler_deferred".to_owned());
+                return Ok(TargetExecutionOutcome::Deferred { job, reason });
+            }
+            maybe_reclassify_on_host_incident(&mut result, options.reclassify_vitals_path);
+
+            // Re-run only a transient local INFRA blip, bounded by the policy.
+            let should_retry = attempt < options.transient_retry.max_retries()
+                && !result.passed()
+                && result.backend == "local"
+                && crate::classify::same_leg_local_retryable(result.failure_class.as_deref());
+            if !should_retry {
+                break annotate_retry_history(result, &prior_transient);
+            }
+
+            // A cancel may have landed while this attempt ran; honor it before
+            // spending another attempt.
+            if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
+                return Ok(TargetExecutionOutcome::Completed(cancelled));
+            }
+            prior_transient.push(format!(
+                "attempt {}: {} (log {})",
+                attempt + 1,
+                result.failure_class.as_deref().unwrap_or("INFRA"),
+                progress_log_path.display()
+            ));
+            attempt += 1;
         };
-        if let Some(error) = progress_error {
-            return Err(ShipExecutionError::Queue(error));
-        }
+
         job = job.with_result(result.clone());
         queue.update(&job)?;
         if !result.passed() {
@@ -377,7 +1562,45 @@ fn execute_targets<D: ShipTargetDispatcher>(
         )
         .map_err(ShipExecutionError::WarmPool)?;
     }
-    Ok(job)
+    Ok(TargetExecutionOutcome::Completed(job))
+}
+
+/// Opt-in, fail-open host-incident reclassification. When enabled (a resolved
+/// vitals path is present), a LOCAL leg that failed with a plain `TEST` class is
+/// relabeled `INFRA` — with an honest note — if a host infra incident (jetsam /
+/// `WindowServer` crash) overlapped its window, so the author isn't misled into
+/// debugging their own code after the host shed load under them. Purely a label
+/// plus note: it never changes `TargetStatus`, so merge readiness (which keys on
+/// status, not `failure_class`) is unaffected. No-op for remote/cloud legs, any
+/// non-`TEST` class, or an absent/stale signal.
+fn maybe_reclassify_on_host_incident(
+    result: &mut TargetResult,
+    reclassify_vitals_path: Option<&Path>,
+) {
+    let Some(path) = reclassify_vitals_path else {
+        return;
+    };
+    if result.passed() || result.backend != "local" {
+        return;
+    }
+    let (Some(started_at), Some(completed_at)) = (result.started_at, result.completed_at) else {
+        return;
+    };
+    // Cheap class-eligibility check before the filesystem probe.
+    let Some(new_class) = crate::classify::promote_test_to_infra(result.failure_class.as_deref())
+    else {
+        return;
+    };
+    let Some(reason) = crate::host_health::incident_from_path(path, started_at, completed_at)
+    else {
+        return;
+    };
+    result.failure_class = Some(new_class.as_str().to_owned());
+    let note = format!("Reclassified to {new_class} — {reason}");
+    result.error_message = Some(match result.error_message.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}\n{note}"),
+        _ => note,
+    });
 }
 
 fn apply_progress_event(
@@ -411,10 +1634,27 @@ fn load_or_create_state(
     request: &ShipExecutionRequest,
     target_names: &[String],
     store: &ShipStateStore,
+    lock: Option<&ShipStatePrLock>,
 ) -> Result<ShipState, ShipExecutionError> {
     let policy = policy_signature(&request.targets, target_names, request.mode);
-    if let Some(mut existing) = store.get(request.pr) {
-        validate_existing_state(&existing, &request.sha, &policy)?;
+    let existing = lock.map_or_else(
+        || store.get(request.pr),
+        |lock| store.get_locked(request.pr, lock),
+    );
+    if let Some(mut existing) = existing {
+        validate_existing_state(&existing, &request.sha, &policy, request.adopt_head)?;
+        if request.adopt_head && existing.is_sha_drift(&request.sha) {
+            // Adopt the amended/force-pushed head. Clear prior remote runs and
+            // evidence so the new head is re-validated from scratch — never
+            // bless stale validation for a possibly-different tree. `head_sha`
+            // also gates auto-merge's live-head preflight, so it must track the
+            // SHA we actually validate (Shipyard #346; codex review). A
+            // same-tree fast path that preserves evidence for a trailer-only
+            // amend is a possible follow-up.
+            existing.head_sha.clone_from(&request.sha);
+            existing.dispatched_runs.clear();
+            existing.evidence_snapshot.clear();
+        }
         existing.commit_subject.clone_from(&request.commit_subject);
         refresh_pr_metadata(&mut existing, request);
         existing.touch();
@@ -454,8 +1694,9 @@ fn validate_existing_state(
     state: &ShipState,
     sha: &str,
     policy: &str,
+    adopt_head: bool,
 ) -> Result<(), ShipExecutionError> {
-    if state.is_sha_drift(sha) {
+    if !adopt_head && state.is_sha_drift(sha) {
         return Err(ShipExecutionError::ShaDrift {
             existing: state.head_sha.clone(),
             current: sha.to_owned(),
@@ -532,6 +1773,53 @@ fn cancelled_result(
     result.started_at = started_at;
     result.completed_at = Some(Utc::now());
     result.error_message = Some("Skipped (earlier target failed, --fail-fast)".to_owned());
+    result
+}
+
+/// Log path for a given same-backend retry attempt of a target. Attempt 0 uses
+/// the stable base path, so a run with retries disabled is byte-identical to
+/// before. Each retry writes to a distinct `.retry<N>` sibling, so re-running
+/// never truncates the failing attempt's log — that preserved evidence is
+/// exactly what makes a transient-vs-real determination possible after the fact.
+/// Distinct from the dispatch layer's `.attempt-<N>` cross-backend failover logs.
+fn retry_attempt_log_path(base: &Path, attempt: u32) -> PathBuf {
+    if attempt == 0 {
+        return base.to_path_buf();
+    }
+    let mut file_name = base
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    file_name.push(format!(".retry{attempt}"));
+    base.with_file_name(file_name)
+}
+
+/// Fold same-backend retry history into the terminal result so the outcome is
+/// honest about the re-runs. No retries → returned unchanged. A recovered
+/// (passed) result records the recovery in `phase` and never in `error_message`
+/// — a non-empty `error_message` is read elsewhere as a failure signal. A result
+/// that is still failing appends the transient history to `error_message`,
+/// matching the incident-reclassification note style.
+fn annotate_retry_history(mut result: TargetResult, prior_transient: &[String]) -> TargetResult {
+    if prior_transient.is_empty() {
+        return result;
+    }
+    let retries = prior_transient.len();
+    let plural = if retries == 1 { "y" } else { "ies" };
+    let history = prior_transient.join("; ");
+    if result.passed() {
+        result.phase = Some(format!(
+            "recovered after {retries} same-backend transient retr{plural} ({history})"
+        ));
+    } else {
+        let note = format!(
+            "Same-backend transient retry exhausted after {retries} retr{plural} ({history})."
+        );
+        result.error_message = Some(match result.error_message.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}\n{note}"),
+            _ => note,
+        });
+    }
     result
 }
 
@@ -776,26 +2064,184 @@ fn effective_warm_resume(requested_resume_from: Option<&str>) -> &str {
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::Duration as StdDuration;
 
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use toml::Table;
 
     use super::{
-        ShipExecutionError, ShipExecutionRequest, ShipStores, ShipTargetDispatcher, WarmPoolUpdate,
-        apply_warm_reuse, execute_ship, update_warm_pool_after_run,
+        CooperativeDrainOptions, RunExecutionRequest, RunStores, ShipExecutionError,
+        ShipExecutionRequest, ShipStores, ShipTargetDispatcher, TargetExecOptions,
+        TargetExecutionOutcome, WarmPoolUpdate, apply_warm_reuse, cap_admit_pass_workers,
+        drain_or_wait_run, drain_or_wait_run_with_options, execute_run, execute_run_worker,
+        execute_ship, execute_ship_worker, execute_targets_with_options, load_run_outcome,
+        load_ship_outcome, retry_attempt_log_path, submit_run, submit_ship, target_log_path,
+        update_warm_pool_after_run,
     };
+    use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::EvidenceStore;
     use crate::executor::dispatch::{
         DispatchValidationRequest, ResolvedTarget, resolve_targets_from_table,
     };
     use crate::executor::streaming::ProgressEvent;
-    use crate::job::{Priority, TargetResult, TargetStatus, ValidationMode};
+    use crate::job::{Job, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
     use crate::queue::Queue;
+    use crate::queue_request::{
+        QueueOutcomeStore, QueueRequestStore, QueuedExecutionOutcome, QueuedExecutionRequest,
+    };
+    use crate::queue_scheduler::{AdmitPassPlan, RequestBackedAdmitPass, SamePrShipAdmission};
     use crate::ship_state::{ShipState, ShipStateStore};
     use crate::warm_pool::{PoolEntry, WarmPool};
 
     fn table(input: &str) -> Table {
         input.parse::<Table>().expect("valid TOML")
+    }
+
+    // ---- host-incident reclassification seam (Part 2) ----
+
+    fn failed_local_test_result(started: DateTime<Utc>, completed: DateTime<Utc>) -> TargetResult {
+        let mut result = TargetResult::new("mac", "macos-arm64", TargetStatus::Fail, "local");
+        result.started_at = Some(started);
+        result.completed_at = Some(completed);
+        result.failure_class = Some("TEST".to_owned());
+        result
+    }
+
+    fn write_host_vitals(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("host_vitals.json");
+        std::fs::write(&path, body).expect("write vitals");
+        path
+    }
+
+    #[test]
+    fn reclassify_promotes_local_test_to_infra_on_overlapping_jetsam() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("INFRA"));
+        assert!(
+            result.error_message.unwrap_or_default().contains("jetsam"),
+            "reclassification should note the reason"
+        );
+    }
+
+    #[test]
+    fn reclassify_is_noop_without_a_resolved_path() {
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        super::maybe_reclassify_on_host_incident(&mut result, None);
+        assert_eq!(result.failure_class.as_deref(), Some("TEST"));
+    }
+
+    #[test]
+    fn reclassify_skips_remote_backends() {
+        // SSH/cloud legs run on another host; local DiagnosticReports don't apply.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        result.backend = "ssh".to_owned();
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("TEST"));
+    }
+
+    #[test]
+    fn reclassify_never_masks_a_contract_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        result.failure_class = Some("CONTRACT".to_owned());
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("CONTRACT"));
+    }
+
+    #[test]
+    fn reclassify_skips_when_no_incident_overlaps_the_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Jetsam ~28h ago → far before a recent leg window.
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":100000}"#);
+        let now = Utc::now();
+        let mut result = failed_local_test_result(now - Duration::seconds(10), now);
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("TEST"));
+    }
+
+    #[test]
+    fn reclassify_preserves_the_original_failure_message() {
+        // The real test-failure message must survive — the infra note is appended,
+        // not substituted, so evidence of what actually failed isn't lost.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        result.error_message = Some("assertion failed: foo == bar".to_owned());
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("INFRA"));
+        let message = result.error_message.expect("message");
+        assert!(
+            message.contains("assertion failed: foo == bar"),
+            "original preserved: {message}"
+        );
+        assert!(message.contains("jetsam"), "note appended: {message}");
+    }
+
+    #[test]
+    fn reclassify_skips_when_timestamps_are_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let mut result = TargetResult::new("mac", "macos-arm64", TargetStatus::Fail, "local");
+        result.failure_class = Some("TEST".to_owned());
+        // started_at / completed_at left None → cannot bound a window, so no-op.
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("TEST"));
+    }
+
+    #[test]
+    fn reclassify_skips_a_passed_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result = TargetResult::new("mac", "macos-arm64", TargetStatus::Pass, "local");
+        result.started_at = Some(now - Duration::hours(1));
+        result.completed_at = Some(now + Duration::hours(1));
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class, None);
+    }
+
+    fn empty_config(root: &std::path::Path) -> LoadedConfig {
+        LoadedConfig {
+            data: Table::new(),
+            global_dir: root.join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        }
+    }
+
+    fn macos_zero_capacity_config(root: &std::path::Path) -> LoadedConfig {
+        LoadedConfig {
+            data: table(
+                r#"
+                [host_class.studio]
+                cap = 0
+                tart_bin = "/bin/echo"
+                "#,
+            ),
+            global_dir: root.join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        }
     }
 
     fn ssh_target() -> ResolvedTarget {
@@ -809,6 +2255,29 @@ mod tests {
             warm_keepalive_seconds = 600
             "#,
         );
+        resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0)
+    }
+
+    fn local_target(name: &str, platform: &str, cwd: &std::path::Path) -> ResolvedTarget {
+        let cwd = cwd
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let config = format!(
+            r#"
+            [validation.default]
+            command = "true"
+
+            [targets.{name}]
+            backend = "local"
+            platform = "{platform}"
+            cwd = "{cwd}"
+            "#
+        )
+        .parse::<Table>()
+        .expect("config");
         resolve_targets_from_table(&config, ValidationMode::Full)
             .expect("targets")
             .remove(0)
@@ -830,6 +2299,7 @@ mod tests {
             fail_fast: false,
             resume_from: None,
             advisory_targets: BTreeSet::new(),
+            adopt_head: false,
             targets,
         }
     }
@@ -855,6 +2325,8 @@ mod tests {
     struct FakeDispatcher {
         status: TargetStatus,
         progress_event: Option<ProgressEvent>,
+        cancel_before_progress_event: bool,
+        scheduler_defer_reason: Option<String>,
         seen_workdirs: RefCell<Vec<Option<String>>>,
         seen_resume: RefCell<Vec<Option<String>>>,
         seen_durable_progress: RefCell<Vec<TargetResult>>,
@@ -865,6 +2337,8 @@ mod tests {
             Self {
                 status,
                 progress_event: None,
+                cancel_before_progress_event: false,
+                scheduler_defer_reason: None,
                 seen_workdirs: RefCell::new(Vec::new()),
                 seen_resume: RefCell::new(Vec::new()),
                 seen_durable_progress: RefCell::new(Vec::new()),
@@ -873,6 +2347,16 @@ mod tests {
 
         fn with_progress_event(mut self, event: ProgressEvent) -> Self {
             self.progress_event = Some(event);
+            self
+        }
+
+        fn with_cancel_before_progress_event(mut self) -> Self {
+            self.cancel_before_progress_event = true;
+            self
+        }
+
+        fn with_scheduler_defer(mut self, reason: &str) -> Self {
+            self.scheduler_defer_reason = Some(reason.to_owned());
             self
         }
     }
@@ -886,6 +2370,9 @@ mod tests {
                 .borrow_mut()
                 .push(request.resume_from.clone());
             if let Some(event) = self.progress_event.clone() {
+                if self.cancel_before_progress_event {
+                    cancel_job_from_log_path(&request.log_path);
+                }
                 if let Some(callback) = request.progress_callback.as_mut() {
                     callback(event);
                 }
@@ -896,6 +2383,45 @@ mod tests {
                         &request.target.name,
                     ));
             }
+            let now = Utc::now();
+            let mut result = TargetResult::new(
+                request.target.name.clone(),
+                request.target.platform.clone(),
+                self.status,
+                request.target.backend_name.clone(),
+            );
+            result.started_at = Some(now);
+            result.completed_at = Some(now);
+            result.log_path = Some(request.log_path.to_string_lossy().into_owned());
+            result.scheduler_defer_reason = self.scheduler_defer_reason.clone();
+            result
+        }
+    }
+
+    struct SyncDispatcher {
+        status: TargetStatus,
+        seen_workdirs: Mutex<Vec<Option<String>>>,
+    }
+
+    impl SyncDispatcher {
+        fn new(status: TargetStatus) -> Self {
+            Self {
+                status,
+                seen_workdirs: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen_count(&self) -> usize {
+            self.seen_workdirs.lock().expect("seen lock").len()
+        }
+    }
+
+    impl ShipTargetDispatcher for SyncDispatcher {
+        fn validate(&self, request: DispatchValidationRequest<'_, '_>) -> TargetResult {
+            self.seen_workdirs
+                .lock()
+                .expect("seen lock")
+                .push(request.target.workdir());
             let now = Utc::now();
             let mut result = TargetResult::new(
                 request.target.name.clone(),
@@ -927,6 +2453,22 @@ mod tests {
             .get(target)
             .expect("target result")
             .clone()
+    }
+
+    fn cancel_job_from_log_path(log_path: &std::path::Path) {
+        let job_dir = log_path.parent().expect("target log parent");
+        let logs_dir = job_dir.parent().expect("logs parent");
+        let state_dir = logs_dir.parent().expect("state dir");
+        let job_id = job_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("job id");
+        let mut queue = Queue::new(state_dir).expect("queue");
+        let job = queue.get(job_id).expect("queue get").expect("job");
+        let cancelled = job
+            .cancel_with_reason(Some("cancelled during progress".to_owned()))
+            .expect("cancel");
+        queue.update(&cancelled).expect("update cancel");
     }
 
     #[test]
@@ -1017,7 +2559,7 @@ mod tests {
         let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
         let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship");
         let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
-        let dispatcher = FakeDispatcher::new(TargetStatus::Pass);
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
         let request = ship_request(vec![target]);
 
         let outcome = execute_ship(
@@ -1027,7 +2569,9 @@ mod tests {
                 evidence: &evidence,
                 ship_state: &ship_state,
                 warm_pool: &warm_pool,
+                cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -1057,11 +2601,761 @@ mod tests {
         assert_eq!(run.provider, "ssh");
         assert_eq!(run.run_id, outcome.job.id);
         assert!(run.required);
+        let request_envelope = QueueRequestStore::new(temp.path())
+            .expect("request store")
+            .load(&outcome.job.id)
+            .expect("load request")
+            .expect("request");
+        assert_eq!(request_envelope.job_id, outcome.job.id);
+        assert_eq!(request_envelope.cwd, temp.path());
+        assert!(matches!(
+            request_envelope.request,
+            QueuedExecutionRequest::Ship(_)
+        ));
+        let stored_outcome = QueueOutcomeStore::new(temp.path())
+            .expect("outcome store")
+            .load(&outcome.job.id)
+            .expect("load outcome")
+            .expect("outcome");
+        assert!(matches!(
+            stored_outcome,
+            QueuedExecutionOutcome::Ship {
+                pr: 42,
+                resumed_existing_state: false,
+                ..
+            }
+        ));
+        let loaded = load_ship_outcome(&mut queue, temp.path(), &outcome.job.id)
+            .expect("load durable outcome");
+        assert_eq!(loaded, outcome);
         assert!(
             warm_pool
                 .get("ubuntu", "vm", crate::warm_pool::now_epoch_secs())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn execute_run_records_request_and_outcome_snapshots() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("state")).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![target],
+        };
+
+        let outcome = execute_run(
+            &request,
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: temp.path(),
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+        )
+        .expect("execute");
+
+        assert!(outcome.job.passed());
+        let request_envelope = QueueRequestStore::new(temp.path())
+            .expect("request store")
+            .load(&outcome.job.id)
+            .expect("load request")
+            .expect("request");
+        assert_eq!(request_envelope.job_id, outcome.job.id);
+        assert_eq!(request_envelope.cwd, temp.path());
+        assert!(matches!(
+            request_envelope.request,
+            QueuedExecutionRequest::Run(_)
+        ));
+        let stored_outcome = QueueOutcomeStore::new(temp.path())
+            .expect("outcome store")
+            .load(&outcome.job.id)
+            .expect("load outcome")
+            .expect("outcome");
+        assert_eq!(
+            stored_outcome,
+            QueuedExecutionOutcome::run(outcome.job.id.clone())
+        );
+        let loaded =
+            load_run_outcome(&mut queue, temp.path(), &outcome.job.id).expect("load durable run");
+        assert_eq!(loaded, outcome);
+    }
+
+    #[test]
+    fn submit_run_records_pending_job_and_request_without_execution() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("state")).expect("queue");
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![target],
+        };
+
+        let job = submit_run(&request, &mut queue, temp.path(), temp.path()).expect("submit");
+
+        assert_eq!(job.status, crate::job::JobStatus::Pending);
+        assert_eq!(
+            queue
+                .get(&job.id)
+                .expect("queue")
+                .expect("durable job")
+                .status,
+            crate::job::JobStatus::Pending
+        );
+        let request_envelope = QueueRequestStore::new(temp.path())
+            .expect("request store")
+            .load(&job.id)
+            .expect("load request")
+            .expect("request");
+        assert_eq!(request_envelope.job_id, job.id);
+        assert!(matches!(
+            request_envelope.request,
+            QueuedExecutionRequest::Run(_)
+        ));
+        assert!(
+            QueueOutcomeStore::new(temp.path())
+                .expect("outcome store")
+                .load(&job.id)
+                .expect("load outcome")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cooperative_run_wait_executes_worker_after_acquiring_drain() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("state")).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![target],
+        };
+        let job = submit_run(&request, &mut queue, temp.path(), temp.path()).expect("submit");
+
+        let outcome = drain_or_wait_run(
+            &request,
+            job,
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: temp.path(),
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+        )
+        .expect("drain");
+
+        assert!(outcome.job.passed());
+        assert_eq!(dispatcher.seen_count(), 1);
+        assert_eq!(
+            QueueOutcomeStore::new(temp.path())
+                .expect("outcome store")
+                .load(&outcome.job.id)
+                .expect("load outcome"),
+            Some(QueuedExecutionOutcome::run(outcome.job.id))
+        );
+    }
+
+    #[test]
+    fn cooperative_run_wait_does_not_dispatch_without_drain_ownership() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![target],
+        };
+        let job = submit_run(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let _held_drain = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+
+        let error = drain_or_wait_run_with_options(
+            &request,
+            job,
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: &state_dir,
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+            CooperativeDrainOptions {
+                poll_interval: StdDuration::ZERO,
+                max_wait_iterations: Some(0),
+            },
+        )
+        .expect_err("wait timeout");
+
+        assert!(matches!(
+            error,
+            ShipExecutionError::CooperativeWaitTimedOut(_)
+        ));
+        assert_eq!(dispatcher.seen_count(), 0);
+    }
+
+    #[test]
+    fn drain_admission_defers_macos_when_vm_slots_exhausted_but_runs_linux() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mac_cwd = temp.path().join("mac");
+        let linux_cwd = temp.path().join("linux");
+        std::fs::create_dir_all(&mac_cwd).expect("mac cwd");
+        std::fs::create_dir_all(&linux_cwd).expect("linux cwd");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let config = macos_zero_capacity_config(temp.path());
+        let mac_request = RunExecutionRequest {
+            branch: "feature/mac".to_owned(),
+            sha: "mac".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![local_target("mac", "macos-arm64", &mac_cwd)],
+        };
+        let linux_request = RunExecutionRequest {
+            branch: "feature/linux".to_owned(),
+            sha: "linux".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![local_target("linux", "linux-x64", &linux_cwd)],
+        };
+        let mac_job =
+            submit_run(&mac_request, &mut queue, temp.path(), &state_dir).expect("submit mac");
+        let linux_job =
+            submit_run(&linux_request, &mut queue, temp.path(), &state_dir).expect("submit linux");
+
+        let error = drain_or_wait_run_with_options(
+            &mac_request,
+            mac_job.clone(),
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: &state_dir,
+                config: &config,
+            },
+            &dispatcher,
+            CooperativeDrainOptions {
+                poll_interval: StdDuration::ZERO,
+                max_wait_iterations: Some(0),
+            },
+        )
+        .expect_err("mac job remains queued");
+
+        assert!(matches!(
+            error,
+            ShipExecutionError::CooperativeWaitTimedOut(job_id) if job_id == mac_job.id
+        ));
+        assert_eq!(
+            queue
+                .get(&mac_job.id)
+                .expect("queue")
+                .expect("mac job")
+                .status,
+            JobStatus::Pending
+        );
+        assert_eq!(
+            queue
+                .get(&linux_job.id)
+                .expect("queue")
+                .expect("linux job")
+                .status,
+            JobStatus::Completed
+        );
+        assert_eq!(dispatcher.seen_count(), 1);
+    }
+
+    #[test]
+    fn run_worker_honors_durable_cancel_before_start() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("state")).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = FakeDispatcher::new(TargetStatus::Pass);
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![target],
+        };
+        let job = submit_run(&request, &mut queue, temp.path(), temp.path()).expect("submit");
+        let cancelled = job
+            .cancel_with_reason(Some("user requested cancellation".to_owned()))
+            .expect("cancel");
+        queue.update(&cancelled).expect("update cancel");
+
+        let outcome = execute_run_worker(
+            &request,
+            job,
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: temp.path(),
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+        )
+        .expect("worker");
+
+        assert_eq!(outcome.job.status, JobStatus::Cancelled);
+        assert!(dispatcher.seen_workdirs.borrow().is_empty());
+        assert!(
+            QueueOutcomeStore::new(temp.path())
+                .expect("outcome store")
+                .load(&outcome.job.id)
+                .expect("load outcome")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn run_worker_honors_durable_cancel_from_progress_callback() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = FakeDispatcher::new(TargetStatus::Pass)
+            .with_progress_event(ProgressEvent::phase("build"))
+            .with_cancel_before_progress_event();
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![target],
+        };
+        let job = submit_run(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+
+        let outcome = execute_run_worker(
+            &request,
+            job,
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: &state_dir,
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+        )
+        .expect("worker");
+
+        assert_eq!(outcome.job.status, JobStatus::Cancelled);
+        assert_eq!(
+            outcome.job.cancellation_reason.as_deref(),
+            Some("cancelled during progress")
+        );
+        assert_eq!(dispatcher.seen_workdirs.borrow().len(), 1);
+        assert!(
+            QueueOutcomeStore::new(&state_dir)
+                .expect("outcome store")
+                .load(&outcome.job.id)
+                .expect("load outcome")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn run_worker_accepts_job_started_by_drain_owner() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = FakeDispatcher::new(TargetStatus::Pass);
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![target],
+        };
+        let job = submit_run(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("held");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&job.id))
+            .expect("start")
+            .pop()
+            .expect("started");
+        let started_at = started.started_at;
+
+        let outcome = execute_run_worker(
+            &request,
+            started,
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: &state_dir,
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+        )
+        .expect("worker");
+
+        assert_eq!(outcome.job.status, JobStatus::Completed);
+        assert_eq!(outcome.job.started_at, started_at);
+        assert_eq!(dispatcher.seen_workdirs.borrow().len(), 1);
+    }
+
+    #[test]
+    fn scheduler_deferred_target_is_not_persisted_as_final_result() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = FakeDispatcher::new(TargetStatus::Pending)
+            .with_scheduler_defer("host_pool_lease_unavailable");
+        let request = ship_request(vec![target]);
+        let job = submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("held");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&job.id))
+            .expect("start")
+            .pop()
+            .expect("started");
+
+        let outcome = execute_targets_with_options(
+            &request,
+            &state_dir,
+            &mut queue,
+            &warm_pool,
+            &dispatcher,
+            started.clone(),
+            super::TargetExecOptions {
+                defer_host_pool_lease_unavailable: true,
+                reclassify_vitals_path: None,
+                transient_retry: crate::ship_retry::TransientRetryPolicy::disabled(),
+            },
+        )
+        .expect("targets");
+
+        match outcome {
+            super::TargetExecutionOutcome::Deferred { job, reason } => {
+                assert_eq!(job.id, started.id);
+                assert_eq!(reason, "host_pool_lease_unavailable");
+            }
+            super::TargetExecutionOutcome::Completed(job) => {
+                panic!("expected scheduler deferral, got {job:?}");
+            }
+        }
+        let durable = queue.get(&started.id).expect("queue").expect("durable job");
+        let result = durable.results.get("ubuntu").expect("running result");
+        assert_eq!(result.status, TargetStatus::Running);
+        assert_eq!(result.scheduler_defer_reason, None);
+    }
+
+    #[test]
+    fn drain_admit_worker_cap_respects_already_running_jobs() {
+        let mut running = crate::job::Job::create(
+            "sha-running",
+            "feature/running",
+            vec!["mac".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        )
+        .start()
+        .expect("start");
+        running.id = "running".to_owned();
+        let mut pass = RequestBackedAdmitPass {
+            plan: AdmitPassPlan {
+                admitted: vec!["job-a".to_owned(), "job-b".to_owned(), "job-c".to_owned()],
+                ..AdmitPassPlan::default()
+            },
+            running_request_errors: Vec::new(),
+            same_pr_ship_admission: SamePrShipAdmission::default(),
+        };
+
+        cap_admit_pass_workers(&[running], &mut pass, 2);
+
+        assert_eq!(pass.plan.admitted, ["job-a"]);
+    }
+
+    #[test]
+    fn submit_ship_records_pending_job_and_request_without_ship_state() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("state")).expect("queue");
+        let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship");
+        let request = ship_request(vec![target]);
+
+        let job = submit_ship(&request, &mut queue, temp.path(), temp.path()).expect("submit");
+
+        assert_eq!(job.status, crate::job::JobStatus::Pending);
+        assert_eq!(
+            queue
+                .get(&job.id)
+                .expect("queue")
+                .expect("durable job")
+                .status,
+            crate::job::JobStatus::Pending
+        );
+        assert!(ship_state.get(request.pr).is_none());
+        let request_envelope = QueueRequestStore::new(temp.path())
+            .expect("request store")
+            .load(&job.id)
+            .expect("load request")
+            .expect("request");
+        assert_eq!(request_envelope.job_id, job.id);
+        assert!(matches!(
+            request_envelope.request,
+            QueuedExecutionRequest::Ship(_)
+        ));
+        assert!(
+            QueueOutcomeStore::new(temp.path())
+                .expect("outcome store")
+                .load(&job.id)
+                .expect("load outcome")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn submit_ship_refuses_when_same_pr_ship_is_running() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let request = ship_request(vec![target.clone()]);
+        let running_job =
+            submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit existing");
+        let drain = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain, std::slice::from_ref(&running_job.id))
+            .expect("start");
+        assert_eq!(started.len(), 1);
+
+        let error = submit_ship(
+            &ship_request(vec![target]),
+            &mut queue,
+            temp.path(),
+            &state_dir,
+        )
+        .expect_err("same PR running");
+
+        assert!(matches!(
+            error,
+            ShipExecutionError::SamePrShipRunning {
+                pr: 42,
+                running_job_id,
+                ..
+            } if running_job_id == running_job.id
+        ));
+    }
+
+    #[test]
+    fn submit_ship_reaps_stale_same_pr_running_ship_and_enqueues_retry() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let request = ship_request(vec![target.clone()]);
+        let running_job =
+            submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit existing");
+        let drain = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain, std::slice::from_ref(&running_job.id))
+            .expect("start");
+        assert_eq!(started.len(), 1);
+
+        // Age the started worker past the staleness threshold to simulate a
+        // killed worker that stopped heartbeating.
+        let mut aged = queue.get(&running_job.id).expect("get").expect("running");
+        aged.started_at = Some(
+            Utc::now() - Duration::seconds(crate::job::DEFAULT_RUNNING_JOB_STALE_SECONDS + 60),
+        );
+        queue.update(&aged).expect("age running job");
+
+        // The retry now succeeds: the stale running job is reaped rather than
+        // blocking the same PR forever.
+        let retry = submit_ship(
+            &ship_request(vec![target]),
+            &mut queue,
+            temp.path(),
+            &state_dir,
+        )
+        .expect("retry submits after reaping stale same-PR ship");
+        assert_ne!(retry.id, running_job.id);
+        assert_eq!(retry.status, crate::job::JobStatus::Pending);
+
+        let reaped = queue.get(&running_job.id).expect("get").expect("reaped");
+        assert_eq!(reaped.status, crate::job::JobStatus::Cancelled);
+        assert_eq!(
+            reaped.cancellation_reason.as_deref(),
+            Some(crate::queue::STALE_RUNNING_CANCEL_REASON)
+        );
+    }
+
+    #[test]
+    fn ship_worker_honors_durable_cancel_before_start_without_ship_state() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path().join("state")).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = FakeDispatcher::new(TargetStatus::Pass);
+        let request = ship_request(vec![target]);
+        let job = submit_ship(&request, &mut queue, temp.path(), temp.path()).expect("submit");
+        let cancelled = job
+            .cancel_with_reason(Some("user requested cancellation".to_owned()))
+            .expect("cancel");
+        queue.update(&cancelled).expect("update cancel");
+
+        let outcome = execute_ship_worker(
+            &request,
+            job,
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: temp.path(),
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+        )
+        .expect("worker");
+
+        assert_eq!(outcome.job.status, JobStatus::Cancelled);
+        assert!(dispatcher.seen_workdirs.borrow().is_empty());
+        assert!(ship_state.get(request.pr).is_none());
+        assert!(
+            QueueOutcomeStore::new(temp.path())
+                .expect("outcome store")
+                .load(&outcome.job.id)
+                .expect("load outcome")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ship_worker_accepts_job_started_by_drain_owner() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = FakeDispatcher::new(TargetStatus::Pass);
+        let request = ship_request(vec![target]);
+        let job = submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("held");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&job.id))
+            .expect("start")
+            .pop()
+            .expect("started");
+        let started_at = started.started_at;
+
+        let outcome = execute_ship_worker(
+            &request,
+            started,
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: &state_dir,
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+        )
+        .expect("worker");
+
+        assert_eq!(outcome.job.status, JobStatus::Completed);
+        assert_eq!(outcome.job.started_at, started_at);
+        assert!(ship_state.get(request.pr).is_some());
+        assert_eq!(dispatcher.seen_workdirs.borrow().len(), 1);
     }
 
     #[test]
@@ -1083,7 +3377,9 @@ mod tests {
                 evidence: &evidence,
                 ship_state: &ship_state,
                 warm_pool: &warm_pool,
+                cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -1123,7 +3419,9 @@ mod tests {
                 evidence: &evidence,
                 ship_state: &ship_state,
                 warm_pool: &warm_pool,
+                cwd: temp.path(),
                 state_dir: &state_dir,
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -1170,7 +3468,9 @@ mod tests {
                 evidence: &evidence,
                 ship_state: &ship_state,
                 warm_pool: &warm_pool,
+                cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -1223,7 +3523,9 @@ mod tests {
                 evidence: &evidence,
                 ship_state: &ship_state,
                 warm_pool: &warm_pool,
+                cwd: temp.path(),
                 state_dir: temp.path(),
+                config: &empty_config(temp.path()),
             },
             &dispatcher,
         )
@@ -1235,5 +3537,473 @@ mod tests {
                 if existing == "old" && current == "abc"
         ));
         assert!(queue.get_pending().expect("pending").is_empty());
+    }
+
+    #[test]
+    fn adopt_head_tolerates_sha_drift_but_still_enforces_policy() {
+        // #346: --adopt-head relaxes ONLY the SHA-drift guard (so an amend /
+        // force-push re-validates instead of dead-ending), and never relaxes
+        // the policy-signature guard — a changed merge policy must still fail.
+        let state = ShipState::new(
+            42,
+            "danielraffel/pulp",
+            "feature/test",
+            "main",
+            "old",
+            "policy",
+        );
+
+        // Without the flag, SHA drift is rejected.
+        assert!(matches!(
+            super::validate_existing_state(&state, "new", "policy", false),
+            Err(ShipExecutionError::ShaDrift { .. })
+        ));
+        // With the flag, the same SHA drift is tolerated...
+        assert!(super::validate_existing_state(&state, "new", "policy", true).is_ok());
+        // ...but a policy-signature change is STILL rejected even with the flag.
+        assert!(matches!(
+            super::validate_existing_state(&state, "new", "different-policy", true),
+            Err(ShipExecutionError::PolicyDrift { .. })
+        ));
+    }
+
+    #[test]
+    fn adopt_head_reconciles_drift_clearing_stale_evidence() {
+        // #346: adopting the new head must clear prior remote runs + evidence so
+        // the new head re-validates from scratch — never bless stale validation.
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("ship");
+        let mut seeded = ShipState::new(
+            42,
+            "danielraffel/pulp",
+            "feature/test",
+            "main",
+            "old",
+            "policy",
+        );
+        seeded
+            .evidence_snapshot
+            .insert("ssh".to_owned(), "passed-on-old-head".to_owned());
+        store.save(&seeded).expect("save");
+
+        // Build a request whose policy matches the seeded state so only SHA
+        // drift is in play, with adopt_head set and the live SHA = "abc".
+        let mut request = ship_request(vec![target]);
+        request.adopt_head = true;
+        let target_names = vec![request.targets[0].name.clone()];
+        let mut seeded = store.get(42).expect("seeded present");
+        seeded.policy_signature =
+            super::policy_signature(&request.targets, &target_names, request.mode);
+        store.save(&seeded).expect("re-save with matching policy");
+
+        let reconciled = super::load_or_create_state(&request, &target_names, &store, None)
+            .expect("adopt-head reconciles drift");
+        assert_eq!(reconciled.head_sha, "abc", "adopts the current head");
+        assert!(
+            reconciled.evidence_snapshot.is_empty(),
+            "stale evidence cleared so the new head re-validates"
+        );
+    }
+
+    /// Dispatcher that returns a scripted `(status, failure_class)` per attempt
+    /// (last entry repeats), writes a distinct log file per attempt so evidence
+    /// preservation is observable, and can cancel the durable job after a chosen
+    /// attempt to exercise the retry loop's cancellation handling. `Mutex`-backed
+    /// so it satisfies the `Sync` bound the ship entrypoints require.
+    struct SequenceDispatcher {
+        steps: Vec<(TargetStatus, Option<&'static str>)>,
+        cancel_after_attempt: Option<usize>,
+        seen_log_paths: Mutex<Vec<PathBuf>>,
+    }
+
+    impl SequenceDispatcher {
+        fn new(steps: Vec<(TargetStatus, Option<&'static str>)>) -> Self {
+            Self {
+                steps,
+                cancel_after_attempt: None,
+                seen_log_paths: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn cancelling_after(mut self, attempt: usize) -> Self {
+            self.cancel_after_attempt = Some(attempt);
+            self
+        }
+
+        fn call_count(&self) -> usize {
+            self.seen_log_paths.lock().expect("seen lock").len()
+        }
+    }
+
+    impl ShipTargetDispatcher for SequenceDispatcher {
+        fn validate(&self, request: DispatchValidationRequest<'_, '_>) -> TargetResult {
+            let index = {
+                let mut seen = self.seen_log_paths.lock().expect("seen lock");
+                let idx = seen.len();
+                seen.push(request.log_path.clone());
+                idx
+            };
+            if let Some(parent) = request.log_path.parent() {
+                std::fs::create_dir_all(parent).expect("log dir");
+            }
+            std::fs::write(&request.log_path, format!("attempt {index}\n")).expect("log write");
+            let (status, failure_class) = self
+                .steps
+                .get(index)
+                .or_else(|| self.steps.last())
+                .copied()
+                .expect("at least one step");
+            let now = Utc::now();
+            let mut result = TargetResult::new(
+                request.target.name.clone(),
+                request.target.platform.clone(),
+                status,
+                request.target.backend_name.clone(),
+            );
+            result.started_at = Some(now);
+            result.completed_at = Some(now);
+            result.log_path = Some(request.log_path.to_string_lossy().into_owned());
+            result.failure_class = failure_class.map(str::to_owned);
+            if self.cancel_after_attempt == Some(index) {
+                cancel_job_from_log_path(&request.log_path);
+            }
+            result
+        }
+    }
+
+    fn drive_targets(
+        target: ResolvedTarget,
+        dispatcher: &(impl ShipTargetDispatcher + Sync),
+        policy: crate::ship_retry::TransientRetryPolicy,
+    ) -> (tempfile::TempDir, Job, PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let target_name = target.name.clone();
+        let request = ship_request(vec![target]);
+        let job = submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("held");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&job.id))
+            .expect("start")
+            .pop()
+            .expect("started");
+        let base_log = target_log_path(&state_dir, &started.id, &target_name);
+        let outcome = execute_targets_with_options(
+            &request,
+            &state_dir,
+            &mut queue,
+            &warm_pool,
+            dispatcher,
+            started,
+            TargetExecOptions {
+                defer_host_pool_lease_unavailable: false,
+                reclassify_vitals_path: None,
+                transient_retry: policy,
+            },
+        )
+        .expect("targets");
+        let job = match outcome {
+            TargetExecutionOutcome::Completed(job) => job,
+            other @ TargetExecutionOutcome::Deferred { .. } => {
+                panic!("expected completed, got {other:?}")
+            }
+        };
+        (temp, job, base_log)
+    }
+
+    fn only_result(job: &Job) -> &TargetResult {
+        job.results.values().next().expect("one target result")
+    }
+
+    #[test]
+    fn transient_retry_disabled_runs_single_attempt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("INFRA"))]);
+
+        let (_temp, job, base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::disabled(),
+        );
+
+        // Default policy = exactly one attempt, byte-identical to no-retry.
+        assert_eq!(dispatcher.call_count(), 1);
+        let result = only_result(&job);
+        assert_eq!(result.status, TargetStatus::Fail);
+        assert!(
+            result.error_message.is_none(),
+            "no retry note when disabled"
+        );
+        assert!(result.phase.is_none());
+        assert!(
+            !retry_attempt_log_path(&base_log, 1).exists(),
+            "no retry log written"
+        );
+    }
+
+    #[test]
+    fn transient_local_infra_recovers_on_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let dispatcher = SequenceDispatcher::new(vec![
+            (TargetStatus::Fail, Some("INFRA")),
+            (TargetStatus::Pass, None),
+        ]);
+
+        let (_temp, job, base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(1),
+        );
+
+        assert_eq!(dispatcher.call_count(), 2, "one retry after the INFRA blip");
+        let result = only_result(&job);
+        assert!(result.passed(), "recovered on the retry");
+        // A recovered result records the retry in `phase`, never `error_message`
+        // (a non-empty message is read elsewhere as a failure signal).
+        assert!(result.error_message.is_none());
+        assert!(
+            result
+                .phase
+                .as_deref()
+                .unwrap_or_default()
+                .contains("recovered"),
+            "phase notes the recovery: {:?}",
+            result.phase
+        );
+        // Both attempts' logs are preserved under distinct paths.
+        assert!(base_log.exists(), "attempt-0 log preserved");
+        let retry_log = retry_attempt_log_path(&base_log, 1);
+        assert!(retry_log.exists(), "retry log written to a distinct path");
+        assert_ne!(base_log, retry_log);
+        assert_eq!(
+            std::fs::read_to_string(&base_log).expect("read base"),
+            "attempt 0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&retry_log).expect("read retry"),
+            "attempt 1\n"
+        );
+    }
+
+    #[test]
+    fn transient_local_infra_exhausts_retries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("INFRA"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(1),
+        );
+
+        assert_eq!(dispatcher.call_count(), 2, "first attempt + one retry");
+        let result = only_result(&job);
+        assert_eq!(result.status, TargetStatus::Fail);
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("transient retry exhausted"),
+            "failure note records the exhausted retry: {:?}",
+            result.error_message
+        );
+    }
+
+    #[test]
+    fn transient_local_test_failure_is_not_retried() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        // An authoritative TEST failure must never be masked behind a retry.
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("TEST"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(
+            dispatcher.call_count(),
+            1,
+            "TEST is authoritative, no retry"
+        );
+        let result = only_result(&job);
+        assert_eq!(result.status, TargetStatus::Fail);
+        assert!(result.error_message.is_none());
+    }
+
+    #[test]
+    fn transient_local_contract_failure_is_not_retried() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("CONTRACT"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(dispatcher.call_count(), 1, "CONTRACT is never retried");
+        assert_eq!(only_result(&job).status, TargetStatus::Fail);
+    }
+
+    #[test]
+    fn transient_local_timeout_is_not_retried_same_leg() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        // Same-backend retry is stricter than the global taxonomy: a local
+        // TIMEOUT would just re-burn the wall-clock budget, so it is not re-run.
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("TIMEOUT"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(dispatcher.call_count(), 1, "local TIMEOUT is not re-run");
+        assert_eq!(only_result(&job).status, TargetStatus::Fail);
+    }
+
+    #[test]
+    fn transient_remote_infra_is_not_retried_same_leg() {
+        // A non-local backend already has next-backend failover; same-leg retry
+        // is local-only.
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("INFRA"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            ssh_target(),
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(
+            dispatcher.call_count(),
+            1,
+            "remote INFRA is not re-run in place"
+        );
+        assert_eq!(only_result(&job).status, TargetStatus::Fail);
+    }
+
+    #[test]
+    fn transient_retry_honors_cancellation_between_attempts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        // Cancel the durable job during attempt 0; the retry loop must stop
+        // rather than spend another attempt.
+        let dispatcher =
+            SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("INFRA"))]).cancelling_after(0);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(dispatcher.call_count(), 1, "no retry after cancellation");
+        assert_eq!(job.status, JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn transient_retry_never_touches_scheduler_deferred() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        // A scheduler-deferred result must stay on the defer path, never retried.
+        let dispatcher = FakeDispatcher::new(TargetStatus::Pending)
+            .with_scheduler_defer("host_pool_lease_unavailable");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let request = ship_request(vec![target]);
+        let job = submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("held");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&job.id))
+            .expect("start")
+            .pop()
+            .expect("started");
+
+        let outcome = execute_targets_with_options(
+            &request,
+            &state_dir,
+            &mut queue,
+            &warm_pool,
+            &dispatcher,
+            started,
+            TargetExecOptions {
+                defer_host_pool_lease_unavailable: true,
+                reclassify_vitals_path: None,
+                transient_retry: crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+            },
+        )
+        .expect("targets");
+
+        match outcome {
+            TargetExecutionOutcome::Deferred { reason, .. } => {
+                assert_eq!(reason, "host_pool_lease_unavailable");
+            }
+            other @ TargetExecutionOutcome::Completed(_) => {
+                panic!("expected scheduler deferral, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn execute_ship_retries_transient_local_infra_from_config() {
+        // End-to-end through the real ship entrypoint: config opt-in →
+        // resolved policy → same-backend retry → recovered pass.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let mut queue = Queue::new(temp.path().join("state")).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SequenceDispatcher::new(vec![
+            (TargetStatus::Fail, Some("INFRA")),
+            (TargetStatus::Pass, None),
+        ]);
+        let request = ship_request(vec![target]);
+        let config = LoadedConfig {
+            data: table("[ship]\ntransient_local_retries = 1\n"),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        };
+
+        let outcome = execute_ship(
+            &request,
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: temp.path(),
+                config: &config,
+            },
+            &dispatcher,
+        )
+        .expect("execute");
+
+        assert_eq!(dispatcher.call_count(), 2, "config opt-in drove one retry");
+        assert!(
+            outcome.job.passed(),
+            "recovered through the ship entrypoint"
+        );
     }
 }

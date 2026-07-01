@@ -15,6 +15,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Validate specific targets | `shipyard run --targets mac,ubuntu --json` |
 | Iterate on one platform's CI failure | `shipyard run --skip-target <others>` (see [Iterating on a single-platform failure](#iterating-on-a-single-platform-failure)) |
 | Fast smoke check | `shipyard run --smoke --json` |
+| Run one target command and store typed evidence/artifacts | `shipyard run command --target <name> --artifact '<glob>' -- <argv...>` |
 | Start the live-mode webhook daemon | `shipyard daemon start` |
 | Inspect the daemon | `shipyard daemon status --json` |
 | Stop the daemon | `shipyard daemon stop` |
@@ -26,6 +27,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Inspect one PR's ship state | `shipyard ship-state show <pr> --json` |
 | Live-tail the active ship | `shipyard watch` (or `shipyard watch --pr <n>`) |
 | One-shot snapshot | `shipyard watch --no-follow --json` |
+| Watch a long local/SSH VM build | `shipyard watch local --target <name> --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'` |
 | Merge on green (cron-safe one-shot) | `shipyard auto-merge <pr>` (0=merged, 1=fail, 2=not-found, 3=in-flight) |
 | Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` |
 | Configure RELEASE_BOT_TOKEN | `shipyard release-bot setup` (guided) |
@@ -43,14 +45,30 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Runner watchdog: cancel stale queued runs** | `shipyard runner cleanup --fix` |
 | **Runner watchdog: daemon mode** | `shipyard runner watch --fix` |
 | **Runner watchdog: auto-kill hung workers (full recovery)** | `shipyard runner watch --kill-hung-workers` (implies `--fix`) |
+| **Runner provisioning: set this box's machine tag** | `shipyard runner tag --set <studio\|m1\|m5>` (stored per-box; never hostname-derived) |
+| **Runner provisioning: register N runners for a repo** | `shipyard runner register --repo <owner/repo> --count <N> [--ci-root <dir>]` (names `<repo>-<tag>-NN`, continues the index) |
+| **Runner provisioning: dry-run the registration plan** | `shipyard runner register --repo <owner/repo> --count <N> --dry-run` |
+| **Runner provisioning: live cross-repo pool view** | `shipyard runner list [--repo <owner/repo>]` (groups by machine; flags orphaned local dirs) |
+| **Runner provisioning: audit host-class naming/label drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels; exit 1 on drift) |
+| **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` + `tart get` per `[host_class.*]`, using configured `tart_home` as `TART_HOME`; counts only running macOS/darwin VMs; `free = Σ max(0, cap − running_macos)`; fail-closed, exit 1 if any host/VM OS unreadable) |
+| **Runner fleet visibility: capacity + tartci health + queue age** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (runs host-local `tartci doctor --reap --json` via configured `tartci_bin`, checks supervisor freshness, per-host routability, and oldest queued macOS age; exits 1 on unreadable/problem hosts or queued-age-with-capacity) |
+| **Drain cloud-queued macOS jobs to local when a slot frees** | `shipyard runner reroute-watch [--apply] [--once] [--interval N] [--flap-window N]` (observe-only without `--apply`; logs per-host capacity + candidate list; flap-guard, one-reroute-per-tick, slot/fail-closed) |
+| **Runner provisioning: deregister a runner** | `shipyard runner remove --name <repo>-<tag>-NN --yes [--purge-dir]` |
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
 | **Self-update: apply latest stable** | `shipyard update` (delegates to `install.sh`) |
 | **Self-update: pin / rollback to a specific tag** | `shipyard update --to v0.53.0` |
+| **Self-update hits "rate limit exceeded"** | v0.68.0+ auto-uses `gh`/`GITHUB_TOKEN` auth; if still rate-limited (60/hr unauth, no `gh` login), run `gh auth login` or export `GITHUB_TOKEN` and retry. Not a missing-`.dmg` error. |
 | **Stuck-runner: kill specific worker (with recovery)** | `shipyard runner kill --pid <pid> --reason "..." [--retrigger]` |
 | **Stuck-runner: review past kills** | `shipyard runner kill --history` |
 | **Stuck-runner: restore quarantined build after a misclick** | `shipyard runner kill --recover <event-id>` |
 | Show logs for one target | `shipyard logs <job_id> --target windows` |
 | Check merge readiness | `shipyard evidence --json` |
+| Show latest command-evidence bundle | `shipyard evidence command --json` |
+| Import recent GitHub Actions timing into runner metrics | `shipyard metrics import github --repo <owner/repo> --limit 20 --json` |
+| Import tartci VM timing into runner metrics | `tartci runtime export --repo <owner/repo> | shipyard metrics import tartci --json` |
+| Summarize runner timing history | `shipyard metrics summary --project <name> --json` |
+| Ask for agent-readable runner health findings | `shipyard metrics watch --project <name> --since 14d --json` |
+| Compare local vs GitHub runner timing | `shipyard metrics compare --project <name> --baseline github-hosted --candidate macstudio --json` |
 | Bump job priority | `shipyard bump <job_id> high` |
 | Cancel a job | `shipyard cancel <job_id>` |
 | List cloud workflows | `shipyard cloud workflows --json` |
@@ -65,8 +83,10 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Global warm-pool kill switch | `SHIPYARD_NO_WARM_POOL=1` in the environment |
 | Retarget one lane on an in-flight PR | `shipyard cloud retarget --pr <n> --target macos --provider github-hosted` (dry-run; add `--apply`) |
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider github-hosted]` (dry-run; add `--apply`) |
-| Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (cancels + redispatches queued runs to `github-hosted`; add `--dry-run` to preview, `--rerun-failed` for watchdog-cancelled runs) |
+| Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (cancels + redispatches; add `--dry-run` to preview, `--rerun-failed` for completed cancelled/failed/timed-out runs; omit `--to` to re-resolve a failed leg local-first, or pass `--to <provider>` to force) |
 | Rescue every stuck run repo-wide | `shipyard rescue --all-stuck` |
+| Same-PR ship refused by a killed worker (`SamePrShipRunning`) | v0.68.0+ auto-reaps the stale `running` queue job after ~180s — just retry `shipyard pr`. See the `shipyard` skill's "Durable Queue: killed-worker recovery". Don't run two `shipyard pr`s for one PR concurrently. |
+| PR stuck in-flight forever (never auto-merges after a host reboot / daemon crash) | `shipyard ship-state list` or `shipyard status` flags it `ORPHANED? [<evidence>]` — cross-referencing the queue: `queue_stale` (dead worker heartbeat) / `queue_terminal` (worker ended without finalizing) surface in ~3m; `queue_absent` / `time_fallback` are time-gated (default 45m, `[ship_state] orphan_stale_minutes`). A live or pending worker is never flagged. Re-run `shipyard ship <pr>` to re-validate, or `shipyard ship-state discard <pr>` if truly dead. Report-only — never merges or resumes on its own. See the `shipyard` skill's "Orphaned ship-state reporting". |
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |
 | Deliberately skip one lane | `shipyard run --skip-target windows` (repeatable; no probe run) |
@@ -75,6 +95,8 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Environment check | `shipyard doctor --json` |
 | Probe SSH runner reachability | `shipyard doctor --runners --json` |
 | Inspect GitHub REST + GraphQL rate-limit buckets (both separately) | `shipyard doctor --rate-limit --json` |
+| Inspect effective GitHub auth only | `shipyard auth doctor --json` |
+| Export/import GitHub auth config only | `shipyard auth export --output shipyard-auth.toml` / `shipyard auth import shipyard-auth.toml --scope local` |
 | Clean up artifacts | `shipyard cleanup --apply` |
 | Wait for a release to fully upload | `shipyard wait release v0.23.0 --timeout 900 --json` |
 | Wait for a PR's required checks to go green | `shipyard wait pr 151 --state green --timeout 1800 --json` |
@@ -84,6 +106,105 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | List quarantined targets | `shipyard quarantine list --json` |
 | Quarantine a flaky target | `shipyard quarantine add <target> --reason "..."` |
 | Remove from quarantine | `shipyard quarantine remove <target>` |
+
+## tartci local VM routing profiles
+
+When a repo uses tartci-backed local VM lanes, inspect the profile before
+changing GitHub variables or dispatch inputs:
+
+```sh
+tartci profile explain normal-local-fast --repo danielraffel/pulp --json
+tartci profile plan normal-local-fast --repo danielraffel/pulp --json
+tartci status --json
+```
+
+tartci owns host-local facts: Tart/QEMU providers, capacity, golden/cache
+state, and target-to-`runs-on` mappings. Shipyard owns fleet routing: read each
+host's tartci status, choose one concrete target from the ordered fallback chain,
+then apply that selector through repo variables or `workflow_dispatch`.
+
+Do not pass a fallback chain into GitHub Actions. GitHub cannot change `runs-on`
+after a job queues. Pulp workflows should receive one concrete selector per run.
+
+For Pulp's normal fast profile, local ARM64 PR lanes are fast feedback and
+GitHub-hosted nightly Intel Linux/Windows lanes are compatibility surveillance.
+Windows QEMU on Apple Silicon is Windows ARM64; x64 MSVC/Prism execution is
+smoke/debug until proven and should not replace `windows-latest` authority.
+Coverage must use dedicated ephemeral labels, not warm bare-metal build pools.
+
+## Runner Metrics For Agents
+
+Runner metrics are optional and provider-neutral. Use them when an agent needs
+historical context before changing CI routing, cache policy, or monitoring
+cadence. Shipyard owns the local SQLite store and query surface; tartci, GitHub
+Actions, local commands, SSH targets, or other VM managers can feed the store.
+
+For GitHub-hosted history, import recent job timings:
+
+```sh
+shipyard metrics import github --repo danielraffel/pulp --limit 50 --json
+shipyard metrics watch --project pulp --since 14d --json
+```
+
+For tartci VM history, export runtime records from tartci and import them into
+Shipyard:
+
+```sh
+tartci runtime export --repo danielraffel/pulp |
+  shipyard metrics import tartci --json
+shipyard metrics summary --project pulp --json
+```
+
+The `summary`, `watch`, `advise`, and `compare` commands return structured JSON
+intended for agents. Treat insufficient-sample findings as "keep collecting",
+not as proof of a regression. Escalate only when the finding includes enough
+samples and a material delta for that repo/lane.
+
+When debugging GitHub imports, remember that Shipyard invokes `gh api` with
+absolute `/repos/...` paths and forces `-X GET` when query parameters are passed
+with `-f`; without `-X GET`, `gh api -f` can POST and produce misleading 404s.
+
+## GitHub Auth Diagnostics
+
+Before blaming ambient `gh auth status`, check whether the repo config has
+`[github.auth]`. Shipyard can inject env or command-helper tokens into its
+built-in `gh` subprocesses as `GH_TOKEN`, including helpers that mint GitHub
+App installation tokens. `shipyard doctor --rate-limit --json` reports the
+effective source and rate-limit buckets. For GitHub App or fine-grained tokens,
+permissions may not be locally inspectable, so verify Actions: Read and write
+on the token/App when cloud retarget or handoff fails with auth/scope errors.
+That doctor command actively resolves configured auth, so command helpers may
+run and GitHub App helpers may mint installation tokens.
+
+The `github-auth` doctor row distinguishes a context-dependent placeholder from
+a genuinely broken source (presentation only — operational auth still never
+silently falls back). A `token_command` using `{repo_slug}`/`{repo_name}` that
+can't resolve in a repo-less context (`doctor`) reads as **green** with a
+hint to pin `--repo <owner>/<name>` for account-wide Apps, because it resolves
+normally inside a repo. The **daemon** resolves `{repo_slug}` from its served
+`--repo` (the registrar hints it), so live-mode webhook registration mints a
+token from a repo-less CWD instead of failing on "placeholder requires
+remote.origin.url" (which left live mode stuck on "updates paused"). Any other
+resolution failure stays **red** and now tells
+gh-only users they can simply drop `[github.auth]` to use ambient `gh`. The
+`nsc` row is likewise optional: green "not configured (optional)" unless a
+Namespace provider is configured (`cloud.provider` or a per-target `provider`).
+The `gh-scope` row is green-informational for configured Env/App/helper tokens
+(whose scopes can't be inspected locally) — same treatment as a fine-grained/app
+token under ambient `gh` — keeping the "verify Actions: Read/write" reminder in
+detail rather than showing a red ✗ that only the rare configured-token user sees.
+
+GitHub App installation tokens are the preferred path for high-volume
+inspection because Shipyard injects them into its built-in `gh` subprocesses
+and REST/GraphQL fallback paths. Do not silently fall back to ambient user auth
+for polling, watch, retarget, handoff, or diagnostics. The narrow exception is
+pull-request creation: if GitHub rejects App-token PR creation with `Resource
+not accessible by integration` through both GraphQL and REST, Shipyard may print
+an explicit notice and use ambient `gh` auth for that one low-volume create
+operation.
+PR merge should stay on the configured token: if GitHub rejects the App token's
+GraphQL merge probe, Shipyard falls back to its REST merge path with the same
+configured token.
 
 ## Supervised-Push Signal (`SHIPYARD_PR_RUNNING=1`)
 
@@ -122,6 +243,28 @@ VM fleet. Do not add hidden repo-variable fallbacks that silently override the
 GitHub-hosted default; a trusted self-hosted run should be an explicit per-run
 choice. GitHub dispatches by `runs-on` labels; SSH is only the management layer
 for those machines.
+
+### The `local` provider (self-hosted Mac)
+
+`scripts/ci_matrix.py` recognizes a third provider, `local`, alongside
+`namespace` and `github-hosted`. Set it the same way — repo variable
+`DEFAULT_RUNNER_PROVIDER=local` or per-dispatch `-f runner_provider=local`.
+It routes the **macOS ARM64** leg to the maintainer's self-hosted Mac via the
+built-in label set `["self-hosted","local-mac"]`; Linux and Windows have no
+local box, so they transparently degrade to their GitHub-hosted labels (the
+resolved `provider` for those rows reports `github-hosted`). Override the macOS
+selector with repo var `LOCAL_MACOS_ARM64_RUNS_ON_JSON` if a different label set
+is needed. An explicit `*_runner_selector_json` input still wins over the
+provider default. This is *not* a hidden fallback — `local` only takes effect
+when explicitly requested, and the default remains GitHub-hosted.
+
+To land jobs on the Mac, register a runner carrying the matching labels with
+`shipyard runner register --repo <owner/repo> --labels self-hosted,macos,arm64,local-mac`
+(see the runner-provisioning rows above). This is the mechanism behind routing
+macOS **release** builds to the Mac Studio so they skip GitHub's hosted-macOS
+queue — the Studio's keychain already holds the Developer ID signing identity.
+Use `local` only on private repos / the owner's own machine, never a public repo
+with untrusted PRs.
 
 ## Live mode (`shipyard daemon`) — when it helps and when to ignore it
 
@@ -290,27 +433,29 @@ process, queued runs sitting >30m, repo PRs all in
 provider in one shot:
 
 ```sh
-# Most common case: one PR is stuck. Rescue it (default target is github-hosted):
+# Most common case: one PR is stuck. Rescue it (omit --to → provider is
+# resolved per candidate; see below):
 shipyard rescue 286
 
 # Preview without acting:
 shipyard rescue 286 --dry-run
 
-# Also re-arm runs a watchdog sweep marked failed/cancelled, then hand them off:
+# Also re-dispatch completed runs that ended cancelled / FAILED / timed-out
+# (e.g. a flaky required leg, or a watchdog-cancelled run):
 shipyard rescue 286 --rerun-failed
 
 # Repo-wide: rescue every queued run older than 30m:
 shipyard rescue --all-stuck
 
-# Override the queue-age threshold or destination provider:
-shipyard rescue 286 --threshold 10m --to github-hosted
+# Force a specific destination provider (e.g. pin a re-run to local):
+shipyard rescue 286 --rerun-failed --to local
 ```
 
 What it does:
 1. Resolves the PR's head branch (skipped under `--all-stuck`).
 2. Lists queued workflow runs and filters to (a) the PR's branch and (b) ones older than `--threshold` (default `30m`).
-3. With `--rerun-failed`, additionally pulls `status=completed conclusion=cancelled` runs on that branch — these get `gh run rerun --failed` first, then the same cancel+redispatch handoff.
-4. For each candidate, cancels the existing run and dispatches a fresh one with `--to <provider>` as the provider override.
+3. With `--rerun-failed`, additionally pulls `status=completed` runs whose conclusion is `cancelled`, `failure`, or `timed_out` on that branch (#345 — previously cancelled-only, so a plain failed leg was never a candidate) — these get `gh run rerun --failed` first, then the same cancel+redispatch handoff.
+4. For each candidate, cancels the existing run and dispatches a fresh one. **Provider resolution is kind-aware when `--to` is omitted (#345):** a wedged *stuck-queued* run falls back to `github-hosted` (move off the stuck local runner), while a re-run *failed* run RE-RESOLVES the provider (config/default — local-first with overflow) so a leg that overflowed to a GPU-less hosted runner can return to a real local runner. An explicit `--to <provider>` forces the destination for any candidate.
 5. Emits a per-run summary (`applied`, `rerun+applied`, `planned`, `skipped-completed`, `skipped-no-plan`, `failed`) with a top-level `event=cloud.rescue` JSON envelope under `--json`.
 
 **Do not reach for `runner-watchdog.sh --fix` instead of `shipyard rescue`.**
@@ -585,6 +730,59 @@ fallback = [
 There is no `shipyard config` or `shipyard targets` subcommand yet. Inspect
 target definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml`,
 and use `shipyard status --json` for live target state.
+
+### Same-backend transient retry (`[ship] transient_local_retries`)
+
+Off by default (`0`, clamped `0..=2`). When set, a **local** leg that fails with
+a transient `INFRA` blip is re-run once (up to the bound) on the same backend
+before recording the failure — for a momentary network/runner hiccup, not a real
+test failure. Deliberately `INFRA`-only: a local `TIMEOUT` would just re-burn its
+wall-clock budget, and `CONTRACT`/`TEST`/`TREE_DRIFT` are authoritative. Remote
+legs already have next-backend fallback, so same-leg retry is local-only. With
+the default `0`, execution is byte-identical to no retry. Details:
+`docs/local-mac-pool.md` § Same-backend transient retry.
+
+```toml
+[ship]
+transient_local_retries = 1   # 0 = off (default)
+```
+
+### Local Mac capacity
+
+For simple two-Mac capacity, use explicit ordered fallback:
+
+```toml
+[targets.mac]
+backend = "ssh"
+host = "mac-studio"
+platform = "macos-arm64"
+repo_path = "/Users/shipyard/work/shipyard"
+warm_keepalive_seconds = 1800
+
+fallback = [
+  { type = "local", cwd = "/Users/danielraffel/Code/shipyard" },
+]
+```
+
+This makes Mac Studio the first backend tried for macOS work, then falls back
+locally only for infrastructure failures. Real test failures remain
+authoritative.
+
+For named members and lease visibility, use `backend = "host-pool"` with
+explicit `[host_pools]` members, then inspect with
+`shipyard targets pool status`. Stale lease records can be pruned with
+`shipyard targets pool cleanup --fix`. Host-pool targets can drain multiple
+non-conflicting queued jobs across available members under one local drain
+owner; jobs still serialize when they claim the same checkout, PR state,
+evidence lane, or exhausted pool capacity. Use `shipyard targets test mac` and
+then `shipyard run --targets mac` when bringing the Mac Studio online. See
+`docs/local-mac-pool.md`.
+
+For Pulp/tartci macOS VM lanes, local queueing is preferred over hosted
+overflow. A full local fleet should leave jobs queued on the VM self-hosted
+labels until a controller/secondary Mac slot opens. Use GitHub-hosted macOS only
+as an explicit operator fallback for local-fleet outage/unhealthiness or for a
+workflow that deliberately requests hosted coverage.
 
 ### Locality routing (`requires`)
 

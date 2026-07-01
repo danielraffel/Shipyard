@@ -2,15 +2,18 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
-use crate::governance::{BranchProtectionRules, put_branch_protection};
+use crate::governance::{BranchProtectionRules, GovernanceGh, put_branch_protection};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_PUSH_TIMEOUT: Duration = Duration::from_mins(1);
+const GIT_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(25);
+const GIT_SPAWN_ATTEMPTS: usize = 3;
 
 /// Outcome status for `shipyard branch apply`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,14 +203,14 @@ pub fn create_branch_and_apply_rules(
     base_branch: &str,
     rules: &BranchProtectionRules,
     git_command: Option<&Path>,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> BranchApplyResult {
     let create_result = create_branch_on_remote(cwd, branch, base_branch, git_command);
     if create_result.status == BranchApplyStatus::GitFailed {
         return create_result;
     }
 
-    match put_branch_protection(repo, branch, rules, gh_command) {
+    match put_branch_protection(repo, branch, rules, gh) {
         Ok(()) => BranchApplyResult {
             branch: branch.to_owned(),
             status: BranchApplyStatus::RulesApplied,
@@ -233,9 +236,9 @@ pub fn apply_branch_rules(
     repo: &str,
     branch: &str,
     rules: &BranchProtectionRules,
-    gh_command: Option<&Path>,
+    gh: &GovernanceGh,
 ) -> BranchApplyResult {
-    match put_branch_protection(repo, branch, rules, gh_command) {
+    match put_branch_protection(repo, branch, rules, gh) {
         Ok(()) => BranchApplyResult {
             branch: branch.to_owned(),
             status: BranchApplyStatus::RulesApplied,
@@ -292,9 +295,8 @@ fn run_git(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to run git: {error}"))?;
+    let mut child =
+        spawn_git(&mut command).map_err(|error| format!("failed to run git: {error}"))?;
     let mut stdout = child
         .stdout
         .take()
@@ -326,6 +328,25 @@ fn run_git(
     })
 }
 
+fn spawn_git(command: &mut Command) -> std::io::Result<Child> {
+    let mut last_error = None;
+    for attempt in 1..=GIT_SPAWN_ATTEMPTS {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if is_text_file_busy(&error) && attempt < GIT_SPAWN_ATTEMPTS => {
+                last_error = Some(error);
+                thread::sleep(GIT_SPAWN_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("spawn retry loop should retain the last error"))
+}
+
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(26)
+}
+
 fn first_sha(stdout: &str) -> Option<String> {
     stdout
         .lines()
@@ -351,7 +372,7 @@ mod tests {
         BranchApplyStatus, apply_branch_rules, create_branch_and_apply_rules,
         create_branch_on_remote,
     };
-    use crate::governance::resolve_branch_rules;
+    use crate::governance::{GovernanceGh, resolve_branch_rules};
 
     #[test]
     fn create_branch_on_remote_is_idempotent_when_remote_branch_exists() {
@@ -444,6 +465,7 @@ exit 0
             ),
         );
         let rules = rules();
+        let gh = GovernanceGh::ambient(temp.path(), Some(&gh));
 
         let result = create_branch_and_apply_rules(
             temp.path(),
@@ -452,7 +474,7 @@ exit 0
             "main",
             &rules,
             Some(&git),
-            Some(&gh),
+            &gh,
         );
 
         assert_eq!(result.status, BranchApplyStatus::RulesApplied);
@@ -473,8 +495,9 @@ echo "forbidden" >&2
 exit 1
 "#,
         );
+        let gh = GovernanceGh::ambient(temp.path(), Some(&gh));
 
-        let result = apply_branch_rules("owner/repo", "main", &rules(), Some(&gh));
+        let result = apply_branch_rules("owner/repo", "main", &rules(), &gh);
 
         assert_eq!(result.status, BranchApplyStatus::RulesFailed);
         assert!(result.message.contains("forbidden"));

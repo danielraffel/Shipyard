@@ -6,9 +6,10 @@ use serde_json::Value;
 
 use crate::config::LoadedConfig;
 use crate::doctor::{
-    DoctorReport, SystemCommandProbe, check_release_chain, collect_report, collect_runner_checks,
-    runner_config_error_checks,
+    DoctorReport, SystemCommandProbe, check_github_auth, check_release_chain_with_mode,
+    collect_report, collect_runner_checks, runner_config_error_checks,
 };
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 
@@ -23,8 +24,8 @@ pub(super) fn doctor<W: Write>(
     rate_limit: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut report = collect_report(&SystemCommandProbe, cwd, state_dir);
-    if release_chain && let Some(entry) = check_release_chain(cwd) {
+    let mut report = collect_report(&SystemCommandProbe, mode, cwd, state_dir);
+    if release_chain && let Some(entry) = check_release_chain_with_mode(mode, cwd) {
         report
             .checks
             .entry("Release pipeline".to_owned())
@@ -41,7 +42,7 @@ pub(super) fn doctor<W: Write>(
         }
     }
     if rate_limit {
-        let entries = collect_rate_limit_section(cwd);
+        let entries = collect_rate_limit_section(mode, cwd);
         report
             .checks
             .insert("GitHub rate limits".to_owned(), entries);
@@ -97,13 +98,27 @@ fn write_human_report<W: Write>(stdout: &mut W, report: DoctorReport) -> std::io
     Ok(())
 }
 
-fn collect_rate_limit_section(cwd: &Path) -> BTreeMap<String, crate::doctor::DoctorEntry> {
-    use std::process::Command;
-    let raw = Command::new("gh")
-        .args(["api", "rate_limit"])
-        .current_dir(cwd)
-        .output();
+fn collect_rate_limit_section(
+    mode: RuntimeMode,
+    cwd: &Path,
+) -> BTreeMap<String, crate::doctor::DoctorEntry> {
     let mut entries: BTreeMap<String, crate::doctor::DoctorEntry> = BTreeMap::new();
+    entries.insert("auth".to_owned(), check_github_auth(mode, cwd));
+
+    let raw = (|| {
+        let client = GhClient::from_cwd(mode, cwd).map_err(|error| error.to_string())?;
+        client
+            .prepare_command(
+                cwd,
+                None,
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+            )
+            .map_err(|error| error.to_string())?
+            .args(["api", "rate_limit"])
+            .output()
+            .map_err(|error| error.to_string())
+    })();
     match raw {
         Ok(output) if output.status.success() => {
             let parsed: Result<Value, _> = serde_json::from_slice(&output.stdout);
