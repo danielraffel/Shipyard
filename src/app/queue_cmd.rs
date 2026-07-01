@@ -42,6 +42,7 @@ pub(super) fn status_command<W: Write>(
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let targets = target_statuses(&config)?;
+    let orphaned = collect_orphaned_ship_states(state_dir, &config);
 
     if json_mode {
         let mut data = BTreeMap::new();
@@ -58,12 +59,56 @@ pub(super) fn status_command<W: Write>(
         }
         data.insert("active_runs".to_owned(), jobs_value(&active_runs)?);
         data.insert("targets".to_owned(), serde_json::to_value(targets)?);
+        data.insert(
+            "orphaned_ship_states".to_owned(),
+            Value::Array(
+                orphaned
+                    .iter()
+                    .map(|(pr, report)| {
+                        json!({
+                            "pr": pr,
+                            "stalled_minutes": report.stalled_minutes,
+                            "evidence": report.evidence.as_str(),
+                        })
+                    })
+                    .collect(),
+            ),
+        );
         write_json_envelope(stdout, "status", data)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     } else {
-        write_status_human(stdout, active_runs.len(), pending, &recent, &targets)?;
+        write_status_human(
+            stdout,
+            active_runs.len(),
+            pending,
+            &recent,
+            &targets,
+            &orphaned,
+        )?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Classify every active ship-state against the queue for orphan reporting.
+/// Best-effort and strictly read-only: only reads the ship-state store when it
+/// already exists (so `status` never materializes state in a fresh directory),
+/// and yields nothing on any read failure rather than failing `status`.
+fn collect_orphaned_ship_states(
+    state_dir: &Path,
+    config: &LoadedConfig,
+) -> Vec<(u64, crate::ship_liveness::OrphanReport)> {
+    let ship_dir = state_dir.join("ship");
+    if !ship_dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(store) = crate::ship_state::ShipStateStore::new(ship_dir) else {
+        return Vec::new();
+    };
+    let stale_after = crate::ship_liveness::orphan_stale_after(config);
+    let now = chrono::Utc::now();
+    crate::ship_liveness::with_liveness_context(state_dir, stale_after, |liveness| {
+        crate::ship_liveness::collect_orphans(&store, liveness, now)
+    })
 }
 
 pub(super) fn evidence_command<W: Write>(
@@ -246,6 +291,7 @@ fn write_status_human<W: Write>(
     pending: usize,
     recent: &[Job],
     targets: &BTreeMap<String, TargetStatusRow>,
+    orphaned: &[(u64, crate::ship_liveness::OrphanReport)],
 ) -> Result<(), CliFailure> {
     writeln!(stdout, "Status").map_err(|error| CliFailure::new(1, error.to_string()))?;
     writeln!(stdout, "  running: {running}")
@@ -261,6 +307,22 @@ fn write_status_human<W: Write>(
                 stdout,
                 "  {name}: {} reachable={}",
                 info.backend, info.reachable
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
+    if !orphaned.is_empty() {
+        writeln!(
+            stdout,
+            "Orphaned ship states (in flight, worker likely gone)"
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        for (pr, report) in orphaned {
+            writeln!(
+                stdout,
+                "  PR #{pr}: {} ({}m stalled) — re-run `shipyard ship {pr}` or `ship-state discard {pr}`",
+                report.evidence.cause(),
+                report.stalled_minutes,
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }

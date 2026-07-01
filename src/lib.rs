@@ -90,6 +90,8 @@ pub mod runner_provision;
 pub mod runner_watchdog;
 /// Ship execution orchestration helpers.
 pub mod ship;
+/// Read-only orphan/liveness classification for in-flight ship states.
+pub mod ship_liveness;
 /// Durable in-flight ship-state model and store.
 pub mod ship_state;
 /// Subprocess helpers that mark supervised child processes with

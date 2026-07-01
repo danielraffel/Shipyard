@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0740"></a>
+## [0.75.0]
+
 ## [0.74.0] - 2026-07-01
 
 - feat(ship-state): report orphaned in-flight states in `ship-state list` ([#366](https://github.com/danielraffel/Shipyard/pull/366))
