@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0740"></a>
-## [0.75.0]
+<a id="v0750"></a>
+## [0.75.0] - 2026-07-01
 
+- feat(ship-state): liveness-aware, configurable, status-surfaced orphan detection ([#367](https://github.com/danielraffel/Shipyard/pull/367))
+
+<a id="v0740"></a>
 ## [0.74.0] - 2026-07-01
 
 - feat(ship-state): report orphaned in-flight states in `ship-state list` ([#366](https://github.com/danielraffel/Shipyard/pull/366))
@@ -666,6 +669,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.75.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.75.0
 [0.74.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.74.0
 [0.73.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.73.0
 [0.72.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.72.0
