@@ -329,6 +329,41 @@ starts to the next pass rather than double-running the PR.
   discard <pr>`, then mark the stuck `queue.json` job terminal (or restart the
   daemon to trigger startup recovery).
 
+## Orphaned ship-state reporting
+
+The queue reaper above recovers the *queue* `Job` when a worker dies. The
+durable *ship-state* (`<state>/ship/<pr>.json`) is a separate store with no
+orphan lifecycle: when the owning process dies mid-validation (host reboot from
+a jetsam kill, daemon crash, `cmux` relaunch), the ship-state freezes in an
+in-flight verdict forever. `ship_terminal_verdict` returns `None`, so auto-merge
+reports `InFlight` and refuses to merge — the PR silently stalls with no signal.
+
+`shipyard ship-state list` now flags these. A state is **orphaned** when it is
+still in flight (same `ship_terminal_verdict` predicate the auto-merge gate uses,
+so the two never drift) *and* its `updated_at` has been idle for at least 45
+minutes. It's a staleness heuristic, not proof of death: ship-state is written
+once before a leg runs and not again until the leg reports, so a genuinely slow
+live leg (>45m under saturation) can also be flagged — `last_heartbeat_at` is
+unpopulated on ship-state, so `updated_at` is the only liveness signal. The
+human listing prints an `ORPHANED?: ...` line under the PR; the JSON envelope
+gains an `orphaned: [{pr, stalled_minutes}]` array.
+
+This is **report-only** — it never resumes, re-dispatches, or mutates the store,
+and cannot affect merge readiness (an orphan is by definition not `pass`).
+Recovery is still operator-driven: re-run `shipyard ship <pr>` to re-validate
+the head, or `shipyard ship-state discard <pr>` to drop a dead entry. Automatic
+resume is a deliberately deferred follow-up.
+
+### Gotchas
+
+- The 45-minute threshold trades a rare false positive (a genuinely slow live
+  ship idle >45m between evidence writes) for never mislabeling a normal ship.
+  A false positive is harmless here — it only invites an operator to look; it
+  cannot merge or cancel anything. Don't shorten it toward normal leg durations.
+- Orphan status is computed lazily at `ship-state list` time; there is no daemon
+  startup sweep and nothing is written back. A state stops being reported the
+  moment a live ship touches it again or it reaches a verdict.
+
 ## Runner Provisioning (register / list / remove / tag)
 
 The `runner` family also *provisions* self-hosted GitHub Actions runners, not
