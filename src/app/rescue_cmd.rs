@@ -553,6 +553,7 @@ mod tests {
             name: format!("CI #{id}"),
             head_branch: branch.to_owned(),
             created_at: created_at.to_owned(),
+            run_started_at: None,
             workflow_name: "CI".to_owned(),
             url: Some(format!("https://example/run/{id}")),
             path: ".github/workflows/ci.yml".to_owned(),

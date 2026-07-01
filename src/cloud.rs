@@ -18,6 +18,35 @@ use crate::identity::RuntimeMode;
 const RUN_JSON_FIELDS: &str =
     "databaseId,status,conclusion,url,createdAt,updatedAt,workflowName,headBranch,headSha";
 const JOB_ACTIVE_STATUSES: [&str; 2] = ["queued", "in_progress"];
+/// Maximum page size the GitHub Actions runs API accepts. Paginated listers
+/// request this many items per page and stop early on a short page.
+const RUNS_API_PAGE_SIZE: u32 = 100;
+
+/// Build the `gh api` path for a workflow-runs query.
+///
+/// Pure string assembly so the pagination helpers can be unit-tested without a
+/// real `gh` on `PATH`. When `page` is `Some`, the path requests a full page
+/// (`per_page=RUNS_API_PAGE_SIZE`) at that page number; when `None`, it
+/// requests `per_page=limit` for the single-shot listers.
+fn runs_query_path(
+    repository: &str,
+    status: &str,
+    branch: Option<&str>,
+    limit: u32,
+    page: Option<u32>,
+) -> String {
+    let mut path = match page {
+        Some(page) => format!(
+            "repos/{repository}/actions/runs?status={status}&per_page={RUNS_API_PAGE_SIZE}&page={page}"
+        ),
+        None => format!("repos/{repository}/actions/runs?status={status}&per_page={limit}"),
+    };
+    if let Some(branch) = branch.filter(|value| !value.is_empty()) {
+        path.push_str("&branch=");
+        path.push_str(&encode_branch(branch));
+    }
+    path
+}
 
 /// A workflow that can be launched with `workflow_dispatch`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -122,6 +151,10 @@ pub struct QueuedRun {
     pub head_branch: String,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
+    /// ISO-8601 execution-start timestamp, when GitHub reported one. Absent
+    /// (`None`) while a run is still `queued`; set once the run begins
+    /// `in_progress`.
+    pub run_started_at: Option<String>,
     /// Workflow display name.
     pub workflow_name: String,
     /// HTML URL.
@@ -492,35 +525,21 @@ impl GitHubActions {
     ) -> Result<Vec<QueuedRun>, GitHubError> {
         let args = vec![
             "api".to_owned(),
-            format!("repos/{repository}/actions/runs?status=queued&per_page={limit}"),
+            runs_query_path(repository, "queued", None, limit, None),
         ];
         let stdout = self.run_gh(&args)?;
         parse_queued_runs(&stdout)
     }
 
-    /// Like `list_queued_runs` but paginates up to `max_pages` (`per_page=100` each)
-    /// so callers can cover busy repos with more than one page of queued runs.
-    /// Stops early when a page returns no items.
+    /// Like `list_queued_runs` but paginates up to `max_pages`
+    /// (`per_page=RUNS_API_PAGE_SIZE` each) so callers can cover busy repos
+    /// with more than one page of queued runs. Stops early on a short page.
     pub fn list_queued_runs_paginated(
         &self,
         repository: &str,
         max_pages: u32,
     ) -> Result<Vec<QueuedRun>, GitHubError> {
-        let mut out = Vec::new();
-        for page in 1..=max_pages.max(1) {
-            let args = vec![
-                "api".to_owned(),
-                format!("repos/{repository}/actions/runs?status=queued&`per_page=100`&page={page}"),
-            ];
-            let stdout = self.run_gh(&args)?;
-            let page_runs = parse_queued_runs(&stdout)?;
-            let count = page_runs.len();
-            out.extend(page_runs);
-            if count < 100 {
-                break;
-            }
-        }
-        Ok(out)
+        self.list_runs_with_status_paginated(repository, "queued", None, max_pages)
     }
 
     /// List workflow runs filtered by status (and optional branch).
@@ -531,18 +550,17 @@ impl GitHubActions {
         branch: Option<&str>,
         limit: u32,
     ) -> Result<Vec<QueuedRun>, GitHubError> {
-        let mut path = format!("repos/{repository}/actions/runs?status={status}&per_page={limit}");
-        if let Some(branch) = branch.filter(|value| !value.is_empty()) {
-            path.push_str("&branch=");
-            path.push_str(&encode_branch(branch));
-        }
-        let args = vec!["api".to_owned(), path];
+        let args = vec![
+            "api".to_owned(),
+            runs_query_path(repository, status, branch, limit, None),
+        ];
         let stdout = self.run_gh(&args)?;
         parse_queued_runs(&stdout)
     }
 
-    /// Like `list_runs_with_status` but paginates up to `max_pages` (`per_page=100`
-    /// each). Stops early when a page returns no items.
+    /// Like `list_runs_with_status` but paginates up to `max_pages`
+    /// (`per_page=RUNS_API_PAGE_SIZE` each). Stops early on a short page — a
+    /// page with fewer than a full `RUNS_API_PAGE_SIZE` items is the last one.
     pub fn list_runs_with_status_paginated(
         &self,
         repository: &str,
@@ -552,19 +570,15 @@ impl GitHubActions {
     ) -> Result<Vec<QueuedRun>, GitHubError> {
         let mut out = Vec::new();
         for page in 1..=max_pages.max(1) {
-            let mut path = format!(
-                "repos/{repository}/actions/runs?status={status}&`per_page=100`&page={page}"
-            );
-            if let Some(branch) = branch.filter(|value| !value.is_empty()) {
-                path.push_str("&branch=");
-                path.push_str(&encode_branch(branch));
-            }
-            let args = vec!["api".to_owned(), path];
+            let args = vec![
+                "api".to_owned(),
+                runs_query_path(repository, status, branch, RUNS_API_PAGE_SIZE, Some(page)),
+            ];
             let stdout = self.run_gh(&args)?;
             let page_runs = parse_queued_runs(&stdout)?;
             let count = page_runs.len();
             out.extend(page_runs);
-            if count < 100 {
+            if count < RUNS_API_PAGE_SIZE as usize {
                 break;
             }
         }
@@ -981,6 +995,11 @@ pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let run_started_at = run
+            .get("run_started_at")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
         let path = run
             .get("path")
             .and_then(Value::as_str)
@@ -1002,6 +1021,7 @@ pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
             name,
             head_branch,
             created_at,
+            run_started_at,
             url: run
                 .get("html_url")
                 .or_else(|| run.get("url"))
@@ -1541,13 +1561,78 @@ runner_selector = "config-selector"
     #[test]
     fn queued_runs_parse_github_api_shape() {
         let parsed = super::parse_queued_runs(
-            r#"{"workflow_runs":[{"id":555,"name":"CI","head_branch":"feat/x","created_at":"2026-04-23T12:00:00Z","html_url":"https://example/run/555","path":".github/workflows/ci.yml"}]}"#,
+            r#"{"workflow_runs":[{"id":555,"name":"CI","head_branch":"feat/x","created_at":"2026-04-23T12:00:00Z","run_started_at":"2026-04-23T12:05:00Z","html_url":"https://example/run/555","path":".github/workflows/ci.yml"}]}"#,
         )
         .expect("parse");
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].database_id, 555);
         assert_eq!(parsed[0].path, ".github/workflows/ci.yml");
+        // P1: `run_started_at` is captured so the reaper can age in_progress
+        // runs from execution start, not creation time.
+        assert_eq!(
+            parsed[0].run_started_at.as_deref(),
+            Some("2026-04-23T12:05:00Z")
+        );
+    }
+
+    #[test]
+    fn queued_runs_parse_without_run_started_at() {
+        // P1: a still-queued run has no `run_started_at`; it must parse as
+        // `None` rather than an empty string, so the reaper's null check works.
+        let parsed = super::parse_queued_runs(
+            r#"{"workflow_runs":[{"id":7,"name":"CI","head_branch":"main","created_at":"2026-04-23T12:00:00Z","path":".github/workflows/ci.yml"}]}"#,
+        )
+        .expect("parse");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].run_started_at, None);
+    }
+
+    #[test]
+    fn runs_query_path_paginates_with_full_page_size() {
+        // P2: paginated listers must request a full RUNS_API_PAGE_SIZE page at
+        // an explicit page number — and never emit the literal backticks that
+        // the pre-fix code shipped (`per_page=100` as a quoted token).
+        let page2 = super::runs_query_path("owner/repo", "queued", None, 100, Some(2));
+        assert_eq!(
+            page2,
+            "repos/owner/repo/actions/runs?status=queued&per_page=100&page=2"
+        );
+        assert!(!page2.contains('`'), "URL must not contain backticks");
+
+        let page1 = super::runs_query_path("owner/repo", "in_progress", None, 100, Some(1));
+        assert_eq!(
+            page1,
+            "repos/owner/repo/actions/runs?status=in_progress&per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn runs_query_path_single_shot_uses_limit_and_no_page() {
+        // The non-paginated form keeps `per_page=<limit>` and omits `page=`.
+        let path = super::runs_query_path("owner/repo", "queued", None, 25, None);
+        assert_eq!(
+            path,
+            "repos/owner/repo/actions/runs?status=queued&per_page=25"
+        );
+        assert!(!path.contains("&page="));
+    }
+
+    #[test]
+    fn runs_query_path_appends_encoded_branch() {
+        // Branch filtering survives pagination and is percent-encoded.
+        let path = super::runs_query_path("owner/repo", "queued", Some("feat/a b"), 100, Some(3));
+        assert!(
+            path.starts_with(
+                "repos/owner/repo/actions/runs?status=queued&per_page=100&page=3&branch="
+            ),
+            "got {path}"
+        );
+        assert!(
+            path.contains("feat/a%20b"),
+            "branch must be encoded: {path}"
+        );
     }
 
     #[test]

@@ -24,12 +24,19 @@ use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::runner_watchdog::{
-    DEFAULT_MAX_JOB_MIN, DEFAULT_MAX_QUEUE_AGE_HOURS, DEFAULT_WATCH_INTERVAL_SECONDS, RunnerHealth,
-    RunnerReport, RunnerSnapshot, StaleQueuedRun, Symptom, WatchdogThresholds, assess_runner,
-    compute_stale_queued_runs, report_to_json,
+    DEFAULT_MAX_JOB_MIN, DEFAULT_MAX_QUEUE_AGE_HOURS, DEFAULT_REAP_IN_PROGRESS_MAX_MIN,
+    DEFAULT_REAP_QUEUED_MAX_MIN, DEFAULT_WATCH_INTERVAL_SECONDS, ReaperThresholds, RunnerHealth,
+    RunnerReport, RunnerSnapshot, StaleQueuedRun, StaleRun, Symptom, WatchdogThresholds,
+    assess_runner, compute_stale_queued_runs, compute_stale_runs, report_to_json,
 };
 
 const QUEUED_RUNS_LIMIT: u32 = 100;
+/// Cap on the number of paginated `gh api` calls per reaper tick, per status.
+/// Each page is 100 items, so the worst case is 500 `in_progress` + 500
+/// `queued` runs scanned — far beyond any healthy repo. The paginated listers
+/// stop early on the first short page, so a small repo still costs one call
+/// per status.
+const REAP_RUNS_MAX_PAGES: u32 = 5;
 
 /// Entry point dispatched from `src/app.rs`.
 #[allow(clippy::too_many_lines)]
@@ -549,6 +556,10 @@ fn dispatch_watch<W: Write>(
         interval,
         fix,
         kill_hung_workers,
+        reap_stale_runs,
+        reap_in_progress_max_min,
+        reap_queued_max_min,
+        dry_run,
         max_iterations,
         kill_grace_secs,
     } = command
@@ -565,6 +576,10 @@ fn dispatch_watch<W: Write>(
         interval_override: interval,
         fix: fix || kill_hung_workers,
         kill_hung_workers,
+        reap_stale_runs,
+        reap_in_progress_max_min,
+        reap_queued_max_min,
+        dry_run,
         max_iterations,
         kill_grace_secs,
         json,
@@ -572,6 +587,7 @@ fn dispatch_watch<W: Write>(
     })
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct WatchCommandArgs<'a, W: Write> {
     pub(super) config: &'a LoadedConfig,
     pub(super) cwd: &'a Path,
@@ -582,6 +598,10 @@ pub(super) struct WatchCommandArgs<'a, W: Write> {
     pub(super) interval_override: Option<u64>,
     pub(super) fix: bool,
     pub(super) kill_hung_workers: bool,
+    pub(super) reap_stale_runs: bool,
+    pub(super) reap_in_progress_max_min: Option<i64>,
+    pub(super) reap_queued_max_min: Option<i64>,
+    pub(super) dry_run: bool,
     pub(super) max_iterations: Option<u32>,
     pub(super) kill_grace_secs: Option<u64>,
     pub(super) json: bool,
@@ -599,6 +619,10 @@ fn watch_command<W: Write>(args: WatchCommandArgs<'_, W>) -> Result<ExitCode, Cl
         interval_override,
         fix,
         kill_hung_workers,
+        reap_stale_runs,
+        reap_in_progress_max_min,
+        reap_queued_max_min,
+        dry_run,
         max_iterations,
         kill_grace_secs,
         json,
@@ -614,6 +638,8 @@ fn watch_command<W: Write>(args: WatchCommandArgs<'_, W>) -> Result<ExitCode, Cl
         None,
         interval_override,
     )?;
+    let reaper_thresholds =
+        resolve_reaper_thresholds(config, reap_in_progress_max_min, reap_queued_max_min);
     let interval = Duration::from_secs(settings.thresholds.watch_interval_seconds.max(1));
     if max_iterations == Some(0) {
         return Ok(ExitCode::SUCCESS);
@@ -638,6 +664,16 @@ fn watch_command<W: Write>(args: WatchCommandArgs<'_, W>) -> Result<ExitCode, Cl
                         actions,
                         &settings,
                         kill_grace_secs,
+                        json,
+                        stdout,
+                    )?;
+                }
+                if reap_stale_runs {
+                    reap_stale_runs_tick(
+                        actions,
+                        &settings,
+                        reaper_thresholds,
+                        dry_run,
                         json,
                         stdout,
                     )?;
@@ -874,6 +910,156 @@ fn cancel_stale_inline<W: Write>(
         }
     }
     Ok(())
+}
+
+// ---------- stale-run reaper ----------
+
+/// Resolve [`ReaperThresholds`] from flags, then `[runner.watchdog]` config,
+/// then the built-in defaults — matching the precedence used by
+/// `resolve_watchdog_settings`.
+fn resolve_reaper_thresholds(
+    config: &LoadedConfig,
+    in_progress_override: Option<i64>,
+    queued_override: Option<i64>,
+) -> ReaperThresholds {
+    let in_progress_max_min = in_progress_override
+        .or_else(|| {
+            config
+                .get("runner.watchdog.reap_in_progress_max_min")
+                .and_then(toml::Value::as_integer)
+        })
+        .unwrap_or(DEFAULT_REAP_IN_PROGRESS_MAX_MIN);
+    let queued_max_min = queued_override
+        .or_else(|| {
+            config
+                .get("runner.watchdog.reap_queued_max_min")
+                .and_then(toml::Value::as_integer)
+        })
+        .unwrap_or(DEFAULT_REAP_QUEUED_MAX_MIN);
+    ReaperThresholds {
+        in_progress_max_min,
+        queued_max_min,
+    }
+}
+
+/// One stale-run reaper pass: list `in_progress` + `queued` runs, select the
+/// genuinely-stale ones, and cancel them (unless `--dry-run`). Emits one
+/// `event=reap_stale_run` envelope per run, mirroring the `auto_kill_worker`
+/// event style used by `--kill-hung-workers`.
+fn reap_stale_runs_tick<W: Write>(
+    actions: &GitHubActions,
+    settings: &WatchdogSettings,
+    thresholds: ReaperThresholds,
+    dry_run: bool,
+    json: bool,
+    stdout: &mut W,
+) -> Result<(), CliFailure> {
+    // Paginate both status queries so repos with more than one page of
+    // `in_progress` / `queued` runs are fully covered — a single 100-item
+    // page would silently miss the oldest (and most likely stale) entries.
+    let in_progress = actions
+        .list_runs_with_status_paginated(
+            &settings.repo_slug,
+            "in_progress",
+            None,
+            REAP_RUNS_MAX_PAGES,
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let queued = actions
+        .list_runs_with_status_paginated(&settings.repo_slug, "queued", None, REAP_RUNS_MAX_PAGES)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+
+    let stale = compute_stale_runs(&in_progress, &queued, thresholds, Utc::now());
+    for run in &stale {
+        let detail = format!(
+            "{} run {} ({}, branch={}) {} for {}s — threshold {}min",
+            run.kind.as_str(),
+            run.run_id,
+            run.workflow,
+            run.branch,
+            run.status,
+            run.age_secs,
+            match run.kind {
+                crate::runner_watchdog::StaleRunKind::HungInProgress => {
+                    thresholds.in_progress_max_min
+                }
+                crate::runner_watchdog::StaleRunKind::OrphanedQueued => thresholds.queued_max_min,
+            },
+        );
+        emit_reap_event(
+            stdout,
+            &settings.repo_slug,
+            json,
+            "attempt",
+            run,
+            Some(&detail),
+        )?;
+        if dry_run {
+            emit_reap_event(
+                stdout,
+                &settings.repo_slug,
+                json,
+                "skipped",
+                run,
+                Some("dry-run: not cancelling"),
+            )?;
+            continue;
+        }
+        match actions.cancel_workflow_run(&settings.repo_slug, run.run_id) {
+            Ok(()) => {
+                emit_reap_event(stdout, &settings.repo_slug, json, "cancelled", run, None)?;
+            }
+            Err(err) => {
+                emit_reap_event(
+                    stdout,
+                    &settings.repo_slug,
+                    json,
+                    "failed",
+                    run,
+                    Some(&err.to_string()),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_reap_event<W: Write>(
+    stdout: &mut W,
+    repo: &str,
+    json: bool,
+    phase: &str,
+    run: &StaleRun,
+    detail: Option<&str>,
+) -> Result<(), CliFailure> {
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("event".to_owned(), Value::from("reap_stale_run"));
+        data.insert("phase".to_owned(), Value::from(phase.to_owned()));
+        data.insert("repo".to_owned(), Value::from(repo.to_owned()));
+        data.insert("run_id".to_owned(), Value::from(run.run_id));
+        data.insert("kind".to_owned(), Value::from(run.kind.as_str()));
+        data.insert("status".to_owned(), Value::from(run.status.clone()));
+        data.insert("workflow".to_owned(), Value::from(run.workflow.clone()));
+        data.insert("branch".to_owned(), Value::from(run.branch.clone()));
+        data.insert("age_secs".to_owned(), Value::from(run.age_secs));
+        if let Some(url) = &run.url {
+            data.insert("url".to_owned(), Value::from(url.clone()));
+        }
+        if let Some(detail) = detail {
+            data.insert("detail".to_owned(), Value::from(detail.to_owned()));
+        }
+        return write_json_envelope(stdout, "runner.watch", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()));
+    }
+    let ts = Utc::now().format("%H:%M:%S");
+    let detail_part = detail.map_or_else(String::new, |d| format!(" — {d}"));
+    writeln!(
+        stdout,
+        "[{ts}] reap-stale-run {phase} run={}{detail_part}",
+        run.run_id
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 // ---------- settings / config wiring ----------
@@ -1296,5 +1482,54 @@ mod tests {
     fn dry_run_overridden_only_respects_fix_flag() {
         assert!(dry_run_overridden_only(true, false));
         assert!(!dry_run_overridden_only(true, true));
+    }
+
+    fn config_with(body: &str) -> crate::config::LoadedConfig {
+        use crate::config::{LoadedConfig, LocalOverlaySource};
+        let sandbox = tempfile::TempDir::new().expect("tempdir");
+        let project_dir = sandbox.path().join(".shipyard");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(project_dir.join("config.toml"), body).expect("write config");
+        // Keep the TempDir alive for the lifetime of the test by leaking it;
+        // tests are short-lived processes and this avoids a lifetime dance.
+        let dir = sandbox.keep();
+        LoadedConfig::load(
+            Some(dir.join("global-missing")),
+            Some(dir.join(".shipyard")),
+            None,
+            LocalOverlaySource::None,
+        )
+        .expect("load config")
+    }
+
+    #[test]
+    fn reaper_thresholds_fall_back_to_built_in_defaults() {
+        let config = config_with("[project]\nname = \"x\"\n");
+        let thresholds = resolve_reaper_thresholds(&config, None, None);
+        assert_eq!(
+            thresholds.in_progress_max_min,
+            DEFAULT_REAP_IN_PROGRESS_MAX_MIN
+        );
+        assert_eq!(thresholds.queued_max_min, DEFAULT_REAP_QUEUED_MAX_MIN);
+    }
+
+    #[test]
+    fn reaper_thresholds_read_from_config() {
+        let config = config_with(
+            "[runner.watchdog]\nreap_in_progress_max_min = 120\nreap_queued_max_min = 240\n",
+        );
+        let thresholds = resolve_reaper_thresholds(&config, None, None);
+        assert_eq!(thresholds.in_progress_max_min, 120);
+        assert_eq!(thresholds.queued_max_min, 240);
+    }
+
+    #[test]
+    fn reaper_thresholds_flags_win_over_config() {
+        let config = config_with(
+            "[runner.watchdog]\nreap_in_progress_max_min = 120\nreap_queued_max_min = 240\n",
+        );
+        let thresholds = resolve_reaper_thresholds(&config, Some(30), Some(60));
+        assert_eq!(thresholds.in_progress_max_min, 30);
+        assert_eq!(thresholds.queued_max_min, 60);
     }
 }

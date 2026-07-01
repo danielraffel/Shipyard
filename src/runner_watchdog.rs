@@ -40,6 +40,13 @@ pub const DEFAULT_MAX_JOB_MIN: i64 = 90;
 pub const DEFAULT_MAX_QUEUE_AGE_HOURS: i64 = 2;
 /// Default watch-mode polling interval in seconds.
 pub const DEFAULT_WATCH_INTERVAL_SECONDS: u64 = 300;
+/// Default max age (minutes) for an `in_progress` run before the stale-run
+/// reaper treats it as hung. ~5h — well past any healthy run, so an in-flight
+/// validation is never touched.
+pub const DEFAULT_REAP_IN_PROGRESS_MAX_MIN: i64 = 300;
+/// Default max age (minutes) for a `queued` run before the stale-run reaper
+/// treats it as orphaned (~8h).
+pub const DEFAULT_REAP_QUEUED_MAX_MIN: i64 = 480;
 
 /// Resolved runner-watchdog thresholds for a single invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,6 +287,152 @@ pub fn compute_stale_queued_runs(
     out
 }
 
+/// Why a workflow run was selected for reaping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleRunKind {
+    /// Run stuck `in_progress` past the in-progress max age (hung).
+    HungInProgress,
+    /// Run stuck `queued` past the queued max age (orphaned).
+    OrphanedQueued,
+}
+
+impl StaleRunKind {
+    /// Snake-case string form used in JSON and human output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HungInProgress => "hung_in_progress",
+            Self::OrphanedQueued => "orphaned_queued",
+        }
+    }
+}
+
+/// A single workflow run the stale-run reaper would cancel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StaleRun {
+    /// GitHub Actions run ID.
+    pub run_id: u64,
+    /// Workflow display name.
+    pub workflow: String,
+    /// Head branch.
+    pub branch: String,
+    /// Raw GitHub status (`queued` / `in_progress`).
+    pub status: String,
+    /// Why this run was flagged.
+    pub kind: StaleRunKind,
+    /// How long the run has existed, in seconds.
+    pub age_secs: i64,
+    /// Browser URL, when GitHub returned one.
+    pub url: Option<String>,
+}
+
+/// Thresholds for the stale-run reaper, in minutes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReaperThresholds {
+    /// Cancel `in_progress` runs older than this many minutes (hung).
+    pub in_progress_max_min: i64,
+    /// Cancel `queued` runs older than this many minutes (orphaned).
+    pub queued_max_min: i64,
+}
+
+impl Default for ReaperThresholds {
+    fn default() -> Self {
+        Self {
+            in_progress_max_min: DEFAULT_REAP_IN_PROGRESS_MAX_MIN,
+            queued_max_min: DEFAULT_REAP_QUEUED_MAX_MIN,
+        }
+    }
+}
+
+/// Select workflow runs that are genuinely stale and should be cancelled.
+///
+/// `in_progress_runs` and `queued_runs` are the raw run lists from the GitHub
+/// Actions API. A run is flagged only when its age strictly exceeds the
+/// matching threshold — a healthy in-flight run, or one just under the
+/// threshold, is always kept. Runs with an unparseable timestamp are silently
+/// skipped, matching [`compute_stale_queued_runs`].
+///
+/// Age basis differs by kind:
+///
+/// * **`in_progress`** runs are aged from `run_started_at` (execution start),
+///   so a run that sat in queue for hours and only just began executing is
+///   *not* treated as hung. When GitHub did not report `run_started_at`, the
+///   computation falls back to `created_at`.
+/// * **`queued`** runs are aged from `created_at` — a queued run has not
+///   started, so time-since-creation *is* its meaningful age.
+///
+/// `now` is a parameter so tests can pin the clock.
+#[must_use]
+pub fn compute_stale_runs(
+    in_progress_runs: &[QueuedRun],
+    queued_runs: &[QueuedRun],
+    thresholds: ReaperThresholds,
+    now: DateTime<Utc>,
+) -> Vec<StaleRun> {
+    let mut out = Vec::new();
+    collect_stale(
+        &mut out,
+        in_progress_runs,
+        thresholds.in_progress_max_min.max(0) * 60,
+        StaleRunKind::HungInProgress,
+        now,
+    );
+    collect_stale(
+        &mut out,
+        queued_runs,
+        thresholds.queued_max_min.max(0) * 60,
+        StaleRunKind::OrphanedQueued,
+        now,
+    );
+    out
+}
+
+/// Pick the timestamp a run's age should be measured from.
+///
+/// For a [`StaleRunKind::HungInProgress`] run, "age" means how long it has
+/// been *executing* — so prefer `run_started_at`, falling back to
+/// `created_at` only when GitHub did not report a start time. For a
+/// [`StaleRunKind::OrphanedQueued`] run, the run never started, so
+/// `created_at` is the meaningful basis.
+fn age_basis(run: &QueuedRun, kind: StaleRunKind) -> &str {
+    match kind {
+        StaleRunKind::HungInProgress => run
+            .run_started_at
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&run.created_at),
+        StaleRunKind::OrphanedQueued => &run.created_at,
+    }
+}
+
+fn collect_stale(
+    out: &mut Vec<StaleRun>,
+    runs: &[QueuedRun],
+    threshold_secs: i64,
+    kind: StaleRunKind,
+    now: DateTime<Utc>,
+) {
+    for run in runs {
+        let Ok(started) = DateTime::parse_from_rfc3339(age_basis(run, kind)) else {
+            continue;
+        };
+        let age_secs = (now - started.with_timezone(&Utc)).num_seconds();
+        if age_secs <= threshold_secs {
+            continue;
+        }
+        out.push(StaleRun {
+            run_id: run.database_id,
+            workflow: run.workflow_name.clone(),
+            branch: run.head_branch.clone(),
+            status: run.status.clone(),
+            kind,
+            age_secs,
+            url: run.url.clone(),
+        });
+    }
+}
+
 /// Render a [`RunnerReport`] as a flat `BTreeMap<String, Value>` ready to be
 /// dropped into `write_json_envelope`.
 #[must_use]
@@ -311,6 +464,7 @@ mod tests {
             name: workflow.to_owned(),
             head_branch: branch.to_owned(),
             created_at: created_at.to_owned(),
+            run_started_at: None,
             workflow_name: workflow.to_owned(),
             url: Some(format!("https://github.com/owner/repo/actions/runs/{id}")),
             path: ".github/workflows/ci.yml".to_owned(),
@@ -443,6 +597,241 @@ mod tests {
             Symptom::StaleQueuedRuns { count: 1 }
         ));
         assert_eq!(report.stale_queued_runs.len(), 1);
+    }
+
+    fn run_with_status(
+        id: u64,
+        workflow: &str,
+        branch: &str,
+        status: &str,
+        created_at: &str,
+    ) -> QueuedRun {
+        QueuedRun {
+            database_id: id,
+            name: workflow.to_owned(),
+            head_branch: branch.to_owned(),
+            created_at: created_at.to_owned(),
+            run_started_at: None,
+            workflow_name: workflow.to_owned(),
+            url: Some(format!("https://github.com/owner/repo/actions/runs/{id}")),
+            path: ".github/workflows/ci.yml".to_owned(),
+            status: status.to_owned(),
+            conclusion: None,
+        }
+    }
+
+    /// Like [`run_with_status`] but also pins `run_started_at`. Used by the
+    /// P1 hung-detection tests, where an `in_progress` run's age must be
+    /// measured from execution start, not creation time.
+    fn in_progress_run(
+        id: u64,
+        branch: &str,
+        created_at: &str,
+        run_started_at: Option<&str>,
+    ) -> QueuedRun {
+        QueuedRun {
+            run_started_at: run_started_at.map(ToOwned::to_owned),
+            ..run_with_status(id, "Coverage", branch, "in_progress", created_at)
+        }
+    }
+
+    #[test]
+    fn reaper_keeps_run_just_under_threshold() {
+        let now = Utc::now();
+        // in_progress threshold is 300 min by default; 299 min must be kept.
+        let in_progress = vec![run_with_status(
+            1,
+            "Coverage",
+            "main",
+            "in_progress",
+            &(now - ChronoDuration::minutes(299)).to_rfc3339(),
+        )];
+        let stale = compute_stale_runs(&in_progress, &[], ReaperThresholds::default(), now);
+        assert!(stale.is_empty(), "a 299-min run is healthy, must be kept");
+    }
+
+    #[test]
+    fn reaper_reaps_hung_in_progress_run_over_threshold() {
+        let now = Utc::now();
+        let in_progress = vec![run_with_status(
+            42,
+            "Coverage",
+            "main",
+            "in_progress",
+            &(now - ChronoDuration::minutes(301)).to_rfc3339(),
+        )];
+        let stale = compute_stale_runs(&in_progress, &[], ReaperThresholds::default(), now);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].run_id, 42);
+        assert_eq!(stale[0].kind, StaleRunKind::HungInProgress);
+        assert!(stale[0].age_secs > 300 * 60);
+    }
+
+    #[test]
+    fn reaper_reaps_orphaned_queued_run_over_threshold() {
+        let now = Utc::now();
+        // queued threshold is 480 min by default; 5 days is way past it.
+        let queued = vec![run_with_status(
+            7,
+            "CI",
+            "feature/orphan",
+            "queued",
+            &(now - ChronoDuration::days(5)).to_rfc3339(),
+        )];
+        let stale = compute_stale_runs(&[], &queued, ReaperThresholds::default(), now);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].run_id, 7);
+        assert_eq!(stale[0].kind, StaleRunKind::OrphanedQueued);
+    }
+
+    #[test]
+    fn reaper_keeps_queued_run_just_under_threshold() {
+        let now = Utc::now();
+        let queued = vec![run_with_status(
+            8,
+            "CI",
+            "feature/recent",
+            "queued",
+            &(now - ChronoDuration::minutes(479)).to_rfc3339(),
+        )];
+        let stale = compute_stale_runs(&[], &queued, ReaperThresholds::default(), now);
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn reaper_skips_unparseable_timestamps() {
+        let now = Utc::now();
+        let in_progress = vec![run_with_status(
+            9,
+            "CI",
+            "main",
+            "in_progress",
+            "not-a-timestamp",
+        )];
+        let stale = compute_stale_runs(&in_progress, &[], ReaperThresholds::default(), now);
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn reaper_classifies_both_kinds_in_one_pass() {
+        let now = Utc::now();
+        let in_progress = vec![run_with_status(
+            100,
+            "Coverage",
+            "main",
+            "in_progress",
+            &(now - ChronoDuration::hours(7)).to_rfc3339(),
+        )];
+        let queued = vec![run_with_status(
+            200,
+            "CI",
+            "feature/x",
+            "queued",
+            &(now - ChronoDuration::days(3)).to_rfc3339(),
+        )];
+        let stale = compute_stale_runs(&in_progress, &queued, ReaperThresholds::default(), now);
+        assert_eq!(stale.len(), 2);
+        assert_eq!(stale[0].kind, StaleRunKind::HungInProgress);
+        assert_eq!(stale[1].kind, StaleRunKind::OrphanedQueued);
+    }
+
+    #[test]
+    fn reaper_respects_custom_thresholds() {
+        let now = Utc::now();
+        let in_progress = vec![run_with_status(
+            1,
+            "CI",
+            "main",
+            "in_progress",
+            &(now - ChronoDuration::minutes(45)).to_rfc3339(),
+        )];
+        // A tight 30-min in_progress threshold flags the 45-min run.
+        let thresholds = ReaperThresholds {
+            in_progress_max_min: 30,
+            queued_max_min: 60,
+        };
+        let stale = compute_stale_runs(&in_progress, &[], thresholds, now);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].kind, StaleRunKind::HungInProgress);
+    }
+
+    #[test]
+    fn reaper_keeps_recently_started_in_progress_run_with_old_created_at() {
+        // P1: a run that sat queued for ~9h then started executing 10 min ago
+        // is healthy. Aging it from `created_at` would (wrongly) cancel it;
+        // aging it from `run_started_at` keeps it.
+        let now = Utc::now();
+        let in_progress = vec![in_progress_run(
+            1,
+            "main",
+            &(now - ChronoDuration::hours(9)).to_rfc3339(),
+            Some(&(now - ChronoDuration::minutes(10)).to_rfc3339()),
+        )];
+        let stale = compute_stale_runs(&in_progress, &[], ReaperThresholds::default(), now);
+        assert!(
+            stale.is_empty(),
+            "an in_progress run started 10 min ago is healthy regardless of queue wait"
+        );
+    }
+
+    #[test]
+    fn reaper_reaps_in_progress_run_with_old_run_started_at() {
+        // P1: a genuinely hung run — started executing 6h ago, past the
+        // 300-min default — is still reaped when aged from `run_started_at`.
+        let now = Utc::now();
+        let in_progress = vec![in_progress_run(
+            2,
+            "main",
+            &(now - ChronoDuration::hours(7)).to_rfc3339(),
+            Some(&(now - ChronoDuration::hours(6)).to_rfc3339()),
+        )];
+        let stale = compute_stale_runs(&in_progress, &[], ReaperThresholds::default(), now);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].run_id, 2);
+        assert_eq!(stale[0].kind, StaleRunKind::HungInProgress);
+    }
+
+    #[test]
+    fn reaper_falls_back_to_created_at_when_run_started_at_missing() {
+        // P1: GitHub can omit `run_started_at`; the reaper must not crash and
+        // should fall back to `created_at` for in_progress runs.
+        let now = Utc::now();
+        let in_progress = vec![in_progress_run(
+            3,
+            "main",
+            &(now - ChronoDuration::minutes(301)).to_rfc3339(),
+            None,
+        )];
+        let stale = compute_stale_runs(&in_progress, &[], ReaperThresholds::default(), now);
+        assert_eq!(
+            stale.len(),
+            1,
+            "missing run_started_at falls back to created_at"
+        );
+        assert_eq!(stale[0].kind, StaleRunKind::HungInProgress);
+    }
+
+    #[test]
+    fn reaper_queued_run_age_still_uses_created_at() {
+        // P1: queued runs never started, so a (spurious) `run_started_at` must
+        // be ignored — age is measured from `created_at`. Here `created_at` is
+        // 5 days old (well past the 480-min queued threshold) so the run is
+        // reaped even though a stray recent `run_started_at` is present.
+        let now = Utc::now();
+        let queued = vec![QueuedRun {
+            run_started_at: Some((now - ChronoDuration::minutes(1)).to_rfc3339()),
+            ..run_with_status(
+                4,
+                "CI",
+                "feature/orphan",
+                "queued",
+                &(now - ChronoDuration::days(5)).to_rfc3339(),
+            )
+        }];
+        let stale = compute_stale_runs(&[], &queued, ReaperThresholds::default(), now);
+        assert_eq!(stale.len(), 1, "queued run age ignores run_started_at");
+        assert_eq!(stale[0].run_id, 4);
+        assert_eq!(stale[0].kind, StaleRunKind::OrphanedQueued);
     }
 
     #[test]

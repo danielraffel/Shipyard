@@ -2211,6 +2211,7 @@ mod tests {
             name: format!("{workflow} run"),
             head_branch: branch.to_owned(),
             created_at: created_at.to_owned(),
+            run_started_at: None,
             workflow_name: workflow.to_owned(),
             url: Some(format!("https://github.com/owner/repo/actions/runs/{id}")),
             path: ".github/workflows/ci.yml".to_owned(),

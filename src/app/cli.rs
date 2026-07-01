@@ -730,6 +730,24 @@ pub(super) enum RunnerCommand {
         /// Implies `--fix`.
         #[arg(long = "kill-hung-workers")]
         kill_hung_workers: bool,
+        /// On every tick, cancel stale GitHub Actions workflow *runs* repo-wide:
+        /// runs stuck `in_progress` past the in-progress max age (hung) and runs
+        /// stuck `queued` past the queued max age (orphaned). The run-level
+        /// complement to `--kill-hung-workers`.
+        #[arg(long = "reap-stale-runs")]
+        reap_stale_runs: bool,
+        /// Cancel `in_progress` runs older than this many minutes (hung).
+        /// Defaults to `runner.watchdog.reap_in_progress_max_min` or ~5h.
+        #[arg(long = "reap-in-progress-max-min")]
+        reap_in_progress_max_min: Option<i64>,
+        /// Cancel `queued` runs older than this many minutes (orphaned).
+        /// Defaults to `runner.watchdog.reap_queued_max_min` or ~8h.
+        #[arg(long = "reap-queued-max-min")]
+        reap_queued_max_min: Option<i64>,
+        /// With `--reap-stale-runs`, log what would be cancelled without
+        /// cancelling anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
         /// Maximum number of iterations to run before exiting. Defaults to
         /// looping forever. Test hook.
         #[arg(long = "max-iterations", hide = true)]

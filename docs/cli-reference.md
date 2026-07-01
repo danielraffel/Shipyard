@@ -79,7 +79,10 @@ shipyard runner cleanup                   # dry-run: list stale queued runs
 shipyard runner cleanup --fix             # cancel stale queued runs
 shipyard runner cleanup --stale-hours 4   # override threshold for this call
 shipyard runner watch                     # poll loop (default 5 min)
-shipyard runner watch --fix               # auto-cancel stale runs each tick
+shipyard runner watch --fix               # auto-cancel stale queued runs each tick
+shipyard runner watch --kill-hung-workers # also auto-kill hung Worker processes
+shipyard runner watch --reap-stale-runs   # also cancel stale workflow runs repo-wide
+shipyard runner watch --reap-stale-runs --dry-run   # preview reaper, cancel nothing
 
 # Self-hosted runner provisioning (register / list / remove on this machine)
 shipyard runner tag --set studio          # set this box's machine tag (m1, m5, …)

@@ -18,6 +18,8 @@ them, and offer a guarded recovery path.
 | `orphaned_busy` | API reports `busy=true` but no `Runner.Worker` process is visible locally | Report only (clears in 1-5 min) |
 | `hung_worker` | A `Runner.Worker` has been running longer than `max_job_min` | Report on `status`; terminate with full recovery via `runner kill --pid <pid>` |
 | `stale_queued_runs` | Queued runs older than `max_queue_age_hours` | Report on `status`; cancel on `cleanup --fix` |
+| `hung_in_progress` (run-level) | A workflow run stuck `in_progress` past `reap_in_progress_max_min` | Cancel on `runner watch --reap-stale-runs` |
+| `orphaned_queued` (run-level) | A workflow run stuck `queued` past `reap_queued_max_min` | Cancel on `runner watch --reap-stale-runs` |
 
 ## Subcommands
 
@@ -171,6 +173,44 @@ The loop never exits on its own; press Ctrl-C or run it under
 `launchd` / `systemd` for unattended operation. A hidden
 `--max-iterations N` flag exists for tests.
 
+#### `--reap-stale-runs` — repo-wide stale-run reaper
+
+`--kill-hung-workers` reaps hung *processes* on the runner host;
+`--reap-stale-runs` reaps stale GitHub Actions *workflow runs* repo-wide.
+On every tick it lists the repo's runs and cancels:
+
+- runs stuck `in_progress` longer than `--reap-in-progress-max-min`
+  (default ~5h — "hung", e.g. a `Coverage` run squatting until GitHub's
+  6h timeout); and
+- runs stuck `queued` longer than `--reap-queued-max-min` (default ~8h —
+  "orphaned", e.g. a run waiting on a runner label that no longer exists,
+  which never hits any `timeout-minutes`).
+
+Both thresholds are deliberately well past any healthy run, so an
+in-flight validation run is never cancelled. Unlike host-process reaping,
+this also covers runs on **GitHub-hosted** runners.
+
+```bash
+# Auto-cancel stale runs on every tick:
+shipyard runner watch --reap-stale-runs
+
+# Preview only — log what would be cancelled, cancel nothing:
+shipyard runner watch --reap-stale-runs --dry-run --json
+
+# Tighter thresholds (minutes):
+shipyard runner watch --reap-stale-runs \
+  --reap-in-progress-max-min 240 --reap-queued-max-min 360
+```
+
+With `--json`, each candidate emits a `runner.watch` envelope with
+`event=reap_stale_run` and `phase ∈ {attempt, cancelled, failed,
+skipped}` (`skipped` only under `--dry-run`) — mirroring the
+`event=auto_kill_worker` envelopes from `--kill-hung-workers`.
+
+Cancellation goes through the GitHub REST API
+(`POST /repos/{owner}/{repo}/actions/runs/{id}/cancel`), the same path
+`runner cleanup --fix` and `shipyard rescue` use.
+
 ## Configuration
 
 Defaults live in `.shipyard/config.toml`:
@@ -183,6 +223,10 @@ max_job_min = 90
 max_queue_age_hours = 2
 watch_interval_seconds = 300
 auto_fix = false
+# Stale-run reaper thresholds (minutes), used by
+# `runner watch --reap-stale-runs`:
+reap_in_progress_max_min = 300
+reap_queued_max_min = 480
 ```
 
 Per-machine overrides go in `.shipyard.local/config.toml` and follow the
@@ -190,7 +234,8 @@ standard Shipyard layered-config rules.
 
 Every command-line flag wins over config; config wins over the built-in
 defaults (`max_job_min=90`, `max_queue_age_hours=2`,
-`watch_interval_seconds=300`).
+`watch_interval_seconds=300`, `reap_in_progress_max_min=300`,
+`reap_queued_max_min=480`).
 
 ## Lessons learned (from the prototype)
 
