@@ -26,7 +26,7 @@ use crate::paths::RuntimePaths;
 use crate::pr::{PrInfo, create_pr, find_pr_for_branch, push_branch};
 use crate::pr_text::{compose_pr_body_with_policy, compose_pr_title};
 use crate::preflight::{
-    EXIT_BACKEND_UNREACHABLE, ShipPreflightError, ShipPreflightOptions,
+    EXIT_BACKEND_UNREACHABLE, EXIT_HOST_UNHEALTHY, ShipPreflightError, ShipPreflightOptions,
     collect_ship_preflight_with_options,
 };
 use crate::prepared_state::PreparedStateStore;
@@ -292,6 +292,7 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
     let code = match error {
         ShipPreflightError::RootMismatch { .. } => 1,
         ShipPreflightError::BackendUnreachable { .. } => EXIT_BACKEND_UNREACHABLE,
+        ShipPreflightError::HostUnhealthy { .. } => EXIT_HOST_UNHEALTHY,
     };
     CliFailure::new(code, error.to_string())
 }
