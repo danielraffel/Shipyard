@@ -92,6 +92,8 @@ pub mod runner_watchdog;
 pub mod ship;
 /// Read-only orphan/liveness classification for in-flight ship states.
 pub mod ship_liveness;
+/// Opt-in, default-off same-backend retry policy for transient local legs.
+pub mod ship_retry;
 /// Durable in-flight ship-state model and store.
 pub mod ship_state;
 /// Subprocess helpers that mark supervised child processes with

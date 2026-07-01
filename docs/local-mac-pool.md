@@ -213,3 +213,28 @@ considered (SSH/cloud DiagnosticReports live on another host), and it is a
 **pure label** — it never changes `TargetStatus`, so a failed leg still blocks
 merge exactly as before (merge readiness keys on pass/fail, not the class). Fails
 open: an absent/stale/unreadable signal leaves the original class untouched.
+
+#### Same-backend transient retry (`[ship] transient_local_retries`)
+
+An independent, off-by-default opt-in that re-runs a **local** leg once (or up to
+a small bound) on the **same** backend when it fails with a transient `INFRA`
+blip — a momentary network/runner hiccup, not an authoritative test failure.
+
+```toml
+[ship]
+transient_local_retries = 0   # 0 = off (default); clamped to 0..=2
+```
+
+Deliberately narrower than the global retryable taxonomy: **only `INFRA`** is
+re-run. A local `TIMEOUT` already burned its full wall-clock budget on a host
+that is likely still slow, so re-running it in place would just double the wait;
+every other class (`CONTRACT`, `TEST`, `TREE_DRIFT`) is authoritative and never
+retried. Only local legs qualify — remote backends already have next-backend
+failover. Each retry writes to a distinct `<log>.retry<N>` sibling so the failing
+attempt's log is never truncated; the outcome is honest about the re-run (a
+recovered leg notes it in `phase`, an exhausted one in its error message). With
+the default `0`, execution is byte-identical to no retry.
+
+If `classify_local_failures` is also on, a `TEST` failure that gets relabelled
+`INFRA` (because a host incident overlapped) becomes retry-eligible — the two
+opt-ins compose deliberately.

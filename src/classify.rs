@@ -37,6 +37,23 @@ impl FailureClass {
             Self::Unknown => "UNKNOWN",
         }
     }
+
+    /// Parse the uppercase label produced by [`FailureClass::as_str`] back into a
+    /// class. Case-sensitive on purpose — the emitted labels are always uppercase,
+    /// and a loose parse could silently accept a foreign producer's lowercase
+    /// value that means something else. Unknown/empty → `None`.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "INFRA" => Some(Self::Infra),
+            "TIMEOUT" => Some(Self::Timeout),
+            "CONTRACT" => Some(Self::Contract),
+            "TEST" => Some(Self::Test),
+            "TREE_DRIFT" => Some(Self::TreeDrift),
+            "UNKNOWN" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for FailureClass {
@@ -84,10 +101,29 @@ pub fn classify_failure(
     FailureClass::Unknown
 }
 
-/// Return whether the failure class is worth retrying once.
+/// Return whether the failure class is worth retrying once. This is the broad
+/// taxonomy predicate (`INFRA` or `TIMEOUT`) intended for cross-backend failover
+/// policies. Same-backend local retry is deliberately stricter — see
+/// [`same_leg_local_retryable`].
 #[must_use]
 pub fn is_retryable(failure_class: FailureClass) -> bool {
     matches!(failure_class, FailureClass::Infra | FailureClass::Timeout)
+}
+
+/// Whether a failed LOCAL leg is worth re-running once on the SAME backend.
+///
+/// Deliberately narrower than [`is_retryable`]: only a transient `INFRA` blip
+/// qualifies. A local `TIMEOUT` failure means the leg already burned its full
+/// (large) wall-clock budget on a host that is likely still slow, so re-running
+/// it in place would merely double the wait and almost certainly time out again.
+/// Every other class is authoritative. A missing or unparseable label → not
+/// retryable (fail toward the honest single attempt).
+#[must_use]
+pub fn same_leg_local_retryable(failure_class: Option<&str>) -> bool {
+    matches!(
+        failure_class.and_then(FailureClass::from_label),
+        Some(FailureClass::Infra)
+    )
 }
 
 /// Return the class a failed target's `failure_class` should become when — and
@@ -170,6 +206,43 @@ mod tests {
             classify_failure("", "", 0, false, false),
             FailureClass::Unknown
         );
+    }
+
+    #[test]
+    fn from_label_round_trips_every_class() {
+        for class in [
+            FailureClass::Infra,
+            FailureClass::Timeout,
+            FailureClass::Contract,
+            FailureClass::Test,
+            FailureClass::TreeDrift,
+            FailureClass::Unknown,
+        ] {
+            assert_eq!(FailureClass::from_label(class.as_str()), Some(class));
+        }
+    }
+
+    #[test]
+    fn from_label_rejects_unknown_and_lowercase() {
+        assert_eq!(FailureClass::from_label(""), None);
+        assert_eq!(FailureClass::from_label("infra"), None);
+        assert_eq!(FailureClass::from_label("timeout"), None);
+        assert_eq!(FailureClass::from_label("NOT_A_CLASS"), None);
+    }
+
+    #[test]
+    fn same_leg_local_retry_is_infra_only() {
+        use super::same_leg_local_retryable;
+        assert!(same_leg_local_retryable(Some("INFRA")));
+        // Stricter than the global taxonomy: a local TIMEOUT is NOT re-run.
+        assert!(!same_leg_local_retryable(Some("TIMEOUT")));
+        assert!(!same_leg_local_retryable(Some("CONTRACT")));
+        assert!(!same_leg_local_retryable(Some("TEST")));
+        assert!(!same_leg_local_retryable(Some("TREE_DRIFT")));
+        assert!(!same_leg_local_retryable(Some("UNKNOWN")));
+        // Unparseable / missing label fails toward a single honest attempt.
+        assert!(!same_leg_local_retryable(Some("infra")));
+        assert!(!same_leg_local_retryable(None));
     }
 
     #[test]

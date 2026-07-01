@@ -548,6 +548,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         ..
     } = stores;
     let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
+    let transient_retry = crate::ship_retry::transient_local_retry_policy(config);
     if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
         return Ok(ShipExecutionOutcome {
             job: cancelled,
@@ -588,8 +589,11 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         warm_pool,
         dispatcher,
         job,
-        defer_host_pool_lease_unavailable,
-        reclassify_vitals_path.as_deref(),
+        TargetExecOptions {
+            defer_host_pool_lease_unavailable,
+            reclassify_vitals_path: reclassify_vitals_path.as_deref(),
+            transient_retry,
+        },
     )?
     .into_completed()?;
     if job.status == JobStatus::Cancelled {
@@ -799,6 +803,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         ..
     } = stores;
     let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
+    let transient_retry = crate::ship_retry::transient_local_retry_policy(config);
     if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
         return Ok(RunExecutionOutcome { job: cancelled });
     }
@@ -828,8 +833,11 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         warm_pool,
         dispatcher,
         job,
-        defer_host_pool_lease_unavailable,
-        reclassify_vitals_path.as_deref(),
+        TargetExecOptions {
+            defer_host_pool_lease_unavailable,
+            reclassify_vitals_path: reclassify_vitals_path.as_deref(),
+            transient_retry,
+        },
     )?
     .into_completed()?;
     if job.status == JobStatus::Cancelled {
@@ -1383,9 +1391,28 @@ fn unsaved_ship_state(request: &ShipExecutionRequest, target_names: &[String]) -
 
 #[allow(clippy::too_many_lines)]
 // This internal execution loop threads several heterogeneous handles (stores,
-// dispatcher, job, per-run flags); a params struct would be a reasonable future
-// tidy-up but is out of scope for the host-incident opt-in that adds the 8th arg.
-#[allow(clippy::too_many_arguments)]
+/// Mostly default-off knobs for one target-execution pass. Bundled so the
+/// execution seam takes a single cohesive options value rather than a growing
+/// list of loose booleans and paths — and so a new opt-in is one field, not one
+/// more positional argument. Resolved once at the command layer.
+#[derive(Clone, Copy)]
+struct TargetExecOptions<'a> {
+    /// Return scheduler-owned deferral results for transient host-pool lease
+    /// contention instead of final busy target results.
+    defer_host_pool_lease_unavailable: bool,
+    /// When set, a local `TEST` failure overlapping a host infra incident is
+    /// relabeled `INFRA` (opt-in host-vitals reclassification); `None` = off.
+    reclassify_vitals_path: Option<&'a Path>,
+    /// Same-backend retry budget for transient local `INFRA` blips (default off).
+    transient_retry: crate::ship_retry::TransientRetryPolicy,
+}
+
+// The per-target retry loop keeps the cancellation-sensitive dispatch +
+// progress-callback block inline (it borrows `job`/`queue` mutably and early-
+// returns on Deferred/Cancelled). Extracting the per-target body into its own
+// runner is the right next step, but as a separate no-behavior-change refactor
+// so a cancellation regression stays bisectable — not bundled with this opt-in.
+#[allow(clippy::too_many_lines)]
 fn execute_targets_with_options<D: ShipTargetDispatcher>(
     request: &ShipExecutionRequest,
     state_dir: &Path,
@@ -1393,8 +1420,7 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
     warm_pool: &WarmPool,
     dispatcher: &D,
     mut job: Job,
-    defer_host_pool_lease_unavailable: bool,
-    reclassify_vitals_path: Option<&Path>,
+    options: TargetExecOptions<'_>,
 ) -> Result<TargetExecutionOutcome, ShipExecutionError> {
     let mut had_failure = false;
     for target in &request.targets {
@@ -1406,7 +1432,7 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
             queue.update(&job)?;
             continue;
         }
-        let log_path = target_log_path(state_dir, &job.id, &target.name);
+        let base_log_path = target_log_path(state_dir, &job.id, &target.name);
         let decision = apply_warm_reuse(
             warm_pool,
             target,
@@ -1415,73 +1441,111 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
             request.warm_disabled,
             crate::warm_pool::now_epoch_secs(),
         );
-        job = job.with_result(running_result(&decision.target, &log_path, job.started_at));
-        queue.update(&job)?;
 
-        let dispatch_job_id = job.id.clone();
-        let progress_log_path = log_path.clone();
-        let mut progress_error = None;
-        let mut progress_cancelled = None;
-        let mut result = {
-            let mut progress_callback = |event: ProgressEvent| {
-                if progress_error.is_some() || progress_cancelled.is_some() {
-                    return;
-                }
-                match durable_cancelled_job(queue, &job) {
-                    Ok(Some(cancelled)) => {
-                        progress_cancelled = Some(cancelled);
+        // Same-backend retry loop for transient local INFRA blips. When the
+        // policy is disabled (the default) this runs exactly once against the
+        // base log path — byte-identical to the non-retry behavior.
+        let mut attempt: u32 = 0;
+        let mut prior_transient: Vec<String> = Vec::new();
+        let result = loop {
+            let attempt_log_path = retry_attempt_log_path(&base_log_path, attempt);
+            job = job.with_result(running_result(
+                &decision.target,
+                &attempt_log_path,
+                job.started_at,
+            ));
+            queue.update(&job)?;
+
+            let dispatch_job_id = job.id.clone();
+            let progress_log_path = attempt_log_path.clone();
+            let mut progress_error = None;
+            let mut progress_cancelled = None;
+            let mut result = {
+                let mut progress_callback = |event: ProgressEvent| {
+                    if progress_error.is_some() || progress_cancelled.is_some() {
                         return;
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        progress_error = Some(error);
+                    match durable_cancelled_job(queue, &job) {
+                        Ok(Some(cancelled)) => {
+                            progress_cancelled = Some(cancelled);
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            progress_error = Some(error);
+                            return;
+                        }
+                    }
+                    apply_progress_event(&mut job, &decision.target, &progress_log_path, event);
+                    if let Err(error) = queue.update(&job) {
+                        progress_error = Some(ShipExecutionError::Queue(error));
                         return;
                     }
-                }
-                apply_progress_event(&mut job, &decision.target, &progress_log_path, event);
-                if let Err(error) = queue.update(&job) {
-                    progress_error = Some(ShipExecutionError::Queue(error));
-                    return;
-                }
-                match durable_cancelled_job(queue, &job) {
-                    Ok(Some(cancelled)) => {
-                        progress_cancelled = Some(cancelled);
+                    match durable_cancelled_job(queue, &job) {
+                        Ok(Some(cancelled)) => {
+                            progress_cancelled = Some(cancelled);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            progress_error = Some(error);
+                        }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        progress_error = Some(error);
-                    }
-                }
+                };
+                dispatcher.validate(DispatchValidationRequest {
+                    job_id: Some(dispatch_job_id),
+                    defer_host_pool_lease_unavailable: options.defer_host_pool_lease_unavailable,
+                    sha: request.sha.clone(),
+                    branch: request.branch.clone(),
+                    target: &decision.target,
+                    log_path: attempt_log_path,
+                    resume_from: decision.resume_from.clone(),
+                    mode: request.mode,
+                    progress_callback: Some(&mut progress_callback),
+                })
             };
-            dispatcher.validate(DispatchValidationRequest {
-                job_id: Some(dispatch_job_id),
-                defer_host_pool_lease_unavailable,
-                sha: request.sha.clone(),
-                branch: request.branch.clone(),
-                target: &decision.target,
-                log_path,
-                resume_from: decision.resume_from.clone(),
-                mode: request.mode,
-                progress_callback: Some(&mut progress_callback),
-            })
+            if let Some(error) = progress_error {
+                return Err(error);
+            }
+            if let Some(cancelled) = progress_cancelled {
+                return Ok(TargetExecutionOutcome::Completed(cancelled));
+            }
+            if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
+                return Ok(TargetExecutionOutcome::Completed(cancelled));
+            }
+            // A scheduler-deferred result is never terminal — it must not be
+            // retried or persisted as a failure; hand it back on the defer path.
+            if result.is_scheduler_deferred() {
+                let reason = result
+                    .scheduler_defer_reason
+                    .clone()
+                    .unwrap_or_else(|| "scheduler_deferred".to_owned());
+                return Ok(TargetExecutionOutcome::Deferred { job, reason });
+            }
+            maybe_reclassify_on_host_incident(&mut result, options.reclassify_vitals_path);
+
+            // Re-run only a transient local INFRA blip, bounded by the policy.
+            let should_retry = attempt < options.transient_retry.max_retries()
+                && !result.passed()
+                && result.backend == "local"
+                && crate::classify::same_leg_local_retryable(result.failure_class.as_deref());
+            if !should_retry {
+                break annotate_retry_history(result, &prior_transient);
+            }
+
+            // A cancel may have landed while this attempt ran; honor it before
+            // spending another attempt.
+            if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
+                return Ok(TargetExecutionOutcome::Completed(cancelled));
+            }
+            prior_transient.push(format!(
+                "attempt {}: {} (log {})",
+                attempt + 1,
+                result.failure_class.as_deref().unwrap_or("INFRA"),
+                progress_log_path.display()
+            ));
+            attempt += 1;
         };
-        if let Some(error) = progress_error {
-            return Err(error);
-        }
-        if let Some(cancelled) = progress_cancelled {
-            return Ok(TargetExecutionOutcome::Completed(cancelled));
-        }
-        if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
-            return Ok(TargetExecutionOutcome::Completed(cancelled));
-        }
-        if result.is_scheduler_deferred() {
-            let reason = result
-                .scheduler_defer_reason
-                .clone()
-                .unwrap_or_else(|| "scheduler_deferred".to_owned());
-            return Ok(TargetExecutionOutcome::Deferred { job, reason });
-        }
-        maybe_reclassify_on_host_incident(&mut result, reclassify_vitals_path);
+
         job = job.with_result(result.clone());
         queue.update(&job)?;
         if !result.passed() {
@@ -1709,6 +1773,53 @@ fn cancelled_result(
     result.started_at = started_at;
     result.completed_at = Some(Utc::now());
     result.error_message = Some("Skipped (earlier target failed, --fail-fast)".to_owned());
+    result
+}
+
+/// Log path for a given same-backend retry attempt of a target. Attempt 0 uses
+/// the stable base path, so a run with retries disabled is byte-identical to
+/// before. Each retry writes to a distinct `.retry<N>` sibling, so re-running
+/// never truncates the failing attempt's log — that preserved evidence is
+/// exactly what makes a transient-vs-real determination possible after the fact.
+/// Distinct from the dispatch layer's `.attempt-<N>` cross-backend failover logs.
+fn retry_attempt_log_path(base: &Path, attempt: u32) -> PathBuf {
+    if attempt == 0 {
+        return base.to_path_buf();
+    }
+    let mut file_name = base
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    file_name.push(format!(".retry{attempt}"));
+    base.with_file_name(file_name)
+}
+
+/// Fold same-backend retry history into the terminal result so the outcome is
+/// honest about the re-runs. No retries → returned unchanged. A recovered
+/// (passed) result records the recovery in `phase` and never in `error_message`
+/// — a non-empty `error_message` is read elsewhere as a failure signal. A result
+/// that is still failing appends the transient history to `error_message`,
+/// matching the incident-reclassification note style.
+fn annotate_retry_history(mut result: TargetResult, prior_transient: &[String]) -> TargetResult {
+    if prior_transient.is_empty() {
+        return result;
+    }
+    let retries = prior_transient.len();
+    let plural = if retries == 1 { "y" } else { "ies" };
+    let history = prior_transient.join("; ");
+    if result.passed() {
+        result.phase = Some(format!(
+            "recovered after {retries} same-backend transient retr{plural} ({history})"
+        ));
+    } else {
+        let note = format!(
+            "Same-backend transient retry exhausted after {retries} retr{plural} ({history})."
+        );
+        result.error_message = Some(match result.error_message.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}\n{note}"),
+            _ => note,
+        });
+    }
     result
 }
 
@@ -1953,6 +2064,7 @@ fn effective_warm_resume(requested_resume_from: Option<&str>) -> &str {
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Duration as StdDuration;
 
@@ -1961,10 +2073,12 @@ mod tests {
 
     use super::{
         CooperativeDrainOptions, RunExecutionRequest, RunStores, ShipExecutionError,
-        ShipExecutionRequest, ShipStores, ShipTargetDispatcher, WarmPoolUpdate, apply_warm_reuse,
-        cap_admit_pass_workers, drain_or_wait_run, drain_or_wait_run_with_options, execute_run,
-        execute_run_worker, execute_ship, execute_ship_worker, execute_targets_with_options,
-        load_run_outcome, load_ship_outcome, submit_run, submit_ship, update_warm_pool_after_run,
+        ShipExecutionRequest, ShipStores, ShipTargetDispatcher, TargetExecOptions,
+        TargetExecutionOutcome, WarmPoolUpdate, apply_warm_reuse, cap_admit_pass_workers,
+        drain_or_wait_run, drain_or_wait_run_with_options, execute_run, execute_run_worker,
+        execute_ship, execute_ship_worker, execute_targets_with_options, load_run_outcome,
+        load_ship_outcome, retry_attempt_log_path, submit_run, submit_ship, target_log_path,
+        update_warm_pool_after_run,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::EvidenceStore;
@@ -1972,7 +2086,7 @@ mod tests {
         DispatchValidationRequest, ResolvedTarget, resolve_targets_from_table,
     };
     use crate::executor::streaming::ProgressEvent;
-    use crate::job::{JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
+    use crate::job::{Job, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
     use crate::queue::Queue;
     use crate::queue_request::{
         QueueOutcomeStore, QueueRequestStore, QueuedExecutionOutcome, QueuedExecutionRequest,
@@ -2985,8 +3099,11 @@ mod tests {
             &warm_pool,
             &dispatcher,
             started.clone(),
-            true,
-            None,
+            super::TargetExecOptions {
+                defer_host_pool_lease_unavailable: true,
+                reclassify_vitals_path: None,
+                transient_retry: crate::ship_retry::TransientRetryPolicy::disabled(),
+            },
         )
         .expect("targets");
 
@@ -3486,6 +3603,407 @@ mod tests {
         assert!(
             reconciled.evidence_snapshot.is_empty(),
             "stale evidence cleared so the new head re-validates"
+        );
+    }
+
+    /// Dispatcher that returns a scripted `(status, failure_class)` per attempt
+    /// (last entry repeats), writes a distinct log file per attempt so evidence
+    /// preservation is observable, and can cancel the durable job after a chosen
+    /// attempt to exercise the retry loop's cancellation handling. `Mutex`-backed
+    /// so it satisfies the `Sync` bound the ship entrypoints require.
+    struct SequenceDispatcher {
+        steps: Vec<(TargetStatus, Option<&'static str>)>,
+        cancel_after_attempt: Option<usize>,
+        seen_log_paths: Mutex<Vec<PathBuf>>,
+    }
+
+    impl SequenceDispatcher {
+        fn new(steps: Vec<(TargetStatus, Option<&'static str>)>) -> Self {
+            Self {
+                steps,
+                cancel_after_attempt: None,
+                seen_log_paths: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn cancelling_after(mut self, attempt: usize) -> Self {
+            self.cancel_after_attempt = Some(attempt);
+            self
+        }
+
+        fn call_count(&self) -> usize {
+            self.seen_log_paths.lock().expect("seen lock").len()
+        }
+    }
+
+    impl ShipTargetDispatcher for SequenceDispatcher {
+        fn validate(&self, request: DispatchValidationRequest<'_, '_>) -> TargetResult {
+            let index = {
+                let mut seen = self.seen_log_paths.lock().expect("seen lock");
+                let idx = seen.len();
+                seen.push(request.log_path.clone());
+                idx
+            };
+            if let Some(parent) = request.log_path.parent() {
+                std::fs::create_dir_all(parent).expect("log dir");
+            }
+            std::fs::write(&request.log_path, format!("attempt {index}\n")).expect("log write");
+            let (status, failure_class) = self
+                .steps
+                .get(index)
+                .or_else(|| self.steps.last())
+                .copied()
+                .expect("at least one step");
+            let now = Utc::now();
+            let mut result = TargetResult::new(
+                request.target.name.clone(),
+                request.target.platform.clone(),
+                status,
+                request.target.backend_name.clone(),
+            );
+            result.started_at = Some(now);
+            result.completed_at = Some(now);
+            result.log_path = Some(request.log_path.to_string_lossy().into_owned());
+            result.failure_class = failure_class.map(str::to_owned);
+            if self.cancel_after_attempt == Some(index) {
+                cancel_job_from_log_path(&request.log_path);
+            }
+            result
+        }
+    }
+
+    fn drive_targets(
+        target: ResolvedTarget,
+        dispatcher: &(impl ShipTargetDispatcher + Sync),
+        policy: crate::ship_retry::TransientRetryPolicy,
+    ) -> (tempfile::TempDir, Job, PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let target_name = target.name.clone();
+        let request = ship_request(vec![target]);
+        let job = submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("held");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&job.id))
+            .expect("start")
+            .pop()
+            .expect("started");
+        let base_log = target_log_path(&state_dir, &started.id, &target_name);
+        let outcome = execute_targets_with_options(
+            &request,
+            &state_dir,
+            &mut queue,
+            &warm_pool,
+            dispatcher,
+            started,
+            TargetExecOptions {
+                defer_host_pool_lease_unavailable: false,
+                reclassify_vitals_path: None,
+                transient_retry: policy,
+            },
+        )
+        .expect("targets");
+        let job = match outcome {
+            TargetExecutionOutcome::Completed(job) => job,
+            other @ TargetExecutionOutcome::Deferred { .. } => {
+                panic!("expected completed, got {other:?}")
+            }
+        };
+        (temp, job, base_log)
+    }
+
+    fn only_result(job: &Job) -> &TargetResult {
+        job.results.values().next().expect("one target result")
+    }
+
+    #[test]
+    fn transient_retry_disabled_runs_single_attempt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("INFRA"))]);
+
+        let (_temp, job, base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::disabled(),
+        );
+
+        // Default policy = exactly one attempt, byte-identical to no-retry.
+        assert_eq!(dispatcher.call_count(), 1);
+        let result = only_result(&job);
+        assert_eq!(result.status, TargetStatus::Fail);
+        assert!(
+            result.error_message.is_none(),
+            "no retry note when disabled"
+        );
+        assert!(result.phase.is_none());
+        assert!(
+            !retry_attempt_log_path(&base_log, 1).exists(),
+            "no retry log written"
+        );
+    }
+
+    #[test]
+    fn transient_local_infra_recovers_on_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let dispatcher = SequenceDispatcher::new(vec![
+            (TargetStatus::Fail, Some("INFRA")),
+            (TargetStatus::Pass, None),
+        ]);
+
+        let (_temp, job, base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(1),
+        );
+
+        assert_eq!(dispatcher.call_count(), 2, "one retry after the INFRA blip");
+        let result = only_result(&job);
+        assert!(result.passed(), "recovered on the retry");
+        // A recovered result records the retry in `phase`, never `error_message`
+        // (a non-empty message is read elsewhere as a failure signal).
+        assert!(result.error_message.is_none());
+        assert!(
+            result
+                .phase
+                .as_deref()
+                .unwrap_or_default()
+                .contains("recovered"),
+            "phase notes the recovery: {:?}",
+            result.phase
+        );
+        // Both attempts' logs are preserved under distinct paths.
+        assert!(base_log.exists(), "attempt-0 log preserved");
+        let retry_log = retry_attempt_log_path(&base_log, 1);
+        assert!(retry_log.exists(), "retry log written to a distinct path");
+        assert_ne!(base_log, retry_log);
+        assert_eq!(
+            std::fs::read_to_string(&base_log).expect("read base"),
+            "attempt 0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&retry_log).expect("read retry"),
+            "attempt 1\n"
+        );
+    }
+
+    #[test]
+    fn transient_local_infra_exhausts_retries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("INFRA"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(1),
+        );
+
+        assert_eq!(dispatcher.call_count(), 2, "first attempt + one retry");
+        let result = only_result(&job);
+        assert_eq!(result.status, TargetStatus::Fail);
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("transient retry exhausted"),
+            "failure note records the exhausted retry: {:?}",
+            result.error_message
+        );
+    }
+
+    #[test]
+    fn transient_local_test_failure_is_not_retried() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        // An authoritative TEST failure must never be masked behind a retry.
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("TEST"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(
+            dispatcher.call_count(),
+            1,
+            "TEST is authoritative, no retry"
+        );
+        let result = only_result(&job);
+        assert_eq!(result.status, TargetStatus::Fail);
+        assert!(result.error_message.is_none());
+    }
+
+    #[test]
+    fn transient_local_contract_failure_is_not_retried() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("CONTRACT"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(dispatcher.call_count(), 1, "CONTRACT is never retried");
+        assert_eq!(only_result(&job).status, TargetStatus::Fail);
+    }
+
+    #[test]
+    fn transient_local_timeout_is_not_retried_same_leg() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        // Same-backend retry is stricter than the global taxonomy: a local
+        // TIMEOUT would just re-burn the wall-clock budget, so it is not re-run.
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("TIMEOUT"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(dispatcher.call_count(), 1, "local TIMEOUT is not re-run");
+        assert_eq!(only_result(&job).status, TargetStatus::Fail);
+    }
+
+    #[test]
+    fn transient_remote_infra_is_not_retried_same_leg() {
+        // A non-local backend already has next-backend failover; same-leg retry
+        // is local-only.
+        let dispatcher = SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("INFRA"))]);
+
+        let (_temp, job, _base_log) = drive_targets(
+            ssh_target(),
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(
+            dispatcher.call_count(),
+            1,
+            "remote INFRA is not re-run in place"
+        );
+        assert_eq!(only_result(&job).status, TargetStatus::Fail);
+    }
+
+    #[test]
+    fn transient_retry_honors_cancellation_between_attempts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        // Cancel the durable job during attempt 0; the retry loop must stop
+        // rather than spend another attempt.
+        let dispatcher =
+            SequenceDispatcher::new(vec![(TargetStatus::Fail, Some("INFRA"))]).cancelling_after(0);
+
+        let (_temp, job, _base_log) = drive_targets(
+            target,
+            &dispatcher,
+            crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+        );
+
+        assert_eq!(dispatcher.call_count(), 1, "no retry after cancellation");
+        assert_eq!(job.status, JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn transient_retry_never_touches_scheduler_deferred() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        // A scheduler-deferred result must stay on the defer path, never retried.
+        let dispatcher = FakeDispatcher::new(TargetStatus::Pending)
+            .with_scheduler_defer("host_pool_lease_unavailable");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let request = ship_request(vec![target]);
+        let job = submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("held");
+        let started = queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&job.id))
+            .expect("start")
+            .pop()
+            .expect("started");
+
+        let outcome = execute_targets_with_options(
+            &request,
+            &state_dir,
+            &mut queue,
+            &warm_pool,
+            &dispatcher,
+            started,
+            TargetExecOptions {
+                defer_host_pool_lease_unavailable: true,
+                reclassify_vitals_path: None,
+                transient_retry: crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+            },
+        )
+        .expect("targets");
+
+        match outcome {
+            TargetExecutionOutcome::Deferred { reason, .. } => {
+                assert_eq!(reason, "host_pool_lease_unavailable");
+            }
+            other @ TargetExecutionOutcome::Completed(_) => {
+                panic!("expected scheduler deferral, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn execute_ship_retries_transient_local_infra_from_config() {
+        // End-to-end through the real ship entrypoint: config opt-in →
+        // resolved policy → same-backend retry → recovered pass.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = local_target("mac", "macos-arm64", temp.path());
+        let mut queue = Queue::new(temp.path().join("state")).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(temp.path().join("ship")).expect("ship");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SequenceDispatcher::new(vec![
+            (TargetStatus::Fail, Some("INFRA")),
+            (TargetStatus::Pass, None),
+        ]);
+        let request = ship_request(vec![target]);
+        let config = LoadedConfig {
+            data: table("[ship]\ntransient_local_retries = 1\n"),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        };
+
+        let outcome = execute_ship(
+            &request,
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: temp.path(),
+                config: &config,
+            },
+            &dispatcher,
+        )
+        .expect("execute");
+
+        assert_eq!(dispatcher.call_count(), 2, "config opt-in drove one retry");
+        assert!(
+            outcome.job.passed(),
+            "recovered through the ship entrypoint"
         );
     }
 }
