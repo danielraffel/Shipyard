@@ -687,6 +687,22 @@ There is no `shipyard config` or `shipyard targets` subcommand yet. Inspect
 target definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml`,
 and use `shipyard status --json` for live target state.
 
+### Same-backend transient retry (`[ship] transient_local_retries`)
+
+Off by default (`0`, clamped `0..=2`). When set, a **local** leg that fails with
+a transient `INFRA` blip is re-run once (up to the bound) on the same backend
+before recording the failure — for a momentary network/runner hiccup, not a real
+test failure. Deliberately `INFRA`-only: a local `TIMEOUT` would just re-burn its
+wall-clock budget, and `CONTRACT`/`TEST`/`TREE_DRIFT` are authoritative. Remote
+legs already have next-backend fallback, so same-leg retry is local-only. With
+the default `0`, execution is byte-identical to no retry. Details:
+`docs/local-mac-pool.md` § Same-backend transient retry.
+
+```toml
+[ship]
+transient_local_retries = 1   # 0 = off (default)
+```
+
 ### Local Mac capacity
 
 For simple two-Mac capacity, use explicit ordered fallback:

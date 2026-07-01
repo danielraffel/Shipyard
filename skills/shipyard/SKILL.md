@@ -296,6 +296,19 @@ Behavior when `gate=true`: green/absent → silent; warn → warn + proceed;
 critical → warn + proceed, or fail (exit 4) when `block_on_critical`. Full table:
 `docs/local-mac-pool.md` § Host-Health Pre-Dispatch Gate.
 
+**Same-backend transient retry (`[ship] transient_local_retries`).** Off by
+default (`0`, clamped `0..=2`). When set, a **local** leg that fails with a
+transient `INFRA` blip is re-run once (or up to the bound) on the same backend
+before the failure is recorded. Deliberately stricter than the global
+`is_retryable` taxonomy: **`INFRA` only** — a local `TIMEOUT` would just re-burn
+its wall-clock budget, and `CONTRACT`/`TEST`/`TREE_DRIFT` are authoritative.
+Remote legs already have next-backend failover, so same-leg retry is local-only.
+Each retry uses a distinct `<log>.retry<N>` path (attempt-0 evidence preserved);
+a recovered leg is noted in `phase`, an exhausted one in its error message. With
+the default `0`, execution is byte-identical to no retry. Composes with
+`classify_local_failures` (a relabelled-`INFRA` failure becomes retry-eligible).
+Full behavior: `docs/local-mac-pool.md` § Same-backend transient retry.
+
 ## Durable Queue: killed-worker recovery (stale-running reaping)
 
 A `shipyard ship` / `shipyard pr` worker that is killed (SIGTERM, crash,
