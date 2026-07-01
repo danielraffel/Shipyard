@@ -90,6 +90,28 @@ pub fn is_retryable(failure_class: FailureClass) -> bool {
     matches!(failure_class, FailureClass::Infra | FailureClass::Timeout)
 }
 
+/// Return the class a failed target's `failure_class` should become when — and
+/// ONLY when — the caller has independently confirmed a host infrastructure
+/// incident (jetsam / `WindowServer` crash) overlapped the leg. `Some(Infra)` if
+/// `current` is `TEST`, else `None`.
+///
+/// This function does NOT check for an incident itself: it is a pure
+/// eligibility rule. Only a `TEST` failure (a non-zero exit with no infra
+/// marker) is promotable — exactly the ambiguous case a concurrent host incident
+/// best explains. `CONTRACT`, `TIMEOUT`, `TREE_DRIFT`, an already-`INFRA`, and
+/// `UNKNOWN` are authoritative and kept, so a genuine validation-contract
+/// violation is never masked behind an infra label. Callers must gate on a
+/// confirmed overlap (see `crate::host_health::incident_from_path`) before
+/// applying the result.
+#[must_use]
+pub fn promote_test_to_infra(current: Option<&str>) -> Option<FailureClass> {
+    if current == Some(FailureClass::Test.as_str()) {
+        Some(FailureClass::Infra)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FailureClass, classify_failure, is_retryable};
@@ -166,5 +188,28 @@ mod tests {
             serde_json::to_string(&FailureClass::Infra).expect("json"),
             r#""INFRA""#
         );
+    }
+
+    #[test]
+    fn promote_only_acts_on_test() {
+        use super::promote_test_to_infra;
+        assert_eq!(
+            promote_test_to_infra(Some("TEST")),
+            Some(FailureClass::Infra)
+        );
+    }
+
+    #[test]
+    fn promote_keeps_authoritative_classes() {
+        use super::promote_test_to_infra;
+        // A real contract/timeout/tree-drift/infra/unknown is never masked.
+        for class in ["CONTRACT", "TIMEOUT", "TREE_DRIFT", "INFRA", "UNKNOWN"] {
+            assert_eq!(
+                promote_test_to_infra(Some(class)),
+                None,
+                "{class} must not be reclassified"
+            );
+        }
+        assert_eq!(promote_test_to_infra(None), None);
     }
 }

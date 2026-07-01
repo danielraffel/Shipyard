@@ -173,9 +173,11 @@ crash-avoidance.
 
 ```toml
 [host_health]
-gate = true                # master opt-in; when false the signal is never read
-block_on_critical = false  # true = a `critical` reading hard-stops preflight (exit 4)
-                           #        (default: surface a warning and proceed)
+gate = true                    # master opt-in; when false the signal is never read
+block_on_critical = false      # true = a `critical` reading hard-stops preflight (exit 4)
+                               #        (default: surface a warning and proceed)
+classify_local_failures = false # true = relabel a LOCAL leg's TEST failure as INFRA when a
+                               #        host jetsam/WindowServer crash overlapped its window
 # file = "/custom/path/host_vitals.json"   # default: ~/.local/state/pulp/host_vitals.json
 ```
 
@@ -195,3 +197,19 @@ that writes `~/.local/state/pulp/host_vitals.json` — the default path here).
 | critical | proceed, print a warning | **fail preflight (exit 4)** |
 
 The `SHIPYARD_HOST_VITALS_FILE` env var overrides the path (primarily for tests).
+
+#### Infra-vs-code failure labelling (`classify_local_failures`)
+
+A separate, independent opt-in. When on, a **local** leg that fails with a plain
+`TEST` class (a non-zero exit with no infra marker) is relabelled `INFRA` — with
+an honest note on the result — if the `host_vitals` signal shows a jetsam or
+`WindowServer` crash whose reconstructed time (`file mtime − age_s`) overlaps the
+leg's `[started, completed]` window. This distinguishes "your code failed" from
+"the host shed load under you", so the author isn't sent to debug a green tree.
+
+Deliberately conservative: only a `TEST` class is eligible (a real `CONTRACT` /
+`TIMEOUT` / `TREE_DRIFT` is authoritative and kept), only local legs are
+considered (SSH/cloud DiagnosticReports live on another host), and it is a
+**pure label** — it never changes `TargetStatus`, so a failed leg still blocks
+merge exactly as before (merge readiness keys on pass/fail, not the class). Fails
+open: an absent/stale/unreadable signal leaves the original class untouched.

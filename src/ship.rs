@@ -544,8 +544,10 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         ship_state,
         warm_pool,
         state_dir,
+        config,
         ..
     } = stores;
+    let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
     if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
         return Ok(ShipExecutionOutcome {
             job: cancelled,
@@ -587,6 +589,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         dispatcher,
         job,
         defer_host_pool_lease_unavailable,
+        reclassify_vitals_path.as_deref(),
     )?
     .into_completed()?;
     if job.status == JobStatus::Cancelled {
@@ -792,8 +795,10 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         evidence,
         warm_pool,
         state_dir,
+        config,
         ..
     } = stores;
+    let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
     if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
         return Ok(RunExecutionOutcome { job: cancelled });
     }
@@ -824,6 +829,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         dispatcher,
         job,
         defer_host_pool_lease_unavailable,
+        reclassify_vitals_path.as_deref(),
     )?
     .into_completed()?;
     if job.status == JobStatus::Cancelled {
@@ -1376,6 +1382,10 @@ fn unsaved_ship_state(request: &ShipExecutionRequest, target_names: &[String]) -
 }
 
 #[allow(clippy::too_many_lines)]
+// This internal execution loop threads several heterogeneous handles (stores,
+// dispatcher, job, per-run flags); a params struct would be a reasonable future
+// tidy-up but is out of scope for the host-incident opt-in that adds the 8th arg.
+#[allow(clippy::too_many_arguments)]
 fn execute_targets_with_options<D: ShipTargetDispatcher>(
     request: &ShipExecutionRequest,
     state_dir: &Path,
@@ -1384,6 +1394,7 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
     dispatcher: &D,
     mut job: Job,
     defer_host_pool_lease_unavailable: bool,
+    reclassify_vitals_path: Option<&Path>,
 ) -> Result<TargetExecutionOutcome, ShipExecutionError> {
     let mut had_failure = false;
     for target in &request.targets {
@@ -1411,7 +1422,7 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
         let progress_log_path = log_path.clone();
         let mut progress_error = None;
         let mut progress_cancelled = None;
-        let result = {
+        let mut result = {
             let mut progress_callback = |event: ProgressEvent| {
                 if progress_error.is_some() || progress_cancelled.is_some() {
                     return;
@@ -1470,6 +1481,7 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
                 .unwrap_or_else(|| "scheduler_deferred".to_owned());
             return Ok(TargetExecutionOutcome::Deferred { job, reason });
         }
+        maybe_reclassify_on_host_incident(&mut result, reclassify_vitals_path);
         job = job.with_result(result.clone());
         queue.update(&job)?;
         if !result.passed() {
@@ -1487,6 +1499,44 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
         .map_err(ShipExecutionError::WarmPool)?;
     }
     Ok(TargetExecutionOutcome::Completed(job))
+}
+
+/// Opt-in, fail-open host-incident reclassification. When enabled (a resolved
+/// vitals path is present), a LOCAL leg that failed with a plain `TEST` class is
+/// relabeled `INFRA` — with an honest note — if a host infra incident (jetsam /
+/// `WindowServer` crash) overlapped its window, so the author isn't misled into
+/// debugging their own code after the host shed load under them. Purely a label
+/// plus note: it never changes `TargetStatus`, so merge readiness (which keys on
+/// status, not `failure_class`) is unaffected. No-op for remote/cloud legs, any
+/// non-`TEST` class, or an absent/stale signal.
+fn maybe_reclassify_on_host_incident(
+    result: &mut TargetResult,
+    reclassify_vitals_path: Option<&Path>,
+) {
+    let Some(path) = reclassify_vitals_path else {
+        return;
+    };
+    if result.passed() || result.backend != "local" {
+        return;
+    }
+    let (Some(started_at), Some(completed_at)) = (result.started_at, result.completed_at) else {
+        return;
+    };
+    // Cheap class-eligibility check before the filesystem probe.
+    let Some(new_class) = crate::classify::promote_test_to_infra(result.failure_class.as_deref())
+    else {
+        return;
+    };
+    let Some(reason) = crate::host_health::incident_from_path(path, started_at, completed_at)
+    else {
+        return;
+    };
+    result.failure_class = Some(new_class.as_str().to_owned());
+    let note = format!("Reclassified to {new_class} — {reason}");
+    result.error_message = Some(match result.error_message.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}\n{note}"),
+        _ => note,
+    });
 }
 
 fn apply_progress_event(
@@ -1906,7 +1956,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration as StdDuration;
 
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use toml::Table;
 
     use super::{
@@ -1933,6 +1983,125 @@ mod tests {
 
     fn table(input: &str) -> Table {
         input.parse::<Table>().expect("valid TOML")
+    }
+
+    // ---- host-incident reclassification seam (Part 2) ----
+
+    fn failed_local_test_result(started: DateTime<Utc>, completed: DateTime<Utc>) -> TargetResult {
+        let mut result = TargetResult::new("mac", "macos-arm64", TargetStatus::Fail, "local");
+        result.started_at = Some(started);
+        result.completed_at = Some(completed);
+        result.failure_class = Some("TEST".to_owned());
+        result
+    }
+
+    fn write_host_vitals(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("host_vitals.json");
+        std::fs::write(&path, body).expect("write vitals");
+        path
+    }
+
+    #[test]
+    fn reclassify_promotes_local_test_to_infra_on_overlapping_jetsam() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("INFRA"));
+        assert!(
+            result.error_message.unwrap_or_default().contains("jetsam"),
+            "reclassification should note the reason"
+        );
+    }
+
+    #[test]
+    fn reclassify_is_noop_without_a_resolved_path() {
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        super::maybe_reclassify_on_host_incident(&mut result, None);
+        assert_eq!(result.failure_class.as_deref(), Some("TEST"));
+    }
+
+    #[test]
+    fn reclassify_skips_remote_backends() {
+        // SSH/cloud legs run on another host; local DiagnosticReports don't apply.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        result.backend = "ssh".to_owned();
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("TEST"));
+    }
+
+    #[test]
+    fn reclassify_never_masks_a_contract_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        result.failure_class = Some("CONTRACT".to_owned());
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("CONTRACT"));
+    }
+
+    #[test]
+    fn reclassify_skips_when_no_incident_overlaps_the_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Jetsam ~28h ago → far before a recent leg window.
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":100000}"#);
+        let now = Utc::now();
+        let mut result = failed_local_test_result(now - Duration::seconds(10), now);
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("TEST"));
+    }
+
+    #[test]
+    fn reclassify_preserves_the_original_failure_message() {
+        // The real test-failure message must survive — the infra note is appended,
+        // not substituted, so evidence of what actually failed isn't lost.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result =
+            failed_local_test_result(now - Duration::hours(1), now + Duration::hours(1));
+        result.error_message = Some("assertion failed: foo == bar".to_owned());
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("INFRA"));
+        let message = result.error_message.expect("message");
+        assert!(
+            message.contains("assertion failed: foo == bar"),
+            "original preserved: {message}"
+        );
+        assert!(message.contains("jetsam"), "note appended: {message}");
+    }
+
+    #[test]
+    fn reclassify_skips_when_timestamps_are_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let mut result = TargetResult::new("mac", "macos-arm64", TargetStatus::Fail, "local");
+        result.failure_class = Some("TEST".to_owned());
+        // started_at / completed_at left None → cannot bound a window, so no-op.
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class.as_deref(), Some("TEST"));
+    }
+
+    #[test]
+    fn reclassify_skips_a_passed_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_host_vitals(dir.path(), r#"{"jetsam_age_s":5}"#);
+        let now = Utc::now();
+        let mut result = TargetResult::new("mac", "macos-arm64", TargetStatus::Pass, "local");
+        result.started_at = Some(now - Duration::hours(1));
+        result.completed_at = Some(now + Duration::hours(1));
+        super::maybe_reclassify_on_host_incident(&mut result, Some(&path));
+        assert_eq!(result.failure_class, None);
     }
 
     fn empty_config(root: &std::path::Path) -> LoadedConfig {
@@ -2817,6 +2986,7 @@ mod tests {
             &dispatcher,
             started.clone(),
             true,
+            None,
         )
         .expect("targets");
 

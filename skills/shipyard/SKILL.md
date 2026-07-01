@@ -274,10 +274,19 @@ reachability gates correctness, host-health gates only crash-avoidance.)
 
 ```toml
 [host_health]
-gate = true                # master opt-in
-block_on_critical = false  # true → `critical` hard-stops preflight (exit 4); default warns
+gate = true                     # master opt-in (pre-dispatch gate)
+block_on_critical = false       # true → `critical` hard-stops preflight (exit 4); default warns
+classify_local_failures = false # true → relabel a local TEST failure as INFRA when a host
+                                #        jetsam/WindowServer crash overlapped the leg window
 # file = "/custom/host_vitals.json"   # default: ~/.local/state/pulp/host_vitals.json
 ```
+
+`classify_local_failures` is an independent opt-in: it relabels a **local** leg's
+`TEST` failure to `INFRA` (with an honest note) when the signal shows a host
+incident during the leg. Conservative — only `TEST` is eligible, only local legs,
+and it's a pure label (never flips `TargetStatus`, so a failed leg still blocks
+merge). Fails open. Full behavior: `docs/local-mac-pool.md` § Infra-vs-code
+failure labelling.
 
 Signal contract: JSON with numeric `code` (0/10/20) and/or string `level`
 (green/warn/critical) + optional `reason`; `code` wins. Shipyard ships no
