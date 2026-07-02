@@ -373,20 +373,27 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   stay report-only (T-diagnostic below): a terminal-but-unfinalized job may be a
   success mid-write, and the weaker signals are inferences. Fail-**closed**: an
   unavailable/absent queue never abandons.
-- **Writes:** under the per-PR lock, re-checks the state is still in flight
-  (`ship_terminal_verdict` still `None`) and still a `queue_stale` orphan against
-  the snapshot, then `mark_abandoned(AbandonRecord { reason, evidence,
+- **Writes:** the sweep snapshot only *selects candidates*; the destructive
+  decision is re-made per PR under the per-PR lock. There it re-checks the state
+  is still in flight (`ship_terminal_verdict` still `None`) and re-classifies it
+  as a `queue_stale` orphan against a **fresh queue read** (never the sweep-wide
+  snapshot), then `mark_abandoned(AbandonRecord { reason, evidence,
   stalled_minutes, job_id, abandoned_at })`. Emits a `ship_state_abandoned`
   daemon IPC event.
 - **Effect:** the wait/auto-merge path sees a terminal failure and stops blocking;
   the state is **never merged**. Recovery stays operator-driven — a human
-  re-ships (`shipyard ship <pr>`), creating a fresh attempt. The sweep does
-  **not** auto-re-dispatch, so there is no resume→die→resume loop.
+  re-ships (`shipyard ship <pr>`), which clears the `abandoned` marker (both the
+  reuse and archive-and-replace paths) so the re-validated PR is no longer
+  short-circuited to failure. The sweep does **not** auto-re-dispatch, so there
+  is no resume→die→resume loop.
 - **Idempotent:** an abandoned state is terminal, so the next sweep's
   `classify_orphan` returns `None` — it is never re-abandoned.
 - **Failure modes**
-  - A verdict lands between the snapshot and the per-PR lock → the under-lock
-    `ship_terminal_verdict` re-check skips it (counted as `raced`).
+  - A verdict lands between candidate selection and the per-PR lock → the
+    under-lock `ship_terminal_verdict` re-check skips it (counted as `raced`).
+  - A re-ship's worker starts (or a job resumes) during the sweep → the
+    under-lock **fresh** queue read sees the owner live, so the live re-ship is
+    never abandoned (counted as `raced`).
   - Config load fails in the daemon worker → the sweep no-ops for that pass.
 
 ## Diagnostic: orphan reporting (no transition)

@@ -23,12 +23,11 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::config::LoadedConfig;
 use crate::ship_liveness::{
-    LivenessContext, OrphanEvidence, auto_resume_enabled, collect_orphans, orphan_stale_after,
-    with_liveness_context,
+    OrphanEvidence, auto_resume_enabled, collect_orphans, orphan_stale_after, with_liveness_context,
 };
 use crate::ship_state::{AbandonRecord, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
@@ -72,24 +71,26 @@ pub fn sweep_orphaned_ship_states(
         return AbandonReport::default();
     };
     let stale_after = orphan_stale_after(config);
-    with_liveness_context(state_dir, stale_after, |liveness| {
-        let mut report = AbandonReport::default();
-        // Only the strongest evidence (a provably dead owning worker) may trigger
-        // the destructive abandon; everything weaker stays report-only.
-        let strong: Vec<u64> = collect_orphans(&store, liveness, now)
+    // Detection pass: a cheap snapshot classification only decides which PRs are
+    // *candidates*. The authoritative destructive decision is re-made per PR,
+    // under its lock, against a fresh queue read (see `abandon_one`) — so a
+    // worker that started or resumed since this snapshot is never abandoned.
+    let strong: Vec<u64> = with_liveness_context(state_dir, stale_after, |liveness| {
+        collect_orphans(&store, liveness, now)
             .into_iter()
             .filter(|(_, orphan)| orphan.evidence == OrphanEvidence::QueueStale)
             .map(|(pr, _)| pr)
-            .collect();
-        for pr in strong {
-            match abandon_one(&store, liveness, pr, now) {
-                AbandonOutcome::Abandoned(entry) => report.abandoned.push(entry),
-                AbandonOutcome::Raced => report.raced += 1,
-                AbandonOutcome::Skipped => {}
-            }
+            .collect()
+    });
+    let mut report = AbandonReport::default();
+    for pr in strong {
+        match abandon_one(&store, state_dir, stale_after, pr, now) {
+            AbandonOutcome::Abandoned(entry) => report.abandoned.push(entry),
+            AbandonOutcome::Raced => report.raced += 1,
+            AbandonOutcome::Skipped => {}
         }
-        report
-    })
+    }
+    report
 }
 
 enum AbandonOutcome {
@@ -99,12 +100,15 @@ enum AbandonOutcome {
 }
 
 /// Abandon a single PR's ship-state under its per-PR lock, re-verifying at lock
-/// time that it is still a strong (`QueueStale`) orphan and still in flight —
-/// this defends against a verdict or a competing writer landing between the
-/// snapshot classification and acquiring the lock.
+/// time that it is still in flight AND still a strong (`QueueStale`) orphan
+/// against a **fresh** queue read — never the sweep-wide snapshot. This defends
+/// against a verdict, a competing writer, or a re-ship's worker starting between
+/// the snapshot classification and acquiring the lock: a heartbeat that landed
+/// during the sweep now shows the owning job as live, so the state is left alone.
 fn abandon_one(
     store: &ShipStateStore,
-    liveness: &LivenessContext<'_>,
+    state_dir: &Path,
+    stale_after: Duration,
     pr: u64,
     now: DateTime<Utc>,
 ) -> AbandonOutcome {
@@ -117,34 +121,40 @@ fn abandon_one(
             if ship_terminal_verdict(state).is_some() {
                 return Ok(AbandonOutcome::Raced);
             }
-            match liveness.classify(state, now) {
-                Some(orphan) if orphan.evidence == OrphanEvidence::QueueStale => {
-                    let job_id = liveness
-                        .match_job(state, now)
-                        .job()
-                        .map(|job| job.id.clone());
-                    let entry = AbandonedShipState {
-                        pr: state.pr,
-                        repo: state.repo.clone(),
-                        evidence: orphan.evidence.as_str().to_owned(),
-                        stalled_minutes: orphan.stalled_minutes,
-                    };
-                    state.mark_abandoned(AbandonRecord {
-                        reason: format!(
-                            "orphaned: {} ({}m idle); re-ship required",
-                            orphan.evidence.cause(),
-                            orphan.stalled_minutes
-                        ),
-                        evidence: orphan.evidence.as_str().to_owned(),
-                        stalled_minutes: orphan.stalled_minutes,
-                        job_id,
-                        abandoned_at: now,
-                    });
-                    Ok(AbandonOutcome::Abandoned(entry))
+            // Re-derive liveness from a fresh queue read under the lock so the
+            // destructive decision never trusts the (possibly stale) sweep
+            // snapshot.
+            let outcome = with_liveness_context(state_dir, stale_after, |liveness| {
+                match liveness.classify(state, now) {
+                    Some(orphan) if orphan.evidence == OrphanEvidence::QueueStale => {
+                        let job_id = liveness
+                            .match_job(state, now)
+                            .job()
+                            .map(|job| job.id.clone());
+                        let entry = AbandonedShipState {
+                            pr: state.pr,
+                            repo: state.repo.clone(),
+                            evidence: orphan.evidence.as_str().to_owned(),
+                            stalled_minutes: orphan.stalled_minutes,
+                        };
+                        state.mark_abandoned(AbandonRecord {
+                            reason: format!(
+                                "orphaned: {} ({}m idle); re-ship required",
+                                orphan.evidence.cause(),
+                                orphan.stalled_minutes
+                            ),
+                            evidence: orphan.evidence.as_str().to_owned(),
+                            stalled_minutes: orphan.stalled_minutes,
+                            job_id,
+                            abandoned_at: now,
+                        });
+                        AbandonOutcome::Abandoned(entry)
+                    }
+                    // No longer a strong orphan under the lock — leave it alone.
+                    _ => AbandonOutcome::Raced,
                 }
-                // No longer a strong orphan under the lock — leave it alone.
-                _ => Ok(AbandonOutcome::Raced),
-            }
+            });
+            Ok(outcome)
         })
         .unwrap_or(AbandonOutcome::Skipped)
 }
@@ -379,5 +389,34 @@ mod tests {
             report.abandoned.is_empty(),
             "a state with a verdict is terminal"
         );
+    }
+
+    #[test]
+    fn abandon_one_abandons_a_provably_dead_worker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        write_in_flight_state(dir, 1, 7);
+        enqueue_owner(dir, 1, stale_running());
+        let store = ShipStateStore::new(dir.join("ship")).expect("store");
+
+        let outcome = abandon_one(&store, dir, Duration::minutes(45), 1, Utc::now());
+        assert!(matches!(outcome, AbandonOutcome::Abandoned(_)));
+        assert!(is_abandoned(dir, 1));
+    }
+
+    #[test]
+    fn abandon_one_reads_live_queue_and_spares_a_revived_worker() {
+        // The candidate may have looked stale in the sweep snapshot, but
+        // abandon_one re-reads the queue live under the lock: a worker that is
+        // heartbeating by the time the lock is held must never be abandoned.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path();
+        write_in_flight_state(dir, 1, 90);
+        enqueue_owner(dir, 1, base_job().start().expect("start")); // live on disk
+        let store = ShipStateStore::new(dir.join("ship")).expect("store");
+
+        let outcome = abandon_one(&store, dir, Duration::minutes(45), 1, Utc::now());
+        assert!(matches!(outcome, AbandonOutcome::Raced));
+        assert!(!is_abandoned(dir, 1));
     }
 }

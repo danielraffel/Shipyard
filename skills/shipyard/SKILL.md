@@ -395,13 +395,22 @@ strongly-orphaned in-flight state it sets a terminal `abandoned` marker
 (`ship_terminal_verdict` → `Some(false)`), so the wait/auto-merge path stops
 blocking and a human re-ships. Deliberately conservative — marking a *live* ship
 failed is the one catastrophic error, so it abandons **only** on `queue_stale`
-evidence (a provably dead owning worker), re-checks in-flight status under the
-per-PR lock, and fails **closed** (an unavailable queue never abandons). It never
-auto-re-dispatches (no resume→die→resume loop), and abandonment is idempotent (an
-abandoned state is terminal). Emits a `ship_state_abandoned` daemon IPC event.
-With the default `false`, the sweep opens no queue and mutates nothing. Recovery
-without the opt-in stays operator-driven: `shipyard ship <pr>` to re-validate, or
-`shipyard ship-state discard <pr>`.
+evidence (a provably dead owning worker) and fails **closed** (an unavailable
+queue never abandons). The sweep snapshot only *selects candidates*; the abandon
+decision is re-made per PR under the per-PR lock, re-checking in-flight status
+**and re-reading the queue live** — never the sweep snapshot — so a worker that
+starts or resumes during the sweep (e.g. an operator re-shipping the moment they
+see the orphan) shows live and is spared. It never auto-re-dispatches (no
+resume→die→resume loop), and abandonment is idempotent (an abandoned state is
+terminal). Emits a `ship_state_abandoned` daemon IPC event. With the default
+`false`, the sweep opens no queue and mutates nothing.
+
+**Recovery clears the marker.** Re-shipping an abandoned PR (`shipyard ship
+<pr>`) clears `abandoned` when the ship execution begins — on both the
+reuse-existing-state and the archive-and-replace fresh-attempt paths — so the
+re-validated PR is no longer short-circuited to failure. `shipyard ship-state
+discard <pr>` remains the manual alternative. The config load is scoped to the
+daemon's own runtime mode, so an isolated daemon reads its own overlay.
 
 ### Gotchas
 

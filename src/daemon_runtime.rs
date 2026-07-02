@@ -243,6 +243,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             reconcile_in_flight = true;
             next_reconcile_at = now + Duration::from_secs(RECONCILE_INTERVAL_SECONDS);
             start_reconcile_worker(
+                config.mode,
                 config.state_dir.clone(),
                 reconcile_window.clone(),
                 reconcile_tx.clone(),
@@ -470,6 +471,7 @@ struct ReconcileWorkerResult {
 
 #[cfg(unix)]
 fn start_reconcile_worker(
+    mode: RuntimeMode,
     state_dir: PathBuf,
     mut window: ReconcileWindow,
     sender: mpsc::Sender<ReconcileWorkerResult>,
@@ -479,10 +481,12 @@ fn start_reconcile_worker(
         // Opt-in orphan-abandon sweep, same cadence as reconcile. Config is
         // reloaded each pass so toggling `[ship_state] auto_resume` takes effect
         // without a daemon restart; a load failure or the disabled default both
-        // yield an empty report (no queue opened, nothing mutated).
+        // yield an empty report (no queue opened, nothing mutated). The load is
+        // scoped to the daemon's own runtime mode so an isolated daemon reads
+        // its own config, not the Shipyard-mode overlay.
         let abandon = {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            match LoadedConfig::load_from_cwd(RuntimeMode::Shipyard, &cwd) {
+            match LoadedConfig::load_from_cwd(mode, &cwd) {
                 Ok(config) => sweep_orphaned_ship_states(&state_dir, &config, Utc::now()),
                 Err(_) => AbandonReport::default(),
             }

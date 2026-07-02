@@ -1657,6 +1657,11 @@ fn load_or_create_state(
         }
         existing.commit_subject.clone_from(&request.commit_subject);
         refresh_pr_metadata(&mut existing, request);
+        // Beginning a ship execution is the intended recovery from an opt-in
+        // orphan abandonment: clear the terminal marker so a re-shipped PR is
+        // no longer short-circuited to failure by `ship_terminal_verdict`. A
+        // non-abandoned state already has `None` here, so this is a no-op then.
+        existing.abandoned = None;
         existing.touch();
         return Ok(existing);
     }
@@ -2092,7 +2097,7 @@ mod tests {
         QueueOutcomeStore, QueueRequestStore, QueuedExecutionOutcome, QueuedExecutionRequest,
     };
     use crate::queue_scheduler::{AdmitPassPlan, RequestBackedAdmitPass, SamePrShipAdmission};
-    use crate::ship_state::{ShipState, ShipStateStore};
+    use crate::ship_state::{AbandonRecord, ShipState, ShipStateStore};
     use crate::warm_pool::{PoolEntry, WarmPool};
 
     fn table(input: &str) -> Table {
@@ -3603,6 +3608,41 @@ mod tests {
         assert!(
             reconciled.evidence_snapshot.is_empty(),
             "stale evidence cleared so the new head re-validates"
+        );
+    }
+
+    #[test]
+    fn reship_clears_a_prior_orphan_abandonment() {
+        // A re-ship is the intended recovery from an opt-in orphan abandonment:
+        // reusing the existing state for a new execution must clear the terminal
+        // marker, or the re-shipped PR would be short-circuited to failure.
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("ship");
+        let request = ship_request(vec![target]);
+        let target_names = vec![request.targets[0].name.clone()];
+        let mut seeded = ShipState::new(
+            request.pr,
+            &request.repo,
+            &request.branch,
+            &request.base_branch,
+            &request.sha,
+            super::policy_signature(&request.targets, &target_names, request.mode),
+        );
+        seeded.mark_abandoned(AbandonRecord {
+            reason: "orphaned".to_owned(),
+            evidence: "queue_stale".to_owned(),
+            stalled_minutes: 90,
+            job_id: Some("job-1".to_owned()),
+            abandoned_at: Utc::now(),
+        });
+        store.save(&seeded).expect("save abandoned state");
+
+        let reused = super::load_or_create_state(&request, &target_names, &store, None)
+            .expect("reship reuses the state");
+        assert!(
+            !reused.is_abandoned(),
+            "beginning a ship execution clears the terminal abandonment marker"
         );
     }
 
