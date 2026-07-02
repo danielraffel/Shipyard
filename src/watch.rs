@@ -116,6 +116,11 @@ pub fn watch_event_signature(state: &ShipState, reuse_map: &BTreeMap<String, Str
 /// or `None` while the ship is still in flight.
 #[must_use]
 pub fn ship_terminal_verdict(state: &ShipState) -> Option<bool> {
+    // A daemon-abandoned orphan is terminally failed: the wait/auto-merge path
+    // must stop blocking on it, and it is never merged (verdict is always false).
+    if state.is_abandoned() {
+        return Some(false);
+    }
     if state.evidence_snapshot.is_empty() {
         return None;
     }
@@ -886,6 +891,22 @@ mod tests {
             &[("macos", "fail")],
             vec![run("macos", "failed", "1", true)],
         );
+        assert_eq!(ship_terminal_verdict(&state), Some(false));
+    }
+
+    #[test]
+    fn verdict_is_terminal_failure_for_an_abandoned_state() {
+        // An in-flight state (empty evidence) is normally `None`...
+        let mut state = state(42, &[], vec![]);
+        assert_eq!(ship_terminal_verdict(&state), None);
+        // ...but a daemon-abandoned orphan is terminally failed regardless.
+        state.mark_abandoned(crate::ship_state::AbandonRecord {
+            reason: "orphaned: owning worker heartbeat is dead".to_owned(),
+            evidence: "queue_stale".to_owned(),
+            stalled_minutes: 12,
+            job_id: Some("job-1".to_owned()),
+            abandoned_at: chrono::Utc::now(),
+        });
         assert_eq!(ship_terminal_verdict(&state), Some(false));
     }
 

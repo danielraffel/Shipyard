@@ -1771,6 +1771,7 @@ mod tests {
             evidence_snapshot: BTreeMap::new(),
             attempt: 1,
             schema_version: crate::ship_state::SHIP_STATE_SCHEMA_VERSION,
+            abandoned: None,
         };
         let outcome = QueuedExecutionOutcome::ship("job-ship", request.pr, state, true);
         outcome_store.save(&outcome).expect("save outcome");

@@ -128,6 +128,18 @@ pub fn orphan_stale_after(config: &LoadedConfig) -> Duration {
 #[serde(default)]
 struct ShipStateConfig {
     orphan_stale_minutes: Option<i64>,
+    auto_resume: bool,
+}
+
+/// Whether the daemon's opt-in orphan auto-resume sweep is enabled
+/// (`[ship_state] auto_resume`, default `false`). When off, the daemon never
+/// opens the queue for a resume pass and never mutates a ship-state.
+#[must_use]
+pub fn auto_resume_enabled(config: &LoadedConfig) -> bool {
+    config
+        .get("ship_state")
+        .and_then(|value| value.clone().try_into().ok())
+        .is_some_and(|cfg: ShipStateConfig| cfg.auto_resume)
 }
 
 /// The queue's verdict on the job (if any) owning a ship-state's `{repo, pr}`.
@@ -610,6 +622,25 @@ mod tests {
             )),
             Duration::minutes(MAX_ORPHAN_STALE_MINUTES)
         );
+    }
+
+    #[test]
+    fn auto_resume_defaults_off_and_reads_config() {
+        assert!(!auto_resume_enabled(&loaded_config("")), "absent => off");
+        assert!(
+            !auto_resume_enabled(&loaded_config("[ship_state]\norphan_stale_minutes = 30\n")),
+            "unrelated key => still off"
+        );
+        assert!(auto_resume_enabled(&loaded_config(
+            "[ship_state]\nauto_resume = true\n"
+        )));
+        assert!(!auto_resume_enabled(&loaded_config(
+            "[ship_state]\nauto_resume = false\n"
+        )));
+        // A wrong-typed value must not enable the sweep (fail safe to off).
+        assert!(!auto_resume_enabled(&loaded_config(
+            "[ship_state]\nauto_resume = \"yes\"\n"
+        )));
     }
 
     /// End-to-end through a real `QueueRequestStore`: the `{pr, repo}` mapping is

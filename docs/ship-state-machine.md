@@ -357,6 +357,38 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   - Ancestor SHA unknown or diff check fails → falls through to normal dispatch. No false-PASS risk from the reuse path itself.
   - Stage-list drift or validation-contract drift → reuse is refused by `reuse.py`; normal dispatch runs.
 
+### T14 — Abandon an orphaned in-flight state (opt-in, daemon)
+
+- **From:** `STATE_IN_FLIGHT` (verdict `None`) whose owning worker is provably dead
+- **To:** terminal **abandoned** — `ShipState.abandoned` is set, so
+  `ship_terminal_verdict` short-circuits to `Some(false)`
+- **Trigger:** the daemon's periodic reconcile pass runs an opt-in abandon sweep
+  (`src/ship_resume.rs::sweep_orphaned_ship_states`), gated by
+  `[ship_state] auto_resume` (default **off**). No-op — and opens no queue — when
+  disabled.
+- **Quantification (deliberately conservative — a *false* abandon of a live ship
+  is the one catastrophic error):** abandons **only** on `queue_stale` evidence
+  (a matching running job whose heartbeat is dead past the reaper's ~180s window —
+  a provably dead worker). `queue_terminal` / `queue_absent` / `time_fallback`
+  stay report-only (T-diagnostic below): a terminal-but-unfinalized job may be a
+  success mid-write, and the weaker signals are inferences. Fail-**closed**: an
+  unavailable/absent queue never abandons.
+- **Writes:** under the per-PR lock, re-checks the state is still in flight
+  (`ship_terminal_verdict` still `None`) and still a `queue_stale` orphan against
+  the snapshot, then `mark_abandoned(AbandonRecord { reason, evidence,
+  stalled_minutes, job_id, abandoned_at })`. Emits a `ship_state_abandoned`
+  daemon IPC event.
+- **Effect:** the wait/auto-merge path sees a terminal failure and stops blocking;
+  the state is **never merged**. Recovery stays operator-driven — a human
+  re-ships (`shipyard ship <pr>`), creating a fresh attempt. The sweep does
+  **not** auto-re-dispatch, so there is no resume→die→resume loop.
+- **Idempotent:** an abandoned state is terminal, so the next sweep's
+  `classify_orphan` returns `None` — it is never re-abandoned.
+- **Failure modes**
+  - A verdict lands between the snapshot and the per-PR lock → the under-lock
+    `ship_terminal_verdict` re-check skips it (counted as `raced`).
+  - Config load fails in the daemon worker → the sweep no-ops for that pass.
+
 ## Diagnostic: orphan reporting (no transition)
 
 `STATE_IN_FLIGHT` has no self-healing exit when the owning process dies
@@ -383,8 +415,10 @@ and is configurable via `[ship_state] orphan_stale_minutes`. Human output adds a
 evidence}]` (`ship-state list`) / `orphaned_ship_states` (`status`). It cannot
 affect merge readiness — a flagged state is in flight, which auto-merge already
 refuses. Recovery stays operator-driven (`shipyard ship <pr>` to re-validate, or
-`ship-state discard`); automatic resume is a deferred follow-up, and the
-`QueueMatch` the classifier returns already carries the owning `Job` for it.
+`ship-state discard`) unless the opt-in daemon abandon sweep is enabled — see T14,
+which acts on the strongest (`queue_stale`) evidence this diagnostic surfaces. The
+`QueueMatch` the classifier returns carries the owning `Job` so the sweep records
+the dead worker's id.
 
 ## External dependency matrix
 

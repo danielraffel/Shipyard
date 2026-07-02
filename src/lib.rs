@@ -92,6 +92,8 @@ pub mod runner_watchdog;
 pub mod ship;
 /// Read-only orphan/liveness classification for in-flight ship states.
 pub mod ship_liveness;
+/// Opt-in, default-off daemon sweep that abandons orphaned in-flight states.
+pub mod ship_resume;
 /// Opt-in, default-off same-backend retry policy for transient local legs.
 pub mod ship_retry;
 /// Durable in-flight ship-state model and store.

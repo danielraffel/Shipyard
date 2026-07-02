@@ -380,17 +380,28 @@ The threshold defaults to 45 minutes and is configurable:
 
 ```toml
 [ship_state]
-orphan_stale_minutes = 45   # clamped to [1, 525600]
+orphan_stale_minutes = 45    # clamped to [1, 525600]
+auto_resume = false          # opt-in daemon abandon sweep (default off)
 ```
 
-This is **report-only** — it never resumes, re-dispatches, or mutates the queue
-or ship-state, and cannot affect merge readiness (a flagged state is in flight,
+Detection (`shipyard ship-state list` / `status`) is **report-only** — it never
+mutates anything and cannot affect merge readiness (a flagged state is in flight,
 which auto-merge already refuses; the harm it surfaces is the *inverse* — a PR
-that silently never merges). Recovery is operator-driven: re-run
-`shipyard ship <pr>` to re-validate the head, or `shipyard ship-state discard
-<pr>` to drop a dead entry. Automatic resume is a deliberately deferred
-follow-up; the `QueueMatch` returned by `LivenessContext::match_job` already
-carries the owning `Job` so a future retry/resume can act on it.
+that silently never merges).
+
+**Opt-in abandon sweep (`auto_resume`, default off).** When enabled, the daemon's
+periodic reconcile pass runs `ship_resume::sweep_orphaned_ship_states`: for a
+strongly-orphaned in-flight state it sets a terminal `abandoned` marker
+(`ship_terminal_verdict` → `Some(false)`), so the wait/auto-merge path stops
+blocking and a human re-ships. Deliberately conservative — marking a *live* ship
+failed is the one catastrophic error, so it abandons **only** on `queue_stale`
+evidence (a provably dead owning worker), re-checks in-flight status under the
+per-PR lock, and fails **closed** (an unavailable queue never abandons). It never
+auto-re-dispatches (no resume→die→resume loop), and abandonment is idempotent (an
+abandoned state is terminal). Emits a `ship_state_abandoned` daemon IPC event.
+With the default `false`, the sweep opens no queue and mutates nothing. Recovery
+without the opt-in stays operator-driven: `shipyard ship <pr>` to re-validate, or
+`shipyard ship-state discard <pr>`.
 
 ### Gotchas
 
