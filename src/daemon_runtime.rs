@@ -23,6 +23,11 @@ use base64::Engine;
 #[cfg(unix)]
 use serde_json::Value;
 
+#[cfg(unix)]
+use chrono::Utc;
+
+#[cfg(unix)]
+use crate::config::LoadedConfig;
 use crate::daemon_ipc::read_daemon_status;
 #[cfg(unix)]
 use crate::daemon_ipc::{IpcServer, IpcState};
@@ -34,6 +39,8 @@ use crate::reconcile::{
 };
 #[cfg(unix)]
 use crate::registrar::{Registrar, RegistrarError, WEBHOOK_SCOPE_COMMAND};
+#[cfg(unix)]
+use crate::ship_resume::{AbandonReport, AbandonedShipState, sweep_orphaned_ship_states};
 use crate::ship_state::ShipStateStore;
 #[cfg(unix)]
 use crate::ship_state::{DispatchedRun, ShipState};
@@ -227,6 +234,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             reconcile_in_flight = false;
             reconcile_window = result.window;
             publish_reconcile_events(&server, &last_event_at, &result.report);
+            publish_abandon_events(&server, &last_event_at, &result.abandon);
         }
 
         let now = Instant::now();
@@ -457,6 +465,7 @@ fn should_start_reconcile(
 struct ReconcileWorkerResult {
     report: ReconcileReport,
     window: ReconcileWindow,
+    abandon: AbandonReport,
 }
 
 #[cfg(unix)]
@@ -467,7 +476,22 @@ fn start_reconcile_worker(
 ) {
     thread::spawn(move || {
         let report = reconcile_active_ship_states(&state_dir, &mut window);
-        let _ = sender.send(ReconcileWorkerResult { report, window });
+        // Opt-in orphan-abandon sweep, same cadence as reconcile. Config is
+        // reloaded each pass so toggling `[ship_state] auto_resume` takes effect
+        // without a daemon restart; a load failure or the disabled default both
+        // yield an empty report (no queue opened, nothing mutated).
+        let abandon = {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match LoadedConfig::load_from_cwd(RuntimeMode::Shipyard, &cwd) {
+                Ok(config) => sweep_orphaned_ship_states(&state_dir, &config, Utc::now()),
+                Err(_) => AbandonReport::default(),
+            }
+        };
+        let _ = sender.send(ReconcileWorkerResult {
+            report,
+            window,
+            abandon,
+        });
     });
 }
 
@@ -484,6 +508,34 @@ fn publish_reconcile_events(
         }
         server.broadcast_event(reconcile_healed_event(transition));
     }
+}
+
+#[cfg(unix)]
+fn publish_abandon_events(
+    server: &IpcServer,
+    last_event_at: &Arc<Mutex<Option<f64>>>,
+    report: &AbandonReport,
+) {
+    for entry in &report.abandoned {
+        let timestamp = daemon_timestamp();
+        if let Ok(mut last_event_at) = last_event_at.lock() {
+            *last_event_at = Some(timestamp);
+        }
+        server.broadcast_event(ship_state_abandoned_event(entry));
+    }
+}
+
+#[cfg(unix)]
+fn ship_state_abandoned_event(entry: &AbandonedShipState) -> Value {
+    serde_json::json!({
+        "kind": "ship_state_abandoned",
+        "payload": {
+            "pr": entry.pr,
+            "repo": entry.repo,
+            "evidence": entry.evidence,
+            "stalled_minutes": entry.stalled_minutes,
+        }
+    })
 }
 
 #[cfg(unix)]

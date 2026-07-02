@@ -49,6 +49,26 @@ impl DispatchedRun {
     }
 }
 
+/// Terminal marker recorded when the daemon's opt-in resume sweep abandons an
+/// orphaned in-flight ship-state — its owning ship worker died and never wrote a
+/// verdict, so the state would otherwise block the wait/auto-merge path forever.
+/// Setting it makes the state terminally failed (never merged); the PR must be
+/// re-shipped by hand. Surfaced by `ship-state list` and a daemon IPC event.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AbandonRecord {
+    /// Human-readable reason the state was abandoned.
+    pub reason: String,
+    /// The orphan-evidence class that justified abandonment (e.g. `queue_stale`).
+    pub evidence: String,
+    /// Minutes the state had been idle (`updated_at` age) when abandoned.
+    pub stalled_minutes: i64,
+    /// The dead owning queue job's id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// When the abandonment was recorded.
+    pub abandoned_at: DateTime<Utc>,
+}
+
 /// Durable state for a single in-flight PR ship.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ShipState {
@@ -90,6 +110,10 @@ pub struct ShipState {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// Terminal abandonment marker set by the daemon's opt-in orphan resume
+    /// sweep. `None` for a normal in-flight or evidence-terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned: Option<AbandonRecord>,
 }
 
 impl ShipState {
@@ -120,7 +144,20 @@ impl ShipState {
             attempt: default_attempt(),
             created_at: now,
             updated_at: now,
+            abandoned: None,
         }
+    }
+
+    /// Whether this state has been terminally abandoned by the resume sweep.
+    #[must_use]
+    pub fn is_abandoned(&self) -> bool {
+        self.abandoned.is_some()
+    }
+
+    /// Record a terminal abandonment marker and bump `updated_at`.
+    pub fn mark_abandoned(&mut self, record: AbandonRecord) {
+        self.abandoned = Some(record);
+        self.touch();
     }
 
     /// Update the `updated_at` timestamp.
