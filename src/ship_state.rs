@@ -427,6 +427,9 @@ impl ShipStateStore {
             evidence_snapshot: BTreeMap::new(),
             created_at: now,
             updated_at: now,
+            // A fresh attempt must not inherit the prior attempt's terminal
+            // abandonment marker, or the re-ship would be dead on arrival.
+            abandoned: None,
             ..state.clone()
         })
     }
@@ -528,7 +531,9 @@ mod tests {
 
     use chrono::{Duration, TimeZone, Utc};
 
-    use super::{DispatchedRun, ShipState, ShipStateStore, compute_policy_signature};
+    use super::{
+        AbandonRecord, DispatchedRun, ShipState, ShipStateStore, compute_policy_signature,
+    };
 
     fn sample_state(pr: u64, sha: &str) -> ShipState {
         ShipState::new(
@@ -777,5 +782,28 @@ mod tests {
         assert!(state.updated_at >= original);
         assert!(!state.is_sha_drift("abc"));
         assert!(state.is_sha_drift("def"));
+    }
+
+    #[test]
+    fn archive_and_replace_clears_prior_abandonment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let mut state = sample_state(7, "abc");
+        state.mark_abandoned(AbandonRecord {
+            reason: "orphaned".to_owned(),
+            evidence: "queue_stale".to_owned(),
+            stalled_minutes: 90,
+            job_id: Some("job-1".to_owned()),
+            abandoned_at: Utc::now(),
+        });
+        store.save(&state).expect("save");
+
+        let fresh = store
+            .archive_and_replace(&state, None)
+            .expect("archive + fresh attempt");
+        assert!(
+            !fresh.is_abandoned(),
+            "a fresh attempt must not inherit the abandonment marker"
+        );
     }
 }
