@@ -3,9 +3,14 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0760"></a>
-## [0.77.0]
+<a id="v0770"></a>
+## [0.77.0] - 2026-07-03
 
+- feat(ship): recognise the flaky-required-leg merge wedge and hand over the rescue one-liner ([#371](https://github.com/danielraffel/Shipyard/pull/371))
+- fix(ship-state): harden opt-in orphan abandon against live re-ships ([#370](https://github.com/danielraffel/Shipyard/pull/370))
+- feat(ship-state): opt-in daemon abandon of orphaned in-flight states ([#369](https://github.com/danielraffel/Shipyard/pull/369))
+
+<a id="v0760"></a>
 ## [0.76.0] - 2026-07-02
 
 - feat(runner): reap stale workflow runs in runner watch ([#313](https://github.com/danielraffel/Shipyard/pull/313))
@@ -677,6 +682,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.77.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.77.0
 [0.76.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.76.0
 [0.75.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.75.0
 [0.74.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.74.0
