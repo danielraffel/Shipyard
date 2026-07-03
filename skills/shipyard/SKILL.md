@@ -693,6 +693,43 @@ guard above, because GraphQL auto-merge can otherwise land a commit
 pushed *after* validation completed (the bug that merged pulp #3128 at a
 pre-fix SHA).
 
+### Flaky-required-leg wedge → rescue hand-off (`auto_rescue`)
+
+When Shipyard validated every target green but `gh pr merge` is *rejected*
+(`post_run_merge_state` sees `AutoMergeOutcome::MergeFailed`), the usual cause
+is a GitHub branch-protection **required check that is RED on the exact SHA
+Shipyard just validated** — a *flaky* required leg, not a real regression.
+`classify_merge_failure` (`src/app/ship_cmd.rs`, backed by the pure
+`auto_rescue::classify_wedge`) decides whether that's the case and, if so,
+renders `GreenNotMergedFlakyRequired` — a hand-back that hands the operator the
+one-liner `shipyard rescue <PR> --rerun-failed` instead of the generic message.
+It never mutates the merge path (only guidance text + one additive JSON field,
+`flaky_required_recovery`).
+
+It is deliberately fail-closed — it falls back to the plain `GreenNotMerged`
+hand-back on **any** ambiguity:
+- a red *or pending* check with absent `isRequired` (ruleset / merge-queue
+  governance, older `gh`, REST-synthesized rollup that lacks requiredness);
+- a red required check whose name doesn't map to a Shipyard-validated-green
+  target;
+- an unreadable ship-state, a failed rollup fetch, or a live `headRefOid` that
+  no longer matches the validated `head_sha` (same head-advance guard as the
+  superseded-SHA preflight above).
+
+**Mapping is exact or explicitly configured — never fuzzy.** A red required
+check maps to a validated-green target only when the check context name equals
+the target name (case-insensitive) *or* the target declares
+`required_check_context = "<check name>"` in `[targets.<t>]`. This bridges the
+common case where the Shipyard target is `mac` but the GitHub required check is
+`macos`: without the config line the classifier fail-closes to a no-op, so a
+consuming repo must add `required_check_context` to activate the hint. Do NOT
+reach for the fuzzy reconcile matcher here — a wrong mapping would tell the
+operator to "just rerun" a genuinely-failing required check.
+
+The destructive counterpart (actually invoking `rescue --rerun-failed` + arming
+auto-merge automatically, behind a default-off flag) is a planned follow-up; the
+current behavior is diagnostic-only.
+
 ## Validation Gates
 
 **Before `shipyard pr` / `shipyard ship`, run the *exact* chain the `mac`

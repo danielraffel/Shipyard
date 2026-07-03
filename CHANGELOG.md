@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0760"></a>
+## [0.77.0]
+
 ## [0.76.0] - 2026-07-02
 
 - feat(runner): reap stale workflow runs in runner watch ([#313](https://github.com/danielraffel/Shipyard/pull/313))
