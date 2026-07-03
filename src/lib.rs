@@ -4,6 +4,9 @@
 
 /// CLI entrypoint and command dispatch.
 pub mod app;
+/// Classify a "Shipyard validated green but GitHub refused the merge" wedge and
+/// decide whether a red required check is a flaky leg the operator can recover.
+pub mod auto_rescue;
 /// Remote branch creation and branch-protection application.
 pub mod branch;
 /// Bundle transfer command construction and path normalization.

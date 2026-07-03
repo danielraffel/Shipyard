@@ -289,6 +289,46 @@ fn fetch_status_check_rollup_with_client(
     repo: &str,
     pr: u64,
 ) -> Result<Vec<Value>, ReconcileFetchError> {
+    let (_head, rollup) = fetch_head_and_status_check_rollup_with_client(
+        gh_client,
+        cwd,
+        repo,
+        pr,
+        "statusCheckRollup",
+    )?;
+    Ok(rollup)
+}
+
+/// Fetch the PR's live `headRefOid` alongside its `statusCheckRollup`, so a
+/// caller can prove the rollup describes the exact SHA it validated before
+/// acting on it. Returns `(head_ref_oid, rollup_entries)`.
+pub fn fetch_head_and_status_check_rollup_with_cwd(
+    mode: RuntimeMode,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+) -> Result<(String, Vec<Value>), ReconcileFetchError> {
+    let gh_client = GhClient::from_cwd(mode, cwd).map_err(|error| {
+        ReconcileFetchError::Prepare(format!(
+            "failed to load GitHub auth config while reconciling PR #{pr} ({repo}): {error}"
+        ))
+    })?;
+    fetch_head_and_status_check_rollup_with_client(
+        &gh_client,
+        cwd,
+        repo,
+        pr,
+        "headRefOid,statusCheckRollup",
+    )
+}
+
+fn fetch_head_and_status_check_rollup_with_client(
+    gh_client: &GhClient,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+    json_fields: &str,
+) -> Result<(String, Vec<Value>), ReconcileFetchError> {
     let mut command = gh_client
         .prepare_command(
             cwd,
@@ -308,7 +348,7 @@ fn fetch_status_check_rollup_with_client(
         "--repo",
         repo,
         "--json",
-        "statusCheckRollup",
+        json_fields,
     ]);
     let capture = run_capture(command, RECONCILE_FETCH_TIMEOUT)?;
     if capture.timed_out {
@@ -325,11 +365,17 @@ fn fetch_status_check_rollup_with_client(
     let value = serde_json::from_str::<Value>(&capture.stdout).map_err(|error| {
         ReconcileFetchError::Parse(format!("failed to parse gh pr view JSON: {error}"))
     })?;
-    Ok(value
+    let head = value
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let rollup = value
         .get("statusCheckRollup")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default();
+    Ok((head, rollup))
 }
 
 fn is_aged_terminal(state: &ShipState, window: &ReconcileWindow, now: DateTime<Utc>) -> bool {

@@ -11,6 +11,9 @@ use super::{
     cli::{MergeMethod, MergeResult},
     wait_cmd::parse_github_repo_slug,
 };
+use crate::auto_rescue::{
+    WedgeClass, WedgeInputs, classify_wedge, sha_matches, validated_green_contexts,
+};
 use crate::config::LoadedConfig;
 use crate::diagnostics::{
     FailureDiagnostics, FailureKind, GhDiagnosticsFetcher, fetch_failed_job_diagnostics,
@@ -19,6 +22,7 @@ use crate::diagnostics::{
 use crate::evidence::EvidenceStore;
 use crate::executor::dispatch::{ExecutorDispatcher, ResolvedTarget, resolve_targets};
 use crate::governance::{GovernanceGh, put_branch_protection, resolve_branch_rules};
+use crate::identity::RuntimeMode;
 use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
 use crate::lane_policy::{LanePolicy, resolve_lane_policy};
 use crate::output::write_json_envelope;
@@ -31,6 +35,7 @@ use crate::preflight::{
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
+use crate::reconcile::fetch_head_and_status_check_rollup_with_cwd;
 use crate::ship::{ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_ship};
 use crate::ship_state::ShipStateStore;
 use crate::warm_pool::{WarmPool, default_pool_path};
@@ -147,6 +152,8 @@ pub(super) fn ship_command<W: Write>(
         pr_context.number,
         cwd,
         &ship_state,
+        config,
+        &request.repo,
         outcome.job.passed(),
         args.merge_command,
         args.merge_result,
@@ -165,7 +172,7 @@ pub(super) fn ship_command<W: Write>(
             stdout,
             pr_context.number,
             &outcome,
-            render_state.merged(),
+            &render_state,
             &diagnostics,
         )?;
     } else {
@@ -476,6 +483,18 @@ enum ShipRenderState {
     /// from the merge attempt, useful for human + JSON renderers
     /// to surface the actual reason instead of claiming "all green".
     GreenNotMerged(String),
+    /// A [`GreenNotMerged`](Self::GreenNotMerged) whose block is classified as a
+    /// *flaky required leg*: the merge was rejected because a required check is
+    /// RED on the exact SHA Shipyard validated green, and every red required
+    /// check maps to a Shipyard-validated-green target. Renders the one-liner
+    /// `shipyard rescue` recovery instead of the generic hand-back. Still
+    /// `merged() == false` — this only changes the guidance, not the outcome.
+    GreenNotMergedFlakyRequired {
+        /// The underlying `gh pr merge` error, surfaced verbatim.
+        error: String,
+        /// Names of the red required checks (all validated green by Shipyard).
+        red_contexts: Vec<String>,
+    },
 }
 
 impl ShipRenderState {
@@ -484,10 +503,13 @@ impl ShipRenderState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn post_run_merge_state(
     pr: u64,
     cwd: &Path,
     store: &ShipStateStore,
+    config: &LoadedConfig,
+    repo: &str,
     validation_passed: bool,
     merge_command: Option<PathBuf>,
     merge_result: Option<MergeResult>,
@@ -511,7 +533,9 @@ fn post_run_merge_state(
         AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
             Ok(ShipRenderState::Merged)
         }
-        AutoMergeOutcome::MergeFailed { error } => Ok(ShipRenderState::GreenNotMerged(error)),
+        AutoMergeOutcome::MergeFailed { error } => {
+            Ok(classify_merge_failure(store, config, cwd, repo, pr, error))
+        }
         // Validation passed but the live head advanced past the validated SHA
         // (issue #321). Report green-not-merged so `shipyard ship` surfaces
         // merged:false / status:"green_not_merged" and the operator re-ships
@@ -530,13 +554,75 @@ fn post_run_merge_state(
     }
 }
 
+/// Classify a validated-green-but-`gh pr merge`-rejected wedge. Returns
+/// [`ShipRenderState::GreenNotMergedFlakyRequired`] only when the block is a
+/// flaky required leg (a required check RED on the exact SHA Shipyard validated
+/// green, every red required check mapping to a validated-green target) so the
+/// hand-back can point at the one-liner recovery. Fails closed to
+/// [`ShipRenderState::GreenNotMerged`] on any ambiguity — state unreadable,
+/// rollup fetch failed, or the wedge is not a recognised flake. This never
+/// mutates the merge path; it only picks which guidance to render.
+fn classify_merge_failure(
+    store: &ShipStateStore,
+    config: &LoadedConfig,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+    error: String,
+) -> ShipRenderState {
+    let Some(state) = store.get(pr) else {
+        return ShipRenderState::GreenNotMerged(error);
+    };
+    let green = validated_green_contexts(&state, config);
+    if green.is_empty() {
+        return ShipRenderState::GreenNotMerged(error);
+    }
+    // Fail closed: without a trustworthy rollup we cannot prove the block is a
+    // flaky required leg, so fall back to the generic hand-back.
+    let Ok((live_head, rollup)) =
+        fetch_head_and_status_check_rollup_with_cwd(RuntimeMode::Shipyard, cwd, repo, pr)
+    else {
+        return ShipRenderState::GreenNotMerged(error);
+    };
+    // Prove the rollup describes the exact SHA Shipyard validated. If the head
+    // advanced between the failed merge and this fetch, the rollup can describe
+    // an unvalidated SHA — never claim "the SHA Shipyard validated green" then.
+    if !sha_matches(&live_head, &state.head_sha) {
+        return ShipRenderState::GreenNotMerged(error);
+    }
+    match classify_wedge(&WedgeInputs {
+        rollup: &rollup,
+        validated_green_contexts: &green,
+    }) {
+        WedgeClass::FlakyRequired { red_contexts } => {
+            ShipRenderState::GreenNotMergedFlakyRequired {
+                error,
+                red_contexts,
+            }
+        }
+        WedgeClass::RequiredStillPending | WedgeClass::NotRecoverable { .. } => {
+            ShipRenderState::GreenNotMerged(error)
+        }
+    }
+}
+
 fn render_json<W: Write>(
     stdout: &mut W,
     pr: u64,
     outcome: &crate::ship::ShipExecutionOutcome,
-    merged: bool,
+    state: &ShipRenderState,
     diagnostics: &[RenderedDiagnostics],
 ) -> Result<(), CliFailure> {
+    let merged = state.merged();
+    // Only the flaky-required wedge carries recovery contexts; every other
+    // state leaves this an empty array so the envelope shape stays stable.
+    let flaky_recovery: Vec<Value> = match state {
+        ShipRenderState::GreenNotMergedFlakyRequired { red_contexts, .. } => red_contexts
+            .iter()
+            .map(|name| Value::String(name.clone()))
+            .collect(),
+        _ => Vec::new(),
+    };
     let diag_payload: Vec<Value> = diagnostics
         .iter()
         .map(|entry| {
@@ -565,6 +651,7 @@ fn render_json<W: Write>(
                 Value::Bool(outcome.resumed_existing_state),
             ),
             ("diagnostics", Value::Array(diag_payload)),
+            ("flaky_required_recovery", Value::Array(flaky_recovery)),
         ]),
     )
     .map_err(|error| CliFailure::new(1, error.to_string()))
@@ -580,6 +667,10 @@ fn render_human<W: Write>(
         ShipRenderState::ValidationFailed => render_validation_failed(stdout, pr, diagnostics),
         ShipRenderState::Merged => writeln!(stdout, "PR #{pr} merged. All green."),
         ShipRenderState::GreenNotMerged(error) => render_green_not_merged(stdout, pr, error),
+        ShipRenderState::GreenNotMergedFlakyRequired {
+            error,
+            red_contexts,
+        } => render_green_not_merged_flaky(stdout, pr, error, red_contexts),
     };
     result.map_err(|error| CliFailure::new(1, error.to_string()))
 }
@@ -612,6 +703,43 @@ fn render_green_not_merged<W: Write>(stdout: &mut W, pr: u64, error: &str) -> st
     writeln!(
         stdout,
         "  * enable native auto-merge: `gh pr merge {pr} --squash --auto`"
+    )?;
+    Ok(())
+}
+
+/// Recovery guidance for a *flaky required leg* wedge — a required check that is
+/// RED on the exact SHA Shipyard validated green. Unlike the generic hand-back,
+/// this is a known-recoverable case: re-dispatch the flaky leg and arm the
+/// merge, both one-liners. Motivated by the ~hour lost hand-cranking
+/// cancel+rerun when the `macos` required leg flaked under runner load.
+fn render_green_not_merged_flaky<W: Write>(
+    stdout: &mut W,
+    pr: u64,
+    error: &str,
+    red_contexts: &[String],
+) -> std::io::Result<()> {
+    let checks = red_contexts.join(", ");
+    writeln!(
+        stdout,
+        "Shipyard-validated targets passed, but the merge was rejected for PR #{pr}:"
+    )?;
+    writeln!(stdout, "  reason: {error}")?;
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "Required check(s) [{checks}] are RED on the exact SHA Shipyard just"
+    )?;
+    writeln!(
+        stdout,
+        "validated green — a flaky required leg, not a real regression. Recover it:"
+    )?;
+    writeln!(
+        stdout,
+        "  * re-dispatch the flaky leg:   `shipyard rescue {pr} --rerun-failed`"
+    )?;
+    writeln!(
+        stdout,
+        "  * arm the merge for when it's green: `gh pr merge {pr} --squash --auto`"
     )?;
     Ok(())
 }
@@ -749,7 +877,10 @@ mod tests {
 
     use toml::Table;
 
-    use super::{ShipCommandArgs, ShipRenderState, render_green_not_merged, ship_command};
+    use super::{
+        ShipCommandArgs, ShipRenderState, render_green_not_merged, render_green_not_merged_flaky,
+        ship_command,
+    };
     use crate::app::cli::MergeResult;
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::identity::RuntimeMode;
@@ -794,6 +925,42 @@ mod tests {
         assert!(ShipRenderState::Merged.merged());
         assert!(!ShipRenderState::ValidationFailed.merged());
         assert!(!ShipRenderState::GreenNotMerged("err".to_owned()).merged());
+        assert!(
+            !ShipRenderState::GreenNotMergedFlakyRequired {
+                error: "err".to_owned(),
+                red_contexts: vec!["macos".to_owned()],
+            }
+            .merged()
+        );
+    }
+
+    #[test]
+    fn flaky_required_render_points_at_the_rescue_one_liner() {
+        let mut out = Vec::new();
+        render_green_not_merged_flaky(
+            &mut out,
+            2020,
+            "base branch policy prohibits the merge",
+            &["macos".to_owned()],
+        )
+        .expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("shipyard rescue 2020 --rerun-failed"),
+            "must hand the operator the one-liner rescue; got:\n{text}"
+        );
+        assert!(
+            text.contains("macos"),
+            "must name the flaky required check; got:\n{text}"
+        );
+        assert!(
+            text.contains("flaky required leg"),
+            "must explain the block is a flake, not a regression; got:\n{text}"
+        );
+        assert!(
+            !text.contains("All green"),
+            "must not claim all green; got:\n{text}"
+        );
     }
 
     fn git(args: &[&str], cwd: &std::path::Path) {
