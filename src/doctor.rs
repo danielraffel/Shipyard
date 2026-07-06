@@ -153,9 +153,10 @@ pub fn collect_report(
     let mut cloud = BTreeMap::new();
     cloud.insert("gh".to_owned(), check_command(probe, "gh", &["--version"]));
     let github_auth = github_auth_summary(mode, cwd);
+    let ambient_gh_auth = probe_ambient_gh_cli_auth(probe);
     cloud.insert(
         "github-auth".to_owned(),
-        github_auth_entry_result(&github_auth),
+        github_auth_entry_result(&github_auth, &ambient_gh_auth),
     );
     if let Ok(summary) = &github_auth
         && let Some(entry) = check_gh_workflow_scope_for_auth(probe, summary)
@@ -696,7 +697,8 @@ fn release_chain_entry(
 #[must_use]
 pub fn check_github_auth(mode: RuntimeMode, cwd: &Path) -> DoctorEntry {
     let result = github_auth_summary(mode, cwd);
-    github_auth_entry_result(&result)
+    let ambient_gh_auth = probe_ambient_gh_cli_auth(&SystemCommandProbe);
+    github_auth_entry_result(&result, &ambient_gh_auth)
 }
 
 /// Why a configured `[github.auth]` source couldn't be summarized — kept typed
@@ -726,9 +728,12 @@ fn github_auth_summary(mode: RuntimeMode, cwd: &Path) -> Result<GhAuthSummary, G
         .map_err(GhAuthCheckError::Prepare)
 }
 
-fn github_auth_entry_result(result: &Result<GhAuthSummary, GhAuthCheckError>) -> DoctorEntry {
+fn github_auth_entry_result(
+    result: &Result<GhAuthSummary, GhAuthCheckError>,
+    ambient: &AmbientGhCliAuth,
+) -> DoctorEntry {
     match result {
-        Ok(summary) => github_auth_entry(summary),
+        Ok(summary) => github_auth_entry(summary, ambient),
         // A repo-placeholder token_command can't be filled in a repo-less
         // context (doctor/daemon run outside a checkout) — but it resolves fine
         // when Shipyard runs inside a repo. That's expected, not broken, so keep
@@ -753,11 +758,100 @@ fn github_auth_entry_result(result: &Result<GhAuthSummary, GhAuthCheckError>) ->
     }
 }
 
-fn github_auth_entry(summary: &GhAuthSummary) -> DoctorEntry {
+/// Validity of the ambient `gh` login as reported by `gh auth status`. The
+/// ambient (`GhCli`) auth source used to be reported unconditionally green, which
+/// hid a dead token — this lets the doctor downgrade a genuinely broken ambient
+/// login while still preferring calm guidance over an alarming ✗ when the token
+/// is fine or simply can't be verified here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AmbientGhCliAuth {
+    /// `gh auth status` succeeded — the ambient token authenticates.
+    Valid,
+    /// `gh auth status` exited non-zero — the ambient token is missing,
+    /// invalid, or expired. Carries a concise reason line from `gh`.
+    Invalid(String),
+    /// `gh auth status` couldn't be run (gh absent / probe unavailable). Not a
+    /// downgrade — surfaced as a caveat instead.
+    Unknown,
+}
+
+/// Probe the ambient `gh` login via the `CommandProbe` (`gh auth status`).
+fn probe_ambient_gh_cli_auth(probe: &impl CommandProbe) -> AmbientGhCliAuth {
+    ambient_gh_cli_auth_from(|args| probe.run("gh", args))
+}
+
+/// Testable core of the ambient-auth probe. Treats a non-zero
+/// `gh auth status` exit as an invalid ambient token, mirroring how
+/// `check_gh_workflow_scope_with` treats the same signal.
+fn ambient_gh_cli_auth_from<F>(mut run: F) -> AmbientGhCliAuth
+where
+    F: FnMut(&[&str]) -> Option<DoctorCommandOutput>,
+{
+    let Some(output) = run(&["auth", "status", "--hostname", "github.com"]) else {
+        return AmbientGhCliAuth::Unknown;
+    };
+    if output.success {
+        return AmbientGhCliAuth::Valid;
+    }
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    let reason = combined
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            let lowered = line.to_lowercase();
+            !line.is_empty()
+                && (lowered.contains("invalid")
+                    || lowered.contains("not logged")
+                    || lowered.contains("expired")
+                    || lowered.contains("bad credentials")
+                    || lowered.contains("error")
+                    || lowered.contains("could not"))
+        })
+        .or_else(|| {
+            combined
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        })
+        .map_or_else(
+            || "gh auth status reported the ambient token is not usable".to_owned(),
+            |line| line.chars().take(200).collect::<String>(),
+        );
+    AmbientGhCliAuth::Invalid(reason)
+}
+
+/// Resolved-detail text for a working (or unverifiable) ambient `gh` login,
+/// with a caveat that a later-invalid token pauses live updates.
+fn ambient_gh_cli_detail(ambient: &AmbientGhCliAuth) -> String {
+    let base = "Resolved. Shipyard will use ambient gh auth. Classic PAT scopes can usually be inspected with `gh auth status`. If GH_TOKEN is exported in the parent environment, gh gives that token precedence over keychain auth.";
+    let caveat = if matches!(ambient, AmbientGhCliAuth::Unknown) {
+        " Couldn't verify the ambient token with `gh auth status` here — check it manually. If it is invalid or missing, live updates pause and GitHub API polling falls back to the anonymous 60/hr limit; for unattended hosts prefer a [github.auth] App token."
+    } else {
+        " Note: if this ambient token later becomes invalid or expires, live updates pause and GitHub API polling falls back to the anonymous 60/hr limit — re-check with `gh auth status`; for unattended hosts prefer a [github.auth] App token."
+    };
+    format!("{base}{caveat}")
+}
+
+fn github_auth_entry(summary: &GhAuthSummary, ambient: &AmbientGhCliAuth) -> DoctorEntry {
+    // A dead ambient token is the one case that must not read as bare "ok":
+    // it silently pauses live updates and drops GitHub calls to the anonymous
+    // 60/hr limit. Downgrade to a clear problem row (still not a red-scare for
+    // the healthy/unverifiable cases, which stay green with a caveat).
+    if let (GhAuthSourceSummary::GhCli, AmbientGhCliAuth::Invalid(reason)) =
+        (&summary.source, ambient)
+    {
+        return DoctorEntry {
+            ok: false,
+            version: Some("gh-cli (ambient) - token invalid".to_owned()),
+            detail: Some(format!(
+                "Ambient `gh` auth is not working: {reason}. An invalid, expired, or missing ambient token pauses live updates and drops GitHub API calls to the anonymous 60/hr limit. Fix with `gh auth login` / `gh auth refresh -h github.com`, or configure a [github.auth] App token for unattended hosts. Re-check with `gh auth status`."
+            )),
+            error: Some("ambient gh token invalid".to_owned()),
+        };
+    }
+
     let mut details = vec![match &summary.source {
-        GhAuthSourceSummary::GhCli => {
-            "Resolved. Shipyard will use ambient gh auth. Classic PAT scopes can usually be inspected with `gh auth status`. If GH_TOKEN is exported in the parent environment, gh gives that token precedence over keychain auth.".to_owned()
-        }
+        GhAuthSourceSummary::GhCli => ambient_gh_cli_detail(ambient),
         GhAuthSourceSummary::Env { token_env } => format!(
             "Resolved. Shipyard will read {token_env} and inject it into child gh commands as GH_TOKEN. The token value is not stored by Shipyard."
         ),
@@ -1115,11 +1209,12 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        CommandProbe, DoctorCommandOutput, DoctorReport, GhAuthCheckError, ReleaseBotSecretState,
-        check_daemon_version_drift_with, check_gh_workflow_scope_for_auth,
-        check_gh_workflow_scope_with, check_macos_gatekeeper_health_with,
-        check_release_bot_token_with, check_shipyard_path_shadows_with, check_tag_drift_with,
-        collect_report, configured_token_scope_entry, github_auth_entry, github_auth_entry_result,
+        AmbientGhCliAuth, CommandProbe, DoctorCommandOutput, DoctorReport, GhAuthCheckError,
+        ReleaseBotSecretState, ambient_gh_cli_auth_from, check_daemon_version_drift_with,
+        check_gh_workflow_scope_for_auth, check_gh_workflow_scope_with,
+        check_macos_gatekeeper_health_with, check_release_bot_token_with,
+        check_shipyard_path_shadows_with, check_tag_drift_with, collect_report,
+        configured_token_scope_entry, github_auth_entry, github_auth_entry_result,
         is_runner_target, nsc_entry, parse_github_repo_slug, release_chain_result_entry,
         runner_check,
     };
@@ -1191,9 +1286,10 @@ mod tests {
 
     #[test]
     fn github_auth_repo_slug_in_repoless_context_is_green_not_misconfigured() {
-        let entry = github_auth_entry_result(&Err(GhAuthCheckError::Prepare(
-            GhPrepareError::RepoSlugRequired,
-        )));
+        let entry = github_auth_entry_result(
+            &Err(GhAuthCheckError::Prepare(GhPrepareError::RepoSlugRequired)),
+            &AmbientGhCliAuth::Unknown,
+        );
         assert!(
             entry.ok,
             "repo-context placeholder should not read as broken"
@@ -1211,15 +1307,96 @@ mod tests {
 
     #[test]
     fn github_auth_broken_source_is_red_with_gh_fallback_hint() {
-        let entry = github_auth_entry_result(&Err(GhAuthCheckError::Prepare(
-            GhPrepareError::HelperStdoutEmpty,
-        )));
+        let entry = github_auth_entry_result(
+            &Err(GhAuthCheckError::Prepare(GhPrepareError::HelperStdoutEmpty)),
+            &AmbientGhCliAuth::Unknown,
+        );
         assert!(!entry.ok);
         // No longer leads with the alarming "fails closed" wording; instead it
         // tells gh-only users they can just drop [github.auth].
         let detail = entry.detail.as_deref().unwrap();
         assert!(detail.contains("ambient `gh`"));
         assert!(!detail.contains("fails closed"));
+    }
+
+    #[test]
+    fn ambient_probe_reports_valid_on_success() {
+        let ambient = ambient_gh_cli_auth_from(|args| {
+            assert_eq!(args, ["auth", "status", "--hostname", "github.com"]);
+            Some(DoctorCommandOutput {
+                success: true,
+                stdout: "✓ Logged in to github.com account octocat\n".to_owned(),
+                stderr: String::new(),
+            })
+        });
+        assert_eq!(ambient, AmbientGhCliAuth::Valid);
+    }
+
+    #[test]
+    fn ambient_probe_reports_invalid_on_nonzero_exit() {
+        let ambient = ambient_gh_cli_auth_from(|_| {
+            Some(DoctorCommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "X github.com: The token in keyring is invalid.\n".to_owned(),
+            })
+        });
+        match ambient {
+            AmbientGhCliAuth::Invalid(reason) => assert!(reason.to_lowercase().contains("invalid")),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ambient_probe_reports_unknown_when_gh_absent() {
+        let ambient = ambient_gh_cli_auth_from(|_| None);
+        assert_eq!(ambient, AmbientGhCliAuth::Unknown);
+    }
+
+    #[test]
+    fn github_auth_entry_downgrades_invalid_ambient_token() {
+        let summary = GhAuthSummary {
+            source: GhAuthSourceSummary::GhCli,
+            token_kind: None,
+            expires_at: None,
+        };
+        let entry = github_auth_entry(
+            &summary,
+            &AmbientGhCliAuth::Invalid("The token in keyring is invalid.".to_owned()),
+        );
+        assert!(!entry.ok, "a dead ambient token must not read as ok");
+        assert_eq!(entry.error.as_deref(), Some("ambient gh token invalid"));
+        let detail = entry.detail.as_deref().expect("detail");
+        assert!(detail.contains("pauses live updates"));
+        assert!(detail.contains("gh auth"));
+    }
+
+    #[test]
+    fn github_auth_entry_valid_ambient_is_green_with_caveat() {
+        let summary = GhAuthSummary {
+            source: GhAuthSourceSummary::GhCli,
+            token_kind: None,
+            expires_at: None,
+        };
+        let entry = github_auth_entry(&summary, &AmbientGhCliAuth::Valid);
+        assert!(entry.ok);
+        assert_eq!(entry.version.as_deref(), Some("gh-cli (ambient)"));
+        let detail = entry.detail.as_deref().expect("detail");
+        // Still green, but no longer a bare "ok" — warns about the failure mode.
+        assert!(detail.contains("anonymous 60/hr"));
+    }
+
+    #[test]
+    fn github_auth_entry_unknown_ambient_stays_green_with_verify_hint() {
+        let summary = GhAuthSummary {
+            source: GhAuthSourceSummary::GhCli,
+            token_kind: None,
+            expires_at: None,
+        };
+        let entry = github_auth_entry(&summary, &AmbientGhCliAuth::Unknown);
+        assert!(entry.ok);
+        let detail = entry.detail.as_deref().expect("detail");
+        assert!(detail.contains("Couldn't verify"));
     }
 
     #[test]
@@ -1394,7 +1571,7 @@ mod tests {
             expires_at: None,
         };
 
-        let entry = github_auth_entry(&summary);
+        let entry = github_auth_entry(&summary, &AmbientGhCliAuth::Unknown);
 
         assert!(entry.ok);
         assert_eq!(entry.version.as_deref(), Some("env SHIPYARD_GITHUB_TOKEN"));
@@ -1414,7 +1591,7 @@ mod tests {
             expires_at: Some(expires_at),
         };
 
-        let entry = github_auth_entry(&summary);
+        let entry = github_auth_entry(&summary, &AmbientGhCliAuth::Unknown);
 
         assert!(entry.ok);
         assert_eq!(
