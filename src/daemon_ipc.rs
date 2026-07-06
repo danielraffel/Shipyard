@@ -27,6 +27,60 @@ pub const IPC_PROTOCOL_VERSION: u32 = 2;
 /// Number of historical events replayed to new subscribers.
 pub const RING_BUFFER_SIZE: usize = 100;
 
+/// Wire prefix that marks a `last_error` string as a GitHub-auth-degraded
+/// pause reason for the menu-bar app.
+///
+/// The daemon↔menu-bar reason channel is the flat `last_error: Option<String>`
+/// field on the status update (the same channel the webhook-scope hint uses).
+/// The menu-bar app (shipyard-macos-gui PR #31) decodes an auth-degraded pause
+/// by matching this case-insensitive prefix and taking the trailing text as the
+/// human detail, e.g.
+///
+/// ```text
+/// github_auth_degraded: unauthenticated (anonymous 60/hr) — token invalid or missing
+/// ```
+///
+/// The GUI trims a leading `": "` and falls back to a generic message when the
+/// detail is empty. Keep this prefix in lockstep with the GUI decoder; do NOT
+/// turn it into a structured serde discriminator.
+pub const GITHUB_AUTH_DEGRADED_PREFIX: &str = "github_auth_degraded:";
+
+/// Format a `last_error` value that the menu-bar app decodes as a
+/// GitHub-auth-degraded pause reason. `detail` is a short human explanation;
+/// an empty detail is tolerated (the GUI supplies its own fallback text).
+#[must_use]
+pub fn github_auth_degraded_message(detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        GITHUB_AUTH_DEGRADED_PREFIX.to_owned()
+    } else {
+        format!("{GITHUB_AUTH_DEGRADED_PREFIX} {detail}")
+    }
+}
+
+/// GitHub's anonymous (unauthenticated) REST core rate-limit ceiling. When a
+/// `gh api rate_limit` snapshot reports this as the core limit, the request is
+/// hitting GitHub without a valid token — i.e. auth is degraded, not merely
+/// throttled on an authenticated 5000/hr bucket.
+pub const ANONYMOUS_CORE_RATE_LIMIT: u64 = 60;
+
+/// True when a `rate_limit` snapshot indicates the anonymous 60/hr bucket,
+/// meaning the token isn't authenticating. Accepts either the full
+/// `gh api rate_limit` shape (`.resources.core.limit`) or the flattened
+/// `.rate.limit` shape. Returns false for the authenticated bucket, unknown
+/// shapes, or a missing snapshot.
+#[must_use]
+pub fn rate_limit_is_anonymous(rate_limit: &Value) -> bool {
+    let core_limit = rate_limit
+        .get("resources")
+        .and_then(|resources| resources.get("core"))
+        .and_then(|core| core.get("limit"))
+        .or_else(|| rate_limit.get("rate").and_then(|rate| rate.get("limit")))
+        .or_else(|| rate_limit.get("limit"))
+        .and_then(Value::as_u64);
+    core_limit == Some(ANONYMOUS_CORE_RATE_LIMIT)
+}
+
 /// Server-side view of daemon state exposed over the IPC socket.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IpcState {
@@ -44,7 +98,9 @@ pub struct IpcState {
     pub registered_repos: Vec<String>,
     /// Rate-limit snapshot if known.
     pub rate_limit: Option<Value>,
-    /// Last recoverable daemon warning/error, if any.
+    /// Last recoverable daemon warning/error, if any. Doubles as the
+    /// menu-bar app's pause-reason channel: an auth-degraded pause is encoded
+    /// here via [`github_auth_degraded_message`].
     pub last_error: Option<String>,
 }
 
@@ -476,6 +532,52 @@ mod tests {
     use super::{
         IPC_PROTOCOL_VERSION, IpcServer, IpcState, read_daemon_ship_state_list, read_daemon_status,
     };
+
+    #[test]
+    fn github_auth_degraded_message_prefixes_detail() {
+        let message = super::github_auth_degraded_message(
+            "unauthenticated (anonymous 60/hr) — token invalid or missing",
+        );
+        assert!(message.starts_with(super::GITHUB_AUTH_DEGRADED_PREFIX));
+        let (prefix, detail) = message
+            .split_once(':')
+            .map(|(p, rest)| (format!("{p}:"), rest.trim_start()))
+            .expect("colon");
+        assert_eq!(prefix, super::GITHUB_AUTH_DEGRADED_PREFIX);
+        assert_eq!(
+            detail,
+            "unauthenticated (anonymous 60/hr) — token invalid or missing"
+        );
+    }
+
+    #[test]
+    fn github_auth_degraded_message_tolerates_empty_detail() {
+        // GUI supplies its own fallback text when the detail is empty.
+        assert_eq!(
+            super::github_auth_degraded_message("   "),
+            super::GITHUB_AUTH_DEGRADED_PREFIX
+        );
+    }
+
+    #[test]
+    fn anonymous_core_rate_limit_is_detected() {
+        let resources = serde_json::json!({
+            "resources": { "core": { "limit": 60, "remaining": 0 } }
+        });
+        assert!(super::rate_limit_is_anonymous(&resources));
+
+        let flat = serde_json::json!({ "rate": { "limit": 60 } });
+        assert!(super::rate_limit_is_anonymous(&flat));
+    }
+
+    #[test]
+    fn authenticated_rate_limit_is_not_anonymous() {
+        let resources = serde_json::json!({
+            "resources": { "core": { "limit": 5000, "remaining": 4999 } }
+        });
+        assert!(!super::rate_limit_is_anonymous(&resources));
+        assert!(!super::rate_limit_is_anonymous(&serde_json::json!({})));
+    }
 
     #[cfg(unix)]
     fn dummy_state() -> IpcState {

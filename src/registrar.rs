@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wait_timeout::ChildExt;
 
+use crate::daemon_ipc::rate_limit_is_anonymous;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 
@@ -65,6 +66,16 @@ pub enum RegistrarError {
         /// Combined stdout/stderr from `gh`.
         output: String,
     },
+    /// GitHub rejected the request because the token isn't authenticating:
+    /// HTTP 401/403 (bad/expired/missing credentials) or the anonymous
+    /// 60-req/hr rate limit. Distinct from a missing repo-hook scope — the
+    /// token itself is invalid, so live updates degrade until it's fixed.
+    AuthDegraded {
+        /// Registrar operation being attempted.
+        action: &'static str,
+        /// Combined stdout/stderr from `gh`.
+        output: String,
+    },
     /// GitHub CLI returned a successful response without a hook ID.
     MissingHookId(String),
     /// Persisted registration state could not be serialized or parsed.
@@ -87,6 +98,13 @@ impl std::fmt::Display for RegistrarError {
                     output.trim()
                 )
             }
+            Self::AuthDegraded { action, output } => {
+                write!(
+                    formatter,
+                    "{action} hook failed: GitHub rejected the request ({}). The token is invalid, expired, or missing. Run `gh auth status` or configure a [github.auth] token.",
+                    output.trim()
+                )
+            }
             Self::MissingHookId(output) => {
                 write!(
                     formatter,
@@ -106,6 +124,24 @@ impl RegistrarError {
     #[must_use]
     pub fn is_missing_webhook_scope(&self) -> bool {
         matches!(self, Self::MissingWebhookScope { .. })
+    }
+
+    /// True when GitHub rejected the request because the token isn't
+    /// authenticating (HTTP 401/403 or the anonymous 60/hr rate limit).
+    #[must_use]
+    pub fn is_auth_degraded(&self) -> bool {
+        matches!(self, Self::AuthDegraded { .. })
+    }
+
+    /// Concise, human detail for an auth-degraded failure, suitable as the
+    /// trailing text of a `github_auth_degraded:` pause message. Empty for
+    /// other error kinds.
+    #[must_use]
+    pub fn auth_degraded_detail(&self) -> String {
+        match self {
+            Self::AuthDegraded { output, .. } => auth_failure_detail(output),
+            _ => String::new(),
+        }
     }
 }
 
@@ -423,8 +459,12 @@ fn delete_hook(
 }
 
 fn classify_gh_failure(action: &'static str, output: String) -> RegistrarError {
+    // Order matters: a missing repo-hook scope is a 403 too, but it's a
+    // one-time grant, not a dead token — keep it distinct and check first.
     if mentions_webhook_scope(&output) {
         RegistrarError::MissingWebhookScope { action, output }
+    } else if mentions_auth_failure(&output) {
+        RegistrarError::AuthDegraded { action, output }
     } else {
         RegistrarError::GhFailed { action, output }
     }
@@ -433,6 +473,51 @@ fn classify_gh_failure(action: &'static str, output: String) -> RegistrarError {
 fn mentions_webhook_scope(output: &str) -> bool {
     let lowered = output.to_ascii_lowercase();
     lowered.contains("admin:repo_hook") || lowered.contains("repo_hook")
+}
+
+/// True when `gh api` output indicates the token isn't authenticating — an
+/// HTTP 401/403, an explicit bad/expired-credentials message, or GitHub's
+/// anonymous (unauthenticated) rate-limit response. The anonymous rate limit is
+/// recognized either from the human "API rate limit exceeded" message or, when
+/// `gh` echoes a `rate_limit` JSON body, from a core limit of 60 via
+/// [`rate_limit_is_anonymous`].
+fn mentions_auth_failure(output: &str) -> bool {
+    let lowered = output.to_ascii_lowercase();
+    let http_auth_status = lowered.contains("http 401")
+        || lowered.contains("http 403")
+        || lowered.contains("401 unauthorized")
+        || lowered.contains("403 forbidden");
+    let credential_hint = lowered.contains("bad credentials")
+        || lowered.contains("requires authentication")
+        || lowered.contains("must authenticate")
+        || lowered.contains("token expired")
+        || lowered.contains("invalid token");
+    let anonymous_rate_limit = lowered.contains("api rate limit exceeded")
+        || serde_json::from_str::<serde_json::Value>(output.trim())
+            .is_ok_and(|value| rate_limit_is_anonymous(&value));
+    http_auth_status || credential_hint || anonymous_rate_limit
+}
+
+/// Build a concise human detail from raw `gh` auth-failure output for the
+/// `github_auth_degraded:` pause message. Prefers the anonymous-rate-limit
+/// explanation, then the first meaningful line of `gh` output, and finally a
+/// generic fallback.
+fn auth_failure_detail(output: &str) -> String {
+    let lowered = output.to_ascii_lowercase();
+    if lowered.contains("api rate limit exceeded")
+        || serde_json::from_str::<serde_json::Value>(output.trim())
+            .is_ok_and(|value| rate_limit_is_anonymous(&value))
+    {
+        return "unauthenticated (anonymous 60/hr) — token invalid or missing".to_owned();
+    }
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map_or_else(
+            || "invalid or expired GitHub token".to_owned(),
+            |line| line.chars().take(200).collect(),
+        )
 }
 
 #[derive(Debug)]
@@ -680,6 +765,94 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn create_http_401_is_auth_degraded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::Unauthorized);
+        let mut registrar = Registrar::new(temp.path());
+
+        let error = registrar
+            .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
+            .expect_err("unauthorized");
+
+        assert!(error.is_auth_degraded(), "401 should be auth-degraded");
+        assert!(!error.is_missing_webhook_scope());
+        assert!(
+            error
+                .auth_degraded_detail()
+                .to_lowercase()
+                .contains("bad credentials")
+        );
+        assert!(registrar.all().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_anonymous_rate_limit_is_auth_degraded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::AnonRateLimit);
+        let mut registrar = Registrar::new(temp.path());
+
+        let error = registrar
+            .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
+            .expect_err("rate limited");
+
+        assert!(
+            error.is_auth_degraded(),
+            "anonymous rate limit is auth-degraded"
+        );
+        assert!(
+            error.auth_degraded_detail().contains("anonymous 60/hr"),
+            "detail should name the anonymous bucket: {}",
+            error.auth_degraded_detail()
+        );
+    }
+
+    #[test]
+    fn classify_prefers_webhook_scope_over_auth() {
+        // A repo_hook 403 must stay a scope grant, not a dead-token downgrade.
+        let error = super::classify_gh_failure(
+            "create",
+            "HTTP 403: Resource not accessible; missing admin:repo_hook".to_owned(),
+        );
+        assert!(error.is_missing_webhook_scope());
+        assert!(!error.is_auth_degraded());
+    }
+
+    #[test]
+    fn classify_detects_401_403_and_credentials() {
+        for output in [
+            "HTTP 401: Bad credentials",
+            "gh: 401 Unauthorized",
+            "HTTP 403: Forbidden",
+            "This endpoint requires authentication",
+        ] {
+            let error = super::classify_gh_failure("create", output.to_owned());
+            assert!(
+                error.is_auth_degraded(),
+                "should be auth-degraded: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_detects_anonymous_rate_limit_json_body() {
+        // Some gh versions echo a rate_limit JSON body; core limit 60 = anon.
+        let body = r#"{"resources":{"core":{"limit":60,"remaining":0}}}"#;
+        let error = super::classify_gh_failure("create", body.to_owned());
+        assert!(error.is_auth_degraded());
+        assert!(error.auth_degraded_detail().contains("anonymous 60/hr"));
+    }
+
+    #[test]
+    fn classify_leaves_generic_failure_alone() {
+        let error = super::classify_gh_failure("create", "HTTP 500: server error".to_owned());
+        assert!(!error.is_auth_degraded());
+        assert!(!error.is_missing_webhook_scope());
+        assert!(matches!(error, super::RegistrarError::GhFailed { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unregister_without_gh_removes_local_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = write_gh_stub(temp.path(), GhStubMode::Ok);
@@ -701,6 +874,8 @@ mod tests {
         Delete404,
         MissingId,
         MissingWebhookScope,
+        Unauthorized,
+        AnonRateLimit,
     }
 
     #[cfg(unix)]
@@ -708,21 +883,31 @@ mod tests {
         let gh = temp.join("gh");
         let create_response = match mode {
             GhStubMode::MissingId => "{}",
-            GhStubMode::Ok | GhStubMode::Delete404 | GhStubMode::MissingWebhookScope => {
-                "{\"id\":4242}"
-            }
+            GhStubMode::Ok
+            | GhStubMode::Delete404
+            | GhStubMode::MissingWebhookScope
+            | GhStubMode::Unauthorized
+            | GhStubMode::AnonRateLimit => "{\"id\":4242}",
         };
         let delete_branch = match mode {
             GhStubMode::Delete404 => {
                 "  *\" -X DELETE \"*) printf '404 not found\\n' >&2; exit 1 ;;"
             }
-            GhStubMode::Ok | GhStubMode::MissingId | GhStubMode::MissingWebhookScope => {
-                "  *\" -X DELETE \"*) exit 0 ;;"
-            }
+            GhStubMode::Ok
+            | GhStubMode::MissingId
+            | GhStubMode::MissingWebhookScope
+            | GhStubMode::Unauthorized
+            | GhStubMode::AnonRateLimit => "  *\" -X DELETE \"*) exit 0 ;;",
         };
         let create_branch = match mode {
             GhStubMode::MissingWebhookScope => String::from(
                 "  *\" -X POST \"*) printf 'missing scope: admin:repo_hook\\n' >&2; exit 1 ;;",
+            ),
+            GhStubMode::Unauthorized => String::from(
+                "  *\" -X POST \"*) printf 'HTTP 401: Bad credentials (https://api.github.com/repos/owner/repo/hooks)\\n' >&2; exit 1 ;;",
+            ),
+            GhStubMode::AnonRateLimit => String::from(
+                "  *\" -X POST \"*) printf 'HTTP 403: API rate limit exceeded for 203.0.113.7. (But here is the good news: Authenticated requests get a higher rate limit.)\\n' >&2; exit 1 ;;",
             ),
             GhStubMode::Ok | GhStubMode::Delete404 | GhStubMode::MissingId => {
                 format!("  *\" -X POST \"*) printf '%s\\n' '{create_response}' ;;")

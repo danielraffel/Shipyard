@@ -30,7 +30,7 @@ use chrono::Utc;
 use crate::config::LoadedConfig;
 use crate::daemon_ipc::read_daemon_status;
 #[cfg(unix)]
-use crate::daemon_ipc::{IpcServer, IpcState};
+use crate::daemon_ipc::{IpcServer, IpcState, github_auth_degraded_message};
 use crate::identity::RuntimeMode;
 #[cfg(unix)]
 use crate::reconcile::{
@@ -1284,6 +1284,10 @@ fn registration_error_message(repo: &str, error: &RegistrarError) -> String {
         format!(
             "GitHub webhook management for {repo} needs one-time authorization. Polling continues; live webhooks need: {WEBHOOK_SCOPE_COMMAND}"
         )
+    } else if error.is_auth_degraded() {
+        // Encode the auth-degraded pause reason on the flat `last_error`
+        // channel the menu-bar app decodes (github_auth_degraded: <detail>).
+        github_auth_degraded_message(&error.auth_degraded_detail())
     } else {
         error.to_string()
     }
@@ -1553,6 +1557,39 @@ mod tests {
     use crate::webhook::hmac_sha256_hex;
     #[cfg(unix)]
     use wait_timeout::ChildExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_error_message_encodes_auth_degraded_pause() {
+        use crate::daemon_ipc::GITHUB_AUTH_DEGRADED_PREFIX;
+        use crate::registrar::RegistrarError;
+
+        let error = RegistrarError::AuthDegraded {
+            action: "create",
+            output: "HTTP 401: Bad credentials".to_owned(),
+        };
+        let message = super::registration_error_message("owner/repo", &error);
+        assert!(
+            message.starts_with(GITHUB_AUTH_DEGRADED_PREFIX),
+            "auth-degraded pause must use the GUI-decoded prefix: {message}"
+        );
+        assert!(message.to_lowercase().contains("bad credentials"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_error_message_keeps_webhook_scope_hint() {
+        use crate::daemon_ipc::GITHUB_AUTH_DEGRADED_PREFIX;
+        use crate::registrar::RegistrarError;
+
+        let error = RegistrarError::MissingWebhookScope {
+            action: "create",
+            output: "missing scope: admin:repo_hook".to_owned(),
+        };
+        let message = super::registration_error_message("owner/repo", &error);
+        assert!(!message.starts_with(GITHUB_AUTH_DEGRADED_PREFIX));
+        assert!(message.contains("admin:repo_hook"));
+    }
 
     #[test]
     fn resolve_repos_prefers_explicit_and_deduplicates() {
