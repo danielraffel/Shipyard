@@ -114,6 +114,40 @@ The first concurrency release uses a conservative worker cap, so host-pool
 throughput is bounded by both configured pool capacity and the queue worker
 limit.
 
+## Local Build Command Contract (project-supplied wrappers)
+
+The `local` backend runs each project-configured stage string
+(`setup` / `configure` / `build` / `test` from the project's Shipyard config)
+**verbatim** — the whole string is handed to `sh -c "<string>"`, so shell
+quoting, `&&`, and multi-word commands work as written. Shipyard does not parse,
+rewrite, or split the string beyond that. Three properties of that execution are
+a stable contract that projects rely on, and that should not regress:
+
+1. **Working directory is the target's `cwd`.** Local targets run in their
+   configured `cwd` (or, when a target leaves `cwd` unset, Shipyard's own current
+   directory). Set `cwd` to the repo/worktree root so a stage string may use
+   **relative** paths (`tools/ci/build.sh`, `cmake --build build`).
+2. **The full parent environment is inherited.** The local executor does not
+   clear or whitelist the environment, so `PATH` and any tool-specific variables
+   present when Shipyard runs reach the stage command unchanged. A wrapper can
+   therefore resolve helper binaries on `PATH` and read its own env inputs.
+3. **The child's exit code is propagated.** A nonzero exit from the stage command
+   fails that stage (and the target); zero passes.
+
+Because of these three properties, a project can point a stage at a **wrapper
+command** with no special Shipyard support. For example, Pulp's `local` macOS
+build stage is `tools/ci/governed-build.sh cmake --build build`: a thin wrapper
+that acquires a tartci host **build-lease** (sizing parallelism to a shared host
+budget so a validation build does not oversubscribe a Mac already running agent
+builds), exports `CMAKE_BUILD_PARALLEL_LEVEL`, runs the real `cmake --build`
+child, and releases the lease on exit. To Shipyard it is just another build
+string. It depends on exactly the guarantees above — repo-root `cwd` (for the
+relative script path and the relative `cmake --build build`), inherited `PATH`
+(to find `tartci` / `getconf`), and a propagated exit code (so a failed compile
+still fails the leg). Shipyard itself is unchanged by this; the note exists so a
+future change to how the local backend sets `cwd`, scrubs the environment, or
+maps exit codes is understood to break such wrappers.
+
 ## Mixed OS VM Lanes
 
 A host can serve more than one VM lane. For Pulp/tartci, the same controller and
