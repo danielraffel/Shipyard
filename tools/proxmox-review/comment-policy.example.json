@@ -1,0 +1,14 @@
+{
+  "enabled": false,
+  "publish_results": false,
+  "ghapp": "/usr/local/bin/ghapp",
+  "controller_config": "/etc/shipyard-review/controller.json",
+  "state_db": "/var/lib/shipyard-review/comments.sqlite3",
+  "results_dir": "/var/lib/shipyard-review/results",
+  "authorized_users": {
+    "danielraffel": 25807
+  },
+  "repositories": {
+    "danielraffel/pulp": "/etc/shipyard-review/recipes/pulp-linux.json"
+  }
+}

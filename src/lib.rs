@@ -110,6 +110,8 @@ pub mod supervised;
 pub mod tree_drift;
 /// Tunnel readiness, Tailscale probe decoding, and supervisor retry policy.
 pub mod tunnel;
+/// Fail-closed policy primitives for contributor-controlled review requests.
+pub mod untrusted;
 /// Pure truth evaluators for `shipyard wait`.
 pub mod wait;
 /// Transport orchestration and snapshot fetching for `shipyard wait`.

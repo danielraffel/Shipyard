@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review External Contributions"
+  short_description: "Review external PRs safely without leaving them in limbo"
+  default_prompt: "Review this external contribution using exact-head evidence, normal maintainer norms, and the repository policy."

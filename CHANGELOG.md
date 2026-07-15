@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0770"></a>
+## [0.77.1]
+
 ## [0.77.0] - 2026-07-03
 
 - feat(ship): recognise the flaky-required-leg merge wedge and hand over the rescue one-liner ([#371](https://github.com/danielraffel/Shipyard/pull/371))

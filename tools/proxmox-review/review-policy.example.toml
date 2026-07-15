@@ -1,0 +1,36 @@
+# Read only from a trusted base revision or protected controller configuration.
+# Omitted fields inherit Shipyard's contributor-review defaults.
+
+[review]
+merge_authority = "danielraffel"
+exact_head_required = true
+human_merge_required = true
+feedback_style = "consolidated"
+
+[review.ownership]
+substantive_fixes = "contributor"
+moving_base = "maintainer"
+version_collision = "maintainer"
+merge_preparation = "maintainer"
+
+[review.visibility]
+first_seen = "notify"
+routine_activity = "quiet"
+
+[review.plans]
+known_collaborator = "review_then_schedule"
+first_seen = "review_then_schedule_with_identity_context"
+rewrite_sound_plan = false
+first_execution = "isolated_vm"
+schedule_choices = ["build_now", "table", "decline"]
+
+[review.public_comments]
+mention_private_security_probes = false
+include_raw_logs = false
+require_next_owner_and_action = true
+
+[repositories."danielraffel/pulp"]
+alignment_document = "VISION.md"
+license = "MIT"
+require_realtime_review_for_signal_changes = true
+require_dependency_notice_review = true

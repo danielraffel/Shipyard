@@ -1,0 +1,29 @@
+{
+  "enabled": false,
+  "proxmox": {
+    "host": "192.168.86.70",
+    "port": 8006,
+    "node": "nexus",
+    "tls_sha256": "2ef39e10092e61b3052930a94f44b1b96d713f77fd2df5d509625a4671f0ee0b",
+    "token_file": "/var/lib/shipyard-review/secrets/proxmox-api-token"
+  },
+  "template_vmid": 127,
+  "template_name": "shipyard-review-template-v9",
+  "template_image_sha256": "6e891728d885669aacfd40e8bdd8208b9d202b73dc15998268e46c7afafbd4d3",
+  "template_image_manifest": "/etc/shipyard-review/images/shipyard-review-template-v9.json",
+  "dependency_inventory_sha256": "31ab3bd4a6bfe0666ee890f2eec4e8831138f1ecfc730586894df0eb97bc0936",
+  "dependency_inventory": "/etc/shipyard-review/dependencies/pulp-linux.json",
+  "guest_runner_sha256": "f4b949d337fbbd11f7b053ca0050f543d9a2aad765219ee4a6e78d6781cd49f4",
+  "job_vmid": 200,
+  "job_bridge": "vmbr1",
+  "job_ip": "10.77.0.200/24",
+  "disk_storage": "local-lvm",
+  "job_disk_gib": 80,
+  "iso_storage": "shipyard-review-iso",
+  "pool": "shipyard-review-jobs",
+  "admission_latch": "/var/lib/shipyard-review/admission-latch.json",
+  "admission_lock": "/var/lib/shipyard-review/admission.lock",
+  "wall_timeout_seconds": 7200,
+  "qga_timeout_seconds": 180,
+  "result_timeout_seconds": 30
+}

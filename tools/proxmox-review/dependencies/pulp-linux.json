@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "repository": "danielraffel/pulp",
+  "recipe": "pulp-linux.json",
+  "policy": {
+    "controller_fetch": "forbidden",
+    "controller_cache_warming": "forbidden",
+    "guest_network": "none",
+    "missing_dependency": "fail-closed"
+  },
+  "not_required": [
+    { "name": "planning", "reason": "private fixture submodule; guarded tests skip when absent" },
+    { "name": "webgpu", "reason": "PULP_ENABLE_GPU=OFF" },
+    { "name": "simdjson", "reason": "PULP_ENABLE_GPU=OFF" },
+    { "name": "fastgltf", "reason": "PULP_ENABLE_GPU=OFF" },
+    { "name": "threejs", "reason": "PULP_ENABLE_GPU=OFF and PULP_BUILD_EXAMPLES=OFF" },
+    { "name": "draco", "reason": "PULP_ENABLE_DRACO defaults OFF" }
+  ],
+  "baked_sources": [
+    { "name": "catch2", "path": "catch2-src", "commit": "fa43b77429ba76c462b1898d6cd2f2d7a9416b14", "git_archive_sha256": "63ff271325220bc5df168fd1efe694c80678dddac2889dd5603219b4383c3cbe" },
+    { "name": "choc", "path": "choc-src", "commit": "df148a41a6bc9cbd67727532c4d5c9d8aa6d5d60", "git_archive_sha256": "d7787ebc1db9c153ecbcbed9aab9d1e5d7d86b8f04623381e3b4675e9a158a00" },
+    { "name": "clap", "path": "clap-src", "commit": "cd94482ba5941ae410809b6fbaed3bc851044270", "git_archive_sha256": "adffb5df335d8b5f31da53d9bd3bfed26b8aee35efde4d37169266f644c4e36e" },
+    { "name": "highway", "path": "highway-src", "commit": "457c891775a7397bdb0376bb1031e6e027af1c48", "git_archive_sha256": "e27b0cfb42ff071c91116588923a16cac6a809e46eb1472055295da3e4e9f1d9" },
+    { "name": "lv2", "path": "lv2-src", "commit": "0bcde338db1c63bbc503b4d1f6d7b55ed43154af", "git_archive_sha256": "a5caf291816c0fa820fd64fb07aea075ae90f13f267bebd55487e258ee6a50df" },
+    { "name": "mbedtls", "path": "mbedtls-src", "commit": "107ea89daaefb9867ea9121002fbbdf926780e98", "git_archive_sha256": "455d2ebe89f25c0aae940e017e3c765c173e9777f6390054977aa649235dc343" },
+    { "name": "sdl3", "path": "sdl3-src", "commit": "5ac37a8ffcf89da390404c1016833d56e2d67ae4", "git_archive_sha256": "099496d88945ce7e05d70d9fa5964512b7d7439db448f2d147500d101f703ed1" },
+    { "name": "sheenbidi", "path": "sheenbidi-src", "commit": "cfe430e7375a7845b679adae9d51dac6deaa8858", "git_archive_sha256": "9bdf0c279f5070f9d397d8f1446acd0bf8eebb802da80ca4cb6b57fb1cac4a28" },
+    { "name": "yaml-cpp", "path": "yaml-cpp-src", "commit": "f7320141120f720aecc4c32be25586e7da9eb978", "git_archive_sha256": "0b937677b409a738ba18e12f62d5b21a38a57d2d90f2db848bc662c18b7fd5ec" },
+    { "name": "yoga", "path": "yoga-src", "commit": "042f5013152eb81c1552dec945b88f7b95ca350f", "git_archive_sha256": "695992bba663b8efa3f8609d87be46b6d83f445d548b54c83625049d233a7c9e" }
+  ]
+}

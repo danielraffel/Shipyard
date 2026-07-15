@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "commands": [
+    { "argv": ["python3", "isolation_probe.py", "identity"], "timeout_seconds": 30 },
+    { "argv": ["python3", "isolation_probe.py", "mac-home"], "timeout_seconds": 30 },
+    { "argv": ["python3", "isolation_probe.py", "control-secret"], "timeout_seconds": 30 },
+    { "argv": ["python3", "isolation_probe.py", "root-ssh"], "timeout_seconds": 30 },
+    { "argv": ["python3", "isolation_probe.py", "nested-virtualization"], "timeout_seconds": 30 },
+    { "argv": ["python3", "isolation_probe.py", "root-filesystem"], "timeout_seconds": 30 },
+    { "argv": ["python3", "isolation_probe.py", "proxmox-bridge"], "timeout_seconds": 30 },
+    { "argv": ["python3", "isolation_probe.py", "proxmox-management"], "timeout_seconds": 30 },
+    { "argv": ["python3", "isolation_probe.py", "internet"], "timeout_seconds": 30 },
+    {
+      "argv": ["cmake", "-S", ".", "-B", "build", "-G", "Ninja"],
+      "timeout_seconds": 120
+    },
+    {
+      "argv": ["cmake", "--build", "build"],
+      "timeout_seconds": 120
+    },
+    {
+      "argv": ["./build/shipyard-review-smoke"],
+      "timeout_seconds": 30
+    }
+  ]
+}

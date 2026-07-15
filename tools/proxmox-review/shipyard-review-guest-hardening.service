@@ -1,0 +1,13 @@
+[Unit]
+Description=Enforce unprivileged Shipyard review guest after cloud-init
+After=cloud-config.service
+Before=cloud-final.service
+Requires=cloud-config.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/shipyard-enforce-unprivileged
+RemainAfterExit=yes
+
+[Install]
+WantedBy=cloud-init.target

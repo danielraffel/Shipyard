@@ -24,6 +24,11 @@ go/no-go for that operation.
    `docs/plan/README.md`.
 4. Use `--mode isolated`, temporary install directories, and sandbox HOME/PATH
    roots for rehearsals that must not touch the active production state.
+5. For contributor-controlled revisions or `/shipyard review`, use
+   `skills/review-external-contributions/SKILL.md`. The dedicated disposable-VM
+   controller is intentionally separate from normal Shipyard targets and must
+   fail closed rather than use local, SSH, host-pool, self-hosted, or fallback
+   execution. Its polling timer remains an explicit activation gate.
 
 ## Local/SSH VM Watch
 

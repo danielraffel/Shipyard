@@ -507,6 +507,7 @@ skip_commit_patterns = ["^docs:"]
 
     fn git(root: &Path, args: &[&str]) {
         let status = Command::new("git")
+            .args(["-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false"])
             .args(args)
             .current_dir(root)
             .status()
