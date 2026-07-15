@@ -28,6 +28,15 @@
         "commands/changelog.md"
       ]
     },
+    "review-external-contributions": {
+      "paths": [
+        "docs/external-contributor-review.md",
+        "docs/external-review-phase-1-*.md",
+        "docs/untrusted-contributor-execution.md",
+        "tools/proxmox-review/**",
+        "skills/review-external-contributions/**"
+      ]
+    },
     "shipyard": {
       "paths": [
         "src/**",

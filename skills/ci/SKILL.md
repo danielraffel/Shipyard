@@ -266,6 +266,16 @@ queue — the Studio's keychain already holds the Developer ID signing identity.
 Use `local` only on private repos / the owner's own machine, never a public repo
 with untrusted PRs.
 
+### External contribution execution
+
+Never route contributor-controlled revisions through Shipyard's normal local,
+SSH, host-pool, cloud/self-hosted, or fallback dispatchers. Those are execution
+providers, not isolation boundaries. Use the dedicated external-contribution
+review workflow in `skills/review-external-contributions/SKILL.md`; if its
+disposable VM lane is unavailable, the request blocks and does not fall back.
+Treat Git hooks as execution too: an external-derived branch must not trigger a
+maintainer-workstation configure, build, generator, or test hook.
+
 ## Live mode (`shipyard daemon`) — when it helps and when to ignore it
 
 Shipyard has a long-running webhook receiver that converts GitHub

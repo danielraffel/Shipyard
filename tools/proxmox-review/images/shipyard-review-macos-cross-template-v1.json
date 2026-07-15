@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "template_vmid": 131,
+  "template_name": "shipyard-review-macos-cross-template-v1-clean",
+  "purpose": "credential-free offline macOS compile validation only",
+  "network": "no NIC",
+  "signing": "not present",
+  "sdk": {
+    "version": "26.5",
+    "archive_sha256": "2230af467c4af2eb4eb7a6e5bc6ef63d7e73b68b45de4bd956b2a2c8067ab531"
+  },
+  "toolchain": {
+    "darwin": "25.5",
+    "architecture": "arm64",
+    "infra_commit": "f4aad34",
+    "infra_archive_sha256": "35ebd2d1b395f67270927aa41c86a64e40dd44cd593fc53d2d39e855a954491b"
+  },
+  "image": {
+    "root_logical_sha256": "54f3c5b38a281759d1519ade24f96ed14e454c2fa5a6fe26adde8ca4458ac249",
+    "efi_logical_sha256": "f7228a52f0b91649430a50c45596cde7c697926aa391ed306967612d4ff90dc7",
+    "cloud_init_logical_sha256": "4ddfa374467ed0e5de3078476ef3c3ad4862e03a25dc44a1f330087837ad05a0",
+    "stable_config_sha256": "de018582bb2f8dfe73670d6c8e45bdc97ab14759c7e501bdc9b89ab8f6748b96",
+    "user_data_sha256": "5d309276ffc3f9c66f4b50bf9622953d1123f9b92cf32c8a020e7158667426e5"
+  },
+  "validation": {
+    "source": "int meaning(void) { return 42; }",
+    "output": "Mach-O 64-bit arm64 object",
+    "object_sha256": "32160db1e79bfb4e9d8fc94f379a52d0196864b7c9c23f2cfcf1f522d74d0d9a"
+  }
+}

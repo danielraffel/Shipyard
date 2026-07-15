@@ -23,10 +23,11 @@ CONTROL = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CONTROL)
 
 COMMAND = "/shipyard review"
-REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 MAX_GITHUB_RESPONSE = 8 * 1024 * 1024
 MAX_PUBLISH_BODY = 4096
+RUNNING_STALE_SECONDS = 3 * 60 * 60
 
 
 def load_policy(path: Path) -> dict[str, object]:
@@ -46,7 +47,7 @@ def load_policy(path: Path) -> dict[str, object]:
     if not isinstance(authorized_users, dict) or not authorized_users:
         raise CONTROL.Blocked("authorized user allowlist is empty")
     if not all(
-        isinstance(login, str) and login and isinstance(user_id, int) and user_id > 0
+        isinstance(login, str) and login and type(user_id) is int and user_id > 0
         for login, user_id in authorized_users.items()
     ):
         raise CONTROL.Blocked("authorized users must map login to numeric GitHub user id")
@@ -139,9 +140,12 @@ def publish_result(
         raise CONTROL.Blocked("GitHub publication response lacked a comment id")
 
 
-def gh_archive(ghapp: Path, endpoint: str, destination: Path) -> None:
+def gh_archive(ghapp: Path, repo: str, head_sha: str, destination: Path) -> None:
     if not ghapp.is_absolute() or not ghapp.is_file():
         raise CONTROL.Blocked("configured ghapp executable is unavailable")
+    if not REPO_RE.fullmatch(repo) or not SHA_RE.fullmatch(head_sha):
+        raise CONTROL.Blocked("GitHub source archive provenance is invalid")
+    endpoint = f"repos/{repo}/tarball/{head_sha}"
     with destination.open("wb") as output:
         completed = subprocess.run(
             [str(ghapp), "api", "--method", "GET", "-H", "Accept: application/vnd.github+json", endpoint],
@@ -171,11 +175,11 @@ def initialize_db(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def comment_status(connection: sqlite3.Connection, repo: str, comment_id: int) -> str | None:
+def comment_record(connection: sqlite3.Connection, repo: str, comment_id: int) -> tuple[str, int] | None:
     row = connection.execute(
-        "SELECT status FROM comments WHERE repo = ? AND comment_id = ?", (repo, comment_id)
+        "SELECT status, updated_at FROM comments WHERE repo = ? AND comment_id = ?", (repo, comment_id)
     ).fetchone()
-    return str(row[0]) if row else None
+    return (str(row[0]), int(row[1])) if row else None
 
 
 def record(connection: sqlite3.Connection, repo: str, comment_id: int, status: str, detail: str) -> None:
@@ -211,13 +215,28 @@ def process_comment(
     if not isinstance(comment, dict) or not isinstance(comment.get("id"), int):
         return
     comment_id = comment["id"]
-    if comment_status(connection, repo, comment_id) in {"ignored", "completed", "running"}:
-        return
+    prior = comment_record(connection, repo, comment_id)
+    if prior:
+        status, updated_at = prior
+        if status in {"ignored", "completed", "blocked"}:
+            return
+        if status == "running":
+            if int(time.time()) - updated_at <= RUNNING_STALE_SECONDS:
+                return
+            record(
+                connection, repo, comment_id, "blocked",
+                "stale interrupted attempt; reconcile fixed resources and submit a fresh trigger",
+            )
+            return
+        raise CONTROL.Blocked(f"comment state is invalid: {status}")
     user = comment.get("user")
     login = user.get("login") if isinstance(user, dict) else None
     user_id = user.get("id") if isinstance(user, dict) else None
     if (
         not exact_command(comment.get("body"))
+        or not isinstance(login, str)
+        or type(user_id) is not int
+        or login not in policy["authorized_users"]
         or policy["authorized_users"].get(login) != user_id
     ):
         record(connection, repo, comment_id, "ignored", "not an exact authorized trigger")
@@ -241,7 +260,7 @@ def process_comment(
             temp = Path(temp_name)
             source = temp / "source.tar.gz"
             iso = temp / lifecycle.iso_name
-            gh_archive(ghapp, f"repos/{repo}/tarball/{request['head_sha']}", source)
+            gh_archive(ghapp, repo, str(request["head_sha"]), source)
             manifest = CONTROL.build_iso(source, Path(str(policy["repositories"][repo])), request, iso)
             result = lifecycle.run(iso, manifest)
         result["controller"]["teardown"] = "confirmed"
@@ -287,6 +306,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except CONTROL.Blocked as error:
+    except (CONTROL.Blocked, CONTROL.ControllerInterrupted) as error:
         print(json.dumps({"status": "blocked", "reason": str(error)}), file=sys.stderr)
         raise SystemExit(3)

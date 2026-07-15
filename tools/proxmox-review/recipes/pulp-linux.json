@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "commands": [
+    {
+      "argv": [
+        "cmake", "-S", ".", "-B", "build-shipyard-review", "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release", "-DPULP_ENABLE_GPU=OFF",
+        "-DPULP_BUILD_EXAMPLES=OFF",
+        "-DFETCHCONTENT_BASE_DIR=/opt/shipyard-review/pulp-deps",
+        "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
+      ],
+      "env": { "CMAKE_BUILD_PARALLEL_LEVEL": "2" },
+      "timeout_seconds": 900
+    },
+    {
+      "argv": ["cmake", "--build", "build-shipyard-review", "--parallel", "2"],
+      "env": { "CMAKE_BUILD_PARALLEL_LEVEL": "2" },
+      "timeout_seconds": 3600
+    },
+    {
+      "argv": [
+        "ctest", "--test-dir", "build-shipyard-review", "--output-on-failure",
+        "-LE", "validation|slow", "-j2", "--timeout", "120"
+      ],
+      "timeout_seconds": 3600
+    }
+  ]
+}

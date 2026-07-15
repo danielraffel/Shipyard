@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import shutil
+import signal
 import ssl
 import subprocess
 import sys
@@ -22,6 +25,8 @@ import uuid
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_ISO_BYTES = 80 * 1024 * 1024
 MAX_RESULT_BYTES = 256 * 1024
+MAX_RESULT_COMMANDS = 32
+MAX_RESULT_STRING_BYTES = 16 * 1024
 FORBIDDEN_CONFIG_PREFIXES = (
     "args", "audio", "hostpci", "ivshmem", "parallel", "tpmstate", "usb", "virtiofs",
 )
@@ -29,6 +34,19 @@ FORBIDDEN_CONFIG_PREFIXES = (
 
 class Blocked(RuntimeError):
     """A fail-closed admission or infrastructure failure."""
+
+
+class TeardownBlocked(Blocked):
+    """Teardown could not be proven; admission must remain latched closed."""
+
+
+class ControllerInterrupted(RuntimeError):
+    """Graceful service termination; deliberately not a retryable Blocked error."""
+
+
+def interrupt_for_teardown(signum: int, _frame: object) -> None:
+    """Turn graceful service termination into an exception so finally runs."""
+    raise ControllerInterrupted(f"controller interrupted by signal {signum}")
 
 
 def sha256(path: Path) -> str:
@@ -84,11 +102,12 @@ class ProxmoxApi:
         path: str,
         fields: dict[str, object] | None = None,
         upload: tuple[str, Path] | None = None,
+        timeout: int = 60,
     ) -> object:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        connection = http.client.HTTPSConnection(self.host, self.port, context=context, timeout=60)
+        connection = http.client.HTTPSConnection(self.host, self.port, context=context, timeout=timeout)
         headers = {"Authorization": self.token, "Accept": "application/json"}
         body: bytes | None = None
         target = "/api2/json" + path
@@ -155,9 +174,12 @@ class ProxmoxApi:
 
 def validate_config(config: dict[str, object]) -> None:
     expected = {
-        "enabled", "proxmox", "template_vmid", "template_name", "guest_runner_sha256",
+        "enabled", "proxmox", "template_vmid", "template_name", "template_image_sha256",
+        "template_image_manifest", "dependency_inventory_sha256", "dependency_inventory",
+        "guest_runner_sha256",
         "job_vmid", "job_bridge", "job_ip",
-        "disk_storage", "iso_storage", "pool", "wall_timeout_seconds", "qga_timeout_seconds",
+        "disk_storage", "job_disk_gib", "iso_storage", "pool", "wall_timeout_seconds", "qga_timeout_seconds",
+        "result_timeout_seconds", "admission_latch", "admission_lock",
     }
     extra = set(config) - expected
     if extra:
@@ -170,18 +192,124 @@ def validate_config(config: dict[str, object]) -> None:
         raise Blocked("untrusted job bridge must be vmbr1")
     if config.get("disk_storage") != "local-lvm":
         raise Blocked("untrusted job disk storage must be local-lvm")
+    if int(config.get("job_disk_gib", 0)) not in range(1, 81):
+        raise Blocked("job disk cap must be 1..80 GiB")
     if not isinstance(config.get("template_name"), str) or not config["template_name"]:
         raise Blocked("golden template name is missing")
+    if not re_full_sha256(str(config.get("template_image_sha256", ""))):
+        raise Blocked("golden template image identity is invalid")
+    if not re_full_sha256(str(config.get("dependency_inventory_sha256", ""))):
+        raise Blocked("dependency inventory identity is invalid")
     if not re_full_sha256(str(config.get("guest_runner_sha256", ""))):
         raise Blocked("guest runner SHA-256 is invalid")
     if int(config.get("job_vmid", 0)) == int(config.get("template_vmid", 0)):
         raise Blocked("job VMID must differ from template VMID")
     if int(config.get("wall_timeout_seconds", 0)) not in range(1, 7201):
         raise Blocked("wall timeout must be 1..7200 seconds")
+    if int(config.get("result_timeout_seconds", 0)) not in range(1, 61):
+        raise Blocked("result timeout must be 1..60 seconds")
+    latch = Path(str(config.get("admission_latch", "")))
+    if not latch.is_absolute() or latch.name != "admission-latch.json":
+        raise Blocked("admission latch path is invalid")
+    lock = Path(str(config.get("admission_lock", "")))
+    if not lock.is_absolute() or lock.name != "admission.lock" or lock.parent != latch.parent:
+        raise Blocked("admission lock path is invalid")
 
 
 def re_full_sha256(value: str) -> bool:
     return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def is_nonnegative_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def validate_guest_result(value: object, manifest: dict[str, object]) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise Blocked("guest result must be an object")
+    required = {
+        "schema", "status", "request", "source_sha256", "recipe_sha256",
+        "commands", "duration_seconds", "standing_secrets", "network",
+    }
+    if set(value) != required:
+        raise Blocked("guest result has missing or unexpected fields")
+    if value.get("request") != manifest["request"]:
+        raise Blocked("guest result provenance mismatch")
+    if (
+        value.get("schema") != 1
+        or value.get("source_sha256") != manifest["source_sha256"]
+        or value.get("recipe_sha256") != manifest["recipe_sha256"]
+        or value.get("status") not in {"pass", "fail"}
+        or value.get("standing_secrets") != "none"
+        or value.get("network") != "none"
+        or not is_nonnegative_number(value.get("duration_seconds"))
+    ):
+        raise Blocked("guest result attestation fields are incomplete or contradictory")
+    commands = value.get("commands")
+    if not isinstance(commands, list) or not 1 <= len(commands) <= MAX_RESULT_COMMANDS:
+        raise Blocked("guest result command count is invalid")
+    allowed = {
+        "index", "argv", "cwd", "status", "exit_code", "duration_seconds",
+        "log_sha256", "log_bytes", "log_truncated", "log_tail_untrusted",
+    }
+    required_command = allowed - {"log_tail_untrusted"}
+    for expected_index, command in enumerate(commands):
+        if (
+            not isinstance(command, dict)
+            or set(command) - allowed
+            or not required_command <= set(command)
+        ):
+            raise Blocked("guest result command schema is invalid")
+        argv = command.get("argv")
+        strings = [command.get("cwd"), command.get("log_tail_untrusted", "")]
+        if (
+            command.get("index") != expected_index
+            or not isinstance(argv, list) or not argv
+            or not all(isinstance(item, str) and 0 < len(item.encode()) <= 4096 for item in argv)
+            or len(argv) > 64
+            or not all(isinstance(item, str) and len(item.encode()) <= MAX_RESULT_STRING_BYTES for item in strings)
+            or command.get("status") not in {"pass", "fail", "timeout"}
+            or not (
+                command.get("exit_code") is None
+                or isinstance(command.get("exit_code"), int) and not isinstance(command.get("exit_code"), bool)
+            )
+            or not is_nonnegative_number(command.get("duration_seconds"))
+            or not re_full_sha256(str(command.get("log_sha256", "")))
+            or not isinstance(command.get("log_bytes"), int)
+            or isinstance(command.get("log_bytes"), bool)
+            or not 0 <= command["log_bytes"] <= 1024 * 1024
+            or not isinstance(command.get("log_truncated"), bool)
+        ):
+            raise Blocked("guest result command value is invalid")
+    command_passes = [
+        command["status"] == "pass" and command["exit_code"] == 0
+        for command in commands
+    ]
+    if (value["status"] == "pass") != all(command_passes):
+        raise Blocked("guest result status contradicts command outcomes")
+    return value
+
+
+def validate_cloud_init_status(output: object) -> None:
+    if not isinstance(output, str) or len(output.encode()) > 64 * 1024:
+        raise Blocked("guest initialization status is invalid")
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise Blocked("guest initialization status is invalid JSON") from error
+    if (
+        not isinstance(value, dict)
+        or value.get("status") != "done"
+        or value.get("extended_status") != "done"
+        or value.get("errors") != []
+        or value.get("recoverable_errors") != {}
+    ):
+        raise Blocked("guest initialization did not complete cleanly")
 
 
 def validate_job_vm_config(vm: dict[str, object], config: dict[str, object], iso_name: str) -> None:
@@ -213,6 +341,8 @@ def validate_job_vm_config(vm: dict[str, object], config: dict[str, object], iso
     for disk in ["scsi0", "efidisk0", "ide2"]:
         if not str(vm.get(disk, "")).startswith(f"{config['disk_storage']}:"):
             failures.append(f"job disk {disk} is not on the expected storage")
+    if f"size={config['job_disk_gib']}G" not in str(vm.get("scsi0", "")):
+        failures.append("job root disk size does not match the hard cap")
     if failures:
         raise Blocked("job VM admission failed: " + "; ".join(failures))
 
@@ -259,6 +389,14 @@ class ReviewLifecycle:
     def __init__(self, config: dict[str, object]):
         validate_config(config)
         self.config = config
+        image_manifest = Path(str(config["template_image_manifest"]))
+        dependency_inventory = Path(str(config["dependency_inventory"]))
+        require_root_protected_file(image_manifest)
+        require_root_protected_file(dependency_inventory)
+        if sha256(image_manifest) != config["template_image_sha256"]:
+            raise Blocked("protected template image manifest digest does not match policy")
+        if sha256(dependency_inventory) != config["dependency_inventory_sha256"]:
+            raise Blocked("protected dependency inventory digest does not match policy")
         self.api = ProxmoxApi(config["proxmox"])
         self.node = str(config["proxmox"]["node"])
         self.vmid = int(config["job_vmid"])
@@ -268,6 +406,79 @@ class ReviewLifecycle:
         self.created_vm = False
         self.uploaded_iso = False
         self.last_storage_check = 0.0
+        self.admission_latch = Path(str(config["admission_latch"]))
+        self.admission_lock = Path(str(config["admission_lock"]))
+        self.lock_handle: object | None = None
+
+    def acquire_admission_lock(self) -> None:
+        self.admission_lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.admission_lock.parent, 0o700)
+        handle = self.admission_lock.open("a+", encoding="utf-8")
+        os.chmod(self.admission_lock, 0o600)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            handle.close()
+            raise Blocked("another untrusted review admission holds the exclusive lock") from error
+        self.lock_handle = handle
+
+    def release_admission_lock(self) -> None:
+        if self.lock_handle is None:
+            return
+        handle = self.lock_handle
+        self.lock_handle = None
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+    def assert_admission_unlatched(self) -> None:
+        if self.admission_latch.exists():
+            raise Blocked(
+                f"admission is latched after unconfirmed teardown; operator reconciliation required: "
+                f"{self.admission_latch}"
+            )
+
+    def latch_admission(self, reason: str) -> None:
+        self.admission_latch.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.admission_latch.parent, 0o700)
+        temporary = self.admission_latch.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                {"schema": 1, "latched_at": int(time.time()), "reason": reason[:4096]},
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.admission_latch)
+
+    def assert_job_slot_clean(self) -> None:
+        guests = self.api.request("GET", f"/nodes/{self.node}/qemu")
+        if not isinstance(guests, list):
+            raise Blocked("cannot verify clean job slot")
+        for guest in guests:
+            if not isinstance(guest, dict):
+                raise Blocked("cannot verify clean job slot")
+            vmid = int(guest.get("vmid", -1))
+            if vmid == self.vmid:
+                raise Blocked("fixed job VM identity is already present")
+            if guest.get("status") != "running" or guest.get("template"):
+                continue
+            vm = self.api.request("GET", f"/nodes/{self.node}/qemu/{vmid}/config")
+            if isinstance(vm, dict) and any(
+                f"bridge={self.config['job_bridge']}" in str(value)
+                for key, value in vm.items() if key.startswith("net")
+            ):
+                raise Blocked(f"isolated job bridge already has running guest {vmid}")
+        for storage in [str(self.config["disk_storage"]), str(self.config["iso_storage"])]:
+            content = self.api.request("GET", f"/nodes/{self.node}/storage/{storage}/content")
+            if not isinstance(content, list):
+                raise Blocked(f"cannot verify clean job resources on {storage}")
+            for item in content:
+                if not isinstance(item, dict):
+                    raise Blocked(f"cannot verify clean job resources on {storage}")
+                volid = str(item.get("volid", ""))
+                if f"vm-{self.vmid}-" in volid or volid.endswith(f"/{self.iso_name}"):
+                    raise Blocked(f"orphaned job resource is present: {volid}")
 
     def assert_storage_headroom(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -275,7 +486,11 @@ class ReviewLifecycle:
             return
         self.last_storage_check = now
         for storage, minimum_free, maximum_used in [
-            (str(self.config["disk_storage"]), 20 * 1024**3, 0.70),
+            (
+                str(self.config["disk_storage"]),
+                (int(self.config["job_disk_gib"]) + 20) * 1024**3,
+                0.70,
+            ),
             (str(self.config["iso_storage"]), 1024**3, 0.95),
         ]:
             value = self.api.request("GET", f"/nodes/{self.node}/storage/{storage}/status")
@@ -296,12 +511,19 @@ class ReviewLifecycle:
             failures.append("template/protection flags are missing")
         if vm.get("name") != self.config["template_name"]:
             failures.append("template name does not match pin")
+        description = str(vm.get("description", ""))
+        if f"image-manifest-sha256={self.config['template_image_sha256']}" not in description:
+            failures.append("template image identity does not match pin")
+        if f"dependency-inventory-sha256={self.config['dependency_inventory_sha256']}" not in description:
+            failures.append("template dependency identity does not match pin")
         if str(vm.get("hotplug", "")) != "0" or str(vm.get("onboot", "0")) not in {"0", "false", "False"}:
             failures.append("template hotplug/onboot policy is wrong")
         if sorted(key for key in vm if key.startswith("net")) != ["net0"] or "bridge=vmbr1" not in str(vm.get("net0", "")):
             failures.append("template network boundary is wrong")
         if str(vm.get("sata1", "")) != "none,media=cdrom":
             failures.append("template immutable-input slot is wrong")
+        if f"size={self.config['job_disk_gib']}G" not in str(vm.get("scsi0", "")):
+            failures.append("template root disk exceeds or differs from the hard cap")
         if any(key.startswith(FORBIDDEN_CONFIG_PREFIXES) for key in vm):
             failures.append("template has a forbidden device/config field")
         if any(key in vm for key in ["sshkeys", "cipassword", "nameserver", "searchdomain"]):
@@ -319,7 +541,10 @@ class ReviewLifecycle:
         if iso.name != self.iso_name:
             raise Blocked(f"ISO must be named {self.iso_name}")
         started = time.time()
+        self.acquire_admission_lock()
         try:
+            self.assert_admission_unlatched()
+            self.assert_job_slot_clean()
             self.assert_storage_headroom(force=True)
             self.assert_template()
             self.api.request(
@@ -381,6 +606,14 @@ class ReviewLifecycle:
                 if time.monotonic() >= admission_deadline:
                     raise Blocked("guest hardening admission marker is missing")
                 time.sleep(2)
+            cloud_status = self.api.request(
+                "POST", f"/nodes/{self.node}/qemu/{self.vmid}/agent/exec",
+                {"command": ["/usr/bin/cloud-init", "status", "--long", "--format", "json"]},
+            )
+            cloud_result = self._wait_guest_exec(cloud_status, 30)
+            if cloud_result.get("exitcode") != 0:
+                raise Blocked("guest initialization status command failed")
+            validate_cloud_init_status(cloud_result.get("out-data"))
             group_check = self.api.request(
                 "POST", f"/nodes/{self.node}/qemu/{self.vmid}/agent/exec",
                 {"command": ["/usr/bin/id", "-nG", "shipyard"]},
@@ -409,42 +642,81 @@ class ReviewLifecycle:
                 {"command": ["/usr/local/sbin/shipyard-review-guest-runner"]},
             )
             self._wait_guest_exec(execution, int(self.config["wall_timeout_seconds"]))
-            result = self.api.request(
-                "GET", f"/nodes/{self.node}/qemu/{self.vmid}/agent/file-read",
-                {"file": "/run/shipyard-review/result.json", "count": MAX_RESULT_BYTES, "decode": 1},
-            )
-            if not isinstance(result, dict) or not isinstance(result.get("content"), str):
-                raise Blocked("guest result transport is invalid")
-            value = json.loads(result["content"])
-            if not isinstance(value, dict) or value.get("request") != manifest["request"]:
-                detail = value.get("reason", value.get("status", "unknown")) if isinstance(value, dict) else "invalid result"
-                raise Blocked(f"guest result provenance mismatch: {str(detail)[:1000]}")
-            if (
-                value.get("schema") != 1
-                or value.get("source_sha256") != manifest["source_sha256"]
-                or value.get("recipe_sha256") != manifest["recipe_sha256"]
-                or value.get("status") not in {"pass", "fail"}
-                or value.get("standing_secrets") != "none"
-                or value.get("network") != "none"
-                or not isinstance(value.get("commands"), list)
-            ):
-                raise Blocked("guest result attestation fields are incomplete or contradictory")
+            value = self.collect_guest_result(manifest)
             value["controller"] = {
                 "boundary": "proxmox-disposable-vm", "vmid": self.vmid,
                 "template_vmid": self.template, "teardown": "pending",
+                "template_image_sha256": self.config["template_image_sha256"],
+                "dependency_inventory_sha256": self.config["dependency_inventory_sha256"],
                 "duration_seconds": round(time.time() - started, 3),
             }
             return value
         finally:
             primary_error = sys.exception()
             try:
-                self.teardown()
-            except Blocked as teardown_error:
-                if primary_error is not None:
-                    raise Blocked(
-                        f"job failed: {primary_error}; additionally {teardown_error}"
-                    ) from teardown_error
-                raise
+                self.teardown_or_latch(primary_error)
+            finally:
+                self.release_admission_lock()
+
+    def collect_guest_result(self, manifest: dict[str, object]) -> dict[str, object]:
+        result = self.api.request(
+            "GET", f"/nodes/{self.node}/qemu/{self.vmid}/agent/file-read",
+            {"file": "/run/shipyard-review/result.json", "count": MAX_RESULT_BYTES, "decode": 1},
+            timeout=int(self.config["result_timeout_seconds"]),
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("content"), str):
+            raise Blocked("guest result transport is invalid")
+        try:
+            decoded = json.loads(result["content"])
+        except json.JSONDecodeError as error:
+            raise Blocked("guest result is invalid JSON") from error
+        return validate_guest_result(decoded, manifest)
+
+    def teardown_or_latch(self, primary_error: BaseException | None) -> None:
+        try:
+            self.teardown()
+        except TeardownBlocked as teardown_error:
+            self.latch_admission(str(teardown_error))
+            if primary_error is not None:
+                raise Blocked(
+                    f"job failed: {primary_error}; additionally {teardown_error}"
+                ) from teardown_error
+            raise
+
+    def reconcile_stranded_job(self) -> None:
+        """Adopt only controller-owned fixed resources, destroy, then clear latch."""
+        guests = self.api.request("GET", f"/nodes/{self.node}/qemu")
+        if not isinstance(guests, list):
+            raise Blocked("VM inventory response is invalid")
+        if any(isinstance(vm, dict) and vm.get("vmid") == self.vmid for vm in guests):
+            vm = self.api.request("GET", f"/nodes/{self.node}/qemu/{self.vmid}/config")
+            if not isinstance(vm, dict):
+                raise Blocked("stranded job VM config response is invalid")
+            tags = set(str(vm.get("tags", "")).split(";"))
+            if (
+                vm.get("description")
+                != "Disposable Shipyard untrusted review job; controller-owned; destroy after run."
+                or not {"disposable", "network-deny", "shipyard-review", "untrusted"} <= tags
+            ):
+                raise Blocked("fixed VMID exists but is not provably a controller-owned review job")
+            protection_update = self.api.request(
+                "POST", f"/nodes/{self.node}/qemu/{self.vmid}/config", {"protection": 0}
+            )
+            if isinstance(protection_update, str) and protection_update.startswith("UPID:"):
+                self.api.wait_task(protection_update)
+            self.created_vm = True
+        content = self.api.request(
+            "GET", f"/nodes/{self.node}/storage/{self.config['iso_storage']}/content"
+        )
+        if not isinstance(content, list):
+            raise Blocked("ISO inventory response is invalid")
+        expected_volid = f"{self.config['iso_storage']}:iso/{self.iso_name}"
+        if any(isinstance(item, dict) and item.get("volid") == expected_volid for item in content):
+            self.iso_volid = expected_volid
+            self.uploaded_iso = True
+        self.teardown_or_latch(None)
+        self.assert_job_slot_clean()
+        self.admission_latch.unlink(missing_ok=True)
 
     def _wait_guest_exec(self, response: object, timeout: int) -> dict[str, object]:
         if not isinstance(response, dict) or not isinstance(response.get("pid"), int):
@@ -488,8 +760,12 @@ class ReviewLifecycle:
                 self.uploaded_iso = False
             except Blocked as error:
                 errors.append(str(error))
+        try:
+            self.assert_job_slot_clean()
+        except Blocked as error:
+            errors.append(f"post-delete absence verification failed: {error}")
         if errors:
-            raise Blocked("teardown was not confirmed: " + "; ".join(errors))
+            raise TeardownBlocked("teardown was not confirmed: " + "; ".join(errors))
 
 
 def create_source_archive(source_dir: Path, destination: Path) -> None:
@@ -507,6 +783,7 @@ def run_cli() -> int:
     smoke.add_argument("--source-dir", type=Path, required=True)
     smoke.add_argument("--recipe", type=Path, required=True)
     smoke.add_argument("--repo", default="local/offline-smoke")
+    subparsers.add_parser("reconcile")
     args = parser.parse_args()
     config = load_json(args.config)
     if not isinstance(config, dict):
@@ -515,9 +792,23 @@ def run_cli() -> int:
     require_root_protected_file(args.config)
     lifecycle = ReviewLifecycle(config)
     if args.command == "verify":
-        lifecycle.assert_storage_headroom(force=True)
-        lifecycle.assert_template()
+        lifecycle.acquire_admission_lock()
+        try:
+            lifecycle.assert_admission_unlatched()
+            lifecycle.assert_job_slot_clean()
+            lifecycle.assert_storage_headroom(force=True)
+            lifecycle.assert_template()
+        finally:
+            lifecycle.release_admission_lock()
         print(json.dumps({"status": "ready", "template_vmid": lifecycle.template}, sort_keys=True))
+        return 0
+    if args.command == "reconcile":
+        lifecycle.acquire_admission_lock()
+        try:
+            lifecycle.reconcile_stranded_job()
+        finally:
+            lifecycle.release_admission_lock()
+        print(json.dumps({"status": "reconciled", "job_vmid": lifecycle.vmid}, sort_keys=True))
         return 0
     request = {"repo": args.repo, "pr": 1, "head_sha": "offline-smoke", "base_sha": "offline-smoke"}
     with tempfile.TemporaryDirectory(prefix="shipyard-review-smoke-") as temp_name:
@@ -526,7 +817,11 @@ def run_cli() -> int:
         iso = temp / lifecycle.iso_name
         create_source_archive(args.source_dir.resolve(), source)
         manifest = build_iso(source, args.recipe.resolve(), request, iso)
-        result = lifecycle.run(iso, manifest)
+        previous_handler = signal.signal(signal.SIGTERM, interrupt_for_teardown)
+        try:
+            result = lifecycle.run(iso, manifest)
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
     # A result is only marked teardown-confirmed after the finally block succeeds.
     result["controller"]["teardown"] = "confirmed"
     print(json.dumps(result, sort_keys=True))
@@ -536,6 +831,6 @@ def run_cli() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(run_cli())
-    except Blocked as error:
+    except (Blocked, ControllerInterrupted) as error:
         print(json.dumps({"status": "blocked", "reason": str(error)}), file=sys.stderr)
         raise SystemExit(3)

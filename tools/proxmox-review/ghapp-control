@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+home=/var/lib/shipyard-review
+cache="$home/.config/shipyard/.gh-app-token.json"
+key="$home/secrets/github-app-private-key.pem"
+mint=/usr/local/libexec/shipyard-review/github-app-token.py
+app_id=${SHIPYARD_GITHUB_APP_ID:-3878000}
+repo=${SHIPYARD_GH_APP_REPO:-danielraffel/pulp}
+
+valid_cache() {
+    [ -f "$cache" ] && [ ! -L "$cache" ] &&
+        [ "$(stat -c %a "$cache")" = 600 ] &&
+        python3 - "$cache" <<'PY'
+import datetime
+import json
+import sys
+
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    expires = datetime.datetime.strptime(value["expires_at"], "%Y-%m-%dT%H:%M:%SZ")
+    expires = expires.replace(tzinfo=datetime.timezone.utc)
+    remaining = expires - datetime.datetime.now(datetime.timezone.utc)
+    raise SystemExit(0 if remaining.total_seconds() > 600 else 1)
+except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
+if ! valid_cache; then
+    umask 077
+    mkdir -p "$home/.config/shipyard"
+    "$mint" --app-id "$app_id" --private-key "$key" --repo "$repo" > "$cache.tmp"
+    chmod 600 "$cache.tmp"
+    mv "$cache.tmp" "$cache"
+fi
+
+token=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"])' "$cache")
+exec env GH_TOKEN="$token" /usr/bin/gh "$@"

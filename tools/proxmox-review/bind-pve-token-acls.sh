@@ -7,7 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 token_id=${1:?usage: bind-pve-token-acls.sh TOKEN_ID [TEMPLATE_VMID]}
-template_vmid=${2:-124}
+template_vmid=${2:-127}
 case "$token_id" in
     *[!A-Za-z0-9._-]*|'') echo "invalid token id" >&2; exit 1 ;;
 esac
@@ -18,6 +18,8 @@ pveum user token list shipyard-review@pve --output-format json | jq -e \
 
 pveum acl modify "/vms/$template_vmid" \
     --tokens "$token" --roles ShipyardReviewClone
+pveum acl modify /vms \
+    --tokens "$token" --roles ShipyardReviewFleetAudit
 pveum acl modify /pool/shipyard-review-jobs \
     --tokens "$token" --roles ShipyardReviewJob
 pveum acl modify /storage/local-lvm \

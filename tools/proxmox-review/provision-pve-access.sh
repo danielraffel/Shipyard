@@ -6,7 +6,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-template_vmid=${1:-124}
+template_vmid=${1:-127}
 job_pool=shipyard-review-jobs
 iso_storage=shipyard-review-iso
 identity=shipyard-review@pve
@@ -19,7 +19,9 @@ install -d -o root -g root -m 0700 /var/lib/vz/shipyard-review-iso
 pvesm status | awk 'NR > 1 {print $1}' | grep -Fxq "$iso_storage" || \
     pvesm add dir "$iso_storage" \
         --path /var/lib/vz/shipyard-review-iso \
-        --content iso --nodes "$(hostname)" --shared 0
+        --content iso,snippets --nodes "$(hostname)" --shared 0
+pvesm set "$iso_storage" --content iso,snippets
+install -d -o root -g root -m 0700 /var/lib/vz/shipyard-review-iso/snippets
 
 pveum pool list --output-format json | jq -e \
     --arg pool "$job_pool" '.[] | select(.poolid == $pool)' >/dev/null || \
@@ -39,6 +41,8 @@ upsert_role() {
 
 upsert_role ShipyardReviewClone \
     "VM.Audit VM.Clone"
+upsert_role ShipyardReviewFleetAudit \
+    "VM.Audit"
 upsert_role ShipyardReviewJob \
     "Pool.Audit VM.Allocate VM.Audit VM.Config.CDROM VM.Config.Cloudinit VM.Config.Options VM.GuestAgent.Audit VM.GuestAgent.FileRead VM.GuestAgent.Unrestricted VM.PowerMgmt"
 upsert_role ShipyardReviewDisk \
@@ -55,6 +59,8 @@ pveum user list --output-format json | jq -e \
 
 pveum acl modify "/vms/$template_vmid" \
     --users "$identity" --roles ShipyardReviewClone
+pveum acl modify /vms \
+    --users "$identity" --roles ShipyardReviewFleetAudit
 pveum acl modify "/pool/$job_pool" \
     --users "$identity" --roles ShipyardReviewJob
 pveum acl modify /storage/local-lvm \

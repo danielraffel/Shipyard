@@ -27,6 +27,7 @@ WORK = Path("/var/tmp/shipyard-review-job")
 RESULT = Path("/run/shipyard-review/result.json")
 MAX_RECIPE_BYTES = 64 * 1024
 MAX_LOG_BYTES = 1024 * 1024
+MAX_FAILURE_TAIL_BYTES = 16 * 1024
 MAX_COMMANDS = 32
 MAX_COMMAND_SECONDS = 3600
 ALLOWED_ENV = {"CC", "CXX", "CMAKE_BUILD_PARALLEL_LEVEL", "RUST_BACKTRACE"}
@@ -55,6 +56,15 @@ def validate_relative(path: str) -> Path:
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ValueError(f"unsafe relative path: {path!r}")
     return candidate
+
+
+def safe_tar_filter(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo | None:
+    """Drop links that can resolve outside the extracted source tree."""
+    if member.issym() or member.islnk():
+        link = Path(member.linkname)
+        if link.is_absolute() or ".." in link.parts:
+            return None
+    return tarfile.data_filter(member, destination)
 
 
 def main() -> int:
@@ -94,7 +104,7 @@ def main() -> int:
         source_dir = WORK / "source"
         source_dir.mkdir(mode=0o700)
         with tarfile.open(source_path, "r:gz") as archive:
-            archive.extractall(source_dir, filter="data")
+            archive.extractall(source_dir, filter=safe_tar_filter)
         roots = list(source_dir.iterdir())
         repo_dir = roots[0] if len(roots) == 1 and roots[0].is_dir() else source_dir
         uid = pwd.getpwnam("shipyard").pw_uid
@@ -173,7 +183,7 @@ def main() -> int:
             if status != "pass":
                 overall = "fail"
             log_size = log_path.stat().st_size if log_path.exists() else 0
-            outcomes.append({
+            outcome: dict[str, object] = {
                 "index": index,
                 "argv": argv,
                 "cwd": str(cwd.relative_to(repo_dir)),
@@ -183,7 +193,12 @@ def main() -> int:
                 "log_sha256": digest(log_path),
                 "log_bytes": log_size,
                 "log_truncated": log_size >= MAX_LOG_BYTES,
-            })
+            }
+            if status != "pass" and log_path.exists():
+                with log_path.open("rb") as log:
+                    log.seek(max(0, log_size - MAX_FAILURE_TAIL_BYTES))
+                    outcome["log_tail_untrusted"] = log.read(MAX_FAILURE_TAIL_BYTES).decode(errors="replace")
+            outcomes.append(outcome)
             if status != "pass":
                 break
 

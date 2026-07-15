@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "template_name": "shipyard-review-template-v9",
+  "template_vmid": 127,
+  "components": {
+    "root_disk_sha256": "e3d41bc4cd69cbcc6b490bfe5d933bd4caa6463739ea4763eea568ee7b00e0f1",
+    "efi_disk_sha256": "5e044bd293690cfc4c1c3405b0cee01b8f1b9d0a06b8a9e2d993d336e669251a",
+    "cloud_init_disk_sha256": "12a455c897a4c2115325abd5639661b882b580b5a39771c5d4d1bed0205e6bbe",
+    "stable_config_sha256": "ba3cee5d7f5d8847b53055138409393bfb18558e40833bfe11ed63ff5632e873",
+    "user_data_sha256": "5d309276ffc3f9c66f4b50bf9622953d1123f9b92cf32c8a020e7158667426e5",
+    "guest_runner_sha256": "f4b949d337fbbd11f7b053ca0050f543d9a2aad765219ee4a6e78d6781cd49f4",
+    "dependency_inventory_sha256": "31ab3bd4a6bfe0666ee890f2eec4e8831138f1ecfc730586894df0eb97bc0936"
+  },
+  "measurement": {
+    "root_and_efi": "sha256 over every logical block while the protected template was stopped",
+    "cloud_init": "sha256 over the template cloud-init volume after custom user-data attachment",
+    "stable_config": "qm config with description, smbios1, vmgenid, and meta lines omitted",
+    "baked_sources": "exact commits and canonical git-archive hashes in the dependency inventory"
+  }
+}
