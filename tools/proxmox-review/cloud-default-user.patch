@@ -1,0 +1,18 @@
+--- /etc/cloud/cloud.cfg
++++ /etc/cloud/cloud.cfg
+@@ -92,12 +92,12 @@
+   distro: ubuntu
+   # Default user name + that default users groups (if added/used)
+   default_user:
+-    name: ubuntu
++    name: shipyard
+     lock_passwd: True
+-    gecos: Ubuntu
+-    groups: [adm, cdrom, dip, lxd, sudo]
+-    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
++    gecos: Shipyard untrusted review user
++    groups: []
++    sudo: []
+     shell: /bin/bash
+   network:
+     dhcp_client_priority: [dhcpcd, dhclient, udhcpc]

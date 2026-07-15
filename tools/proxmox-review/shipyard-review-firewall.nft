@@ -1,0 +1,19 @@
+table inet shipyard_review {
+    chain host_input {
+        type filter hook input priority -210; policy accept;
+
+        # The Proxmox host may initiate a control connection to a guest, but a
+        # guest may not initiate any connection to the host or its services.
+        iifname "vmbr1" ct state established,related accept
+        iifname "vmbr1" counter drop
+    }
+
+    chain routed_traffic {
+        type filter hook forward priority -210; policy accept;
+
+        # vmbr1 has no uplink. These rules also fail closed if forwarding or
+        # NAT is enabled elsewhere on the host in the future.
+        iifname "vmbr1" counter drop
+        oifname "vmbr1" counter drop
+    }
+}
