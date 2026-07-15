@@ -3,9 +3,14 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0770"></a>
-## [0.77.1]
+<a id="v0771"></a>
+## [0.77.1] - 2026-07-15
 
+- feat: harden isolated external contribution review ([#375](https://github.com/danielraffel/Shipyard/pull/375))
+- docs(local-mac-pool): document the local-backend build-string contract ([#374](https://github.com/danielraffel/Shipyard/pull/374))
+- feat(daemon,doctor): surface github auth-degraded pause + fix ambient-token doctor false-positive ([#373](https://github.com/danielraffel/Shipyard/pull/373))
+
+<a id="v0770"></a>
 ## [0.77.0] - 2026-07-03
 
 - feat(ship): recognise the flaky-required-leg merge wedge and hand over the rescue one-liner ([#371](https://github.com/danielraffel/Shipyard/pull/371))
@@ -684,6 +689,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.77.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.77.1
 [0.77.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.77.0
 [0.76.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.76.0
 [0.75.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.75.0
