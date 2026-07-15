@@ -1,6 +1,6 @@
 # Untrusted contributor execution
 
-Status: policy proposed; Proxmox execution-boundary prototype deployed
+Status: fail-closed controller and Proxmox boundary deployed; GitHub lane disabled
 
 ## Decision
 
@@ -269,10 +269,13 @@ network=broker-only standing-secrets=none capability=one-run teardown=confirmed
 
 The GitHub identity which publishes the review is not execution provenance.
 
-## Proxmox prototype deployed on 2026-07-14
+## Proxmox controller deployed on 2026-07-14
 
-The current `nexus` Proxmox node now contains a proof of the execution boundary.
-This is infrastructure evidence, not yet a production Shipyard executor.
+The current `nexus` Proxmox node contains a working, fail-closed execution
+boundary and a credential-free control service. The controller has completed
+end-to-end offline smoke and adversarial isolation runs. GitHub polling remains
+disabled until permanent credentials are backed up and installed, so no GitHub
+comment can currently start work.
 
 ### Host boundary
 
@@ -296,8 +299,9 @@ This is infrastructure evidence, not yet a production Shipyard executor.
 
 ### Job image
 
-- VM 119, `shipyard-review-template-v3`, is the protected, powered-off job
-  template. VM 118 is its protected backing template and must not be scheduled.
+- VM 124, `shipyard-review-template-v6`, is the protected, powered-off job
+  template. VMs 118, 119, 122, and 123 are protected backing generations and
+  must not be scheduled.
 - The job shape is two virtual CPUs, 4 GiB maximum RAM with a 2 GiB balloon
   floor, and an 80 GiB sparse thin disk.
 - The signed Ubuntu 24.04 release image was verified with Ubuntu's dedicated
@@ -305,8 +309,8 @@ This is infrastructure evidence, not yet a production Shipyard executor.
   imported source image SHA-256 was
   `ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6`.
 - The template includes C/C++, Clang/LLVM, CMake, Ninja, Rust, Python, common
-  archive/build tools, and the QEMU guest agent. It does not yet include the
-  private macOS SDK or osxcross toolchain.
+  archive/build tools, the QEMU guest agent, and a root-owned fixed review
+  runner. It does not yet include the private macOS SDK or osxcross toolchain.
 - The `shipyard` account has no supplementary groups and no passwordless sudo.
   Root/password login, SSH forwarding, unprivileged BPF, unprivileged user
   namespaces, nested virtualization, guest IPv6, DNS, and a default route are
@@ -314,6 +318,9 @@ This is infrastructure evidence, not yet a production Shipyard executor.
 - Every clone must produce `/run/shipyard-review/unprivileged-ready` through the
   post-cloud-init hardening service before the coordinator may inject source or
   start an agent.
+- A dedicated empty `sata1` CD-ROM slot lets the scoped controller attach the
+  immutable job ISO without receiving the broader `VM.Config.HWType`
+  privilege.
 
 ### Trusted control base
 
@@ -326,16 +333,53 @@ This is infrastructure evidence, not yet a production Shipyard executor.
   Proxmox jump host.
 - Outbound policy permits the LAN resolver/NTP service, the Proxmox HTTPS API,
   and public HTTP(S), while denying other private and link-local IPv4 ranges.
-- `/etc/shipyard-review` and `/var/lib/shipyard-review` exist with mode `0700`.
-  They currently contain no credentials.
-- The eventual coordinator daemon must run as its own non-login, non-sudo
-  service account. The administrative cloud user is not an acceptable runtime
-  identity for the daemon.
+- The controller and exact-trigger poller are installed beneath
+  `/usr/local/libexec/shipyard-review`. The `shipyard-review` runtime account is
+  non-login, has no sudo access, and owns only its `0700` state, results, and
+  secret directories. systemd applies a read-only system, private devices and
+  temporary files, no capabilities, no new privileges, restricted address
+  families, and an explicit writable-state path. `systemd-analyze security`
+  currently rates the unit `3.3 OK`.
+- The timer is disabled, both policy files say `enabled=false`, and there are no
+  credentials in the control VM. VM 121 is powered off after verification.
+
+### Controller and trigger boundary
+
+- `review-control.py` pins the Proxmox proxy certificate, requires a private
+  file-backed API token, uploads a hash-bound ISO, creates one VM in the
+  dedicated pool, removes inherited clone protection, applies and re-reads the
+  VM configuration, and refuses startup unless admission matches policy.
+- Admission rejects extra NICs, any bridge other than `vmbr1`, a gateway or DNS,
+  SSH credentials, host devices, shared filesystems, hotplug, excessive CPU or
+  memory, a missing hardening marker, supplementary guest groups, or non-empty
+  root/user SSH authorization files.
+- The protected template name and shape are pinned before clone, and the guest
+  runner is re-hashed after boot. Template 124 returned runner SHA-256
+  `2bac696cd46687dc2c056f844663b169e35bccfdf7c243ee16f1b53d727f520f`
+  in a fresh verification clone.
+- The input ISO is mounted read-only, `nosuid,nodev,noexec`. Its manifest binds
+  the source and protected recipe hashes plus repository, PR, head SHA, and base
+  SHA. Recipe commands are argv arrays; there is no shell string supplied by a
+  comment.
+- The guest runner uses `runuser` plus `prlimit`, caps each log at 1 MiB, caps
+  command count and duration, validates extraction paths, and returns bounded
+  JSON and hashes through QEMU Guest Agent. It never receives the Proxmox or
+  GitHub credential.
+- `comment-poller.py` uses outbound polling rather than a public webhook. The
+  only recognized body is exactly `/shipyard review`; arguments, additional
+  lines, mentions, Markdown wrappers, and extra whitespace are rejected. The
+  repository, authorized login plus immutable numeric GitHub user ID, recipe
+  path, controller path, and publication setting are root-owned protected local
+  policy. Publication is unimplemented and forced off.
+- The normal Shipyard executor dispatcher is not reused. A Rust policy module
+  rejects local, SSH, Windows SSH, cloud/self-hosted, host-pool, and fallback
+  targets for this workflow.
 
 ### Smoke evidence
 
-A fresh linked clone from VM 119 was admitted only after its cloud-init and
-hardening marker completed. Inside that clone:
+A fresh linked clone from VM 119 originally proved the base boundary. The
+current controller then ran from VM 121 through template 124 and VM 200 using
+only the scoped, privilege-separated test token. It:
 
 - `id` reported only `uid=1000(shipyard) gid=1000(shipyard)`;
 - passwordless sudo failed, `/dev/kvm` was absent, and the CPU exposed no `vmx`;
@@ -348,40 +392,69 @@ hardening marker completed. Inside that clone:
   and
 - teardown removed the VM configuration and every `vm-120-*` thin volume.
 
-### Not production-ready yet
+The current end-to-end controller smoke additionally:
 
-Do not route an unmerged PR to this lane until all of these are complete:
+- attached and verified an immutable ISO containing source, manifest, and a
+  protected argv-only recipe;
+- ran identity, Mac-home, control-secret, root-SSH, nested-virtualization,
+  root-filesystem, Proxmox-bridge, Proxmox-management, and public-Internet
+  negative probes successfully;
+- configured, built, and ran the C++20 smoke target as the unprivileged user;
+- returned per-command exit, duration, byte-count, truncation, and SHA-256
+  evidence with `standing_secrets=none` and `network=none`;
+- incremented the Proxmox host's `vmbr1` input-drop counter from the deliberate
+  host probe; and
+- destroyed VM 200, every `vm-200-*` thin volume, and the job ISO. The final
+  fully attested result reported `teardown=confirmed` after 35.935 seconds.
 
-1. Install a least-privilege Proxmox API token in VM 121 using the file-backed
-   secret policy. Root SSH was acceptable for initial provisioning only.
-2. Implement the deterministic lifecycle coordinator: clone, configure, admit,
-   inject an immutable source bundle, start, limit, collect, stop, destroy, and
-   attest teardown.
+The short-lived smoke API token and every token ACL were revoked afterward.
+The durable `shipyard-review@pve` identity has no token. Its user ACLs are
+separately scoped to clone VM 124, the disposable-job pool, `vmbr1`,
+`local-lvm` allocation, and a dedicated ISO-only datastore. It has no ACL on
+the general `local` datastore.
+
+The controller also checks `local-lvm` and the dedicated ISO datastore before
+clone and while guest commands run. It blocks at 70 percent thin-pool use or
+below 20 GiB free, and blocks ISO work below 1 GiB free. This is admission and
+runtime headroom protection in addition to single-job concurrency and the
+guest's finite disk.
+
+### Deliberately disabled remaining gates
+
+Do not enable GitHub polling or agent dialogue until all of these are complete:
+
+1. Sign in to 1Password, create the permanent privilege-separated Proxmox token,
+   back it up once, bind its token-specific ACLs, and install the live value as a
+   `0600` file inside the service-owned `0700` secret directory. The smoke token
+   is revoked and must not be reused.
+2. Install the existing Shipyard GitHub App private key and token helper under
+   the same file-backed-secret policy, with a verified 1Password backup. Do not
+   copy an unverified credential or use `op read` in the poll loop.
 3. Add a separately isolated inference broker with a one-run capability. The
    job must receive neither the provider credential nor control-plane
    credentials.
-4. Integrate source trust and fail-closed target admission into Shipyard. The
-   current `local` backend remains capable of host execution and is not safe for
-   an unmerged revision.
-5. Implement bounded, inert result transport and GitHub publication through the
-   Shipyard App.
-6. Add the reviewed macOS cross toolchain to a new signed image generation. The
+4. Implement bounded GitHub publication through the Shipyard App. Publication
+   must describe ordinary verification provenance without exposing internal
+   security-test details, and must never publish an approval without a
+   teardown-confirmed attestation.
+5. Add the reviewed macOS cross toolchain to a new signed image generation. The
    current image proves Linux-native builds only.
-7. Automate the optional per-PR disk lease and 24-hour expiry before enabling
+6. Automate the optional per-PR disk lease and 24-hour expiry before enabling
    warm builds.
-8. Keep concurrency at one until each job has a separate layer-2 segment; the
+7. Keep concurrency at one until each job has a separate layer-2 segment; the
    shared prototype bridge is not a cross-guest isolation boundary.
-9. Replace Proxmox's deprecated generated `user` cloud-init field with explicit
+8. Replace Proxmox's deprecated generated `user` cloud-init field with explicit
    protected user-data, then require a clean cloud-init result rather than the
    currently understood deprecation-only `degraded done` state.
-10. Decide whether this risk level is acceptable on `nexus`. It currently hosts
+9. Decide whether this risk level is acceptable on `nexus`. It currently hosts
     unrelated home-service VMs and containers, so it is not the sterile
     dedicated CI host recommended by this design. A hypervisor escape could
     threaten those workloads even though ordinary guest networking is blocked.
     The high-assurance production lane should use a dedicated node and isolated
     management network.
-11. Produce and pin a digest for the fully hardened template, not only the
-    upstream Ubuntu source image, and include that digest in every attestation.
+10. Produce and pin a full disk-image digest for the fully hardened template,
+    not only the upstream Ubuntu source image and currently pinned guest-runner
+    digest, and include that digest in every attestation.
 
 The intended runtime path does not require the maintainer Mac. VM 121 can poll
 GitHub or receive a brokered event, operate Proxmox through its scoped API token,
@@ -392,9 +465,8 @@ executor.
 To preserve spin-up/down behavior without putting credentials or review logic on
 the hypervisor, a future host timer may perform only one fixed operation: start
 VM 121 periodically when it is stopped. VM 121 then polls GitHub and shuts itself
-down after an idle window. Do not install that timer until the coordinator can
-authenticate, complete work, and shut down safely; otherwise it would only boot
-an idle VM repeatedly.
+down after an idle window. This host timer remains uninstalled until permanent
+credentials, idle shutdown, publication, and broker behavior are verified.
 
 ## Required Shipyard guardrails
 

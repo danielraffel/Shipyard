@@ -1,0 +1,21 @@
+{
+  "enabled": false,
+  "proxmox": {
+    "host": "192.168.86.70",
+    "port": 8006,
+    "node": "nexus",
+    "tls_sha256": "2ef39e10092e61b3052930a94f44b1b96d713f77fd2df5d509625a4671f0ee0b",
+    "token_file": "/var/lib/shipyard-review/secrets/proxmox-api-token"
+  },
+  "template_vmid": 124,
+  "template_name": "shipyard-review-template-v6",
+  "guest_runner_sha256": "2bac696cd46687dc2c056f844663b169e35bccfdf7c243ee16f1b53d727f520f",
+  "job_vmid": 200,
+  "job_bridge": "vmbr1",
+  "job_ip": "10.77.0.200/24",
+  "disk_storage": "local-lvm",
+  "iso_storage": "shipyard-review-iso",
+  "pool": "shipyard-review-jobs",
+  "wall_timeout_seconds": 3600,
+  "qga_timeout_seconds": 180
+}

@@ -1,20 +1,27 @@
-# Proxmox review-lane prototype
+# Proxmox disposable review lane
 
 These files reproduce the hardened infrastructure assets used by the
 untrusted-contributor execution prototype described in
 `docs/untrusted-contributor-execution.md`.
 
-They are not a complete executor. In particular, this directory does not yet
-contain a Proxmox API client, source-bundle transport, inference broker, GitHub
-publisher, resource lease manager, or teardown attestation implementation.
+The directory contains the fail-closed Proxmox controller, fixed guest runner,
+exact GitHub trigger poller, systemd confinement, provisioning assets, and live
+smoke probes. It does not yet contain the inference broker, GitHub result
+publisher, macOS cross image, or optional warm-disk lease manager. Those missing
+pieces are deliberately disabled rather than routed to another executor.
 
 Deployed resources on `nexus`:
 
 - `vmbr1` (`10.77.0.1/24`): isolated job bridge with no uplink;
 - VM 118: protected backing template, never schedule directly;
-- VM 119: protected `shipyard-review-template-v3`, powered off by default; and
+- VM 124: protected `shipyard-review-template-v6`, powered off by default;
+- VMs 118, 119, 122, and 123: protected backing generations, never schedule; and
 - VM 121: protected trusted control VM, powered off by default and currently
   credential-free.
+
+The deployed controller service and timer are disabled. Both example policies
+also say `enabled=false`; copying them cannot accidentally activate the lane.
+There is no permanent PVE API token or GitHub credential in VM 121.
 
 The firewall and hardening files are intentionally versioned so the effective
 boundary can be reviewed. Live credentials must never be added here. When the
@@ -22,7 +29,7 @@ control-plane token and broker credentials are introduced, store each as a
 `0600` file below a `0700` directory in the control or broker VM, with a 1Password
 backup. No credential belongs in a job image or source bundle.
 
-Do not manually clone VM 119 and treat its existence as admission. A production
+Do not manually clone VM 124 and treat its existence as admission. The
 coordinator must verify all of the following before source injection:
 
 - the clone derives from the expected template and image digest;
@@ -35,6 +42,28 @@ coordinator must verify all of the following before source injection:
 
 Any failed assertion requires destruction of the clone and a blocked result.
 There is no local, SSH-host, Docker-host, or maintainer-Mac fallback.
+
+`review-control.py` is the only supported lifecycle path. It pins the PVE proxy
+certificate, attaches a hash-bound ISO, re-reads VM configuration before boot,
+waits for guest hardening, runs a protected argv-only recipe, collects bounded
+JSON evidence, and tears down the VM, disks, and ISO in `finally`. The sole job
+VMID and shared `vmbr1` intentionally enforce concurrency one.
+
+`comment-poller.py` has no listener. It polls through `ghapp`, accepts exactly
+`/shipyard review` from a host-owned login allowlist, verifies the open PR and
+base repository, and selects a host-owned recipe. Comment text is never passed
+to a shell, recipe, executor selector, prompt, or Proxmox argument. Result
+publication is currently required to remain false.
+
+The deployed PVE identity has separate roles for cloning template 124, managing
+VMs only in the disposable pool, allocating linked disks, using only `vmbr1`,
+and managing an ISO-only datastore. A privilege-separated token also needs the
+same token-specific ACLs; `bind-pve-token-acls.sh` installs those after the token
+is created. Never grant this identity access to the general `local` datastore.
+
+Live smoke completed with every isolation probe and C++ build command passing,
+followed by confirmed removal of VM 200, its thin volumes, and its ISO. The
+short-lived smoke token was revoked. See the policy document for exact evidence.
 
 The prototype is single-job only. `vmbr1` prevents host and routed access, but
 it does not by itself isolate two guests attached to the same bridge at layer 2.

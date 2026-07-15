@@ -1,0 +1,33 @@
+[Unit]
+Description=Poll exact GitHub triggers for isolated Shipyard review jobs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=shipyard-review
+Group=shipyard-review
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/shipyard-review
+ReadWritePaths=/var/lib/shipyard-review
+ExecStart=/usr/local/libexec/shipyard-review/comment-poller.py --policy /etc/shipyard-review/comment-policy.json --once
+
+[Install]
+WantedBy=multi-user.target
