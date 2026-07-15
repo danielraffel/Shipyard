@@ -26,6 +26,7 @@ COMMAND = "/shipyard review"
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 MAX_GITHUB_RESPONSE = 8 * 1024 * 1024
+MAX_PUBLISH_BODY = 4096
 
 
 def load_policy(path: Path) -> dict[str, object]:
@@ -39,8 +40,8 @@ def load_policy(path: Path) -> dict[str, object]:
     if policy["enabled"] is not True:
         raise CONTROL.Blocked("GitHub comment polling is disabled")
     CONTROL.require_root_protected_file(path)
-    if policy["publish_results"] is not False:
-        raise CONTROL.Blocked("result publication is not implemented and must remain disabled")
+    if not isinstance(policy["publish_results"], bool):
+        raise CONTROL.Blocked("publish_results must be a boolean")
     authorized_users = policy["authorized_users"]
     if not isinstance(authorized_users, dict) or not authorized_users:
         raise CONTROL.Blocked("authorized user allowlist is empty")
@@ -86,6 +87,56 @@ def gh_json(ghapp: Path, endpoint: str) -> object:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as error:
         raise CONTROL.Blocked("GitHub App returned invalid JSON") from error
+
+
+def gh_post_json(ghapp: Path, endpoint: str, value: dict[str, object]) -> object:
+    """Write JSON through stdin so user-controlled text never appears in argv."""
+    encoded = json.dumps(value, separators=(",", ":")).encode()
+    if len(encoded) > MAX_PUBLISH_BODY:
+        raise CONTROL.Blocked("GitHub publication exceeded limit")
+    completed = subprocess.run(
+        [str(ghapp), "api", "--method", "POST", "--input", "-", endpoint],
+        input=encoded, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=60, check=False,
+    )
+    if len(completed.stdout) > MAX_GITHUB_RESPONSE or len(completed.stderr) > 64 * 1024:
+        raise CONTROL.Blocked("GitHub publication response exceeded limit")
+    if completed.returncode != 0:
+        raise CONTROL.Blocked("GitHub result publication failed: " + completed.stderr.decode(errors="replace")[-1000:])
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise CONTROL.Blocked("GitHub publication returned invalid JSON") from error
+
+
+def result_comment(comment_id: int, request: dict[str, object], result: dict[str, object]) -> str:
+    status = result.get("status")
+    controller = result.get("controller")
+    commands = result.get("commands")
+    if status not in {"pass", "fail"} or not isinstance(controller, dict) or not isinstance(commands, list):
+        raise CONTROL.Blocked("result is not publishable")
+    if controller.get("teardown") != "confirmed":
+        raise CONTROL.Blocked("result cannot be published before teardown is confirmed")
+    head = str(request["head_sha"])
+    marker = f"<!-- shipyard-review:{comment_id}:{head} -->"
+    outcome = "passed" if status == "pass" else "failed"
+    return f"Shipyard review {outcome} for `{head[:12]}` ({len(commands)} steps).\n\n{marker}"
+
+
+def publish_result(
+    ghapp: Path, repo: str, issue_number: int, comment_id: int,
+    request: dict[str, object], result: dict[str, object],
+) -> None:
+    body = result_comment(comment_id, request, result)
+    marker = body.rsplit("\n", 1)[-1]
+    existing = gh_json(ghapp, f"repos/{repo}/issues/{issue_number}/comments?per_page=100")
+    if not isinstance(existing, list):
+        raise CONTROL.Blocked("GitHub issue comments response is not an array")
+    if any(isinstance(item, dict) and marker in str(item.get("body", "")) for item in existing):
+        return
+    created = gh_post_json(ghapp, f"repos/{repo}/issues/{issue_number}/comments", {"body": body})
+    if not isinstance(created, dict) or not isinstance(created.get("id"), int):
+        raise CONTROL.Blocked("GitHub publication response lacked a comment id")
 
 
 def gh_archive(ghapp: Path, endpoint: str, destination: Path) -> None:
@@ -200,6 +251,8 @@ def process_comment(
         result_path = results / f"{repo.replace('/', '--')}-{issue_number}-{comment_id}.json"
         result_path.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
         os.chmod(result_path, 0o600)
+        if policy["publish_results"]:
+            publish_result(ghapp, repo, issue_number, comment_id, request, result)
         record(connection, repo, comment_id, "completed", str(result.get("status", "unknown")))
     except Exception as error:
         record(connection, repo, comment_id, "blocked", str(error))

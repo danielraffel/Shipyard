@@ -5,10 +5,11 @@ untrusted-contributor execution prototype described in
 `docs/untrusted-contributor-execution.md`.
 
 The directory contains the fail-closed Proxmox controller, fixed guest runner,
-exact GitHub trigger poller, systemd confinement, provisioning assets, and live
-smoke probes. It does not yet contain the inference broker, GitHub result
-publisher, macOS cross image, or optional warm-disk lease manager. Those missing
-pieces are deliberately disabled rather than routed to another executor.
+exact GitHub trigger poller, generic idempotent result publisher, systemd
+confinement, provisioning assets, and live smoke probes. It does not yet contain
+the inference broker, macOS cross image, or optional warm-disk lease manager.
+Those missing pieces are deliberately disabled rather than routed to another
+executor.
 
 Deployed resources on `nexus`:
 
@@ -52,8 +53,9 @@ VMID and shared `vmbr1` intentionally enforce concurrency one.
 `comment-poller.py` has no listener. It polls through `ghapp`, accepts exactly
 `/shipyard review` from a host-owned login allowlist, verifies the open PR and
 base repository, and selects a host-owned recipe. Comment text is never passed
-to a shell, recipe, executor selector, prompt, or Proxmox argument. Result
-publication is currently required to remain false.
+to a shell, recipe, executor selector, prompt, or Proxmox argument. Optional
+publication posts only a bounded pass/fail summary after confirmed teardown and
+uses a hidden request marker to avoid duplicate comments after retries.
 
 The deployed PVE identity has separate roles for cloning template 124, managing
 VMs only in the disposable pool, allocating linked disks, using only `vmbr1`,

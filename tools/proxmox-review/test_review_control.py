@@ -103,6 +103,18 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(example["enabled"])
         self.assertFalse(example["publish_results"])
 
+    def test_publication_requires_confirmed_teardown(self):
+        request = {"head_sha": "a" * 40}
+        result = {"status": "pass", "commands": [{"exit_code": 0}], "controller": {"teardown": "pending"}}
+        with self.assertRaisesRegex(POLLER.CONTROL.Blocked, "teardown"):
+            POLLER.result_comment(7, request, result)
+        result["controller"]["teardown"] = "confirmed"
+        body = POLLER.result_comment(7, request, result)
+        self.assertIn("Shipyard review passed", body)
+        self.assertIn("shipyard-review:7:", body)
+        self.assertNotIn("security", body.lower())
+        self.assertNotIn("sandbox", body.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -433,10 +433,9 @@ Do not enable GitHub polling or agent dialogue until all of these are complete:
 3. Add a separately isolated inference broker with a one-run capability. The
    job must receive neither the provider credential nor control-plane
    credentials.
-4. Implement bounded GitHub publication through the Shipyard App. Publication
-   must describe ordinary verification provenance without exposing internal
-   security-test details, and must never publish an approval without a
-   teardown-confirmed attestation.
+4. Bounded, idempotent GitHub publication is implemented and deployed but
+   disabled. Enable it only with the Shipyard App credential installed; it
+   publishes a generic pass/fail summary only after teardown is confirmed.
 5. Add the reviewed macOS cross toolchain to a new signed image generation. The
    current image proves Linux-native builds only.
 6. Automate the optional per-PR disk lease and 24-hour expiry before enabling
