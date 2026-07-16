@@ -94,6 +94,22 @@ does not activate the lane.
 - The timer was stopped, its prior policy restored, publication returned to
   false, and the temporary App authorization removed. The timer is again
   `disabled` and `inactive`; only Daniel remains allowlisted.
+- Replaying the checked-in identity and token ACL installers against the live
+  host bound clone rights to VM 132 and left both principals with zero
+  bridge/SDN grants. A service-user verification then reported VM 132 ready.
+
+## Current maintainer brief: PR 6114
+
+- `clear`: exact head `c2f37ca01fecdbddc6529f4646101df618a585d8` is
+  mergeable and passed the focused no-NIC build/test recipe with confirmed
+  teardown.
+- `blocker`: after that validation, the contributor explicitly requested a
+  hold because neither commit has DCO sign-off and the PR lacks a provenance
+  statement. Passing execution evidence does not satisfy this legal/provenance
+  gate.
+- Recommendation: `hold`. Next owner/action: Matthew either supplies the DCO
+  sign-off and provenance statement or closes the patch in favor of the
+  plan-based contribution. Daniel should not merge this head.
 
 ## Still required before activation
 
