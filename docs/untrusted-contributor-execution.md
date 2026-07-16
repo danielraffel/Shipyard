@@ -425,7 +425,10 @@ Proxmox side while VM 200 was running. Inside the guest, only `lo` existed and
 both non-loopback route sets were empty. Configure, build, and tests passed from
 baked dependencies; the controller reported `network=none`,
 `standing_secrets=none`, and confirmed teardown after 32.53 seconds. Live build
-failure, command timeout, and direct SIGTERM runs also confirmed teardown. An
+failure, command timeout, and direct SIGTERM on the smoke-controller path also
+confirmed teardown. A production-poller stop after VM 200 reached `running`
+delivered the same teardown exception, recorded a blocked result, and left the
+VM, disks, and ISO independently absent. An
 abrupt parent-wrapper termination left only an ISO; the next admission blocked
 on the orphan and reconciliation removed it before readiness returned.
 

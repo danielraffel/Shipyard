@@ -416,6 +416,20 @@ class PolicyTests(unittest.TestCase):
             CONTROL.interrupt_for_teardown(15, None)
         self.assertFalse(issubclass(CONTROL.ControllerInterrupted, CONTROL.Blocked))
 
+    def test_poller_installs_and_restores_teardown_signal_handler(self):
+        prior = object()
+        with mock.patch.object(POLLER.signal, "signal", side_effect=[prior, None]) as install, \
+             mock.patch.object(POLLER, "poll_once", side_effect=RuntimeError("stop")):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                POLLER.poll_once_with_teardown({})
+        self.assertEqual(
+            install.call_args_list,
+            [
+                mock.call(POLLER.signal.SIGTERM, POLLER.CONTROL.interrupt_for_teardown),
+                mock.call(POLLER.signal.SIGTERM, prior),
+            ],
+        )
+
     def test_reconcile_deletes_only_controller_owned_fixed_resources_then_clears_latch(self):
         with tempfile.TemporaryDirectory() as temp_name:
             lifecycle = self.lifecycle_for_state(Path(temp_name) / "state")

@@ -336,7 +336,9 @@ criteria above are explicit activation gates.
    proven absent after placement in the actual disposable pool.
 3. **Image identity:** complete logical disk, stable configuration, and
    protected user-data identities are pinned for no-NIC Linux template 132 and offline
-   macOS-cross template 131.
+   macOS-cross template 131. Template creation is currently a manual,
+   digest-attested maintenance procedure rather than a code-reproducible image
+   build.
 4. **Host residual risk:** the current prototype host is not a dedicated sterile
    CI machine. Ordinary guest paths are blocked, but a hypervisor escape could
    affect unrelated workloads. Production use requires an explicit acceptance

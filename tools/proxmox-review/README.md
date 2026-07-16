@@ -105,7 +105,8 @@ grant this identity access to the general `local` datastore.
 Live no-NIC smoke completed with Proxmox showing no network device, the guest
 showing only `lo` and no non-loopback routes, every C++ build command passing,
 and confirmed removal of VM 200, its thin volumes, and its ISO. Build-failure,
-timeout, graceful SIGTERM, and abrupt-parent-loss paths also fail closed. See
+timeout, graceful SIGTERM on the controller and poller paths, and
+abrupt-parent-loss paths also fail closed. See
 the evidence document for exact results.
 
 The prototype is single-job only. Job VMs have no NIC, so concurrency does not

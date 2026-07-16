@@ -97,6 +97,12 @@ does not activate the lane.
 - Replaying the checked-in identity and token ACL installers against the live
   host bound clone rights to VM 132 and left both principals with zero
   bridge/SDN grants. A service-user verification then reported VM 132 ready.
+- A second exact trigger (`4987089637`) exercised interruption through the
+  production poller rather than the smoke CLI. After VM 200 reached `running`,
+  stopping the systemd oneshot delivered SIGTERM; the poller recorded
+  `blocked: controller interrupted by signal 15`, and the VM, disks, and ISO
+  were independently absent. The temporary App authorization was removed and
+  the timer returned to `disabled`/`inactive` with publication false.
 
 ## Current maintainer brief: PR 6114
 
@@ -122,7 +128,7 @@ does not activate the lane.
   removed all fixed resources; and reconciliation refused then removed an
   identity-checked protected job in the actual disposable pool.
 - Decide whether to leave the proven timer/publication path disabled or enable
-  it after the shared-host decision. No further mechanism proof is required.
+  it after the shared-host decision.
 - Produce the complete maintainer brief for a current external PR and have the
   final exact diff plus installed evidence independently adversarially reviewed.
 - Decide whether shared-host hypervisor-escape residual risk is accepted for
