@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -291,6 +292,14 @@ def poll_once(policy: dict[str, object]) -> None:
         connection.close()
 
 
+def poll_once_with_teardown(policy: dict[str, object]) -> None:
+    previous_handler = signal.signal(signal.SIGTERM, CONTROL.interrupt_for_teardown)
+    try:
+        poll_once(policy)
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--policy", type=Path, required=True)
@@ -299,7 +308,7 @@ def main() -> int:
     policy = load_policy(args.policy)
     if not args.once:
         raise CONTROL.Blocked("only one-shot polling is supported; systemd owns repetition")
-    poll_once(policy)
+    poll_once_with_teardown(policy)
     return 0
 
 

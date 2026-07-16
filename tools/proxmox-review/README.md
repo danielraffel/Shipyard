@@ -19,7 +19,9 @@ Deployed resources on `nexus`:
 
 - `vmbr1` (`10.77.0.1/24`): isolated job bridge with no uplink;
 - VM 118: protected backing template, never schedule directly;
-- VM 127: protected `shipyard-review-template-v9`, powered off by default;
+- VM 132: protected no-NIC `shipyard-review-template-v10`, powered off by
+  default;
+- VM 127: protected rollback template, never scheduled by current policy;
 - VMs 118, 119, 122, 123, 124, 125, and 126: protected backing generations,
   never schedule; and
 - VM 121: protected trusted control VM, holding only the scoped control-plane
@@ -39,19 +41,20 @@ control-plane token and broker credentials are installed, store each as a
 `0600` file below a `0700` directory in the control or broker VM, with a 1Password
 backup. No credential belongs in a job image or source bundle.
 
-Template 127 is pinned by the composite manifest in
-`images/shipyard-review-template-v9.json`. That identity covers every logical
+Template 132 is pinned by the composite manifest in
+`images/shipyard-review-template-v10.json`. That identity covers every logical
 root and EFI disk block, the cloud-init volume, stable VM configuration,
 explicit protected user-data, fixed guest runner, and the exact baked-source
 inventory in `dependencies/pulp-linux.json`. Admission requires both manifest
 digests in the protected template description and emits them in result
 evidence.
 
-Do not manually clone VM 127 and treat its existence as admission. The
+Do not manually clone VM 132 and treat its existence as admission. The
 coordinator must verify all of the following before source injection:
 
 - the clone derives from the expected template and image digest;
-- its only NIC is on `vmbr1` and it has no gateway or DNS server;
+- it has no virtual NIC or cloud-init network configuration, only loopback, and
+  no non-loopback IPv4 or IPv6 kernel routes;
 - CPU, memory, disk, wall-clock, output, and process limits are attached;
 - cloud-init is complete without unexpected errors;
 - `shipyard-review-guest-hardening.service` is active; and
@@ -90,22 +93,25 @@ to a shell, recipe, executor selector, prompt, or Proxmox argument. Optional
 publication posts only a bounded pass/fail summary after confirmed teardown and
 uses a hidden request marker to avoid duplicate comments after retries.
 
-The deployed PVE identity has separate roles for cloning template 127, managing
-VMs only in the disposable pool, allocating linked disks, using only `vmbr1`,
+The deployed PVE identity has separate roles for cloning template 132, managing
+VMs only in the disposable pool, removing inherited network configuration,
+allocating linked disks, using only `vmbr1` during trusted image maintenance,
 and managing an ISO/snippet-only datastore. It has read-only `VM.Audit` across
 VMs so bridge admission can see every running NIC, but no management right on
 unrelated VMs. A privilege-separated token also needs the same token-specific
 ACLs; `bind-pve-token-acls.sh` installs those after the token is created. Never
 grant this identity access to the general `local` datastore.
 
-Live smoke completed with every isolation probe and C++ build command passing,
-followed by confirmed removal of VM 200, its thin volumes, and its ISO. The
-short-lived smoke token was revoked. See the policy document for exact evidence.
+Live no-NIC smoke completed with Proxmox showing no network device, the guest
+showing only `lo` and no non-loopback routes, every C++ build command passing,
+and confirmed removal of VM 200, its thin volumes, and its ISO. Build-failure,
+timeout, graceful SIGTERM on the controller and poller paths, and
+abrupt-parent-loss paths also fail closed. See
+the evidence document for exact results.
 
-The prototype is single-job only. `vmbr1` prevents host and routed access, but
-it does not by itself isolate two guests attached to the same bridge at layer 2.
-Do not enable concurrent untrusted clones until the coordinator allocates a
-unique VLAN or bridge per job and proves cross-guest traffic is denied.
+The prototype is single-job only. Job VMs have no NIC, so concurrency does not
+create a guest layer-2 path; keep the fixed-VMID lock until storage and lifecycle
+resources are made independently job-scoped.
 
 `nexus` is also a shared home-services hypervisor. This prototype protects
 against normal guest access and contributor code, but it does not make a

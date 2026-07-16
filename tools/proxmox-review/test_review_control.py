@@ -45,7 +45,7 @@ class PolicyTests(unittest.TestCase):
             "dependency_inventory_sha256": "b" * 64,
             "dependency_inventory": "/etc/shipyard-review/dependencies/pulp-linux.json",
             "guest_runner_sha256": "a" * 64, "job_vmid": 200, "job_bridge": "vmbr1",
-            "job_ip": "10.77.0.200/24", "disk_storage": "local-lvm",
+            "disk_storage": "local-lvm",
             "job_disk_gib": 80,
             "iso_storage": "shipyard-review-iso",
             "pool": "shipyard-review-jobs",
@@ -70,13 +70,14 @@ class PolicyTests(unittest.TestCase):
         config = self.config()
         vm = {
             "cores": 2, "memory": 4096, "onboot": 0, "protection": 0, "hotplug": "0",
-            "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr1,firewall=1",
-            "ipconfig0": "ip=10.77.0.200/24", "sata1": "local:iso/shipyard-review-job-200.iso,media=cdrom",
+            "sata1": "local:iso/shipyard-review-job-200.iso,media=cdrom",
             "scsi0": "local-lvm:vm-200-disk-1,size=80G", "efidisk0": "local-lvm:vm-200-disk-0",
             "ide2": "local-lvm:vm-200-cloudinit,media=cdrom",
         }
         CONTROL.validate_job_vm_config(vm, config, "shipyard-review-job-200.iso")
         for key, value in [
+            ("net0", "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr1,firewall=1"),
+            ("ipconfig0", "ip=10.77.0.200/24"),
             ("net1", "virtio=AA:BB:CC:DD:EE:00,bridge=vmbr0"),
             ("hostpci0", "0000:00:02.0"),
             ("sshkeys", "attacker-key"),
@@ -86,6 +87,23 @@ class PolicyTests(unittest.TestCase):
             hostile[key] = value
             with self.assertRaises(CONTROL.Blocked, msg=key):
                 CONTROL.validate_job_vm_config(hostile, config, "shipyard-review-job-200.iso")
+
+    def test_networkless_guest_probe_rejects_any_interface_or_route(self):
+        self.assertIn("interfaces != {'lo'}", CONTROL.NETWORKLESS_GUEST_PROBE)
+        self.assertIn("line.split()[0] != 'lo'", CONTROL.NETWORKLESS_GUEST_PROBE)
+        self.assertIn("line.split()[-1] != 'lo'", CONTROL.NETWORKLESS_GUEST_PROBE)
+        self.assertNotIn("socket", CONTROL.NETWORKLESS_GUEST_PROBE)
+
+    def test_guest_exec_uses_only_the_fixed_job_vm_agent_endpoint(self):
+        lifecycle = CONTROL.ReviewLifecycle.__new__(CONTROL.ReviewLifecycle)
+        lifecycle.node = "nexus"
+        lifecycle.vmid = 200
+        lifecycle.api = mock.Mock()
+        payload = {"command": ["/usr/bin/true"]}
+        lifecycle._guest_exec(payload)
+        lifecycle.api.request.assert_called_once_with(
+            "POST", "/nodes/nexus/qemu/200/agent/exec", payload,
+        )
 
     def test_comment_trigger_is_exact(self):
         self.assertTrue(POLLER.exact_command("/shipyard review"))
@@ -397,6 +415,20 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(CONTROL.ControllerInterrupted, "signal 15"):
             CONTROL.interrupt_for_teardown(15, None)
         self.assertFalse(issubclass(CONTROL.ControllerInterrupted, CONTROL.Blocked))
+
+    def test_poller_installs_and_restores_teardown_signal_handler(self):
+        prior = object()
+        with mock.patch.object(POLLER.signal, "signal", side_effect=[prior, None]) as install, \
+             mock.patch.object(POLLER, "poll_once", side_effect=RuntimeError("stop")):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                POLLER.poll_once_with_teardown({})
+        self.assertEqual(
+            install.call_args_list,
+            [
+                mock.call(POLLER.signal.SIGTERM, POLLER.CONTROL.interrupt_for_teardown),
+                mock.call(POLLER.signal.SIGTERM, prior),
+            ],
+        )
 
     def test_reconcile_deletes_only_controller_owned_fixed_resources_then_clears_latch(self):
         with tempfile.TemporaryDirectory() as temp_name:

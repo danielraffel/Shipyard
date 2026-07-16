@@ -247,8 +247,9 @@ After those blockers close, all of the following must also be true before Phase
 - [x] Automated tests prove that untrusted work cannot resolve to local, SSH,
   persistent self-hosted, or fallback executors.
 - [x] A fresh real-PR run proves unprivileged execution, no standing secrets,
-  bounded resources and logs, exact-head evidence, and confirmed teardown. A
-  separate fresh clone of the same protected image proves no route or DNS.
+  bounded resources and logs, exact-head evidence, and confirmed teardown. The
+  protected template and live job have no virtual NIC or IP configuration; the
+  guest reports only loopback and no non-loopback IPv4 or IPv6 routes.
 - [x] Negative probes prove that guest attempts to reach host, management, LAN,
   and public network paths fail.
 - [x] Pass, build failure, command timeout, controller interruption, malformed
@@ -279,7 +280,7 @@ After those blockers close, all of the following must also be true before Phase
 - [x] Operational documentation covers enable, disable, blocked-state
   diagnosis, credential rotation, image rebuild, evidence retention, and
   emergency teardown.
-- [ ] An unattended exact-command trigger proves restart-safe polling,
+- [x] An unattended exact-command trigger proves restart-safe polling,
   idempotent admission, bounded sanitized publication, and confirmed teardown
   without enabling any workstation or fallback execution path.
 - [ ] Guest disk allocation and host admission prevent one job from exhausting
@@ -322,9 +323,10 @@ criteria above are explicit activation gates.
 
 ## Open risks and remaining proof
 
-1. **Activation path:** the polling timer and result publication remain
-   disabled. Their real unattended, idempotent, restart-safe behavior still
-   needs a controlled end-to-end proof.
+1. **Activation posture:** a controlled timer run admitted one exact authorized
+   comment, validated the exact PR head in a no-NIC guest, published one bounded
+   result only after teardown, and remained idempotent across a later poll. The
+   timer and publication were then disabled again pending the host-risk decision.
 2. **Failure matrix:** the installed suite covers malformed, oversized, and
    fuzzed result data, the independent collection deadline, storage refusal,
    teardown failure, lock/latch behavior, and reconciliation. Live controlled
@@ -333,14 +335,16 @@ criteria above are explicit activation gates.
    latched, then identity-checked, unprotected, destroyed, and independently
    proven absent after placement in the actual disposable pool.
 3. **Image identity:** complete logical disk, stable configuration, and
-   protected user-data identities are pinned for Linux template 127 and offline
-   macOS-cross template 131.
+   protected user-data identities are pinned for no-NIC Linux template 132 and offline
+   macOS-cross template 131. Template creation is currently a manual,
+   digest-attested maintenance procedure rather than a code-reproducible image
+   build.
 4. **Host residual risk:** the current prototype host is not a dedicated sterile
    CI machine. Ordinary guest paths are blocked, but a hypervisor escape could
    affect unrelated workloads. Production use requires an explicit acceptance
    or migration decision.
-5. **Single-job boundary:** the current isolated network is safe only at
-   concurrency one. Per-job layer-2 isolation must precede concurrency.
+5. **Single-job boundary:** job VMs have no NIC, but the fixed VMID, ISO name,
+   storage reservation, and admission lock still intentionally enforce one job.
 6. **Cloud-init state:** explicit protected user data is installed, and clean
    `done` state with no errors is an admission requirement.
 7. **macOS coverage:** the protected no-NIC cross image can compile arm64

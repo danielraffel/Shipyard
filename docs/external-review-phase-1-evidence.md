@@ -13,8 +13,8 @@ does not activate the lane.
   template-clone rights, and read-only fleet VM audit. On an unrelated VM it
   has `VM.Audit` only.
 - The systemd timer is `disabled` and `inactive`.
-- The installed Python failure/policy suite passes 31 tests. Readiness reports
-  template VM 127 ready after independent fixed-slot, storage, template,
+- The installed Python failure/policy suite passes 33 tests. Readiness reports
+  template VM 132 ready after independent fixed-slot, storage, template,
   manifest, clean-init-policy, latch, and lock checks.
 - A held kernel lock, a durable latch, an orphan job ISO, and a latch surviving
   controller reboot each blocked readiness. Removing the synthetic condition
@@ -34,14 +34,22 @@ does not activate the lane.
 
 ## Linux image and execution
 
-- Protected template VM 127 is stopped and pinned by composite manifest SHA-256
-  `6e891728d885669aacfd40e8bdd8208b9d202b73dc15998268e46c7afafbd4d3`.
+- Protected template VM 132 is stopped, has no NIC, and is pinned by composite
+  manifest SHA-256
+  `54e61a991ae71c9fdbcd630d005bb9cd31e2a6e9335c6462f2727e9d6465f976`.
+- Its stopped 80-GiB logical root digest is
+  `6b9718177488469106bb6673c146cf222fecfe2c36e6328e327422ff5c030e46`.
+  With `systemd-networkd-wait-online` masked, a no-NIC boot brought QEMU Guest
+  Agent up in 14 seconds and reported only `lo`, zero non-loopback IPv4 routes,
+  and zero non-loopback IPv6 routes.
 - A fresh clone completed explicit cloud-init with `status=done`,
   `extended_status=done`, no errors, no recoverable errors, no SSH keys, and the
   expected unprivileged marker. The clone and all volumes were removed.
-- An offline smoke passed privilege, host/LAN/management/public-network probes,
-  compiled and ran a C++ target, returned bounded evidence, and confirmed
-  teardown.
+- A fresh no-NIC smoke completed configure, build, and tests from baked
+  dependencies in 32.53 seconds. Proxmox showed no `net*` or `ipconfig*` field
+  while VM 200 was running; the guest reported only loopback and no non-loopback
+  routes. The result recorded `network=none`, `standing_secrets=none`, and
+  confirmed teardown; the VM, disks, and ISO were independently absent.
 - A broad exact-head run of external PR 6115 hit the controller wall deadline
   after its offline build and failed closed with confirmed teardown. A later
   focused recipe passed selected builds/tests for the same exact head in a new
@@ -71,6 +79,44 @@ does not activate the lane.
 - This proves compile structure only. Runtime, signing, notarization, and macOS
   host behavior remain explicitly outside this lane.
 
+## Controlled unattended proof
+
+- GitHub comment `4986904720` contained exactly `/shipyard review` and was bound
+  to PR 6114 head `c2f37ca01fecdbddc6529f4646101df618a585d8`.
+- For this bounded rehearsal only, the exact numeric GitHub App identity was
+  added to the allowlist and publication was enabled. The systemd timer was
+  started without enabling it across reboot.
+- The focused three-command recipe passed in the no-NIC guest. After confirmed
+  teardown, comment `4986940759` published only the exact-head prefix, pass
+  state, and step count plus an idempotency marker.
+- A later scheduled poll produced no second VM or publication; the marker count
+  remained exactly one and SQLite retained `completed/pass` for the trigger.
+- The timer was stopped, its prior policy restored, publication returned to
+  false, and the temporary App authorization removed. The timer is again
+  `disabled` and `inactive`; only Daniel remains allowlisted.
+- Replaying the checked-in identity and token ACL installers against the live
+  host bound clone rights to VM 132 and left both principals with zero
+  bridge/SDN grants. A service-user verification then reported VM 132 ready.
+- A second exact trigger (`4987089637`) exercised interruption through the
+  production poller rather than the smoke CLI. After VM 200 reached `running`,
+  stopping the systemd oneshot delivered SIGTERM; the poller recorded
+  `blocked: controller interrupted by signal 15`, and the VM, disks, and ISO
+  were independently absent. The temporary App authorization was removed and
+  the timer returned to `disabled`/`inactive` with publication false.
+
+## Current maintainer brief: PR 6114
+
+- `clear`: exact head `c2f37ca01fecdbddc6529f4646101df618a585d8` is
+  mergeable and passed the focused no-NIC build/test recipe with confirmed
+  teardown.
+- `blocker`: after that validation, the contributor explicitly requested a
+  hold because neither commit has DCO sign-off and the PR lacks a provenance
+  statement. Passing execution evidence does not satisfy this legal/provenance
+  gate.
+- Recommendation: `hold`. Next owner/action: Matthew either supplies the DCO
+  sign-off and provenance statement or closes the patch in favor of the
+  plan-based contribution. Daniel should not merge this head.
+
 ## Still required before activation
 
 - The installed/live failure matrix is closed: pass, structured build failure,
@@ -81,12 +127,8 @@ does not activate the lane.
   job returned fail with confirmed teardown; SIGTERM returned blocked and
   removed all fixed resources; and reconciliation refused then removed an
   identity-checked protected job in the actual disposable pool.
-- Prove unattended exact-command polling, idempotency, and sanitized bounded
-  publication in a controlled non-publishing/dry-run sequence before enabling
-  either feature. One installed systemd one-shot already completed successfully
-  with no exact trigger present, recorded 100 comments as ignored, created no
-  job, and left the timer disabled/inactive; publication remains unit/corpus
-  proven but disabled.
+- Decide whether to leave the proven timer/publication path disabled or enable
+  it after the shared-host decision.
 - Produce the complete maintainer brief for a current external PR and have the
   final exact diff plus installed evidence independently adversarially reviewed.
 - Decide whether shared-host hypervisor-escape residual risk is accepted for

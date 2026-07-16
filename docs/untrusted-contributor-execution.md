@@ -295,16 +295,16 @@ GitHub comment can currently start work.
   `shipyard-thin` profile: auto-extension begins at 70 percent and extends by 2
   percent. Disk-use admission and alerting are still required in the
   coordinator.
-- The prototype admits at most one untrusted job VM at a time. Guests on the
-  same Linux bridge may otherwise communicate at layer 2 without traversing
-  the host's routed-traffic rules. Concurrency requires a unique VLAN or bridge
-  per job plus a negative cross-guest connectivity test.
+- The prototype admits at most one untrusted job VM at a time. Current job VMs
+  have no virtual NIC, so they have no guest layer-2 path; the fixed VMID, ISO,
+  storage reservation, and admission lock still intentionally enforce one job.
 
 ### Job image
 
-- VM 127, `shipyard-review-template-v9`, is the protected, powered-off job
-  template. VMs 118, 119, 122, 123, 124, 125, and 126 are protected backing generations and
-  must not be scheduled.
+- VM 132, `shipyard-review-template-v10`, is the protected, powered-off no-NIC
+  job template. VM 127 is the protected rollback template. VMs 118, 119, 122,
+  123, 124, 125, and 126 are protected backing generations and must not be
+  scheduled.
 - The job shape is two virtual CPUs, 4 GiB maximum RAM with a 2 GiB balloon
   floor, and an 80 GiB sparse thin disk.
 - The signed Ubuntu 24.04 release image was verified with Ubuntu's dedicated
@@ -353,12 +353,13 @@ GitHub comment can currently start work.
   file-backed API token, uploads a hash-bound ISO, creates one VM in the
   dedicated pool, removes inherited clone protection, applies and re-reads the
   VM configuration, and refuses startup unless admission matches policy.
-- Admission rejects extra NICs, any bridge other than `vmbr1`, a gateway or DNS,
-  SSH credentials, host devices, shared filesystems, hotplug, excessive CPU or
+- Admission rejects every virtual NIC and cloud-init IP configuration, plus SSH
+  credentials, host devices, shared filesystems, hotplug, excessive CPU or
   memory, a missing hardening marker, supplementary guest groups, or non-empty
-  root/user SSH authorization files.
+  root/user SSH authorization files. Before source execution, a fixed in-guest
+  probe also requires only `lo` and no non-loopback IPv4 or IPv6 kernel routes.
 - The protected template name and shape are pinned before clone, and the guest
-  runner is re-hashed after boot. Template 127 returned runner SHA-256
+  runner is re-hashed after boot. Template 132 returned runner SHA-256
   `f4b949d337fbbd11f7b053ca0050f543d9a2aad765219ee4a6e78d6781cd49f4`
   in a fresh verification clone.
 - The input ISO is mounted read-only, `nosuid,nodev,noexec`. Its manifest binds
@@ -383,7 +384,7 @@ GitHub comment can currently start work.
 ### Smoke evidence
 
 A fresh linked clone from VM 119 originally proved the base boundary. The
-current controller then ran from VM 121 through template 127 and VM 200 using
+current controller then ran from VM 121 through template 132 and VM 200 using
 only the scoped, privilege-separated test token. It:
 
 - `id` reported only `uid=1000(shipyard) gid=1000(shipyard)`;
@@ -397,7 +398,7 @@ only the scoped, privilege-separated test token. It:
   and
 - teardown removed the VM configuration and every `vm-120-*` thin volume.
 
-The current end-to-end controller smoke additionally:
+Historical bridge-based smoke additionally:
 
 - attached and verified an immutable ISO containing source, manifest, and a
   protected argv-only recipe;
@@ -414,9 +415,22 @@ The current end-to-end controller smoke additionally:
 
 The permanent privilege-separated API token was installed only after its
 1Password backup was verified. Its token ACLs and the durable identity's ACLs
-are separately scoped to clone VM 127, the disposable-job pool, `vmbr1`,
-`local-lvm` allocation, and a dedicated ISO-only datastore. It has no ACL on
-the general `local` datastore.
+are separately scoped to clone VM 132 (with VM 127 retained for rollback), the
+disposable-job pool, network-device removal on only that pool, `local-lvm`
+allocation, and a dedicated ISO-only datastore. It has no bridge/SDN ACL and
+no ACL on the general `local` datastore.
+
+The current no-NIC smoke showed no `net*` or `ipconfig*` field from the
+Proxmox side while VM 200 was running. Inside the guest, only `lo` existed and
+both non-loopback route sets were empty. Configure, build, and tests passed from
+baked dependencies; the controller reported `network=none`,
+`standing_secrets=none`, and confirmed teardown after 32.53 seconds. Live build
+failure, command timeout, and direct SIGTERM on the smoke-controller path also
+confirmed teardown. A production-poller stop after VM 200 reached `running`
+delivered the same teardown exception, recorded a blocked result, and left the
+VM, disks, and ISO independently absent. An
+abrupt parent-wrapper termination left only an ISO; the next admission blocked
+on the orphan and reconciliation removed it before readiness returned.
 
 The controller also checks `local-lvm` and the dedicated ISO datastore before
 clone and while guest commands run. The root disk must match the protected
@@ -430,7 +444,8 @@ to single-job concurrency.
 The permanent privilege-separated Proxmox token and Shipyard GitHub App key
 have byte-for-byte verified 1Password backups and are installed as service-owned
 files. The controller's hot path works with `op` absent. The polling timer and
-publication remain disabled while activation testing is completed.
+publication remain disabled pending the operator's shared-host risk decision,
+even though the controlled unattended proof is complete.
 
 Before enabling agent dialogue or the corresponding optional capabilities:
 

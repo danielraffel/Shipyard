@@ -55,6 +55,8 @@ install -o root -g shipyard-review -m 0640 "$asset_dir/dependencies/pulp-linux.j
     /etc/shipyard-review/dependencies/pulp-linux.json
 install -o root -g shipyard-review -m 0640 "$asset_dir/images/shipyard-review-template-v9.json" \
     /etc/shipyard-review/images/shipyard-review-template-v9.json
+install -o root -g shipyard-review -m 0640 "$asset_dir/images/shipyard-review-template-v10.json" \
+    /etc/shipyard-review/images/shipyard-review-template-v10.json
 install -m 0644 "$asset_dir/shipyard-review-poll.service" \
     /etc/systemd/system/shipyard-review-poll.service
 install -m 0644 "$asset_dir/shipyard-review-poll.timer" \

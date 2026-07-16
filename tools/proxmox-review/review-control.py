@@ -26,6 +26,18 @@ MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_ISO_BYTES = 80 * 1024 * 1024
 MAX_RESULT_BYTES = 256 * 1024
 MAX_RESULT_COMMANDS = 32
+NETWORKLESS_GUEST_PROBE = """\
+import os
+import pathlib
+
+interfaces = set(os.listdir('/sys/class/net'))
+routes = pathlib.Path('/proc/net/route').read_text(encoding='utf-8').splitlines()[1:]
+ipv6_routes = pathlib.Path('/proc/net/ipv6_route').read_text(encoding='utf-8').splitlines()
+non_loopback_routes = [line for line in routes if line.split()[0] != 'lo']
+non_loopback_ipv6_routes = [line for line in ipv6_routes if line.split()[-1] != 'lo']
+if interfaces != {'lo'} or non_loopback_routes or non_loopback_ipv6_routes:
+    raise SystemExit(72)
+"""
 MAX_RESULT_STRING_BYTES = 16 * 1024
 FORBIDDEN_CONFIG_PREFIXES = (
     "args", "audio", "hostpci", "ivshmem", "parallel", "tpmstate", "usb", "virtiofs",
@@ -177,7 +189,7 @@ def validate_config(config: dict[str, object]) -> None:
         "enabled", "proxmox", "template_vmid", "template_name", "template_image_sha256",
         "template_image_manifest", "dependency_inventory_sha256", "dependency_inventory",
         "guest_runner_sha256",
-        "job_vmid", "job_bridge", "job_ip",
+        "job_vmid", "job_bridge",
         "disk_storage", "job_disk_gib", "iso_storage", "pool", "wall_timeout_seconds", "qga_timeout_seconds",
         "result_timeout_seconds", "admission_latch", "admission_lock",
     }
@@ -325,11 +337,10 @@ def validate_job_vm_config(vm: dict[str, object], config: dict[str, object], iso
     if str(vm.get("hotplug", "")) != "0":
         failures.append("hotplug is not disabled")
     network_keys = sorted(key for key in vm if key.startswith("net"))
-    if network_keys != ["net0"] or f"bridge={config['job_bridge']}" not in str(vm.get("net0", "")):
-        failures.append("job has an unexpected network device or bridge")
-    ipconfig = str(vm.get("ipconfig0", ""))
-    if ipconfig != f"ip={config['job_ip']}" or "gw=" in ipconfig:
-        failures.append(f"job IP configuration includes a gateway or is unexpected: {ipconfig!r}")
+    if network_keys:
+        failures.append(f"job has a network device: {network_keys}")
+    if any(key.startswith("ipconfig") for key in vm):
+        failures.append("job has cloud-init network configuration")
     for key in vm:
         if key.startswith(FORBIDDEN_CONFIG_PREFIXES):
             failures.append(f"forbidden device/config field present: {key}")
@@ -518,8 +529,8 @@ class ReviewLifecycle:
             failures.append("template dependency identity does not match pin")
         if str(vm.get("hotplug", "")) != "0" or str(vm.get("onboot", "0")) not in {"0", "false", "False"}:
             failures.append("template hotplug/onboot policy is wrong")
-        if sorted(key for key in vm if key.startswith("net")) != ["net0"] or "bridge=vmbr1" not in str(vm.get("net0", "")):
-            failures.append("template network boundary is wrong")
+        if any(key.startswith(("net", "ipconfig")) for key in vm):
+            failures.append("template has a network device or cloud-init network configuration")
         if str(vm.get("sata1", "")) != "none,media=cdrom":
             failures.append("template immutable-input slot is wrong")
         if f"size={self.config['job_disk_gib']}G" not in str(vm.get("scsi0", "")):
@@ -574,7 +585,7 @@ class ReviewLifecycle:
                 "POST", f"/nodes/{self.node}/qemu/{self.vmid}/config",
                 {
                     "tags": "disposable;network-deny;shipyard-review;untrusted",
-                    "ipconfig0": f"ip={self.config['job_ip']}",
+                    "delete": "net0,ipconfig0",
                     "sata1": f"{self.iso_volid},media=cdrom",
                 },
             )
@@ -594,6 +605,12 @@ class ReviewLifecycle:
                     if time.monotonic() >= deadline:
                         raise Blocked("guest agent did not become ready")
                     time.sleep(2)
+            network_probe = self._guest_exec(
+                {"command": ["/usr/bin/python3", "-c", NETWORKLESS_GUEST_PROBE]},
+            )
+            network_status = self._wait_guest_exec(network_probe, 30)
+            if network_status.get("exitcode") != 0:
+                raise Blocked("guest has a non-loopback interface or kernel route")
             admission_deadline = time.monotonic() + int(self.config["qga_timeout_seconds"])
             while True:
                 admission = self.api.request(
@@ -717,6 +734,11 @@ class ReviewLifecycle:
         self.teardown_or_latch(None)
         self.assert_job_slot_clean()
         self.admission_latch.unlink(missing_ok=True)
+
+    def _guest_exec(self, payload: dict[str, object]) -> object:
+        return self.api.request(
+            "POST", f"/nodes/{self.node}/qemu/{self.vmid}/agent/exec", payload,
+        )
 
     def _wait_guest_exec(self, response: object, timeout: int) -> dict[str, object]:
         if not isinstance(response, dict) or not isinstance(response.get("pid"), int):
