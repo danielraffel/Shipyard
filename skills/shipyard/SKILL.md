@@ -28,7 +28,8 @@ go/no-go for that operation.
    `skills/review-external-contributions/SKILL.md`. The dedicated disposable-VM
    controller is intentionally separate from normal Shipyard targets and must
    fail closed rather than use local, SSH, host-pool, self-hosted, or fallback
-   execution. Its polling timer remains an explicit activation gate.
+   execution. Its untrusted job VM has no virtual NIC; only the trusted
+   controller talks to GitHub. Timer activation remains an operator decision.
 
 ## Local/SSH VM Watch
 

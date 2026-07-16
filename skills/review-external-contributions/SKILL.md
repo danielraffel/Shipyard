@@ -27,7 +27,8 @@ boundary, exact-head validation, evidence redaction, or human merge gate.
    behavior, dependencies, licensing, provenance, and security as relevant.
 4. Run repository-controlled commands only through the eligible isolated lane.
    If it is unavailable, report `unverified`; never fall back to a maintainer
-   machine.
+   machine. The untrusted job VM must have no virtual NIC or IP configuration;
+   controller-side GitHub access is not guest network access.
 5. Consolidate actionable feedback. Separate blockers from suggestions and
    post ordinary, specific GitHub review comments when authorized. Do not
    mention private security probes or expose raw untrusted logs.

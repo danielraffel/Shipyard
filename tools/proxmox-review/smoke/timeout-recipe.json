@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "commands": [
+    {
+      "argv": ["/usr/bin/sleep", "60"],
+      "timeout_seconds": 2
+    }
+  ]
+}
