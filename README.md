@@ -37,6 +37,11 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
 - **Declarative security & governance.** One TOML line picks a profile
   (`solo` or `multi`); one CLI command makes GitHub branch protection,
   tag protection, and workflow token permissions match.
+- **Merge-queue compatible.** Release-bot commits (e.g. the post-tag
+  CHANGELOG sync) can land through a PR instead of a direct push — set
+  `push_mode = "pr"` under `[release.post_tag_hook]` and shipyard opens +
+  auto-merges the bot commit, so it works on a branch that enforces a
+  GitHub merge queue (which rejects all direct pushes).
 - **22 ecosystem detectors.** `shipyard init` recognises CMake, Swift,
   Xcode, Rust, Go, Node (pnpm/bun/yarn/npm), Python (uv/poetry/pip),
   Gradle, Maven, .NET, Flutter, Dart, Deno, Ruby, Elixir, PHP.
