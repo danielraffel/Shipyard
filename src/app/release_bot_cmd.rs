@@ -590,6 +590,16 @@ struct HookConfig {
     bot_email: String,
     remote: String,
     branch: String,
+    // How the bot commit lands on `branch`:
+    //   "direct" (default) — push --ff-only straight to `branch` (today's
+    //     behavior). Incompatible with a GitHub "Require merge queue" rule,
+    //     which rejects ALL direct pushes to the protected branch.
+    //   "pr" — push to a dedicated branch, open a PR, and arm auto-merge so the
+    //     commit lands THROUGH the merge queue. Required when `branch` enforces
+    //     a merge queue.
+    push_mode: String,
+    // PR-route branch name prefix (push_mode = "pr"); the tag is appended.
+    pr_branch_prefix: String,
 }
 
 impl Default for HookConfig {
@@ -605,6 +615,8 @@ impl Default for HookConfig {
             bot_email: String::from("shipyard-release-bot@users.noreply.github.com"),
             remote: String::from("origin"),
             branch: String::from("main"),
+            push_mode: String::from("direct"),
+            pr_branch_prefix: String::from("release/post-tag-sync"),
         }
     }
 }
@@ -659,6 +671,16 @@ fn load_hook_config(config: &LoadedConfig) -> HookConfig {
             .get("branch")
             .and_then(toml::Value::as_str)
             .unwrap_or("main")
+            .to_owned(),
+        push_mode: section
+            .get("push_mode")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("direct")
+            .to_owned(),
+        pr_branch_prefix: section
+            .get("pr_branch_prefix")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("release/post-tag-sync")
             .to_owned(),
         ..HookConfig::default()
     };
@@ -755,6 +777,16 @@ fn commit_and_push_docs(
     }
     run_git_owned(cwd, &commit_args)?;
     result.committed = true;
+    match config.push_mode.as_str() {
+        "pr" => push_via_pr(cwd, config, tag, result),
+        _ => push_direct(cwd, config, result),
+    }
+}
+
+// push_mode = "direct" (default): --ff-only push straight to `branch`, with a
+// fetch+rebase retry on a lost race. A GitHub "Require merge queue" rule rejects
+// this (it blocks ALL direct pushes to the protected branch) — use "pr" there.
+fn push_direct(cwd: &Path, config: &HookConfig, result: &mut HookResult) -> Result<(), String> {
     for attempt in 1..=config.max_push_attempts.max(1) {
         result.attempts = attempt;
         if run_git(
@@ -777,6 +809,66 @@ fn commit_and_push_docs(
         "git push failed after {} attempt(s)",
         config.max_push_attempts.max(1)
     ))
+}
+
+// push_mode = "pr": push the bot commit to a dedicated branch, open a PR, and
+// arm auto-merge so it lands THROUGH the merge queue (the direct push a
+// "Require merge queue" rule would reject). `gh` authenticates via GH_TOKEN in
+// the caller's environment — the same mechanism shipyard's other gh usage
+// (src/pr.rs) relies on.
+fn push_via_pr(
+    cwd: &Path,
+    config: &HookConfig,
+    tag: &str,
+    result: &mut HookResult,
+) -> Result<(), String> {
+    let pr_branch = format!("{}-{}", config.pr_branch_prefix, sanitize_ref_component(tag));
+    // Force-push the bot-owned throwaway branch (a stale branch from an aborted
+    // run must not block a fresh sync). Safe — only the bot writes it.
+    run_git(
+        cwd,
+        &["push", "--force", &config.remote, &format!("HEAD:{pr_branch}")],
+    )?;
+    result.pushed = true;
+    let title = format!("docs: regenerate changelog for {tag}");
+    let body = format!(
+        "Automated by shipyard release-bot hook run after tag `{tag}` — routes the CHANGELOG.md regeneration through a PR so it lands via the merge queue instead of a direct push to `{}`.",
+        config.branch
+    );
+    let created = run_gh(
+        cwd,
+        &[
+            "pr", "create", "--base", &config.branch, "--head", &pr_branch, "--title", &title,
+            "--body", &body,
+        ],
+    );
+    if let Err(error) = created {
+        // A concurrent/prior run already opened it — GitHub rejects a second PR
+        // from the same head. Treat that as success and just (re-)arm auto-merge.
+        if !error.contains("already exists") && !error.contains("a pull request for branch") {
+            return Err(format!("gh pr create failed: {error}"));
+        }
+    }
+    // Arm GitHub-native auto-merge with --merge (never --squash: the bot commit
+    // carries the `Release: skip` trailer that must survive to prevent a
+    // recursive auto-release). When a merge queue is enabled, --auto enqueues it.
+    run_gh(cwd, &["pr", "merge", &pr_branch, "--auto", "--merge"])
+        .map_err(|error| format!("gh pr merge --auto failed: {error}"))?;
+    Ok(())
+}
+
+// Make a tag safe as a git ref component (tags like `v1.2.3` are already safe;
+// this guards odd characters so `pr_branch` is always a valid ref).
+fn sanitize_ref_component(tag: &str) -> String {
+    tag.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn watched_diffs(cwd: &Path, paths: &[String]) -> Vec<String> {
@@ -970,6 +1062,25 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
 fn run_git_owned(cwd: &Path, args: &[String]) -> Result<(), String> {
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     run_git(cwd, &arg_refs)
+}
+
+// Run `gh` in `cwd` via shipyard's ambient GhClient (same auth path as
+// src/pr.rs). Used by push_via_pr to open + auto-merge the changelog PR.
+fn run_gh(cwd: &Path, args: &[&str]) -> Result<(), String> {
+    let output = gh(None)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("failed to run gh {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "gh {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 fn gh(gh_command: Option<&Path>) -> Command {
@@ -1248,6 +1359,42 @@ email = "bot@example.com"
         assert_eq!(parsed.branch, "stable");
         assert_eq!(parsed.bot_name, "release bot");
         assert_eq!(parsed.bot_email, "bot@example.com");
+        // push_mode is unset in this section → defaults to the direct push.
+        assert_eq!(parsed.push_mode, "direct");
+        assert_eq!(parsed.pr_branch_prefix, "release/post-tag-sync");
+    }
+
+    #[test]
+    fn hook_config_parses_pr_push_mode() {
+        let config = config_from_toml(
+            r#"
+[release.post_tag_hook]
+enabled = true
+push_mode = "pr"
+pr_branch_prefix = "bot/changelog"
+"#,
+        );
+
+        let parsed = load_hook_config(&config);
+
+        assert!(parsed.enabled);
+        assert_eq!(parsed.push_mode, "pr");
+        assert_eq!(parsed.pr_branch_prefix, "bot/changelog");
+    }
+
+    #[test]
+    fn hook_config_defaults_push_mode_to_direct() {
+        // An empty hook section (or none) keeps today's behavior — no surprise
+        // switch to the PR route.
+        assert_eq!(HookConfig::default().push_mode, "direct");
+    }
+
+    #[test]
+    fn sanitize_ref_component_keeps_semver_tags_and_scrubs_odd_chars() {
+        assert_eq!(sanitize_ref_component("v1.2.3"), "v1.2.3");
+        assert_eq!(sanitize_ref_component("plugin-v0.4.0"), "plugin-v0.4.0");
+        // spaces / slashes / other ref-hostile chars become '-'.
+        assert_eq!(sanitize_ref_component("v1.0 rc/1"), "v1.0-rc-1");
     }
 
     #[test]
