@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0780"></a>
+## [0.78.0] - 2026-07-21
+
+- feat(release-bot): merge-queue-compatible post-tag hook via push_mode = "pr" ([#377](https://github.com/danielraffel/Shipyard/pull/377))
+- Record independent activation review ([#376](https://github.com/danielraffel/Shipyard/pull/376))
+
 <a id="v0771"></a>
 ## [0.77.1] - 2026-07-15
 
@@ -689,6 +695,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.78.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.78.0
 [0.77.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.77.1
 [0.77.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.77.0
 [0.76.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.76.0
