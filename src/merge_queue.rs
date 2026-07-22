@@ -21,6 +21,16 @@ use serde::Serialize;
 /// GitHub caps a connection page at 100 nodes.
 pub const QUEUE_PAGE_SIZE: usize = 100;
 
+/// Minimum time after an enqueue before a momentary absence is trusted as an
+/// eviction.
+///
+/// GitHub's merge-queue `entries` connection is eventually consistent: it lags
+/// the enqueue mutation by a few seconds, so the first poll right after
+/// (re-)enqueue can read a just-armed PR as absent. A 10s settle window
+/// comfortably covers that arm-write lag while costing at most one extra poll
+/// before a genuine eviction is actioned.
+pub const DEFAULT_SETTLE_WINDOW: Duration = Duration::from_secs(10);
+
 /// Consecutive errored polls tolerated before a poll attempt degrades from
 /// retry-in-place to a non-terminal [`QueuePollClass::TimedOut`].
 ///
@@ -125,20 +135,20 @@ pub enum QueuePollParse {
 /// snapshot in which the PR's absence is a trustworthy statement.
 #[must_use]
 pub fn parse_queue_snapshot(body: &serde_json::Value, pr_number: u64) -> QueuePollParse {
-    if let Some(errors) = body.get("errors").and_then(serde_json::Value::as_array) {
-        if !errors.is_empty() {
-            let reason = errors
-                .iter()
-                .filter_map(|err| err.get("message").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ");
-            let reason = if reason.is_empty() {
-                "graphql errors present".to_owned()
-            } else {
-                reason
-            };
-            return QueuePollParse::Errored(reason);
-        }
+    if let Some(errors) = body.get("errors").and_then(serde_json::Value::as_array)
+        && !errors.is_empty()
+    {
+        let reason = errors
+            .iter()
+            .filter_map(|err| err.get("message").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let reason = if reason.is_empty() {
+            "graphql errors present".to_owned()
+        } else {
+            reason
+        };
+        return QueuePollParse::Errored(reason);
     }
 
     let Some(data) = body.get("data") else {
@@ -240,6 +250,12 @@ pub fn classify_poll(parse: &QueuePollParse, ctx: &PollContext) -> QueuePollClas
     }
 
     if ctx.seen_in_queue {
+        // The entries connection lags the enqueue mutation. Within the settle
+        // window after (re-)enqueue, a momentary absence is arm-write lag, not
+        // an eviction — keep supervising until the window elapses.
+        if ctx.attempt_elapsed < ctx.settle_window {
+            return QueuePollClass::Enqueued { position: None };
+        }
         QueuePollClass::Evicted
     } else {
         QueuePollClass::PrNotFound
@@ -324,7 +340,7 @@ mod tests {
     fn ctx(seen: bool) -> PollContext {
         PollContext {
             attempt_elapsed: Duration::from_secs(60),
-            settle_window: Duration::from_secs(10),
+            settle_window: DEFAULT_SETTLE_WINDOW,
             seen_in_queue: seen,
             consecutive_errors: 0,
             error_budget: DEFAULT_ERROR_BUDGET,
@@ -489,5 +505,35 @@ mod tests {
         });
         let parse = parse_queue_pages(&[page1, page2], 42);
         assert!(matches!(parse, QueuePollParse::Errored(_)));
+    }
+
+    // --- F3: a poll inside the settle window must not read lag as eviction ---
+
+    #[test]
+    fn absent_before_settle_window_is_not_evicted() {
+        // First poll right after (re-)enqueue: the entries connection has not
+        // caught up, so PR 42 momentarily reads absent from a full, valid queue.
+        let body = body_with_entries(&[7, 9], false);
+        let parse = parse_queue_snapshot(&body, 42);
+        let mut c = ctx(true);
+        c.attempt_elapsed = Duration::from_secs(2);
+        c.settle_window = Duration::from_secs(10);
+        let class = classify_poll(&parse, &c);
+        assert_ne!(
+            class,
+            QueuePollClass::Evicted,
+            "arm-write lag inside settle window misread as eviction (F3): {class:?}"
+        );
+    }
+
+    #[test]
+    fn absent_after_settle_window_is_evicted() {
+        // Same absence, but past the settle window -> a trustworthy eviction.
+        let body = body_with_entries(&[7, 9], false);
+        let parse = parse_queue_snapshot(&body, 42);
+        let mut c = ctx(true);
+        c.attempt_elapsed = Duration::from_secs(11);
+        c.settle_window = Duration::from_secs(10);
+        assert_eq!(classify_poll(&parse, &c), QueuePollClass::Evicted);
     }
 }
