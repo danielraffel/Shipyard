@@ -186,7 +186,7 @@ pub fn evaluate_pr_green(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_ascii_uppercase();
-    if merge_state.contains("RULESET") || merge_state == "MERGE_QUEUED" {
+    if merge_state.contains("RULESET") || merge_queue_required(snapshot) {
         return Err(Box::new(UnsupportedScopeError(
             "Rulesets / merge-queue governance isn't supported by `shipyard wait pr --state green` yet — see governance/profiles.py.".to_owned(),
         )));
@@ -212,6 +212,25 @@ pub fn evaluate_pr_green(
         matched: checks.all_required_pass && !checks.any_still_waiting,
         observed: pr_green_observed(snapshot, merge_state, checks),
     })
+}
+
+/// Whether the PR is governed by a merge queue, derived from the
+/// `mergeStateStatus` field.
+///
+/// This is the ONLY merge-queue accessor that works against a `gh pr view
+/// --json` snapshot. `mergeStateStatus == "MERGE_QUEUED"` is a scalar the
+/// `gh` JSON surface can fetch. The GraphQL `mergeQueueEntry` connection —
+/// which would name the queue and the PR's position — is NOT a field `gh pr
+/// view --json` can request, so any accessor reading `snapshot["mergeQueueEntry"]`
+/// returns null/false permanently. Such accessors are worse than absent: an
+/// eviction watcher built on them would read "not in queue" forever and strand
+/// a queued PR. Do not add them; ride on `mergeStateStatus` alone.
+pub fn merge_queue_required(snapshot: &serde_json::Value) -> bool {
+    snapshot
+        .get("mergeStateStatus")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .eq_ignore_ascii_case("MERGE_QUEUED")
 }
 
 struct PrGreenChecks {
@@ -438,7 +457,7 @@ pub fn evaluate_run(
 mod tests {
     use super::{
         InvalidInputError, RunFailedFastError, UnsupportedScopeError, evaluate_pr_green,
-        evaluate_pr_state, evaluate_release, evaluate_run,
+        evaluate_pr_state, evaluate_release, evaluate_run, merge_queue_required,
     };
 
     fn rollup_entry(
@@ -545,6 +564,94 @@ mod tests {
         });
         let error = evaluate_pr_green(Some(&snapshot)).expect_err("unsupported");
         assert!(error.downcast_ref::<UnsupportedScopeError>().is_some());
+    }
+
+    #[test]
+    fn merge_queue_required_rides_on_merge_state_status() {
+        // MERGE_QUEUED is reported through the fetchable `mergeStateStatus`
+        // scalar — note there is NO `mergeQueueEntry` field here, mirroring a
+        // real `gh pr view --json` snapshot.
+        let queued = serde_json::json!({
+            "number": 7,
+            "mergeStateStatus": "MERGE_QUEUED"
+        });
+        assert!(merge_queue_required(&queued));
+
+        // Case-insensitive, matching evaluate_pr_green's uppercasing.
+        let queued_lower = serde_json::json!({ "mergeStateStatus": "merge_queued" });
+        assert!(merge_queue_required(&queued_lower));
+
+        let clean = serde_json::json!({ "mergeStateStatus": "CLEAN" });
+        assert!(!merge_queue_required(&clean));
+
+        // Missing field must be treated as not-queued, never panic.
+        let empty = serde_json::json!({ "number": 7 });
+        assert!(!merge_queue_required(&empty));
+    }
+
+    #[test]
+    fn merge_queue_required_ignores_unfetchable_merge_queue_entry() {
+        // Negative control for the deleted dead accessors: `mergeQueueEntry`
+        // is a GraphQL-only connection `gh pr view --json` cannot fetch, so it
+        // must NOT drive the verdict. A snapshot that (impossibly) carries a
+        // populated `mergeQueueEntry` while `mergeStateStatus` is CLEAN must
+        // still report not-queued. An accessor reading `mergeQueueEntry`
+        // (round 1's in_merge_queue / merge_queue_state) would return true here.
+        let bogus = serde_json::json!({
+            "mergeStateStatus": "CLEAN",
+            "mergeQueueEntry": { "position": 3, "mergeQueue": { "id": "MQ_x" } }
+        });
+        assert!(!merge_queue_required(&bogus));
+    }
+
+    #[test]
+    fn pr_green_merge_queued_is_not_terminal_success() {
+        // A green-but-queued PR must stay a loud, non-terminal signal — never
+        // matched:true (which the CLI maps to exit 0 and a `wait pr --state
+        // green && treat-as-landed` script reads as "landed"). Round 1's
+        // regression turned this into terminal success; this pins it back to
+        // the UnsupportedScope error (exit 7).
+        let snapshot = serde_json::json!({
+            "number": 42,
+            "headRefOid": "deadbeef",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "MERGE_QUEUED",
+            "statusCheckRollup": [
+                rollup_entry("Linux", "SUCCESS", "COMPLETED", true),
+                rollup_entry("macOS", "SUCCESS", "COMPLETED", true)
+            ]
+        });
+        let result = evaluate_pr_green(Some(&snapshot));
+        let error = result.expect_err("green-but-queued must not report terminal success");
+        assert!(
+            error.downcast_ref::<UnsupportedScopeError>().is_some(),
+            "queued PR must surface UnsupportedScope, not a silent matched:true"
+        );
+    }
+
+    #[test]
+    fn pr_green_non_merge_queue_evaluates_unchanged() {
+        // Regression guard: a repo not under merge-queue governance must
+        // evaluate byte-identically to before — all required green -> matched,
+        // and merge_queue_required is false so no code path diverges.
+        let snapshot = serde_json::json!({
+            "number": 99,
+            "headRefOid": "cafe",
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [
+                rollup_entry("Linux", "SUCCESS", "COMPLETED", true),
+                rollup_entry("macOS", "SUCCESS", "COMPLETED", true)
+            ]
+        });
+        assert!(!merge_queue_required(&snapshot));
+        let result = evaluate_pr_green(Some(&snapshot)).expect("green");
+        assert!(result.matched);
+        assert_eq!(
+            result.observed["checks"].as_array().expect("checks").len(),
+            2
+        );
     }
 
     #[test]
