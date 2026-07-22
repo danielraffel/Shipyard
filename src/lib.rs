@@ -57,6 +57,8 @@ pub mod init_config;
 pub mod job;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
+/// Merge-queue enqueue / poll / eviction supervision engine.
+pub mod merge_queue;
 /// Runner and CI timing metrics store and analysis helpers.
 pub mod metrics;
 /// Structured JSON output helpers.
