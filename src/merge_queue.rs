@@ -21,6 +21,19 @@ use serde::Serialize;
 /// GitHub caps a connection page at 100 nodes.
 pub const QUEUE_PAGE_SIZE: usize = 100;
 
+/// Consecutive errored polls tolerated before a poll attempt degrades from
+/// retry-in-place to a non-terminal [`QueuePollClass::TimedOut`].
+///
+/// Merge-queue polls run on a ~15-30s cadence; the shared GitHub App token
+/// rides a secondary rate limit that produces short, self-clearing error
+/// bursts. A budget of five consecutive errors rides out roughly a minute of
+/// sustained blips (≈100s at a 20s cadence) before giving up — long enough to
+/// survive a transient secondary-limit window, short enough that a genuine
+/// outage surfaces as an actionable `TimedOut` within about two minutes rather
+/// than polling blind forever. Critically, an errored body NEVER degrades to
+/// the terminal `PrNotFound`: a rate-limit blip must not report the PR gone.
+pub const DEFAULT_ERROR_BUDGET: u32 = 5;
+
 /// The target PR's standing in the merge queue for a single poll.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueueSnapshot {
@@ -68,6 +81,13 @@ pub enum QueuePollClass {
     /// PR is provably absent from a valid queue response and was never seen;
     /// supervision ends.
     PrNotFound,
+    /// The poll response was errored / null / malformed (rate-limit, transient
+    /// blip) and the error budget is not yet spent; retry the poll in place.
+    /// Non-terminal, and never conflated with a genuine absence.
+    PollError {
+        /// Human-readable reason drawn from the errored body.
+        reason: String,
+    },
     /// The attempt ran out of actionable signal; a non-terminal outcome the
     /// caller can retry or surface.
     TimedOut,
@@ -81,20 +101,72 @@ impl QueuePollClass {
     }
 }
 
-/// Parse a merge-queue GraphQL poll response into a [`QueueSnapshot`].
+/// Outcome of parsing a merge-queue GraphQL poll response.
 ///
-/// Walks `data.repository.mergeQueue.entries`, locating `pr_number` among the
-/// entry nodes.
+/// Distinguishing an *errored / null* body from a *valid response in which the
+/// PR is simply absent* is the whole point: the former must retry, the latter
+/// may be terminal. Collapsing both to "PR not found" is what strands a
+/// green-outside-the-queue PR on a single rate-limit blip.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueuePollParse {
+    /// A well-formed queue response.
+    Valid(QueueSnapshot),
+    /// A null-data, GraphQL-errors, or structurally-missing response that
+    /// carries no trustworthy statement about the PR's queue standing.
+    Errored(String),
+}
+
+/// Parse a merge-queue GraphQL poll response into a [`QueuePollParse`].
+///
+/// A body is [`QueuePollParse::Errored`] when it carries GraphQL `errors`, a
+/// null top-level `data`, a null `repository` (unresolvable / permission /
+/// transient), or a structurally-absent merge-queue `entries` connection. Only
+/// a well-formed `entries` connection yields a [`QueuePollParse::Valid`]
+/// snapshot in which the PR's absence is a trustworthy statement.
 #[must_use]
-pub fn parse_queue_snapshot(body: &serde_json::Value, pr_number: u64) -> QueueSnapshot {
-    let entries = body
-        .get("data")
-        .and_then(|data| data.get("repository"))
-        .and_then(|repo| repo.get("mergeQueue"))
-        .and_then(|queue| queue.get("entries"));
+pub fn parse_queue_snapshot(body: &serde_json::Value, pr_number: u64) -> QueuePollParse {
+    if let Some(errors) = body.get("errors").and_then(serde_json::Value::as_array) {
+        if !errors.is_empty() {
+            let reason = errors
+                .iter()
+                .filter_map(|err| err.get("message").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let reason = if reason.is_empty() {
+                "graphql errors present".to_owned()
+            } else {
+                reason
+            };
+            return QueuePollParse::Errored(reason);
+        }
+    }
+
+    let Some(data) = body.get("data") else {
+        return QueuePollParse::Errored("response missing `data`".to_owned());
+    };
+    if data.is_null() {
+        return QueuePollParse::Errored("response `data` is null".to_owned());
+    }
+
+    let Some(repository) = data.get("repository") else {
+        return QueuePollParse::Errored("response missing `repository`".to_owned());
+    };
+    if repository.is_null() {
+        return QueuePollParse::Errored("response `repository` is null".to_owned());
+    }
+
+    let entries = repository
+        .get("mergeQueue")
+        .filter(|queue| !queue.is_null())
+        .and_then(|queue| queue.get("entries"))
+        .filter(|entries| !entries.is_null());
+
+    let Some(entries) = entries else {
+        return QueuePollParse::Errored("response missing merge-queue entries".to_owned());
+    };
 
     let nodes = entries
-        .and_then(|entries| entries.get("nodes"))
+        .get("nodes")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -114,27 +186,45 @@ pub fn parse_queue_snapshot(body: &serde_json::Value, pr_number: u64) -> QueueSn
     }
 
     let page_truncated = entries
-        .and_then(|entries| entries.get("pageInfo"))
+        .get("pageInfo")
         .and_then(|info| info.get("hasNextPage"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     let total_entries = entries
-        .and_then(|entries| entries.get("totalEntries"))
+        .get("totalEntries")
         .and_then(serde_json::Value::as_u64);
 
-    QueueSnapshot {
+    QueuePollParse::Valid(QueueSnapshot {
         pr_found,
         position,
         entries_returned: nodes.len(),
         page_truncated,
         total_entries,
-    }
+    })
 }
 
 /// Classify a single merge-queue poll.
+///
+/// An errored / null body is retried in place ([`QueuePollClass::PollError`])
+/// until the consecutive-error budget is spent, at which point it degrades to
+/// the non-terminal [`QueuePollClass::TimedOut`]. It is never conflated with a
+/// genuine absence: only a *valid* response with the PR missing can reach
+/// [`QueuePollClass::PrNotFound`].
 #[must_use]
-pub fn classify_poll(snap: &QueueSnapshot, ctx: &PollContext) -> QueuePollClass {
+pub fn classify_poll(parse: &QueuePollParse, ctx: &PollContext) -> QueuePollClass {
+    let snap = match parse {
+        QueuePollParse::Errored(reason) => {
+            if ctx.consecutive_errors >= ctx.error_budget {
+                return QueuePollClass::TimedOut;
+            }
+            return QueuePollClass::PollError {
+                reason: reason.clone(),
+            };
+        }
+        QueuePollParse::Valid(snap) => snap,
+    };
+
     if snap.pr_found {
         return QueuePollClass::Enqueued {
             position: snap.position,
@@ -184,18 +274,25 @@ mod tests {
             settle_window: Duration::from_secs(10),
             seen_in_queue: seen,
             consecutive_errors: 0,
-            error_budget: 5,
+            error_budget: DEFAULT_ERROR_BUDGET,
+        }
+    }
+
+    fn expect_valid(parse: &QueuePollParse) -> &QueueSnapshot {
+        match parse {
+            QueuePollParse::Valid(snap) => snap,
+            QueuePollParse::Errored(reason) => panic!("expected valid parse, got errored: {reason}"),
         }
     }
 
     #[test]
     fn present_pr_is_enqueued() {
         let body = body_with_entries(&[7, 42, 9], false);
-        let snap = parse_queue_snapshot(&body, 42);
-        assert!(snap.pr_found);
-        assert_eq!(snap.position, Some(1));
+        let parse = parse_queue_snapshot(&body, 42);
+        assert!(expect_valid(&parse).pr_found);
+        assert_eq!(expect_valid(&parse).position, Some(1));
         assert_eq!(
-            classify_poll(&snap, &ctx(true)),
+            classify_poll(&parse, &ctx(true)),
             QueuePollClass::Enqueued { position: Some(1) }
         );
     }
@@ -203,16 +300,63 @@ mod tests {
     #[test]
     fn absent_and_never_seen_is_pr_not_found() {
         let body = body_with_entries(&[7, 9], false);
-        let snap = parse_queue_snapshot(&body, 42);
-        assert!(!snap.pr_found);
-        assert_eq!(classify_poll(&snap, &ctx(false)), QueuePollClass::PrNotFound);
+        let parse = parse_queue_snapshot(&body, 42);
+        assert!(!expect_valid(&parse).pr_found);
+        assert_eq!(classify_poll(&parse, &ctx(false)), QueuePollClass::PrNotFound);
     }
 
     #[test]
     fn absent_after_seen_in_full_queue_is_evicted() {
         let body = body_with_entries(&[7, 9], false);
-        let snap = parse_queue_snapshot(&body, 42);
-        assert!(!snap.pr_found);
-        assert_eq!(classify_poll(&snap, &ctx(true)), QueuePollClass::Evicted);
+        let parse = parse_queue_snapshot(&body, 42);
+        assert!(!expect_valid(&parse).pr_found);
+        assert_eq!(classify_poll(&parse, &ctx(true)), QueuePollClass::Evicted);
+    }
+
+    // --- F1: an errored / null poll body must never strand the PR ---
+
+    #[test]
+    fn errored_body_retries_in_place_not_terminal() {
+        // A rate-limited / transient GraphQL body: null data + errors present.
+        let body = serde_json::json!({
+            "data": null,
+            "errors": [ { "message": "API rate limit exceeded" } ]
+        });
+        let parse = parse_queue_snapshot(&body, 42);
+        assert_eq!(
+            parse,
+            QueuePollParse::Errored("API rate limit exceeded".to_owned())
+        );
+        let class = classify_poll(&parse, &ctx(false));
+        // The regression: a single transient blip must NOT be terminal PrNotFound.
+        assert!(!class.is_terminal(), "errored body became terminal: {class:?}");
+        assert_eq!(
+            class,
+            QueuePollClass::PollError {
+                reason: "API rate limit exceeded".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn errored_body_degrades_to_timed_out_never_pr_not_found() {
+        let body = serde_json::json!({ "data": { "repository": null } });
+        let parse = parse_queue_snapshot(&body, 42);
+        assert!(matches!(parse, QueuePollParse::Errored(_)));
+        let mut spent = ctx(false);
+        spent.consecutive_errors = DEFAULT_ERROR_BUDGET;
+        let class = classify_poll(&parse, &spent);
+        assert_eq!(class, QueuePollClass::TimedOut);
+        assert_ne!(class, QueuePollClass::PrNotFound);
+        assert!(!class.is_terminal());
+    }
+
+    #[test]
+    fn genuine_absence_in_valid_response_is_still_pr_not_found() {
+        // The complementary guard: a VALID response with the PR absent and never
+        // seen is still a legitimate terminal PrNotFound — F1 must not blunt it.
+        let body = body_with_entries(&[7, 9], false);
+        let parse = parse_queue_snapshot(&body, 42);
+        assert_eq!(classify_poll(&parse, &ctx(false)), QueuePollClass::PrNotFound);
     }
 }
