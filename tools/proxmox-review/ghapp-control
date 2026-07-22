@@ -6,7 +6,7 @@ cache="$home/.config/shipyard/.gh-app-token.json"
 key="$home/secrets/github-app-private-key.pem"
 mint=/usr/local/libexec/shipyard-review/github-app-token.py
 app_id=${SHIPYARD_GITHUB_APP_ID:-3878000}
-repo=${SHIPYARD_GH_APP_REPO:-danielraffel/pulp}
+repo=${SHIPYARD_GH_APP_REPO:-Generous-Corp/pulp}
 
 valid_cache() {
     [ -f "$cache" ] && [ ! -L "$cache" ] &&

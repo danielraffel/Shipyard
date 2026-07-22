@@ -84,8 +84,8 @@ evidence. Import cloud and VM history explicitly when comparing local hardware
 with GitHub-hosted runners:
 
 ```sh
-shipyard metrics import github --repo danielraffel/pulp --limit 50 --json
-tartci runtime export --repo danielraffel/pulp |
+shipyard metrics import github --repo Generous-Corp/pulp --limit 50 --json
+tartci runtime export --repo Generous-Corp/pulp |
   shipyard metrics import tartci --json
 shipyard metrics summary --project pulp --json
 shipyard metrics watch --project pulp --since 14d --json
@@ -458,7 +458,7 @@ shipyard runner tag                # prints the stored tag
 ```bash
 # Host must already have the toolchain/caches (repo-specific bootstrap).
 # This step only registers runners and points their .env at the shared caches.
-shipyard runner register --repo danielraffel/pulp --count 3 \
+shipyard runner register --repo Generous-Corp/pulp --count 3 \
   --ci-root /Volumes/Workshop/ci/pulp [--dry-run]
 ```
 
@@ -474,7 +474,7 @@ shipyard runner register --repo danielraffel/pulp --count 3 \
 ### List and remove
 
 ```bash
-shipyard runner list --repo danielraffel/pulp   # live pool, grouped by machine
+shipyard runner list --repo Generous-Corp/pulp   # live pool, grouped by machine
 shipyard runner remove --name pulp-studio-03 --yes [--purge-dir]
 ```
 

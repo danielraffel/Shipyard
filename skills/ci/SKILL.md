@@ -113,8 +113,8 @@ When a repo uses tartci-backed local VM lanes, inspect the profile before
 changing GitHub variables or dispatch inputs:
 
 ```sh
-tartci profile explain normal-local-fast --repo danielraffel/pulp --json
-tartci profile plan normal-local-fast --repo danielraffel/pulp --json
+tartci profile explain normal-local-fast --repo Generous-Corp/pulp --json
+tartci profile plan normal-local-fast --repo Generous-Corp/pulp --json
 tartci status --json
 ```
 
@@ -142,7 +142,7 @@ Actions, local commands, SSH targets, or other VM managers can feed the store.
 For GitHub-hosted history, import recent job timings:
 
 ```sh
-shipyard metrics import github --repo danielraffel/pulp --limit 50 --json
+shipyard metrics import github --repo Generous-Corp/pulp --limit 50 --json
 shipyard metrics watch --project pulp --since 14d --json
 ```
 
@@ -150,7 +150,7 @@ For tartci VM history, export runtime records from tartci and import them into
 Shipyard:
 
 ```sh
-tartci runtime export --repo danielraffel/pulp |
+tartci runtime export --repo Generous-Corp/pulp |
   shipyard metrics import tartci --json
 shipyard metrics summary --project pulp --json
 ```

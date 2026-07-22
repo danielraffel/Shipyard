@@ -47,7 +47,7 @@ Once configured, your agent handles CI end-to-end:
    - If all green, merges automatically
 4. You come back, it's on main
 
-This is how [Pulp](https://github.com/danielraffel/pulp) (the project
+This is how [Pulp](https://github.com/Generous-Corp/pulp) (the project
 Shipyard was extracted from) operates daily.
 
 ## If you prefer manual merging

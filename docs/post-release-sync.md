@@ -92,7 +92,7 @@ Exit codes: `0` in sync, `1` drift, `2` config missing / tag missing.
 
 ## Pulp as the reference implementation
 
-The canonical adopter is [pulp](https://github.com/danielraffel/pulp). Its CHANGELOG generator (`tools/scripts/regenerate_changelog.py`, PRs #262 / #265) plus the post-tag block in `auto-release.yml` (PR #294) is exactly what shipyard ships here, parameterized. After the shipyard v0.9.0 release, pulp's migration PR:
+The canonical adopter is [pulp](https://github.com/Generous-Corp/pulp). Its CHANGELOG generator (`tools/scripts/regenerate_changelog.py`, PRs #262 / #265) plus the post-tag block in `auto-release.yml` (PR #294) is exactly what shipyard ships here, parameterized. After the shipyard v0.9.0 release, pulp's migration PR:
 
 1. Adds `.shipyard/config.toml` with `[release.changelog]` set to pulp's values.
 2. Verifies byte-identical output: `diff <(shipyard changelog regenerate --stdout) CHANGELOG.md` is empty.
