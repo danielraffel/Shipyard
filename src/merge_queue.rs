@@ -231,11 +231,64 @@ pub fn classify_poll(parse: &QueuePollParse, ctx: &PollContext) -> QueuePollClas
         };
     }
 
+    // pr absent from what we read. If the queue reported more entries than we
+    // fetched, the PR may simply live on an unread page (position 101+). Absence
+    // is unproven, so neither an eviction nor a terminal not-found can be
+    // concluded — keep supervising and let the driver paginate the full queue.
+    if snap.page_truncated {
+        return QueuePollClass::Enqueued { position: None };
+    }
+
     if ctx.seen_in_queue {
         QueuePollClass::Evicted
     } else {
         QueuePollClass::PrNotFound
     }
+}
+
+/// Fold a full set of merge-queue `entries` pages into a single
+/// [`QueuePollParse`].
+///
+/// The poll driver paginates the queue with `entries(first:100, after:cursor)`
+/// and hands every page here so absence is judged against the *whole* queue,
+/// not a truncated first page. Any errored page taints the scan — absence
+/// cannot be proven through a hole — so the first [`QueuePollParse::Errored`]
+/// is returned. The aggregate `page_truncated` reflects the final page's
+/// `hasNextPage`: it is false only when pagination genuinely drained the queue.
+#[must_use]
+pub fn parse_queue_pages(pages: &[serde_json::Value], pr_number: u64) -> QueuePollParse {
+    let mut pr_found = false;
+    let mut position = None;
+    let mut entries_returned = 0;
+    let mut total_entries = None;
+    let mut page_truncated = false;
+
+    for page in pages {
+        match parse_queue_snapshot(page, pr_number) {
+            QueuePollParse::Errored(reason) => return QueuePollParse::Errored(reason),
+            QueuePollParse::Valid(snap) => {
+                if snap.pr_found && !pr_found {
+                    pr_found = true;
+                    position = snap.position;
+                }
+                entries_returned += snap.entries_returned;
+                if snap.total_entries.is_some() {
+                    total_entries = snap.total_entries;
+                }
+                // Only the last page's continuation matters: an earlier page
+                // always has a next page by construction.
+                page_truncated = snap.page_truncated;
+            }
+        }
+    }
+
+    QueuePollParse::Valid(QueueSnapshot {
+        pr_found,
+        position,
+        entries_returned,
+        page_truncated,
+        total_entries,
+    })
 }
 
 #[cfg(test)]
@@ -358,5 +411,83 @@ mod tests {
         let body = body_with_entries(&[7, 9], false);
         let parse = parse_queue_snapshot(&body, 42);
         assert_eq!(classify_poll(&parse, &ctx(false)), QueuePollClass::PrNotFound);
+    }
+
+    // --- F2: a truncated page must not manufacture an eviction ---
+
+    #[test]
+    fn absent_on_truncated_page_is_not_evicted() {
+        // PR 42 is absent from THIS page, but the queue reports more entries
+        // beyond it (hasNextPage). It may live at position 101+. A seen PR that
+        // has merely paged out must NOT be classified Evicted.
+        let body = body_with_entries(&[7, 9, 11], true);
+        let parse = parse_queue_snapshot(&body, 42);
+        assert!(expect_valid(&parse).page_truncated);
+        let class = classify_poll(&parse, &ctx(true));
+        assert_ne!(
+            class,
+            QueuePollClass::Evicted,
+            "truncated page misread as eviction (F2): {class:?}"
+        );
+    }
+
+    fn positioned_page(nodes: &[(u64, u64)], has_next_page: bool) -> serde_json::Value {
+        let nodes = nodes
+            .iter()
+            .map(|(pr, position)| {
+                serde_json::json!({
+                    "pullRequest": { "number": pr },
+                    "position": position,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "data": { "repository": { "mergeQueue": { "entries": {
+                "nodes": nodes,
+                "pageInfo": { "hasNextPage": has_next_page },
+            } } } }
+        })
+    }
+
+    #[test]
+    fn pr_on_second_page_is_enqueued_not_evicted() {
+        // Full queue spans two pages; PR 42 lives at position 100 on page two.
+        let page1 = positioned_page(&[(7, 0), (9, 1)], true);
+        let page2 = positioned_page(&[(11, 99), (42, 100)], false);
+        let parse = parse_queue_pages(&[page1, page2], 42);
+        let snap = expect_valid(&parse);
+        assert!(snap.pr_found);
+        assert!(!snap.page_truncated);
+        assert_eq!(
+            classify_poll(&parse, &ctx(true)),
+            QueuePollClass::Enqueued {
+                position: Some(100)
+            }
+        );
+    }
+
+    #[test]
+    fn proven_full_queue_absence_after_seen_is_still_evicted() {
+        // Absent across the WHOLE drained queue (last page hasNextPage=false),
+        // and previously seen -> a real eviction. The F2 guard must not suppress
+        // this.
+        let page1 = positioned_page(&[(7, 0), (9, 1)], true);
+        let page2 = positioned_page(&[(11, 2), (13, 3)], false);
+        let parse = parse_queue_pages(&[page1, page2], 42);
+        let snap = expect_valid(&parse);
+        assert!(!snap.pr_found);
+        assert!(!snap.page_truncated);
+        assert_eq!(classify_poll(&parse, &ctx(true)), QueuePollClass::Evicted);
+    }
+
+    #[test]
+    fn errored_page_taints_pagination() {
+        let page1 = positioned_page(&[(7, 0)], true);
+        let page2 = serde_json::json!({
+            "data": null,
+            "errors": [ { "message": "API rate limit exceeded" } ]
+        });
+        let parse = parse_queue_pages(&[page1, page2], 42);
+        assert!(matches!(parse, QueuePollParse::Errored(_)));
     }
 }
