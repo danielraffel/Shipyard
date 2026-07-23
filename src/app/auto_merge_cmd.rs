@@ -881,6 +881,9 @@ fn queue_absence_allows_arm(
     removed_at: Option<&str>,
     state: &ShipState,
 ) -> bool {
+    if state.merge_queue_enqueue_started_at.is_some() {
+        return false;
+    }
     !owns_native_merge_authority(state)
         || removal_authorizes_rearm(event_present, reason, removed_at, state)
 }
@@ -1778,7 +1781,10 @@ fn delete_head_branch(
         .prepare_git_command(cwd)
         .map_err(|error| format!("failed to prepare authenticated git cleanup: {error}"))?
         .args([
+            "-c",
+            "core.hooksPath=/dev/null",
             "push",
+            "--no-verify",
             &format!("--force-with-lease=refs/heads/{head_ref}:{expected_sha}"),
             &format!("https://github.com/{repo}.git"),
             &format!(":refs/heads/{head_ref}"),
@@ -2435,6 +2441,14 @@ mod tests {
             &state,
         ));
         assert!(queue_absence_allows_arm(
+            true,
+            Some("INVALID_MERGE_COMMIT"),
+            Some("2026-07-23T12:01:00Z"),
+            &state,
+        ));
+
+        state.merge_queue_enqueue_started_at = Some(observed);
+        assert!(!queue_absence_allows_arm(
             true,
             Some("INVALID_MERGE_COMMIT"),
             Some("2026-07-23T12:01:00Z"),
