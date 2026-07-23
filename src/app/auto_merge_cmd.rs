@@ -113,54 +113,8 @@ pub(super) fn execute_auto_merge(
             evidence: state.evidence_snapshot,
         }),
         Some(true) => {
-            // Preflight (issue #321): before merging, confirm the live PR head
-            // still points at the SHA we validated. If new commits landed on
-            // the branch after validation, the validated evidence is stale and
-            // merging would land unvalidated code. Refuse and leave the state
-            // active so the new head can be re-validated.
-            //
-            // Fail closed: if the live head cannot be verified, do NOT merge
-            // blind — report a merge failure instead.
-            match fetch_live_pr_target(
-                request.pr,
-                cwd,
-                request.pr_snapshot_file.as_deref(),
-                &state.base_branch,
-            ) {
-                Some(live_pr) => {
-                    // Revocation must inspect the PR's current queue, even
-                    // when its head and target branch changed together.
-                    state.base_branch = live_pr.base_branch;
-                    if !shas_match(&live_pr.head_sha, &state.head_sha) {
-                        // Snapshot-backed execution is the deterministic test
-                        // seam and has no live GitHub authority to revoke.
-                        if request.pr_snapshot_file.is_none()
-                            && owns_native_merge_authority(&state)
-                            && let Err(error) = revoke_drifted_native_merge(cwd, &state)
-                        {
-                            return Ok(AutoMergeOutcome::MergeFailed {
-                                error: format!(
-                                    "live PR head {} superseded validated SHA {}, but native merge revocation failed: {error}",
-                                    live_pr.head_sha, state.head_sha
-                                ),
-                            });
-                        }
-                        return Ok(AutoMergeOutcome::SupersededSha {
-                            validated: state.head_sha.clone(),
-                            current: live_pr.head_sha,
-                        });
-                    }
-                    // `ship --pr N` historically recorded the CLI's default
-                    // base rather than the PR's target, and a PR may be
-                    // retargeted while validation runs. Queue governance and
-                    // every subsequent queue poll must follow GitHub's live
-                    // target branch, not that stale hint.
-                }
-                None => {
-                    return Ok(AutoMergeOutcome::MergeFailed {
-                        error: "failed to verify live PR head and base before merge".to_owned(),
-                    });
-                }
+            if let Err(outcome) = validate_live_pr_before_merge(cwd, request, &state) {
+                return Ok(outcome);
             }
 
             let merge_disposition = match merge_pr(
@@ -204,6 +158,70 @@ pub(super) fn execute_auto_merge(
             Ok(AutoMergeOutcome::Merged { cleanup_warning })
         }
     }
+}
+
+/// Bind validated evidence to the live PR head and target immediately before
+/// selecting merge governance. Snapshot-backed tests have no authority to
+/// revoke; production runs revoke any exact-head native merge authority on the
+/// PR's current target before returning drift.
+fn validate_live_pr_before_merge(
+    cwd: &Path,
+    request: &AutoMergeRequest,
+    state: &ShipState,
+) -> Result<(), AutoMergeOutcome> {
+    let Some(live_pr) = fetch_live_pr_target(
+        request.pr,
+        cwd,
+        request.pr_snapshot_file.as_deref(),
+        &state.base_branch,
+    ) else {
+        return Err(AutoMergeOutcome::MergeFailed {
+            error: "failed to verify live PR head and base before merge".to_owned(),
+        });
+    };
+    let revoke = || {
+        if request.pr_snapshot_file.is_some() || !owns_native_merge_authority(state) {
+            return Ok(());
+        }
+        revoke_drifted_native_merge(cwd, &state_with_live_base(state, &live_pr.base_branch))
+    };
+    if !shas_match(&live_pr.head_sha, &state.head_sha) {
+        if let Err(error) = revoke() {
+            return Err(AutoMergeOutcome::MergeFailed {
+                error: format!(
+                    "live PR head {} superseded validated SHA {}, but native merge revocation failed: {error}",
+                    live_pr.head_sha, state.head_sha
+                ),
+            });
+        }
+        return Err(AutoMergeOutcome::SupersededSha {
+            validated: state.head_sha.clone(),
+            current: live_pr.head_sha,
+        });
+    }
+    if live_pr.base_branch != state.base_branch {
+        if let Err(error) = revoke() {
+            return Err(AutoMergeOutcome::MergeFailed {
+                error: format!(
+                    "PR #{} was retargeted from validated base {} to {}, but native merge revocation failed: {error}",
+                    state.pr, state.base_branch, live_pr.base_branch
+                ),
+            });
+        }
+        return Err(AutoMergeOutcome::MergeFailed {
+            error: format!(
+                "PR #{} was retargeted from validated base {} to {}; refusing merge",
+                state.pr, state.base_branch, live_pr.base_branch
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn state_with_live_base(state: &ShipState, live_base: &str) -> ShipState {
+    let mut revocation_state = state.clone();
+    live_base.clone_into(&mut revocation_state.base_branch);
+    revocation_state
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -735,19 +753,14 @@ fn queue_admission(
             observation.head_sha, state.head_sha
         ));
     }
-    if observation.merged {
-        return Ok(QueueAdmission::AlreadyMerged);
-    }
-    let live_base = body
-        .pointer("/data/repository/pullRequest/baseRefName")
-        .and_then(Value::as_str)
-        .filter(|base| !base.is_empty())
-        .ok_or_else(|| "merge-queue admission observation omitted PR baseRefName".to_owned())?;
-    if live_base != state.base_branch {
+    if observation.base_branch != state.base_branch {
         return Err(format!(
             "PR #{} was retargeted from validated base {} to {} before queue admission",
-            state.pr, state.base_branch, live_base
+            state.pr, state.base_branch, observation.base_branch
         ));
+    }
+    if observation.merged {
+        return Ok(QueueAdmission::AlreadyMerged);
     }
     match crate::merge_queue::parse_queue_pages(&pages, state.pr) {
         crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found => {
@@ -968,6 +981,28 @@ pub(super) fn supervise_merge_queue(
                     return AutoMergeOutcome::SupersededSha {
                         validated: state.head_sha,
                         current: observation.head_sha,
+                    };
+                }
+                if observation.base_branch != state.base_branch {
+                    let revocation_state = state_with_live_base(&state, &observation.base_branch);
+                    if let Err(error) = with_current_queue_state_locked(
+                        store,
+                        &state,
+                        state.merge_queue_attempt_started_at,
+                        || revoke_drifted_native_merge(cwd, &revocation_state),
+                    ) {
+                        return AutoMergeOutcome::MergeFailed {
+                            error: format!(
+                                "PR #{pr} was retargeted from validated base {} to {}, but native merge revocation failed: {error}",
+                                state.base_branch, observation.base_branch
+                            ),
+                        };
+                    }
+                    return AutoMergeOutcome::MergeFailed {
+                        error: format!(
+                            "PR #{pr} was retargeted from validated base {} to {}; refusing to accept queue outcome",
+                            state.base_branch, observation.base_branch
+                        ),
                     };
                 }
                 if observation.merged {
@@ -1377,7 +1412,6 @@ fn enqueue_requirements_pending(message: &str) -> bool {
         || lower.contains("required approving review")
         || lower.contains("required review")
         || lower.contains("requirements are not met")
-        || lower.contains("not mergeable")
 }
 
 fn revoke_native_queue(
@@ -2084,6 +2118,9 @@ mod tests {
         ));
         assert!(!enqueue_requirements_pending(
             "Resource not accessible by integration: review permission required"
+        ));
+        assert!(!enqueue_requirements_pending(
+            "Pull request is not mergeable because it has conflicts"
         ));
     }
 

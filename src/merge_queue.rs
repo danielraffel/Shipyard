@@ -133,6 +133,8 @@ pub struct QueuePrObservation {
     pub id: String,
     /// Current full head SHA.
     pub head_sha: String,
+    /// Current PR target branch.
+    pub base_branch: String,
     /// Whether GitHub reports the PR merged.
     pub merged: bool,
     /// Whether GitHub still has an active auto-merge request for the PR.
@@ -175,6 +177,12 @@ pub fn parse_pr_observation(body: &serde_json::Value) -> Result<QueuePrObservati
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "response missing pull request head SHA".to_owned())?
         .to_owned();
+    let base_branch = pr
+        .get("baseRefName")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "response missing pull request base branch".to_owned())?
+        .to_owned();
     let merged = pr
         .get("merged")
         .and_then(serde_json::Value::as_bool)
@@ -197,6 +205,7 @@ pub fn parse_pr_observation(body: &serde_json::Value) -> Result<QueuePrObservati
     Ok(QueuePrObservation {
         id,
         head_sha,
+        base_branch,
         merged,
         auto_merge_active,
         removal_reason,
@@ -550,6 +559,7 @@ mod tests {
                 "pullRequest": {
                     "id": "PR_1",
                     "headRefOid": "0123456789abcdef",
+                    "baseRefName": "main",
                     "merged": false,
                     "autoMergeRequest": { "id": "AMR_1" },
                     "timelineItems": { "nodes": [
@@ -563,6 +573,7 @@ mod tests {
             QueuePrObservation {
                 id: "PR_1".to_owned(),
                 head_sha: "0123456789abcdef".to_owned(),
+                base_branch: "main".to_owned(),
                 merged: false,
                 auto_merge_active: true,
                 removal_reason: Some("FAILED_CHECKS".to_owned()),

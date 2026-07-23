@@ -2595,6 +2595,55 @@ mod tests {
     }
 
     #[test]
+    fn auto_merge_green_refuses_when_pr_is_retargeted_after_validation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        store
+            .save(&auto_merge_state(
+                43,
+                &[("macos", "pass"), ("linux", "pass")],
+            ))
+            .expect("save");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            format!(
+                r#"{{"headRefOid":"{}","baseRefName":"release"}}"#,
+                "a".repeat(40)
+            ),
+        )
+        .expect("write snapshot");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "auto-merge",
+            "43",
+            "--merge-result",
+            "success",
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["event"], "merge-failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("retargeted from validated base main to release")
+        );
+        assert!(store.get(43).is_some());
+        assert_eq!(store.list_archived().len(), 0);
+    }
+
+    #[test]
     fn auto_merge_green_fails_closed_when_live_head_is_unreadable() {
         // The single most important property: if the live PR head cannot be
         // verified (network error, missing/empty head field), the preflight

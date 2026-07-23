@@ -29,7 +29,7 @@ use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
 use crate::lane_policy::{LanePolicy, resolve_lane_policy};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
-use crate::pr::{PrInfo, create_pr, find_pr_for_branch, push_branch};
+use crate::pr::{PrInfo, create_pr, find_pr_for_branch, get_pr_status, push_branch};
 use crate::pr_text::{compose_pr_body_with_policy, compose_pr_title};
 use crate::preflight::{
     EXIT_BACKEND_UNREACHABLE, EXIT_HOST_UNHEALTHY, ShipPreflightError, ShipPreflightOptions,
@@ -431,11 +431,13 @@ fn resolve_pr_context(
     lane_policy: &LanePolicy,
 ) -> Result<ResolvedPrContext, CliFailure> {
     if let Some(number) = pr {
+        let info = get_pr_status(config, cwd, gh_command, &number.to_string())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return Ok(ResolvedPrContext {
             number,
-            base_branch: base.to_owned(),
-            pr_url: None,
-            pr_title: None,
+            base_branch: info.base,
+            pr_url: Some(info.url),
+            pr_title: Some(info.title),
         });
     }
 
