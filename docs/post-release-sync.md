@@ -1,13 +1,16 @@
 # Post-release docs sync
 
-Shipyard closes the "tag landed → CHANGELOG still stale" gap in the release pipeline. Once opted in, every tag push auto-commits a regenerated `CHANGELOG.md` back to `main` with `[skip ci]`. No catch-up PRs, no stale release links.
+Shipyard closes the "tag landed → CHANGELOG still stale" gap in the release
+pipeline. Once opted in, every tag push commits a regenerated `CHANGELOG.md`
+back to `main`. Direct mode uses `[skip ci]`; PR mode runs required validation
+and lands through the merge queue. No catch-up PRs, no stale release links.
 
 Two independently usable capabilities ship together:
 
 | | Shape | When to use |
 |---|---|---|
 | **Generator** | Opinionated CHANGELOG.md + release-notes renderer that walks `v*` tags in reverse semver order | Projects that don't already have a changelog script |
-| **Hook runner** | Unopinionated post-tag command runner: run a configured command, watch files, commit with trailers + `[skip ci]`, rebase-retry race loop | Every project — matches the original issue exactly |
+| **Hook runner** | Unopinionated post-tag command runner: run a configured command, watch files, commit with trailers, then use direct or queue-backed PR delivery | Every project — matches the original issue exactly |
 
 A project can mix-and-match: point the hook's `command` at your own script if you don't want shipyard's generator. Or call the generator from your own workflow if you don't want shipyard to own the commit-back side.
 
@@ -69,11 +72,35 @@ email = "shipyard-release-bot@users.noreply.github.com"
 The workflow:
 
 1. Fires on `push: tags: ["v*"]` (or your configured pattern).
-2. Checks out `main` with full history + tags via `RELEASE_BOT_TOKEN || GITHUB_TOKEN`.
-3. Installs shipyard via `curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh`, pinned to a version.
-4. Runs `shipyard release-bot hook run --tag "${GITHUB_REF#refs/tags/}"`.
+2. Runs on `ubuntu-latest` unless `[merge_queue].mutation_machine` is set in
+   trusted machine-global config; a queue-authority install instead targets
+   `[self-hosted, <repo>-queue-authority-<machine>]` so required-check
+   supervision and exact-head admission use a dedicated controller runner on
+   the configured mutation host. Do not place the generic
+   `<repo>-build-<machine>` label on that controller: required build checks
+   must retain separate capacity while the controller watches them. Install
+   refuses to write this workflow until that label is visible to GitHub; create
+   it first on the authority host with
+   `shipyard runner register --count 1 --labels <repo>-queue-authority-<machine>`.
+3. Checks out the immutable release tag with full history + tags via
+   `RELEASE_BOT_TOKEN || GITHUB_TOKEN`; PR-mode commits use the tag commit time,
+   so a workflow retry reproduces the exact commit SHA.
+4. Installs shipyard via `curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh`, pinned to a version.
+5. Runs `shipyard release-bot hook run --tag "${GITHUB_REF#refs/tags/}"`.
 
-That final command reads `[release.post_tag_hook]`, executes `command`, checks `watch` for diffs, commits with the configured trailers + `[skip ci]`, and pushes back with a rebase-retry loop (up to `max_push_attempts`).
+That final command reads `[release.post_tag_hook]`, executes `command`, checks
+`watch` for diffs, and commits with the configured trailers. Direct mode adds
+`[skip ci]`; PR mode intentionally does not, so required checks run.
+`push_mode = "pr"` creates or resumes one immutable branch and open PR per tag,
+waits for required checks, revalidates the head/base, then calls GitHub's
+exact-head queue admission mutation. A workflow retry resumes that PR and head;
+it never force-pushes or leaves ordinary auto-merge authority attached.
+
+> **0.79 migration:** Existing PR-mode workflows that still run on
+> `ubuntu-latest` cannot mutate a merge queue after upgrading. Configure
+> `[merge_queue].mutation_machine` in trusted machine-global config, set the
+> authority host's runner tag, provision its dedicated controller label, and
+> rerun `shipyard release-bot hook install` before the next tag.
 
 ## Best-effort semantics
 
@@ -114,4 +141,7 @@ Recover manually by running `shipyard changelog regenerate` locally and opening 
 
 **Drift detected in CI.** Either a human hand-edited the wrong block, or a squash-merge subject matched a skip pattern that shouldn't have. Run `shipyard changelog regenerate` locally, review the diff, and commit.
 
-**Hook loops forever.** Shouldn't happen — the `[skip ci]` subject suppresses re-runs, and the three `*: skip` trailers suppress the version-bump, skill-sync, and auto-release gates. If you see the hook re-triggering itself, the trailers aren't being applied; check `.shipyard/config.toml` for typos.
+**Hook loops forever.** Shouldn't happen — direct mode's `[skip ci]` subject
+suppresses re-runs, while PR mode relies on the three `*: skip` trailers to
+suppress the version-bump, skill-sync, and auto-release gates. If you see the
+hook re-triggering itself, check `.shipyard/config.toml` trailers for typos.

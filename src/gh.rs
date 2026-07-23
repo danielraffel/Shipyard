@@ -92,6 +92,25 @@ impl GhClient {
         Ok(command)
     }
 
+    /// Prepare a non-interactive `git` command that uses the same configured
+    /// GitHub identity as `prepare_command`.
+    ///
+    /// The credential helper receives `GH_TOKEN` through the child
+    /// environment; token material is never placed in argv or a remote URL.
+    pub fn prepare_git_command(&self, cwd: &Path) -> Result<Command, GhPrepareError> {
+        let mut command = crate::supervised::git_supervised();
+        command
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "credential.helper")
+            .env("GIT_CONFIG_VALUE_0", "!gh auth git-credential");
+        if let Some(token) = self.resolve_token(cwd)? {
+            command.env(GH_TOKEN_ENV, token.token);
+        }
+        Ok(command)
+    }
+
     /// Resolve the effective auth source without exposing token material.
     pub fn auth_summary(
         &self,
@@ -1091,6 +1110,33 @@ mod tests {
     fn detects_graphql_rate_limit_text() {
         assert!(is_graphql_rate_limited("GraphQL: API rate limit exceeded"));
         assert!(!is_graphql_rate_limited("REST API rate limit exceeded"));
+    }
+
+    #[test]
+    fn authenticated_git_command_uses_environment_credential_helper() {
+        let cwd = TempDir::new().expect("tempdir");
+        let command = GhClient::ambient()
+            .prepare_git_command(cwd.path())
+            .expect("git command");
+        assert_eq!(
+            command.get_program().to_string_lossy(),
+            crate::supervised::git_supervised()
+                .get_program()
+                .to_string_lossy()
+        );
+        assert_eq!(
+            env_value(&command, "GIT_TERMINAL_PROMPT"),
+            Some(OsString::from("0"))
+        );
+        assert_eq!(
+            env_value(&command, "GIT_CONFIG_VALUE_0"),
+            Some(OsString::from("!gh auth git-credential"))
+        );
+        assert!(
+            command
+                .get_args()
+                .all(|arg| !arg.to_string_lossy().contains("token"))
+        );
     }
 
     #[test]

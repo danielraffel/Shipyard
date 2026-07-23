@@ -7,16 +7,22 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::{
     CliFailure,
+    auto_merge_cmd::{
+        AutoMergeOutcome, AutoMergeRequest, execute_auto_merge, target_requires_merge_queue,
+    },
     branch_cmd::detect_repo_from_remote,
-    cli::{ReleaseBotCommand, ReleaseBotHookCommand},
+    cli::{MergeMethod, ReleaseBotCommand, ReleaseBotHookCommand},
 };
 use crate::config::LoadedConfig;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
+use crate::merge_queue_control::preflight_mutation_authority;
 use crate::output::write_json_envelope;
+use crate::ship_state::{ShipState, ShipStateStore};
 
 const POST_TAG_WORKFLOW: &str = "post-tag-sync.yml";
 
@@ -24,18 +30,24 @@ pub(super) fn release_bot_command<W: Write>(
     command: ReleaseBotCommand,
     mode: RuntimeMode,
     cwd: &Path,
+    state_root: &Path,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    release_bot_command_with(command, &config, cwd, json_mode, stdout, None)
+    release_bot_command_with(
+        command, mode, &config, cwd, state_root, json_mode, stdout, None,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn release_bot_command_with<W: Write>(
     command: ReleaseBotCommand,
+    mode: RuntimeMode,
     config: &LoadedConfig,
     cwd: &Path,
+    state_root: &Path,
     json_mode: bool,
     stdout: &mut W,
     gh_command: Option<&Path>,
@@ -75,16 +87,24 @@ fn release_bot_command_with<W: Write>(
                 shipyard_version,
             } => hook_install(
                 stdout,
+                config,
                 cwd,
                 tag_pattern.as_deref().unwrap_or("v*"),
                 shipyard_version
                     .as_deref()
                     .unwrap_or(env!("CARGO_PKG_VERSION")),
                 json_mode,
+                gh_command,
             ),
-            ReleaseBotHookCommand::Run { tag } => {
-                hook_run(stdout, config, cwd, tag.as_deref(), json_mode)
-            }
+            ReleaseBotHookCommand::Run { tag } => hook_run(
+                stdout,
+                config,
+                cwd,
+                state_root,
+                mode,
+                tag.as_deref(),
+                json_mode,
+            ),
         },
     }
 }
@@ -313,10 +333,12 @@ fn setup<W: Write>(
 
 fn hook_install<W: Write>(
     stdout: &mut W,
+    config: &LoadedConfig,
     cwd: &Path,
     tag_pattern: &str,
     shipyard_version: &str,
     json_mode: bool,
+    gh_command: Option<&Path>,
 ) -> Result<ExitCode, CliFailure> {
     let workflows_dir = cwd.join(".github").join("workflows");
     fs::create_dir_all(&workflows_dir).map_err(|error| {
@@ -327,7 +349,34 @@ fn hook_install<W: Write>(
     })?;
     let target = workflows_dir.join(POST_TAG_WORKFLOW);
     let overwrote = target.exists();
-    fs::write(&target, render_workflow(tag_pattern, shipyard_version)).map_err(|error| {
+    let trusted_config = LoadedConfig::load_machine_global_from_dir(config.global_dir.clone())
+        .map_err(|error| {
+            CliFailure::new(
+                1,
+                format!("failed to load trusted queue authority policy: {error}"),
+            )
+        })?;
+    let runner = if let Some(machine) = trusted_config.get_str("merge_queue.mutation_machine") {
+        crate::runner_provision::validate_machine_tag(machine)
+            .map_err(|error| CliFailure::new(1, error))?;
+        let repo_slug = detect_repo_from_remote(cwd, None).ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "can't detect repository name for queue-authority runner label",
+            )
+        })?;
+        let repo = repo_slug.rsplit('/').next().unwrap_or(&repo_slug);
+        let label = format!("{repo}-queue-authority-{machine}");
+        ensure_runner_label(&repo_slug, &label, gh_command)?;
+        format!("[self-hosted, {label}]")
+    } else {
+        "ubuntu-latest".to_owned()
+    };
+    fs::write(
+        &target,
+        render_workflow(tag_pattern, shipyard_version, &runner),
+    )
+    .map_err(|error| {
         CliFailure::new(1, format!("failed to write {}: {error}", target.display()))
     })?;
     if json_mode {
@@ -359,10 +408,50 @@ fn hook_install<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+fn ensure_runner_label(
+    repo_slug: &str,
+    label: &str,
+    gh_command: Option<&Path>,
+) -> Result<(), CliFailure> {
+    let output = gh(gh_command)
+        .args([
+            "api",
+            &format!("repos/{repo_slug}/actions/runners"),
+            "--paginate",
+            "--jq",
+            ".runners[].labels[].name",
+        ])
+        .output()
+        .map_err(|error| CliFailure::new(1, format!("failed to inspect runner labels: {error}")))?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "failed to inspect runner label `{label}`: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    if String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|candidate| candidate.trim() == label)
+    {
+        return Ok(());
+    }
+    Err(CliFailure::new(
+        1,
+        format!(
+            "dedicated queue-authority runner label `{label}` is not registered; run `shipyard runner register --count 1 --labels {label}` on the authority machine, ensuring that controller does not also carry the generic build label"
+        ),
+    ))
+}
+
 fn hook_run<W: Write>(
     stdout: &mut W,
     config: &LoadedConfig,
     cwd: &Path,
+    state_root: &Path,
+    mode: RuntimeMode,
     tag: Option<&str>,
     json_mode: bool,
 ) -> Result<ExitCode, CliFailure> {
@@ -386,7 +475,14 @@ fn hook_run<W: Write>(
             "--tag is required (or set GITHUB_REF=refs/tags/<tag>).",
         ));
     };
-    let result = run_hook(&hook_config, &resolved_tag, cwd);
+    let result = run_hook(
+        &hook_config,
+        &resolved_tag,
+        cwd,
+        state_root,
+        mode,
+        &config.global_dir,
+    );
     render_hook_run(stdout, &resolved_tag, &result, json_mode)?;
     Ok(if result.error.is_some() {
         ExitCode::from(1)
@@ -525,7 +621,7 @@ fn render_pat_creation_url(owner: &str, repo: &str, pat_name: &str) -> String {
     )
 }
 
-fn render_workflow(tag_pattern: &str, shipyard_version: &str) -> String {
+fn render_workflow(tag_pattern: &str, shipyard_version: &str, runner: &str) -> String {
     format!(
         r#"name: Post-tag docs sync
 
@@ -549,12 +645,12 @@ env:
 jobs:
   sync:
     name: Regenerate docs for ${{{{ github.ref_name }}}}
-    runs-on: ubuntu-latest
+    runs-on: {runner}
     steps:
-      - name: Checkout main with full history
+      - name: Checkout release tag with full history
         uses: actions/checkout@v5
         with:
-          ref: main
+          ref: ${{{{ github.ref }}}}
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: true
@@ -594,11 +690,11 @@ struct HookConfig {
     //   "direct" (default) — push --ff-only straight to `branch` (today's
     //     behavior). Incompatible with a GitHub "Require merge queue" rule,
     //     which rejects ALL direct pushes to the protected branch.
-    //   "pr" — push to a dedicated branch, open a PR, and arm auto-merge so the
-    //     commit lands THROUGH the merge queue. Required when `branch` enforces
+    //   "pr" — create or resume one immutable branch per tag, wait for required
+    //     checks, then enqueue its exact head. Required when `branch` enforces
     //     a merge queue.
     push_mode: String,
-    // PR-route branch name prefix (push_mode = "pr"); the tag is appended.
+    // PR-route branch prefix; the stable release tag is appended.
     pr_branch_prefix: String,
 }
 
@@ -695,7 +791,14 @@ fn load_hook_config(config: &LoadedConfig) -> HookConfig {
     cfg
 }
 
-fn run_hook(config: &HookConfig, tag: &str, cwd: &Path) -> HookResult {
+fn run_hook(
+    config: &HookConfig,
+    tag: &str,
+    cwd: &Path,
+    state_root: &Path,
+    mode: RuntimeMode,
+    global_dir: &Path,
+) -> HookResult {
     let mut result = HookResult::default();
     if !config.enabled {
         result.skipped_reason = Some(String::from("hook disabled in config"));
@@ -742,14 +845,27 @@ fn run_hook(config: &HookConfig, tag: &str, cwd: &Path) -> HookResult {
         return result;
     }
     let diffed = result.watched_diffed.clone();
-    if let Err(error) = commit_and_push_docs(cwd, config, tag, &diffed, &mut result) {
+    if let Err(error) = commit_and_push_docs(
+        cwd,
+        state_root,
+        mode,
+        global_dir,
+        config,
+        tag,
+        &diffed,
+        &mut result,
+    ) {
         result.error = Some(error);
     }
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_and_push_docs(
     cwd: &Path,
+    state_root: &Path,
+    mode: RuntimeMode,
+    global_dir: &Path,
     config: &HookConfig,
     tag: &str,
     diffed: &[String],
@@ -760,10 +876,11 @@ fn commit_and_push_docs(
     run_git_owned(cwd, &add_args)?;
     run_git(cwd, &["config", "user.name", &config.bot_name])?;
     run_git(cwd, &["config", "user.email", &config.bot_email])?;
+    let subject = release_bot_commit_subject(&config.push_mode, tag);
     let mut commit_args = vec![
         "commit".to_owned(),
         "-m".to_owned(),
-        format!("docs: regenerate changelog for {tag} [skip ci]"),
+        subject,
         "-m".to_owned(),
         String::from(
             "Automated by shipyard release-bot hook run after tag push, so CHANGELOG.md and the GitHub Release page stay in sync.",
@@ -775,10 +892,15 @@ fn commit_and_push_docs(
         commit_args.push("-m".to_owned());
         commit_args.push(trailer.clone());
     }
-    run_git_owned(cwd, &commit_args)?;
+    if config.push_mode == "pr" {
+        let commit_date = run_git_capture(cwd, &["log", "-1", "--format=%cI", tag])?;
+        run_git_owned_with_date(cwd, &commit_args, &commit_date)?;
+    } else {
+        run_git_owned(cwd, &commit_args)?;
+    }
     result.committed = true;
     match config.push_mode.as_str() {
-        "pr" => push_via_pr(cwd, config, tag, result),
+        "pr" => push_via_pr(cwd, state_root, mode, global_dir, config, tag, result),
         _ => push_direct(cwd, config, result),
     }
 }
@@ -811,50 +933,458 @@ fn push_direct(cwd: &Path, config: &HookConfig, result: &mut HookResult) -> Resu
     ))
 }
 
-// push_mode = "pr": push the bot commit to a dedicated branch, open a PR, and
-// arm auto-merge so it lands THROUGH the merge queue (the direct push a
-// "Require merge queue" rule would reject). `gh` authenticates via GH_TOKEN in
-// the caller's environment — the same mechanism shipyard's other gh usage
-// (src/pr.rs) relies on.
+// push_mode = "pr": push the bot commit to an immutable branch, open a PR,
+// wait for required checks, and enqueue exactly that SHA (a direct push would
+// violate "Require merge queue"). `gh` authenticates via the ambient client.
+#[allow(clippy::too_many_lines)]
 fn push_via_pr(
     cwd: &Path,
+    state_root: &Path,
+    mode: RuntimeMode,
+    global_dir: &Path,
     config: &HookConfig,
     tag: &str,
     result: &mut HookResult,
 ) -> Result<(), String> {
-    let pr_branch = format!("{}-{}", config.pr_branch_prefix, sanitize_ref_component(tag));
-    // Force-push the bot-owned throwaway branch (a stale branch from an aborted
-    // run must not block a fresh sync). Safe — only the bot writes it.
-    run_git(
+    let repo = detect_repo_from_remote(cwd, None)
+        .ok_or_else(|| "can't detect owner/repo from git remote".to_owned())?;
+    let preflight = if target_requires_merge_queue(cwd, &repo, &config.branch)? {
+        Some(
+            preflight_mutation_authority(
+                state_root,
+                cwd,
+                mode,
+                global_dir,
+                &repo,
+                &config.branch,
+            )
+            .map_err(|error| {
+                format!(
+                    "{error}; merge-queue PR mode now requires a dedicated authority host. Configure machine-global [merge_queue].mutation_machine, set its runner tag, and rerun `shipyard release-bot hook install` so the workflow no longer targets a GitHub-hosted runner"
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    let local_commit = run_git_capture(cwd, &["rev-parse", "HEAD"])?;
+    ensure_release_commit_is_based_on_target(cwd, config)?;
+    let pr_branch = release_bot_branch(&config.pr_branch_prefix, tag);
+    let existing = find_open_release_bot_pr(cwd, &pr_branch, &repo)?;
+    let (target, commit) = if let Some(target) = existing {
+        let commit = target["headRefOid"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "existing release-bot PR omitted headRefOid".to_owned())?
+            .to_owned();
+        if commit != local_commit {
+            return Err(format!(
+                "existing release-bot PR head {commit} does not match deterministic generated commit {local_commit} for tag `{tag}`"
+            ));
+        }
+        validate_release_bot_repository(&target, &repo)?;
+        validated_release_bot_pr(&target, &commit, &config.branch)?;
+        match target["state"].as_str() {
+            Some("MERGED") => return Ok(()),
+            Some("OPEN") => {}
+            Some(state) => {
+                return Err(format!(
+                    "release-bot PR for deterministic head {commit} is {state}; refusing to replace it"
+                ));
+            }
+            None => return Err("existing release-bot PR omitted state".to_owned()),
+        }
+        (target, commit)
+    } else {
+        run_git(cwd, &["push", &config.remote, &format!("HEAD:{pr_branch}")])?;
+        result.pushed = true;
+        create_release_bot_pr(cwd, config, tag, &pr_branch)?;
+        let target = run_gh_json(
+            cwd,
+            &[
+                "pr",
+                "view",
+                &pr_branch,
+                "--json",
+                "number,id,state,headRefOid,baseRefName,headRepository,headRepositoryOwner,isCrossRepository",
+            ],
+        )?;
+        validate_release_bot_repository(&target, &repo)?;
+        (target, local_commit)
+    };
+    // Verify the immutable ref before waiting and again immediately before the
+    // server-side exact-head enqueue mutation.
+    let (pr, _, _, _) = validated_release_bot_pr(&target, &commit, &config.branch)?;
+    // The immutable PR now exists without any auto-merge authority. Release
+    // process-wide serialization while required checks run; admission below
+    // reacquires authority and revalidates the exact head and base.
+    drop(preflight);
+    let pr_text = pr.to_string();
+    let target = run_gh_json(
         cwd,
-        &["push", "--force", &config.remote, &format!("HEAD:{pr_branch}")],
+        &[
+            "pr",
+            "view",
+            &pr_text,
+            "--json",
+            "number,id,state,headRefOid,baseRefName,headRepository,headRepositoryOwner,isCrossRepository",
+        ],
     )?;
-    result.pushed = true;
+    validate_release_bot_repository(&target, &repo)?;
+    let (revalidated_pr, _, head, base) =
+        validated_release_bot_pr(&target, &commit, &config.branch)?;
+    if revalidated_pr != pr {
+        return Err(format!(
+            "release-bot PR identity changed from #{pr} to #{revalidated_pr}; refusing queue admission"
+        ));
+    }
+    wait_for_required_pr_checks(cwd, pr)?;
+    let store = ShipStateStore::new(state_root.join("ship"))
+        .map_err(|error| format!("failed to open ship-state store: {error}"))?;
+    seed_release_bot_ship_state(&store, pr, &repo, &pr_branch, &base, &head)?;
+    let request = AutoMergeRequest {
+        mode,
+        global_dir: global_dir.to_path_buf(),
+        pr,
+        merge_method: MergeMethod::Merge,
+        delete_branch: false,
+        admin: false,
+        pr_snapshot_file: None,
+        merge_command: None,
+        merge_result: None,
+    };
+    supervise_release_bot_admission(&store, cwd, &request)
+}
+
+fn ensure_release_commit_is_based_on_target(cwd: &Path, config: &HookConfig) -> Result<(), String> {
+    run_git(cwd, &["fetch", &config.remote, &config.branch])?;
+    let generated_parent = run_git_capture(cwd, &["rev-parse", "HEAD^"])?;
+    let target = format!("{}/{}", config.remote, config.branch);
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", &generated_parent, &target])
+        .current_dir(cwd)
+        .status()
+        .map_err(|error| format!("failed to verify release tag ancestry: {error}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "release tag commit {generated_parent} is not an ancestor of configured target {target}; refusing to open a PR that could contain unrelated divergent commits"
+    ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RequiredCheckState {
+    Passed,
+    NoChecks,
+    Pending,
+    Failed(Vec<String>),
+}
+
+fn wait_for_required_pr_checks(cwd: &Path, pr: u64) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_hours(2);
+    let mut no_checks_since = None;
+    loop {
+        match required_pr_check_state(cwd, pr)? {
+            RequiredCheckState::Passed => return Ok(()),
+            RequiredCheckState::NoChecks => {
+                let observed_at = no_checks_since.get_or_insert_with(std::time::Instant::now);
+                if observed_at.elapsed() >= Duration::from_secs(30) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            RequiredCheckState::Failed(checks) => {
+                return Err(format!(
+                    "release-bot PR #{pr} has failed required checks: {}",
+                    checks.join(", ")
+                ));
+            }
+            RequiredCheckState::Pending if std::time::Instant::now() >= deadline => {
+                return Err(format!(
+                    "timed out waiting for required checks on release-bot PR #{pr}"
+                ));
+            }
+            RequiredCheckState::Pending => {
+                no_checks_since = None;
+                std::thread::sleep(Duration::from_secs(15));
+            }
+        }
+    }
+}
+
+fn required_pr_check_state(cwd: &Path, pr: u64) -> Result<RequiredCheckState, String> {
+    let output = gh(None)
+        .args([
+            "pr",
+            "checks",
+            &pr.to_string(),
+            "--required",
+            "--json",
+            "bucket,name,state",
+        ])
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("failed to inspect required checks for PR #{pr}: {error}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    interpret_required_check_output(output.status.success(), &output.stdout, &stderr)
+        .map_err(|error| format!("failed to inspect required checks for PR #{pr}: {error}"))
+}
+
+fn interpret_required_check_output(
+    success: bool,
+    stdout: &[u8],
+    stderr: &str,
+) -> Result<RequiredCheckState, String> {
+    if success && let Ok(rows) = serde_json::from_slice::<Vec<Value>>(stdout) {
+        return classify_required_check_rows(&rows);
+    }
+    if no_required_checks_reported(stderr) {
+        return Ok(RequiredCheckState::NoChecks);
+    }
+    Err(stderr.to_owned())
+}
+
+fn no_required_checks_reported(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("no required checks reported on the") && lower.contains("branch")
+}
+
+fn classify_required_check_rows(rows: &[Value]) -> Result<RequiredCheckState, String> {
+    if rows.is_empty() {
+        return Ok(RequiredCheckState::NoChecks);
+    }
+    let mut pending = false;
+    let mut failed = Vec::new();
+    for row in rows {
+        let name = row["name"].as_str().unwrap_or("<unnamed>").to_owned();
+        match row["bucket"].as_str().unwrap_or("") {
+            "pass" | "skipping" => {}
+            "pending" => pending = true,
+            "fail" | "cancel" => failed.push(name),
+            bucket => {
+                return Err(format!(
+                    "required check {name} returned unknown bucket {bucket:?}"
+                ));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        Ok(RequiredCheckState::Failed(failed))
+    } else if pending {
+        Ok(RequiredCheckState::Pending)
+    } else {
+        Ok(RequiredCheckState::Passed)
+    }
+}
+
+fn seed_release_bot_ship_state(
+    store: &ShipStateStore,
+    pr: u64,
+    repo: &str,
+    head_branch: &str,
+    base: &str,
+    head: &str,
+) -> Result<(), String> {
+    let lock = store
+        .lock_pr(pr)
+        .map_err(|error| format!("failed to lock release-bot ship-state: {error}"))?;
+    let mut state = if let Some(existing) = store.get_locked(pr, &lock) {
+        if existing.repo != repo || existing.base_branch != base || existing.head_sha != head {
+            return Err(format!(
+                "existing ship-state for release-bot PR #{pr} does not match {repo} {base} {head}"
+            ));
+        }
+        existing
+    } else {
+        ShipState::new(pr, repo, head_branch.to_owned(), base, head, "release-bot")
+    };
+    state
+        .evidence_snapshot
+        .insert("release-bot-required-checks".to_owned(), "pass".to_owned());
+    state.touch();
+    store
+        .save_locked(&state, &lock)
+        .map_err(|error| format!("failed to persist release-bot ship-state: {error}"))
+}
+
+fn supervise_release_bot_admission(
+    store: &ShipStateStore,
+    cwd: &Path,
+    request: &AutoMergeRequest,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_hours(2);
+    loop {
+        let outcome = execute_auto_merge(store, cwd, request)
+            .map_err(|error| format!("release-bot queue supervision failed: {error}"))?;
+        match outcome {
+            AutoMergeOutcome::AlreadyMerged | AutoMergeOutcome::Merged { .. } => return Ok(()),
+            AutoMergeOutcome::Enqueued => {
+                let state = store.get(request.pr).ok_or_else(|| {
+                    format!("release-bot ship-state disappeared for PR #{}", request.pr)
+                })?;
+                if state.merge_queue_enqueue_succeeded_at.is_some()
+                    || state.merge_queue_observed_at.is_some()
+                {
+                    return Ok(());
+                }
+            }
+            AutoMergeOutcome::MergeFailed { error } if merge_queue_lock_contended(&error) => {}
+            outcome => {
+                return Err(format!(
+                    "release-bot exact-head queue supervision did not admit PR #{}: {outcome:?}",
+                    request.pr
+                ));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for authoritative queue admission of release-bot PR #{}",
+                request.pr
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(15));
+    }
+}
+
+fn merge_queue_lock_contended(error: &str) -> bool {
+    error.contains("another Shipyard process is performing a merge-queue mutation")
+        || error.contains("another Shipyard process owns merge-queue mutation authority")
+}
+
+fn find_open_release_bot_pr(
+    cwd: &Path,
+    branch: &str,
+    expected_repo: &str,
+) -> Result<Option<Value>, String> {
+    let result = run_gh_json(
+        cwd,
+        &[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--limit",
+            "1",
+            "--json",
+            "number,id,state,headRefOid,baseRefName,headRepository,headRepositoryOwner,isCrossRepository",
+        ],
+    )?;
+    let target = result.as_array().and_then(|items| items.first()).cloned();
+    if let Some(target) = target.as_ref() {
+        validate_release_bot_repository(target, expected_repo)?;
+    }
+    Ok(target)
+}
+
+fn create_release_bot_pr(
+    cwd: &Path,
+    config: &HookConfig,
+    tag: &str,
+    branch: &str,
+) -> Result<(), String> {
     let title = format!("docs: regenerate changelog for {tag}");
     let body = format!(
         "Automated by shipyard release-bot hook run after tag `{tag}` — routes the CHANGELOG.md regeneration through a PR so it lands via the merge queue instead of a direct push to `{}`.",
         config.branch
     );
-    let created = run_gh(
+    run_gh(
         cwd,
         &[
-            "pr", "create", "--base", &config.branch, "--head", &pr_branch, "--title", &title,
-            "--body", &body,
+            "pr",
+            "create",
+            "--base",
+            &config.branch,
+            "--head",
+            branch,
+            "--title",
+            &title,
+            "--body",
+            &body,
         ],
-    );
-    if let Err(error) = created {
-        // A concurrent/prior run already opened it — GitHub rejects a second PR
-        // from the same head. Treat that as success and just (re-)arm auto-merge.
-        if !error.contains("already exists") && !error.contains("a pull request for branch") {
-            return Err(format!("gh pr create failed: {error}"));
-        }
+    )
+    .map_err(|error| format!("gh pr create failed: {error}"))
+}
+
+fn release_bot_branch(prefix: &str, tag: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(tag.as_bytes()));
+    format!("{prefix}-{}-{}", sanitize_ref_component(tag), &digest[..12])
+}
+
+fn release_bot_commit_subject(push_mode: &str, tag: &str) -> String {
+    if push_mode == "pr" {
+        format!("docs: regenerate changelog for {tag}")
+    } else {
+        format!("docs: regenerate changelog for {tag} [skip ci]")
     }
-    // Arm GitHub-native auto-merge with --merge (never --squash: the bot commit
-    // carries the `Release: skip` trailer that must survive to prevent a
-    // recursive auto-release). When a merge queue is enabled, --auto enqueues it.
-    run_gh(cwd, &["pr", "merge", &pr_branch, "--auto", "--merge"])
-        .map_err(|error| format!("gh pr merge --auto failed: {error}"))?;
+}
+
+fn validate_release_bot_base(actual: &str, expected: &str) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "release-bot PR targets `{actual}`, expected configured base `{expected}`; refusing queue admission"
+        ))
+    }
+}
+
+fn validate_release_bot_repository(target: &Value, expected_repo: &str) -> Result<(), String> {
+    let (expected_owner, expected_name) = expected_repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid expected repository `{expected_repo}`"))?;
+    let owner = target["headRepositoryOwner"]["login"]
+        .as_str()
+        .ok_or_else(|| "gh pr view omitted headRepositoryOwner.login".to_owned())?;
+    let name = target["headRepository"]["name"]
+        .as_str()
+        .ok_or_else(|| "gh pr view omitted headRepository.name".to_owned())?;
+    let cross_repo = target["isCrossRepository"]
+        .as_bool()
+        .ok_or_else(|| "gh pr view omitted isCrossRepository".to_owned())?;
+    if cross_repo || owner != expected_owner || name != expected_name {
+        return Err(format!(
+            "release-bot PR head belongs to {owner}/{name}, expected same-repository head in {expected_repo}"
+        ));
+    }
     Ok(())
+}
+
+fn validated_release_bot_pr(
+    target: &Value,
+    expected_head: &str,
+    expected_base: &str,
+) -> Result<(u64, String, String, String), String> {
+    let pr = target["number"]
+        .as_u64()
+        .ok_or_else(|| "gh pr view omitted PR number".to_owned())?;
+    let id = target["id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "gh pr view omitted GraphQL id".to_owned())?;
+    let head = target["headRefOid"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "gh pr view omitted headRefOid".to_owned())?;
+    let base = target["baseRefName"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "gh pr view omitted baseRefName".to_owned())?;
+    validate_release_bot_head(head, expected_head)?;
+    validate_release_bot_base(base, expected_base)?;
+    Ok((pr, id.to_owned(), head.to_owned(), base.to_owned()))
+}
+
+fn validate_release_bot_head(actual: &str, expected: &str) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "release-bot PR head changed to `{actual}`, expected immutable head `{expected}`; refusing queue admission"
+        ))
+    }
 }
 
 // Make a tag safe as a git ref component (tags like `v1.2.3` are already safe;
@@ -1059,13 +1589,49 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
+fn run_git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("failed to run git {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 fn run_git_owned(cwd: &Path, args: &[String]) -> Result<(), String> {
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     run_git(cwd, &arg_refs)
 }
 
+fn run_git_owned_with_date(cwd: &Path, args: &[String], date: &str) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .output()
+        .map_err(|error| format!("failed to run git {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 // Run `gh` in `cwd` via shipyard's ambient GhClient (same auth path as
-// src/pr.rs). Used by push_via_pr to open + auto-merge the changelog PR.
+// src/pr.rs). Used by push_via_pr to open, watch, and enqueue the changelog PR.
 fn run_gh(cwd: &Path, args: &[&str]) -> Result<(), String> {
     let output = gh(None)
         .args(args)
@@ -1081,6 +1647,23 @@ fn run_gh(cwd: &Path, args: &[&str]) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+fn run_gh_json(cwd: &Path, args: &[&str]) -> Result<Value, String> {
+    let output = gh(None)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("failed to run gh {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("gh {} returned malformed JSON: {error}", args.join(" ")))
 }
 
 fn gh(gh_command: Option<&Path>) -> Command {
@@ -1184,6 +1767,72 @@ mod tests {
         serde_json::from_str(text).expect("json")
     }
 
+    #[test]
+    fn release_bot_state_seed_is_atomic_with_concurrent_provenance_update() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let pr = 42;
+        let mut initial = ShipState::new(
+            pr,
+            "owner/repo",
+            "release/post-tag-sync/v0.79.0",
+            "main",
+            "a".repeat(40),
+            "policy",
+        );
+        initial
+            .evidence_snapshot
+            .insert("initial".to_owned(), "pass".to_owned());
+        store.save(&initial).expect("initial state");
+
+        let lock = store.lock_pr(pr).expect("writer lock");
+        let worker_store = store.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("started");
+            done_tx
+                .send(seed_release_bot_ship_state(
+                    &worker_store,
+                    pr,
+                    "owner/repo",
+                    "release/post-tag-sync/v0.79.0",
+                    "main",
+                    &"a".repeat(40),
+                ))
+                .expect("result");
+        });
+        started_rx.recv().expect("worker started");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "release-bot seed bypassed the existing PR-state lock"
+        );
+
+        let mut concurrent = store.get_locked(pr, &lock).expect("state");
+        concurrent
+            .evidence_snapshot
+            .insert("concurrent-provenance".to_owned(), "pass".to_owned());
+        store
+            .save_locked(&concurrent, &lock)
+            .expect("concurrent update");
+        drop(lock);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("seed completed")
+            .expect("seed succeeded");
+        worker.join().expect("worker");
+
+        let saved = store.get(pr).expect("saved state");
+        assert_eq!(saved.evidence_snapshot["initial"], "pass");
+        assert_eq!(saved.evidence_snapshot["concurrent-provenance"], "pass");
+        assert_eq!(
+            saved.evidence_snapshot["release-bot-required-checks"],
+            "pass"
+        );
+    }
+
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -1201,6 +1850,9 @@ mod tests {
             &script,
             r#"#!/bin/sh
 case "$*" in
+  api\ repos/owner/repo/actions/runners*)
+    printf '%s\n' 'self-hosted' 'macos' 'arm64' 'repo-queue-authority-studio'
+    ;;
   api\ repos/owner/repo/actions/secrets*)
     printf '%s\n' '{"secrets":[{"name":"RELEASE_BOT_TOKEN","updated_at":"2026-04-25T09:30:00Z"}]}'
     ;;
@@ -1288,8 +1940,16 @@ esac
         let temp = tempfile::tempdir().expect("tempdir");
         let mut output = Vec::new();
 
-        let exit = hook_install(&mut output, temp.path(), "shipyard-v*", "v0.50.0", true)
-            .expect("hook install");
+        let exit = hook_install(
+            &mut output,
+            &empty_config(),
+            temp.path(),
+            "shipyard-v*",
+            "v0.50.0",
+            true,
+            None,
+        )
+        .expect("hook install");
 
         assert_eq!(exit, ExitCode::SUCCESS);
         let workflow = temp
@@ -1310,12 +1970,63 @@ esac
 
     #[test]
     fn render_workflow_uses_release_bot_token_fallback() {
-        let workflow = render_workflow("v*", "v0.51.0");
+        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest");
 
         assert!(workflow.contains("secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN"));
         assert!(workflow.contains(r#"SHIPYARD_VERSION: "v0.51.0""#));
         assert!(workflow.contains(r#"tags: ["v*"]"#));
         assert!(workflow.contains("curl -fsSL \"https://generouscorp.com/Shipyard/install.sh\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_install_routes_queue_authority_to_its_host_runner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git(temp.path(), &["init"]);
+        git(
+            temp.path(),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        let global_dir = temp.path().join("global");
+        fs::create_dir_all(&global_dir).expect("global config dir");
+        fs::create_dir_all(temp.path().join(".shipyard")).expect("project config dir");
+        fs::write(
+            temp.path().join(".shipyard/config.toml"),
+            "[merge_queue]\nmutation_machine = \"m1\"\n",
+        )
+        .expect("untrusted project config");
+        fs::write(
+            global_dir.join("config.toml"),
+            "[merge_queue]\nmutation_machine = \"studio\"\n",
+        )
+        .expect("global config");
+        let config = LoadedConfig::load(
+            Some(global_dir),
+            Some(temp.path().join(".shipyard")),
+            None,
+            LocalOverlaySource::None,
+        )
+        .expect("config");
+        let mut output = Vec::new();
+
+        let gh = fake_gh(temp.path());
+        hook_install(
+            &mut output,
+            &config,
+            temp.path(),
+            "v*",
+            "v0.79.0",
+            true,
+            Some(&gh),
+        )
+        .expect("install");
+        let workflow = fs::read_to_string(
+            temp.path()
+                .join(".github/workflows")
+                .join(POST_TAG_WORKFLOW),
+        )
+        .expect("workflow");
+        assert!(workflow.contains("runs-on: [self-hosted, repo-queue-authority-studio]"));
     }
 
     #[test]
@@ -1383,6 +2094,154 @@ pr_branch_prefix = "bot/changelog"
     }
 
     #[test]
+    fn release_bot_pr_must_still_target_configured_base() {
+        validate_release_bot_base("main", "main").expect("matching base");
+        let error =
+            validate_release_bot_base("release", "main").expect_err("retargeted PR rejected");
+        assert!(error.contains("targets `release`"));
+        assert!(error.contains("expected configured base `main`"));
+    }
+
+    #[test]
+    fn release_bot_pr_must_keep_immutable_head() {
+        let head = "a".repeat(40);
+        validate_release_bot_head(&head, &head).expect("matching head");
+        let error =
+            validate_release_bot_head(&"b".repeat(40), &head).expect_err("changed head rejected");
+        assert!(error.contains("expected immutable head"));
+    }
+
+    #[test]
+    fn release_bot_pr_must_use_same_repository_head() {
+        let same_repo = serde_json::json!({
+            "headRepositoryOwner": {"login": "owner"},
+            "headRepository": {"name": "repo"},
+            "isCrossRepository": false,
+        });
+        validate_release_bot_repository(&same_repo, "owner/repo").expect("same repo");
+        let fork = serde_json::json!({
+            "headRepositoryOwner": {"login": "attacker"},
+            "headRepository": {"name": "repo"},
+            "isCrossRepository": true,
+        });
+        let error =
+            validate_release_bot_repository(&fork, "owner/repo").expect_err("fork rejected");
+        assert!(error.contains("expected same-repository head"));
+    }
+
+    #[test]
+    fn release_bot_branch_is_stable_for_workflow_retries() {
+        let first = release_bot_branch("release/post-tag-sync", "v0.79.0");
+        assert_eq!(
+            first,
+            release_bot_branch("release/post-tag-sync", "v0.79.0")
+        );
+        assert!(first.starts_with("release/post-tag-sync-v0.79.0-"));
+        assert_ne!(
+            release_bot_branch("release/post-tag-sync", "v1/foo"),
+            release_bot_branch("release/post-tag-sync", "v1-foo")
+        );
+    }
+
+    #[test]
+    fn pr_mode_does_not_suppress_required_ci() {
+        assert_eq!(
+            release_bot_commit_subject("pr", "v0.79.0"),
+            "docs: regenerate changelog for v0.79.0"
+        );
+        assert!(release_bot_commit_subject("direct", "v0.79.0").contains("[skip ci]"));
+    }
+
+    #[test]
+    fn required_check_rows_use_structured_buckets() {
+        assert_eq!(
+            classify_required_check_rows(&[]).expect("empty"),
+            RequiredCheckState::NoChecks
+        );
+        assert_eq!(
+            classify_required_check_rows(&[serde_json::json!({
+                "name": "macos",
+                "bucket": "pending"
+            })])
+            .expect("pending"),
+            RequiredCheckState::Pending
+        );
+        assert_eq!(
+            classify_required_check_rows(&[serde_json::json!({
+                "name": "windows",
+                "bucket": "fail"
+            })])
+            .expect("failed"),
+            RequiredCheckState::Failed(vec!["windows".to_owned()])
+        );
+        assert!(
+            classify_required_check_rows(&[serde_json::json!({
+                "name": "mystery",
+                "bucket": "unknown"
+            })])
+            .expect_err("unknown rejected")
+            .contains("unknown bucket")
+        );
+    }
+
+    #[test]
+    fn failed_required_check_query_cannot_turn_empty_json_into_no_checks() {
+        let error = interpret_required_check_output(false, b"[]", "authentication failed")
+            .expect_err("failed gh command must fail closed");
+        assert_eq!(error, "authentication failed");
+        assert_eq!(
+            interpret_required_check_output(
+                false,
+                b"[]",
+                "no required checks reported on the main branch"
+            )
+            .expect("known zero-check response"),
+            RequiredCheckState::NoChecks
+        );
+    }
+
+    #[test]
+    fn no_required_checks_wording_is_recognized_without_text_status_parsing() {
+        assert!(no_required_checks_reported(
+            "no required checks reported on the main branch"
+        ));
+        assert!(!no_required_checks_reported(
+            "required check macos is pending"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn annotated_tag_commit_date_resolves_to_one_rfc3339_line() {
+        let temp = tempfile::tempdir().expect("temp");
+        git(temp.path(), &["init"]);
+        git(temp.path(), &["config", "user.name", "test user"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        fs::write(temp.path().join("README.md"), "seed\n").expect("readme");
+        git(temp.path(), &["add", "README.md"]);
+        git(temp.path(), &["commit", "-m", "seed"]);
+        git(temp.path(), &["tag", "-a", "v0.79.0", "-m", "release"]);
+
+        let commit_date =
+            run_git_capture(temp.path(), &["log", "-1", "--format=%cI", "v0.79.0"]).expect("date");
+        assert!(!commit_date.contains('\n'));
+        assert!(chrono::DateTime::parse_from_rfc3339(&commit_date).is_ok());
+    }
+
+    #[test]
+    fn release_bot_retries_only_merge_queue_lock_contention() {
+        assert!(merge_queue_lock_contended(
+            "another Shipyard process is performing a merge-queue mutation"
+        ));
+        assert!(merge_queue_lock_contended(
+            "another Shipyard process owns merge-queue mutation authority for owner/repo"
+        ));
+        assert!(!merge_queue_lock_contended(
+            "merge-queue mutation authority is studio; this machine is m1"
+        ));
+    }
+
+    #[test]
     fn hook_config_defaults_push_mode_to_direct() {
         // An empty hook section (or none) keeps today's behavior — no surprise
         // switch to the PR route.
@@ -1403,7 +2262,16 @@ pr_branch_prefix = "bot/changelog"
         let config = empty_config();
         let mut output = Vec::new();
 
-        let exit = hook_run(&mut output, &config, temp.path(), None, true).expect("hook run");
+        let exit = hook_run(
+            &mut output,
+            &config,
+            temp.path(),
+            &temp.path().join("state"),
+            RuntimeMode::Shipyard,
+            None,
+            true,
+        )
+        .expect("hook run");
 
         assert_eq!(exit, ExitCode::SUCCESS);
         let envelope = decode_envelope(&output);
@@ -1424,7 +2292,16 @@ enabled = true
         );
         let mut output = Vec::new();
 
-        let error = hook_run(&mut output, &config, temp.path(), None, true).expect_err("tag error");
+        let error = hook_run(
+            &mut output,
+            &config,
+            temp.path(),
+            &temp.path().join("state"),
+            RuntimeMode::Shipyard,
+            None,
+            true,
+        )
+        .expect_err("tag error");
 
         assert_eq!(error.code, 2);
         assert!(error.message.contains("--tag is required"));
@@ -1522,8 +2399,10 @@ enabled = true
             ReleaseBotCommand::Status {
                 siblings: vec![String::from("owner/other")],
             },
+            RuntimeMode::Shipyard,
             &config,
             &repo,
+            &temp.path().join("state"),
             true,
             &mut output,
             Some(&gh),
@@ -1548,7 +2427,14 @@ enabled = true
             ..HookConfig::default()
         };
 
-        let result = run_hook(&config, "v0.50.0", temp.path());
+        let result = run_hook(
+            &config,
+            "v0.50.0",
+            temp.path(),
+            &temp.path().join("state"),
+            RuntimeMode::Shipyard,
+            &temp.path().join("global"),
+        );
 
         assert!(result.ran_command);
         assert_eq!(result.command_exit, 7);
@@ -1591,7 +2477,14 @@ enabled = true
             ..HookConfig::default()
         };
 
-        let result = run_hook(&config, "v0.50.0", &repo);
+        let result = run_hook(
+            &config,
+            "v0.50.0",
+            &repo,
+            &temp.path().join("state"),
+            RuntimeMode::Shipyard,
+            &temp.path().join("global"),
+        );
 
         assert_eq!(result.error, None);
         assert!(result.ran_command);
@@ -1618,7 +2511,14 @@ enabled = true
             ..HookConfig::default()
         };
 
-        let result = run_hook(&config, "nightly-2026-04-25", temp.path());
+        let result = run_hook(
+            &config,
+            "nightly-2026-04-25",
+            temp.path(),
+            &temp.path().join("state"),
+            RuntimeMode::Shipyard,
+            &temp.path().join("global"),
+        );
 
         assert!(!result.ran_command);
         assert_eq!(

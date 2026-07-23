@@ -60,6 +60,22 @@ cargo llvm-cov --locked --summary-only --fail-under-lines 75
 python3 -m pytest tools/sandbox-e2e/ -q
 ```
 
+For a release that changes merge-queue behavior, add these fleet gates:
+
+1. Set and verify a distinct runner tag on every machine.
+2. Configure one `[merge_queue].mutation_machine` in each host's trusted
+   machine-global `config.toml` reported by `shipyard paths`; prove every
+   other host refuses a mutation before invoking the GitHub client.
+3. Prove `shipyard merge-queue hold` blocks enqueue and dequeue, survives a
+   process restart, and reports the stored reason.
+4. Run concurrent same-repo/base mutation fixtures and verify only one writer
+   enters while `merge_queue/mutations.jsonl` records the winning correlation.
+5. Replay the incident timelines for stale head/base, ambiguous enqueue,
+   manual removal, `failed_checks`, `invalid_merge_commit`, and base advance.
+6. Install the same release on every fleet host and verify both
+   `shipyard --version` and the artifact checksum before activating the sole
+   authority.
+
 For release candidates, also validate the package/install path in an
 isolated sandbox:
 

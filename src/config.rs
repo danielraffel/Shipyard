@@ -40,6 +40,20 @@ pub struct LoadedConfig {
 }
 
 impl LoadedConfig {
+    /// Load only the trusted machine-global configuration layer.
+    ///
+    /// Security-sensitive machine policy must use this instead of the normal
+    /// layered loader because tracked and checkout-local configuration is
+    /// controlled by the repository being operated on.
+    pub fn load_machine_global(mode: RuntimeMode) -> ConfigResult<Self> {
+        Self::load_machine_global_from_dir(RuntimePaths::current(mode).global_dir)
+    }
+
+    /// Load only an explicitly resolved machine-global configuration layer.
+    pub fn load_machine_global_from_dir(global_dir: PathBuf) -> ConfigResult<Self> {
+        Self::load(Some(global_dir), None, None, LocalOverlaySource::None)
+    }
+
     /// Load and merge config layers for a given mode and directory.
     pub fn load_from_cwd(mode: RuntimeMode, cwd: &Path) -> ConfigResult<Self> {
         let identity = ProductIdentity::for_mode(mode);

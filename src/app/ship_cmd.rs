@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 
 use super::{
     CliFailure,
-    auto_merge_cmd::{AutoMergeOutcome, AutoMergeRequest, execute_auto_merge},
+    auto_merge_cmd::{
+        AutoMergeOutcome, AutoMergeRequest, execute_auto_merge, supervise_merge_queue,
+    },
     cli::{MergeMethod, MergeResult},
     wait_cmd::parse_github_repo_slug,
 };
@@ -27,7 +29,7 @@ use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
 use crate::lane_policy::{LanePolicy, resolve_lane_policy};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
-use crate::pr::{PrInfo, create_pr, find_pr_for_branch, push_branch};
+use crate::pr::{PrInfo, create_pr, find_pr_for_branch, get_pr_status, push_branch};
 use crate::pr_text::{compose_pr_body_with_policy, compose_pr_title};
 use crate::preflight::{
     EXIT_BACKEND_UNREACHABLE, EXIT_HOST_UNHEALTHY, ShipPreflightError, ShipPreflightOptions,
@@ -90,15 +92,7 @@ pub(super) fn ship_command<W: Write>(
         maybe_auto_create_base_branch(cwd, &args.base, config, args.gh_command.as_deref());
     }
     let lane_policy = resolve_lane_policy(config, cwd);
-    let pr_context = resolve_pr_context(
-        config,
-        args.pr,
-        &args.base,
-        cwd,
-        &branch,
-        args.gh_command.as_deref(),
-        &lane_policy,
-    )?;
+    let pr_context = resolve_pr_context(config, &args, cwd, &branch, &lane_policy)?;
 
     let mut queue = Queue::new(runtime_paths.state_dir.clone())
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -153,6 +147,11 @@ pub(super) fn ship_command<W: Write>(
         cwd,
         &ship_state,
         config,
+        if runtime_paths.mode == RuntimeMode::Isolated.as_str() {
+            RuntimeMode::Isolated
+        } else {
+            RuntimeMode::Shipyard
+        },
         &request.repo,
         outcome.job.passed(),
         args.merge_command,
@@ -421,27 +420,58 @@ struct ResolvedPrContext {
 
 fn resolve_pr_context(
     config: &LoadedConfig,
-    pr: Option<u64>,
-    base: &str,
+    args: &ShipCommandArgs,
     cwd: &Path,
     branch: &str,
-    gh_command: Option<&Path>,
     lane_policy: &LanePolicy,
 ) -> Result<ResolvedPrContext, CliFailure> {
-    if let Some(number) = pr {
+    if let Some(number) = args.pr {
+        if let Some(path) = args.pr_snapshot_file.as_deref() {
+            let value: Value = std::fs::read_to_string(path)
+                .map_err(|error| CliFailure::new(1, format!("failed to read PR snapshot: {error}")))
+                .and_then(|payload| {
+                    serde_json::from_str(&payload).map_err(|error| {
+                        CliFailure::new(1, format!("failed to parse PR snapshot: {error}"))
+                    })
+                })?;
+            let base_branch = value
+                .get("baseRefName")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| value.pointer("/base/ref").and_then(Value::as_str))
+                .unwrap_or(&args.base)
+                .to_owned();
+            return Ok(ResolvedPrContext {
+                number,
+                base_branch,
+                pr_url: None,
+                pr_title: None,
+            });
+        }
+        let info = get_pr_status(config, cwd, args.gh_command.as_deref(), &number.to_string())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return Ok(ResolvedPrContext {
             number,
-            base_branch: base.to_owned(),
-            pr_url: None,
-            pr_title: None,
+            base_branch: info.base,
+            pr_url: Some(info.url),
+            pr_title: Some(info.title),
         });
     }
 
     push_branch(cwd, branch).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let info = find_pr_for_branch(config, cwd, gh_command, branch)
+    let info = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), branch)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .map_or_else(
-            || create_current_branch_pr(config, cwd, gh_command, branch, base, lane_policy),
+            || {
+                create_current_branch_pr(
+                    config,
+                    cwd,
+                    args.gh_command.as_deref(),
+                    branch,
+                    &args.base,
+                    lane_policy,
+                )
+            },
             Ok::<PrInfo, CliFailure>,
         )?;
     Ok(ResolvedPrContext {
@@ -509,6 +539,7 @@ fn post_run_merge_state(
     cwd: &Path,
     store: &ShipStateStore,
     config: &LoadedConfig,
+    mode: RuntimeMode,
     repo: &str,
     validation_passed: bool,
     merge_command: Option<PathBuf>,
@@ -519,6 +550,8 @@ fn post_run_merge_state(
         return Ok(ShipRenderState::ValidationFailed);
     }
     let request = AutoMergeRequest {
+        mode,
+        global_dir: config.global_dir.clone(),
         pr,
         merge_method: MergeMethod::Squash,
         delete_branch: true,
@@ -532,6 +565,28 @@ fn post_run_merge_state(
     {
         AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
             Ok(ShipRenderState::Merged)
+        }
+        AutoMergeOutcome::Enqueued => {
+            match supervise_merge_queue(store, cwd, mode, &config.global_dir, pr, true) {
+                AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
+                    Ok(ShipRenderState::Merged)
+                }
+                AutoMergeOutcome::SupersededSha { validated, current } => {
+                    Ok(ShipRenderState::GreenNotMerged(format!(
+                        "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
+                    )))
+                }
+                AutoMergeOutcome::MergeFailed { error } => {
+                    Ok(ShipRenderState::GreenNotMerged(error))
+                }
+                AutoMergeOutcome::Enqueued
+                | AutoMergeOutcome::PrNotFound
+                | AutoMergeOutcome::InFlight { .. }
+                | AutoMergeOutcome::TargetFailed { .. } => Err(CliFailure::new(
+                    1,
+                    format!("PR #{pr}: merge-queue supervision ended without a terminal verdict"),
+                )),
+            }
         }
         AutoMergeOutcome::MergeFailed { error } => {
             Ok(classify_merge_failure(store, config, cwd, repo, pr, error))
@@ -1297,6 +1352,13 @@ mod tests {
             Some(temp.path().join("global")),
             Some(temp.path().join("state")),
         );
+        let head = git_capture(&["rev-parse", "HEAD"], &repo);
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"headRefOid":"{head}","baseRefName":"main"}}"#),
+        )
+        .expect("write snapshot");
         let mut stdout = Vec::new();
 
         let code = ship_command(
@@ -1309,7 +1371,7 @@ mod tests {
                 merge_command: None,
                 merge_result: Some(MergeResult::Success),
                 gh_command: None,
-                pr_snapshot_file: None,
+                pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
                 skip_targets: vec!["linux".to_owned()],
                 adopt_head: false,

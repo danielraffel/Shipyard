@@ -3,6 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0790"></a>
+## [0.79.0]
+
+- feat(merge): add queue-native exact-head handoff with fleet authority, authority-local hold, serialized writes, and durable mutation provenance
+- fix(merge): fail closed on uncertain admission, stale head/base authority, incomplete queue reads, and unsafe re-arm/revocation
+- migration(release-bot): merge-queue PR mode now requires machine-global authority policy and a dedicated authority runner; rerun `shipyard release-bot hook install` after configuring the fleet
+
 <a id="v0780"></a>
 ## [0.78.0] - 2026-07-21
 
@@ -695,6 +702,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.79.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.79.0
 [0.78.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.78.0
 [0.77.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.77.1
 [0.77.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.77.0

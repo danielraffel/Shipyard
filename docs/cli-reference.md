@@ -23,6 +23,9 @@ shipyard run command --target linux-vm --artifact 'build/linux-x64/lib/libv8.so'
 # Ship
 shipyard ship                  # PR → validate → merge on green
 shipyard ship --base develop   # target a different branch
+shipyard merge-queue status    # local mutation authority hold
+shipyard merge-queue hold --reason "incident"
+shipyard merge-queue resume
 
 # Monitor
 shipyard status                # dashboard: queue + targets + evidence
@@ -118,6 +121,27 @@ shipyard ci profile plan normal-local-fast --repo OWNER/REPO --json
 
 The envelope always carries `schema_version: 1` and the command name, so
 agents can pin to a stable contract.
+
+## Merge Queue Control
+
+`shipyard merge-queue hold` writes a durable machine-global sentinel and every
+Shipyard enqueue/dequeue path checks it before invoking GitHub. `resume`
+removes only that sentinel. It does not bypass
+`[merge_queue].mutation_machine` from the trusted machine-global `config.toml`
+reported by `shipyard paths`, which binds queue writes to the host whose stored
+runner tag matches the configured authority. Tracked project config and local
+checkout overlays cannot grant or redirect mutation authority.
+
+Every attempted write is serialized process-wide and recorded in
+`$SHIPYARD_STATE_DIR/merge_queue/mutations.jsonl`. A `started` record without a
+definitive `finished` result is classified under `uncertain_mutations` by
+`merge-queue status --json`, preserving the fail-closed retry boundary after a
+hard crash or transport ambiguity.
+
+An unresolved row blocks another mutation for the same repository, base, and
+PR. After checking GitHub's authoritative queue/timeline state, resolve it with
+`shipyard merge-queue resolve <correlation-id> --outcome accepted|rejected
+--reason "<evidence>"`.
 
 `shipyard ci profile plan` is provider-neutral and read-only. It parses a
 repo-owned TOML profile from `.tartci/`, `.shipyard/ci-profiles/`, or

@@ -31,6 +31,38 @@ go/no-go for that operation.
    execution. Its untrusted job VM has no virtual NIC; only the trusted
    controller talks to GitHub. Timer activation remains an operator decision.
 
+## Merge-queue ownership
+
+When GitHub's live branch queue or evaluated rules require a merge queue,
+Shipyard is a validator and queue supervisor, not a second merge authority. A
+passing `shipyard ship` calls GitHub's queue mutation with
+`expectedHeadOid=<validated SHA>` and waits for GitHub to merge it. The
+one-shot `shipyard auto-merge` returns exit 3 while queued and retains
+ship-state for later ticks.
+
+Never treat queue absence alone as permission to rearm. The PR must first have
+been observed in the queue (durably recorded across restarts), and only an
+`invalid_merge_commit` removal may be re-enqueued automatically. Failed checks,
+manual/unknown removal, head drift, malformed authority data, or a
+403/rate-limit response stop fail-closed.
+
+For fleets, configure exactly one mutation host in the trusted machine-global
+`config.toml` reported by `shipyard paths` (never in tracked project config):
+
+```toml
+[merge_queue]
+mutation_machine = "studio"
+```
+
+Each box must have its stable `shipyard runner tag`. Validation can execute on
+any host, but a non-authority host must fail before queue mutation. Use
+`shipyard merge-queue hold --reason "<incident>"` on the configured mutation
+machine as the authority stop and `shipyard merge-queue status` there to verify
+it. Propagate the hold to other hosts when consistent fleet status matters. Do
+not resume until the incident owner has restored the intended queue order.
+Queue writes are serialized process-wide and recorded in machine-global
+`merge_queue/mutations.jsonl`.
+
 ## Local/SSH VM Watch
 
 Use `shipyard watch local` for long target-backed jobs that are not GitHub

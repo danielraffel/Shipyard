@@ -28,6 +28,7 @@ mod doctor_cmd;
 mod fleet_status_cmd;
 mod governance_cmd;
 mod init_cmd;
+mod merge_queue_control_cmd;
 mod metrics_cmd;
 mod paths_cmd;
 mod pin_cmd;
@@ -68,6 +69,7 @@ use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
 use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
+use self::merge_queue_control_cmd::merge_queue_control_command;
 use self::metrics_cmd::metrics_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
@@ -180,7 +182,14 @@ fn dispatch<W: Write, E: Write>(
         | Command::Branch { .. }
         | Command::Governance { .. }
         | Command::ReleaseBot { .. }) => {
-            return handle_setup_command(command, cli.mode.into(), &cwd, cli.json, stdout);
+            return handle_setup_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
         }
         command @ (Command::Status
         | Command::Evidence { .. }
@@ -234,6 +243,17 @@ fn dispatch<W: Write, E: Write>(
                 cli.global_dir.clone(),
                 cli.state_dir.clone(),
                 &runtime_paths,
+                cli.json,
+                stdout,
+            );
+        }
+        Command::MergeQueue { command } => {
+            return merge_queue_control_command(
+                command,
+                &runtime_paths.state_dir,
+                &runtime_paths.global_dir,
+                &cwd,
+                cli.mode.into(),
                 cli.json,
                 stdout,
             );
@@ -292,7 +312,7 @@ fn handle_operational_variant<W: Write>(
         }
         command @ Command::Rescue(_) => handle_rescue_variant(command, mode, cwd, json, stdout),
         command @ Command::AutoMerge { .. } => {
-            handle_auto_merge_variant(command, &runtime_paths.state_dir, cwd, json, stdout)
+            handle_auto_merge_variant(command, mode, runtime_paths, cwd, json, stdout)
         }
         command @ Command::Watch { .. } => {
             handle_watch_variant(command, mode, &runtime_paths.state_dir, cwd, json, stdout)
@@ -301,7 +321,9 @@ fn handle_operational_variant<W: Write>(
             handle_ship_state_variant(&command, mode, cwd, &runtime_paths.state_dir, json, stdout)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Runner { command } => handle_runner_command(command, mode, cwd, json, stdout),
+        Command::Runner { command } => {
+            handle_runner_command(command, mode, cwd, &runtime_paths.state_dir, json, stdout)
+        }
         Command::Paths
         | Command::Pin { .. }
         | Command::Config { .. }
@@ -324,6 +346,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Quarantine { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }
+        | Command::MergeQueue { .. }
         | Command::Wait { .. }
         | Command::Update(_) => unreachable!("command handled by top-level dispatch"),
     }
@@ -348,6 +371,7 @@ fn handle_setup_command<W: Write>(
     command: Command,
     mode: RuntimeMode,
     cwd: &Path,
+    state_dir: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -356,7 +380,9 @@ fn handle_setup_command<W: Write>(
         Command::Changelog { command } => changelog_command(command, mode, cwd, json, stdout),
         Command::Branch { command } => branch_command(command, mode, cwd, json, stdout),
         Command::Governance { command } => governance_command(command, mode, cwd, json, stdout),
-        Command::ReleaseBot { command } => release_bot_command(command, mode, cwd, json, stdout),
+        Command::ReleaseBot { command } => {
+            release_bot_command(command, mode, cwd, state_dir, json, stdout)
+        }
         _ => unreachable!("setup command helper only receives setup commands"),
     }
 }
@@ -485,12 +511,13 @@ fn handle_runner_command<W: Write>(
     command: self::cli::RunnerCommand,
     mode: RuntimeMode,
     cwd: &Path,
+    state_dir: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let config = crate::config::LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    runner_command(command, mode, &config, cwd, json, stdout)
+    runner_command(command, &config, cwd, state_dir, json, stdout)
 }
 
 struct AutoMergeInvocation {
@@ -666,7 +693,8 @@ fn handle_cloud_variant<W: Write>(
 
 fn handle_auto_merge_variant<W: Write>(
     command: Command,
-    state_dir: &Path,
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
@@ -694,7 +722,9 @@ fn handle_auto_merge_variant<W: Write>(
             merge_command,
             merge_result,
         },
-        state_dir,
+        mode,
+        &runtime_paths.state_dir,
+        &runtime_paths.global_dir,
         cwd,
         json,
         stdout,
@@ -807,7 +837,9 @@ fn handle_cloud_command<W: Write>(
 
 fn handle_auto_merge<W: Write>(
     invocation: AutoMergeInvocation,
+    mode: RuntimeMode,
     state_dir: &Path,
+    global_dir: &Path,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
@@ -817,6 +849,8 @@ fn handle_auto_merge<W: Write>(
     auto_merge(
         &store,
         cwd,
+        mode,
+        global_dir,
         invocation.pr,
         invocation.merge_method,
         invocation.delete_branch,
@@ -2591,6 +2625,55 @@ mod tests {
         // State must stay active (not archived) so the new head can be
         // re-validated.
         assert!(store.get(42).is_some());
+        assert_eq!(store.list_archived().len(), 0);
+    }
+
+    #[test]
+    fn auto_merge_green_refuses_when_pr_is_retargeted_after_validation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        store
+            .save(&auto_merge_state(
+                43,
+                &[("macos", "pass"), ("linux", "pass")],
+            ))
+            .expect("save");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            format!(
+                r#"{{"headRefOid":"{}","baseRefName":"release"}}"#,
+                "a".repeat(40)
+            ),
+        )
+        .expect("write snapshot");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "auto-merge",
+            "43",
+            "--merge-result",
+            "success",
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["event"], "merge-failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("retargeted from validated base main to release")
+        );
+        assert!(store.get(43).is_some());
         assert_eq!(store.list_archived().len(), 0);
     }
 

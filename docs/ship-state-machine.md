@@ -397,6 +397,45 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
     never abandoned (counted as `raced`).
   - Config load fails in the daemon worker → the sweep no-ops for that pass.
 
+### T15 — Native merge-queue handoff
+
+- **From:** terminal passing ship-state for an OPEN PR on a base branch whose
+  live merge-queue object or evaluated repository rules require `merge_queue`
+- **To:** active ship-state plus a GitHub-native merge-queue entry; ultimately
+  archived ship-state only after GitHub reports the PR merged
+- **Trigger:** `shipyard ship` or the one-shot `shipyard auto-merge <pr>`
+- **Externals:** the configured `GhClient` reads the live branch merge-queue
+  object plus evaluated rules, then performs sparse GraphQL queue/PR polls and
+  calls `enqueuePullRequest(expectedHeadOid: <validated-sha>)`.
+- **Rules:** classic branches retain the direct merge path. Queue branches
+  never use the REST direct-merge fallback. The exact live head must equal the
+  validated SHA atomically on GitHub. `auto-merge` returns exit 3 while queued
+  and keeps state active; `ship` supervises until merge or a terminal queue
+  outcome.
+- **Eviction safety:** absence is actionable only after the PR was observed in
+  the queue and the enqueue settle window elapsed. Re-enqueue is allowed only
+  for `invalid_merge_commit`. `failed_checks`, manual/unknown removal, a
+  never-observed arm, malformed/truncated authority data, and head drift are
+  terminal without mutation. Observed membership and attempt timestamps are
+  durable across process restarts. HTTP 403/rate-limit responses are never
+  retried.
+- **Idempotency:** a later one-shot first polls the queue. An already queued PR
+  is not armed again; a terminal removal newer than the current ship-state is
+  not rearmed. A new validated head creates newer ship-state and may be armed.
+- **Fleet authority:** `[merge_queue].mutation_machine` is required in the
+  trusted machine-global `config.toml` reported by `shipyard paths`; tracked
+  project and checkout-local overlays are ignored. The machine-global runner
+  tag must match before any GraphQL mutation is started.
+  Queue writes are serialized with a machine-global lock shared by hold/resume,
+  so a successful hold waits out any admitted writer and no later writer can
+  pass the sentinel. Resume removes only the hold, not the authority policy.
+- **Provenance:** every mutation writes `started` and `finished` JSONL records
+  under `merge_queue/mutations.jsonl`, including correlation id, machine tag,
+  PID, repo, base, PR, validated head, action, and outcome. A normal unwind or
+  ambiguous transport result records `outcome=uncertain`; after hard
+  termination, `merge-queue status` classifies an unmatched `started` row as
+  uncertain. It is never silently converted into permission to retry.
+
 ## Diagnostic: orphan reporting (no transition)
 
 `STATE_IN_FLIGHT` has no self-healing exit when the owning process dies
