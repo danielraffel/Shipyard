@@ -474,6 +474,12 @@ fn merge_pr(
     if delete_branch && !queue_required {
         command.arg("--delete-branch");
     }
+    if admin && queue_required {
+        return Err(
+            "`--admin` cannot be used on a merge-queue-governed branch because it bypasses the queue"
+                .to_owned(),
+        );
+    }
     if admin {
         command.arg("--admin");
     }
@@ -538,8 +544,11 @@ fn queue_admission(
     cwd: &Path,
     state: &ShipState,
 ) -> Result<QueueAdmission, String> {
-    let body = fetch_queue_poll(client, cwd, state)?;
-    let observation = parse_pr_observation(&body)
+    let pages = fetch_queue_poll_pages(client, cwd, state)?;
+    let body = pages
+        .first()
+        .ok_or_else(|| "merge-queue admission returned no pages".to_owned())?;
+    let observation = parse_pr_observation(body)
         .map_err(|error| format!("merge-queue admission observation was malformed: {error}"))?;
     if !shas_match(&observation.head_sha, &state.head_sha) {
         return Err(format!(
@@ -550,7 +559,7 @@ fn queue_admission(
     if observation.merged {
         return Ok(QueueAdmission::AlreadyMerged);
     }
-    match parse_queue_snapshot(&body, state.pr) {
+    match crate::merge_queue::parse_queue_pages(&pages, state.pr) {
         crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found => {
             return Ok(QueueAdmission::AlreadyEnqueued);
         }
@@ -608,14 +617,19 @@ pub(super) fn supervise_merge_queue(
     };
     let started = Instant::now();
     let mut attempt_started = Instant::now();
+    let mut attempt_started_at = chrono::Utc::now();
     let mut seen_in_queue = false;
     let mut consecutive_errors = 0_u32;
 
     while started.elapsed() < QUEUE_WAIT_TIMEOUT {
-        match fetch_queue_poll(&client, cwd, &state) {
-            Ok(body) => {
-                consecutive_errors = 0;
-                let observation = match parse_pr_observation(&body) {
+        match fetch_queue_poll_pages(&client, cwd, &state) {
+            Ok(pages) => {
+                let Some(body) = pages.first() else {
+                    return AutoMergeOutcome::MergeFailed {
+                        error: "merge-queue poll returned no pages".to_owned(),
+                    };
+                };
+                let observation = match parse_pr_observation(body) {
                     Ok(observation) => observation,
                     Err(error) => {
                         return AutoMergeOutcome::MergeFailed {
@@ -640,7 +654,7 @@ pub(super) fn supervise_merge_queue(
                     };
                 }
 
-                let parsed = parse_queue_snapshot(&body, pr);
+                let parsed = crate::merge_queue::parse_queue_pages(&pages, pr);
                 let class = classify_poll(
                     &parsed,
                     &PollContext {
@@ -653,6 +667,7 @@ pub(super) fn supervise_merge_queue(
                 );
                 match class {
                     QueuePollClass::Enqueued { .. } => {
+                        consecutive_errors = 0;
                         if let crate::merge_queue::QueuePollParse::Valid(snapshot) = parsed
                             && snapshot.pr_found
                         {
@@ -660,11 +675,21 @@ pub(super) fn supervise_merge_queue(
                         }
                     }
                     QueuePollClass::Evicted => {
+                        consecutive_errors = 0;
                         let reason = observation.removal_reason.as_deref().unwrap_or("UNKNOWN");
-                        if !reason.eq_ignore_ascii_case("invalid_merge_commit") {
+                        let removal_is_current = observation
+                            .removal_at
+                            .as_deref()
+                            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                            .is_some_and(|removed| {
+                                removed.with_timezone(&chrono::Utc) >= attempt_started_at
+                            });
+                        if !reason.eq_ignore_ascii_case("invalid_merge_commit")
+                            || !removal_is_current
+                        {
                             return AutoMergeOutcome::MergeFailed {
                                 error: format!(
-                                    "merge queue removed PR #{pr} with terminal reason {reason}; refusing to re-enqueue"
+                                    "merge queue removed PR #{pr} with terminal or stale reason {reason}; refusing to re-enqueue"
                                 ),
                             };
                         }
@@ -673,6 +698,7 @@ pub(super) fn supervise_merge_queue(
                         }
                         seen_in_queue = false;
                         attempt_started = Instant::now();
+                        attempt_started_at = chrono::Utc::now();
                     }
                     QueuePollClass::PrNotFound => {
                         return AutoMergeOutcome::MergeFailed {
@@ -685,6 +711,13 @@ pub(super) fn supervise_merge_queue(
                         consecutive_errors = consecutive_errors.saturating_add(1);
                         if terminal_github_error(&reason) {
                             return AutoMergeOutcome::MergeFailed { error: reason };
+                        }
+                        if consecutive_errors >= DEFAULT_ERROR_BUDGET {
+                            return AutoMergeOutcome::MergeFailed {
+                                error: format!(
+                                    "merge-queue polling exhausted its malformed-response budget: {reason}"
+                                ),
+                            };
                         }
                     }
                     QueuePollClass::TimedOut => {
@@ -716,15 +749,21 @@ pub(super) fn supervise_merge_queue(
     }
 }
 
-fn fetch_queue_poll(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<Value, String> {
+fn fetch_queue_poll_pages(
+    client: &GhClient,
+    cwd: &Path,
+    state: &ShipState,
+) -> Result<Vec<Value>, String> {
     let (owner, name) = state
         .repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug {:?}", state.repo))?;
-    let query = r#"query($owner:String!,$name:String!,$branch:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){headRefOid merged timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100){nodes{position pullRequest{number}} pageInfo{hasNextPage}}}}}"#;
-    let mut command = gh(client, cwd)?;
-    let output = command
-        .args([
+    let query = r#"query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){headRefOid merged timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100,after:$after){nodes{position pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}"#;
+    let mut pages = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut command = gh(client, cwd)?;
+        command.args([
             "api",
             "graphql",
             "-f",
@@ -737,14 +776,44 @@ fn fetch_queue_poll(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<
             &format!("branch={}", state.base_branch),
             "-F",
             &format!("pr={}", state.pr),
-        ])
-        .output()
-        .map_err(|error| format!("failed to poll merge queue: {error}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        ]);
+        if let Some(after) = cursor.as_deref() {
+            command.args(["-F", &format!("after={after}")]);
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("failed to poll merge queue: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        let page: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("merge-queue poll returned invalid JSON: {error}"))?;
+        let parsed = parse_queue_snapshot(&page, state.pr);
+        pages.push(page);
+        if matches!(parsed, crate::merge_queue::QueuePollParse::Errored(_)) {
+            return Ok(pages);
+        }
+        let info = pages
+            .last()
+            .and_then(|page| page.pointer("/data/repository/mergeQueue/entries/pageInfo"))
+            .ok_or_else(|| "merge-queue page missing pageInfo".to_owned())?;
+        let has_next = info
+            .get("hasNextPage")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| "merge-queue page missing pageInfo.hasNextPage".to_owned())?;
+        if !has_next {
+            return Ok(pages);
+        }
+        cursor = Some(
+            info.get("endCursor")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "merge-queue page hasNextPage without a usable endCursor".to_owned()
+                })?
+                .to_owned(),
+        );
     }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("merge-queue poll returned invalid JSON: {error}"))
 }
 
 fn arm_native_queue(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<(), String> {
