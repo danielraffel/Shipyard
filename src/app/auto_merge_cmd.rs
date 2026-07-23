@@ -597,7 +597,7 @@ fn removal_blocks_rearm(
     if !event_present {
         return false;
     }
-    let (Some(reason), Some(removed_at)) = (reason, removed_at) else {
+    let (Some(_reason), Some(removed_at)) = (reason, removed_at) else {
         return true;
     };
     let Ok(removed) = chrono::DateTime::parse_from_rfc3339(removed_at) else {
@@ -606,7 +606,10 @@ fn removal_blocks_rearm(
     if removed.with_timezone(&chrono::Utc) < ship_created_at {
         return false;
     }
-    !reason.eq_ignore_ascii_case("invalid_merge_commit")
+    // Initial admission has not observed this queue attempt, so even GitHub's
+    // recoverable INVALID_MERGE_COMMIT reason is not authority to mutate it.
+    // The live supervisor is the sole re-enqueue path, after seen_in_queue.
+    true
 }
 
 /// Wait for GitHub's merge queue to land a previously armed PR.
@@ -876,6 +879,47 @@ fn repository_requires_merge_queue(
     repo: &str,
     base_branch: &str,
 ) -> Result<bool, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository slug {repo:?}"))?;
+    let query = r"query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){id}}}";
+    let mut queue_command = gh(client, cwd)?;
+    let queue_output = queue_command
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-F",
+            &format!("owner={owner}"),
+            "-F",
+            &format!("name={name}"),
+            "-F",
+            &format!("branch={base_branch}"),
+        ])
+        .output()
+        .map_err(|error| format!("failed to inspect branch merge queue: {error}"))?;
+    if !queue_output.status.success() {
+        let stderr = String::from_utf8_lossy(&queue_output.stderr)
+            .trim()
+            .to_owned();
+        return Err(format!(
+            "failed to inspect branch merge queue for {repo}:{base_branch}: {stderr}"
+        ));
+    }
+    let queue_body: Value = serde_json::from_slice(&queue_output.stdout)
+        .map_err(|error| format!("branch merge-queue query returned invalid JSON: {error}"))?;
+    let queue = queue_body
+        .pointer("/data/repository/mergeQueue")
+        .ok_or_else(|| "branch merge-queue query omitted repository authority".to_owned())?;
+    if !queue.is_null() {
+        return Ok(true);
+    }
+
+    // Retain evaluated-rules inspection as a fail-closed governance cross-check.
+    // The mergeQueue object above is what covers both rulesets and classic
+    // branch-protection queues; rules are still useful when GitHub has not yet
+    // materialized that object.
     let mut command = gh(client, cwd)?;
     let branch = encode_path_segment(base_branch);
     let endpoint = format!("repos/{repo}/rules/branches/{branch}?per_page=100");
@@ -1364,7 +1408,7 @@ mod tests {
             Some("2026-07-23T12:01:00Z"),
             ship_created,
         ));
-        assert!(!removal_blocks_rearm(
+        assert!(removal_blocks_rearm(
             true,
             Some("invalid_merge_commit"),
             Some("2026-07-23T12:01:00Z"),
