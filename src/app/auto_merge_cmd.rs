@@ -1272,15 +1272,18 @@ fn merge_pr_rest(
         Err(error) => return Err(error),
     }
 
-    if delete_branch {
-        let _ = delete_head_branch(client, cwd, &repo, &info.head_ref);
+    if delete_branch && let Some(head_repo) = info.head_repo.as_deref() {
+        let _ = delete_head_branch(client, cwd, head_repo, &info.head_ref, expected_head_sha);
     }
     Ok(())
 }
 
 fn delete_pr_head_branch(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<(), String> {
     let info = pr_head_info_rest(client, &state.repo, state.pr, cwd)?;
-    delete_head_branch(client, cwd, &state.repo, &info.head_ref)
+    let Some(head_repo) = info.head_repo.as_deref() else {
+        return Ok(());
+    };
+    delete_head_branch(client, cwd, head_repo, &info.head_ref, &state.head_sha)
 }
 
 fn delete_head_branch(
@@ -1288,14 +1291,41 @@ fn delete_head_branch(
     cwd: &Path,
     repo: &str,
     head_ref: &str,
+    expected_sha: &str,
 ) -> Result<(), String> {
+    let endpoint = format!("repos/{repo}/git/ref/heads/{head_ref}");
+    let probe = gh(client, cwd)?
+        .args(["api", &endpoint])
+        .output()
+        .map_err(|error| format!("failed to inspect merged PR branch {head_ref}: {error}"))?;
+    if !probe.status.success() {
+        let stderr = String::from_utf8_lossy(&probe.stderr).trim().to_owned();
+        if stderr.contains("404")
+            || stderr
+                .to_ascii_lowercase()
+                .contains("reference does not exist")
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "PR merged but failed to inspect branch {repo}:{head_ref}: {stderr}"
+        ));
+    }
+    let value: Value = serde_json::from_slice(&probe.stdout)
+        .map_err(|error| format!("failed to parse branch ref {repo}:{head_ref}: {error}"))?;
+    let current_sha = value
+        .pointer("/object/sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("branch ref {repo}:{head_ref} omitted object.sha"))?;
+    if !shas_match(current_sha, expected_sha) {
+        return Err(format!(
+            "PR merged but branch {repo}:{head_ref} advanced from validated SHA {} to {}; refusing to delete it",
+            short_sha(expected_sha),
+            short_sha(current_sha)
+        ));
+    }
     let output = gh(client, cwd)?
-        .args([
-            "api",
-            "-X",
-            "DELETE",
-            &format!("repos/{repo}/git/refs/heads/{head_ref}"),
-        ])
+        .args(["api", "-X", "DELETE", &endpoint])
         .output()
         .map_err(|error| format!("failed to delete merged PR branch {head_ref}: {error}"))?;
     if output.status.success() {
@@ -1366,6 +1396,7 @@ fn short_sha(sha: &str) -> &str {
 /// Subset of the PR REST payload that the REST merge path needs.
 struct PrHeadInfo {
     head_ref: String,
+    head_repo: Option<String>,
     sha: String,
 }
 
@@ -1395,12 +1426,22 @@ fn pr_head_info_rest(
         .and_then(Value::as_str)
         .ok_or_else(|| "REST fallback: PR JSON missing head.ref".to_owned())?
         .to_owned();
+    let head_repo = head
+        .get("repo")
+        .and_then(|repo| repo.get("full_name"))
+        .and_then(Value::as_str)
+        .filter(|repo| !repo.is_empty())
+        .map(str::to_owned);
     let sha = head
         .get("sha")
         .and_then(Value::as_str)
         .ok_or_else(|| "REST fallback: PR JSON missing head.sha".to_owned())?
         .to_owned();
-    Ok(PrHeadInfo { head_ref, sha })
+    Ok(PrHeadInfo {
+        head_ref,
+        head_repo,
+        sha,
+    })
 }
 
 fn repo_slug_for_rest(cwd: &Path) -> Result<String, String> {
