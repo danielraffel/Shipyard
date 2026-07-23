@@ -699,6 +699,17 @@ fn queue_admission(
             state.pr
         ));
     }
+    if !queue_absence_allows_arm(
+        observation.removal_event_present,
+        observation.removal_reason.as_deref(),
+        observation.removal_at.as_deref(),
+        state,
+    ) {
+        return Err(format!(
+            "merge queue no longer contains PR #{} after Shipyard previously admitted it; refusing to re-arm without an observed recoverable eviction",
+            state.pr
+        ));
+    }
     Ok(QueueAdmission::Arm {
         pr_id: observation.id,
     })
@@ -726,11 +737,42 @@ fn removal_blocks_rearm(
     if removed < attempt_started {
         return false;
     }
-    let recoverable_observed_eviction = reason.eq_ignore_ascii_case("invalid_merge_commit")
+    !removal_authorizes_rearm(event_present, Some(reason), Some(removed_at), state)
+}
+
+fn removal_authorizes_rearm(
+    event_present: bool,
+    reason: Option<&str>,
+    removed_at: Option<&str>,
+    state: &ShipState,
+) -> bool {
+    if !event_present {
+        return false;
+    }
+    let (Some(reason), Some(removed_at)) = (reason, removed_at) else {
+        return false;
+    };
+    let Ok(removed) = chrono::DateTime::parse_from_rfc3339(removed_at) else {
+        return false;
+    };
+    let removed = removed.with_timezone(&chrono::Utc);
+    let attempt_started = state
+        .merge_queue_attempt_started_at
+        .unwrap_or(state.created_at);
+    reason.eq_ignore_ascii_case("invalid_merge_commit")
         && state
             .merge_queue_observed_at
-            .is_some_and(|observed| observed >= attempt_started && removed >= observed);
-    !recoverable_observed_eviction
+            .is_some_and(|observed| observed >= attempt_started && removed >= observed)
+}
+
+fn queue_absence_allows_arm(
+    event_present: bool,
+    reason: Option<&str>,
+    removed_at: Option<&str>,
+    state: &ShipState,
+) -> bool {
+    !owns_native_merge_authority(state)
+        || removal_authorizes_rearm(event_present, reason, removed_at, state)
 }
 
 fn owns_native_merge_authority(state: &ShipState) -> bool {
@@ -2065,6 +2107,40 @@ mod tests {
         state.merge_queue_enqueue_succeeded_at = None;
         state.merge_queue_observed_at = Some(chrono::Utc::now());
         assert!(owns_native_merge_authority(&state));
+    }
+
+    #[test]
+    fn prior_queue_authority_requires_observed_recoverable_eviction_to_rearm() {
+        let attempt = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+            .expect("attempt")
+            .with_timezone(&chrono::Utc);
+        let observed = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:30Z")
+            .expect("observed")
+            .with_timezone(&chrono::Utc);
+        let mut state = ShipState::new(9, "owner/repo", "feature/x", "main", "abc", "policy");
+        assert!(queue_absence_allows_arm(false, None, None, &state));
+
+        state.merge_queue_attempt_started_at = Some(attempt);
+        state.merge_queue_observed_at = Some(observed);
+        assert!(!queue_absence_allows_arm(false, None, None, &state));
+        assert!(!queue_absence_allows_arm(
+            true,
+            Some("MANUAL"),
+            Some("2026-07-23T12:01:00Z"),
+            &state,
+        ));
+        assert!(!queue_absence_allows_arm(
+            true,
+            Some("INVALID_MERGE_COMMIT"),
+            Some("2026-07-23T12:00:20Z"),
+            &state,
+        ));
+        assert!(queue_absence_allows_arm(
+            true,
+            Some("INVALID_MERGE_COMMIT"),
+            Some("2026-07-23T12:01:00Z"),
+            &state,
+        ));
     }
 
     #[test]
