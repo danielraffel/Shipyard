@@ -535,7 +535,7 @@ fn post_run_merge_state(
         AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
             Ok(ShipRenderState::Merged)
         }
-        AutoMergeOutcome::Enqueued => match supervise_merge_queue(store, cwd, pr) {
+        AutoMergeOutcome::Enqueued => match supervise_merge_queue(store, cwd, pr, true) {
             AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
                 Ok(ShipRenderState::Merged)
             }

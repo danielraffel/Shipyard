@@ -121,9 +121,14 @@ pub(super) fn execute_auto_merge(
             //
             // Fail closed: if the live head cannot be verified, do NOT merge
             // blind — report a merge failure instead.
-            match fetch_live_head_sha(request.pr, cwd, request.pr_snapshot_file.as_deref()) {
-                Some(live_head) => {
-                    if !shas_match(&live_head, &state.head_sha) {
+            match fetch_live_pr_target(
+                request.pr,
+                cwd,
+                request.pr_snapshot_file.as_deref(),
+                &state.base_branch,
+            ) {
+                Some(live_pr) => {
+                    if !shas_match(&live_pr.head_sha, &state.head_sha) {
                         // Snapshot-backed execution is the deterministic test
                         // seam and has no live GitHub authority to revoke.
                         if request.pr_snapshot_file.is_none()
@@ -131,20 +136,26 @@ pub(super) fn execute_auto_merge(
                         {
                             return Ok(AutoMergeOutcome::MergeFailed {
                                 error: format!(
-                                    "live PR head {live_head} superseded validated SHA {}, but native merge revocation failed: {error}",
-                                    state.head_sha
+                                    "live PR head {} superseded validated SHA {}, but native merge revocation failed: {error}",
+                                    live_pr.head_sha, state.head_sha
                                 ),
                             });
                         }
                         return Ok(AutoMergeOutcome::SupersededSha {
                             validated: state.head_sha.clone(),
-                            current: live_head,
+                            current: live_pr.head_sha,
                         });
                     }
+                    // `ship --pr N` historically recorded the CLI's default
+                    // base rather than the PR's target, and a PR may be
+                    // retargeted while validation runs. Queue governance and
+                    // every subsequent queue poll must follow GitHub's live
+                    // target branch, not that stale hint.
+                    state.base_branch = live_pr.base_branch;
                 }
                 None => {
                     return Ok(AutoMergeOutcome::MergeFailed {
-                        error: "failed to verify live PR head before merge".to_owned(),
+                        error: "failed to verify live PR head and base before merge".to_owned(),
                     });
                 }
             }
@@ -348,16 +359,26 @@ fn pr_is_merged(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> bool {
         .is_some_and(|state| state.eq_ignore_ascii_case("merged"))
 }
 
-/// Fetch the live PR head SHA for the merge preflight (issue #321).
+struct LivePrTarget {
+    head_sha: String,
+    base_branch: String,
+}
+
+/// Fetch the live PR head SHA and base branch for the merge preflight.
 ///
-/// Returns `Some(full_sha)` when the head can be verified, `None` when it
-/// cannot (so the caller can fail closed rather than merge a stale SHA).
+/// Both values are authoritative: the head protects validated evidence and
+/// the base selects the correct merge-governance path.
 ///
 /// Reuses the same `--pr-snapshot-file` injection seam as `pr_is_merged`,
 /// accepting either the GraphQL `gh pr view --json` shape (`headRefOid`)
-/// or the REST `gh api repos/:r/pulls/:n` shape (`head.sha`) so tests can
-/// inject either. With no snapshot file it fetches the PR over REST.
-fn fetch_live_head_sha(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> Option<String> {
+/// or the REST `gh api repos/:r/pulls/:n` shape (`head.sha`, `base.ref`) so
+/// tests can inject either. With no snapshot file it fetches the PR over REST.
+fn fetch_live_pr_target(
+    pr: u64,
+    cwd: &Path,
+    snapshot_file: Option<&Path>,
+    snapshot_base_fallback: &str,
+) -> Option<LivePrTarget> {
     let payload = if let Some(path) = snapshot_file {
         std::fs::read_to_string(path).ok()?
     } else {
@@ -374,7 +395,18 @@ fn fetch_live_head_sha(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> Opt
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
     let value = serde_json::from_str::<Value>(&payload).ok()?;
-    head_sha_from_value(&value)
+    let base_branch = base_branch_from_value(&value).or_else(|| {
+        // Older deterministic fixtures only supplied the head. They do not
+        // represent live GitHub authority, so retaining their seeded base is
+        // safe while production REST responses remain fail-closed.
+        snapshot_file
+            .is_some()
+            .then(|| snapshot_base_fallback.to_owned())
+    })?;
+    Some(LivePrTarget {
+        head_sha: head_sha_from_value(&value)?,
+        base_branch,
+    })
 }
 
 /// Extract a head SHA from either the GraphQL (`headRefOid`) or the REST
@@ -392,6 +424,21 @@ fn head_sha_from_value(value: &Value) -> Option<String> {
         .and_then(|head| head.get("sha"))
         .and_then(Value::as_str)
         .filter(|sha| !sha.is_empty())
+        .map(str::to_owned)
+}
+
+fn base_branch_from_value(value: &Value) -> Option<String> {
+    value
+        .get("baseRefName")
+        .and_then(Value::as_str)
+        .filter(|base| !base.is_empty())
+        .or_else(|| {
+            value
+                .get("base")
+                .and_then(|base| base.get("ref"))
+                .and_then(Value::as_str)
+                .filter(|base| !base.is_empty())
+        })
         .map(str::to_owned)
 }
 
@@ -673,6 +720,7 @@ pub(super) fn supervise_merge_queue(
     store: &ShipStateStore,
     cwd: &Path,
     pr: u64,
+    delete_branch: bool,
 ) -> AutoMergeOutcome {
     let Some(mut state) = store.get(pr) else {
         return AutoMergeOutcome::PrNotFound;
@@ -707,6 +755,9 @@ pub(super) fn supervise_merge_queue(
                     }
                 };
                 let parsed = crate::merge_queue::parse_queue_pages(&pages, pr);
+                if matches!(&parsed, crate::merge_queue::QueuePollParse::Valid(_)) {
+                    consecutive_errors = 0;
+                }
                 if !shas_match(&observation.head_sha, &state.head_sha) {
                     let queued = matches!(
                         &parsed,
@@ -726,14 +777,17 @@ pub(super) fn supervise_merge_queue(
                     };
                 }
                 if observation.merged {
+                    let cleanup_warning = if delete_branch {
+                        delete_pr_head_branch(&client, cwd, &state).err()
+                    } else {
+                        None
+                    };
                     if let Err(error) = store.archive(pr) {
                         return AutoMergeOutcome::MergeFailed {
                             error: format!("PR merged but ship-state archive failed: {error}"),
                         };
                     }
-                    return AutoMergeOutcome::Merged {
-                        cleanup_warning: None,
-                    };
+                    return AutoMergeOutcome::Merged { cleanup_warning };
                 }
 
                 let class = classify_poll(
@@ -1219,20 +1273,45 @@ fn merge_pr_rest(
     }
 
     if delete_branch {
-        // Best-effort delete; mirrors `gh pr merge --delete-branch` which
-        // also tolerates a missing branch silently.
-        if let Ok(mut command) = gh(client, cwd) {
-            let _ = command
-                .args([
-                    "api",
-                    "-X",
-                    "DELETE",
-                    &format!("repos/{repo}/git/refs/heads/{}", info.head_ref),
-                ])
-                .status();
-        }
+        let _ = delete_head_branch(client, cwd, &repo, &info.head_ref);
     }
     Ok(())
+}
+
+fn delete_pr_head_branch(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<(), String> {
+    let info = pr_head_info_rest(client, &state.repo, state.pr, cwd)?;
+    delete_head_branch(client, cwd, &state.repo, &info.head_ref)
+}
+
+fn delete_head_branch(
+    client: &GhClient,
+    cwd: &Path,
+    repo: &str,
+    head_ref: &str,
+) -> Result<(), String> {
+    let output = gh(client, cwd)?
+        .args([
+            "api",
+            "-X",
+            "DELETE",
+            &format!("repos/{repo}/git/refs/heads/{head_ref}"),
+        ])
+        .output()
+        .map_err(|error| format!("failed to delete merged PR branch {head_ref}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if stderr.contains("404")
+        || stderr
+            .to_ascii_lowercase()
+            .contains("reference does not exist")
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "PR merged but failed to delete branch {head_ref}: {stderr}"
+    ))
 }
 
 /// Issue the PUT /repos/:r/pulls/:n/merge call with the merge method
@@ -1550,6 +1629,19 @@ mod tests {
             head_sha_from_value(&serde_json::json!({ "head": { "sha": "" } })),
             None
         );
+    }
+
+    #[test]
+    fn base_branch_from_value_reads_graphql_and_rest_shapes() {
+        assert_eq!(
+            base_branch_from_value(&serde_json::json!({ "baseRefName": "release" })),
+            Some("release".to_owned())
+        );
+        assert_eq!(
+            base_branch_from_value(&serde_json::json!({ "base": { "ref": "main" } })),
+            Some("main".to_owned())
+        );
+        assert_eq!(base_branch_from_value(&serde_json::json!({})), None);
     }
 
     #[test]
