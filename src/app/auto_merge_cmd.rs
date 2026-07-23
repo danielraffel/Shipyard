@@ -678,7 +678,13 @@ fn queue_admission(
         crate::merge_queue::QueuePollParse::Valid(_) => {}
     }
     if observation.auto_merge_active {
-        return Ok(QueueAdmission::AutoMergePending);
+        if auto_merge_has_exact_head_proof(state) {
+            return Ok(QueueAdmission::AutoMergePending);
+        }
+        return Err(format!(
+            "PR #{} has pre-existing auto-merge authority that Shipyard cannot prove was bound to validated SHA {}; refusing to adopt it",
+            state.pr, state.head_sha
+        ));
     }
 
     if removal_blocks_rearm(
@@ -729,6 +735,10 @@ fn removal_blocks_rearm(
 
 fn owns_native_merge_authority(state: &ShipState) -> bool {
     state.merge_queue_enqueue_succeeded_at.is_some() || state.merge_queue_observed_at.is_some()
+}
+
+fn auto_merge_has_exact_head_proof(state: &ShipState) -> bool {
+    state.merge_queue_enqueue_succeeded_at.is_some()
 }
 
 fn record_observed_queue_adoption(
@@ -935,8 +945,15 @@ pub(super) fn supervise_merge_queue(
                     }
                     QueuePollClass::PrNotFound => {
                         if observation.auto_merge_active {
-                            thread::sleep(QUEUE_POLL_INTERVAL);
-                            continue;
+                            if auto_merge_has_exact_head_proof(&state) {
+                                thread::sleep(QUEUE_POLL_INTERVAL);
+                                continue;
+                            }
+                            return AutoMergeOutcome::MergeFailed {
+                                error: format!(
+                                    "PR #{pr} has unowned auto-merge authority without durable exact-head enqueue proof; refusing to supervise it"
+                                ),
+                            };
                         }
                         if state.merge_queue_enqueue_succeeded_at.is_some() {
                             return AutoMergeOutcome::MergeFailed {
@@ -2038,10 +2055,13 @@ mod tests {
     fn native_merge_authority_requires_enqueue_or_observation() {
         let mut state = ShipState::new(9, "owner/repo", "feature/x", "main", "abc", "policy");
         assert!(!owns_native_merge_authority(&state));
+        assert!(!auto_merge_has_exact_head_proof(&state));
         state.merge_queue_attempt_started_at = Some(chrono::Utc::now());
         assert!(!owns_native_merge_authority(&state));
+        assert!(!auto_merge_has_exact_head_proof(&state));
         state.merge_queue_enqueue_succeeded_at = Some(chrono::Utc::now());
         assert!(owns_native_merge_authority(&state));
+        assert!(auto_merge_has_exact_head_proof(&state));
         state.merge_queue_enqueue_succeeded_at = None;
         state.merge_queue_observed_at = Some(chrono::Utc::now());
         assert!(owns_native_merge_authority(&state));
