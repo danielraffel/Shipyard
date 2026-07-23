@@ -135,6 +135,7 @@ pub(super) fn execute_auto_merge(
                         // Snapshot-backed execution is the deterministic test
                         // seam and has no live GitHub authority to revoke.
                         if request.pr_snapshot_file.is_none()
+                            && owns_native_merge_authority(&state)
                             && let Err(error) = revoke_drifted_native_merge(cwd, &state)
                         {
                             return Ok(AutoMergeOutcome::MergeFailed {
@@ -522,6 +523,7 @@ fn merge_pr(
                     .to_owned(),
             );
         }
+        let admission_started_at = chrono::Utc::now();
         match queue_admission(
             client
                 .as_ref()
@@ -545,19 +547,11 @@ fn merge_pr(
                 return Ok(MergeDisposition::Merged { cleanup_warning });
             }
             QueueAdmission::AlreadyQueued => {
-                let now = chrono::Utc::now();
-                state.merge_queue_attempt_started_at = Some(now);
-                state.merge_queue_observed_at = Some(now);
-                state.merge_queue_enqueue_succeeded_at = Some(now);
-                state.touch();
+                record_observed_queue_adoption(state, admission_started_at);
                 return Ok(MergeDisposition::Enqueued);
             }
             QueueAdmission::AutoMergePending => {
-                state
-                    .merge_queue_attempt_started_at
-                    .get_or_insert_with(chrono::Utc::now);
-                state.merge_queue_enqueue_succeeded_at = None;
-                state.touch();
+                record_pending_auto_merge(state, admission_started_at);
                 return Ok(MergeDisposition::Enqueued);
             }
             QueueAdmission::Arm { pr_id } => {
@@ -732,6 +726,36 @@ fn removal_blocks_rearm(
             .merge_queue_observed_at
             .is_some_and(|observed| observed >= attempt_started && removed >= observed);
     !recoverable_observed_eviction
+}
+
+fn owns_native_merge_authority(state: &ShipState) -> bool {
+    state.merge_queue_enqueue_succeeded_at.is_some() || state.merge_queue_observed_at.is_some()
+}
+
+fn record_observed_queue_adoption(
+    state: &mut ShipState,
+    admission_started_at: chrono::DateTime<chrono::Utc>,
+) {
+    state
+        .merge_queue_attempt_started_at
+        .get_or_insert(admission_started_at);
+    state
+        .merge_queue_observed_at
+        .get_or_insert(admission_started_at);
+    state.touch();
+}
+
+fn record_pending_auto_merge(
+    state: &mut ShipState,
+    admission_started_at: chrono::DateTime<chrono::Utc>,
+) {
+    state
+        .merge_queue_attempt_started_at
+        .get_or_insert(admission_started_at);
+    // Preserve exact-head enqueue evidence from an earlier one-shot. A
+    // pending auto-merge observation can be the eventual-consistency window
+    // after that successful mutation.
+    state.touch();
 }
 
 /// Wait for GitHub's merge queue to land a previously armed PR.
@@ -1966,6 +1990,56 @@ mod tests {
             attempt,
             None,
         ));
+    }
+
+    #[test]
+    fn native_merge_authority_requires_enqueue_or_observation() {
+        let mut state = ShipState::new(9, "owner/repo", "feature/x", "main", "abc", "policy");
+        assert!(!owns_native_merge_authority(&state));
+        state.merge_queue_attempt_started_at = Some(chrono::Utc::now());
+        assert!(!owns_native_merge_authority(&state));
+        state.merge_queue_enqueue_succeeded_at = Some(chrono::Utc::now());
+        assert!(owns_native_merge_authority(&state));
+        state.merge_queue_enqueue_succeeded_at = None;
+        state.merge_queue_observed_at = Some(chrono::Utc::now());
+        assert!(owns_native_merge_authority(&state));
+    }
+
+    #[test]
+    fn repeated_queue_adoption_preserves_original_authority_times() {
+        let first = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+            .expect("first")
+            .with_timezone(&chrono::Utc);
+        let later = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:05:00Z")
+            .expect("later")
+            .with_timezone(&chrono::Utc);
+        let mut state = ShipState::new(10, "owner/repo", "feature/x", "main", "abc", "policy");
+        record_observed_queue_adoption(&mut state, first);
+        record_observed_queue_adoption(&mut state, later);
+        assert_eq!(state.merge_queue_attempt_started_at, Some(first));
+        assert_eq!(state.merge_queue_observed_at, Some(first));
+        assert_eq!(state.merge_queue_enqueue_succeeded_at, None);
+    }
+
+    #[test]
+    fn pending_auto_merge_preserves_successful_enqueue_evidence() {
+        let first = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+            .expect("first")
+            .with_timezone(&chrono::Utc);
+        let later = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:05:00Z")
+            .expect("later")
+            .with_timezone(&chrono::Utc);
+        let mut state = ShipState::new(11, "owner/repo", "feature/x", "main", "abc", "policy");
+        state.merge_queue_attempt_started_at = Some(first);
+        state.merge_queue_enqueue_succeeded_at = Some(first);
+        record_pending_auto_merge(&mut state, later);
+        assert_eq!(state.merge_queue_attempt_started_at, Some(first));
+        assert_eq!(state.merge_queue_enqueue_succeeded_at, Some(first));
+
+        let mut external = ShipState::new(12, "owner/repo", "feature/y", "main", "def", "policy");
+        record_pending_auto_merge(&mut external, later);
+        assert_eq!(external.merge_queue_attempt_started_at, Some(later));
+        assert_eq!(external.merge_queue_enqueue_succeeded_at, None);
     }
 
     #[test]
