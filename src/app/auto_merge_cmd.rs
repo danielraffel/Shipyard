@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -858,13 +858,11 @@ pub(super) fn supervise_merge_queue(
                     QueuePollClass::Evicted => {
                         consecutive_errors = 0;
                         let reason = observation.removal_reason.as_deref().unwrap_or("UNKNOWN");
-                        let removal_is_current = observation
-                            .removal_at
-                            .as_deref()
-                            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                            .is_some_and(|removed| {
-                                removed.with_timezone(&chrono::Utc) >= attempt_started_at
-                            });
+                        let removal_is_current = removal_follows_queue_observation(
+                            observation.removal_at.as_deref(),
+                            attempt_started_at,
+                            state.merge_queue_observed_at,
+                        );
                         if !reason.eq_ignore_ascii_case("invalid_merge_commit")
                             || !removal_is_current
                         {
@@ -1060,6 +1058,7 @@ fn fetch_queue_poll_pages(
     let query = r"query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){id headRefOid merged autoMergeRequest{id} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100,after:$after){nodes{position pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
     let mut pages = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
     loop {
         let mut command = gh(client, cwd)?;
         command.args([
@@ -1096,23 +1095,49 @@ fn fetch_queue_poll_pages(
             .last()
             .and_then(|page| page.pointer("/data/repository/mergeQueue/entries/pageInfo"))
             .ok_or_else(|| "merge-queue page missing pageInfo".to_owned())?;
-        let has_next = info
-            .get("hasNextPage")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| "merge-queue page missing pageInfo.hasNextPage".to_owned())?;
-        if !has_next {
+        let Some(next_cursor) = advance_queue_cursor(info, &mut seen_cursors)? else {
             return Ok(pages);
-        }
-        cursor = Some(
-            info.get("endCursor")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    "merge-queue page hasNextPage without a usable endCursor".to_owned()
-                })?
-                .to_owned(),
-        );
+        };
+        cursor = Some(next_cursor);
     }
+}
+
+fn advance_queue_cursor(
+    page_info: &Value,
+    seen: &mut BTreeSet<String>,
+) -> Result<Option<String>, String> {
+    let has_next = page_info
+        .get("hasNextPage")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "merge-queue page missing pageInfo.hasNextPage".to_owned())?;
+    if !has_next {
+        return Ok(None);
+    }
+    let next = page_info
+        .get("endCursor")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "merge-queue page hasNextPage without a usable endCursor".to_owned())?
+        .to_owned();
+    if !seen.insert(next.clone()) {
+        return Err(format!(
+            "merge-queue pagination repeated cursor {next}; refusing an unbounded poll"
+        ));
+    }
+    Ok(Some(next))
+}
+
+fn removal_follows_queue_observation(
+    removed_at: Option<&str>,
+    attempt_started_at: chrono::DateTime<chrono::Utc>,
+    observed_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    removed_at
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|removed| {
+            let removed = removed.with_timezone(&chrono::Utc);
+            removed >= attempt_started_at && observed_at.is_some_and(|observed| removed >= observed)
+        })
 }
 
 fn arm_native_queue(
@@ -1402,54 +1427,28 @@ fn delete_head_branch(
     head_ref: &str,
     expected_sha: &str,
 ) -> Result<(), String> {
-    let endpoint = format!("repos/{repo}/git/ref/heads/{head_ref}");
-    let probe = gh(client, cwd)?
-        .args(["api", &endpoint])
-        .output()
-        .map_err(|error| format!("failed to inspect merged PR branch {head_ref}: {error}"))?;
-    if !probe.status.success() {
-        let stderr = String::from_utf8_lossy(&probe.stderr).trim().to_owned();
-        if stderr.contains("404")
-            || stderr
-                .to_ascii_lowercase()
-                .contains("reference does not exist")
-        {
-            return Ok(());
-        }
-        return Err(format!(
-            "PR merged but failed to inspect branch {repo}:{head_ref}: {stderr}"
-        ));
-    }
-    let value: Value = serde_json::from_slice(&probe.stdout)
-        .map_err(|error| format!("failed to parse branch ref {repo}:{head_ref}: {error}"))?;
-    let current_sha = value
-        .pointer("/object/sha")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("branch ref {repo}:{head_ref} omitted object.sha"))?;
-    if !shas_match(current_sha, expected_sha) {
-        return Err(format!(
-            "PR merged but branch {repo}:{head_ref} advanced from validated SHA {} to {}; refusing to delete it",
-            short_sha(expected_sha),
-            short_sha(current_sha)
-        ));
-    }
-    let output = gh(client, cwd)?
-        .args(["api", "-X", "DELETE", &endpoint])
+    let output = client
+        .prepare_git_command(cwd)
+        .map_err(|error| format!("failed to prepare authenticated git cleanup: {error}"))?
+        .args([
+            "push",
+            &format!("--force-with-lease=refs/heads/{head_ref}:{expected_sha}"),
+            &format!("https://github.com/{repo}.git"),
+            &format!(":refs/heads/{head_ref}"),
+        ])
         .output()
         .map_err(|error| format!("failed to delete merged PR branch {head_ref}: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if stderr.contains("404")
-        || stderr
-            .to_ascii_lowercase()
-            .contains("reference does not exist")
-    {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("remote ref does not exist") || lower.contains("couldn't find remote ref") {
         return Ok(());
     }
     Err(format!(
-        "PR merged but failed to delete branch {head_ref}: {stderr}"
+        "PR merged but failed to atomically delete branch {repo}:{head_ref} at validated SHA {}: {stderr}",
+        short_sha(expected_sha)
     ))
 }
 
@@ -1941,6 +1940,53 @@ mod tests {
         assert_eq!(
             store.get(8).expect("newer state remains active").head_sha,
             "new"
+        );
+    }
+
+    #[test]
+    fn queue_removal_must_follow_persisted_observation() {
+        let attempt = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+            .expect("attempt")
+            .with_timezone(&chrono::Utc);
+        let observed = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:30Z")
+            .expect("observed")
+            .with_timezone(&chrono::Utc);
+        assert!(!removal_follows_queue_observation(
+            Some("2026-07-23T12:00:20Z"),
+            attempt,
+            Some(observed),
+        ));
+        assert!(removal_follows_queue_observation(
+            Some("2026-07-23T12:01:00Z"),
+            attempt,
+            Some(observed),
+        ));
+        assert!(!removal_follows_queue_observation(
+            Some("2026-07-23T12:01:00Z"),
+            attempt,
+            None,
+        ));
+    }
+
+    #[test]
+    fn queue_cursor_repetition_fails_closed() {
+        let mut seen = BTreeSet::new();
+        let page = serde_json::json!({
+            "hasNextPage": true,
+            "endCursor": "cursor-1",
+        });
+        assert_eq!(
+            advance_queue_cursor(&page, &mut seen).expect("first cursor"),
+            Some("cursor-1".to_owned())
+        );
+        assert!(advance_queue_cursor(&page, &mut seen).is_err());
+        assert_eq!(
+            advance_queue_cursor(
+                &serde_json::json!({ "hasNextPage": false, "endCursor": null }),
+                &mut seen,
+            )
+            .expect("last page"),
+            None
         );
     }
 
