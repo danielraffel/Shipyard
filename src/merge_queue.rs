@@ -133,6 +133,12 @@ pub struct QueuePrObservation {
     pub head_sha: String,
     /// Whether GitHub reports the PR merged.
     pub merged: bool,
+    /// Whether GitHub still has an active auto-merge request for the PR.
+    ///
+    /// GitHub can accept `gh pr merge --auto` before all repository-level
+    /// requirements are satisfied. During that interval the request is active
+    /// even though the PR has not appeared in the merge queue yet.
+    pub auto_merge_active: bool,
     /// Latest queue-removal reason, when one exists.
     pub removal_reason: Option<String>,
     /// Creation time of the latest removal event.
@@ -165,6 +171,9 @@ pub fn parse_pr_observation(body: &serde_json::Value) -> Result<QueuePrObservati
         .get("merged")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| "response missing pull request merged state".to_owned())?;
+    let auto_merge_active = pr
+        .get("autoMergeRequest")
+        .is_some_and(|request| !request.is_null());
     let removal_node = pr
         .pointer("/timelineItems/nodes")
         .and_then(serde_json::Value::as_array)
@@ -180,6 +189,7 @@ pub fn parse_pr_observation(body: &serde_json::Value) -> Result<QueuePrObservati
     Ok(QueuePrObservation {
         head_sha,
         merged,
+        auto_merge_active,
         removal_reason,
         removal_at,
         removal_event_present: removal_node.is_some(),
@@ -423,7 +433,7 @@ mod tests {
 
     fn ctx(seen: bool) -> PollContext {
         PollContext {
-            attempt_elapsed: Duration::from_secs(60),
+            attempt_elapsed: Duration::from_mins(1),
             settle_window: DEFAULT_SETTLE_WINDOW,
             seen_in_queue: seen,
             consecutive_errors: 0,
@@ -531,6 +541,7 @@ mod tests {
                 "pullRequest": {
                     "headRefOid": "0123456789abcdef",
                     "merged": false,
+                    "autoMergeRequest": { "id": "AMR_1" },
                     "timelineItems": { "nodes": [
                         { "reason": "FAILED_CHECKS" }
                     ] }
@@ -542,6 +553,7 @@ mod tests {
             QueuePrObservation {
                 head_sha: "0123456789abcdef".to_owned(),
                 merged: false,
+                auto_merge_active: true,
                 removal_reason: Some("FAILED_CHECKS".to_owned()),
                 removal_at: None,
                 removal_event_present: true,

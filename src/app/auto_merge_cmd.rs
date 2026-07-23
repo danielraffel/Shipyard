@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -62,7 +63,7 @@ pub(super) enum AutoMergeOutcome {
 }
 
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(15);
-const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(7_200);
+const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_hours(2);
 
 #[derive(Debug)]
 pub(super) enum AutoMergeOperationError {
@@ -399,7 +400,7 @@ fn gh(client: &GhClient, cwd: &Path) -> Result<Command, String> {
         .map_err(|error| format!("gh command preparation failed: {error}"))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn merge_pr(
     cwd: &Path,
     state: &ShipState,
@@ -559,6 +560,9 @@ fn queue_admission(
     if observation.merged {
         return Ok(QueueAdmission::AlreadyMerged);
     }
+    if observation.auto_merge_active {
+        return Ok(QueueAdmission::AlreadyEnqueued);
+    }
     match crate::merge_queue::parse_queue_pages(&pages, state.pr) {
         crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found => {
             return Ok(QueueAdmission::AlreadyEnqueued);
@@ -596,9 +600,13 @@ fn removal_blocks_rearm(
     let (Some(reason), Some(removed_at)) = (reason, removed_at) else {
         return true;
     };
+    let Ok(removed) = chrono::DateTime::parse_from_rfc3339(removed_at) else {
+        return true;
+    };
+    if removed.with_timezone(&chrono::Utc) < ship_created_at {
+        return false;
+    }
     !reason.eq_ignore_ascii_case("invalid_merge_commit")
-        && chrono::DateTime::parse_from_rfc3339(removed_at)
-            .is_ok_and(|removed| removed.with_timezone(&chrono::Utc) >= ship_created_at)
 }
 
 /// Wait for GitHub's merge queue to land a previously armed PR.
@@ -607,6 +615,7 @@ fn removal_blocks_rearm(
 /// limited to GitHub's `INVALID_MERGE_COMMIT` reason; failed checks, manual
 /// removal, unknown reasons, head drift, and HTTP 403/rate-limit responses are
 /// terminal and leave ship-state active for diagnosis.
+#[allow(clippy::too_many_lines)]
 pub(super) fn supervise_merge_queue(
     store: &ShipStateStore,
     cwd: &Path,
@@ -706,6 +715,10 @@ pub(super) fn supervise_merge_queue(
                         attempt_started_at = chrono::Utc::now();
                     }
                     QueuePollClass::PrNotFound => {
+                        if observation.auto_merge_active {
+                            thread::sleep(QUEUE_POLL_INTERVAL);
+                            continue;
+                        }
                         return AutoMergeOutcome::MergeFailed {
                             error: format!(
                                 "PR #{pr} was never observed in the merge queue after auto-merge was armed"
@@ -763,7 +776,7 @@ fn fetch_queue_poll_pages(
         .repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug {:?}", state.repo))?;
-    let query = r#"query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){headRefOid merged timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100,after:$after){nodes{position pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}"#;
+    let query = r"query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){headRefOid merged autoMergeRequest{id} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100,after:$after){nodes{position pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
     let mut pages = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -897,7 +910,7 @@ fn encode_path_segment(value: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             encoded.push(char::from(byte));
         } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+            let _ = write!(encoded, "%{byte:02X}");
         }
     }
     encoded
@@ -1367,6 +1380,18 @@ mod tests {
             true,
             None,
             Some("2026-07-23T12:01:00Z"),
+            ship_created,
+        ));
+        assert!(removal_blocks_rearm(
+            true,
+            Some("invalid_merge_commit"),
+            Some("not-a-timestamp"),
+            ship_created,
+        ));
+        assert!(removal_blocks_rearm(
+            true,
+            Some("failed_checks"),
+            Some("not-a-timestamp"),
             ship_created,
         ));
         assert!(!removal_blocks_rearm(false, None, None, ship_created));
