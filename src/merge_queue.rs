@@ -126,6 +126,80 @@ pub enum QueuePollParse {
     Errored(String),
 }
 
+/// PR-level facts returned alongside each sparse queue poll.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuePrObservation {
+    /// Current full head SHA.
+    pub head_sha: String,
+    /// Whether GitHub reports the PR merged.
+    pub merged: bool,
+    /// Latest queue-removal reason, when one exists.
+    pub removal_reason: Option<String>,
+    /// Creation time of the latest removal event.
+    pub removal_at: Option<String>,
+}
+
+/// Parse the target PR facts included in the queue GraphQL response.
+pub fn parse_pr_observation(body: &serde_json::Value) -> Result<QueuePrObservation, String> {
+    if body
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err("graphql errors present".to_owned());
+    }
+    let pr = body
+        .pointer("/data/repository/pullRequest")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| "response missing pull request".to_owned())?;
+    let head_sha = pr
+        .get("headRefOid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "response missing pull request head SHA".to_owned())?
+        .to_owned();
+    let merged = pr
+        .get("merged")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "response missing pull request merged state".to_owned())?;
+    let removal_reason = pr
+        .pointer("/timelineItems/nodes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|nodes| nodes.last())
+        .and_then(|node| node.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let removal_at = pr
+        .pointer("/timelineItems/nodes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|nodes| nodes.last())
+        .and_then(|node| node.get("createdAt"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Ok(QueuePrObservation {
+        head_sha,
+        merged,
+        removal_reason,
+        removal_at,
+    })
+}
+
+/// Parse the evaluated branch-rules response used to choose the merge path.
+///
+/// The endpoint returns an array of rule objects. A malformed response is an
+/// error rather than "no queue": falling back to a direct merge when
+/// governance could not be read would reintroduce dual merge authorities.
+pub fn rules_require_merge_queue(body: &serde_json::Value) -> Result<bool, String> {
+    let rules = body
+        .as_array()
+        .ok_or_else(|| "evaluated branch rules response is not an array".to_owned())?;
+    Ok(rules.iter().any(|rule| {
+        rule.get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind == "merge_queue")
+    }))
+}
+
 /// Parse a merge-queue GraphQL poll response into a [`QueuePollParse`].
 ///
 /// A body is [`QueuePollParse::Errored`] when it carries GraphQL `errors`, a
@@ -175,11 +249,13 @@ pub fn parse_queue_snapshot(body: &serde_json::Value, pr_number: u64) -> QueuePo
         return QueuePollParse::Errored("response missing merge-queue entries".to_owned());
     };
 
-    let nodes = entries
+    let Some(nodes) = entries
         .get("nodes")
         .and_then(serde_json::Value::as_array)
         .cloned()
-        .unwrap_or_default();
+    else {
+        return QueuePollParse::Errored("response merge-queue entries missing `nodes`".to_owned());
+    };
 
     let mut pr_found = false;
     let mut position = None;
@@ -195,11 +271,15 @@ pub fn parse_queue_snapshot(body: &serde_json::Value, pr_number: u64) -> QueuePo
         }
     }
 
-    let page_truncated = entries
+    let Some(page_truncated) = entries
         .get("pageInfo")
         .and_then(|info| info.get("hasNextPage"))
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    else {
+        return QueuePollParse::Errored(
+            "response merge-queue entries missing `pageInfo.hasNextPage`".to_owned(),
+        );
+    };
 
     let total_entries = entries
         .get("totalEntries")
@@ -249,13 +329,15 @@ pub fn classify_poll(parse: &QueuePollParse, ctx: &PollContext) -> QueuePollClas
         return QueuePollClass::Enqueued { position: None };
     }
 
+    // The entries connection lags the enqueue mutation. Within the settle
+    // window after the initial enqueue or a re-enqueue, a momentary absence is
+    // arm-write lag, not a trustworthy not-found / eviction verdict. This
+    // applies before the PR has ever been observed too.
+    if ctx.attempt_elapsed < ctx.settle_window {
+        return QueuePollClass::Enqueued { position: None };
+    }
+
     if ctx.seen_in_queue {
-        // The entries connection lags the enqueue mutation. Within the settle
-        // window after (re-)enqueue, a momentary absence is arm-write lag, not
-        // an eviction — keep supervising until the window elapses.
-        if ctx.attempt_elapsed < ctx.settle_window {
-            return QueuePollClass::Enqueued { position: None };
-        }
         QueuePollClass::Evicted
     } else {
         QueuePollClass::PrNotFound
@@ -350,7 +432,9 @@ mod tests {
     fn expect_valid(parse: &QueuePollParse) -> &QueueSnapshot {
         match parse {
             QueuePollParse::Valid(snap) => snap,
-            QueuePollParse::Errored(reason) => panic!("expected valid parse, got errored: {reason}"),
+            QueuePollParse::Errored(reason) => {
+                panic!("expected valid parse, got errored: {reason}")
+            }
         }
     }
 
@@ -371,7 +455,10 @@ mod tests {
         let body = body_with_entries(&[7, 9], false);
         let parse = parse_queue_snapshot(&body, 42);
         assert!(!expect_valid(&parse).pr_found);
-        assert_eq!(classify_poll(&parse, &ctx(false)), QueuePollClass::PrNotFound);
+        assert_eq!(
+            classify_poll(&parse, &ctx(false)),
+            QueuePollClass::PrNotFound
+        );
     }
 
     #[test]
@@ -398,7 +485,10 @@ mod tests {
         );
         let class = classify_poll(&parse, &ctx(false));
         // The regression: a single transient blip must NOT be terminal PrNotFound.
-        assert!(!class.is_terminal(), "errored body became terminal: {class:?}");
+        assert!(
+            !class.is_terminal(),
+            "errored body became terminal: {class:?}"
+        );
         assert_eq!(
             class,
             QueuePollClass::PollError {
@@ -426,7 +516,61 @@ mod tests {
         // seen is still a legitimate terminal PrNotFound — F1 must not blunt it.
         let body = body_with_entries(&[7, 9], false);
         let parse = parse_queue_snapshot(&body, 42);
-        assert_eq!(classify_poll(&parse, &ctx(false)), QueuePollClass::PrNotFound);
+        assert_eq!(
+            classify_poll(&parse, &ctx(false)),
+            QueuePollClass::PrNotFound
+        );
+    }
+
+    #[test]
+    fn parses_exact_head_merge_state_and_latest_removal_reason() {
+        let body = serde_json::json!({
+            "data": { "repository": {
+                "pullRequest": {
+                    "headRefOid": "0123456789abcdef",
+                    "merged": false,
+                    "timelineItems": { "nodes": [
+                        { "reason": "FAILED_CHECKS" }
+                    ] }
+                }
+            } }
+        });
+        assert_eq!(
+            parse_pr_observation(&body).expect("observation"),
+            QueuePrObservation {
+                head_sha: "0123456789abcdef".to_owned(),
+                merged: false,
+                removal_reason: Some("FAILED_CHECKS".to_owned()),
+                removal_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_pr_observation_fails_closed() {
+        let body = serde_json::json!({
+            "data": { "repository": { "pullRequest": {
+                "merged": false,
+                "timelineItems": { "nodes": [] }
+            } } }
+        });
+        assert!(parse_pr_observation(&body).is_err());
+    }
+
+    #[test]
+    fn evaluated_rules_detect_merge_queue_and_reject_malformed_body() {
+        let rules = serde_json::json!([
+            { "type": "required_status_checks" },
+            { "type": "merge_queue", "parameters": {} }
+        ]);
+        assert_eq!(rules_require_merge_queue(&rules), Ok(true));
+        assert_eq!(
+            rules_require_merge_queue(&serde_json::json!([
+                { "type": "required_status_checks" }
+            ])),
+            Ok(false)
+        );
+        assert!(rules_require_merge_queue(&serde_json::json!({"rules": []})).is_err());
     }
 
     // --- F2: a truncated page must not manufacture an eviction ---
@@ -507,6 +651,32 @@ mod tests {
         assert!(matches!(parse, QueuePollParse::Errored(_)));
     }
 
+    #[test]
+    fn missing_nodes_is_errored_not_valid_empty_queue() {
+        let body = serde_json::json!({
+            "data": { "repository": { "mergeQueue": { "entries": {
+                "pageInfo": { "hasNextPage": false }
+            } } } }
+        });
+        assert!(matches!(
+            parse_queue_snapshot(&body, 42),
+            QueuePollParse::Errored(_)
+        ));
+    }
+
+    #[test]
+    fn missing_page_info_is_errored_not_proven_full_queue() {
+        let body = serde_json::json!({
+            "data": { "repository": { "mergeQueue": { "entries": {
+                "nodes": []
+            } } } }
+        });
+        assert!(matches!(
+            parse_queue_snapshot(&body, 42),
+            QueuePollParse::Errored(_)
+        ));
+    }
+
     // --- F3: a poll inside the settle window must not read lag as eviction ---
 
     #[test]
@@ -523,6 +693,19 @@ mod tests {
             class,
             QueuePollClass::Evicted,
             "arm-write lag inside settle window misread as eviction (F3): {class:?}"
+        );
+    }
+
+    #[test]
+    fn never_seen_absence_before_settle_window_is_not_not_found() {
+        let body = body_with_entries(&[7, 9], false);
+        let parse = parse_queue_snapshot(&body, 42);
+        let mut c = ctx(false);
+        c.attempt_elapsed = Duration::from_secs(2);
+        c.settle_window = Duration::from_secs(10);
+        assert_eq!(
+            classify_poll(&parse, &c),
+            QueuePollClass::Enqueued { position: None }
         );
     }
 

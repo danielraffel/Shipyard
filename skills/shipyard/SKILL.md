@@ -31,6 +31,19 @@ go/no-go for that operation.
    execution. Its untrusted job VM has no virtual NIC; only the trusted
    controller talks to GitHub. Timer activation remains an operator decision.
 
+## Merge-queue ownership
+
+When evaluated rules require GitHub's merge queue, Shipyard is a validator and
+queue supervisor, not a second merge authority. A passing `shipyard ship` arms
+native `gh pr merge --merge --auto` for the exact validated SHA and waits for
+GitHub to merge it. The one-shot `shipyard auto-merge` returns exit 3 while
+queued and retains ship-state for later ticks.
+
+Never treat queue absence alone as permission to rearm. The PR must first have
+been observed in the queue, and only an `invalid_merge_commit` removal may be
+re-enqueued automatically. Failed checks, manual/unknown removal, head drift,
+malformed authority data, or a 403/rate-limit response stop fail-closed.
+
 ## Local/SSH VM Watch
 
 Use `shipyard watch local` for long target-backed jobs that are not GitHub

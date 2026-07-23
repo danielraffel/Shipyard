@@ -326,7 +326,7 @@ think the build takes:
 |---|---|---|
 | You can hold the session open until merge | `shipyard watch --follow --json` | Blocks; exits `0` pass, `1` fail, `130` SIGINT. Zero polling logic needed. |
 | You want to release the session, re-check later | `shipyard watch --no-follow --json` + `ScheduleWakeup` | One-shot snapshot is cheap. Re-check on wakeup; exits `3` while in-flight. |
-| The agent is stepping away entirely | `shipyard auto-merge <pr>` on cron / GitHub schedule | Idempotent one-shot. Exits `0` merged, `1` fail, `2` not-found, `3` in-flight. |
+| The agent is stepping away entirely | `shipyard auto-merge <pr>` on cron / GitHub schedule | Idempotent one-shot. Exits `0` merged, `1` fail, `2` not-found, `3` in-flight or natively enqueued. |
 | You just want a status peek right now | `shipyard watch --no-follow --json` | Same as a `ship-state show` but uses the live event schema. |
 
 **Rules of thumb for agents:**
@@ -634,6 +634,15 @@ See `docs/waiting.md` for the full reference: subcommand semantics, event source
 
 Shipyard refuses to merge unless every required platform has passing evidence
 for the exact HEAD SHA.
+
+On a base branch whose evaluated rules require GitHub's merge queue, Shipyard
+does not issue a direct merge. It arms native auto-merge with `--merge` and the
+exact validated head SHA, then `shipyard ship` waits for the queue result.
+`shipyard auto-merge` remains a cron-safe one-shot: it returns exit 3 after
+arming or observing the queue and leaves ship-state active. A queue supervisor
+re-enqueues only after it previously observed the PR and GitHub reports
+`invalid_merge_commit`; `failed_checks`, manual/unknown removal, head drift, and
+HTTP 403/rate-limit responses stop fail-closed.
 
 ### Iterating on a single-platform failure
 

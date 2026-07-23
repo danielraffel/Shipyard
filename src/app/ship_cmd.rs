@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 
 use super::{
     CliFailure,
-    auto_merge_cmd::{AutoMergeOutcome, AutoMergeRequest, execute_auto_merge},
+    auto_merge_cmd::{
+        AutoMergeOutcome, AutoMergeRequest, execute_auto_merge, supervise_merge_queue,
+    },
     cli::{MergeMethod, MergeResult},
     wait_cmd::parse_github_repo_slug,
 };
@@ -533,6 +535,24 @@ fn post_run_merge_state(
         AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
             Ok(ShipRenderState::Merged)
         }
+        AutoMergeOutcome::Enqueued => match supervise_merge_queue(store, cwd, pr) {
+            AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
+                Ok(ShipRenderState::Merged)
+            }
+            AutoMergeOutcome::SupersededSha { validated, current } => {
+                Ok(ShipRenderState::GreenNotMerged(format!(
+                    "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
+                )))
+            }
+            AutoMergeOutcome::MergeFailed { error } => Ok(ShipRenderState::GreenNotMerged(error)),
+            AutoMergeOutcome::Enqueued
+            | AutoMergeOutcome::PrNotFound
+            | AutoMergeOutcome::InFlight { .. }
+            | AutoMergeOutcome::TargetFailed { .. } => Err(CliFailure::new(
+                1,
+                format!("PR #{pr}: merge-queue supervision ended without a terminal verdict"),
+            )),
+        },
         AutoMergeOutcome::MergeFailed { error } => {
             Ok(classify_merge_failure(store, config, cwd, repo, pr, error))
         }

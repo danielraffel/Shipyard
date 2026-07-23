@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -11,6 +13,10 @@ use super::{
 };
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
+use crate::merge_queue::{
+    DEFAULT_ERROR_BUDGET, DEFAULT_SETTLE_WINDOW, PollContext, QueuePollClass, classify_poll,
+    parse_pr_observation, parse_queue_snapshot,
+};
 use crate::output::write_json_envelope;
 use crate::ship_state::{ShipState, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
@@ -39,6 +45,9 @@ pub(super) enum AutoMergeOutcome {
     MergeFailed {
         error: String,
     },
+    /// Native GitHub auto-merge was armed for a queue-governed base branch.
+    /// The ship state remains active until GitHub's merge queue lands the PR.
+    Enqueued,
     /// The live PR head SHA advanced past the validated merge-candidate SHA
     /// (someone pushed new commits to the branch after validation). Refuse
     /// to merge the stale validated SHA; leave the ship state active so the
@@ -51,6 +60,9 @@ pub(super) enum AutoMergeOutcome {
         cleanup_warning: Option<String>,
     },
 }
+
+const QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(7_200);
 
 #[derive(Debug)]
 pub(super) enum AutoMergeOperationError {
@@ -124,27 +136,32 @@ pub(super) fn execute_auto_merge(
                 }
             }
 
-            if let Err(error) = merge_pr(
-                request.pr,
+            let merge_disposition = match merge_pr(
                 cwd,
-                &state.head_sha,
+                &state,
                 request.merge_method,
                 request.delete_branch,
                 request.admin,
                 request.merge_command.as_deref(),
                 request.merge_result,
             ) {
-                if merge_error_confirms_merged(&error)
-                    || pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref())
-                {
-                    store
-                        .archive_locked(request.pr, &lock)
-                        .map_err(AutoMergeOperationError::Store)?;
-                    return Ok(AutoMergeOutcome::Merged {
-                        cleanup_warning: Some(error),
-                    });
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    if merge_error_confirms_merged(&error)
+                        || pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref())
+                    {
+                        store
+                            .archive_locked(request.pr, &lock)
+                            .map_err(AutoMergeOperationError::Store)?;
+                        return Ok(AutoMergeOutcome::Merged {
+                            cleanup_warning: Some(error),
+                        });
+                    }
+                    return Ok(AutoMergeOutcome::MergeFailed { error });
                 }
-                return Ok(AutoMergeOutcome::MergeFailed { error });
+            };
+            if merge_disposition == MergeDisposition::Enqueued {
+                return Ok(AutoMergeOutcome::Enqueued);
             }
             store
                 .archive_locked(request.pr, &lock)
@@ -245,6 +262,10 @@ fn render_auto_merge_outcome<W: Write>(
                 fields([("pr", Value::from(pr)), ("error", Value::from(error))]),
             )?;
             Ok(ExitCode::from(1))
+        }
+        AutoMergeOutcome::Enqueued => {
+            render_event(stdout, json, "enqueued", fields([("pr", Value::from(pr))]))?;
+            Ok(ExitCode::from(3))
         }
         AutoMergeOutcome::SupersededSha { validated, current } => {
             render_event(
@@ -380,17 +401,16 @@ fn gh(client: &GhClient, cwd: &Path) -> Result<Command, String> {
 
 #[allow(clippy::too_many_arguments)]
 fn merge_pr(
-    pr: u64,
     cwd: &Path,
-    expected_head_sha: &str,
+    state: &ShipState,
     merge_method: MergeMethod,
     delete_branch: bool,
     admin: bool,
     merge_command: Option<&Path>,
     merge_result: Option<MergeResult>,
-) -> Result<(), String> {
+) -> Result<MergeDisposition, String> {
     match merge_result {
-        Some(MergeResult::Success) => return Ok(()),
+        Some(MergeResult::Success) => return Ok(MergeDisposition::Merged),
         Some(MergeResult::Failure) => return Err("simulated merge failure".to_owned()),
         None => {}
     }
@@ -411,17 +431,47 @@ fn merge_pr(
             cwd,
         )?
     };
+    let queue_required = if custom_command {
+        false
+    } else {
+        repository_requires_merge_queue(
+            client
+                .as_ref()
+                .expect("built-in merge should have gh client"),
+            cwd,
+            &state.repo,
+            &state.base_branch,
+        )?
+    };
+    if queue_required {
+        match queue_admission(
+            client
+                .as_ref()
+                .expect("built-in merge should have gh client"),
+            cwd,
+            state,
+        )? {
+            QueueAdmission::AlreadyMerged => return Ok(MergeDisposition::Merged),
+            QueueAdmission::AlreadyEnqueued => return Ok(MergeDisposition::Enqueued),
+            QueueAdmission::Arm => {}
+        }
+    }
     if !custom_command {
-        command.args(["pr", "merge", &pr.to_string()]);
+        command.args(["pr", "merge", &state.pr.to_string(), "--repo", &state.repo]);
         // Defense in depth (issue #321): tell GitHub the exact head we
         // validated so the SERVER rejects the merge if the head drifted
         // between the preflight and this call. A custom `--merge-command`
         // path can't get this guard — the preflight above is its only
         // protection.
-        command.args(["--match-head-commit", expected_head_sha]);
+        command.args(["--match-head-commit", &state.head_sha]);
     }
-    command.arg(merge_method.gh_flag());
-    if delete_branch {
+    if queue_required {
+        command.arg(MergeMethod::Merge.gh_flag());
+        command.arg("--auto");
+    } else {
+        command.arg(merge_method.gh_flag());
+    }
+    if delete_branch && !queue_required {
         command.arg("--delete-branch");
     }
     if admin {
@@ -432,7 +482,11 @@ fn merge_pr(
         .output()
         .map_err(|error| format!("failed to run merge command: {error}"))?;
     if output.status.success() {
-        return Ok(());
+        return Ok(if queue_required {
+            MergeDisposition::Enqueued
+        } else {
+            MergeDisposition::Merged
+        });
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -445,6 +499,7 @@ fn merge_pr(
     // rather than failing the ship. Matches src/pr.rs's pattern for
     // gh pr list / create / view.
     if !custom_command
+        && !queue_required
         && (crate::pr::is_graphql_rate_limited(&message)
             || is_graphql_merge_integration_blocked(&message))
     {
@@ -458,16 +513,297 @@ fn merge_pr(
                 "shipyard: GraphQL PR merge is unavailable for this GitHub identity. Falling back to REST."
             );
         }
-        return merge_pr_rest(
+        merge_pr_rest(
             client,
-            pr,
+            state.pr,
             cwd,
-            expected_head_sha,
+            &state.head_sha,
             merge_method,
             delete_branch,
-        );
+        )?;
+        return Ok(MergeDisposition::Merged);
     }
     Err(message)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueAdmission {
+    Arm,
+    AlreadyEnqueued,
+    AlreadyMerged,
+}
+
+fn queue_admission(
+    client: &GhClient,
+    cwd: &Path,
+    state: &ShipState,
+) -> Result<QueueAdmission, String> {
+    let body = fetch_queue_poll(client, cwd, state)?;
+    let observation = parse_pr_observation(&body)
+        .map_err(|error| format!("merge-queue admission observation was malformed: {error}"))?;
+    if !shas_match(&observation.head_sha, &state.head_sha) {
+        return Err(format!(
+            "live PR head {} superseded validated SHA {}",
+            observation.head_sha, state.head_sha
+        ));
+    }
+    if observation.merged {
+        return Ok(QueueAdmission::AlreadyMerged);
+    }
+    match parse_queue_snapshot(&body, state.pr) {
+        crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found => {
+            return Ok(QueueAdmission::AlreadyEnqueued);
+        }
+        crate::merge_queue::QueuePollParse::Errored(error) => {
+            return Err(format!("merge-queue admission poll failed: {error}"));
+        }
+        crate::merge_queue::QueuePollParse::Valid(_) => {}
+    }
+
+    if removal_blocks_rearm(
+        observation.removal_reason.as_deref(),
+        observation.removal_at.as_deref(),
+        state.created_at,
+    ) {
+        let reason = observation.removal_reason.as_deref().unwrap_or("UNKNOWN");
+        return Err(format!(
+            "merge queue already removed PR #{} with terminal reason {reason}; refusing to re-arm unchanged ship-state",
+            state.pr
+        ));
+    }
+    Ok(QueueAdmission::Arm)
+}
+
+fn removal_blocks_rearm(
+    reason: Option<&str>,
+    removed_at: Option<&str>,
+    ship_created_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let (Some(reason), Some(removed_at)) = (reason, removed_at) else {
+        return false;
+    };
+    !reason.eq_ignore_ascii_case("invalid_merge_commit")
+        && chrono::DateTime::parse_from_rfc3339(removed_at)
+            .is_ok_and(|removed| removed.with_timezone(&chrono::Utc) >= ship_created_at)
+}
+
+/// Wait for GitHub's merge queue to land a previously armed PR.
+///
+/// Only a PR observed in the queue can be considered evicted. Re-enqueue is
+/// limited to GitHub's `INVALID_MERGE_COMMIT` reason; failed checks, manual
+/// removal, unknown reasons, head drift, and HTTP 403/rate-limit responses are
+/// terminal and leave ship-state active for diagnosis.
+pub(super) fn supervise_merge_queue(
+    store: &ShipStateStore,
+    cwd: &Path,
+    pr: u64,
+) -> AutoMergeOutcome {
+    let Some(state) = store.get(pr) else {
+        return AutoMergeOutcome::PrNotFound;
+    };
+    let Ok(client) = gh_client(cwd) else {
+        return AutoMergeOutcome::MergeFailed {
+            error: "github auth config failed while supervising merge queue".to_owned(),
+        };
+    };
+    let started = Instant::now();
+    let mut attempt_started = Instant::now();
+    let mut seen_in_queue = false;
+    let mut consecutive_errors = 0_u32;
+
+    while started.elapsed() < QUEUE_WAIT_TIMEOUT {
+        match fetch_queue_poll(&client, cwd, &state) {
+            Ok(body) => {
+                consecutive_errors = 0;
+                let observation = match parse_pr_observation(&body) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        return AutoMergeOutcome::MergeFailed {
+                            error: format!("merge-queue PR observation was malformed: {error}"),
+                        };
+                    }
+                };
+                if !shas_match(&observation.head_sha, &state.head_sha) {
+                    return AutoMergeOutcome::SupersededSha {
+                        validated: state.head_sha,
+                        current: observation.head_sha,
+                    };
+                }
+                if observation.merged {
+                    if let Err(error) = store.archive(pr) {
+                        return AutoMergeOutcome::MergeFailed {
+                            error: format!("PR merged but ship-state archive failed: {error}"),
+                        };
+                    }
+                    return AutoMergeOutcome::Merged {
+                        cleanup_warning: None,
+                    };
+                }
+
+                let parsed = parse_queue_snapshot(&body, pr);
+                let class = classify_poll(
+                    &parsed,
+                    &PollContext {
+                        attempt_elapsed: attempt_started.elapsed(),
+                        settle_window: DEFAULT_SETTLE_WINDOW,
+                        seen_in_queue,
+                        consecutive_errors,
+                        error_budget: DEFAULT_ERROR_BUDGET,
+                    },
+                );
+                match class {
+                    QueuePollClass::Enqueued { .. } => {
+                        if let crate::merge_queue::QueuePollParse::Valid(snapshot) = parsed
+                            && snapshot.pr_found
+                        {
+                            seen_in_queue = true;
+                        }
+                    }
+                    QueuePollClass::Evicted => {
+                        let reason = observation.removal_reason.as_deref().unwrap_or("UNKNOWN");
+                        if !reason.eq_ignore_ascii_case("invalid_merge_commit") {
+                            return AutoMergeOutcome::MergeFailed {
+                                error: format!(
+                                    "merge queue removed PR #{pr} with terminal reason {reason}; refusing to re-enqueue"
+                                ),
+                            };
+                        }
+                        if let Err(error) = arm_native_queue(&client, cwd, &state) {
+                            return AutoMergeOutcome::MergeFailed { error };
+                        }
+                        seen_in_queue = false;
+                        attempt_started = Instant::now();
+                    }
+                    QueuePollClass::PrNotFound => {
+                        return AutoMergeOutcome::MergeFailed {
+                            error: format!(
+                                "PR #{pr} was never observed in the merge queue after auto-merge was armed"
+                            ),
+                        };
+                    }
+                    QueuePollClass::PollError { reason } => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        if terminal_github_error(&reason) {
+                            return AutoMergeOutcome::MergeFailed { error: reason };
+                        }
+                    }
+                    QueuePollClass::TimedOut => {
+                        return AutoMergeOutcome::MergeFailed {
+                            error: "merge-queue polling exhausted its error budget".to_owned(),
+                        };
+                    }
+                }
+            }
+            Err(error) => {
+                if terminal_github_error(&error) {
+                    return AutoMergeOutcome::MergeFailed { error };
+                }
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                if consecutive_errors >= DEFAULT_ERROR_BUDGET {
+                    return AutoMergeOutcome::MergeFailed {
+                        error: format!("merge-queue polling exhausted its error budget: {error}"),
+                    };
+                }
+            }
+        }
+        thread::sleep(QUEUE_POLL_INTERVAL);
+    }
+    AutoMergeOutcome::MergeFailed {
+        error: format!(
+            "timed out after {}s waiting for GitHub's merge queue",
+            QUEUE_WAIT_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+fn fetch_queue_poll(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<Value, String> {
+    let (owner, name) = state
+        .repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository slug {:?}", state.repo))?;
+    let query = r#"query($owner:String!,$name:String!,$branch:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){headRefOid merged timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100){nodes{position pullRequest{number}} pageInfo{hasNextPage}}}}}"#;
+    let mut command = gh(client, cwd)?;
+    let output = command
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-F",
+            &format!("owner={owner}"),
+            "-F",
+            &format!("name={name}"),
+            "-F",
+            &format!("branch={}", state.base_branch),
+            "-F",
+            &format!("pr={}", state.pr),
+        ])
+        .output()
+        .map_err(|error| format!("failed to poll merge queue: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("merge-queue poll returned invalid JSON: {error}"))
+}
+
+fn arm_native_queue(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<(), String> {
+    let mut command = gh(client, cwd)?;
+    let output = command
+        .args([
+            "pr",
+            "merge",
+            &state.pr.to_string(),
+            "--repo",
+            &state.repo,
+            "--match-head-commit",
+            &state.head_sha,
+            "--merge",
+            "--auto",
+        ])
+        .output()
+        .map_err(|error| format!("failed to re-enqueue merge-queue PR: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(format!("failed to re-enqueue merge-queue PR: {message}"))
+}
+
+fn terminal_github_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("http 403")
+        || lower.contains("api rate limit exceeded")
+        || lower.contains("rate limit")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeDisposition {
+    Merged,
+    Enqueued,
+}
+
+fn repository_requires_merge_queue(
+    client: &GhClient,
+    cwd: &Path,
+    repo: &str,
+    base_branch: &str,
+) -> Result<bool, String> {
+    let mut command = gh(client, cwd)?;
+    let endpoint = format!("repos/{repo}/rules/branches/{base_branch}");
+    let output = command
+        .args(["api", &endpoint])
+        .output()
+        .map_err(|error| format!("failed to inspect evaluated branch rules: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(format!(
+            "failed to inspect evaluated branch rules for {repo}:{base_branch}: {stderr}"
+        ));
+    }
+    let body: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("evaluated branch rules returned invalid JSON: {error}"))?;
+    crate::merge_queue::rules_require_merge_queue(&body)
 }
 
 fn is_graphql_merge_integration_blocked(message: &str) -> bool {
@@ -734,6 +1070,10 @@ fn render_event<W: Write>(
             "PR #{pr}: merge attempt failed - {}",
             data.get("error").and_then(Value::as_str).unwrap_or("")
         ),
+        "enqueued" => writeln!(
+            stdout,
+            "PR #{pr}: validated green and enqueued in GitHub's merge queue."
+        ),
         "superseded-sha" => {
             let validated = data.get("validated").and_then(Value::as_str).unwrap_or("");
             let current = data.get("current").and_then(Value::as_str).unwrap_or("");
@@ -892,5 +1232,36 @@ mod tests {
         assert!(!shas_match("", ""));
         assert!(!shas_match(full, ""));
         assert!(!shas_match("   ", full));
+    }
+
+    #[test]
+    fn terminal_github_errors_include_403_and_rate_limits_only() {
+        assert!(terminal_github_error("HTTP 403: forbidden"));
+        assert!(terminal_github_error("API rate limit exceeded"));
+        assert!(!terminal_github_error(
+            "HTTP 502: transient upstream failure"
+        ));
+    }
+
+    #[test]
+    fn terminal_removal_blocks_same_ship_but_not_new_validation() {
+        let ship_created = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        assert!(removal_blocks_rearm(
+            Some("failed_checks"),
+            Some("2026-07-23T12:01:00Z"),
+            ship_created,
+        ));
+        assert!(!removal_blocks_rearm(
+            Some("invalid_merge_commit"),
+            Some("2026-07-23T12:01:00Z"),
+            ship_created,
+        ));
+        assert!(!removal_blocks_rearm(
+            Some("failed_checks"),
+            Some("2026-07-23T11:59:00Z"),
+            ship_created,
+        ));
     }
 }

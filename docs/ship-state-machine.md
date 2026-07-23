@@ -397,6 +397,29 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
     never abandoned (counted as `raced`).
   - Config load fails in the daemon worker → the sweep no-ops for that pass.
 
+### T15 — Native merge-queue handoff
+
+- **From:** terminal passing ship-state for an OPEN PR on a base branch whose
+  evaluated repository rules contain `merge_queue`
+- **To:** active ship-state plus a GitHub-native merge-queue entry; ultimately
+  archived ship-state only after GitHub reports the PR merged
+- **Trigger:** `shipyard ship` or the one-shot `shipyard auto-merge <pr>`
+- **Externals:** the configured `GhClient` reads evaluated branch rules, then
+  performs one sparse GraphQL queue/PR poll and arms
+  `gh pr merge --merge --auto --match-head-commit <validated-sha>`.
+- **Rules:** classic branches retain the direct merge path. Queue branches
+  never use the REST direct-merge fallback. The exact live head must equal the
+  validated SHA. `auto-merge` returns exit 3 while queued and keeps state
+  active; `ship` supervises until merge or a terminal queue outcome.
+- **Eviction safety:** absence is actionable only after the PR was observed in
+  the queue and the enqueue settle window elapsed. Re-enqueue is allowed only
+  for `invalid_merge_commit`. `failed_checks`, manual/unknown removal, a
+  never-observed arm, malformed/truncated authority data, and head drift are
+  terminal without mutation. HTTP 403/rate-limit responses are never retried.
+- **Idempotency:** a later one-shot first polls the queue. An already queued PR
+  is not armed again; a terminal removal newer than the current ship-state is
+  not rearmed. A new validated head creates newer ship-state and may be armed.
+
 ## Diagnostic: orphan reporting (no transition)
 
 `STATE_IN_FLIGHT` has no self-healing exit when the owning process dies
