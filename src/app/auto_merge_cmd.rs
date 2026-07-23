@@ -462,6 +462,12 @@ fn merge_pr(
         )?
     };
     if queue_required {
+        if admin {
+            return Err(
+                "`--admin` cannot be used on a merge-queue-governed branch because it bypasses the queue"
+                    .to_owned(),
+            );
+        }
         match queue_admission(
             client
                 .as_ref()
@@ -474,6 +480,7 @@ fn merge_pr(
                 let now = chrono::Utc::now();
                 state.merge_queue_attempt_started_at = Some(now);
                 state.merge_queue_observed_at = Some(now);
+                state.merge_queue_enqueue_succeeded_at = Some(now);
                 state.touch();
                 return Ok(MergeDisposition::Enqueued);
             }
@@ -481,25 +488,27 @@ fn merge_pr(
                 state
                     .merge_queue_attempt_started_at
                     .get_or_insert_with(chrono::Utc::now);
+                state.merge_queue_enqueue_succeeded_at = None;
                 state.touch();
                 return Ok(MergeDisposition::Enqueued);
             }
             QueueAdmission::Arm { pr_id } => {
-                let arm_result = arm_native_queue(
+                let arm_succeeded = match arm_native_queue(
                     client
                         .as_ref()
                         .expect("built-in merge should have gh client"),
                     cwd,
                     state,
                     &pr_id,
-                );
-                if let Err(error) = arm_result
-                    && !enqueue_requirements_pending(&error)
-                {
-                    return Err(error);
-                }
-                state.merge_queue_attempt_started_at = Some(chrono::Utc::now());
+                ) {
+                    Ok(()) => true,
+                    Err(error) if enqueue_requirements_pending(&error) => false,
+                    Err(error) => return Err(error),
+                };
+                let now = chrono::Utc::now();
+                state.merge_queue_attempt_started_at = Some(now);
                 state.merge_queue_observed_at = None;
+                state.merge_queue_enqueue_succeeded_at = arm_succeeded.then_some(now);
                 state.touch();
                 return Ok(MergeDisposition::Enqueued);
             }
@@ -517,12 +526,6 @@ fn merge_pr(
     command.arg(merge_method.gh_flag());
     if delete_branch && !queue_required {
         command.arg("--delete-branch");
-    }
-    if admin && queue_required {
-        return Err(
-            "`--admin` cannot be used on a merge-queue-governed branch because it bypasses the queue"
-                .to_owned(),
-        );
     }
     if admin {
         command.arg("--admin");
@@ -617,7 +620,7 @@ fn queue_admission(
         observation.removal_event_present,
         observation.removal_reason.as_deref(),
         observation.removal_at.as_deref(),
-        state.created_at,
+        state,
     ) {
         let reason = observation.removal_reason.as_deref().unwrap_or("UNKNOWN");
         return Err(format!(
@@ -634,24 +637,29 @@ fn removal_blocks_rearm(
     event_present: bool,
     reason: Option<&str>,
     removed_at: Option<&str>,
-    ship_created_at: chrono::DateTime<chrono::Utc>,
+    state: &ShipState,
 ) -> bool {
     if !event_present {
         return false;
     }
-    let (Some(_reason), Some(removed_at)) = (reason, removed_at) else {
+    let (Some(reason), Some(removed_at)) = (reason, removed_at) else {
         return true;
     };
     let Ok(removed) = chrono::DateTime::parse_from_rfc3339(removed_at) else {
         return true;
     };
-    if removed.with_timezone(&chrono::Utc) < ship_created_at {
+    let removed = removed.with_timezone(&chrono::Utc);
+    let attempt_started = state
+        .merge_queue_attempt_started_at
+        .unwrap_or(state.created_at);
+    if removed < attempt_started {
         return false;
     }
-    // Initial admission has not observed this queue attempt, so even GitHub's
-    // recoverable INVALID_MERGE_COMMIT reason is not authority to mutate it.
-    // The live supervisor is the sole re-enqueue path, after seen_in_queue.
-    true
+    let recoverable_observed_eviction = reason.eq_ignore_ascii_case("invalid_merge_commit")
+        && state
+            .merge_queue_observed_at
+            .is_some_and(|observed| observed >= attempt_started && removed >= observed);
+    !recoverable_observed_eviction
 }
 
 /// Wait for GitHub's merge queue to land a previously armed PR.
@@ -786,6 +794,7 @@ pub(super) fn supervise_merge_queue(
                         attempt_started_at = chrono::Utc::now();
                         state.merge_queue_observed_at = None;
                         state.merge_queue_attempt_started_at = Some(attempt_started_at);
+                        state.merge_queue_enqueue_succeeded_at = Some(attempt_started_at);
                         state.touch();
                         if let Err(error) = store.save(&state) {
                             return AutoMergeOutcome::MergeFailed {
@@ -800,12 +809,20 @@ pub(super) fn supervise_merge_queue(
                             thread::sleep(QUEUE_POLL_INTERVAL);
                             continue;
                         }
+                        if state.merge_queue_enqueue_succeeded_at.is_some() {
+                            return AutoMergeOutcome::MergeFailed {
+                                error: format!(
+                                    "PR #{pr} disappeared after exact-head enqueue succeeded but before Shipyard observed queue membership; refusing to override a possible manual removal"
+                                ),
+                            };
+                        }
                         match arm_native_queue(&client, cwd, &state, &observation.id) {
                             Ok(()) => {
                                 attempt_started = Instant::now();
                                 attempt_started_at = chrono::Utc::now();
                                 state.merge_queue_attempt_started_at = Some(attempt_started_at);
                                 state.merge_queue_observed_at = None;
+                                state.merge_queue_enqueue_succeeded_at = Some(attempt_started_at);
                                 state.touch();
                                 if let Err(error) = store.save(&state) {
                                     return AutoMergeOutcome::MergeFailed {
@@ -1581,43 +1598,59 @@ mod tests {
         let ship_created = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
             .expect("time")
             .with_timezone(&chrono::Utc);
+        let mut state = ShipState::new(1, "owner/repo", "feature/x", "main", "abc", "policy");
+        state.created_at = ship_created;
+        state.updated_at = ship_created;
+        state.merge_queue_attempt_started_at = Some(ship_created);
         assert!(removal_blocks_rearm(
             true,
             Some("failed_checks"),
             Some("2026-07-23T12:01:00Z"),
-            ship_created,
+            &state,
         ));
         assert!(removal_blocks_rearm(
             true,
             Some("invalid_merge_commit"),
             Some("2026-07-23T12:01:00Z"),
-            ship_created,
+            &state,
         ));
         assert!(!removal_blocks_rearm(
             true,
             Some("failed_checks"),
             Some("2026-07-23T11:59:00Z"),
-            ship_created,
+            &state,
         ));
         assert!(removal_blocks_rearm(
             true,
             None,
             Some("2026-07-23T12:01:00Z"),
-            ship_created,
+            &state,
         ));
         assert!(removal_blocks_rearm(
             true,
             Some("invalid_merge_commit"),
             Some("not-a-timestamp"),
-            ship_created,
+            &state,
         ));
         assert!(removal_blocks_rearm(
             true,
             Some("failed_checks"),
             Some("not-a-timestamp"),
-            ship_created,
+            &state,
         ));
-        assert!(!removal_blocks_rearm(false, None, None, ship_created));
+        assert!(!removal_blocks_rearm(false, None, None, &state));
+
+        state.merge_queue_observed_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:30Z")
+                .expect("time")
+                .with_timezone(&chrono::Utc),
+        );
+        assert!(!removal_blocks_rearm(
+            true,
+            Some("invalid_merge_commit"),
+            Some("2026-07-23T12:01:00Z"),
+            &state,
+        ));
     }
 
     #[test]

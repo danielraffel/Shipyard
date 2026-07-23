@@ -119,6 +119,12 @@ pub struct ShipState {
     /// Start of the current native queue admission attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_attempt_started_at: Option<DateTime<Utc>>,
+    /// When GitHub accepted the current exact-head enqueue mutation.
+    ///
+    /// An absent PR after this point but before observed membership is
+    /// terminal: Shipyard must not undo a manual dequeue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_enqueue_succeeded_at: Option<DateTime<Utc>>,
     /// Terminal abandonment marker set by the daemon's opt-in orphan resume
     /// sweep. `None` for a normal in-flight or evidence-terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +161,7 @@ impl ShipState {
             updated_at: now,
             merge_queue_observed_at: None,
             merge_queue_attempt_started_at: None,
+            merge_queue_enqueue_succeeded_at: None,
             abandoned: None,
         }
     }
