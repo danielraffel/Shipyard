@@ -128,6 +128,9 @@ pub(super) fn execute_auto_merge(
                 &state.base_branch,
             ) {
                 Some(live_pr) => {
+                    // Revocation must inspect the PR's current queue, even
+                    // when its head and target branch changed together.
+                    state.base_branch = live_pr.base_branch;
                     if !shas_match(&live_pr.head_sha, &state.head_sha) {
                         // Snapshot-backed execution is the deterministic test
                         // seam and has no live GitHub authority to revoke.
@@ -151,7 +154,6 @@ pub(super) fn execute_auto_merge(
                     // retargeted while validation runs. Queue governance and
                     // every subsequent queue poll must follow GitHub's live
                     // target branch, not that stale hint.
-                    state.base_branch = live_pr.base_branch;
                 }
                 None => {
                     return Ok(AutoMergeOutcome::MergeFailed {
@@ -805,7 +807,11 @@ pub(super) fn supervise_merge_queue(
                     } else {
                         None
                     };
-                    if let Err(error) = store.archive(pr) {
+                    if let Err(error) = archive_queue_state_if_current(
+                        store,
+                        &state,
+                        state.merge_queue_attempt_started_at,
+                    ) {
                         return AutoMergeOutcome::MergeFailed {
                             error: format!("PR merged but ship-state archive failed: {error}"),
                         };
@@ -831,9 +837,15 @@ pub(super) fn supervise_merge_queue(
                         {
                             seen_in_queue = true;
                             if state.merge_queue_observed_at.is_none() {
-                                state.merge_queue_observed_at = Some(chrono::Utc::now());
-                                state.touch();
-                                if let Err(error) = store.save(&state) {
+                                let expected_attempt = state.merge_queue_attempt_started_at;
+                                if let Err(error) = update_queue_state_if_current(
+                                    store,
+                                    &mut state,
+                                    expected_attempt,
+                                    |current| {
+                                        current.merge_queue_observed_at = Some(chrono::Utc::now());
+                                    },
+                                ) {
                                     return AutoMergeOutcome::MergeFailed {
                                         error: format!(
                                             "failed to persist merge-queue observation: {error}"
@@ -866,14 +878,20 @@ pub(super) fn supervise_merge_queue(
                         {
                             return AutoMergeOutcome::MergeFailed { error };
                         }
+                        let expected_attempt = state.merge_queue_attempt_started_at;
                         seen_in_queue = false;
                         attempt_started = Instant::now();
                         attempt_started_at = chrono::Utc::now();
-                        state.merge_queue_observed_at = None;
-                        state.merge_queue_attempt_started_at = Some(attempt_started_at);
-                        state.merge_queue_enqueue_succeeded_at = Some(attempt_started_at);
-                        state.touch();
-                        if let Err(error) = store.save(&state) {
+                        if let Err(error) = update_queue_state_if_current(
+                            store,
+                            &mut state,
+                            expected_attempt,
+                            |current| {
+                                current.merge_queue_observed_at = None;
+                                current.merge_queue_attempt_started_at = Some(attempt_started_at);
+                                current.merge_queue_enqueue_succeeded_at = Some(attempt_started_at);
+                            },
+                        ) {
                             return AutoMergeOutcome::MergeFailed {
                                 error: format!(
                                     "failed to persist merge-queue re-enqueue attempt: {error}"
@@ -895,13 +913,21 @@ pub(super) fn supervise_merge_queue(
                         }
                         match arm_native_queue(&client, cwd, &state, &observation.id) {
                             Ok(()) => {
+                                let expected_attempt = state.merge_queue_attempt_started_at;
                                 attempt_started = Instant::now();
                                 attempt_started_at = chrono::Utc::now();
-                                state.merge_queue_attempt_started_at = Some(attempt_started_at);
-                                state.merge_queue_observed_at = None;
-                                state.merge_queue_enqueue_succeeded_at = Some(attempt_started_at);
-                                state.touch();
-                                if let Err(error) = store.save(&state) {
+                                if let Err(error) = update_queue_state_if_current(
+                                    store,
+                                    &mut state,
+                                    expected_attempt,
+                                    |current| {
+                                        current.merge_queue_attempt_started_at =
+                                            Some(attempt_started_at);
+                                        current.merge_queue_observed_at = None;
+                                        current.merge_queue_enqueue_succeeded_at =
+                                            Some(attempt_started_at);
+                                    },
+                                ) {
                                     return AutoMergeOutcome::MergeFailed {
                                         error: format!(
                                             "failed to persist pending queue admission: {error}"
@@ -960,6 +986,66 @@ pub(super) fn supervise_merge_queue(
             QUEUE_WAIT_TIMEOUT.as_secs()
         ),
     }
+}
+
+fn update_queue_state_if_current(
+    store: &ShipStateStore,
+    local: &mut ShipState,
+    expected_attempt: Option<chrono::DateTime<chrono::Utc>>,
+    update: impl FnOnce(&mut ShipState),
+) -> Result<(), String> {
+    let lock = store
+        .lock_pr(local.pr)
+        .map_err(|error| format!("failed to lock ship-state: {error}"))?;
+    let Some(mut current) = store.get_locked(local.pr, &lock) else {
+        return Err("active ship-state disappeared".to_owned());
+    };
+    if !shas_match(&current.head_sha, &local.head_sha)
+        || current.merge_queue_attempt_started_at != expected_attempt
+    {
+        return Err(format!(
+            "ship-state changed concurrently (expected head {} and attempt {:?}, found head {} and attempt {:?}); refusing stale overwrite",
+            local.head_sha,
+            expected_attempt,
+            current.head_sha,
+            current.merge_queue_attempt_started_at
+        ));
+    }
+    update(&mut current);
+    current.touch();
+    store
+        .save_locked(&current, &lock)
+        .map_err(|error| format!("failed to save ship-state: {error}"))?;
+    *local = current;
+    Ok(())
+}
+
+fn archive_queue_state_if_current(
+    store: &ShipStateStore,
+    local: &ShipState,
+    expected_attempt: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), String> {
+    let lock = store
+        .lock_pr(local.pr)
+        .map_err(|error| format!("failed to lock ship-state: {error}"))?;
+    let Some(current) = store.get_locked(local.pr, &lock) else {
+        return Err("active ship-state disappeared".to_owned());
+    };
+    if !shas_match(&current.head_sha, &local.head_sha)
+        || current.merge_queue_attempt_started_at != expected_attempt
+    {
+        return Err(format!(
+            "ship-state changed concurrently (expected head {} and attempt {:?}, found head {} and attempt {:?}); refusing stale archive",
+            local.head_sha,
+            expected_attempt,
+            current.head_sha,
+            current.merge_queue_attempt_started_at
+        ));
+    }
+    store
+        .archive_locked(local.pr, &lock)
+        .map_err(|error| format!("failed to archive ship-state: {error}"))?;
+    Ok(())
 }
 
 fn fetch_queue_poll_pages(
@@ -1807,6 +1893,55 @@ mod tests {
             Some("2026-07-23T12:01:00Z"),
             &state,
         ));
+    }
+
+    #[test]
+    fn queue_state_update_preserves_newer_same_head_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let mut local = ShipState::new(7, "owner/repo", "feature/x", "main", "abc", "policy");
+        let attempt = chrono::Utc::now();
+        local.merge_queue_attempt_started_at = Some(attempt);
+        store.save(&local).expect("seed state");
+
+        let mut current = local.clone();
+        current
+            .evidence_snapshot
+            .insert("macos".to_owned(), "pass".to_owned());
+        store.save(&current).expect("save concurrent evidence");
+
+        update_queue_state_if_current(&store, &mut local, Some(attempt), |state| {
+            state.merge_queue_observed_at = Some(attempt);
+        })
+        .expect("same-head update");
+
+        assert_eq!(
+            local.evidence_snapshot.get("macos").map(String::as_str),
+            Some("pass")
+        );
+        assert_eq!(local.merge_queue_observed_at, Some(attempt));
+    }
+
+    #[test]
+    fn queue_state_update_and_archive_refuse_newer_head() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let mut local = ShipState::new(8, "owner/repo", "feature/x", "main", "old", "policy");
+        let attempt = chrono::Utc::now();
+        local.merge_queue_attempt_started_at = Some(attempt);
+        store.save(&local).expect("seed state");
+
+        let mut newer = local.clone();
+        newer.head_sha = "new".to_owned();
+        newer.merge_queue_attempt_started_at = None;
+        store.save(&newer).expect("save adopted head");
+
+        assert!(update_queue_state_if_current(&store, &mut local, Some(attempt), |_| {}).is_err());
+        assert!(archive_queue_state_if_current(&store, &local, Some(attempt)).is_err());
+        assert_eq!(
+            store.get(8).expect("newer state remains active").head_sha,
+            "new"
+        );
     }
 
     #[test]
