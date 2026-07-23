@@ -504,6 +504,9 @@ fn merge_pr(
             cwd,
         )?
     };
+    if let Some(client) = client.as_ref() {
+        verify_live_merge_target(client, cwd, state, "before governance selection")?;
+    }
     let queue_required = if custom_command {
         false
     } else {
@@ -564,6 +567,7 @@ fn merge_pr(
                     &pr_id,
                 ) {
                     Ok(()) => true,
+                    Err(error) if terminal_github_error(&error) => return Err(error),
                     Err(error) if enqueue_requirements_pending(&error) => false,
                     Err(error) => return Err(error),
                 };
@@ -576,6 +580,14 @@ fn merge_pr(
         }
     }
     if !custom_command {
+        verify_live_merge_target(
+            client
+                .as_ref()
+                .expect("built-in merge should have gh client"),
+            cwd,
+            state,
+            "at classic merge mutation boundary",
+        )?;
         command.args(["pr", "merge", &state.pr.to_string(), "--repo", &state.repo]);
         // Defense in depth (issue #321): tell GitHub the exact head we
         // validated so the SERVER rejects the merge if the head drifted
@@ -596,6 +608,9 @@ fn merge_pr(
         .output()
         .map_err(|error| format!("failed to run merge command: {error}"))?;
     if output.status.success() {
+        if let Some(client) = client.as_ref() {
+            return classify_builtin_merge_success(client, cwd, state);
+        }
         return Ok(MergeDisposition::Merged {
             cleanup_warning: None,
         });
@@ -630,14 +645,69 @@ fn merge_pr(
             state.pr,
             cwd,
             &state.head_sha,
+            &state.base_branch,
             merge_method,
             delete_branch,
         )?;
+        return classify_builtin_merge_success(client, cwd, state);
+    }
+    Err(message)
+}
+
+fn verify_live_merge_target(
+    client: &GhClient,
+    cwd: &Path,
+    state: &ShipState,
+    phase: &str,
+) -> Result<PrHeadInfo, String> {
+    let info = pr_head_info_rest(client, &state.repo, state.pr, cwd)?;
+    validate_live_merge_target_info(&info, state, phase)?;
+    Ok(info)
+}
+
+fn validate_live_merge_target_info(
+    info: &PrHeadInfo,
+    state: &ShipState,
+    phase: &str,
+) -> Result<(), String> {
+    if !shas_match(&info.sha, &state.head_sha) {
+        return Err(format!(
+            "{phase}: live PR head {} superseded validated SHA {}",
+            info.sha, state.head_sha
+        ));
+    }
+    if info.base_ref != state.base_branch {
+        return Err(format!(
+            "{phase}: PR #{} was retargeted from validated base {} to {}; refusing merge",
+            state.pr, state.base_branch, info.base_ref
+        ));
+    }
+    Ok(())
+}
+
+fn classify_builtin_merge_success(
+    client: &GhClient,
+    cwd: &Path,
+    state: &mut ShipState,
+) -> Result<MergeDisposition, String> {
+    let info = verify_live_merge_target(client, cwd, state, "after merge mutation")?;
+    if info.merged {
         return Ok(MergeDisposition::Merged {
             cleanup_warning: None,
         });
     }
-    Err(message)
+    if !repository_requires_merge_queue(client, cwd, &state.repo, &state.base_branch)? {
+        return Err(format!(
+            "GitHub reported merge success for PR #{} but the PR is not merged and its target branch has no merge queue",
+            state.pr
+        ));
+    }
+    let admitted_at = chrono::Utc::now();
+    state.merge_queue_attempt_started_at = Some(admitted_at);
+    state.merge_queue_observed_at = None;
+    state.merge_queue_enqueue_succeeded_at = Some(admitted_at);
+    state.touch();
+    Ok(MergeDisposition::Enqueued)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -667,6 +737,17 @@ fn queue_admission(
     }
     if observation.merged {
         return Ok(QueueAdmission::AlreadyMerged);
+    }
+    let live_base = body
+        .pointer("/data/repository/pullRequest/baseRefName")
+        .and_then(Value::as_str)
+        .filter(|base| !base.is_empty())
+        .ok_or_else(|| "merge-queue admission observation omitted PR baseRefName".to_owned())?;
+    if live_base != state.base_branch {
+        return Err(format!(
+            "PR #{} was retargeted from validated base {} to {} before queue admission",
+            state.pr, state.base_branch, live_base
+        ));
     }
     match crate::merge_queue::parse_queue_pages(&pages, state.pr) {
         crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found => {
@@ -1030,6 +1111,9 @@ pub(super) fn supervise_merge_queue(
                                 thread::sleep(QUEUE_POLL_INTERVAL);
                                 continue;
                             }
+                            Err(error) if terminal_github_error(&error) => {
+                                return AutoMergeOutcome::MergeFailed { error };
+                            }
                             Err(error) if enqueue_requirements_pending(&error) => {
                                 thread::sleep(QUEUE_POLL_INTERVAL);
                                 continue;
@@ -1170,7 +1254,7 @@ fn fetch_queue_poll_pages(
         .repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug {:?}", state.repo))?;
-    let query = r"query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){id headRefOid merged autoMergeRequest{id} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100,after:$after){nodes{position pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
+    let query = r"query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){id headRefOid baseRefName merged autoMergeRequest{id} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100,after:$after){nodes{position pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
     let mut pages = Vec::new();
     let mut cursor: Option<String> = None;
     let mut seen_cursors = BTreeSet::new();
@@ -1284,11 +1368,15 @@ fn arm_native_queue(
 }
 
 fn enqueue_requirements_pending(message: &str) -> bool {
+    if terminal_github_error(message) {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
-    lower.contains("required")
-        || lower.contains("requirement")
-        || lower.contains("status check")
-        || lower.contains("review")
+    lower.contains("required status check")
+        || lower.contains("required check")
+        || lower.contains("required approving review")
+        || lower.contains("required review")
+        || lower.contains("requirements are not met")
         || lower.contains("not mergeable")
 }
 
@@ -1361,7 +1449,10 @@ fn run_queue_mutation(
 
 fn terminal_github_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("http 403")
+    lower.contains("http 401")
+        || lower.contains("http 403")
+        || lower.contains("bad credentials")
+        || lower.contains("resource not accessible by integration")
         || lower.contains("api rate limit exceeded")
         || lower.contains("rate limit")
 }
@@ -1492,11 +1583,18 @@ fn merge_pr_rest(
     pr: u64,
     cwd: &Path,
     expected_head_sha: &str,
+    expected_base: &str,
     merge_method: MergeMethod,
     delete_branch: bool,
 ) -> Result<(), String> {
     let repo = repo_slug_for_rest(cwd)?;
     let info = pr_head_info_rest(client, &repo, pr, cwd)?;
+    if info.base_ref != expected_base {
+        return Err(format!(
+            "REST fallback: PR #{pr} was retargeted from validated base {expected_base} to {}; refusing merge",
+            info.base_ref
+        ));
+    }
     let endpoint = format!("repos/{repo}/pulls/{pr}/merge");
 
     let first = attempt_merge_put(client, &endpoint, expected_head_sha, merge_method, cwd);
@@ -1513,6 +1611,12 @@ fn merge_pr_rest(
                     "REST fallback: PR head moved from validated {} to {} between merge attempts; refusing to retry",
                     short_sha(expected_head_sha),
                     short_sha(&refreshed.sha)
+                ));
+            }
+            if refreshed.base_ref != expected_base {
+                return Err(format!(
+                    "REST fallback: PR #{pr} was retargeted from validated base {expected_base} to {} between merge attempts; refusing to retry",
+                    refreshed.base_ref
                 ));
             }
             attempt_merge_put(client, &endpoint, expected_head_sha, merge_method, cwd)
@@ -1621,6 +1725,8 @@ struct PrHeadInfo {
     head_ref: String,
     head_repo: Option<String>,
     sha: String,
+    base_ref: String,
+    merged: bool,
 }
 
 fn pr_head_info_rest(
@@ -1660,10 +1766,22 @@ fn pr_head_info_rest(
         .and_then(Value::as_str)
         .ok_or_else(|| "REST fallback: PR JSON missing head.sha".to_owned())?
         .to_owned();
+    let base_ref = value
+        .pointer("/base/ref")
+        .and_then(Value::as_str)
+        .filter(|base| !base.is_empty())
+        .ok_or_else(|| "REST fallback: PR JSON missing base.ref".to_owned())?
+        .to_owned();
+    let merged = value
+        .get("merged")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "REST fallback: PR JSON missing merged state".to_owned())?;
     Ok(PrHeadInfo {
         head_ref,
         head_repo,
         sha,
+        base_ref,
+        merged,
     })
 }
 
@@ -1941,12 +2059,58 @@ mod tests {
     }
 
     #[test]
-    fn terminal_github_errors_include_403_and_rate_limits_only() {
+    fn terminal_github_errors_include_auth_and_rate_limits() {
+        assert!(terminal_github_error("HTTP 401: bad credentials"));
         assert!(terminal_github_error("HTTP 403: forbidden"));
+        assert!(terminal_github_error(
+            "GraphQL: Resource not accessible by integration"
+        ));
         assert!(terminal_github_error("API rate limit exceeded"));
         assert!(!terminal_github_error(
             "HTTP 502: transient upstream failure"
         ));
+    }
+
+    #[test]
+    fn enqueue_requirements_pending_never_swallows_terminal_auth_errors() {
+        assert!(enqueue_requirements_pending(
+            "Pull request is not mergeable because a required status check is pending"
+        ));
+        assert!(enqueue_requirements_pending(
+            "Required approving review has not been submitted"
+        ));
+        assert!(!enqueue_requirements_pending(
+            "HTTP 403: a required permission is missing"
+        ));
+        assert!(!enqueue_requirements_pending(
+            "Resource not accessible by integration: review permission required"
+        ));
+    }
+
+    #[test]
+    fn live_merge_target_validation_binds_head_and_base() {
+        let state = ShipState::new(3, "owner/repo", "feature/x", "main", "validated", "policy");
+        let mut info = PrHeadInfo {
+            head_ref: "feature/x".to_owned(),
+            head_repo: Some("owner/repo".to_owned()),
+            sha: "validated".to_owned(),
+            base_ref: "main".to_owned(),
+            merged: false,
+        };
+        assert!(validate_live_merge_target_info(&info, &state, "test").is_ok());
+        info.base_ref = "release".to_owned();
+        assert!(
+            validate_live_merge_target_info(&info, &state, "test")
+                .expect_err("retarget must fail")
+                .contains("retargeted")
+        );
+        info.base_ref = "main".to_owned();
+        info.sha = "different".to_owned();
+        assert!(
+            validate_live_merge_target_info(&info, &state, "test")
+                .expect_err("head drift must fail")
+                .contains("superseded")
+        );
     }
 
     #[test]
