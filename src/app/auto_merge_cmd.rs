@@ -19,7 +19,7 @@ use crate::merge_queue::{
     parse_pr_observation, parse_queue_snapshot,
 };
 use crate::output::write_json_envelope;
-use crate::ship_state::{ShipState, ShipStateStore};
+use crate::ship_state::{ShipState, ShipStatePrLock, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
 
 pub(super) struct AutoMergeRequest {
@@ -118,6 +118,8 @@ pub(super) fn execute_auto_merge(
             }
 
             let merge_disposition = match merge_pr(
+                store,
+                &lock,
                 cwd,
                 &mut state,
                 request.merge_method,
@@ -488,6 +490,8 @@ fn gh(client: &GhClient, cwd: &Path) -> Result<Command, String> {
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn merge_pr(
+    store: &ShipStateStore,
+    lock: &ShipStatePrLock,
     cwd: &Path,
     state: &mut ShipState,
     merge_method: MergeMethod,
@@ -576,23 +580,34 @@ fn merge_pr(
                 return Ok(MergeDisposition::Enqueued);
             }
             QueueAdmission::Arm { pr_id } => {
-                let arm_succeeded = match arm_native_queue(
+                state.merge_queue_attempt_started_at = Some(admission_started_at);
+                state.merge_queue_observed_at = None;
+                state.merge_queue_enqueue_succeeded_at = None;
+                state.merge_queue_enqueue_started_at = Some(admission_started_at);
+                state.touch();
+                store.save_locked(state, lock).map_err(|error| {
+                    format!("failed to persist uncertain queue admission: {error}")
+                })?;
+                let arm_result = arm_native_queue(
                     client
                         .as_ref()
                         .expect("built-in merge should have gh client"),
                     cwd,
                     state,
                     &pr_id,
-                ) {
-                    Ok(()) => true,
-                    Err(error) if terminal_github_error(&error) => return Err(error),
-                    Err(error) if enqueue_requirements_pending(&error) => false,
-                    Err(error) => return Err(error),
-                };
-                state.merge_queue_attempt_started_at = Some(admission_started_at);
-                state.merge_queue_observed_at = None;
-                state.merge_queue_enqueue_succeeded_at = arm_succeeded.then(chrono::Utc::now);
+                );
+                state.merge_queue_enqueue_started_at = None;
+                state.merge_queue_enqueue_succeeded_at = arm_result.is_ok().then(chrono::Utc::now);
                 state.touch();
+                store.save_locked(state, lock).map_err(|error| {
+                    format!("failed to persist queue admission result: {error}")
+                })?;
+                match arm_result {
+                    Ok(()) => {}
+                    Err(error) if terminal_github_error(&error) => return Err(error),
+                    Err(error) if enqueue_requirements_pending(&error) => {}
+                    Err(error) => return Err(error),
+                }
                 return Ok(MergeDisposition::Enqueued);
             }
         }
@@ -724,6 +739,7 @@ fn classify_builtin_merge_success(
     state.merge_queue_attempt_started_at = Some(admitted_at);
     state.merge_queue_observed_at = None;
     state.merge_queue_enqueue_succeeded_at = Some(admitted_at);
+    state.merge_queue_enqueue_started_at = None;
     state.touch();
     Ok(MergeDisposition::Enqueued)
 }
@@ -870,7 +886,9 @@ fn queue_absence_allows_arm(
 }
 
 fn owns_native_merge_authority(state: &ShipState) -> bool {
-    state.merge_queue_enqueue_succeeded_at.is_some() || state.merge_queue_observed_at.is_some()
+    state.merge_queue_enqueue_started_at.is_some()
+        || state.merge_queue_enqueue_succeeded_at.is_some()
+        || state.merge_queue_observed_at.is_some()
 }
 
 fn auto_merge_has_exact_head_proof(state: &ShipState) -> bool {
@@ -887,6 +905,7 @@ fn record_observed_queue_adoption(
     state
         .merge_queue_observed_at
         .get_or_insert(admission_started_at);
+    state.merge_queue_enqueue_started_at = None;
     state.touch();
 }
 
@@ -897,6 +916,7 @@ fn record_pending_auto_merge(
     state
         .merge_queue_attempt_started_at
         .get_or_insert(admission_started_at);
+    state.merge_queue_enqueue_started_at = None;
     // Preserve exact-head enqueue evidence from an earlier one-shot. A
     // pending auto-merge observation can be the eventual-consistency window
     // after that successful mutation.
@@ -1076,30 +1096,39 @@ pub(super) fn supervise_merge_queue(
                                 ),
                             };
                         }
+                        let expected_attempt = match mark_queue_enqueue_started(store, &mut state) {
+                            Ok(expected) => expected,
+                            Err(error) => {
+                                return AutoMergeOutcome::MergeFailed { error };
+                            }
+                        };
                         if let Err(error) = arm_native_queue(&client, cwd, &state, &observation.id)
                         {
+                            if let Err(persist_error) =
+                                finish_queue_enqueue(store, &mut state, expected_attempt, false)
+                            {
+                                return AutoMergeOutcome::MergeFailed {
+                                    error: format!(
+                                        "{error}; additionally failed to clear uncertain admission: {persist_error}"
+                                    ),
+                                };
+                            }
                             return AutoMergeOutcome::MergeFailed { error };
                         }
-                        let expected_attempt = state.merge_queue_attempt_started_at;
                         seen_in_queue = false;
                         attempt_started = Instant::now();
-                        attempt_started_at = chrono::Utc::now();
-                        if let Err(error) = update_queue_state_if_current(
-                            store,
-                            &mut state,
-                            expected_attempt,
-                            |current| {
-                                current.merge_queue_observed_at = None;
-                                current.merge_queue_attempt_started_at = Some(attempt_started_at);
-                                current.merge_queue_enqueue_succeeded_at = Some(attempt_started_at);
-                            },
-                        ) {
+                        if let Err(error) =
+                            finish_queue_enqueue(store, &mut state, expected_attempt, true)
+                        {
                             return AutoMergeOutcome::MergeFailed {
                                 error: format!(
                                     "failed to persist merge-queue re-enqueue attempt: {error}"
                                 ),
                             };
                         }
+                        attempt_started_at = state
+                            .merge_queue_attempt_started_at
+                            .expect("successful enqueue persists attempt time");
                     }
                     QueuePollClass::PrNotFound => {
                         if observation.auto_merge_active {
@@ -1120,40 +1149,72 @@ pub(super) fn supervise_merge_queue(
                                 ),
                             };
                         }
+                        if state.merge_queue_enqueue_started_at.is_some() {
+                            return AutoMergeOutcome::MergeFailed {
+                                error: format!(
+                                    "PR #{pr} has an uncertain prior exact-head enqueue mutation; refusing to re-arm without queue observation"
+                                ),
+                            };
+                        }
+                        let expected_attempt = match mark_queue_enqueue_started(store, &mut state) {
+                            Ok(expected) => expected,
+                            Err(error) => {
+                                return AutoMergeOutcome::MergeFailed { error };
+                            }
+                        };
                         match arm_native_queue(&client, cwd, &state, &observation.id) {
                             Ok(()) => {
-                                let expected_attempt = state.merge_queue_attempt_started_at;
                                 attempt_started = Instant::now();
-                                attempt_started_at = chrono::Utc::now();
-                                if let Err(error) = update_queue_state_if_current(
-                                    store,
-                                    &mut state,
-                                    expected_attempt,
-                                    |current| {
-                                        current.merge_queue_attempt_started_at =
-                                            Some(attempt_started_at);
-                                        current.merge_queue_observed_at = None;
-                                        current.merge_queue_enqueue_succeeded_at =
-                                            Some(attempt_started_at);
-                                    },
-                                ) {
+                                if let Err(error) =
+                                    finish_queue_enqueue(store, &mut state, expected_attempt, true)
+                                {
                                     return AutoMergeOutcome::MergeFailed {
                                         error: format!(
                                             "failed to persist pending queue admission: {error}"
                                         ),
                                     };
                                 }
+                                attempt_started_at = state
+                                    .merge_queue_attempt_started_at
+                                    .expect("successful enqueue persists attempt time");
                                 thread::sleep(QUEUE_POLL_INTERVAL);
                                 continue;
                             }
                             Err(error) if terminal_github_error(&error) => {
+                                if let Err(persist_error) =
+                                    finish_queue_enqueue(store, &mut state, expected_attempt, false)
+                                {
+                                    return AutoMergeOutcome::MergeFailed {
+                                        error: format!(
+                                            "{error}; additionally failed to clear uncertain admission: {persist_error}"
+                                        ),
+                                    };
+                                }
                                 return AutoMergeOutcome::MergeFailed { error };
                             }
                             Err(error) if enqueue_requirements_pending(&error) => {
+                                if let Err(persist_error) =
+                                    finish_queue_enqueue(store, &mut state, expected_attempt, false)
+                                {
+                                    return AutoMergeOutcome::MergeFailed {
+                                        error: format!(
+                                            "failed to clear rejected queue admission: {persist_error}"
+                                        ),
+                                    };
+                                }
                                 thread::sleep(QUEUE_POLL_INTERVAL);
                                 continue;
                             }
                             Err(error) => {
+                                if let Err(persist_error) =
+                                    finish_queue_enqueue(store, &mut state, expected_attempt, false)
+                                {
+                                    return AutoMergeOutcome::MergeFailed {
+                                        error: format!(
+                                            "{error}; additionally failed to clear uncertain admission: {persist_error}"
+                                        ),
+                                    };
+                                }
                                 return AutoMergeOutcome::MergeFailed { error };
                             }
                         }
@@ -1230,6 +1291,35 @@ fn update_queue_state_if_current(
         .map_err(|error| format!("failed to save ship-state: {error}"))?;
     *local = current;
     Ok(())
+}
+
+fn mark_queue_enqueue_started(
+    store: &ShipStateStore,
+    state: &mut ShipState,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let expected_attempt = state.merge_queue_attempt_started_at;
+    let started_at = chrono::Utc::now();
+    update_queue_state_if_current(store, state, expected_attempt, |current| {
+        current.merge_queue_enqueue_started_at = Some(started_at);
+    })?;
+    Ok(expected_attempt)
+}
+
+fn finish_queue_enqueue(
+    store: &ShipStateStore,
+    state: &mut ShipState,
+    expected_attempt: Option<chrono::DateTime<chrono::Utc>>,
+    succeeded: bool,
+) -> Result<(), String> {
+    let finished_at = chrono::Utc::now();
+    update_queue_state_if_current(store, state, expected_attempt, |current| {
+        current.merge_queue_enqueue_started_at = None;
+        if succeeded {
+            current.merge_queue_attempt_started_at = Some(finished_at);
+            current.merge_queue_observed_at = None;
+            current.merge_queue_enqueue_succeeded_at = Some(finished_at);
+        }
+    })
 }
 
 fn archive_queue_state_if_current(
@@ -1448,10 +1538,14 @@ fn revoke_drifted_native_merge(cwd: &Path, state: &ShipState) -> Result<(), Stri
         .ok_or_else(|| "drift revocation returned no queue pages".to_owned())?;
     let observation = parse_pr_observation(body)
         .map_err(|error| format!("drift revocation observation was malformed: {error}"))?;
-    let queued = matches!(
-        crate::merge_queue::parse_queue_pages(&pages, state.pr),
-        crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found
-    );
+    let queued = match crate::merge_queue::parse_queue_pages(&pages, state.pr) {
+        crate::merge_queue::QueuePollParse::Valid(snapshot) => snapshot.pr_found,
+        crate::merge_queue::QueuePollParse::Errored(error) => {
+            return Err(format!(
+                "drift revocation could not prove queue membership: {error}"
+            ));
+        }
+    };
     revoke_native_queue(&client, cwd, &observation, queued)
 }
 
@@ -2302,6 +2396,10 @@ mod tests {
         state.merge_queue_attempt_started_at = Some(chrono::Utc::now());
         assert!(!owns_native_merge_authority(&state));
         assert!(!auto_merge_has_exact_head_proof(&state));
+        state.merge_queue_enqueue_started_at = Some(chrono::Utc::now());
+        assert!(owns_native_merge_authority(&state));
+        assert!(!auto_merge_has_exact_head_proof(&state));
+        state.merge_queue_enqueue_started_at = None;
         state.merge_queue_enqueue_succeeded_at = Some(chrono::Utc::now());
         assert!(owns_native_merge_authority(&state));
         assert!(auto_merge_has_exact_head_proof(&state));
@@ -2379,6 +2477,38 @@ mod tests {
         record_pending_auto_merge(&mut external, later);
         assert_eq!(external.merge_queue_attempt_started_at, Some(later));
         assert_eq!(external.merge_queue_enqueue_succeeded_at, None);
+    }
+
+    #[test]
+    fn queue_enqueue_marker_brackets_mutation_and_preserves_uncertainty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let mut state = ShipState::new(13, "owner/repo", "feature/x", "main", "abc", "policy");
+        store.save(&state).expect("save state");
+
+        let expected_attempt =
+            mark_queue_enqueue_started(&store, &mut state).expect("persist pre-mutation marker");
+        assert!(state.merge_queue_enqueue_started_at.is_some());
+        assert!(
+            store
+                .get(state.pr)
+                .expect("persisted state")
+                .merge_queue_enqueue_started_at
+                .is_some()
+        );
+
+        finish_queue_enqueue(&store, &mut state, expected_attempt, true)
+            .expect("persist successful mutation");
+        assert!(state.merge_queue_enqueue_started_at.is_none());
+        assert!(state.merge_queue_attempt_started_at.is_some());
+        assert!(state.merge_queue_enqueue_succeeded_at.is_some());
+
+        let expected_attempt =
+            mark_queue_enqueue_started(&store, &mut state).expect("persist retry marker");
+        finish_queue_enqueue(&store, &mut state, expected_attempt, false)
+            .expect("persist rejected mutation");
+        assert!(state.merge_queue_enqueue_started_at.is_none());
+        assert!(state.merge_queue_enqueue_succeeded_at.is_some());
     }
 
     #[test]

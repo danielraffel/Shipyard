@@ -1660,6 +1660,7 @@ fn load_or_create_state(
             // events from the previous SHA from governing the new validation.
             existing.merge_queue_attempt_started_at = Some(chrono::Utc::now());
             existing.merge_queue_enqueue_succeeded_at = None;
+            existing.merge_queue_enqueue_started_at = None;
         }
         existing.commit_subject.clone_from(&request.commit_subject);
         refresh_pr_metadata(&mut existing, request);

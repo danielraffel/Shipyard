@@ -92,15 +92,7 @@ pub(super) fn ship_command<W: Write>(
         maybe_auto_create_base_branch(cwd, &args.base, config, args.gh_command.as_deref());
     }
     let lane_policy = resolve_lane_policy(config, cwd);
-    let pr_context = resolve_pr_context(
-        config,
-        args.pr,
-        &args.base,
-        cwd,
-        &branch,
-        args.gh_command.as_deref(),
-        &lane_policy,
-    )?;
+    let pr_context = resolve_pr_context(config, &args, cwd, &branch, &lane_policy)?;
 
     let mut queue = Queue::new(runtime_paths.state_dir.clone())
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -423,15 +415,35 @@ struct ResolvedPrContext {
 
 fn resolve_pr_context(
     config: &LoadedConfig,
-    pr: Option<u64>,
-    base: &str,
+    args: &ShipCommandArgs,
     cwd: &Path,
     branch: &str,
-    gh_command: Option<&Path>,
     lane_policy: &LanePolicy,
 ) -> Result<ResolvedPrContext, CliFailure> {
-    if let Some(number) = pr {
-        let info = get_pr_status(config, cwd, gh_command, &number.to_string())
+    if let Some(number) = args.pr {
+        if let Some(path) = args.pr_snapshot_file.as_deref() {
+            let value: Value = std::fs::read_to_string(path)
+                .map_err(|error| CliFailure::new(1, format!("failed to read PR snapshot: {error}")))
+                .and_then(|payload| {
+                    serde_json::from_str(&payload).map_err(|error| {
+                        CliFailure::new(1, format!("failed to parse PR snapshot: {error}"))
+                    })
+                })?;
+            let base_branch = value
+                .get("baseRefName")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| value.pointer("/base/ref").and_then(Value::as_str))
+                .unwrap_or(&args.base)
+                .to_owned();
+            return Ok(ResolvedPrContext {
+                number,
+                base_branch,
+                pr_url: None,
+                pr_title: None,
+            });
+        }
+        let info = get_pr_status(config, cwd, args.gh_command.as_deref(), &number.to_string())
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return Ok(ResolvedPrContext {
             number,
@@ -442,10 +454,19 @@ fn resolve_pr_context(
     }
 
     push_branch(cwd, branch).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let info = find_pr_for_branch(config, cwd, gh_command, branch)
+    let info = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), branch)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .map_or_else(
-            || create_current_branch_pr(config, cwd, gh_command, branch, base, lane_policy),
+            || {
+                create_current_branch_pr(
+                    config,
+                    cwd,
+                    args.gh_command.as_deref(),
+                    branch,
+                    &args.base,
+                    lane_policy,
+                )
+            },
             Ok::<PrInfo, CliFailure>,
         )?;
     Ok(ResolvedPrContext {
@@ -1319,6 +1340,13 @@ mod tests {
             Some(temp.path().join("global")),
             Some(temp.path().join("state")),
         );
+        let head = git_capture(&["rev-parse", "HEAD"], &repo);
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            format!(r#"{{"headRefOid":"{head}","baseRefName":"main"}}"#),
+        )
+        .expect("write snapshot");
         let mut stdout = Vec::new();
 
         let code = ship_command(
@@ -1331,7 +1359,7 @@ mod tests {
                 merge_command: None,
                 merge_result: Some(MergeResult::Success),
                 gh_command: None,
-                pr_snapshot_file: None,
+                pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
                 skip_targets: vec!["linux".to_owned()],
                 adopt_head: false,
