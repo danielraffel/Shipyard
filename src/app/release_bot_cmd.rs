@@ -822,12 +822,21 @@ fn push_via_pr(
     tag: &str,
     result: &mut HookResult,
 ) -> Result<(), String> {
-    let pr_branch = format!("{}-{}", config.pr_branch_prefix, sanitize_ref_component(tag));
+    let pr_branch = format!(
+        "{}-{}",
+        config.pr_branch_prefix,
+        sanitize_ref_component(tag)
+    );
     // Force-push the bot-owned throwaway branch (a stale branch from an aborted
     // run must not block a fresh sync). Safe — only the bot writes it.
     run_git(
         cwd,
-        &["push", "--force", &config.remote, &format!("HEAD:{pr_branch}")],
+        &[
+            "push",
+            "--force",
+            &config.remote,
+            &format!("HEAD:{pr_branch}"),
+        ],
     )?;
     result.pushed = true;
     let title = format!("docs: regenerate changelog for {tag}");
@@ -838,8 +847,16 @@ fn push_via_pr(
     let created = run_gh(
         cwd,
         &[
-            "pr", "create", "--base", &config.branch, "--head", &pr_branch, "--title", &title,
-            "--body", &body,
+            "pr",
+            "create",
+            "--base",
+            &config.branch,
+            "--head",
+            &pr_branch,
+            "--title",
+            &title,
+            "--body",
+            &body,
         ],
     );
     if let Err(error) = created {
