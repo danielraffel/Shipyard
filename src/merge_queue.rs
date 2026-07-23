@@ -129,6 +129,8 @@ pub enum QueuePollParse {
 /// PR-level facts returned alongside each sparse queue poll.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuePrObservation {
+    /// GraphQL node ID used for fail-closed queue/auto-merge revocation.
+    pub id: String,
     /// Current full head SHA.
     pub head_sha: String,
     /// Whether GitHub reports the PR merged.
@@ -161,6 +163,12 @@ pub fn parse_pr_observation(body: &serde_json::Value) -> Result<QueuePrObservati
         .pointer("/data/repository/pullRequest")
         .filter(|value| !value.is_null())
         .ok_or_else(|| "response missing pull request".to_owned())?;
+    let id = pr
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "response missing pull request node ID".to_owned())?
+        .to_owned();
     let head_sha = pr
         .get("headRefOid")
         .and_then(serde_json::Value::as_str)
@@ -187,6 +195,7 @@ pub fn parse_pr_observation(body: &serde_json::Value) -> Result<QueuePrObservati
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     Ok(QueuePrObservation {
+        id,
         head_sha,
         merged,
         auto_merge_active,
@@ -539,6 +548,7 @@ mod tests {
         let body = serde_json::json!({
             "data": { "repository": {
                 "pullRequest": {
+                    "id": "PR_1",
                     "headRefOid": "0123456789abcdef",
                     "merged": false,
                     "autoMergeRequest": { "id": "AMR_1" },
@@ -551,6 +561,7 @@ mod tests {
         assert_eq!(
             parse_pr_observation(&body).expect("observation"),
             QueuePrObservation {
+                id: "PR_1".to_owned(),
                 head_sha: "0123456789abcdef".to_owned(),
                 merged: false,
                 auto_merge_active: true,

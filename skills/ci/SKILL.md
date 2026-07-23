@@ -635,14 +635,16 @@ See `docs/waiting.md` for the full reference: subcommand semantics, event source
 Shipyard refuses to merge unless every required platform has passing evidence
 for the exact HEAD SHA.
 
-On a base branch whose evaluated rules require GitHub's merge queue, Shipyard
-does not issue a direct merge. It arms native auto-merge with `--merge` and the
-exact validated head SHA, then `shipyard ship` waits for the queue result.
+On a base branch whose live queue object or evaluated rules require GitHub's
+merge queue, Shipyard does not issue a direct merge. It enqueues with GitHub's
+server-atomic `expectedHeadOid` set to the exact validated head SHA, then
+`shipyard ship` waits for the queue result.
 `shipyard auto-merge` remains a cron-safe one-shot: it returns exit 3 after
 arming or observing the queue and leaves ship-state active. A queue supervisor
-re-enqueues only after it previously observed the PR and GitHub reports
-`invalid_merge_commit`; `failed_checks`, manual/unknown removal, head drift, and
-HTTP 403/rate-limit responses stop fail-closed.
+re-enqueues only after it previously observed the PR (persisted across process
+restarts) and GitHub reports `invalid_merge_commit`; `failed_checks`,
+manual/unknown removal, head drift, and HTTP 403/rate-limit responses stop
+fail-closed.
 
 ### Iterating on a single-platform failure
 

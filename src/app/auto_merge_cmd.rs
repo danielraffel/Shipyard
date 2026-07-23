@@ -46,7 +46,7 @@ pub(super) enum AutoMergeOutcome {
     MergeFailed {
         error: String,
     },
-    /// Native GitHub auto-merge was armed for a queue-governed base branch.
+    /// Native GitHub queue admission is pending or active for a governed base.
     /// The ship state remains active until GitHub's merge queue lands the PR.
     Enqueued,
     /// The live PR head SHA advanced past the validated merge-candidate SHA
@@ -94,7 +94,7 @@ pub(super) fn execute_auto_merge(
     let lock = store
         .lock_pr(request.pr)
         .map_err(AutoMergeOperationError::Store)?;
-    let Some(state) = store.get_locked(request.pr, &lock) else {
+    let Some(mut state) = store.get_locked(request.pr, &lock) else {
         return Ok(
             if pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref()) {
                 AutoMergeOutcome::AlreadyMerged
@@ -124,6 +124,18 @@ pub(super) fn execute_auto_merge(
             match fetch_live_head_sha(request.pr, cwd, request.pr_snapshot_file.as_deref()) {
                 Some(live_head) => {
                     if !shas_match(&live_head, &state.head_sha) {
+                        // Snapshot-backed execution is the deterministic test
+                        // seam and has no live GitHub authority to revoke.
+                        if request.pr_snapshot_file.is_none()
+                            && let Err(error) = revoke_drifted_native_merge(cwd, &state)
+                        {
+                            return Ok(AutoMergeOutcome::MergeFailed {
+                                error: format!(
+                                    "live PR head {live_head} superseded validated SHA {}, but native merge revocation failed: {error}",
+                                    state.head_sha
+                                ),
+                            });
+                        }
                         return Ok(AutoMergeOutcome::SupersededSha {
                             validated: state.head_sha.clone(),
                             current: live_head,
@@ -139,7 +151,7 @@ pub(super) fn execute_auto_merge(
 
             let merge_disposition = match merge_pr(
                 cwd,
-                &state,
+                &mut state,
                 request.merge_method,
                 request.delete_branch,
                 request.admin,
@@ -162,6 +174,11 @@ pub(super) fn execute_auto_merge(
                 }
             };
             if merge_disposition == MergeDisposition::Enqueued {
+                if let Err(error) = store.save_locked(&state, &lock) {
+                    return Ok(AutoMergeOutcome::MergeFailed {
+                        error: format!("failed to persist merge-queue admission: {error}"),
+                    });
+                }
                 return Ok(AutoMergeOutcome::Enqueued);
             }
             store
@@ -403,7 +420,7 @@ fn gh(client: &GhClient, cwd: &Path) -> Result<Command, String> {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn merge_pr(
     cwd: &Path,
-    state: &ShipState,
+    state: &mut ShipState,
     merge_method: MergeMethod,
     delete_branch: bool,
     admin: bool,
@@ -453,8 +470,39 @@ fn merge_pr(
             state,
         )? {
             QueueAdmission::AlreadyMerged => return Ok(MergeDisposition::Merged),
-            QueueAdmission::AlreadyEnqueued => return Ok(MergeDisposition::Enqueued),
-            QueueAdmission::Arm => {}
+            QueueAdmission::AlreadyQueued => {
+                let now = chrono::Utc::now();
+                state.merge_queue_attempt_started_at = Some(now);
+                state.merge_queue_observed_at = Some(now);
+                state.touch();
+                return Ok(MergeDisposition::Enqueued);
+            }
+            QueueAdmission::AutoMergePending => {
+                state
+                    .merge_queue_attempt_started_at
+                    .get_or_insert_with(chrono::Utc::now);
+                state.touch();
+                return Ok(MergeDisposition::Enqueued);
+            }
+            QueueAdmission::Arm { pr_id } => {
+                let arm_result = arm_native_queue(
+                    client
+                        .as_ref()
+                        .expect("built-in merge should have gh client"),
+                    cwd,
+                    state,
+                    &pr_id,
+                );
+                if let Err(error) = arm_result
+                    && !enqueue_requirements_pending(&error)
+                {
+                    return Err(error);
+                }
+                state.merge_queue_attempt_started_at = Some(chrono::Utc::now());
+                state.merge_queue_observed_at = None;
+                state.touch();
+                return Ok(MergeDisposition::Enqueued);
+            }
         }
     }
     if !custom_command {
@@ -466,12 +514,7 @@ fn merge_pr(
         // protection.
         command.args(["--match-head-commit", &state.head_sha]);
     }
-    if queue_required {
-        command.arg(MergeMethod::Merge.gh_flag());
-        command.arg("--auto");
-    } else {
-        command.arg(merge_method.gh_flag());
-    }
+    command.arg(merge_method.gh_flag());
     if delete_branch && !queue_required {
         command.arg("--delete-branch");
     }
@@ -489,11 +532,7 @@ fn merge_pr(
         .output()
         .map_err(|error| format!("failed to run merge command: {error}"))?;
     if output.status.success() {
-        return Ok(if queue_required {
-            MergeDisposition::Enqueued
-        } else {
-            MergeDisposition::Merged
-        });
+        return Ok(MergeDisposition::Merged);
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -533,10 +572,11 @@ fn merge_pr(
     Err(message)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum QueueAdmission {
-    Arm,
-    AlreadyEnqueued,
+    Arm { pr_id: String },
+    AlreadyQueued,
+    AutoMergePending,
     AlreadyMerged,
 }
 
@@ -560,17 +600,17 @@ fn queue_admission(
     if observation.merged {
         return Ok(QueueAdmission::AlreadyMerged);
     }
-    if observation.auto_merge_active {
-        return Ok(QueueAdmission::AlreadyEnqueued);
-    }
     match crate::merge_queue::parse_queue_pages(&pages, state.pr) {
         crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found => {
-            return Ok(QueueAdmission::AlreadyEnqueued);
+            return Ok(QueueAdmission::AlreadyQueued);
         }
         crate::merge_queue::QueuePollParse::Errored(error) => {
             return Err(format!("merge-queue admission poll failed: {error}"));
         }
         crate::merge_queue::QueuePollParse::Valid(_) => {}
+    }
+    if observation.auto_merge_active {
+        return Ok(QueueAdmission::AutoMergePending);
     }
 
     if removal_blocks_rearm(
@@ -585,7 +625,9 @@ fn queue_admission(
             state.pr
         ));
     }
-    Ok(QueueAdmission::Arm)
+    Ok(QueueAdmission::Arm {
+        pr_id: observation.id,
+    })
 }
 
 fn removal_blocks_rearm(
@@ -624,7 +666,7 @@ pub(super) fn supervise_merge_queue(
     cwd: &Path,
     pr: u64,
 ) -> AutoMergeOutcome {
-    let Some(state) = store.get(pr) else {
+    let Some(mut state) = store.get(pr) else {
         return AutoMergeOutcome::PrNotFound;
     };
     let Ok(client) = gh_client(cwd) else {
@@ -634,8 +676,10 @@ pub(super) fn supervise_merge_queue(
     };
     let started = Instant::now();
     let mut attempt_started = Instant::now();
-    let mut attempt_started_at = chrono::Utc::now();
-    let mut seen_in_queue = false;
+    let mut attempt_started_at = state
+        .merge_queue_attempt_started_at
+        .unwrap_or(state.created_at);
+    let mut seen_in_queue = state.merge_queue_observed_at.is_some();
     let mut consecutive_errors = 0_u32;
 
     while started.elapsed() < QUEUE_WAIT_TIMEOUT {
@@ -654,7 +698,20 @@ pub(super) fn supervise_merge_queue(
                         };
                     }
                 };
+                let parsed = crate::merge_queue::parse_queue_pages(&pages, pr);
                 if !shas_match(&observation.head_sha, &state.head_sha) {
+                    let queued = matches!(
+                        &parsed,
+                        crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found
+                    );
+                    if let Err(error) = revoke_native_queue(&client, cwd, &observation, queued) {
+                        return AutoMergeOutcome::MergeFailed {
+                            error: format!(
+                                "live PR head {} superseded validated SHA {}, but native merge revocation failed: {error}",
+                                observation.head_sha, state.head_sha
+                            ),
+                        };
+                    }
                     return AutoMergeOutcome::SupersededSha {
                         validated: state.head_sha,
                         current: observation.head_sha,
@@ -671,7 +728,6 @@ pub(super) fn supervise_merge_queue(
                     };
                 }
 
-                let parsed = crate::merge_queue::parse_queue_pages(&pages, pr);
                 let class = classify_poll(
                     &parsed,
                     &PollContext {
@@ -689,6 +745,17 @@ pub(super) fn supervise_merge_queue(
                             && snapshot.pr_found
                         {
                             seen_in_queue = true;
+                            if state.merge_queue_observed_at.is_none() {
+                                state.merge_queue_observed_at = Some(chrono::Utc::now());
+                                state.touch();
+                                if let Err(error) = store.save(&state) {
+                                    return AutoMergeOutcome::MergeFailed {
+                                        error: format!(
+                                            "failed to persist merge-queue observation: {error}"
+                                        ),
+                                    };
+                                }
+                            }
                         }
                     }
                     QueuePollClass::Evicted => {
@@ -710,23 +777,54 @@ pub(super) fn supervise_merge_queue(
                                 ),
                             };
                         }
-                        if let Err(error) = arm_native_queue(&client, cwd, &state) {
+                        if let Err(error) = arm_native_queue(&client, cwd, &state, &observation.id)
+                        {
                             return AutoMergeOutcome::MergeFailed { error };
                         }
                         seen_in_queue = false;
                         attempt_started = Instant::now();
                         attempt_started_at = chrono::Utc::now();
+                        state.merge_queue_observed_at = None;
+                        state.merge_queue_attempt_started_at = Some(attempt_started_at);
+                        state.touch();
+                        if let Err(error) = store.save(&state) {
+                            return AutoMergeOutcome::MergeFailed {
+                                error: format!(
+                                    "failed to persist merge-queue re-enqueue attempt: {error}"
+                                ),
+                            };
+                        }
                     }
                     QueuePollClass::PrNotFound => {
                         if observation.auto_merge_active {
                             thread::sleep(QUEUE_POLL_INTERVAL);
                             continue;
                         }
-                        return AutoMergeOutcome::MergeFailed {
-                            error: format!(
-                                "PR #{pr} was never observed in the merge queue after auto-merge was armed"
-                            ),
-                        };
+                        match arm_native_queue(&client, cwd, &state, &observation.id) {
+                            Ok(()) => {
+                                attempt_started = Instant::now();
+                                attempt_started_at = chrono::Utc::now();
+                                state.merge_queue_attempt_started_at = Some(attempt_started_at);
+                                state.merge_queue_observed_at = None;
+                                state.touch();
+                                if let Err(error) = store.save(&state) {
+                                    return AutoMergeOutcome::MergeFailed {
+                                        error: format!(
+                                            "failed to persist pending queue admission: {error}"
+                                        ),
+                                    };
+                                }
+                                thread::sleep(QUEUE_POLL_INTERVAL);
+                                continue;
+                            }
+                            Err(error) if enqueue_requirements_pending(&error) => {
+                                thread::sleep(QUEUE_POLL_INTERVAL);
+                                continue;
+                            }
+                            Err(error) => {
+                                return AutoMergeOutcome::MergeFailed { error };
+                            }
+                        }
                     }
                     QueuePollClass::PollError { reason } => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
@@ -779,7 +877,7 @@ fn fetch_queue_poll_pages(
         .repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug {:?}", state.repo))?;
-    let query = r"query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){headRefOid merged autoMergeRequest{id} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100,after:$after){nodes{position pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
+    let query = r"query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){id headRefOid merged autoMergeRequest{id} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100,after:$after){nodes{position pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
     let mut pages = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -837,27 +935,108 @@ fn fetch_queue_poll_pages(
     }
 }
 
-fn arm_native_queue(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<(), String> {
+fn arm_native_queue(
+    client: &GhClient,
+    cwd: &Path,
+    state: &ShipState,
+    pr_id: &str,
+) -> Result<(), String> {
+    let query = r"mutation($prId:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$prId,expectedHeadOid:$head}){mergeQueueEntry{id}}}";
     let mut command = gh(client, cwd)?;
     let output = command
         .args([
-            "pr",
-            "merge",
-            &state.pr.to_string(),
-            "--repo",
-            &state.repo,
-            "--match-head-commit",
-            &state.head_sha,
-            "--merge",
-            "--auto",
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-F",
+            &format!("prId={pr_id}"),
+            "-F",
+            &format!("head={}", state.head_sha),
         ])
         .output()
-        .map_err(|error| format!("failed to re-enqueue merge-queue PR: {error}"))?;
+        .map_err(|error| format!("failed to enqueue merge-queue PR: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
     let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(format!("failed to re-enqueue merge-queue PR: {message}"))
+    Err(format!("failed to enqueue merge-queue PR: {message}"))
+}
+
+fn enqueue_requirements_pending(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("required")
+        || lower.contains("requirement")
+        || lower.contains("status check")
+        || lower.contains("review")
+        || lower.contains("not mergeable")
+}
+
+fn revoke_native_queue(
+    client: &GhClient,
+    cwd: &Path,
+    observation: &crate::merge_queue::QueuePrObservation,
+    queued: bool,
+) -> Result<(), String> {
+    // Disable the pending request first so dequeue cannot immediately admit a
+    // replacement head again through the still-active auto-merge authority.
+    if observation.auto_merge_active {
+        let query = r"mutation($prId:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$prId}){pullRequest{id}}}";
+        run_queue_mutation(
+            client,
+            cwd,
+            query,
+            &observation.id,
+            "disable native auto-merge",
+        )?;
+    }
+    if queued {
+        let query =
+            r"mutation($prId:ID!){dequeuePullRequest(input:{id:$prId}){mergeQueueEntry{id}}}";
+        run_queue_mutation(client, cwd, query, &observation.id, "dequeue drifted PR")?;
+    }
+    Ok(())
+}
+
+fn revoke_drifted_native_merge(cwd: &Path, state: &ShipState) -> Result<(), String> {
+    let client = gh_client(cwd)?;
+    let pages = fetch_queue_poll_pages(&client, cwd, state)?;
+    let body = pages
+        .first()
+        .ok_or_else(|| "drift revocation returned no queue pages".to_owned())?;
+    let observation = parse_pr_observation(body)
+        .map_err(|error| format!("drift revocation observation was malformed: {error}"))?;
+    let queued = matches!(
+        crate::merge_queue::parse_queue_pages(&pages, state.pr),
+        crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found
+    );
+    revoke_native_queue(&client, cwd, &observation, queued)
+}
+
+fn run_queue_mutation(
+    client: &GhClient,
+    cwd: &Path,
+    query: &str,
+    pr_id: &str,
+    action: &str,
+) -> Result<(), String> {
+    let mut command = gh(client, cwd)?;
+    let output = command
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-F",
+            &format!("prId={pr_id}"),
+        ])
+        .output()
+        .map_err(|error| format!("failed to {action}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(format!("failed to {action}: {message}"))
 }
 
 fn terminal_github_error(message: &str) -> bool {

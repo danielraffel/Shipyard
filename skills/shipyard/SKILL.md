@@ -33,16 +33,18 @@ go/no-go for that operation.
 
 ## Merge-queue ownership
 
-When evaluated rules require GitHub's merge queue, Shipyard is a validator and
-queue supervisor, not a second merge authority. A passing `shipyard ship` arms
-native `gh pr merge --merge --auto` for the exact validated SHA and waits for
-GitHub to merge it. The one-shot `shipyard auto-merge` returns exit 3 while
-queued and retains ship-state for later ticks.
+When GitHub's live branch queue or evaluated rules require a merge queue,
+Shipyard is a validator and queue supervisor, not a second merge authority. A
+passing `shipyard ship` calls GitHub's queue mutation with
+`expectedHeadOid=<validated SHA>` and waits for GitHub to merge it. The
+one-shot `shipyard auto-merge` returns exit 3 while queued and retains
+ship-state for later ticks.
 
 Never treat queue absence alone as permission to rearm. The PR must first have
-been observed in the queue, and only an `invalid_merge_commit` removal may be
-re-enqueued automatically. Failed checks, manual/unknown removal, head drift,
-malformed authority data, or a 403/rate-limit response stop fail-closed.
+been observed in the queue (durably recorded across restarts), and only an
+`invalid_merge_commit` removal may be re-enqueued automatically. Failed checks,
+manual/unknown removal, head drift, malformed authority data, or a
+403/rate-limit response stop fail-closed.
 
 ## Local/SSH VM Watch
 

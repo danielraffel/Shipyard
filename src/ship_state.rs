@@ -110,6 +110,15 @@ pub struct ShipState {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// When Shipyard most recently observed this PR in GitHub's merge queue.
+    ///
+    /// Persisting this across process restarts is the authority required to
+    /// distinguish a recoverable eviction from a PR that was never queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_observed_at: Option<DateTime<Utc>>,
+    /// Start of the current native queue admission attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_attempt_started_at: Option<DateTime<Utc>>,
     /// Terminal abandonment marker set by the daemon's opt-in orphan resume
     /// sweep. `None` for a normal in-flight or evidence-terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +153,8 @@ impl ShipState {
             attempt: default_attempt(),
             created_at: now,
             updated_at: now,
+            merge_queue_observed_at: None,
+            merge_queue_attempt_started_at: None,
             abandoned: None,
         }
     }
