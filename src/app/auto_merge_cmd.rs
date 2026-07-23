@@ -184,20 +184,21 @@ pub(super) fn execute_auto_merge(
                     return Ok(AutoMergeOutcome::MergeFailed { error });
                 }
             };
-            if merge_disposition == MergeDisposition::Enqueued {
-                if let Err(error) = store.save_locked(&state, &lock) {
-                    return Ok(AutoMergeOutcome::MergeFailed {
-                        error: format!("failed to persist merge-queue admission: {error}"),
-                    });
+            let cleanup_warning = match merge_disposition {
+                MergeDisposition::Enqueued => {
+                    if let Err(error) = store.save_locked(&state, &lock) {
+                        return Ok(AutoMergeOutcome::MergeFailed {
+                            error: format!("failed to persist merge-queue admission: {error}"),
+                        });
+                    }
+                    return Ok(AutoMergeOutcome::Enqueued);
                 }
-                return Ok(AutoMergeOutcome::Enqueued);
-            }
+                MergeDisposition::Merged { cleanup_warning } => cleanup_warning,
+            };
             store
                 .archive_locked(request.pr, &lock)
                 .map_err(AutoMergeOperationError::Store)?;
-            Ok(AutoMergeOutcome::Merged {
-                cleanup_warning: None,
-            })
+            Ok(AutoMergeOutcome::Merged { cleanup_warning })
         }
     }
 }
@@ -475,7 +476,11 @@ fn merge_pr(
     merge_result: Option<MergeResult>,
 ) -> Result<MergeDisposition, String> {
     match merge_result {
-        Some(MergeResult::Success) => return Ok(MergeDisposition::Merged),
+        Some(MergeResult::Success) => {
+            return Ok(MergeDisposition::Merged {
+                cleanup_warning: None,
+            });
+        }
         Some(MergeResult::Failure) => return Err("simulated merge failure".to_owned()),
         None => {}
     }
@@ -522,7 +527,21 @@ fn merge_pr(
             cwd,
             state,
         )? {
-            QueueAdmission::AlreadyMerged => return Ok(MergeDisposition::Merged),
+            QueueAdmission::AlreadyMerged => {
+                let cleanup_warning = if delete_branch {
+                    delete_pr_head_branch(
+                        client
+                            .as_ref()
+                            .expect("built-in merge should have gh client"),
+                        cwd,
+                        state,
+                    )
+                    .err()
+                } else {
+                    None
+                };
+                return Ok(MergeDisposition::Merged { cleanup_warning });
+            }
             QueueAdmission::AlreadyQueued => {
                 let now = chrono::Utc::now();
                 state.merge_queue_attempt_started_at = Some(now);
@@ -582,7 +601,9 @@ fn merge_pr(
         .output()
         .map_err(|error| format!("failed to run merge command: {error}"))?;
     if output.status.success() {
-        return Ok(MergeDisposition::Merged);
+        return Ok(MergeDisposition::Merged {
+            cleanup_warning: None,
+        });
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -617,7 +638,9 @@ fn merge_pr(
             merge_method,
             delete_branch,
         )?;
-        return Ok(MergeDisposition::Merged);
+        return Ok(MergeDisposition::Merged {
+            cleanup_warning: None,
+        });
     }
     Err(message)
 }
@@ -1117,9 +1140,9 @@ fn terminal_github_error(message: &str) -> bool {
         || lower.contains("rate limit")
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum MergeDisposition {
-    Merged,
+    Merged { cleanup_warning: Option<String> },
     Enqueued,
 }
 

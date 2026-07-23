@@ -1654,6 +1654,9 @@ fn load_or_create_state(
             existing.head_sha.clone_from(&request.sha);
             existing.dispatched_runs.clear();
             existing.evidence_snapshot.clear();
+            existing.merge_queue_observed_at = None;
+            existing.merge_queue_attempt_started_at = None;
+            existing.merge_queue_enqueue_succeeded_at = None;
         }
         existing.commit_subject.clone_from(&request.commit_subject);
         refresh_pr_metadata(&mut existing, request);
@@ -3590,6 +3593,10 @@ mod tests {
         seeded
             .evidence_snapshot
             .insert("ssh".to_owned(), "passed-on-old-head".to_owned());
+        let old_attempt = chrono::Utc::now();
+        seeded.merge_queue_attempt_started_at = Some(old_attempt);
+        seeded.merge_queue_observed_at = Some(old_attempt);
+        seeded.merge_queue_enqueue_succeeded_at = Some(old_attempt);
         store.save(&seeded).expect("save");
 
         // Build a request whose policy matches the seeded state so only SHA
@@ -3609,6 +3616,9 @@ mod tests {
             reconciled.evidence_snapshot.is_empty(),
             "stale evidence cleared so the new head re-validates"
         );
+        assert_eq!(reconciled.merge_queue_attempt_started_at, None);
+        assert_eq!(reconciled.merge_queue_observed_at, None);
+        assert_eq!(reconciled.merge_queue_enqueue_succeeded_at, None);
     }
 
     #[test]
