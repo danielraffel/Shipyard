@@ -807,13 +807,18 @@ pub(super) fn supervise_merge_queue(
                     consecutive_errors = 0;
                 }
                 if !shas_match(&observation.head_sha, &state.head_sha) {
-                    match queue_state_is_current(
+                    let queued = matches!(
+                        &parsed,
+                        crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found
+                    );
+                    match with_current_queue_state_locked(
                         store,
                         &state,
                         state.merge_queue_attempt_started_at,
+                        || revoke_native_queue(&client, cwd, &observation, queued),
                     ) {
-                        Ok(true) => {}
-                        Ok(false) => {
+                        Ok(Some(())) => {}
+                        Ok(None) => {
                             return AutoMergeOutcome::SupersededSha {
                                 validated: state.head_sha,
                                 current: observation.head_sha,
@@ -826,18 +831,6 @@ pub(super) fn supervise_merge_queue(
                                 ),
                             };
                         }
-                    }
-                    let queued = matches!(
-                        &parsed,
-                        crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found
-                    );
-                    if let Err(error) = revoke_native_queue(&client, cwd, &observation, queued) {
-                        return AutoMergeOutcome::MergeFailed {
-                            error: format!(
-                                "live PR head {} superseded validated SHA {}, but native merge revocation failed: {error}",
-                                observation.head_sha, state.head_sha
-                            ),
-                        };
                     }
                     return AutoMergeOutcome::SupersededSha {
                         validated: state.head_sha,
@@ -1089,19 +1082,24 @@ fn archive_queue_state_if_current(
     Ok(())
 }
 
-fn queue_state_is_current(
+fn with_current_queue_state_locked<T>(
     store: &ShipStateStore,
     local: &ShipState,
     expected_attempt: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<bool, String> {
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
     let lock = store
         .lock_pr(local.pr)
         .map_err(|error| format!("failed to lock ship-state: {error}"))?;
     let Some(current) = store.get_locked(local.pr, &lock) else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(shas_match(&current.head_sha, &local.head_sha)
-        && current.merge_queue_attempt_started_at == expected_attempt)
+    if !shas_match(&current.head_sha, &local.head_sha)
+        || current.merge_queue_attempt_started_at != expected_attempt
+    {
+        return Ok(None);
+    }
+    action().map(Some)
 }
 
 fn fetch_queue_poll_pages(
@@ -1972,7 +1970,11 @@ mod tests {
         })
         .expect("same-head update");
 
-        assert!(queue_state_is_current(&store, &local, Some(attempt)).expect("current state"));
+        assert_eq!(
+            with_current_queue_state_locked(&store, &local, Some(attempt), || Ok("ran"))
+                .expect("current state"),
+            Some("ran")
+        );
         assert_eq!(
             local.evidence_snapshot.get("macos").map(String::as_str),
             Some("pass")
@@ -1995,7 +1997,11 @@ mod tests {
         store.save(&newer).expect("save adopted head");
 
         assert!(update_queue_state_if_current(&store, &mut local, Some(attempt), |_| {}).is_err());
-        assert!(!queue_state_is_current(&store, &local, Some(attempt)).expect("newer head"));
+        assert_eq!(
+            with_current_queue_state_locked(&store, &local, Some(attempt), || Ok("must not run"))
+                .expect("newer head"),
+            None
+        );
         assert!(archive_queue_state_if_current(&store, &local, Some(attempt)).is_err());
         assert_eq!(
             store.get(8).expect("newer state remains active").head_sha,
