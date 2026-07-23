@@ -1655,7 +1655,10 @@ fn load_or_create_state(
             existing.dispatched_runs.clear();
             existing.evidence_snapshot.clear();
             existing.merge_queue_observed_at = None;
-            existing.merge_queue_attempt_started_at = None;
+            // Establish a fresh authority epoch for the adopted head. This is
+            // deliberately not ownership by itself; it only prevents removal
+            // events from the previous SHA from governing the new validation.
+            existing.merge_queue_attempt_started_at = Some(chrono::Utc::now());
             existing.merge_queue_enqueue_succeeded_at = None;
         }
         existing.commit_subject.clone_from(&request.commit_subject);
@@ -3616,7 +3619,10 @@ mod tests {
             reconciled.evidence_snapshot.is_empty(),
             "stale evidence cleared so the new head re-validates"
         );
-        assert_eq!(reconciled.merge_queue_attempt_started_at, None);
+        assert!(
+            reconciled.merge_queue_attempt_started_at > Some(old_attempt),
+            "adopted head gets a fresh queue authority epoch"
+        );
         assert_eq!(reconciled.merge_queue_observed_at, None);
         assert_eq!(reconciled.merge_queue_enqueue_succeeded_at, None);
     }

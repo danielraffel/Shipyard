@@ -567,10 +567,9 @@ fn merge_pr(
                     Err(error) if enqueue_requirements_pending(&error) => false,
                     Err(error) => return Err(error),
                 };
-                let now = chrono::Utc::now();
-                state.merge_queue_attempt_started_at = Some(now);
+                state.merge_queue_attempt_started_at = Some(admission_started_at);
                 state.merge_queue_observed_at = None;
-                state.merge_queue_enqueue_succeeded_at = arm_succeeded.then_some(now);
+                state.merge_queue_enqueue_succeeded_at = arm_succeeded.then(chrono::Utc::now);
                 state.touch();
                 return Ok(MergeDisposition::Enqueued);
             }
@@ -808,6 +807,26 @@ pub(super) fn supervise_merge_queue(
                     consecutive_errors = 0;
                 }
                 if !shas_match(&observation.head_sha, &state.head_sha) {
+                    match queue_state_is_current(
+                        store,
+                        &state,
+                        state.merge_queue_attempt_started_at,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return AutoMergeOutcome::SupersededSha {
+                                validated: state.head_sha,
+                                current: observation.head_sha,
+                            };
+                        }
+                        Err(error) => {
+                            return AutoMergeOutcome::MergeFailed {
+                                error: format!(
+                                    "failed to verify ship-state before native merge revocation: {error}"
+                                ),
+                            };
+                        }
+                    }
                     let queued = matches!(
                         &parsed,
                         crate::merge_queue::QueuePollParse::Valid(snapshot) if snapshot.pr_found
@@ -1068,6 +1087,21 @@ fn archive_queue_state_if_current(
         .archive_locked(local.pr, &lock)
         .map_err(|error| format!("failed to archive ship-state: {error}"))?;
     Ok(())
+}
+
+fn queue_state_is_current(
+    store: &ShipStateStore,
+    local: &ShipState,
+    expected_attempt: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<bool, String> {
+    let lock = store
+        .lock_pr(local.pr)
+        .map_err(|error| format!("failed to lock ship-state: {error}"))?;
+    let Some(current) = store.get_locked(local.pr, &lock) else {
+        return Ok(false);
+    };
+    Ok(shas_match(&current.head_sha, &local.head_sha)
+        && current.merge_queue_attempt_started_at == expected_attempt)
 }
 
 fn fetch_queue_poll_pages(
@@ -1938,6 +1972,7 @@ mod tests {
         })
         .expect("same-head update");
 
+        assert!(queue_state_is_current(&store, &local, Some(attempt)).expect("current state"));
         assert_eq!(
             local.evidence_snapshot.get("macos").map(String::as_str),
             Some("pass")
@@ -1960,6 +1995,7 @@ mod tests {
         store.save(&newer).expect("save adopted head");
 
         assert!(update_queue_state_if_current(&store, &mut local, Some(attempt), |_| {}).is_err());
+        assert!(!queue_state_is_current(&store, &local, Some(attempt)).expect("newer head"));
         assert!(archive_queue_state_if_current(&store, &local, Some(attempt)).is_err());
         assert_eq!(
             store.get(8).expect("newer state remains active").head_sha,
