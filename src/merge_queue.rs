@@ -137,6 +137,9 @@ pub struct QueuePrObservation {
     pub removal_reason: Option<String>,
     /// Creation time of the latest removal event.
     pub removal_at: Option<String>,
+    /// Whether a removal node was present, even if one of its authority fields
+    /// was null or malformed.
+    pub removal_event_present: bool,
 }
 
 /// Parse the target PR facts included in the queue GraphQL response.
@@ -162,17 +165,15 @@ pub fn parse_pr_observation(body: &serde_json::Value) -> Result<QueuePrObservati
         .get("merged")
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| "response missing pull request merged state".to_owned())?;
-    let removal_reason = pr
+    let removal_node = pr
         .pointer("/timelineItems/nodes")
         .and_then(serde_json::Value::as_array)
-        .and_then(|nodes| nodes.last())
+        .and_then(|nodes| nodes.last());
+    let removal_reason = removal_node
         .and_then(|node| node.get("reason"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
-    let removal_at = pr
-        .pointer("/timelineItems/nodes")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|nodes| nodes.last())
+    let removal_at = removal_node
         .and_then(|node| node.get("createdAt"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
@@ -181,6 +182,7 @@ pub fn parse_pr_observation(body: &serde_json::Value) -> Result<QueuePrObservati
         merged,
         removal_reason,
         removal_at,
+        removal_event_present: removal_node.is_some(),
     })
 }
 
@@ -542,6 +544,7 @@ mod tests {
                 merged: false,
                 removal_reason: Some("FAILED_CHECKS".to_owned()),
                 removal_at: None,
+                removal_event_present: true,
             }
         );
     }

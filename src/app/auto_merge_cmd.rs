@@ -570,6 +570,7 @@ fn queue_admission(
     }
 
     if removal_blocks_rearm(
+        observation.removal_event_present,
         observation.removal_reason.as_deref(),
         observation.removal_at.as_deref(),
         state.created_at,
@@ -584,12 +585,16 @@ fn queue_admission(
 }
 
 fn removal_blocks_rearm(
+    event_present: bool,
     reason: Option<&str>,
     removed_at: Option<&str>,
     ship_created_at: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    let (Some(reason), Some(removed_at)) = (reason, removed_at) else {
+    if !event_present {
         return false;
+    }
+    let (Some(reason), Some(removed_at)) = (reason, removed_at) else {
+        return true;
     };
     !reason.eq_ignore_ascii_case("invalid_merge_commit")
         && chrono::DateTime::parse_from_rfc3339(removed_at)
@@ -859,9 +864,10 @@ fn repository_requires_merge_queue(
     base_branch: &str,
 ) -> Result<bool, String> {
     let mut command = gh(client, cwd)?;
-    let endpoint = format!("repos/{repo}/rules/branches/{base_branch}");
+    let branch = encode_path_segment(base_branch);
+    let endpoint = format!("repos/{repo}/rules/branches/{branch}?per_page=100");
     let output = command
-        .args(["api", &endpoint])
+        .args(["api", "--paginate", "--slurp", &endpoint])
         .output()
         .map_err(|error| format!("failed to inspect evaluated branch rules: {error}"))?;
     if !output.status.success() {
@@ -872,7 +878,29 @@ fn repository_requires_merge_queue(
     }
     let body: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("evaluated branch rules returned invalid JSON: {error}"))?;
-    crate::merge_queue::rules_require_merge_queue(&body)
+    let pages = body
+        .as_array()
+        .ok_or_else(|| "paginated evaluated branch rules response is not an array".to_owned())?;
+    let mut rules = Vec::new();
+    for page in pages {
+        let page = page
+            .as_array()
+            .ok_or_else(|| "evaluated branch rules page is not an array".to_owned())?;
+        rules.extend(page.iter().cloned());
+    }
+    crate::merge_queue::rules_require_merge_queue(&Value::Array(rules))
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn is_graphql_merge_integration_blocked(message: &str) -> bool {
@@ -1318,19 +1346,36 @@ mod tests {
             .expect("time")
             .with_timezone(&chrono::Utc);
         assert!(removal_blocks_rearm(
+            true,
             Some("failed_checks"),
             Some("2026-07-23T12:01:00Z"),
             ship_created,
         ));
         assert!(!removal_blocks_rearm(
+            true,
             Some("invalid_merge_commit"),
             Some("2026-07-23T12:01:00Z"),
             ship_created,
         ));
         assert!(!removal_blocks_rearm(
+            true,
             Some("failed_checks"),
             Some("2026-07-23T11:59:00Z"),
             ship_created,
         ));
+        assert!(removal_blocks_rearm(
+            true,
+            None,
+            Some("2026-07-23T12:01:00Z"),
+            ship_created,
+        ));
+        assert!(!removal_blocks_rearm(false, None, None, ship_created));
+    }
+
+    #[test]
+    fn branch_rule_path_segments_are_percent_encoded() {
+        assert_eq!(encode_path_segment("main"), "main");
+        assert_eq!(encode_path_segment("release/1.2"), "release%2F1.2");
+        assert_eq!(encode_path_segment("topic name"), "topic%20name");
     }
 }
