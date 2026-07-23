@@ -210,6 +210,13 @@ pub enum ShipExecutionError {
         /// Current SHA.
         current: String,
     },
+    /// Existing state was validated against a different base branch.
+    BaseDrift {
+        /// State base branch.
+        existing: String,
+        /// Current base branch.
+        current: String,
+    },
     /// Existing state was created under a different target/policy set.
     PolicyDrift {
         /// State policy signature.
@@ -270,6 +277,10 @@ impl Display for ShipExecutionError {
                     "ship state SHA drift: existing {existing}, current {current}"
                 )
             }
+            Self::BaseDrift { existing, current } => write!(
+                formatter,
+                "ship state base-branch drift: existing {existing}, current {current}"
+            ),
             Self::PolicyDrift { existing, current } => write!(
                 formatter,
                 "ship state policy drift: existing {existing}, current {current}"
@@ -321,6 +332,7 @@ impl Error for ShipExecutionError {
             Self::QueueRequest(error) => Some(error),
             Self::WarmPool(error) => Some(error),
             Self::ShaDrift { .. }
+            | Self::BaseDrift { .. }
             | Self::PolicyDrift { .. }
             | Self::Evidence(_)
             | Self::ShipState(_)
@@ -1642,16 +1654,24 @@ fn load_or_create_state(
         |lock| store.get_locked(request.pr, lock),
     );
     if let Some(mut existing) = existing {
-        validate_existing_state(&existing, &request.sha, &policy, request.adopt_head)?;
-        if request.adopt_head && existing.is_sha_drift(&request.sha) {
-            // Adopt the amended/force-pushed head. Clear prior remote runs and
-            // evidence so the new head is re-validated from scratch — never
-            // bless stale validation for a possibly-different tree. `head_sha`
-            // also gates auto-merge's live-head preflight, so it must track the
-            // SHA we actually validate (Shipyard #346; codex review). A
-            // same-tree fast path that preserves evidence for a trailer-only
-            // amend is a possible follow-up.
+        validate_existing_state(
+            &existing,
+            &request.sha,
+            &request.base_branch,
+            &policy,
+            request.adopt_head,
+        )?;
+        let validation_identity_drift =
+            existing.is_sha_drift(&request.sha) || existing.base_branch != request.base_branch;
+        if request.adopt_head && validation_identity_drift {
+            // Adopt the amended/force-pushed head or retargeted base. Clear
+            // prior remote runs and evidence so the new validation identity is
+            // re-validated from scratch — never bless stale validation for a
+            // different tree or merge target. `head_sha` and `base_branch`
+            // also gate auto-merge's live preflight, so both must track what
+            // this execution actually validates (Shipyard #346).
             existing.head_sha.clone_from(&request.sha);
+            existing.base_branch.clone_from(&request.base_branch);
             existing.dispatched_runs.clear();
             existing.evidence_snapshot.clear();
             existing.merge_queue_observed_at = None;
@@ -1705,6 +1725,7 @@ fn refresh_pr_metadata(state: &mut ShipState, request: &ShipExecutionRequest) {
 fn validate_existing_state(
     state: &ShipState,
     sha: &str,
+    base_branch: &str,
     policy: &str,
     adopt_head: bool,
 ) -> Result<(), ShipExecutionError> {
@@ -1712,6 +1733,12 @@ fn validate_existing_state(
         return Err(ShipExecutionError::ShaDrift {
             existing: state.head_sha.clone(),
             current: sha.to_owned(),
+        });
+    }
+    if !adopt_head && state.base_branch != base_branch {
+        return Err(ShipExecutionError::BaseDrift {
+            existing: state.base_branch.clone(),
+            current: base_branch.to_owned(),
         });
     }
     if state.policy_signature != policy {
@@ -3567,14 +3594,20 @@ mod tests {
 
         // Without the flag, SHA drift is rejected.
         assert!(matches!(
-            super::validate_existing_state(&state, "new", "policy", false),
+            super::validate_existing_state(&state, "new", "main", "policy", false),
             Err(ShipExecutionError::ShaDrift { .. })
         ));
         // With the flag, the same SHA drift is tolerated...
-        assert!(super::validate_existing_state(&state, "new", "policy", true).is_ok());
+        assert!(super::validate_existing_state(&state, "new", "main", "policy", true).is_ok());
+        // Base drift is also validation-identity drift and requires adoption.
+        assert!(matches!(
+            super::validate_existing_state(&state, "old", "release", "policy", false),
+            Err(ShipExecutionError::BaseDrift { .. })
+        ));
+        assert!(super::validate_existing_state(&state, "old", "release", "policy", true).is_ok());
         // ...but a policy-signature change is STILL rejected even with the flag.
         assert!(matches!(
-            super::validate_existing_state(&state, "new", "different-policy", true),
+            super::validate_existing_state(&state, "new", "main", "different-policy", true),
             Err(ShipExecutionError::PolicyDrift { .. })
         ));
     }
@@ -3607,6 +3640,7 @@ mod tests {
         // drift is in play, with adopt_head set and the live SHA = "abc".
         let mut request = ship_request(vec![target]);
         request.adopt_head = true;
+        request.base_branch = "release".to_owned();
         let target_names = vec![request.targets[0].name.clone()];
         let mut seeded = store.get(42).expect("seeded present");
         seeded.policy_signature =
@@ -3616,6 +3650,10 @@ mod tests {
         let reconciled = super::load_or_create_state(&request, &target_names, &store, None)
             .expect("adopt-head reconciles drift");
         assert_eq!(reconciled.head_sha, "abc", "adopts the current head");
+        assert_eq!(
+            reconciled.base_branch, "release",
+            "adopts the current validated base"
+        );
         assert!(
             reconciled.evidence_snapshot.is_empty(),
             "stale evidence cleared so the new head re-validates"

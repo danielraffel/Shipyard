@@ -6,6 +6,10 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 <a id="v0790"></a>
 ## [0.79.0]
 
+- feat(merge): add queue-native exact-head handoff with fleet authority, authority-local hold, serialized writes, and durable mutation provenance
+- fix(merge): fail closed on uncertain admission, stale head/base authority, incomplete queue reads, and unsafe re-arm/revocation
+- migration(release-bot): merge-queue PR mode now requires machine-global authority policy and a dedicated authority runner; rerun `shipyard release-bot hook install` after configuring the fleet
+
 <a id="v0780"></a>
 ## [0.78.0] - 2026-07-21
 

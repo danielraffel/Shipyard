@@ -59,6 +59,8 @@ pub mod job;
 pub mod lane_policy;
 /// Merge-queue enqueue / poll / eviction supervision engine.
 pub mod merge_queue;
+/// Fleet authority, serialization, hold, and audit controls for queue writes.
+pub mod merge_queue_control;
 /// Runner and CI timing metrics store and analysis helpers.
 pub mod metrics;
 /// Structured JSON output helpers.

@@ -422,6 +422,19 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **Idempotency:** a later one-shot first polls the queue. An already queued PR
   is not armed again; a terminal removal newer than the current ship-state is
   not rearmed. A new validated head creates newer ship-state and may be armed.
+- **Fleet authority:** `[merge_queue].mutation_machine` is required in the
+  trusted machine-global `config.toml` reported by `shipyard paths`; tracked
+  project and checkout-local overlays are ignored. The machine-global runner
+  tag must match before any GraphQL mutation is started.
+  Queue writes are serialized with a machine-global lock shared by hold/resume,
+  so a successful hold waits out any admitted writer and no later writer can
+  pass the sentinel. Resume removes only the hold, not the authority policy.
+- **Provenance:** every mutation writes `started` and `finished` JSONL records
+  under `merge_queue/mutations.jsonl`, including correlation id, machine tag,
+  PID, repo, base, PR, validated head, action, and outcome. A normal unwind or
+  ambiguous transport result records `outcome=uncertain`; after hard
+  termination, `merge-queue status` classifies an unmatched `started` row as
+  uncertain. It is never silently converted into permission to retry.
 
 ## Diagnostic: orphan reporting (no transition)
 

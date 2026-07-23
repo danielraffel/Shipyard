@@ -46,6 +46,23 @@ been observed in the queue (durably recorded across restarts), and only an
 manual/unknown removal, head drift, malformed authority data, or a
 403/rate-limit response stop fail-closed.
 
+For fleets, configure exactly one mutation host in the trusted machine-global
+`config.toml` reported by `shipyard paths` (never in tracked project config):
+
+```toml
+[merge_queue]
+mutation_machine = "studio"
+```
+
+Each box must have its stable `shipyard runner tag`. Validation can execute on
+any host, but a non-authority host must fail before queue mutation. Use
+`shipyard merge-queue hold --reason "<incident>"` on the configured mutation
+machine as the authority stop and `shipyard merge-queue status` there to verify
+it. Propagate the hold to other hosts when consistent fleet status matters. Do
+not resume until the incident owner has restored the intended queue order.
+Queue writes are serialized process-wide and recorded in machine-global
+`merge_queue/mutations.jsonl`.
+
 ## Local/SSH VM Watch
 
 Use `shipyard watch local` for long target-backed jobs that are not GitHub

@@ -13,6 +13,7 @@ shipyard ship              # validate, open PR, merge on green
 shipyard watch             # live-tail an in-flight ship
 shipyard wait pr 151 --state green  # wait on release / PR / run conditions
 shipyard auto-merge <pr>   # cron-friendly one-shot merge-on-green
+shipyard merge-queue status  # inspect the local queue-mutation hold
 shipyard rescue <pr>       # cancel + redispatch every stuck queued run on a PR
 shipyard runner watch --kill-hung-workers  # daemon-mode prevent + auto-kill hung Workers
 shipyard update            # self-update the CLI (or `--check` to peek)
@@ -37,11 +38,13 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
 - **Declarative security & governance.** One TOML line picks a profile
   (`solo` or `multi`); one CLI command makes GitHub branch protection,
   tag protection, and workflow token permissions match.
-- **Merge-queue compatible.** Release-bot commits (e.g. the post-tag
-  CHANGELOG sync) can land through a PR instead of a direct push — set
-  `push_mode = "pr"` under `[release.post_tag_hook]` and shipyard opens +
-  auto-merges the bot commit, so it works on a branch that enforces a
-  GitHub merge queue (which rejects all direct pushes).
+- **Native merge-queue handoff.** On queue-governed branches Shipyard
+  validates the exact head, admits that exact SHA, and lets GitHub own the
+  merge. Configure one fleet authority with
+  `merge_queue.mutation_machine`, pause it instantly with
+  `shipyard merge-queue hold --reason "..."`, and audit every attempted
+  queue write in machine-global state. Other machines fail before GitHub is
+  contacted.
 - **22 ecosystem detectors.** `shipyard init` recognises CMake, Swift,
   Xcode, Rust, Go, Node (pnpm/bun/yarn/npm), Python (uv/poetry/pip),
   Gradle, Maven, .NET, Flutter, Dart, Deno, Ruby, Elixir, PHP.
@@ -125,6 +128,23 @@ Downloads a standalone binary for your platform. No runtime needed. See
 `shipyard run` delivers the exact commit to each machine, runs your build
 and test commands, and reports what passed. `shipyard ship` does the same,
 then opens a PR and merges when every required platform is green.
+
+For a multi-Mac fleet, store a stable tag on each host with
+`shipyard runner tag --set <studio|m1|m5>` and select exactly one queue
+writer in the trusted machine-global `config.toml` reported by
+`shipyard paths`:
+
+```toml
+[merge_queue]
+mutation_machine = "studio"
+```
+
+Validation may run anywhere. Only the selected machine can enqueue, disable
+auto-merge, or dequeue through Shipyard, and queue writes for one repo/base
+are serialized across local processes. During an incident,
+`shipyard merge-queue hold --reason "incident"` blocks before GitHub contact;
+`shipyard merge-queue resume` removes the hold while retaining the machine
+authority check.
 
 Shipyard is not a [CI service](https://en.wikipedia.org/wiki/Continuous_integration),
 not a [build system](https://en.wikipedia.org/wiki/Build_automation),

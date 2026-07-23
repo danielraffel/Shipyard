@@ -147,6 +147,11 @@ pub(super) fn ship_command<W: Write>(
         cwd,
         &ship_state,
         config,
+        if runtime_paths.mode == RuntimeMode::Isolated.as_str() {
+            RuntimeMode::Isolated
+        } else {
+            RuntimeMode::Shipyard
+        },
         &request.repo,
         outcome.job.passed(),
         args.merge_command,
@@ -534,6 +539,7 @@ fn post_run_merge_state(
     cwd: &Path,
     store: &ShipStateStore,
     config: &LoadedConfig,
+    mode: RuntimeMode,
     repo: &str,
     validation_passed: bool,
     merge_command: Option<PathBuf>,
@@ -544,6 +550,8 @@ fn post_run_merge_state(
         return Ok(ShipRenderState::ValidationFailed);
     }
     let request = AutoMergeRequest {
+        mode,
+        global_dir: config.global_dir.clone(),
         pr,
         merge_method: MergeMethod::Squash,
         delete_branch: true,
@@ -558,24 +566,28 @@ fn post_run_merge_state(
         AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
             Ok(ShipRenderState::Merged)
         }
-        AutoMergeOutcome::Enqueued => match supervise_merge_queue(store, cwd, pr, true) {
-            AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
-                Ok(ShipRenderState::Merged)
+        AutoMergeOutcome::Enqueued => {
+            match supervise_merge_queue(store, cwd, mode, &config.global_dir, pr, true) {
+                AutoMergeOutcome::Merged { .. } | AutoMergeOutcome::AlreadyMerged => {
+                    Ok(ShipRenderState::Merged)
+                }
+                AutoMergeOutcome::SupersededSha { validated, current } => {
+                    Ok(ShipRenderState::GreenNotMerged(format!(
+                        "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
+                    )))
+                }
+                AutoMergeOutcome::MergeFailed { error } => {
+                    Ok(ShipRenderState::GreenNotMerged(error))
+                }
+                AutoMergeOutcome::Enqueued
+                | AutoMergeOutcome::PrNotFound
+                | AutoMergeOutcome::InFlight { .. }
+                | AutoMergeOutcome::TargetFailed { .. } => Err(CliFailure::new(
+                    1,
+                    format!("PR #{pr}: merge-queue supervision ended without a terminal verdict"),
+                )),
             }
-            AutoMergeOutcome::SupersededSha { validated, current } => {
-                Ok(ShipRenderState::GreenNotMerged(format!(
-                    "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
-                )))
-            }
-            AutoMergeOutcome::MergeFailed { error } => Ok(ShipRenderState::GreenNotMerged(error)),
-            AutoMergeOutcome::Enqueued
-            | AutoMergeOutcome::PrNotFound
-            | AutoMergeOutcome::InFlight { .. }
-            | AutoMergeOutcome::TargetFailed { .. } => Err(CliFailure::new(
-                1,
-                format!("PR #{pr}: merge-queue supervision ended without a terminal verdict"),
-            )),
-        },
+        }
         AutoMergeOutcome::MergeFailed { error } => {
             Ok(classify_merge_failure(store, config, cwd, repo, pr, error))
         }

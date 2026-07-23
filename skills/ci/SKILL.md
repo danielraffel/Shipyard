@@ -646,6 +646,16 @@ restarts) and GitHub reports `invalid_merge_commit`; `failed_checks`,
 manual/unknown removal, head drift, and HTTP 403/rate-limit responses stop
 fail-closed.
 
+On a multi-host fleet, set `[merge_queue].mutation_machine` to one stored
+runner tag in every host's trusted machine-global `config.toml` reported by
+`shipyard paths`. Project and checkout-local config cannot select authority.
+All other hosts may validate but must fail before a queue write.
+Use `shipyard merge-queue hold --reason "<incident>"` / `status` / `resume`
+on the configured mutation machine for the authority stop; propagate the hold
+when consistent fleet status matters. Shipyard serializes mutations
+process-wide and records their correlation id, machine, PID, exact head/base,
+action, and outcome under machine-global `merge_queue/mutations.jsonl`.
+
 ### Iterating on a single-platform failure
 
 When CI goes red on exactly one platform (e.g. only the Windows leg of a

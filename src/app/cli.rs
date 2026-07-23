@@ -317,6 +317,13 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// Inspect or change this machine's merge-queue mutation hold.
+    #[command(name = "merge-queue")]
+    MergeQueue {
+        /// Merge-queue control subcommand.
+        #[command(subcommand)]
+        command: MergeQueueCommand,
+    },
     /// Wait for a GitHub condition to match.
     Wait {
         /// Wait subcommand.
@@ -365,6 +372,31 @@ pub(super) enum EvidenceCommand {
         /// Show all command-evidence bundle summaries.
         #[arg(long)]
         list: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum MergeQueueCommand {
+    /// Show whether queue mutations are centrally held on this machine.
+    Status,
+    /// Block every Shipyard merge-queue mutation before GitHub is contacted.
+    Hold {
+        /// Human-readable incident or maintenance reason.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Remove the local hold. Machine-authority checks still apply.
+    Resume,
+    /// Resolve an uncertain mutation after authoritative GitHub reconciliation.
+    Resolve {
+        /// Correlation id shown by `merge-queue status --json`.
+        correlation_id: String,
+        /// Authoritative result: accepted or rejected.
+        #[arg(long)]
+        outcome: String,
+        /// Human-readable reconciliation evidence.
+        #[arg(long)]
+        reason: String,
     },
 }
 

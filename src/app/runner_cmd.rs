@@ -21,7 +21,6 @@ use super::CliFailure;
 use super::cli::RunnerCommand;
 use crate::cloud::{GitHubActions, QueuedRun};
 use crate::config::LoadedConfig;
-use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::runner_watchdog::{
     DEFAULT_MAX_JOB_MIN, DEFAULT_MAX_QUEUE_AGE_HOURS, DEFAULT_REAP_IN_PROGRESS_MAX_MIN,
@@ -42,9 +41,9 @@ const REAP_RUNS_MAX_PAGES: u32 = 5;
 #[allow(clippy::too_many_lines)]
 pub(super) fn runner_command<W: Write>(
     command: RunnerCommand,
-    mode: RuntimeMode,
     config: &LoadedConfig,
     cwd: &Path,
+    state_dir: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -128,7 +127,7 @@ pub(super) fn runner_command<W: Write>(
             stdout,
         ),
         RunnerCommand::Tag { set } => {
-            super::runner_provision_cmd::tag_command(mode, set, json, stdout)
+            super::runner_provision_cmd::tag_command(state_dir, set, json, stdout)
         }
         RunnerCommand::Register {
             repo,
@@ -139,8 +138,8 @@ pub(super) fn runner_command<W: Write>(
             dry_run,
         } => super::runner_provision_cmd::register_command(
             super::runner_provision_cmd::RegisterArgs {
-                mode,
                 cwd,
+                state_dir,
                 actions: &actions,
                 repo,
                 count,
