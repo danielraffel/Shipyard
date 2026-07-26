@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -113,12 +114,81 @@ def _snapshot_paths(root: Path) -> set[Path]:
         return set()
 
 
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _darwin_process_start_identity(pid: int) -> str | None:
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+    info = _DarwinProcBsdInfo()
+    size = ctypes.sizeof(info)
+    written = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+    if written != size:
+        return None
+    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+
+
+def _linux_process_start_identity(pid: int) -> str | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # The executable name is parenthesized and may contain spaces. Fields after
+    # the final ')' begin at field 3; starttime is field 22 (index 19 here).
+    fields = stat[stat.rfind(")") + 2 :].split()
+    if len(fields) <= 19 or not fields[19].isdigit():
+        return None
+    return f"linux:{fields[19]}"
+
+
+def _process_start_identity(pid: int) -> str | None:
+    if sys.platform == "darwin":
+        return _darwin_process_start_identity(pid)
+    if sys.platform.startswith("linux"):
+        return _linux_process_start_identity(pid)
+    return None
+
+
 def _active_process_identities() -> dict[int, str]:
     if os.name != "posix":
         return {}
     try:
         result = subprocess.run(
-            ["ps", "-axo", "pid=,lstart="],
+            ["ps", "-axo", "pid="],
             check=True,
             capture_output=True,
             text=True,
@@ -127,25 +197,14 @@ def _active_process_identities() -> dict[int, str]:
     except (OSError, subprocess.SubprocessError):
         return {}
     identities: dict[int, str] = {}
-    for line in result.stdout.splitlines():
-        fields = line.strip().split(maxsplit=1)
-        if len(fields) == 2 and fields[0].isdigit():
-            identities[int(fields[0])] = fields[1]
+    for field in result.stdout.split():
+        if not field.isdigit():
+            continue
+        pid = int(field)
+        identity = _process_start_identity(pid)
+        if identity is not None:
+            identities[pid] = identity
     return identities
-
-
-def _process_start_identity(pid: int) -> str | None:
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout.strip() or None
 
 
 def _is_queue_temp_from_pre_existing_process(

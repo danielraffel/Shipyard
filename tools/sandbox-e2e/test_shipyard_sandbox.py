@@ -1,7 +1,18 @@
+import os
 from pathlib import Path
 from unittest import mock
 
-from shipyard_sandbox import _is_queue_temp_from_pre_existing_process
+from shipyard_sandbox import (
+    _is_queue_temp_from_pre_existing_process,
+    _process_start_identity,
+)
+
+
+def test_current_process_start_identity_is_precise_and_stable() -> None:
+    first = _process_start_identity(os.getpid())
+
+    assert first is not None
+    assert _process_start_identity(os.getpid()) == first
 
 
 def test_pre_existing_queue_writer_is_not_attributed_to_sandbox() -> None:
