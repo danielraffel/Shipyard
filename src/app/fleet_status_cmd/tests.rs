@@ -341,6 +341,36 @@ fn release_commit_detail_lookups_are_bounded_and_fail_closed() {
 
 #[cfg(unix)]
 #[test]
+fn only_latest_release_404_is_treated_as_no_releases() {
+    let temp = tempfile::tempdir().expect("temp");
+    let no_release = fake_gh(&temp, "echo 'HTTP 404 Not Found' >&2; exit 1");
+    let probe = inspect_release_liveness(&no_release, "owner/repo", "main", 86_400)
+        .expect("missing latest release is healthy");
+    assert!(probe.readable);
+    assert_eq!(probe.source, "github (no releases)");
+    assert!(probe.report.is_none());
+
+    let temp = tempfile::tempdir().expect("temp");
+    let missing_compare = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"releases/latest"*) printf '%s' '{"tag_name":"v1.0.0","published_at":"2026-07-26T00:00:00Z"}' ;;
+  *"/compare/"*) echo "HTTP 404 Not Found" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let Err(error) = inspect_release_liveness(&missing_compare, "owner/repo", "main", 86_400)
+    else {
+        panic!("missing comparison should be unhealthy");
+    };
+    assert!(error.contains("compare latest release to main failed"));
+    assert!(error.contains("404 Not Found"));
+}
+
+#[cfg(unix)]
+#[test]
 fn check_observations_include_legacy_commit_statuses() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(

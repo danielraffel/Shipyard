@@ -196,22 +196,11 @@ pub(super) fn collect_fleet_assessment(
         &args.base,
         args.release_stale_threshold_secs,
     )
-    .unwrap_or_else(|reason| {
-        let no_releases = reason.contains("HTTP 404") || reason.contains("404 Not Found");
-        ReleaseProbe {
-            readable: no_releases,
-            source: if no_releases {
-                "github (no releases)".to_owned()
-            } else {
-                reason.clone()
-            },
-            report: None,
-            reason_codes: if no_releases {
-                Vec::new()
-            } else {
-                vec![classify_observation_error(&reason)]
-            },
-        }
+    .unwrap_or_else(|reason| ReleaseProbe {
+        readable: false,
+        source: reason.clone(),
+        report: None,
+        reason_codes: vec![classify_observation_error(&reason)],
     });
     let queued_age_threshold_secs = args.queued_age_threshold_secs.max(0);
     let queued_age_with_capacity = queue

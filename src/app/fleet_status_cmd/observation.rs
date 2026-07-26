@@ -587,9 +587,18 @@ pub(super) fn inspect_release_liveness(
     base: &str,
     stale_threshold_secs: i64,
 ) -> Result<ReleaseProbe, String> {
-    let raw = actions
-        .run_gh(&["api".to_owned(), format!("repos/{repo}/releases/latest")])
-        .map_err(|error| format!("inspect latest release failed: {error}"))?;
+    let raw = match actions.run_gh(&["api".to_owned(), format!("repos/{repo}/releases/latest")]) {
+        Ok(raw) => raw,
+        Err(error) if github_not_found(&error.to_string()) => {
+            return Ok(ReleaseProbe {
+                readable: true,
+                source: "github (no releases)".to_owned(),
+                reason_codes: Vec::new(),
+                report: None,
+            });
+        }
+        Err(error) => return Err(format!("inspect latest release failed: {error}")),
+    };
     let release: Value = serde_json::from_str(&raw)
         .map_err(|error| format!("could not parse latest release JSON: {error}"))?;
     let tag = release
@@ -654,6 +663,10 @@ pub(super) fn inspect_release_liveness(
             Utc::now(),
         )?),
     })
+}
+
+fn github_not_found(error: &str) -> bool {
+    error.contains("HTTP 404") || error.contains("404 Not Found")
 }
 
 pub(super) fn count_releasable_commits(
