@@ -242,8 +242,8 @@ impl AuditIssue {
         }
     }
 
-    /// A class-vs-name mismatch is the only drift that means the name is
-    /// untrustworthy; everything else is a fixable label gap.
+    /// Whether the runner has a routing policy violation requiring operator
+    /// attention rather than merely a missing label.
     #[must_use]
     pub fn is_drift(self) -> bool {
         matches!(
@@ -287,7 +287,7 @@ impl AuditFinding {
         !self.issues.is_empty()
     }
 
-    /// Whether any issue is name-untrustworthy drift (vs a fixable label gap).
+    /// Whether any issue is a routing-policy violation (vs a missing label).
     #[must_use]
     pub fn is_drift(&self) -> bool {
         self.issues.iter().any(|issue| issue.is_drift())
@@ -331,8 +331,10 @@ pub fn audit_runners(repo_short: &str, runners: &[ApiRunner]) -> Vec<AuditFindin
                 .iter()
                 .any(|label| label.starts_with(&format!("{prefix}-advisory-")));
             let advertises_required = labels.iter().any(|label| {
-                label.starts_with(&format!("{prefix}-build"))
-                    || label.starts_with(&format!("{prefix}-preamble"))
+                label == &format!("{prefix}-build")
+                    || label.starts_with(&format!("{prefix}-build-"))
+                    || label == &format!("{prefix}-preamble")
+                    || label.starts_with(&format!("{prefix}-preamble-"))
             });
             if advertises_advisory && advertises_required {
                 issues.push(AuditIssue::AdvisoryRequiredLabelOverlap);

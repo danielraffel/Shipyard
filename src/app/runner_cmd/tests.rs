@@ -143,12 +143,9 @@ fn config_with(body: &str) -> crate::config::LoadedConfig {
     let project_dir = sandbox.path().join(".shipyard");
     std::fs::create_dir_all(&project_dir).expect("project dir");
     std::fs::write(project_dir.join("config.toml"), body).expect("write config");
-    // Keep the TempDir alive for the lifetime of the test by leaking it;
-    // tests are short-lived processes and this avoids a lifetime dance.
-    let dir = sandbox.keep();
     LoadedConfig::load(
-        Some(dir.join("global-missing")),
-        Some(dir.join(".shipyard")),
+        Some(sandbox.path().join("global-missing")),
+        Some(sandbox.path().join(".shipyard")),
         None,
         LocalOverlaySource::None,
     )

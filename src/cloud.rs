@@ -692,15 +692,19 @@ impl GitHubActions {
         args: &[String],
         timeout: Duration,
     ) -> Result<String, GitHubError> {
-        let mut child = self
-            .prepare_gh_command()?
+        let mut command = self.prepare_gh_command()?;
+        command
             .args(args)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
-            })?;
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
+        })?;
         let mut stdout = child
             .stdout
             .take()
@@ -725,6 +729,7 @@ impl GitHubActions {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Ok(None) => {
+                    terminate_process_group(&mut child);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(GitHubError::new(format!(
@@ -734,6 +739,7 @@ impl GitHubActions {
                     )));
                 }
                 Err(error) => {
+                    terminate_process_group(&mut child);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(GitHubError::new(format!(
@@ -743,6 +749,27 @@ impl GitHubActions {
                 }
             }
         };
+        while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
+            && started.elapsed() < timeout
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            terminate_process_group(&mut child);
+            let drain_deadline = Instant::now() + Duration::from_millis(500);
+            while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
+                && Instant::now() < drain_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            return Err(GitHubError::new(format!(
+                "gh {} left output pipes open after {}ms",
+                args.join(" "),
+                timeout.as_millis()
+            )));
+        }
         let stdout = stdout_reader
             .join()
             .map_err(|_| GitHubError::new("gh stdout reader panicked".to_owned()))?
@@ -772,6 +799,17 @@ impl GitHubActions {
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
 }
+
+#[cfg(unix)]
+fn terminate_process_group(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &group])
+        .status();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_child: &mut std::process::Child) {}
 
 /// Discover workflow-dispatchable GitHub Actions workflows below `repo_root`.
 #[must_use]

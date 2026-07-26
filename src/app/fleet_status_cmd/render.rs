@@ -17,8 +17,7 @@ pub(in crate::app) fn render_fleet_assessment<W: Write>(
     if json {
         write_fleet_json(stdout, "runner.fleet-status", None, assessment)
     } else {
-        write_fleet_text(stdout, assessment);
-        Ok(())
+        write_fleet_text(stdout, assessment)
     }
 }
 
@@ -105,7 +104,7 @@ fn write_fleet_json<W: Write>(
         .map_err(|e| CliFailure::new(1, format!("failed to write JSON: {e}")))
 }
 
-fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
+fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<(), CliFailure> {
     writeln!(
         stdout,
         "fleet-status repo={repo} target={} free={free} routable_free={routable_free_slots}",
@@ -114,7 +113,7 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
         free = view.free,
         routable_free_slots = view.routable_free_slots
     )
-    .ok();
+    .map_err(text_write_failure)?;
     for host in &view.hosts {
         let running = host
             .capacity
@@ -134,7 +133,7 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
             host.problem_count,
             host.doctor.source
         )
-        .ok();
+        .map_err(text_write_failure)?;
     }
     writeln!(
         stdout,
@@ -146,16 +145,17 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
         view.queued_age_threshold_secs,
         view.queue.readable
     )
-    .ok();
-    write_merge_queue_text(stdout, view);
-    write_release_text(stdout, view);
+    .map_err(text_write_failure)?;
+    write_merge_queue_text(stdout, view)?;
+    write_release_text(stdout, view)?;
     if view.should_fail {
         writeln!(
             stdout,
             "fleet-status: attention required (see fields above)"
         )
-        .ok();
+        .map_err(text_write_failure)?;
     }
+    Ok(())
 }
 
 fn host_to_json(host: &HostFleetStatus) -> Value {
@@ -258,15 +258,18 @@ fn release_to_json(probe: &ReleaseProbe) -> Value {
     Value::Object(m)
 }
 
-fn write_merge_queue_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
+fn write_merge_queue_text<W: Write>(
+    stdout: &mut W,
+    view: &FleetAssessment,
+) -> Result<(), CliFailure> {
     let Some(report) = &view.merge_queue.report else {
         writeln!(
             stdout,
             "  merge queue {}: unreadable ({})",
             view.base, view.merge_queue.source
         )
-        .ok();
-        return;
+        .map_err(text_write_failure)?;
+        return Ok(());
     };
     let front = report
         .front
@@ -283,14 +286,14 @@ fn write_merge_queue_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
         view.merge_queue_stall_threshold_secs,
         view.merge_queue.readable
     )
-    .ok();
+    .map_err(text_write_failure)?;
     if !view.merge_queue.reason_codes.is_empty() {
         writeln!(
             stdout,
             "    observation_reasons={:?}",
             view.merge_queue.reason_codes
         )
-        .ok();
+        .map_err(text_write_failure)?;
     }
     if !report.enrollment_cleared_prs.is_empty() {
         let prs = report
@@ -299,7 +302,7 @@ fn write_merge_queue_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
             .map(|pr| format!("#{pr}"))
             .collect::<Vec<_>>()
             .join(",");
-        writeln!(stdout, "    auto_merge_enrollment_cleared={prs}").ok();
+        writeln!(stdout, "    auto_merge_enrollment_cleared={prs}").map_err(text_write_failure)?;
     }
     for occupier in &report.capacity_occupiers {
         writeln!(
@@ -314,14 +317,16 @@ fn write_merge_queue_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
             occupier.runner_name,
             occupier.url.as_deref().unwrap_or("-")
         )
-        .ok();
+        .map_err(text_write_failure)?;
     }
+    Ok(())
 }
 
-fn write_release_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
+fn write_release_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<(), CliFailure> {
     let Some(report) = &view.release.report else {
-        writeln!(stdout, "  release: unavailable ({})", view.release.source).ok();
-        return;
+        writeln!(stdout, "  release: unavailable ({})", view.release.source)
+            .map_err(text_write_failure)?;
+        return Ok(());
     };
     writeln!(
         stdout,
@@ -333,5 +338,11 @@ fn write_release_text<W: Write>(stdout: &mut W, view: &FleetAssessment) {
         view.release_stale_threshold_secs,
         view.release.readable
     )
-    .ok();
+    .map_err(text_write_failure)?;
+    Ok(())
+}
+
+fn text_write_failure(error: std::io::Error) -> CliFailure {
+    let source: Box<dyn std::error::Error> = Box::new(error);
+    CliFailure::new(1, format!("failed to write fleet status: {source}"))
 }

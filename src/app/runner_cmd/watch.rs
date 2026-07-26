@@ -136,7 +136,7 @@ pub(super) fn watch_command<W: Write>(
                 let report =
                     assess_runner(&snapshot, &queued_runs, settings.thresholds, Utc::now());
                 emit_watch_tick(stdout, &settings, &report, json)?;
-                if fix && report.health == RunnerHealth::Stuck {
+                if (fix || settings.thresholds.auto_fix) && report.health == RunnerHealth::Stuck {
                     cancel_stale_inline(actions, &settings, &report, stdout, json)?;
                 }
                 if kill_hung_workers && report_has_hung_worker(&report) {
@@ -150,16 +150,6 @@ pub(super) fn watch_command<W: Write>(
                         stdout,
                     )?;
                 }
-                if reap_stale_runs {
-                    reap_stale_runs_tick(
-                        actions,
-                        &settings,
-                        reaper_thresholds,
-                        dry_run,
-                        json,
-                        stdout,
-                    )?;
-                }
                 report.health
             }
             (Err(err), _) | (_, Err(err)) => {
@@ -167,6 +157,13 @@ pub(super) fn watch_command<W: Write>(
                 RunnerHealth::Offline
             }
         };
+        if reap_stale_runs
+            && let Err(error) =
+                reap_stale_runs_tick(actions, &settings, reaper_thresholds, dry_run, json, stdout)
+        {
+            fleet_failed = true;
+            emit_watch_error(stdout, &settings, &error, json)?;
+        }
 
         if fleet_liveness_due(config, iterations) {
             let base = fleet_base.clone().map_or_else(
@@ -586,6 +583,10 @@ pub(super) fn reap_stale_runs_tick<W: Write>(
                     run,
                     Some(&err.to_string()),
                 )?;
+                return Err(CliFailure::new(
+                    1,
+                    format!("stale-run cancellation failed: {err}"),
+                ));
             }
         }
     }
