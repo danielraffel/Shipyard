@@ -173,6 +173,43 @@ use an App-authenticated GitHub wrapper, set `github_cli = "ghapp"` on each
 `TARTCI_GH_CLI`. When omitted, local probes preserve any inherited
 `TARTCI_GH_CLI` and remote probes retain tartci's default.
 
+`shipyard runner fleet-status` is the read-only monitoring surface for this
+pool. In addition to TartCI capacity and supervisor freshness, it correlates
+the configured `governance.required_status_checks` with the front merge-group
+commit. It exits nonzero when an aged queue front has no required-check
+progress while a routable slot is free, and reports active non-front
+merge-group jobs assigned to configured host classes. A run whose PR is no
+longer present in the queue is labeled `superseded`; the command only reports
+it and never cancels it. This makes `runner fleet-status --json` safe for a
+periodic queue-tick or launchd monitor.
+
+Use `--base` for a non-`main` merge queue and
+`--merge-queue-stall-threshold-secs` to tune the default 15-minute front-stall
+window. If `governance.required_status_checks` is empty, every check observed
+on the front merge-group commit is treated as a liveness signal. The same
+report compares the latest GitHub release tag with the monitored base and
+flags unreleased commits after `--release-stale-threshold-secs` (24 hours by
+default), keeping release cadence visible in the same durable tick.
+
+A PR behind a healthy, progressing queue front is a normal serialized wait,
+even when its own exact-head required checks are green. It is not a blocked
+goal and does not need re-arming. The fleet report alerts only when the timed
+front signal is stale or missing, when queue-eligible capacity is idle, or
+when non-front/superseded work owns that capacity; each occupier row names the
+run, job, runner, and PR so the current bottleneck owner is explicit.
+
+All agents and automation must consume the same command:
+
+```sh
+shipyard runner fleet-status --repo OWNER/REPO --json
+```
+
+The JSON `reason_codes` are the stable policy API (including
+`NORMAL_SERIAL_WAIT`); skills and chat agents must not reimplement the
+classifier. Run this command from launchd or the existing queue tick on a fixed
+cadence so detection continues independently of any agent session or model
+rate limit.
+
 ## Explicit Cloud Fallback
 
 GitHub-hosted macOS fallback must be explicit and should be reserved for a local

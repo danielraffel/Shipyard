@@ -897,6 +897,9 @@ pub(super) enum RunnerCommand {
         /// Owner/repo slug. Defaults to the current checkout's repo.
         #[arg(long)]
         repo: Option<String>,
+        /// Base branch whose merge queue should be monitored.
+        #[arg(long, default_value = "main")]
+        base: String,
         /// Job-name substring used to identify macOS queued work.
         #[arg(long, default_value = "macos")]
         target: String,
@@ -906,6 +909,14 @@ pub(super) enum RunnerCommand {
         /// Maximum queued workflow runs to inspect for matching macOS jobs.
         #[arg(long = "queue-run-limit", default_value_t = 100)]
         queue_run_limit: u32,
+        /// Alert when the queue front has no required-check progress after this
+        /// age while routable fleet capacity is idle.
+        #[arg(long = "merge-queue-stall-threshold-secs", default_value_t = 900)]
+        merge_queue_stall_threshold_secs: i64,
+        /// Alert when the latest release is older than this while the base
+        /// branch contains unreleased commits.
+        #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
+        release_stale_threshold_secs: i64,
     },
     /// Watch for cloud-queued macOS jobs and drain them to a local runner when
     /// a VM slot frees up. Observe-only unless `--apply`.

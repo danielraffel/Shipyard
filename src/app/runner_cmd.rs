@@ -160,15 +160,21 @@ pub(super) fn runner_command<W: Write>(
         RunnerCommand::Capacity => super::capacity_cmd::capacity_command(config, json, stdout),
         RunnerCommand::FleetStatus {
             repo,
+            base,
             target,
             queued_age_threshold_secs,
             queue_run_limit,
+            merge_queue_stall_threshold_secs,
+            release_stale_threshold_secs,
         } => super::fleet_status_cmd::fleet_status_command(
             super::fleet_status_cmd::FleetStatusArgs {
                 repo,
+                base,
                 target,
                 queued_age_threshold_secs,
                 queue_run_limit,
+                merge_queue_stall_threshold_secs,
+                release_stale_threshold_secs,
             },
             config,
             cwd,

@@ -21,15 +21,23 @@ use crate::capacity::{
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::executor::ssh::shlex_quote;
+use crate::merge_queue_liveness::{
+    ActiveRunObservation, CheckObservation, JobObservation, MergeQueueLivenessInputs,
+    MergeQueueLivenessReport, ReleaseLivenessReport, assess_merge_queue_liveness,
+    assess_release_liveness, parse_check_observations, parse_merge_queue_entries,
+};
 use crate::output::write_json_envelope;
 
 const FLEET_LANE_TARGET: &str = "macos";
 
 pub(super) struct FleetStatusArgs {
     pub(super) repo: Option<String>,
+    pub(super) base: String,
     pub(super) target: String,
     pub(super) queued_age_threshold_secs: i64,
     pub(super) queue_run_limit: u32,
+    pub(super) merge_queue_stall_threshold_secs: i64,
+    pub(super) release_stale_threshold_secs: i64,
 }
 
 struct DoctorProbe {
@@ -52,6 +60,7 @@ struct HostFleetStatus {
     supervisors: Vec<Value>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn fleet_status_command<W: Write>(
     args: FleetStatusArgs,
     config: &LoadedConfig,
@@ -114,6 +123,43 @@ pub(super) fn fleet_status_command<W: Write>(
         .filter(|host| host.routable)
         .map(|host| host.capacity.free())
         .sum();
+    let eligible_host_classes = classes
+        .iter()
+        .map(|class| class.class.clone())
+        .collect::<Vec<_>>();
+    let required_contexts = required_status_checks(config);
+    let merge_queue = inspect_merge_queue_liveness(
+        actions,
+        &repo,
+        &args.base,
+        &required_contexts,
+        &eligible_host_classes,
+        routable_free_slots,
+        args.merge_queue_stall_threshold_secs,
+    )
+    .unwrap_or_else(|reason| MergeQueueProbe {
+        readable: false,
+        source: reason,
+        report: None,
+    });
+    let release = inspect_release_liveness(
+        actions,
+        &repo,
+        &args.base,
+        args.release_stale_threshold_secs,
+    )
+    .unwrap_or_else(|reason| {
+        let no_releases = reason.contains("HTTP 404") || reason.contains("404 Not Found");
+        ReleaseProbe {
+            readable: no_releases,
+            source: if no_releases {
+                "github (no releases)".to_owned()
+            } else {
+                reason
+            },
+            report: None,
+        }
+    });
     let queued_age_threshold_secs = args.queued_age_threshold_secs.max(0);
     let queued_age_with_capacity = queue
         .oldest_age_secs
@@ -124,7 +170,17 @@ pub(super) fn fleet_status_command<W: Write>(
         || supervisor_unhealthy
         || problem_hosts
         || !queue.readable
-        || queued_age_with_capacity;
+        || queued_age_with_capacity
+        || !merge_queue.readable
+        || !release.readable
+        || merge_queue
+            .report
+            .as_ref()
+            .is_some_and(MergeQueueLivenessReport::needs_attention)
+        || release
+            .report
+            .as_ref()
+            .is_some_and(|report| report.stale_with_unreleased_commits);
 
     if json {
         write_fleet_json(
@@ -142,6 +198,11 @@ pub(super) fn fleet_status_command<W: Write>(
                 queue_run_limit,
                 queued_age_with_capacity,
                 queue: &queue,
+                base: &args.base,
+                merge_queue_stall_threshold_secs: args.merge_queue_stall_threshold_secs.max(0),
+                merge_queue: &merge_queue,
+                release_stale_threshold_secs: args.release_stale_threshold_secs.max(0),
+                release: &release,
                 hosts: &hosts,
             },
         )?;
@@ -156,6 +217,11 @@ pub(super) fn fleet_status_command<W: Write>(
                 queued_age_threshold_secs,
                 should_fail,
                 queue: &queue,
+                base: &args.base,
+                merge_queue_stall_threshold_secs: args.merge_queue_stall_threshold_secs.max(0),
+                merge_queue: &merge_queue,
+                release_stale_threshold_secs: args.release_stale_threshold_secs.max(0),
+                release: &release,
                 hosts: &hosts,
             },
         );
@@ -182,6 +248,11 @@ struct FleetJsonView<'a> {
     queue_run_limit: u32,
     queued_age_with_capacity: bool,
     queue: &'a QueuedSummary,
+    base: &'a str,
+    merge_queue_stall_threshold_secs: i64,
+    merge_queue: &'a MergeQueueProbe,
+    release_stale_threshold_secs: i64,
+    release: &'a ReleaseProbe,
     hosts: &'a [HostFleetStatus],
 }
 
@@ -216,6 +287,20 @@ fn write_fleet_json<W: Write>(stdout: &mut W, view: &FleetJsonView<'_>) -> Resul
         Value::from(view.queued_age_with_capacity),
     );
     data.insert("queue".to_owned(), queue_to_json(view.queue));
+    data.insert("base".to_owned(), Value::from(view.base));
+    data.insert(
+        "merge_queue_stall_threshold_secs".to_owned(),
+        Value::from(view.merge_queue_stall_threshold_secs),
+    );
+    data.insert(
+        "merge_queue".to_owned(),
+        merge_queue_to_json(view.merge_queue),
+    );
+    data.insert(
+        "release_stale_threshold_secs".to_owned(),
+        Value::from(view.release_stale_threshold_secs),
+    );
+    data.insert("release".to_owned(), release_to_json(view.release));
     data.insert(
         "hosts".to_owned(),
         Value::from(view.hosts.iter().map(host_to_json).collect::<Vec<_>>()),
@@ -232,6 +317,11 @@ struct FleetTextView<'a> {
     queued_age_threshold_secs: i64,
     should_fail: bool,
     queue: &'a QueuedSummary,
+    base: &'a str,
+    merge_queue_stall_threshold_secs: i64,
+    merge_queue: &'a MergeQueueProbe,
+    release_stale_threshold_secs: i64,
+    release: &'a ReleaseProbe,
     hosts: &'a [HostFleetStatus],
 }
 
@@ -277,6 +367,8 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetTextView<'_>) {
         view.queue.readable
     )
     .ok();
+    write_merge_queue_text(stdout, view);
+    write_release_text(stdout, view);
     if view.should_fail {
         writeln!(
             stdout,
@@ -569,6 +661,262 @@ struct QueuedSummary {
     oldest_age_secs: Option<i64>,
 }
 
+struct MergeQueueProbe {
+    readable: bool,
+    source: String,
+    report: Option<MergeQueueLivenessReport>,
+}
+
+struct ReleaseProbe {
+    readable: bool,
+    source: String,
+    report: Option<ReleaseLivenessReport>,
+}
+
+fn required_status_checks(config: &LoadedConfig) -> Vec<String> {
+    config
+        .get("governance.required_status_checks")
+        .and_then(toml::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_merge_queue_liveness(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    required_contexts: &[String],
+    eligible_host_classes: &[String],
+    routable_free_slots: u32,
+    stall_threshold_secs: i64,
+) -> Result<MergeQueueProbe, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
+    let query = "query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid} pullRequest{number}}}}}}";
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={query}"),
+            "-F".to_owned(),
+            format!("owner={owner}"),
+            "-F".to_owned(),
+            format!("name={name}"),
+            "-F".to_owned(),
+            format!("branch={base}"),
+        ])
+        .map_err(|error| format!("inspect merge queue failed: {error}"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("could not parse merge-queue JSON: {error}"))?;
+    let entries = parse_merge_queue_entries(&value)?;
+    let Some(front) = entries.first() else {
+        return Ok(MergeQueueProbe {
+            readable: true,
+            source: "github (queue empty or not configured)".to_owned(),
+            report: Some(assess_merge_queue_liveness(MergeQueueLivenessInputs {
+                entries: &[],
+                checks: &[],
+                active_runs: &[],
+                required_contexts,
+                eligible_host_classes,
+                routable_free_slots,
+                stall_threshold_secs,
+                now: Utc::now(),
+            })),
+        });
+    };
+
+    let checks = match front.head_sha.as_deref() {
+        Some(sha) => fetch_check_observations(actions, repo, sha)?,
+        None => Vec::new(),
+    };
+    let active_runs = fetch_active_merge_group_runs(actions, repo)?;
+    Ok(MergeQueueProbe {
+        readable: true,
+        source: "github".to_owned(),
+        report: Some(assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &entries,
+            checks: &checks,
+            active_runs: &active_runs,
+            required_contexts,
+            eligible_host_classes,
+            routable_free_slots,
+            stall_threshold_secs,
+            now: Utc::now(),
+        })),
+    })
+}
+
+fn fetch_check_observations(
+    actions: &GitHubActions,
+    repo: &str,
+    sha: &str,
+) -> Result<Vec<CheckObservation>, String> {
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/commits/{sha}/check-runs?per_page=100"),
+        ])
+        .map_err(|error| format!("inspect front merge-group checks failed: {error}"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("could not parse front check-runs JSON: {error}"))?;
+    parse_check_observations(&value)
+}
+
+fn fetch_active_merge_group_runs(
+    actions: &GitHubActions,
+    repo: &str,
+) -> Result<Vec<ActiveRunObservation>, String> {
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/actions/runs?status=in_progress&per_page=100"),
+        ])
+        .map_err(|error| format!("list active workflow runs failed: {error}"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("could not parse active workflow runs JSON: {error}"))?;
+    let runs = value
+        .get("workflow_runs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "active workflow runs response missing workflow_runs".to_owned())?;
+    let mut observations = Vec::new();
+    for run in runs {
+        let Some(head_branch) = run.get("head_branch").and_then(Value::as_str) else {
+            continue;
+        };
+        if crate::merge_queue_liveness::merge_group_pr(head_branch).is_none() {
+            continue;
+        }
+        let Some(run_id) = run.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        observations.push(ActiveRunObservation {
+            run_id,
+            workflow: run
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            head_branch: head_branch.to_owned(),
+            pull_requests: run
+                .get("pull_requests")
+                .and_then(Value::as_array)
+                .map(|pull_requests| {
+                    pull_requests
+                        .iter()
+                        .filter_map(|pr| pr.get("number").and_then(Value::as_u64))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            url: run
+                .get("html_url")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            jobs: fetch_run_jobs(actions, repo, run_id)?,
+        });
+    }
+    Ok(observations)
+}
+
+fn fetch_run_jobs(
+    actions: &GitHubActions,
+    repo: &str,
+    run_id: u64,
+) -> Result<Vec<JobObservation>, String> {
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"),
+        ])
+        .map_err(|error| format!("list jobs for workflow run {run_id} failed: {error}"))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("could not parse jobs for workflow run {run_id}: {error}"))?;
+    let jobs = value
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("workflow run {run_id} response missing jobs"))?;
+    Ok(jobs
+        .iter()
+        .filter_map(|job| {
+            Some(JobObservation {
+                name: job.get("name")?.as_str()?.to_owned(),
+                status: job.get("status")?.as_str()?.to_owned(),
+                runner_name: job
+                    .get("runner_name")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                labels: job
+                    .get("labels")
+                    .and_then(Value::as_array)
+                    .map(|labels| {
+                        labels
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
+fn inspect_release_liveness(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    stale_threshold_secs: i64,
+) -> Result<ReleaseProbe, String> {
+    let raw = actions
+        .run_gh(&["api".to_owned(), format!("repos/{repo}/releases/latest")])
+        .map_err(|error| format!("inspect latest release failed: {error}"))?;
+    let release: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("could not parse latest release JSON: {error}"))?;
+    let tag = release
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .filter(|tag| !tag.is_empty())
+        .ok_or_else(|| "latest release response missing tag_name".to_owned())?;
+    let published_at = release
+        .get("published_at")
+        .and_then(Value::as_str)
+        .filter(|timestamp| !timestamp.is_empty())
+        .ok_or_else(|| "latest release response missing published_at".to_owned())?;
+    let raw = actions
+        .run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/compare/{tag}...{base}"),
+        ])
+        .map_err(|error| format!("compare latest release to {base} failed: {error}"))?;
+    let comparison: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("could not parse release comparison JSON: {error}"))?;
+    let commits_ahead = comparison
+        .get("ahead_by")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "release comparison response missing ahead_by".to_owned())?;
+    Ok(ReleaseProbe {
+        readable: true,
+        source: "github".to_owned(),
+        report: Some(assess_release_liveness(
+            tag.to_owned(),
+            published_at.to_owned(),
+            commits_ahead,
+            stale_threshold_secs,
+            Utc::now(),
+        )?),
+    })
+}
+
 fn queued_macos_summary(
     actions: &GitHubActions,
     repo: &str,
@@ -707,6 +1055,93 @@ fn queue_to_json(queue: &QueuedSummary) -> Value {
         queue.oldest_age_secs.map_or(Value::Null, Value::from),
     );
     Value::Object(m)
+}
+
+fn merge_queue_to_json(probe: &MergeQueueProbe) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("readable".to_owned(), Value::from(probe.readable));
+    m.insert("source".to_owned(), Value::from(probe.source.clone()));
+    m.insert(
+        "report".to_owned(),
+        probe.report.as_ref().map_or(Value::Null, |report| {
+            serde_json::to_value(report).expect("merge-queue liveness serialization")
+        }),
+    );
+    Value::Object(m)
+}
+
+fn release_to_json(probe: &ReleaseProbe) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("readable".to_owned(), Value::from(probe.readable));
+    m.insert("source".to_owned(), Value::from(probe.source.clone()));
+    m.insert(
+        "report".to_owned(),
+        probe.report.as_ref().map_or(Value::Null, |report| {
+            serde_json::to_value(report).expect("release liveness serialization")
+        }),
+    );
+    Value::Object(m)
+}
+
+fn write_merge_queue_text<W: Write>(stdout: &mut W, view: &FleetTextView<'_>) {
+    let Some(report) = &view.merge_queue.report else {
+        writeln!(
+            stdout,
+            "  merge queue {}: unreadable ({})",
+            view.base, view.merge_queue.source
+        )
+        .ok();
+        return;
+    };
+    let front = report
+        .front
+        .as_ref()
+        .map_or_else(|| "-".to_owned(), |front| format!("#{}", front.pr));
+    writeln!(
+        stdout,
+        "  merge queue {}: front={} required_materialized={} required_progressed={} stalled_with_idle_capacity={} threshold={} readable={}",
+        view.base,
+        front,
+        report.materialized_required_checks,
+        report.progressed_required_checks,
+        report.front_stalled_with_idle_capacity,
+        view.merge_queue_stall_threshold_secs,
+        view.merge_queue.readable
+    )
+    .ok();
+    for occupier in &report.capacity_occupiers {
+        writeln!(
+            stdout,
+            "    {:?}: run={} pr={} job={} runner={} url={}",
+            occupier.kind,
+            occupier.run_id,
+            occupier
+                .pr
+                .map_or_else(|| "-".to_owned(), |pr| format!("#{pr}")),
+            occupier.job,
+            occupier.runner_name,
+            occupier.url.as_deref().unwrap_or("-")
+        )
+        .ok();
+    }
+}
+
+fn write_release_text<W: Write>(stdout: &mut W, view: &FleetTextView<'_>) {
+    let Some(report) = &view.release.report else {
+        writeln!(stdout, "  release: unavailable ({})", view.release.source).ok();
+        return;
+    };
+    writeln!(
+        stdout,
+        "  release: tag={} age_secs={} commits_ahead={} stale={} threshold={} readable={}",
+        report.tag,
+        report.age_secs,
+        report.commits_ahead,
+        report.stale_with_unreleased_commits,
+        view.release_stale_threshold_secs,
+        view.release.readable
+    )
+    .ok();
 }
 
 #[cfg(test)]

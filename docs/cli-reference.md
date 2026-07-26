@@ -86,6 +86,8 @@ shipyard runner watch --fix               # auto-cancel stale queued runs each t
 shipyard runner watch --kill-hung-workers # also auto-kill hung Worker processes
 shipyard runner watch --reap-stale-runs   # also cancel stale workflow runs repo-wide
 shipyard runner watch --reap-stale-runs --dry-run   # preview reaper, cancel nothing
+shipyard runner fleet-status --repo OWNER/REPO      # read-only TartCI + queue liveness
+shipyard runner fleet-status --json                 # periodic-monitor JSON + nonzero alerts
 
 # Self-hosted runner provisioning (register / list / remove on this machine)
 shipyard runner tag --set studio          # set this box's machine tag (m1, m5, …)
