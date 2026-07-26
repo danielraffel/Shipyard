@@ -180,6 +180,11 @@ pub fn classify_pr(
             run_ids: transient_runs.into_iter().collect(),
         };
     }
+    if !policy.merge_queue && merge_state != "CLEAN" {
+        return StewardDecision::WaitingRequired {
+            contexts: vec![format!("github-merge-state:CLEAN (current={merge_state})")],
+        };
+    }
     if policy.merge_queue {
         // The exact-head enqueue mutation is idempotent from the steward's
         // perspective and is stronger evidence than autoMergeRequest: GitHub
@@ -245,6 +250,8 @@ pub struct StewardRun {
     pub id: u64,
     /// Stable workflow ID.
     pub workflow_id: u64,
+    /// Workflow display name.
+    pub workflow: String,
     /// Immutable run head SHA.
     pub head_sha: String,
     /// Head branch, including merge-group branches.
@@ -253,8 +260,27 @@ pub struct StewardRun {
     pub status: String,
     /// GitHub event (`pull_request`, `merge_group`, etc.).
     pub event: String,
+    /// Pull request identity from the workflow-run payload, when present.
+    pub pull_request_number: Option<u64>,
     /// Creation timestamp, used only for deterministic retention.
     pub created_at: String,
+    /// Jobs fetched for queue-front pressure or preemption candidates.
+    pub jobs: Vec<StewardJob>,
+}
+
+/// One workflow job used by conservative capacity-preemption policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StewardJob {
+    /// Job display name.
+    pub name: String,
+    /// GitHub job status.
+    pub status: String,
+    /// Terminal conclusion, when GitHub has completed the job.
+    pub conclusion: Option<String>,
+    /// Runner labels requested by the job.
+    pub labels: Vec<String>,
+    /// Assigned runner name, when any.
+    pub runner_name: Option<String>,
 }
 
 /// Why a queued workflow run is safe to cancel.
@@ -267,6 +293,10 @@ pub enum RunCancellationReason {
     SupersededPullRequestHead,
     /// Merge queue has materialized a newer speculative head for the same PR.
     SupersededMergeGroupHead,
+    /// An advisory PR workflow owns shared preamble capacity.
+    AdvisoryPreambleCapacityTheft,
+    /// A superseded branch validation head holds capacity ahead of the queue front.
+    LowerPriorityBranchPreamble,
 }
 
 /// One conservative queued-run cancellation.
@@ -278,6 +308,229 @@ pub struct RunCancellation {
     pub reason: RunCancellationReason,
 }
 
+/// Inputs that prove a queue front is old enough to justify bounded preemption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueFrontPressure {
+    /// Exact speculative merge-group SHA at the queue front.
+    pub head_sha: String,
+    /// Whether the front has exceeded the configured wait threshold.
+    pub old_enough: bool,
+}
+
+/// Plan at most `max_preemptions` incident-safe in-progress cancellations.
+///
+/// Only PR workflows with a running shared-preamble job are eligible. Pushes,
+/// merge groups, unknown workflows/jobs, and any run whose expensive
+/// `pulp-build` leg started are never selected.
+#[must_use]
+pub fn plan_capacity_preemptions(
+    runs: &[StewardRun],
+    current_pull_request_heads: &BTreeMap<u64, String>,
+    opted_out_pull_requests: &BTreeSet<u64>,
+    pressure: &QueueFrontPressure,
+    attempted_heads: &BTreeSet<String>,
+    max_preemptions: usize,
+) -> Vec<RunCancellation> {
+    if max_preemptions == 0 || !pressure.old_enough || !is_full_sha(&pressure.head_sha) {
+        return Vec::new();
+    }
+    if !queue_front_waits_for_pool(runs, &pressure.head_sha) {
+        return Vec::new();
+    }
+
+    let mut candidates = runs
+        .iter()
+        .filter_map(|run| {
+            let reason =
+                preemption_reason(run, current_pull_request_heads, opted_out_pull_requests)?;
+            if attempted_heads.contains(&preemption_key(run)) {
+                return None;
+            }
+            Some((run, reason))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left, left_reason), (right, right_reason)| {
+        preemption_rank(*left_reason)
+            .cmp(&preemption_rank(*right_reason))
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates
+        .into_iter()
+        .take(max_preemptions.min(1))
+        .map(|(run, reason)| RunCancellation {
+            run_id: run.id,
+            reason,
+        })
+        .collect()
+}
+
+/// Prove that the exact merge-group front still has recognized pool work waiting.
+#[must_use]
+pub fn queue_front_waits_for_pool(runs: &[StewardRun], head_sha: &str) -> bool {
+    is_full_sha(head_sha)
+        && runs.iter().any(|run| {
+            run.event == "merge_group"
+                && run.head_sha.eq_ignore_ascii_case(head_sha)
+                && run.jobs.iter().any(|job| {
+                    is_waiting(&job.status)
+                        && (has_label(job, "pulp-preamble") || is_expensive_job(job))
+                })
+        })
+}
+
+fn preemption_reason(
+    run: &StewardRun,
+    current_pull_request_heads: &BTreeMap<u64, String>,
+    opted_out_pull_requests: &BTreeSet<u64>,
+) -> Option<RunCancellationReason> {
+    if run.event != "pull_request"
+        || !run.status.eq_ignore_ascii_case("in_progress")
+        || !is_full_sha(&run.head_sha)
+    {
+        return None;
+    }
+    let pull_request_number = run.pull_request_number?;
+    if opted_out_pull_requests.contains(&pull_request_number) {
+        return None;
+    }
+    let running_preamble = run.jobs.iter().any(|job| {
+        job.status.eq_ignore_ascii_case("in_progress") && has_label(job, "pulp-preamble")
+    });
+    if !running_preamble
+        || run
+            .jobs
+            .iter()
+            .any(|job| expensive_leg_started(job) || unknown_active_job(job))
+    {
+        return None;
+    }
+    if is_advisory_capacity_workflow(&run.workflow) {
+        Some(RunCancellationReason::AdvisoryPreambleCapacityTheft)
+    } else if run.workflow == "Build and Test"
+        && current_pull_request_heads
+            .get(&run.pull_request_number?)
+            .is_some_and(|head| !head.eq_ignore_ascii_case(&run.head_sha))
+    {
+        Some(RunCancellationReason::LowerPriorityBranchPreamble)
+    } else {
+        None
+    }
+}
+
+/// Return whether a workflow name is explicitly allowed for capacity preemption.
+///
+/// This list is intentionally exact and fail-closed. A workflow merely containing
+/// the word "advisory" must not gain cancellation authority.
+#[must_use]
+pub fn is_capacity_preemption_workflow(workflow: &str) -> bool {
+    workflow == "Build and Test" || is_advisory_capacity_workflow(workflow)
+}
+
+fn is_advisory_capacity_workflow(workflow: &str) -> bool {
+    [
+        "Example validation",
+        "GPU Web Plugins",
+        "Intel portability (advisory)",
+        "IWYU advisory",
+        "macOS Cross (advisory)",
+    ]
+    .contains(&workflow)
+}
+
+/// Revalidate that a live run still satisfies the exact planned preemption.
+#[must_use]
+pub fn is_safe_capacity_preemption(
+    run: &StewardRun,
+    current_pull_request_heads: &BTreeMap<u64, String>,
+    opted_out_pull_requests: &BTreeSet<u64>,
+    expected_reason: RunCancellationReason,
+) -> bool {
+    preemption_reason(run, current_pull_request_heads, opted_out_pull_requests)
+        == Some(expected_reason)
+}
+
+fn expensive_leg_started(job: &StewardJob) -> bool {
+    is_expensive_job(job)
+        && !is_waiting(&job.status)
+        && !(job.status == "completed" && job.conclusion.as_deref() == Some("skipped"))
+}
+
+fn is_expensive_job(job: &StewardJob) -> bool {
+    job.labels.iter().any(|label| {
+        let label = label.to_ascii_lowercase();
+        label == "pulp-build" || label.starts_with("pulp-build-")
+    })
+}
+
+fn is_waiting(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "queued" | "waiting" | "pending" | "requested"
+    )
+}
+
+fn unknown_active_job(job: &StewardJob) -> bool {
+    if !is_nonterminal(&job.status)
+        || has_label(job, "pulp-preamble")
+        || is_expensive_job(job)
+        || is_known_hosted_job(job)
+    {
+        return false;
+    }
+    true
+}
+
+fn is_known_hosted_job(job: &StewardJob) -> bool {
+    job.labels.len() == 1
+        && job.labels.iter().any(|label| {
+            matches!(
+                label.as_str(),
+                "ubuntu-latest"
+                    | "ubuntu-24.04"
+                    | "ubuntu-22.04"
+                    | "windows-latest"
+                    | "windows-2025"
+                    | "windows-2022"
+                    | "macos-latest"
+                    | "macos-15"
+                    | "macos-14"
+                    | "macos-13"
+            )
+        })
+}
+
+fn is_nonterminal(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "queued" | "waiting" | "pending" | "requested" | "in_progress"
+    )
+}
+
+fn has_label(job: &StewardJob, expected: &str) -> bool {
+    job.labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(expected))
+}
+
+/// Stable attempt key shared by the planner and durable adapter ledger.
+#[must_use]
+pub fn preemption_key(run: &StewardRun) -> String {
+    format!(
+        "{}:{}",
+        run.workflow.to_ascii_lowercase(),
+        run.head_sha.to_ascii_lowercase()
+    )
+}
+
+fn preemption_rank(reason: RunCancellationReason) -> u8 {
+    match reason {
+        RunCancellationReason::AdvisoryPreambleCapacityTheft => 0,
+        RunCancellationReason::LowerPriorityBranchPreamble => 1,
+        _ => 2,
+    }
+}
+
 /// Plan queued-run coalescing.
 ///
 /// In-progress work is never cancelled. Push/schedule runs are never touched.
@@ -285,23 +538,29 @@ pub struct RunCancellation {
 #[must_use]
 pub fn plan_run_coalescing(
     runs: &[StewardRun],
-    current_pr_heads: &BTreeMap<String, String>,
+    current_pr_heads: &BTreeMap<u64, String>,
     current_merge_group_heads: &BTreeMap<u64, String>,
+    opted_out_pull_requests: &BTreeSet<u64>,
 ) -> Vec<RunCancellation> {
     let mut reasons = BTreeMap::<u64, RunCancellationReason>::new();
     for run in runs {
         if !run.status.eq_ignore_ascii_case("queued") || !is_full_sha(&run.head_sha) {
             continue;
         }
+        let Some(pr_number) = run_pull_request_number(run) else {
+            continue;
+        };
+        if opted_out_pull_requests.contains(&pr_number) {
+            continue;
+        }
         if run.event == "pull_request"
-            && let Some(current) = current_pr_heads.get(&run.head_branch)
+            && let Some(current) = current_pr_heads.get(&pr_number)
             && is_full_sha(current)
             && !current.eq_ignore_ascii_case(&run.head_sha)
         {
             reasons.insert(run.id, RunCancellationReason::SupersededPullRequestHead);
         } else if run.event == "merge_group"
-            && let Some(pr) = merge_group_pr(&run.head_branch)
-            && let Some(current) = current_merge_group_heads.get(&pr)
+            && let Some(current) = current_merge_group_heads.get(&pr_number)
             && is_full_sha(current)
             && !current.eq_ignore_ascii_case(&run.head_sha)
         {
@@ -309,13 +568,22 @@ pub fn plan_run_coalescing(
         }
     }
 
-    let mut groups = BTreeMap::<(u64, String), Vec<&StewardRun>>::new();
+    let mut groups = BTreeMap::<(String, u64, String, u64), Vec<&StewardRun>>::new();
     for run in runs {
+        let Some(pr_number) = run_pull_request_number(run) else {
+            continue;
+        };
         if matches!(run.event.as_str(), "pull_request" | "merge_group")
             && is_full_sha(&run.head_sha)
+            && !opted_out_pull_requests.contains(&pr_number)
         {
             groups
-                .entry((run.workflow_id, run.head_sha.to_ascii_lowercase()))
+                .entry((
+                    run.event.clone(),
+                    run.workflow_id,
+                    run.head_sha.to_ascii_lowercase(),
+                    pr_number,
+                ))
                 .or_default()
                 .push(run);
         }
@@ -332,8 +600,9 @@ pub fn plan_run_coalescing(
                 .then_with(|| right.created_at.cmp(&left.created_at))
                 .then_with(|| right.id.cmp(&left.id))
         });
+        let retained_id = group[0].id;
         for duplicate in group.iter().skip(1) {
-            if duplicate.status.eq_ignore_ascii_case("queued") {
+            if duplicate.id != retained_id && duplicate.status.eq_ignore_ascii_case("queued") {
                 reasons
                     .entry(duplicate.id)
                     .or_insert(RunCancellationReason::DuplicateImmutableHead);
@@ -344,6 +613,14 @@ pub fn plan_run_coalescing(
         .into_iter()
         .map(|(run_id, reason)| RunCancellation { run_id, reason })
         .collect()
+}
+
+fn run_pull_request_number(run: &StewardRun) -> Option<u64> {
+    run.pull_request_number.or_else(|| {
+        (run.event == "merge_group")
+            .then(|| merge_group_pr(&run.head_branch))
+            .flatten()
+    })
 }
 
 /// Extract a PR number from GitHub's merge-group branch convention.
@@ -493,40 +770,63 @@ mod tests {
     }
 
     #[test]
+    fn private_exact_head_merge_never_bypasses_blocked_ruleset_state() {
+        let mut pr = green_pr();
+        pr.merge_state = "BLOCKED".to_owned();
+        let mut policy = queue_policy();
+        policy.merge_queue = false;
+        assert!(matches!(
+            classify_pr(&pr, &policy, &BTreeMap::new()),
+            StewardDecision::WaitingRequired { contexts }
+                if contexts == vec!["github-merge-state:CLEAN (current=BLOCKED)"]
+        ));
+    }
+
+    #[test]
     fn coalesces_only_queued_duplicate_and_superseded_pr_runs() {
         let runs = vec![
             StewardRun {
                 id: 1,
                 workflow_id: 8,
+                workflow: "Build and Test".to_owned(),
                 head_sha: sha('a'),
                 head_branch: "feature".to_owned(),
                 status: "in_progress".to_owned(),
                 event: "pull_request".to_owned(),
+                pull_request_number: Some(1),
                 created_at: "2026-01-01T00:00:00Z".to_owned(),
+                jobs: Vec::new(),
             },
             StewardRun {
                 id: 2,
                 workflow_id: 8,
+                workflow: "Build and Test".to_owned(),
                 head_sha: sha('a'),
                 head_branch: "feature".to_owned(),
                 status: "queued".to_owned(),
                 event: "pull_request".to_owned(),
+                pull_request_number: Some(1),
                 created_at: "2026-01-01T00:01:00Z".to_owned(),
+                jobs: Vec::new(),
             },
             StewardRun {
                 id: 3,
                 workflow_id: 9,
+                workflow: "Build and Test".to_owned(),
                 head_sha: sha('b'),
                 head_branch: "feature".to_owned(),
                 status: "queued".to_owned(),
                 event: "pull_request".to_owned(),
+                pull_request_number: Some(1),
                 created_at: "2026-01-01T00:02:00Z".to_owned(),
+                jobs: Vec::new(),
             },
         ];
         let plan = plan_run_coalescing(
             &runs,
-            &BTreeMap::from([("feature".to_owned(), sha('a'))]),
+            &BTreeMap::from([(1, sha('a'))]),
             &BTreeMap::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             plan,
@@ -544,32 +844,489 @@ mod tests {
     }
 
     #[test]
+    fn repeated_observation_of_same_run_id_is_not_a_duplicate_run() {
+        let run = StewardRun {
+            id: 1,
+            workflow_id: 8,
+            workflow: "Build and Test".to_owned(),
+            head_sha: sha('a'),
+            head_branch: "feature".to_owned(),
+            status: "queued".to_owned(),
+            event: "pull_request".to_owned(),
+            pull_request_number: Some(1),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            jobs: Vec::new(),
+        };
+        assert!(
+            plan_run_coalescing(
+                &[run.clone(), run],
+                &BTreeMap::from([(1, sha('a'))]),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn never_cancels_in_progress_or_non_pr_runs() {
         let runs = vec![
             StewardRun {
                 id: 1,
                 workflow_id: 1,
+                workflow: "Build and Test".to_owned(),
                 head_sha: sha('a'),
                 head_branch: "feature".to_owned(),
                 status: "in_progress".to_owned(),
                 event: "pull_request".to_owned(),
+                pull_request_number: Some(1),
                 created_at: String::new(),
+                jobs: Vec::new(),
             },
             StewardRun {
                 id: 2,
                 workflow_id: 2,
+                workflow: "Build and Test".to_owned(),
                 head_sha: sha('b'),
                 head_branch: "main".to_owned(),
                 status: "queued".to_owned(),
                 event: "push".to_owned(),
+                pull_request_number: None,
                 created_at: String::new(),
+                jobs: Vec::new(),
             },
         ];
         assert!(
             plan_run_coalescing(
                 &runs,
-                &BTreeMap::from([("feature".to_owned(), sha('c'))]),
-                &BTreeMap::new()
+                &BTreeMap::from([(1, sha('c'))]),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn coalescing_uses_pr_identity_and_honors_opt_out() {
+        let runs = vec![
+            StewardRun {
+                id: 10,
+                workflow_id: 8,
+                workflow: "Build and Test".to_owned(),
+                head_sha: sha('a'),
+                head_branch: "same-name".to_owned(),
+                status: "queued".to_owned(),
+                event: "pull_request".to_owned(),
+                pull_request_number: Some(1),
+                created_at: String::new(),
+                jobs: Vec::new(),
+            },
+            StewardRun {
+                id: 11,
+                workflow_id: 8,
+                workflow: "Build and Test".to_owned(),
+                head_sha: sha('b'),
+                head_branch: "same-name".to_owned(),
+                status: "queued".to_owned(),
+                event: "pull_request".to_owned(),
+                pull_request_number: Some(2),
+                created_at: String::new(),
+                jobs: Vec::new(),
+            },
+        ];
+        assert!(
+            plan_run_coalescing(
+                &runs,
+                &BTreeMap::from([(1, sha('a')), (2, sha('c'))]),
+                &BTreeMap::new(),
+                &BTreeSet::from([2]),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn head_move_a_to_b_to_a_does_not_leave_cached_superseded_proof() {
+        let run = StewardRun {
+            id: 12,
+            workflow_id: 8,
+            workflow: "Build and Test".to_owned(),
+            head_sha: sha('a'),
+            head_branch: "feature".to_owned(),
+            status: "queued".to_owned(),
+            event: "pull_request".to_owned(),
+            pull_request_number: Some(1),
+            created_at: String::new(),
+            jobs: Vec::new(),
+        };
+        assert!(
+            plan_run_coalescing(
+                &[run],
+                &BTreeMap::from([(1, sha('a'))]),
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            )
+            .is_empty()
+        );
+    }
+
+    fn job(name: &str, status: &str, labels: &[&str]) -> StewardJob {
+        StewardJob {
+            name: name.to_owned(),
+            status: status.to_owned(),
+            conclusion: (status == "skipped").then(|| "skipped".to_owned()),
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            runner_name: None,
+        }
+    }
+
+    fn pressure_runs() -> Vec<StewardRun> {
+        vec![
+            StewardRun {
+                id: 100,
+                workflow_id: 1,
+                workflow: "Build and Test".to_owned(),
+                head_sha: sha('f'),
+                head_branch: "gh-readonly-queue/main/pr-7-deadbeef".to_owned(),
+                status: "queued".to_owned(),
+                event: "merge_group".to_owned(),
+                pull_request_number: None,
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                jobs: vec![job(
+                    "macOS (ARM64) [local]",
+                    "queued",
+                    &["self-hosted", "pulp-build", "pulp-build-vm"],
+                )],
+            },
+            StewardRun {
+                id: 200,
+                workflow_id: 2,
+                workflow: "Example validation".to_owned(),
+                head_sha: sha('a'),
+                head_branch: "feature-a".to_owned(),
+                status: "in_progress".to_owned(),
+                event: "pull_request".to_owned(),
+                pull_request_number: Some(8),
+                created_at: "2026-01-01T00:01:00Z".to_owned(),
+                jobs: vec![
+                    job(
+                        "Detect example changes",
+                        "in_progress",
+                        &["self-hosted", "pulp-preamble"],
+                    ),
+                    job(
+                        "Validate examples (macOS)",
+                        "queued",
+                        &["self-hosted", "pulp-build", "pulp-build-vm"],
+                    ),
+                ],
+            },
+            StewardRun {
+                id: 300,
+                workflow_id: 3,
+                workflow: "Build and Test".to_owned(),
+                head_sha: sha('b'),
+                head_branch: "feature-b".to_owned(),
+                status: "in_progress".to_owned(),
+                event: "pull_request".to_owned(),
+                pull_request_number: Some(9),
+                created_at: "2026-01-01T00:02:00Z".to_owned(),
+                jobs: vec![
+                    job("macos", "in_progress", &["self-hosted", "pulp-preamble"]),
+                    job(
+                        "macOS (ARM64) [local]",
+                        "queued",
+                        &["self-hosted", "pulp-build", "pulp-build-vm"],
+                    ),
+                    job("Windows", "in_progress", &["windows-latest"]),
+                ],
+            },
+        ]
+    }
+
+    fn current_heads() -> BTreeMap<u64, String> {
+        BTreeMap::from([(8, sha('a')), (9, sha('c'))])
+    }
+
+    #[test]
+    fn preempts_one_advisory_before_lower_priority_branch() {
+        let plan = plan_capacity_preemptions(
+            &pressure_runs(),
+            &current_heads(),
+            &BTreeSet::new(),
+            &QueueFrontPressure {
+                head_sha: sha('f'),
+                old_enough: true,
+            },
+            &BTreeSet::new(),
+            usize::MAX,
+        );
+        assert_eq!(
+            plan,
+            vec![RunCancellation {
+                run_id: 200,
+                reason: RunCancellationReason::AdvisoryPreambleCapacityTheft,
+            }]
+        );
+    }
+
+    #[test]
+    fn gpu_web_plugins_is_exact_advisory_capacity_work_not_cached_supersedence() {
+        let mut runs = pressure_runs();
+        runs[1].workflow = "GPU Web Plugins".to_owned();
+        let plan = plan_capacity_preemptions(
+            &runs,
+            &current_heads(),
+            &BTreeSet::new(),
+            &QueueFrontPressure {
+                head_sha: sha('f'),
+                old_enough: true,
+            },
+            &BTreeSet::new(),
+            1,
+        );
+        assert_eq!(
+            plan,
+            vec![RunCancellation {
+                run_id: 200,
+                reason: RunCancellationReason::AdvisoryPreambleCapacityTheft,
+            }]
+        );
+    }
+
+    #[test]
+    fn never_preempts_started_expensive_push_or_unknown_work() {
+        let mut cases = Vec::new();
+        let mut expensive = pressure_runs();
+        expensive[1].jobs[1].status = "in_progress".to_owned();
+        cases.push(expensive);
+        let mut completed_linux = pressure_runs();
+        completed_linux[1].jobs.push(job(
+            "Linux (x64) [local]",
+            "completed",
+            &["self-hosted", "pulp-build-linux"],
+        ));
+        cases.push(completed_linux);
+        let mut push = pressure_runs();
+        push[1].event = "push".to_owned();
+        cases.push(push);
+        let mut unknown = pressure_runs();
+        unknown[1].jobs.push(job(
+            "mystery",
+            "in_progress",
+            &["self-hosted", "custom-pool"],
+        ));
+        cases.push(unknown);
+        let mut unknown_workflow = pressure_runs();
+        unknown_workflow[1].workflow = "Unclassified advisory validation".to_owned();
+        cases.push(unknown_workflow);
+        let mut wrong_case_workflow = pressure_runs();
+        wrong_case_workflow[1].workflow = "EXAMPLE VALIDATION".to_owned();
+        cases.push(wrong_case_workflow);
+        let mut fake_hosted = pressure_runs();
+        fake_hosted[1].jobs.push(job(
+            "custom",
+            "in_progress",
+            &["self-hosted", "custom-latest"],
+        ));
+        cases.push(fake_hosted);
+        let mut requested_unknown = pressure_runs();
+        requested_unknown[1]
+            .jobs
+            .push(job("requested custom", "requested", &["custom-pool"]));
+        cases.push(requested_unknown);
+        let mut missing_pr_identity = pressure_runs();
+        missing_pr_identity[1].pull_request_number = None;
+        cases.push(missing_pr_identity);
+        for runs in cases {
+            let plan = plan_capacity_preemptions(
+                &runs,
+                &current_heads(),
+                &BTreeSet::new(),
+                &QueueFrontPressure {
+                    head_sha: sha('f'),
+                    old_enough: true,
+                },
+                &BTreeSet::new(),
+                1,
+            );
+            assert!(
+                plan.iter().all(|cancellation| cancellation.run_id != 200),
+                "unsafe run was selected: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_aged_exact_front_and_durable_attempt_budget() {
+        let runs = pressure_runs();
+        let attempted = BTreeSet::from([preemption_key(&runs[1])]);
+        let plan = plan_capacity_preemptions(
+            &runs,
+            &current_heads(),
+            &BTreeSet::new(),
+            &QueueFrontPressure {
+                head_sha: sha('f'),
+                old_enough: true,
+            },
+            &attempted,
+            1,
+        );
+        assert_eq!(plan[0].run_id, 300);
+        let wrong_pr_identity = BTreeMap::from([(10, sha('c'))]);
+        assert!(
+            plan_capacity_preemptions(
+                &runs,
+                &wrong_pr_identity,
+                &BTreeSet::new(),
+                &QueueFrontPressure {
+                    head_sha: sha('f'),
+                    old_enough: true,
+                },
+                &attempted,
+                1,
+            )
+            .is_empty(),
+            "a same-name branch from another PR must not prove stale identity"
+        );
+        assert!(
+            plan_capacity_preemptions(
+                &runs,
+                &current_heads(),
+                &BTreeSet::new(),
+                &QueueFrontPressure {
+                    head_sha: sha('f'),
+                    old_enough: false,
+                },
+                &BTreeSet::new(),
+                1
+            )
+            .is_empty()
+        );
+        assert!(
+            plan_capacity_preemptions(
+                &runs,
+                &current_heads(),
+                &BTreeSet::new(),
+                &QueueFrontPressure {
+                    head_sha: sha('e'),
+                    old_enough: true,
+                },
+                &BTreeSet::new(),
+                1
+            )
+            .is_empty()
+        );
+
+        let mut running_front = runs;
+        running_front[0].jobs[0].status = "in_progress".to_owned();
+        assert!(
+            plan_capacity_preemptions(
+                &running_front,
+                &current_heads(),
+                &BTreeSet::new(),
+                &QueueFrontPressure {
+                    head_sha: sha('f'),
+                    old_enough: true,
+                },
+                &BTreeSet::new(),
+                1
+            )
+            .is_empty(),
+            "an already-running queue front is not waiting for pool capacity"
+        );
+    }
+
+    #[test]
+    fn queued_front_preamble_models_global_scheduler_cap_pressure() {
+        let mut runs = pressure_runs();
+        runs[0].jobs = vec![job(
+            "resolve-provider",
+            "queued",
+            &["self-hosted", "pulp-preamble"],
+        )];
+        assert_eq!(
+            plan_capacity_preemptions(
+                &runs,
+                &current_heads(),
+                &BTreeSet::new(),
+                &QueueFrontPressure {
+                    head_sha: sha('f'),
+                    old_enough: true,
+                },
+                &BTreeSet::new(),
+                1,
+            ),
+            vec![RunCancellation {
+                run_id: 200,
+                reason: RunCancellationReason::AdvisoryPreambleCapacityTheft,
+            }]
+        );
+        runs[0].jobs[0].status = "requested".to_owned();
+        assert_eq!(
+            plan_capacity_preemptions(
+                &runs,
+                &current_heads(),
+                &BTreeSet::new(),
+                &QueueFrontPressure {
+                    head_sha: sha('f'),
+                    old_enough: true,
+                },
+                &BTreeSet::new(),
+                1,
+            )[0]
+            .run_id,
+            200
+        );
+    }
+
+    #[test]
+    fn completed_skipped_expensive_leg_remains_unstarted() {
+        let mut runs = pressure_runs();
+        runs[1].jobs[1].status = "completed".to_owned();
+        runs[1].jobs[1].conclusion = Some("skipped".to_owned());
+        assert_eq!(
+            plan_capacity_preemptions(
+                &runs,
+                &current_heads(),
+                &BTreeSet::new(),
+                &QueueFrontPressure {
+                    head_sha: sha('f'),
+                    old_enough: true,
+                },
+                &BTreeSet::new(),
+                1,
+            )[0]
+            .run_id,
+            200
+        );
+    }
+
+    #[test]
+    fn opted_out_pull_request_is_never_preempted() {
+        let runs = pressure_runs();
+        let pressure = QueueFrontPressure {
+            head_sha: sha('f'),
+            old_enough: true,
+        };
+        let plan = plan_capacity_preemptions(
+            &runs,
+            &current_heads(),
+            &BTreeSet::from([8]),
+            &pressure,
+            &BTreeSet::new(),
+            1,
+        );
+        assert_eq!(plan[0].run_id, 300);
+        assert!(
+            plan_capacity_preemptions(
+                &runs,
+                &current_heads(),
+                &BTreeSet::from([8, 9]),
+                &pressure,
+                &BTreeSet::new(),
+                1,
             )
             .is_empty()
         );

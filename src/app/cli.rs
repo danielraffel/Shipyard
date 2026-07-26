@@ -944,6 +944,12 @@ pub(super) enum RunnerCommand {
         /// Disable queued-run duplicate/superseded-head coalescing.
         #[arg(long = "no-coalesce")]
         no_coalesce: bool,
+        /// Disable bounded preemption of safe preamble-only capacity thieves.
+        #[arg(long = "no-preempt-capacity")]
+        no_preempt_capacity: bool,
+        /// Maximum preemptions of one workflow on one immutable PR head.
+        #[arg(long = "max-preemptions-per-head", default_value_t = 1)]
+        max_preemptions_per_head: u32,
         /// Perform the planned mutations. Without this flag, only audit.
         #[arg(long)]
         apply: bool,

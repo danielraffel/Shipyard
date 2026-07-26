@@ -617,6 +617,37 @@ private-plan branch-protection/merge-queue entitlement use GitHub's REST merge
 endpoint with the same exact-head guard and treat every observed check as
 gating. Add the `shipyard:no-auto-merge` label to opt a PR out.
 
+When an exact merge-group front has waited at least 15 minutes, the steward may
+preempt at most one in-progress PR workflow per pass if that run is an
+allow-listed advisory or a `Build and Test` workflow on a superseded immutable
+PR head, it is
+actively holding a `pulp-preamble` runner, and every `pulp-build` or
+`pulp-build-*` leg is still queued or skipped. It fetches the live run and all
+jobs again immediately before cancellation. Pushes, merge groups, unknown
+workflows/jobs, and any run with a started or completed expensive leg are never
+cancelled. The hard cross-repository pass cap is one; no CLI option can raise
+it. `--no-preempt-capacity` disables this behavior; the per-head attempt
+budget and write-ahead audit live in the `handoff_ledger` path emitted by JSON.
+Apply mode holds an exclusive sibling lock for the whole reconciliation, so
+multiple agents on the authority host cannot race or lose attempt/audit state.
+Immediately before a preemption it also re-reads the native queue and the
+front run's jobs, requiring the same exact speculative front SHA and at least
+one recognized pool job still queued/waiting/pending; front advancement or a
+front job starting turns the action into a reported no-op.
+This also covers an organization scheduler active-workflow cap: an exact-front
+`resolve-provider` job queued on `pulp-preamble` is pressure even when a
+matching runner is idle.
+This policy never creates VMs or changes governor leases, host caps, or Tart
+capacity, so a governor denial remains authoritative and cannot be bypassed.
+After GitHub accepts a cancellation, the steward polls the exact run and all
+job attempts for up to 15 seconds. Capacity is considered released only after
+the run is completed and no job remains queued/in-progress. A nonterminal run
+records `cancel_not_terminal`, then sends GitHub's exact-run `force-cancel` and
+polls once more. If that still does not terminalize, the pass is unhealthy with
+an auditable `job@runner` handoff target. The steward does not remotely kill or
+restart a runner; any service recycle is an explicit exact-host, exact-run
+operator action followed by proof that the runner reconnects and claims work.
+
 ### Reroute watcher (cloud→local drain)
 
 ```bash

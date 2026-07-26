@@ -189,6 +189,8 @@ pub(super) fn runner_command<W: Write>(
             opt_out_label,
             max_transient_reruns,
             no_coalesce,
+            no_preempt_capacity,
+            max_preemptions_per_head,
             apply,
             ledger,
         } => super::merge_steward_cmd::steward_command(
@@ -198,6 +200,8 @@ pub(super) fn runner_command<W: Write>(
                 opt_out_label,
                 max_transient_reruns,
                 coalesce: !no_coalesce,
+                preempt_capacity: !no_preempt_capacity,
+                max_preemptions_per_head,
                 apply,
                 ledger,
             },

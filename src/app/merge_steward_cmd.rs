@@ -1,18 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::CliFailure;
 use crate::cloud::GitHubActions;
 use crate::merge_steward::{
-    RunCancellation, StewardCheck, StewardDecision, StewardPolicy, StewardPullRequest, StewardRun,
-    classify_pr, is_full_sha, plan_run_coalescing,
+    QueueFrontPressure, RunCancellation, RunCancellationReason, StewardCheck, StewardDecision,
+    StewardJob, StewardPolicy, StewardPullRequest, StewardRun, classify_pr,
+    is_capacity_preemption_workflow, is_full_sha, is_safe_capacity_preemption,
+    plan_capacity_preemptions, plan_run_coalescing, preemption_key, queue_front_waits_for_pool,
 };
 use crate::output::write_json_envelope;
 
@@ -22,6 +28,8 @@ pub(super) struct StewardCommandArgs {
     pub(super) opt_out_label: String,
     pub(super) max_transient_reruns: u32,
     pub(super) coalesce: bool,
+    pub(super) preempt_capacity: bool,
+    pub(super) max_preemptions_per_head: u32,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
 }
@@ -35,15 +43,24 @@ struct ObservedPr {
 #[derive(Clone, Debug)]
 struct RepoObservation {
     repo: String,
+    base: String,
     allow_auto_merge: bool,
     merge_queue: bool,
+    merge_method: Option<String>,
     required_contexts: Vec<String>,
     prs: Vec<ObservedPr>,
     runs: Vec<StewardRun>,
     merge_group_heads: BTreeMap<u64, String>,
+    merge_group_enqueued_at: BTreeMap<u64, String>,
+    preemption_error: Option<String>,
 }
 
-type MergeQueueSnapshot = (bool, BTreeMap<u64, u64>, BTreeMap<u64, String>);
+type MergeQueueSnapshot = (
+    bool,
+    BTreeMap<u64, u64>,
+    BTreeMap<u64, String>,
+    BTreeMap<u64, String>,
+);
 
 #[derive(Clone, Debug, Serialize)]
 struct PrReport {
@@ -80,6 +97,8 @@ struct StewardLedger {
     #[serde(default)]
     transient_attempts: BTreeMap<String, u32>,
     #[serde(default)]
+    preemption_attempts: BTreeMap<String, u32>,
+    #[serde(default)]
     audit: Vec<LedgerAudit>,
 }
 
@@ -90,6 +109,22 @@ struct LedgerAudit {
     subject: String,
     action: String,
 }
+
+struct NonTerminalRun {
+    status: String,
+    jobs: Vec<StewardJob>,
+}
+
+struct CapacityRevalidation {
+    candidate: StewardRun,
+    front_enqueued_at: String,
+    front_jobs: Vec<StewardJob>,
+    current_pr_head: Option<String>,
+}
+
+const CANCEL_TERMINAL_WAIT: Duration = Duration::from_secs(15);
+const CANCEL_TERMINAL_POLL: Duration = Duration::from_secs(2);
+const PREEMPT_AFTER_SECS: i64 = 900;
 
 pub(super) fn steward_command<W: Write>(
     args: &StewardCommandArgs,
@@ -104,13 +139,27 @@ pub(super) fn steward_command<W: Write>(
         .ledger
         .clone()
         .unwrap_or_else(|| state_dir.join("merge-steward.json"));
+    let _ledger_lock = if args.apply {
+        Some(acquire_ledger_lock(&ledger_path)?)
+    } else {
+        None
+    };
     let mut ledger = load_ledger(&ledger_path)?;
     let mut reports = Vec::new();
     let mut unhealthy = false;
+    let mut remaining_preemptions = 1;
     for repo in repos {
         match observe_repo(actions, &repo, &args.base) {
             Ok(observation) => {
-                let (report, failed) = apply_repo_plan(actions, args, &observation, &mut ledger);
+                let (report, failed, planned_preemptions) = apply_repo_plan(
+                    actions,
+                    args,
+                    &observation,
+                    &ledger_path,
+                    &mut ledger,
+                    remaining_preemptions,
+                );
+                remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
                 unhealthy |= failed;
                 reports.push(report);
             }
@@ -131,14 +180,94 @@ pub(super) fn steward_command<W: Write>(
         }
     }
     if args.apply {
-        save_ledger(&ledger_path, &ledger)?;
+        persist_final_ledger(
+            &ledger_path,
+            &ledger,
+            &args.base,
+            &mut reports,
+            &mut unhealthy,
+        );
     }
-    render_report(stdout, json_output, args.apply, &reports)?;
+    render_report(stdout, json_output, args.apply, &ledger_path, &reports)?;
     Ok(if unhealthy {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn persist_final_ledger(
+    ledger_path: &Path,
+    ledger: &StewardLedger,
+    base: &str,
+    reports: &mut Vec<RepoReport>,
+    unhealthy: &mut bool,
+) {
+    let Err(error) = save_ledger(ledger_path, ledger) else {
+        return;
+    };
+    *unhealthy = true;
+    let message = format!("final steward ledger persistence failed: {}", error.message);
+    if let Some(report) = reports.first_mut() {
+        report.errors.push(message);
+    } else {
+        reports.push(RepoReport {
+            repo: "steward".to_owned(),
+            base: base.to_owned(),
+            allow_auto_merge: false,
+            merge_queue: false,
+            merge_path: "unreadable".to_owned(),
+            required_contexts: Vec::new(),
+            prs: Vec::new(),
+            cancellations: Vec::new(),
+            errors: vec![message],
+        });
+    }
+}
+
+fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            CliFailure::new(
+                1,
+                format!(
+                    "could not create steward state {}: {error}",
+                    parent.display()
+                ),
+            )
+        })?;
+    }
+    let lock_path = path.with_extension("json.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            CliFailure::new(
+                1,
+                format!(
+                    "could not open steward lock {}: {error}",
+                    lock_path.display()
+                ),
+            )
+        })?;
+    file.try_lock_exclusive().map_err(|error| {
+        let reason = if error.kind() == std::io::ErrorKind::WouldBlock {
+            "another steward apply pass is already running".to_owned()
+        } else {
+            error.to_string()
+        };
+        CliFailure::new(
+            1,
+            format!(
+                "could not lock steward state {}: {reason}",
+                lock_path.display()
+            ),
+        )
+    })?;
+    Ok(file)
 }
 
 fn resolve_repos(mut repos: Vec<String>, cwd: &Path) -> Result<Vec<String>, CliFailure> {
@@ -178,25 +307,69 @@ fn observe_repo(
         .get("allow_auto_merge")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let merge_method = if settings
+        .get("allow_merge_commit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Some("merge".to_owned())
+    } else if settings
+        .get("allow_squash_merge")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Some("squash".to_owned())
+    } else if settings
+        .get("allow_rebase_merge")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        Some("rebase".to_owned())
+    } else {
+        None
+    };
     let required_contexts = required_contexts(actions, repo, base)?;
-    let (merge_queue, queue_positions, merge_group_heads) =
+    let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
         merge_queue_snapshot(actions, repo, base)?;
     let prs = pull_requests(actions, repo, base, &queue_positions)?;
-    let runs = active_runs(actions, repo)?;
+    let mut runs = active_runs(actions, repo)?;
+    let front_head = queue_positions
+        .iter()
+        .min_by_key(|(_, position)| **position)
+        .and_then(|(number, _)| merge_group_heads.get(number))
+        .map(String::as_str);
+    let preemption_error = hydrate_preemption_jobs(actions, repo, front_head, &mut runs).err();
     Ok(RepoObservation {
         repo: repo.to_owned(),
+        base: base.to_owned(),
         allow_auto_merge,
         merge_queue,
+        merge_method,
         required_contexts,
         prs,
         runs,
         merge_group_heads,
+        merge_group_enqueued_at,
+        preemption_error,
     })
 }
 
 fn gh_json(actions: &GitHubActions, args: &[String], purpose: &str) -> Result<Value, String> {
     let raw = actions
         .run_gh(args)
+        .map_err(|error| format!("{purpose} failed: {error}"))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
+}
+
+fn gh_json_timeout(
+    actions: &GitHubActions,
+    args: &[String],
+    purpose: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let raw = actions
+        .run_gh_with_timeout(args, timeout)
         .map_err(|error| format!("{purpose} failed: {error}"))?;
     serde_json::from_str(&raw)
         .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
@@ -213,8 +386,15 @@ fn required_contexts(
     ];
     let raw = match actions.run_gh(&args) {
         Ok(raw) => raw,
-        Err(error) if is_private_free_entitlement(&error.to_string()) => return Ok(Vec::new()),
-        Err(error) if error.to_string().contains("HTTP 404") => return Ok(Vec::new()),
+        Err(error)
+            if is_private_free_entitlement(&error.to_string())
+                || is_admin_protection_denied(&error.to_string()) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) if error.to_string().contains("HTTP 404") => {
+            return required_contexts_from_evaluated_rules(actions, repo, base);
+        }
         Err(error) => return Err(format!("required-check policy read failed: {error}")),
     };
     let value: Value = serde_json::from_str(&raw)
@@ -235,6 +415,54 @@ fn required_contexts(
                 .map(str::to_owned)
         }));
     }
+    contexts.extend(required_contexts_from_evaluated_rules(actions, repo, base)?);
+    contexts.sort();
+    contexts.dedup();
+    Ok(contexts)
+}
+
+fn required_contexts_from_evaluated_rules(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+) -> Result<Vec<String>, String> {
+    let value = gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/rules/branches/{base}"),
+            "--paginate".to_owned(),
+            "--slurp".to_owned(),
+        ],
+        "evaluated branch rules",
+    )?;
+    evaluated_required_contexts(&value)
+}
+
+fn evaluated_required_contexts(value: &Value) -> Result<Vec<String>, String> {
+    let pages = value
+        .as_array()
+        .ok_or_else(|| "evaluated branch rules was not an array".to_owned())?;
+    let rules = if pages.iter().all(Value::is_array) {
+        pages
+            .iter()
+            .flat_map(|page| page.as_array().into_iter().flatten())
+            .collect::<Vec<_>>()
+    } else {
+        pages.iter().collect()
+    };
+    let mut contexts = rules
+        .iter()
+        .filter(|rule| rule.get("type").and_then(Value::as_str) == Some("required_status_checks"))
+        .flat_map(|rule| {
+            rule.pointer("/parameters/required_status_checks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|check| check.get("context").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     contexts.sort();
     contexts.dedup();
     Ok(contexts)
@@ -248,7 +476,7 @@ fn merge_queue_snapshot(
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
-    let query = "query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position headCommit{oid} pullRequest{number}} pageInfo{hasNextPage}}}}}";
+    let query = "query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage}}}}}";
     let args = vec![
         "api".to_owned(),
         "graphql".to_owned(),
@@ -264,7 +492,7 @@ fn merge_queue_snapshot(
     let value = match gh_json(actions, &args, "merge-queue policy") {
         Ok(value) => value,
         Err(error) if is_private_free_entitlement(&error) => {
-            return Ok((false, BTreeMap::new(), BTreeMap::new()));
+            return Ok((false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
         }
         Err(error) => return Err(error),
     };
@@ -275,7 +503,7 @@ fn merge_queue_snapshot(
     {
         let text = value.to_string();
         if is_private_free_entitlement(&text) {
-            return Ok((false, BTreeMap::new(), BTreeMap::new()));
+            return Ok((false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
         }
         return Err(format!("merge-queue GraphQL errors: {text}"));
     }
@@ -283,7 +511,7 @@ fn merge_queue_snapshot(
         return Err("merge-queue response missing repository.mergeQueue".to_owned());
     };
     if queue.is_null() {
-        return Ok((false, BTreeMap::new(), BTreeMap::new()));
+        return Ok((false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
     }
     if queue
         .pointer("/entries/pageInfo/hasNextPage")
@@ -298,6 +526,7 @@ fn merge_queue_snapshot(
         .ok_or_else(|| "merge-queue response missing entries.nodes".to_owned())?;
     let mut positions = BTreeMap::new();
     let mut heads = BTreeMap::new();
+    let mut enqueued = BTreeMap::new();
     for node in nodes {
         let Some(number) = node.pointer("/pullRequest/number").and_then(Value::as_u64) else {
             return Err("merge-queue entry missing PR number".to_owned());
@@ -306,6 +535,10 @@ fn merge_queue_snapshot(
             return Err(format!("merge-queue PR #{number} missing position"));
         };
         positions.insert(number, position);
+        let Some(enqueued_at) = node.get("enqueuedAt").and_then(Value::as_str) else {
+            return Err(format!("merge-queue PR #{number} missing enqueuedAt"));
+        };
+        enqueued.insert(number, enqueued_at.to_owned());
         if let Some(head) = node
             .pointer("/headCommit/oid")
             .and_then(Value::as_str)
@@ -314,7 +547,7 @@ fn merge_queue_snapshot(
             heads.insert(number, head.to_owned());
         }
     }
-    Ok((true, positions, heads))
+    Ok((true, positions, heads, enqueued))
 }
 
 fn pull_requests(
@@ -458,7 +691,7 @@ fn run_id_from_url(url: &str) -> Option<u64> {
 
 fn active_runs(actions: &GitHubActions, repo: &str) -> Result<Vec<StewardRun>, String> {
     let mut all = Vec::new();
-    for status in ["queued", "in_progress"] {
+    for status in ["queued", "waiting", "pending", "requested", "in_progress"] {
         for page in 1..=10 {
             let value = gh_json(
                 actions,
@@ -482,18 +715,157 @@ fn active_runs(actions: &GitHubActions, repo: &str) -> Result<Vec<StewardRun>, S
             }
         }
     }
+    all.sort_unstable_by_key(|run| run.id);
+    all.dedup_by_key(|run| run.id);
     Ok(all)
 }
 
 fn parse_run(value: &Value) -> Option<StewardRun> {
+    let pull_request_number = value
+        .get("pull_requests")
+        .and_then(Value::as_array)
+        .filter(|pull_requests| pull_requests.len() == 1)
+        .and_then(|pull_requests| pull_requests[0].get("number"))
+        .and_then(Value::as_u64);
     Some(StewardRun {
         id: value.get("id")?.as_u64()?,
         workflow_id: value.get("workflow_id")?.as_u64()?,
+        workflow: value.get("name")?.as_str()?.to_owned(),
         head_sha: value.get("head_sha")?.as_str()?.to_owned(),
         head_branch: value.get("head_branch")?.as_str()?.to_owned(),
         status: value.get("status")?.as_str()?.to_owned(),
         event: value.get("event")?.as_str()?.to_owned(),
+        pull_request_number,
         created_at: value.get("created_at")?.as_str()?.to_owned(),
+        jobs: Vec::new(),
+    })
+}
+
+fn hydrate_preemption_jobs(
+    actions: &GitHubActions,
+    repo: &str,
+    front_head: Option<&str>,
+    runs: &mut [StewardRun],
+) -> Result<(), String> {
+    let Some(front_head) = front_head else {
+        return Ok(());
+    };
+    for run in runs {
+        let is_front_candidate =
+            run.event == "merge_group" && front_head.eq_ignore_ascii_case(&run.head_sha);
+        let is_preemption_candidate = run.event == "pull_request"
+            && run.status.eq_ignore_ascii_case("in_progress")
+            && is_capacity_preemption_workflow(&run.workflow);
+        if is_front_candidate || is_preemption_candidate {
+            run.jobs = fetch_run_jobs(actions, repo, run.id)?;
+        }
+    }
+    Ok(())
+}
+
+fn fetch_run_jobs(
+    actions: &GitHubActions,
+    repo: &str,
+    run_id: u64,
+) -> Result<Vec<StewardJob>, String> {
+    let mut all = Vec::new();
+    for page in 1..=10 {
+        let value = gh_json(
+            actions,
+            &[
+                "api".to_owned(),
+                format!(
+                    "repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}"
+                ),
+            ],
+            "workflow jobs",
+        )?;
+        let rows = value
+            .get("jobs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("workflow run {run_id} response missing jobs"))?;
+        let count = rows.len();
+        for row in rows {
+            all.push(parse_job(row)?);
+        }
+        if count < 100 {
+            return Ok(all);
+        }
+    }
+    Err(format!(
+        "workflow run {run_id} exceeds 1000 jobs; refusing partial scan"
+    ))
+}
+
+fn fetch_run_jobs_before(
+    actions: &GitHubActions,
+    repo: &str,
+    run_id: u64,
+    deadline: Instant,
+) -> Result<Vec<StewardJob>, String> {
+    let mut all = Vec::new();
+    for page in 1..=10 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("workflow run {run_id} job fetch timed out"));
+        }
+        let value = gh_json_timeout(
+            actions,
+            &[
+                "api".to_owned(),
+                format!(
+                    "repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}"
+                ),
+            ],
+            "workflow jobs",
+            remaining,
+        )?;
+        let rows = value
+            .get("jobs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("workflow run {run_id} response missing jobs"))?;
+        let count = rows.len();
+        for row in rows {
+            all.push(parse_job(row)?);
+        }
+        if count < 100 {
+            return Ok(all);
+        }
+    }
+    Err(format!(
+        "workflow run {run_id} exceeds 1000 jobs; refusing partial scan"
+    ))
+}
+
+fn parse_job(value: &Value) -> Result<StewardJob, String> {
+    Ok(StewardJob {
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "workflow job missing name".to_owned())?
+            .to_owned(),
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "workflow job missing status".to_owned())?
+            .to_owned(),
+        conclusion: value
+            .get("conclusion")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        labels: value
+            .get("labels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        runner_name: value
+            .get("runner_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -501,8 +873,10 @@ fn apply_repo_plan(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
     observation: &RepoObservation,
+    ledger_path: &Path,
     ledger: &mut StewardLedger,
-) -> (RepoReport, bool) {
+    remaining_preemptions: usize,
+) -> (RepoReport, bool, usize) {
     let policy = StewardPolicy {
         merge_queue: observation.merge_queue,
         native_auto_merge: observation.allow_auto_merge,
@@ -510,54 +884,59 @@ fn apply_repo_plan(
         opt_out_label: args.opt_out_label.clone(),
         max_transient_reruns: args.max_transient_reruns,
     };
-    let mut unhealthy = false;
-    let mut reports = Vec::new();
-    for pr in &observation.prs {
-        let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
-        let decision = classify_pr(&pr.fact, &policy, &attempts);
+    let (reports, pr_mutation_failed) =
+        apply_pr_plans(actions, args, observation, &policy, ledger_path, ledger);
+    let mut unhealthy = observation.preemption_error.is_some() || pr_mutation_failed;
+    let mut planned_cancellations = Vec::new();
+    if args.coalesce {
+        let current_heads = current_pull_request_heads(&observation.prs);
+        let opted_out = opted_out_pull_requests(&observation.prs, &args.opt_out_label);
+        planned_cancellations.extend(plan_run_coalescing(
+            &observation.runs,
+            &current_heads,
+            &observation.merge_group_heads,
+            &opted_out,
+        ));
+    }
+    planned_cancellations.extend(plan_repo_capacity_preemptions(
+        args,
+        observation,
+        ledger,
+        remaining_preemptions,
+    ));
+    let capacity_preemptions_planned = planned_cancellations
+        .iter()
+        .filter(|cancellation| {
+            matches!(
+                cancellation.reason,
+                RunCancellationReason::AdvisoryPreambleCapacityTheft
+                    | RunCancellationReason::LowerPriorityBranchPreamble
+            )
+        })
+        .count();
+    let mut cancellations = Vec::new();
+    for cancellation in planned_cancellations {
         let (mutation, error) = if args.apply {
-            mutate_pr(actions, observation, pr, &decision, ledger)
+            apply_run_cancellation(
+                actions,
+                observation,
+                &cancellation,
+                &args.opt_out_label,
+                ledger_path,
+                ledger,
+            )
         } else {
             (None, None)
         };
         if error.is_some() {
             unhealthy = true;
         }
-        reports.push(PrReport {
-            number: pr.fact.number,
-            head_sha: pr.fact.head_sha.clone(),
-            decision,
+        cancellations.push(CancellationReport {
+            run_id: cancellation.run_id,
+            reason: cancellation_reason_label(cancellation.reason),
             mutation,
             error,
         });
-    }
-    let mut cancellations = Vec::new();
-    if args.coalesce {
-        let current_heads = observation
-            .prs
-            .iter()
-            .map(|pr| (pr.fact.head_branch.clone(), pr.fact.head_sha.clone()))
-            .collect();
-        for cancellation in plan_run_coalescing(
-            &observation.runs,
-            &current_heads,
-            &observation.merge_group_heads,
-        ) {
-            let (mutation, error) = if args.apply {
-                apply_run_cancellation(actions, observation, &cancellation, ledger)
-            } else {
-                (None, None)
-            };
-            if error.is_some() {
-                unhealthy = true;
-            }
-            cancellations.push(CancellationReport {
-                run_id: cancellation.run_id,
-                reason: format!("{:?}", cancellation.reason).to_ascii_lowercase(),
-                mutation,
-                error,
-            });
-        }
     }
     (
         RepoReport {
@@ -573,29 +952,172 @@ fn apply_repo_plan(
             required_contexts: observation.required_contexts.clone(),
             prs: reports,
             cancellations,
-            errors: Vec::new(),
+            errors: observation.preemption_error.iter().cloned().collect(),
         },
         unhealthy,
+        capacity_preemptions_planned,
     )
+}
+
+fn apply_pr_plans(
+    actions: &GitHubActions,
+    args: &StewardCommandArgs,
+    observation: &RepoObservation,
+    policy: &StewardPolicy,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+) -> (Vec<PrReport>, bool) {
+    let mut unhealthy = false;
+    let reports = observation
+        .prs
+        .iter()
+        .map(|pr| {
+            let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
+            let decision = classify_pr(&pr.fact, policy, &attempts);
+            let (mutation, error) = if args.apply {
+                mutate_pr(
+                    actions,
+                    observation,
+                    pr,
+                    policy,
+                    &decision,
+                    ledger_path,
+                    ledger,
+                )
+            } else {
+                (None, None)
+            };
+            unhealthy |= error.is_some();
+            PrReport {
+                number: pr.fact.number,
+                head_sha: pr.fact.head_sha.clone(),
+                decision,
+                mutation,
+                error,
+            }
+        })
+        .collect();
+    (reports, unhealthy)
+}
+
+fn plan_repo_capacity_preemptions(
+    args: &StewardCommandArgs,
+    observation: &RepoObservation,
+    ledger: &StewardLedger,
+    remaining_preemptions: usize,
+) -> Vec<RunCancellation> {
+    if !args.preempt_capacity
+        || args.max_preemptions_per_head == 0
+        || observation.preemption_error.is_some()
+    {
+        return Vec::new();
+    }
+    let Some(pressure) = queue_front_pressure(observation) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}:", observation.repo);
+    let attempted = ledger
+        .preemption_attempts
+        .iter()
+        .filter(|(_, count)| **count >= args.max_preemptions_per_head)
+        .filter_map(|(key, _)| key.strip_prefix(&prefix).map(str::to_owned))
+        .collect();
+    let current_heads = current_pull_request_heads(&observation.prs);
+    let opted_out = opted_out_pull_requests(&observation.prs, &args.opt_out_label);
+    plan_capacity_preemptions(
+        &observation.runs,
+        &current_heads,
+        &opted_out,
+        &pressure,
+        &attempted,
+        remaining_preemptions,
+    )
+}
+
+fn cancellation_reason_label(reason: RunCancellationReason) -> String {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{reason:?}").to_ascii_lowercase())
+}
+
+fn queue_front_pressure(observation: &RepoObservation) -> Option<QueueFrontPressure> {
+    let front = queue_front_pr(observation)?;
+    let head_sha = observation
+        .merge_group_heads
+        .get(&front.fact.number)?
+        .to_owned();
+    let enqueued_at = observation
+        .merge_group_enqueued_at
+        .get(&front.fact.number)?;
+    Some(QueueFrontPressure {
+        head_sha,
+        old_enough: timestamp_old_enough(enqueued_at),
+    })
+}
+
+fn queue_front_head(observation: &RepoObservation) -> Option<&str> {
+    let front = queue_front_pr(observation)?;
+    observation
+        .merge_group_heads
+        .get(&front.fact.number)
+        .map(String::as_str)
+}
+
+fn queue_front_pr(observation: &RepoObservation) -> Option<&ObservedPr> {
+    Some(
+        observation
+            .prs
+            .iter()
+            .filter_map(|pr| pr.fact.queue_position.map(|position| (position, pr)))
+            .min_by_key(|(position, _)| *position)?
+            .1,
+    )
+}
+
+fn timestamp_old_enough(timestamp: &str) -> bool {
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .is_some_and(|created| {
+            (Utc::now() - created.with_timezone(&Utc)).num_seconds() >= PREEMPT_AFTER_SECS
+        })
 }
 
 fn apply_run_cancellation(
     actions: &GitHubActions,
     observation: &RepoObservation,
     cancellation: &RunCancellation,
+    opt_out_label: &str,
+    ledger_path: &Path,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
-    let expected_head = observation
+    if matches!(
+        cancellation.reason,
+        RunCancellationReason::AdvisoryPreambleCapacityTheft
+            | RunCancellationReason::LowerPriorityBranchPreamble
+    ) {
+        return apply_capacity_preemption(
+            actions,
+            observation,
+            cancellation,
+            opt_out_label,
+            ledger_path,
+            ledger,
+        );
+    }
+    let Some(observed) = observation
         .runs
         .iter()
         .find(|run| run.id == cancellation.run_id)
-        .map(|run| run.head_sha.as_str())
-        .unwrap_or_default();
-    match revalidate_queued_run(
+    else {
+        return (None, Some("planned run observation disappeared".to_owned()));
+    };
+    match revalidate_coalescing_cancellation(
         actions,
-        &observation.repo,
-        cancellation.run_id,
-        expected_head,
+        observation,
+        observed,
+        cancellation,
+        opt_out_label,
     ) {
         Ok(false) => (Some("skipped_after_live_revalidation".to_owned()), None),
         Ok(true) => match actions.cancel_workflow_run(&observation.repo, cancellation.run_id) {
@@ -614,30 +1136,645 @@ fn apply_run_cancellation(
     }
 }
 
-fn revalidate_queued_run(
+fn apply_capacity_preemption(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    cancellation: &RunCancellation,
+    opt_out_label: &str,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    let Some(observed) = observation
+        .runs
+        .iter()
+        .find(|run| run.id == cancellation.run_id)
+    else {
+        return (None, Some("planned run observation disappeared".to_owned()));
+    };
+    let Some(expected_front) = queue_front_head(observation) else {
+        return (Some("skipped_after_front_revalidation".to_owned()), None);
+    };
+    let key = format!("{}:{}", observation.repo, preemption_key(observed));
+    *ledger.preemption_attempts.entry(key).or_default() += 1;
+    record_audit(
+        ledger,
+        &observation.repo,
+        &format!(
+            "front:{expected_front}:capacity-run:{}:{}",
+            cancellation.run_id, observed.head_sha
+        ),
+        &format!("capacity_preemption_started:{:?}", cancellation.reason),
+    );
+    if let Err(error) = save_ledger(ledger_path, ledger) {
+        return (
+            None,
+            Some(format!(
+                "could not persist preemption intent: {}",
+                error.message
+            )),
+        );
+    }
+    // The one full live proof is fetched after the write-ahead intent. Persist
+    // that exact proof durably before issuing the irreversible cancellation.
+    let cancel_live = match revalidate_capacity_preemption(
+        actions,
+        observation,
+        cancellation,
+        observed,
+        expected_front,
+        opt_out_label,
+    ) {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => {
+            return (
+                Some("skipped_after_precancel_revalidation".to_owned()),
+                None,
+            );
+        }
+        Err(error) => return (None, Some(error)),
+    };
+    if let Err(error) = persist_capacity_evidence(
+        observation,
+        cancellation,
+        expected_front,
+        &cancel_live,
+        ledger_path,
+        ledger,
+    ) {
+        return (None, Some(error));
+    }
+    match actions.cancel_workflow_run(&observation.repo, cancellation.run_id) {
+        Ok(()) => complete_capacity_cancellation(
+            actions,
+            observation,
+            cancellation,
+            expected_front,
+            &cancel_live.candidate,
+            ledger_path,
+            ledger,
+        ),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+fn persist_capacity_evidence(
+    observation: &RepoObservation,
+    cancellation: &RunCancellation,
+    expected_front: &str,
+    evidence: &CapacityRevalidation,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+) -> Result<(), String> {
+    let final_evidence = serde_json::json!({
+        "front_head": expected_front,
+        "front_enqueued_at": evidence.front_enqueued_at,
+        "front_jobs": evidence.front_jobs,
+        "candidate_run": evidence.candidate.id,
+        "candidate_head": evidence.candidate.head_sha,
+        "candidate_jobs": evidence.candidate.jobs,
+        "current_pr_head": evidence.current_pr_head,
+    });
+    record_audit(
+        ledger,
+        &observation.repo,
+        &format!("capacity-run:{}", cancellation.run_id),
+        &format!("capacity_preemption_precancel_evidence:{final_evidence}"),
+    );
+    save_ledger(ledger_path, ledger).map_err(|error| {
+        format!(
+            "could not persist final preemption evidence: {}",
+            error.message
+        )
+    })
+}
+
+fn complete_capacity_cancellation(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    cancellation: &RunCancellation,
+    expected_front: &str,
+    final_live: &StewardRun,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    record_audit(
+        ledger,
+        &observation.repo,
+        &format!(
+            "front:{expected_front}:capacity-run:{}:{}",
+            cancellation.run_id, final_live.head_sha
+        ),
+        &format!("capacity_preemption_accepted:{:?}", cancellation.reason),
+    );
+    if let Err(error) = save_ledger(ledger_path, ledger) {
+        return (
+            Some("cancelled_after_job_revalidation".to_owned()),
+            Some(format!(
+                "cancel accepted but completion audit failed: {}",
+                error.message
+            )),
+        );
+    }
+    match wait_for_run_terminalization(actions, &observation.repo, cancellation.run_id) {
+        Ok(None) => {
+            record_audit(
+                ledger,
+                &observation.repo,
+                &format!("capacity-run:{}", cancellation.run_id),
+                "capacity_preemption_terminalized",
+            );
+            if let Err(error) = save_ledger(ledger_path, ledger) {
+                return (
+                    Some("cancelled_terminal".to_owned()),
+                    Some(format!(
+                        "cancel terminalized but completion audit failed: {}",
+                        error.message
+                    )),
+                );
+            }
+            (Some("cancelled_terminal".to_owned()), None)
+        }
+        Ok(Some(active)) => force_cancel_nonterminal_run(
+            actions,
+            observation,
+            cancellation.run_id,
+            &active,
+            ledger_path,
+            ledger,
+        ),
+        Err(error) => {
+            record_audit(
+                ledger,
+                &observation.repo,
+                &format!("capacity-run:{}", cancellation.run_id),
+                "cancel_terminalization_unreadable",
+            );
+            let _ = save_ledger(ledger_path, ledger);
+            (
+                Some("cancel_terminalization_unreadable".to_owned()),
+                Some(format!(
+                    "cancel accepted but terminalization could not be verified: {error}"
+                )),
+            )
+        }
+    }
+}
+
+fn force_cancel_nonterminal_run(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    run_id: u64,
+    active: &NonTerminalRun,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    let targets = active_runner_targets(&active.jobs);
+    if let Err(error) = persist_force_cancel_intent(
+        ledger,
+        ledger_path,
+        &observation.repo,
+        run_id,
+        &active.status,
+        &targets,
+    ) {
+        return (
+            Some("cancel_not_terminal".to_owned()),
+            Some(format!(
+                "cancel_not_terminal run {run_id} active={targets}; force-cancel intent persistence failed: {}",
+                error.message
+            )),
+        );
+    }
+    if let Err(error) = actions.force_cancel_workflow_run(&observation.repo, run_id) {
+        audit_force_cancel_failure(ledger, ledger_path, &observation.repo, run_id);
+        return (
+            Some("cancel_not_terminal".to_owned()),
+            Some(format!(
+                "cancel_not_terminal run {run_id} active={targets}; exact force-cancel failed: {error}"
+            )),
+        );
+    }
+    record_audit(
+        ledger,
+        &observation.repo,
+        &format!("capacity-run:{run_id}"),
+        "force_cancel_accepted",
+    );
+    if let Err(error) = save_ledger(ledger_path, ledger) {
+        return (
+            Some("force_cancel_accepted_unverified".to_owned()),
+            Some(format!(
+                "force-cancel accepted for run {run_id}, but audit persistence failed: {}",
+                error.message
+            )),
+        );
+    }
+    match wait_for_run_terminalization(actions, &observation.repo, run_id) {
+        Ok(None) => {
+            record_audit(
+                ledger,
+                &observation.repo,
+                &format!("capacity-run:{run_id}"),
+                "force_cancel_terminalized",
+            );
+            match save_ledger(ledger_path, ledger) {
+                Ok(()) => (Some("force_cancelled_terminal".to_owned()), None),
+                Err(error) => (
+                    Some("force_cancelled_terminal".to_owned()),
+                    Some(format!(
+                        "force-cancel terminalized run {run_id}, but audit persistence failed: {}",
+                        error.message
+                    )),
+                ),
+            }
+        }
+        Ok(Some(still_active)) => {
+            let still_targets = active_runner_targets(&still_active.jobs);
+            record_audit(
+                ledger,
+                &observation.repo,
+                &format!("capacity-run:{run_id}"),
+                &format!("force_cancel_not_terminal:targets={still_targets}"),
+            );
+            let _ = save_ledger(ledger_path, ledger);
+            (
+                Some("force_cancel_not_terminal".to_owned()),
+                Some(format!(
+                    "force_cancel_not_terminal run {run_id} active={still_targets}; exact-host, exact-run recycle handoff required"
+                )),
+            )
+        }
+        Err(error) => {
+            record_audit(
+                ledger,
+                &observation.repo,
+                &format!("capacity-run:{run_id}"),
+                "force_cancel_terminalization_unreadable",
+            );
+            let audit_error = save_ledger(ledger_path, ledger).err();
+            (
+                Some("force_cancel_terminalization_unreadable".to_owned()),
+                Some(format!(
+                    "force-cancel accepted for run {run_id}, but terminalization is unreadable: {error}{}",
+                    audit_error.map_or_else(String::new, |save_error| format!(
+                        "; audit persistence also failed: {}",
+                        save_error.message
+                    ))
+                )),
+            )
+        }
+    }
+}
+
+fn audit_force_cancel_failure(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    repo: &str,
+    run_id: u64,
+) {
+    record_audit(
+        ledger,
+        repo,
+        &format!("capacity-run:{run_id}"),
+        "force_cancel_failed",
+    );
+    let _ = save_ledger(ledger_path, ledger);
+}
+
+fn persist_force_cancel_intent(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    repo: &str,
+    run_id: u64,
+    status: &str,
+    targets: &str,
+) -> Result<(), CliFailure> {
+    record_audit(
+        ledger,
+        repo,
+        &format!("capacity-run:{run_id}"),
+        &format!("cancel_not_terminal:status={status}:targets={targets};force_cancel_intent"),
+    );
+    save_ledger(ledger_path, ledger)
+}
+
+fn wait_for_run_terminalization(
     actions: &GitHubActions,
     repo: &str,
     run_id: u64,
-    expected_head: &str,
+) -> Result<Option<NonTerminalRun>, String> {
+    let deadline = Instant::now() + CANCEL_TERMINAL_WAIT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "cancel terminalization for run {run_id} reached its deadline"
+            ));
+        }
+        let value = gh_json_timeout(
+            actions,
+            &[
+                "api".to_owned(),
+                format!("repos/{repo}/actions/runs/{run_id}"),
+            ],
+            "cancel terminalization",
+            remaining,
+        )?;
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "cancel terminalization response missing status".to_owned())?
+            .to_owned();
+        let jobs = fetch_run_jobs_before(actions, repo, run_id, deadline)?;
+        let active_jobs = jobs
+            .into_iter()
+            .filter(|job| {
+                matches!(
+                    job.status.as_str(),
+                    "queued" | "waiting" | "pending" | "requested" | "in_progress"
+                )
+            })
+            .collect::<Vec<_>>();
+        if status == "completed" && active_jobs.is_empty() {
+            return Ok(None);
+        }
+        if Instant::now() + CANCEL_TERMINAL_POLL >= deadline {
+            return Ok(Some(NonTerminalRun {
+                status,
+                jobs: active_jobs,
+            }));
+        }
+        thread::sleep(CANCEL_TERMINAL_POLL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn active_runner_targets(jobs: &[StewardJob]) -> String {
+    if jobs.is_empty() {
+        return "workflow-status-only".to_owned();
+    }
+    jobs.iter()
+        .map(|job| {
+            format!(
+                "{}@{}",
+                job.name,
+                job.runner_name.as_deref().unwrap_or("unassigned")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn revalidate_capacity_preemption(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    cancellation: &RunCancellation,
+    observed: &StewardRun,
+    expected_front: &str,
+    opt_out_label: &str,
+) -> Result<Option<CapacityRevalidation>, String> {
+    let front_enqueued_at = match live_queue_front(actions, &observation.repo, &observation.base)? {
+        Some((live_front, enqueued_at))
+            if live_front.eq_ignore_ascii_case(expected_front)
+                && timestamp_old_enough(&enqueued_at) =>
+        {
+            enqueued_at
+        }
+        _ => return Ok(None),
+    };
+    let Some(front_jobs) = live_queue_front_pool_jobs(actions, &observation.repo, expected_front)?
+    else {
+        return Ok(None);
+    };
+    let value = gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!(
+                "repos/{}/actions/runs/{}",
+                observation.repo, cancellation.run_id
+            ),
+        ],
+        "capacity-preemption run revalidation",
+    )?;
+    let mut live =
+        parse_run(&value).ok_or_else(|| "live capacity-preemption run was malformed".to_owned())?;
+    if !live.head_sha.eq_ignore_ascii_case(&observed.head_sha)
+        || live.workflow_id != observed.workflow_id
+    {
+        return Ok(None);
+    }
+    live.jobs = fetch_run_jobs(actions, &observation.repo, cancellation.run_id)?;
+    let candidate_pr_number = live
+        .pull_request_number
+        .ok_or_else(|| "capacity-preemption run no longer has a unique PR".to_owned())?;
+    let Some(candidate_pr) = pull_request(
+        actions,
+        &observation.repo,
+        candidate_pr_number,
+        &BTreeMap::new(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let (mut all_current_heads, mut opted_out) = live_current_pull_request_state(
+        actions,
+        &observation.repo,
+        &observation.base,
+        opt_out_label,
+    )?;
+    all_current_heads.insert(candidate_pr.fact.number, candidate_pr.fact.head_sha.clone());
+    if pull_request_opted_out(&candidate_pr, opt_out_label) {
+        opted_out.insert(candidate_pr.fact.number);
+    }
+    let current_heads = if matches!(
+        cancellation.reason,
+        RunCancellationReason::LowerPriorityBranchPreamble
+    ) {
+        all_current_heads.clone()
+    } else {
+        BTreeMap::new()
+    };
+    if !is_safe_capacity_preemption(&live, &current_heads, &opted_out, cancellation.reason) {
+        return Ok(None);
+    }
+    let current_pr_head = live
+        .pull_request_number
+        .and_then(|number| all_current_heads.get(&number).cloned());
+    Ok(Some(CapacityRevalidation {
+        candidate: live,
+        front_enqueued_at,
+        front_jobs,
+        current_pr_head,
+    }))
+}
+
+fn live_current_pull_request_state(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    opt_out_label: &str,
+) -> Result<(BTreeMap<u64, String>, BTreeSet<u64>), String> {
+    let prs = pull_requests(actions, repo, base, &BTreeMap::new())?;
+    Ok((
+        current_pull_request_heads(&prs),
+        opted_out_pull_requests(&prs, opt_out_label),
+    ))
+}
+
+fn pull_request(
+    actions: &GitHubActions,
+    repo: &str,
+    number: u64,
+    queue_positions: &BTreeMap<u64, u64>,
+) -> Result<Option<ObservedPr>, String> {
+    let value = gh_json(
+        actions,
+        &[
+            "pr".to_owned(),
+            "view".to_owned(),
+            number.to_string(),
+            "--repo".to_owned(),
+            repo.to_owned(),
+            "--json".to_owned(),
+            "id,number,state,isDraft,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
+        ],
+        "capacity-preemption candidate PR",
+    )?;
+    if value.get("state").and_then(Value::as_str) != Some("OPEN") {
+        return Ok(None);
+    }
+    parse_pr(&value, queue_positions).map(Some)
+}
+
+fn current_pull_request_heads(prs: &[ObservedPr]) -> BTreeMap<u64, String> {
+    prs.iter()
+        .map(|pr| (pr.fact.number, pr.fact.head_sha.clone()))
+        .collect()
+}
+
+fn opted_out_pull_requests(prs: &[ObservedPr], opt_out_label: &str) -> BTreeSet<u64> {
+    prs.iter()
+        .filter(|pr| pull_request_opted_out(pr, opt_out_label))
+        .map(|pr| pr.fact.number)
+        .collect()
+}
+
+fn pull_request_opted_out(pr: &ObservedPr, opt_out_label: &str) -> bool {
+    pr.fact
+        .labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(opt_out_label))
+}
+
+fn live_queue_front_pool_jobs(
+    actions: &GitHubActions,
+    repo: &str,
+    expected_front: &str,
+) -> Result<Option<Vec<StewardJob>>, String> {
+    let mut runs = active_runs(actions, repo)?;
+    for run in &mut runs {
+        if run.event == "merge_group" && run.head_sha.eq_ignore_ascii_case(expected_front) {
+            run.jobs = fetch_run_jobs(actions, repo, run.id)?;
+        }
+    }
+    if !queue_front_waits_for_pool(&runs, expected_front) {
+        return Ok(None);
+    }
+    Ok(Some(
+        runs.into_iter()
+            .filter(|run| {
+                run.event == "merge_group" && run.head_sha.eq_ignore_ascii_case(expected_front)
+            })
+            .flat_map(|run| run.jobs)
+            .collect(),
+    ))
+}
+
+fn live_queue_front(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+) -> Result<Option<(String, String)>, String> {
+    let (enabled, positions, heads, enqueued) = merge_queue_snapshot(actions, repo, base)?;
+    if !enabled {
+        return Ok(None);
+    }
+    Ok(positions
+        .iter()
+        .min_by_key(|(_, position)| **position)
+        .and_then(|(number, _)| Some((heads.get(number)?.clone(), enqueued.get(number)?.clone()))))
+}
+
+fn revalidate_coalescing_cancellation(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    observed: &StewardRun,
+    cancellation: &RunCancellation,
+    opt_out_label: &str,
 ) -> Result<bool, String> {
-    if !is_full_sha(expected_head) {
+    if !is_full_sha(&observed.head_sha) {
+        return Ok(false);
+    }
+    let Some(pr_number) = observed
+        .pull_request_number
+        .or_else(|| merge_group_pr_number(observed))
+    else {
+        return Ok(false);
+    };
+    let Some(candidate_pr) = pull_request(actions, &observation.repo, pr_number, &BTreeMap::new())?
+    else {
+        return Ok(false);
+    };
+    if pull_request_opted_out(&candidate_pr, opt_out_label) {
+        return Ok(false);
+    }
+    let mut current_heads = BTreeMap::new();
+    current_heads.insert(pr_number, candidate_pr.fact.head_sha);
+    let (_, _, merge_group_heads, _) =
+        merge_queue_snapshot(actions, &observation.repo, &observation.base)?;
+    let live_runs = active_runs(actions, &observation.repo)?;
+    let opted_out = BTreeSet::new();
+    let reason_reproved =
+        plan_run_coalescing(&live_runs, &current_heads, &merge_group_heads, &opted_out)
+            .iter()
+            .any(|planned| {
+                planned.run_id == cancellation.run_id && planned.reason == cancellation.reason
+            });
+    if !reason_reproved {
         return Ok(false);
     }
     let value = gh_json(
         actions,
         &[
             "api".to_owned(),
-            format!("repos/{repo}/actions/runs/{run_id}"),
+            format!(
+                "repos/{}/actions/runs/{}",
+                observation.repo, cancellation.run_id
+            ),
         ],
-        "queued-run revalidation",
+        "coalescing exact-run revalidation",
     )?;
-    Ok(
-        value.get("status").and_then(Value::as_str) == Some("queued")
-            && value
-                .get("head_sha")
-                .and_then(Value::as_str)
-                .is_some_and(|head| head.eq_ignore_ascii_case(expected_head)),
-    )
+    let Some(exact) = parse_run(&value) else {
+        return Ok(false);
+    };
+    Ok(exact.status.eq_ignore_ascii_case("queued")
+        && exact.workflow_id == observed.workflow_id
+        && exact.event == observed.event
+        && exact.head_sha.eq_ignore_ascii_case(&observed.head_sha)
+        && exact
+            .pull_request_number
+            .or_else(|| merge_group_pr_number(&exact))
+            == Some(pr_number))
+}
+
+fn merge_group_pr_number(run: &StewardRun) -> Option<u64> {
+    if run.event != "merge_group" {
+        return None;
+    }
+    run.head_branch
+        .split_once("/pr-")
+        .and_then(|(_, suffix)| suffix.split('-').next())
+        .and_then(|number| number.parse().ok())
 }
 
 fn attempts_for(ledger: &StewardLedger, repo: &str, pr: &StewardPullRequest) -> BTreeMap<u64, u32> {
@@ -658,36 +1795,40 @@ fn mutate_pr(
     actions: &GitHubActions,
     observation: &RepoObservation,
     pr: &ObservedPr,
+    policy: &StewardPolicy,
     decision: &StewardDecision,
+    ledger_path: &Path,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
+    if !matches!(
+        decision,
+        StewardDecision::ArmMergeQueue
+            | StewardDecision::ExactHeadMerge
+            | StewardDecision::RerunTransient { .. }
+    ) {
+        return (None, None);
+    }
+    let queue_positions = match merge_queue_snapshot(actions, &observation.repo, &observation.base)
+    {
+        Ok((_, positions, _, _)) => positions,
+        Err(error) => return (None, Some(error)),
+    };
+    let live_pr = match pull_request(actions, &observation.repo, pr.fact.number, &queue_positions) {
+        Ok(Some(live_pr)) => live_pr,
+        Ok(None) => return (Some("skipped_after_live_revalidation".to_owned()), None),
+        Err(error) => return (None, Some(error)),
+    };
+    let attempts = attempts_for(ledger, &observation.repo, &live_pr.fact);
+    if classify_pr(&live_pr.fact, policy, &attempts) != *decision {
+        return (Some("skipped_after_live_revalidation".to_owned()), None);
+    }
+    let pr = &live_pr;
     match decision {
-        StewardDecision::ArmMergeQueue => {
-            let query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
-            let result = actions.run_gh(&[
-                "api".to_owned(),
-                "graphql".to_owned(),
-                "-f".to_owned(),
-                format!("query={query}"),
-                "-F".to_owned(),
-                format!("id={}", pr.node_id),
-                "-F".to_owned(),
-                format!("head={}", pr.fact.head_sha),
-            ]);
-            match result {
-                Ok(_) => {
-                    record_audit(
-                        ledger,
-                        &observation.repo,
-                        &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
-                        "enqueue_exact_head",
-                    );
-                    (Some("enqueued".to_owned()), None)
-                }
-                Err(error) => (None, Some(error.to_string())),
-            }
-        }
+        StewardDecision::ArmMergeQueue => enqueue_pull_request(actions, observation, pr, ledger),
         StewardDecision::ExactHeadMerge => {
+            let Some(merge_method) = observation.merge_method.as_deref() else {
+                return (Some("waiting_merge_method_configuration".to_owned()), None);
+            };
             let result = gh_json(
                 actions,
                 &[
@@ -698,7 +1839,7 @@ fn mutate_pr(
                     "-f".to_owned(),
                     format!("sha={}", pr.fact.head_sha),
                     "-f".to_owned(),
-                    "merge_method=merge".to_owned(),
+                    format!("merge_method={merge_method}"),
                 ],
                 "exact-head merge",
             );
@@ -725,38 +1866,185 @@ fn mutate_pr(
                 Err(error) => (None, Some(error)),
             }
         }
-        StewardDecision::RerunTransient { run_ids } => {
-            let mut errors = Vec::new();
-            let mut rerun = Vec::new();
-            for run_id in run_ids {
-                match actions.rerun_failed_run(&observation.repo, *run_id) {
-                    Ok(()) => {
-                        let key = attempt_key(
-                            &observation.repo,
-                            pr.fact.number,
-                            &pr.fact.head_sha,
-                            *run_id,
-                        );
-                        *ledger.transient_attempts.entry(key).or_default() += 1;
-                        rerun.push(*run_id);
-                        record_audit(
-                            ledger,
-                            &observation.repo,
-                            &format!("run:{run_id}:{}", pr.fact.head_sha),
-                            "rerun_transient",
-                        );
-                    }
-                    Err(error) => errors.push(error.to_string()),
-                }
-            }
-            if errors.is_empty() {
-                (Some(format!("reran {rerun:?}")), None)
-            } else {
-                (None, Some(errors.join("; ")))
-            }
-        }
+        StewardDecision::RerunTransient { run_ids } => mutate_transient_reruns(
+            actions,
+            observation,
+            pr,
+            policy,
+            run_ids,
+            ledger_path,
+            ledger,
+        ),
         _ => (None, None),
     }
+}
+
+fn enqueue_pull_request(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    let query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
+    let result = actions.run_gh(&[
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={query}"),
+        "-F".to_owned(),
+        format!("id={}", pr.node_id),
+        "-F".to_owned(),
+        format!("head={}", pr.fact.head_sha),
+    ]);
+    match result {
+        Ok(_) => {
+            record_audit(
+                ledger,
+                &observation.repo,
+                &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
+                "enqueue_exact_head",
+            );
+            (Some("enqueued".to_owned()), None)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if enqueue_requirements_pending(&message) {
+                (Some("waiting_enqueue_requirements".to_owned()), None)
+            } else {
+                (None, Some(message))
+            }
+        }
+    }
+}
+
+fn mutate_transient_reruns(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    policy: &StewardPolicy,
+    run_ids: &[u64],
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    let mut errors = Vec::new();
+    let mut rerun = Vec::new();
+    for run_id in run_ids {
+        let key = attempt_key(
+            &observation.repo,
+            pr.fact.number,
+            &pr.fact.head_sha,
+            *run_id,
+        );
+        *ledger.transient_attempts.entry(key).or_default() += 1;
+        record_audit(
+            ledger,
+            &observation.repo,
+            &format!("run:{run_id}:{}", pr.fact.head_sha),
+            "rerun_transient_intent",
+        );
+        if let Err(error) = save_ledger(ledger_path, ledger) {
+            return (
+                None,
+                Some(format!(
+                    "could not persist transient rerun intent: {}",
+                    error.message
+                )),
+            );
+        }
+        match revalidate_transient_rerun(actions, observation, pr, policy, *run_id, ledger) {
+            Ok(false) => {
+                record_audit(
+                    ledger,
+                    &observation.repo,
+                    &format!("run:{run_id}:{}", pr.fact.head_sha),
+                    "rerun_transient_skipped_after_live_revalidation",
+                );
+                continue;
+            }
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+            Ok(true) => {}
+        }
+        match actions.rerun_failed_run(&observation.repo, *run_id) {
+            Ok(()) => {
+                rerun.push(*run_id);
+                record_audit(
+                    ledger,
+                    &observation.repo,
+                    &format!("run:{run_id}:{}", pr.fact.head_sha),
+                    "rerun_transient",
+                );
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if errors.is_empty() {
+        (Some(format!("reran {rerun:?}")), None)
+    } else {
+        (None, Some(errors.join("; ")))
+    }
+}
+
+fn revalidate_transient_rerun(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    observed_pr: &ObservedPr,
+    policy: &StewardPolicy,
+    run_id: u64,
+    ledger: &StewardLedger,
+) -> Result<bool, String> {
+    let Some(live_pr) = pull_request(
+        actions,
+        &observation.repo,
+        observed_pr.fact.number,
+        &BTreeMap::new(),
+    )?
+    else {
+        return Ok(false);
+    };
+    if !live_pr
+        .fact
+        .head_sha
+        .eq_ignore_ascii_case(&observed_pr.fact.head_sha)
+    {
+        return Ok(false);
+    }
+    let mut attempts = attempts_for(ledger, &observation.repo, &live_pr.fact);
+    if let Some(count) = attempts.get_mut(&run_id) {
+        *count = count.saturating_sub(1);
+    }
+    let eligible = matches!(
+        classify_pr(&live_pr.fact, policy, &attempts),
+        StewardDecision::RerunTransient { run_ids } if run_ids.contains(&run_id)
+    );
+    if !eligible {
+        return Ok(false);
+    }
+    let value = gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!("repos/{}/actions/runs/{run_id}", observation.repo),
+        ],
+        "transient exact-run revalidation",
+    )?;
+    let Some(run) = parse_run(&value) else {
+        return Ok(false);
+    };
+    let conclusion = value
+        .get("conclusion")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    Ok(run.status.eq_ignore_ascii_case("completed")
+        && run.head_sha.eq_ignore_ascii_case(&live_pr.fact.head_sha)
+        && run.pull_request_number == Some(live_pr.fact.number)
+        && matches!(
+            conclusion.as_str(),
+            "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "STALE"
+        ))
 }
 
 fn attempt_key(repo: &str, pr: u64, head: &str, run_id: u64) -> String {
@@ -802,10 +2090,27 @@ fn save_ledger(path: &Path, ledger: &StewardLedger) -> Result<(), CliFailure> {
     let payload = serde_json::to_vec_pretty(ledger)
         .map_err(|error| CliFailure::new(1, format!("could not encode steward ledger: {error}")))?;
     let temp = path.with_extension("json.tmp");
-    fs::write(&temp, payload).map_err(|error| {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| {
+            CliFailure::new(
+                1,
+                format!("could not open steward ledger {}: {error}", temp.display()),
+            )
+        })?;
+    file.write_all(&payload).map_err(|error| {
         CliFailure::new(
             1,
             format!("could not write steward ledger {}: {error}", temp.display()),
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("could not sync steward ledger {}: {error}", temp.display()),
         )
     })?;
     fs::rename(&temp, path).map_err(|error| {
@@ -816,18 +2121,40 @@ fn save_ledger(path: &Path, ledger: &StewardLedger) -> Result<(), CliFailure> {
                 path.display()
             ),
         )
-    })
+    })?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                CliFailure::new(
+                    1,
+                    format!(
+                        "could not sync steward state directory {}: {error}",
+                        parent.display()
+                    ),
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn render_report<W: Write>(
     stdout: &mut W,
     json_output: bool,
     apply: bool,
+    ledger_path: &Path,
     reports: &[RepoReport],
 ) -> Result<(), CliFailure> {
     if json_output {
         let mut data = BTreeMap::new();
         data.insert("apply".to_owned(), Value::from(apply));
+        data.insert(
+            "handoff_ledger".to_owned(),
+            Value::from(ledger_path.display().to_string()),
+        );
         data.insert(
             "repos".to_owned(),
             serde_json::to_value(reports).map_err(|error| CliFailure::new(1, error.to_string()))?,
@@ -837,8 +2164,9 @@ fn render_report<W: Write>(
     }
     writeln!(
         stdout,
-        "merge steward: mode={}",
-        if apply { "apply" } else { "dry-run" }
+        "merge steward: mode={} handoff_ledger={}",
+        if apply { "apply" } else { "dry-run" },
+        ledger_path.display()
     )
     .map_err(|error| io_failure(&error))?;
     for repo in reports {
@@ -905,9 +2233,108 @@ fn is_private_free_entitlement(message: &str) -> bool {
     message.contains("Upgrade to GitHub Pro or make this repository public")
 }
 
+fn is_admin_protection_denied(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("http 403")
+        && (lower.contains("must have admin rights")
+            || lower.contains("administration permission")
+            || lower.contains("resource not accessible by integration"))
+}
+
+fn enqueue_requirements_pending(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if [
+        "http 401",
+        "http 403",
+        "http 429",
+        "bad credentials",
+        "resource not accessible by integration",
+        "rate limit",
+        "too many requests",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    lower.contains("required status check")
+        || lower.contains("required check")
+        || lower.contains("required approving review")
+        || lower.contains("required review")
+        || lower.contains("requirements are not met")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp.path().join("gh");
+        fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fake gh");
+        let mut permissions = fs::metadata(&path).expect("fake gh metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod fake gh");
+        GitHubActions::new(temp.path()).with_gh_binary_for_tests(path)
+    }
+
+    fn ready_pr() -> ObservedPr {
+        parse_pr(
+            &serde_json::json!({
+                "id": "PR_kw",
+                "number": 42,
+                "state": "OPEN",
+                "isDraft": false,
+                "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "headRefName": "feature",
+                "mergeStateStatus": "CLEAN",
+                "autoMergeRequest": null,
+                "labels": [],
+                "statusCheckRollup": [{
+                    "__typename": "CheckRun",
+                    "name": "macos",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/100"
+                }]
+            }),
+            &BTreeMap::new(),
+        )
+        .expect("ready PR")
+    }
+
+    fn observation_for(pr: ObservedPr, merge_queue: bool) -> RepoObservation {
+        RepoObservation {
+            repo: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            allow_auto_merge: merge_queue,
+            merge_queue,
+            merge_method: Some("merge".to_owned()),
+            required_contexts: Vec::new(),
+            prs: vec![pr],
+            runs: Vec::new(),
+            merge_group_heads: BTreeMap::new(),
+            merge_group_enqueued_at: BTreeMap::new(),
+            preemption_error: None,
+        }
+    }
+
+    fn queued_run(id: u64, created_at: &str) -> StewardRun {
+        StewardRun {
+            id,
+            workflow_id: 77,
+            workflow: "Required".to_owned(),
+            head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            head_branch: "feature".to_owned(),
+            status: "queued".to_owned(),
+            event: "pull_request".to_owned(),
+            pull_request_number: Some(42),
+            created_at: created_at.to_owned(),
+            jobs: Vec::new(),
+        }
+    }
 
     #[test]
     fn parses_both_check_rollup_shapes() {
@@ -937,5 +2364,326 @@ mod tests {
             "Upgrade to GitHub Pro or make this repository public to enable this feature."
         ));
         assert!(!is_private_free_entitlement("HTTP 403 forbidden"));
+        assert!(is_admin_protection_denied(
+            "HTTP 403: Must have admin rights to Repository"
+        ));
+        assert!(!is_admin_protection_denied("HTTP 403 forbidden"));
+    }
+
+    #[test]
+    fn job_parser_and_reason_labels_fail_closed_and_stay_stable() {
+        let parsed = parse_job(&serde_json::json!({
+            "name": "macos",
+            "status": "in_progress",
+            "labels": ["self-hosted", "pulp-preamble"],
+            "runner_name": "pulp-preamble-m5"
+        }))
+        .expect("job");
+        assert_eq!(parsed.labels[1], "pulp-preamble");
+        assert!(parse_job(&serde_json::json!({"status": "queued"})).is_err());
+        assert_eq!(
+            cancellation_reason_label(RunCancellationReason::LowerPriorityBranchPreamble),
+            "lower_priority_branch_preamble"
+        );
+    }
+
+    #[test]
+    fn evaluated_rules_extract_required_contexts_and_reject_malformed_payloads() {
+        let contexts = evaluated_required_contexts(&serde_json::json!([[
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            {"context": "macos"},
+                            {"context": "linux"},
+                            {"context": "macos"}
+                        ]
+                    }
+                }
+            ],
+            [
+                {"type": "pull_request", "parameters": {"required_approving_review_count": 1}}
+            ]
+        ]))
+        .expect("rules");
+        assert_eq!(contexts, vec!["linux", "macos"]);
+        assert!(evaluated_required_contexts(&serde_json::json!({})).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_context_transport_unions_classic_checks_and_paginated_rules() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(
+            &temp,
+            r#"
+case "$*" in
+  *"protection/required_status_checks"*)
+    printf '%s' '{"contexts":["classic"],"checks":[{"context":"app-bound"}]}' ;;
+  *"rules/branches/main --paginate --slurp"*)
+    printf '%s' '[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"rules-a"}]}}],[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"rules-b"}]}}]]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+        );
+
+        assert_eq!(
+            required_contexts(&actions, "owner/repo", "main").expect("required contexts"),
+            vec!["app-bound", "classic", "rules-a", "rules-b"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_request_transport_preserves_fresh_queue_position() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(
+            &temp,
+            r#"printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[]}'"#,
+        );
+        let positions = BTreeMap::from([(42, 3)]);
+
+        let pr = pull_request(&actions, "owner/repo", 42, &positions)
+            .expect("transport")
+            .expect("open PR");
+        assert_eq!(pr.fact.queue_position, Some(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_queue_transport_refuses_partial_snapshot() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(
+            &temp,
+            r#"printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":true}}}}}}'"#,
+        );
+
+        let error = merge_queue_snapshot(&actions, "owner/repo", "main").expect_err("partial");
+        assert!(error.contains("exceeds 100 entries"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_run_transport_deduplicates_status_and_page_overlap() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(
+            &temp,
+            r#"
+case "$*" in
+  *"actions/runs?status=queued"*|*"actions/runs?status=waiting"*)
+    printf '%s' '{"workflow_runs":[{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}]}' ;;
+  *"actions/runs?status="*) printf '%s' '{"workflow_runs":[]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+        );
+
+        let runs = active_runs(&actions, "owner/repo").expect("active runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, 1);
+    }
+
+    #[test]
+    fn overlapping_apply_pass_fails_fast_on_ledger_lock() {
+        let temp = tempfile::tempdir().expect("temp");
+        let ledger = temp.path().join("merge-steward.json");
+        let _first = acquire_ledger_lock(&ledger).expect("first lock");
+        let error = acquire_ledger_lock(&ledger).expect_err("second lock must not block");
+        assert!(
+            error.message.contains("already running"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn final_ledger_failure_is_renderable_and_marks_tick_unhealthy() {
+        let temp = tempfile::tempdir().expect("temp");
+        let parent_file = temp.path().join("not-a-directory");
+        fs::write(&parent_file, "occupied").expect("parent file");
+        let ledger_path = parent_file.join("merge-steward.json");
+        let mut reports = Vec::new();
+        let mut unhealthy = false;
+
+        persist_final_ledger(
+            &ledger_path,
+            &StewardLedger::default(),
+            "main",
+            &mut reports,
+            &mut unhealthy,
+        );
+
+        assert!(unhealthy);
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].errors[0].contains("ledger persistence failed"));
+        let mut output = Vec::new();
+        render_report(&mut output, true, true, &ledger_path, &reports).expect("render");
+        assert!(
+            String::from_utf8(output)
+                .expect("UTF-8")
+                .contains("ledger persistence failed")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_transport_mutates_only_after_live_queue_and_head_revalidation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"enqueuePullRequest"*) printf '%s' '{{"data":{{"enqueuePullRequest":{{"mergeQueueEntry":{{"position":1}}}}}}}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let pr = ready_pr();
+        let observation = observation_for(pr.clone(), true);
+        let policy = StewardPolicy {
+            merge_queue: true,
+            native_auto_merge: true,
+            required_contexts: Vec::new(),
+            opt_out_label: "steward:skip".to_owned(),
+            max_transient_reruns: 1,
+        };
+        let mut ledger = StewardLedger::default();
+
+        let (mutation, error) = mutate_pr(
+            &actions,
+            &observation,
+            &pr,
+            &policy,
+            &StewardDecision::ArmMergeQueue,
+            &temp.path().join("ledger.json"),
+            &mut ledger,
+        );
+
+        assert_eq!(mutation.as_deref(), Some("enqueued"));
+        assert!(error.is_none(), "{error:?}");
+        let calls = fs::read_to_string(log).expect("calls");
+        assert!(calls.contains("mergeQueue"), "{calls}");
+        assert!(calls.contains("pr view 42"), "{calls}");
+        assert!(calls.contains("enqueuePullRequest"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_requirements_refusal_is_waiting_not_control_plane_failure() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(
+            &temp,
+            r#"
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"BLOCKED","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}]}' ;;
+  *"enqueuePullRequest"*)
+    echo "Required approving review has not been submitted" >&2
+    exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+        );
+        let mut pr = ready_pr();
+        pr.fact.merge_state = "BLOCKED".to_owned();
+        let observation = observation_for(pr.clone(), true);
+        let policy = StewardPolicy {
+            merge_queue: true,
+            native_auto_merge: true,
+            required_contexts: Vec::new(),
+            opt_out_label: "steward:skip".to_owned(),
+            max_transient_reruns: 1,
+        };
+        let mut ledger = StewardLedger::default();
+
+        let (mutation, error) = mutate_pr(
+            &actions,
+            &observation,
+            &pr,
+            &policy,
+            &StewardDecision::ArmMergeQueue,
+            &temp.path().join("ledger.json"),
+            &mut ledger,
+        );
+
+        assert_eq!(mutation.as_deref(), Some("waiting_enqueue_requirements"));
+        assert!(error.is_none(), "{error:?}");
+        assert!(!enqueue_requirements_pending(
+            "HTTP 403: Resource not accessible by integration: required review"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_duplicate_cancel_transport_reproves_exact_run_before_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  *"actions/runs?status=queued"*)
+    printf '%s' '{{"workflow_runs":[
+      {{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}},
+      {{"id":2,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T01:00:00Z","pull_requests":[{{"number":42}}]}}
+    ]}}' ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  "api repos/owner/repo/actions/runs/1")
+    printf '%s' '{{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+  *"actions/runs/1/cancel"*) printf '%s' '{{}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let pr = ready_pr();
+        let mut observation = observation_for(pr, true);
+        observation.runs = vec![
+            queued_run(1, "2026-07-26T00:00:00Z"),
+            queued_run(2, "2026-07-26T01:00:00Z"),
+        ];
+        let cancellation = RunCancellation {
+            run_id: 1,
+            reason: RunCancellationReason::DuplicateImmutableHead,
+        };
+        let mut ledger = StewardLedger::default();
+
+        let (mutation, error) = apply_run_cancellation(
+            &actions,
+            &observation,
+            &cancellation,
+            "steward:skip",
+            &temp.path().join("ledger.json"),
+            &mut ledger,
+        );
+
+        assert_eq!(mutation.as_deref(), Some("cancelled"));
+        assert!(error.is_none(), "{error:?}");
+        let calls = fs::read_to_string(log).expect("calls");
+        let exact = calls
+            .find("api repos/owner/repo/actions/runs/1\n")
+            .expect("exact run re-read");
+        let cancel = calls
+            .find("api -X POST repos/owner/repo/actions/runs/1/cancel")
+            .expect("cancel call");
+        assert!(exact < cancel, "{calls}");
     }
 }
