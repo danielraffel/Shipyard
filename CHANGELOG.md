@@ -6,6 +6,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 <a id="v0792"></a>
 ## [0.79.2] - 2026-07-26
 
+- fix(runner): scope fleet health to requested target ([#381](https://github.com/danielraffel/Shipyard/pull/381))
+
 <a id="v0791"></a>
 ## [0.79.1] - 2026-07-26
 
@@ -708,6 +710,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.79.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.79.2
 [0.79.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.79.1
 [0.79.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.79.0
 [0.78.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.78.0
