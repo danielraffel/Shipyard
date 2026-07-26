@@ -289,7 +289,9 @@ fn probe_doctor(class: &HostClassConfig) -> DoctorProbe {
             .output()
     } else {
         let mut command = Command::new(&class.tartci_bin);
-        command.env("TARTCI_GH_CLI", &class.github_cli);
+        if let Some(github_cli) = &class.github_cli {
+            command.env("TARTCI_GH_CLI", github_cli);
+        }
         if let Some(tart_home) = &class.tart_home {
             command.env("TART_HOME", tart_home);
         }
@@ -430,10 +432,16 @@ fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe, target: &str) -> Ho
 }
 
 fn normalized_target(target: &str) -> String {
-    match target.to_ascii_lowercase().as_str() {
+    let normalized = target.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "mac" | "darwin" => "macos".to_owned(),
         "win" => "windows".to_owned(),
-        normalized => normalized.to_owned(),
+        _ if normalized.starts_with("macos-") || normalized.starts_with("darwin-") => {
+            "macos".to_owned()
+        }
+        _ if normalized.starts_with("windows-") => "windows".to_owned(),
+        _ if normalized.starts_with("linux-") => "linux".to_owned(),
+        _ => normalized,
     }
 }
 
@@ -518,7 +526,9 @@ fn remote_tartci_command(class: &HostClassConfig) -> String {
     if let Some(tart_home) = &class.tart_home {
         parts.push(format!("TART_HOME={}", shlex_quote(tart_home)));
     }
-    parts.push(format!("TARTCI_GH_CLI={}", shlex_quote(&class.github_cli)));
+    if let Some(github_cli) = &class.github_cli {
+        parts.push(format!("TARTCI_GH_CLI={}", shlex_quote(github_cli)));
+    }
     parts.push(shlex_quote(&class.tartci_bin));
     parts.extend(
         ["doctor", "--reap", "--json"]
@@ -720,7 +730,7 @@ mod tests {
             cap: 2,
             tart_bin: "/opt/homebrew/bin/tart".to_owned(),
             tartci_bin: "/Users/ci user/.local/bin/tartci".to_owned(),
-            github_cli: "ghapp".to_owned(),
+            github_cli: Some("ghapp".to_owned()),
             tart_home: Some("/Users/ci user/VMs".to_owned()),
             labels: Vec::new(),
         };
@@ -728,6 +738,31 @@ mod tests {
             remote_tartci_command(&class),
             "env PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin TART_HOME='/Users/ci user/VMs' TARTCI_GH_CLI=ghapp '/Users/ci user/.local/bin/tartci' doctor --reap --json"
         );
+    }
+
+    #[test]
+    fn remote_tartci_command_leaves_github_cli_unset_by_default() {
+        let class = HostClassConfig {
+            class: "studio".to_owned(),
+            ssh: Some("studio".to_owned()),
+            cap: 2,
+            tart_bin: "tart".to_owned(),
+            tartci_bin: "tartci".to_owned(),
+            github_cli: None,
+            tart_home: None,
+            labels: Vec::new(),
+        };
+
+        assert!(!remote_tartci_command(&class).contains("TARTCI_GH_CLI"));
+    }
+
+    #[test]
+    fn composite_platform_target_matches_lane_labels() {
+        let labels = serde_json::json!(["self-hosted", "macOS", "ARM64"]);
+
+        assert!(labels_match_target(&labels, "macos-arm64"));
+        assert!(labels_match_target(&labels, "darwin-arm64"));
+        assert!(!labels_match_target(&labels, "linux-arm64"));
     }
 
     #[test]

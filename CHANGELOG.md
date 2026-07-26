@@ -3,9 +3,10 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0791"></a>
-## [0.79.2]
+<a id="v0792"></a>
+## [0.79.2] - 2026-07-26
 
+<a id="v0791"></a>
 ## [0.79.1] - 2026-07-26
 
 - test(merge): cover composed fallback decision ([#380](https://github.com/danielraffel/Shipyard/pull/380))

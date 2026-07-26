@@ -51,10 +51,11 @@ pub struct HostClassConfig {
     /// The `tartci` binary/wrapper to invoke for host-local doctor/fleet
     /// probes. Defaults to `tartci`; override for non-interactive SSH.
     pub tartci_bin: String,
-    /// GitHub CLI command exposed to tartci as `TARTCI_GH_CLI`. Defaults to
-    /// `gh`; set this to an App-authenticated wrapper such as `ghapp` when the
-    /// ambient user token is unavailable or intentionally not used.
-    pub github_cli: String,
+    /// Optional GitHub CLI command exposed to tartci as `TARTCI_GH_CLI`.
+    /// When absent, Shipyard preserves the local environment and tartci's
+    /// default; set this to an App-authenticated wrapper such as `ghapp` when
+    /// the ambient user token is unavailable or intentionally not used.
+    pub github_cli: Option<String>,
     /// Optional Tart store to expose as `TART_HOME` while reading this host.
     /// Use an absolute path; shell expansion is intentionally not performed.
     pub tart_home: Option<String>,
@@ -106,8 +107,8 @@ pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> 
             Some(_) => return Err(format!("host_class.{class}.tartci_bin must be a string")),
         };
         let github_cli = match table.get("github_cli") {
-            None => "gh".to_owned(),
-            Some(TomlValue::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
+            None => None,
+            Some(TomlValue::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
             Some(_) => return Err(format!("host_class.{class}.github_cli must be a string")),
         };
         let tart_home = match table.get("tart_home") {
@@ -416,7 +417,7 @@ mod tests {
         assert_eq!(classes[0].cap, DEFAULT_CAP);
         assert_eq!(classes[0].tart_bin, "tart");
         assert_eq!(classes[0].tartci_bin, "tartci");
-        assert_eq!(classes[0].github_cli, "gh");
+        assert_eq!(classes[0].github_cli, None);
         assert_eq!(classes[1].class, "studio");
         assert_eq!(classes[1].cap, 4);
         assert_eq!(classes[1].ssh.as_deref(), Some("studio-ci.local"));
@@ -467,7 +468,7 @@ mod tests {
     fn parse_host_classes_reads_github_cli() {
         let cfg = table("[host_class.studio]\ngithub_cli = \"ghapp\"\n");
         let classes = parse_host_classes(&cfg).expect("parse");
-        assert_eq!(classes[0].github_cli, "ghapp");
+        assert_eq!(classes[0].github_cli.as_deref(), Some("ghapp"));
     }
 
     #[test]
@@ -612,7 +613,7 @@ mod tests {
             cap: 2,
             tart_bin: "/opt/homebrew/bin/tart".to_owned(),
             tartci_bin: "/Users/ci/.local/bin/tartci".to_owned(),
-            github_cli: "gh".to_owned(),
+            github_cli: None,
             tart_home: Some("/Users/ci user/VMs".to_owned()),
             labels: Vec::new(),
         };

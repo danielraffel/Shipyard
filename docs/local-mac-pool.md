@@ -170,7 +170,8 @@ to macOS-labeled providers. A wedged Linux provider remains visible to a Linux
 fleet query but does not falsely remove healthy macOS capacity. When tartci must
 use an App-authenticated GitHub wrapper, set `github_cli = "ghapp"` on each
 `[host_class.<name>]`; Shipyard passes it to local and SSH doctor probes as
-`TARTCI_GH_CLI`.
+`TARTCI_GH_CLI`. When omitted, local probes preserve any inherited
+`TARTCI_GH_CLI` and remote probes retain tartci's default.
 
 ## Explicit Cloud Fallback
 
