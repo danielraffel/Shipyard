@@ -521,6 +521,9 @@ fn stalled_contexts(
     now: DateTime<Utc>,
     front_old_enough: bool,
 ) -> Vec<String> {
+    if !front_old_enough {
+        return Vec::new();
+    }
     let stalled = |check: &CheckObservation| {
         check.status == "queued"
             || (check.status == "in_progress"
@@ -654,6 +657,41 @@ mod tests {
         assert!(report.front_stalled_with_idle_capacity);
         assert_eq!(report.materialized_required_checks, 1);
         assert_eq!(report.progressed_required_checks, 0);
+    }
+
+    #[test]
+    fn fresh_front_reports_normal_wait_for_queued_or_missing_checks() {
+        let entries = vec![MergeQueueEntry {
+            pr: 11,
+            position: 0,
+            head_sha: Some("aaa".to_owned()),
+            enqueued_at: Some("1970-01-01T00:01:30Z".to_owned()),
+        }];
+        for checks in [
+            Vec::new(),
+            vec![CheckObservation {
+                name: "macOS".to_owned(),
+                status: "queued".to_owned(),
+                started_at: None,
+                conclusion: None,
+            }],
+        ] {
+            let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+                entries: &entries,
+                checks: &checks,
+                active_runs: &[],
+                required_contexts: &["macOS".to_owned()],
+                eligible_host_classes: &["m5".to_owned()],
+                routable_free_slots: 1,
+                stall_threshold_secs: 60,
+                now: ts(120),
+                enrollment_cleared_prs: &[],
+                observation_truncated: false,
+            });
+            assert!(report.stalled_required_contexts.is_empty());
+            assert_eq!(report.reason_codes, [LivenessReason::NormalSerialWait]);
+            assert!(!report.needs_attention());
+        }
     }
 
     #[test]
