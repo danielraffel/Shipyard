@@ -389,7 +389,7 @@ fn write_queue_human<W: Write>(
 }
 
 fn open_queue(state_dir: &Path) -> Result<Queue, CliFailure> {
-    Queue::new(state_dir.join("queue")).map_err(|error| CliFailure::new(1, error.to_string()))
+    Queue::new(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 fn queue_value(job: Option<Job>) -> Result<Value, CliFailure> {

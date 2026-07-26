@@ -1550,7 +1550,7 @@ mod tests {
     #[test]
     fn queue_json_reports_multiple_active_runs_additively() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let first = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1605,7 +1605,7 @@ mod tests {
     #[test]
     fn status_json_reports_multiple_active_runs_additively() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         for (sha, branch, target) in [
             ("abc123456789", "feature/first", "linux"),
             ("def987654321", "feature/second", "mac"),
@@ -1725,7 +1725,7 @@ mod tests {
     #[test]
     fn bump_json_updates_pending_job_priority() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1758,7 +1758,7 @@ mod tests {
     #[test]
     fn cancel_json_marks_pending_job_cancelled() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1790,7 +1790,7 @@ mod tests {
     #[test]
     fn cancel_json_marks_running_job_cancelled() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1833,7 +1833,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let log_path = temp.path().join("linux.log");
         std::fs::write(&log_path, "target log\n").expect("write log");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1868,7 +1868,7 @@ mod tests {
     #[test]
     fn queue_human_reports_pending_and_recent_jobs() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let pending = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -2156,9 +2156,8 @@ mod tests {
         std::fs::create_dir_all(&active_log).expect("active log dir");
         std::fs::write(orphan_log.join("out.log"), "orphan\n").expect("orphan log");
         std::fs::write(active_log.join("out.log"), "active\n").expect("active log");
-        std::fs::create_dir_all(temp.path().join("queue")).expect("queue dir");
         std::fs::write(
-            temp.path().join("queue").join("queue.json"),
+            temp.path().join("queue.json"),
             r#"{"jobs":[{"id":"active"}]}"#,
         )
         .expect("queue file");
