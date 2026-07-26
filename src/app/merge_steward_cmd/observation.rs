@@ -478,9 +478,9 @@ pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<Ob
         .filter(|id| !id.is_empty())
         .ok_or_else(|| format!("PR #{number} missing node ID"))?
         .to_owned();
-    let checks = row
-        .get("statusCheckRollup")
-        .and_then(Value::as_array)
+    let rollup = row.get("statusCheckRollup").and_then(Value::as_array);
+    let check_rollup_maybe_truncated = rollup.is_some_and(|checks| checks.len() == 100);
+    let checks = rollup
         .into_iter()
         .flatten()
         .filter_map(parse_check)
@@ -519,6 +519,7 @@ pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<Ob
                 .collect(),
             checks,
         },
+        check_rollup_maybe_truncated,
     })
 }
 
@@ -584,16 +585,40 @@ pub(super) fn hydrate_required_check_identities(
     prs: &mut [ObservedPr],
 ) -> Result<(), String> {
     if !required_checks.iter().any(|check| check.app_id.is_some()) {
+        for pr in prs {
+            if pr.check_rollup_maybe_truncated {
+                hydrate_complete_head_checks(actions, repo, pr)?;
+            }
+        }
         return Ok(());
     }
     for pr in prs {
         if !is_full_sha(&pr.fact.head_sha) {
             continue;
         }
-        pr.fact
-            .checks
-            .extend(check_runs_for_head(actions, repo, &pr.fact.head_sha)?);
+        if pr.check_rollup_maybe_truncated {
+            hydrate_complete_head_checks(actions, repo, pr)?;
+        } else {
+            pr.fact
+                .checks
+                .extend(check_runs_for_head(actions, repo, &pr.fact.head_sha)?);
+        }
     }
+    Ok(())
+}
+
+fn hydrate_complete_head_checks(
+    actions: &GitHubActions,
+    repo: &str,
+    pr: &mut ObservedPr,
+) -> Result<(), String> {
+    if !is_full_sha(&pr.fact.head_sha) {
+        return Ok(());
+    }
+    let mut checks = check_runs_for_head(actions, repo, &pr.fact.head_sha)?;
+    checks.extend(commit_statuses_for_head(actions, repo, &pr.fact.head_sha)?);
+    pr.fact.checks = checks;
+    pr.check_rollup_maybe_truncated = false;
     Ok(())
 }
 
@@ -625,6 +650,33 @@ pub(super) fn check_runs_for_head(
     Err("current-head check runs exceed 1000; refusing partial identity scan".to_owned())
 }
 
+pub(super) fn commit_statuses_for_head(
+    actions: &GitHubActions,
+    repo: &str,
+    head_sha: &str,
+) -> Result<Vec<StewardCheck>, String> {
+    let mut checks = Vec::new();
+    for page in 1..=10 {
+        let value = gh_json(
+            actions,
+            &[
+                "api".to_owned(),
+                format!("repos/{repo}/commits/{head_sha}/statuses?per_page=100&page={page}"),
+            ],
+            "current-head commit statuses",
+        )?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| "current-head commit statuses were not an array".to_owned())?;
+        let count = rows.len();
+        checks.extend(rows.iter().filter_map(parse_rest_status));
+        if count < 100 {
+            return Ok(checks);
+        }
+    }
+    Err("current-head commit statuses exceed 1000; refusing partial status scan".to_owned())
+}
+
 pub(super) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
     Some(StewardCheck {
         name: value.get("name")?.as_str()?.to_owned(),
@@ -643,6 +695,36 @@ pub(super) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
             .get("completed_at")
             .and_then(Value::as_str)
             .or_else(|| value.get("started_at").and_then(Value::as_str))
+            .map(str::to_owned),
+    })
+}
+
+pub(super) fn parse_rest_status(value: &Value) -> Option<StewardCheck> {
+    let state = value.get("state")?.as_str()?;
+    Some(StewardCheck {
+        name: value.get("context")?.as_str()?.to_owned(),
+        app_id: None,
+        status: if state.eq_ignore_ascii_case("pending") {
+            "IN_PROGRESS"
+        } else {
+            "COMPLETED"
+        }
+        .to_owned(),
+        conclusion: if state.eq_ignore_ascii_case("success") {
+            Some("SUCCESS".to_owned())
+        } else if matches!(state.to_ascii_lowercase().as_str(), "error" | "failure") {
+            Some("FAILURE".to_owned())
+        } else {
+            None
+        },
+        run_id: value
+            .get("target_url")
+            .and_then(Value::as_str)
+            .and_then(run_id_from_url),
+        observed_at: value
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("created_at").and_then(Value::as_str))
             .map(str::to_owned),
     })
 }

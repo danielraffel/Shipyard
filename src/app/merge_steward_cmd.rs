@@ -45,6 +45,7 @@ pub(super) struct StewardCommandArgs {
 struct ObservedPr {
     node_id: String,
     fact: StewardPullRequest,
+    check_rollup_maybe_truncated: bool,
 }
 
 #[derive(Clone, Debug)]

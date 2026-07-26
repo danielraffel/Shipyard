@@ -85,6 +85,7 @@ fn invalid_pr_head_skips_app_identity_hydration_without_blocking_repo() {
             labels: Vec::new(),
             checks: Vec::new(),
         },
+        check_rollup_maybe_truncated: false,
     }];
     hydrate_required_check_identities(
         &actions,
@@ -376,6 +377,76 @@ esac
             .checks
             .iter()
             .any(|check| check.name == "macos" && check.app_id == Some(42))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn truncated_rollup_fetches_complete_head_checks_before_merge_classification() {
+    let temp = tempfile::tempdir().expect("temp");
+    let rollup = (0..100)
+        .map(|index| {
+            serde_json::json!({
+                "__typename": "CheckRun",
+                "name": format!("check-{index}"),
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS"
+            })
+        })
+        .collect::<Vec<_>>();
+    let pr = serde_json::json!({
+        "id": "PR_kw",
+        "number": 42,
+        "state": "OPEN",
+        "isDraft": false,
+        "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "headRefName": "feature",
+        "mergeStateStatus": "CLEAN",
+        "autoMergeRequest": null,
+        "labels": [],
+        "statusCheckRollup": rollup
+    });
+    let first_page = serde_json::json!({
+        "check_runs": (0..100)
+            .map(|index| serde_json::json!({
+                "name": format!("check-{index}"),
+                "status": "completed",
+                "conclusion": "success"
+            }))
+            .collect::<Vec<_>>()
+    });
+    let second_page = serde_json::json!({
+        "check_runs": [{
+            "name": "omitted-failure",
+            "status": "completed",
+            "conclusion": "failure"
+        }]
+    });
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+case "$*" in
+  *"pr view"*) printf '%s' '{pr}' ;;
+  *"/check-runs"*"&page=1"*) printf '%s' '{first_page}' ;;
+  *"/check-runs"*"&page=2"*) printf '%s' '{second_page}' ;;
+  *"/statuses"*) printf '%s' '[]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#
+        ),
+    );
+    let observed =
+        pull_request_with_required_checks(&actions, "owner/repo", 42, &BTreeMap::new(), &[])
+            .expect("live PR")
+            .expect("open PR");
+    let mut policy = queue_policy();
+    policy.merge_queue = false;
+    assert_eq!(
+        classify_pr(&observed.fact, &policy, &BTreeMap::new()),
+        StewardDecision::RequiredFailed {
+            contexts: vec!["omitted-failure".to_owned()]
+        }
     );
 }
 
