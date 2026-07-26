@@ -544,9 +544,10 @@ fn required_contexts(
     repo: &str,
     base: &str,
 ) -> Result<Vec<String>, String> {
+    let encoded_base = encode_path_segment(base);
     let args = vec![
         "api".to_owned(),
-        format!("repos/{repo}/branches/{base}/protection/required_status_checks"),
+        format!("repos/{repo}/branches/{encoded_base}/protection/required_status_checks"),
     ];
     let raw = match actions.run_gh(&args) {
         Ok(raw) => raw,
@@ -590,17 +591,33 @@ fn required_contexts_from_evaluated_rules(
     repo: &str,
     base: &str,
 ) -> Result<Vec<String>, String> {
+    let encoded_base = encode_path_segment(base);
     let value = gh_json(
         actions,
         &[
             "api".to_owned(),
-            format!("repos/{repo}/rules/branches/{base}"),
+            format!("repos/{repo}/rules/branches/{encoded_base}"),
             "--paginate".to_owned(),
             "--slurp".to_owned(),
         ],
         "evaluated branch rules",
     )?;
     evaluated_required_contexts(&value)
+}
+
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
 }
 
 fn evaluated_required_contexts(value: &Value) -> Result<Vec<String>, String> {
@@ -3880,6 +3897,13 @@ esac
             required_contexts(&actions, "owner/repo", "main").expect("required contexts"),
             vec!["app-bound", "classic", "rules-a", "rules-b"]
         );
+    }
+
+    #[test]
+    fn branch_policy_path_segments_are_percent_encoded() {
+        assert_eq!(encode_path_segment("main"), "main");
+        assert_eq!(encode_path_segment("release/1.2"), "release%2F1.2");
+        assert_eq!(encode_path_segment("topic name"), "topic%20name");
     }
 
     #[cfg(unix)]

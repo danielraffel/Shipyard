@@ -366,6 +366,13 @@ pub fn assess_merge_queue_liveness(
         observation_truncated,
     } = inputs;
     let front = entries.iter().min_by_key(|entry| entry.position).cloned();
+    let front_old_enough = front.as_ref().is_some_and(|entry| {
+        entry.enqueued_at.as_deref().is_some_and(|enqueued_at| {
+            DateTime::parse_from_rfc3339(enqueued_at).is_ok_and(|enqueued| {
+                (now - enqueued.with_timezone(&Utc)).num_seconds() >= stall_threshold_secs.max(0)
+            })
+        })
+    });
     let matching_checks = checks
         .iter()
         .filter(|check| {
@@ -379,8 +386,13 @@ pub fn assess_merge_queue_liveness(
         .iter()
         .filter(|check| check.status != "queued")
         .count();
-    let stalled_required_contexts =
-        stalled_contexts(checks, required_contexts, stall_threshold_secs, now);
+    let stalled_required_contexts = stalled_contexts(
+        checks,
+        required_contexts,
+        stall_threshold_secs,
+        now,
+        front_old_enough,
+    );
     let failed_required_contexts = required_contexts
         .iter()
         .filter(|required| {
@@ -400,13 +412,6 @@ pub fn assess_merge_queue_liveness(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let front_old_enough = front.as_ref().is_some_and(|entry| {
-        entry.enqueued_at.as_deref().is_some_and(|enqueued_at| {
-            DateTime::parse_from_rfc3339(enqueued_at).is_ok_and(|enqueued| {
-                (now - enqueued.with_timezone(&Utc)).num_seconds() >= stall_threshold_secs.max(0)
-            })
-        })
-    });
     let queued_prs = entries
         .iter()
         .map(|entry| entry.pr)
@@ -509,6 +514,7 @@ fn stalled_contexts(
     required_contexts: &[String],
     stall_threshold_secs: i64,
     now: DateTime<Utc>,
+    front_old_enough: bool,
 ) -> Vec<String> {
     let stalled = |check: &CheckObservation| {
         check.status == "queued"
@@ -521,6 +527,9 @@ fn stalled_contexts(
                 }))
     };
     if required_contexts.is_empty() {
+        if checks.is_empty() && front_old_enough {
+            return vec!["at-least-one-current-head-check".to_owned()];
+        }
         return checks
             .iter()
             .filter(|check| stalled(check))
@@ -610,6 +619,35 @@ mod tests {
         assert!(report.front_stalled_with_idle_capacity);
         assert_eq!(report.materialized_required_checks, 1);
         assert_eq!(report.progressed_required_checks, 0);
+    }
+
+    #[test]
+    fn aged_front_with_no_configured_or_observed_checks_alerts() {
+        let entries = vec![MergeQueueEntry {
+            pr: 11,
+            position: 0,
+            head_sha: Some("aaa".to_owned()),
+            enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+        }];
+        let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &entries,
+            checks: &[],
+            active_runs: &[],
+            required_contexts: &[],
+            eligible_host_classes: &["m5".to_owned()],
+            routable_free_slots: 1,
+            stall_threshold_secs: 60,
+            now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
+        });
+
+        assert_eq!(
+            report.stalled_required_contexts,
+            ["at-least-one-current-head-check"]
+        );
+        assert!(report.front_stalled_with_idle_capacity);
+        assert!(report.needs_attention());
     }
 
     #[test]
@@ -933,6 +971,13 @@ mod tests {
             report
                 .reason_codes
                 .contains(&LivenessReason::AutoMergeEnrollmentCleared)
+        );
+        assert!(report.stalled_required_contexts.is_empty());
+        assert!(report.reason_codes.contains(&LivenessReason::QueueEmpty));
+        assert!(
+            !report
+                .reason_codes
+                .contains(&LivenessReason::FrontRequiredStaleOrMissing)
         );
     }
 }
