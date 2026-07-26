@@ -15,7 +15,9 @@ use serde_json::Value;
 use super::CliFailure;
 use crate::cloud::GitHubActions;
 use crate::identity::RuntimeMode;
-use crate::merge_queue_control::{DurableMutationIntent, MergeQueueMutationGuard};
+use crate::merge_queue_control::{
+    DurableMutationIntent, MergeQueueMutationGuard, lock_is_contended,
+};
 use crate::merge_steward::{
     CapacityPreemptionPolicy, QueueFrontPressure, RequiredCheck, RunCancellation,
     RunCancellationReason, StewardCheck, StewardDecision, StewardJob, StewardPolicy,
@@ -402,7 +404,7 @@ fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
             )
         })?;
     file.try_lock_exclusive().map_err(|error| {
-        let reason = if error.kind() == std::io::ErrorKind::WouldBlock {
+        let reason = if lock_is_contended(&error) {
             "another steward apply pass is already running".to_owned()
         } else {
             error.to_string()

@@ -23,6 +23,24 @@ fn overlapping_apply_pass_fails_fast_on_ledger_lock() {
 }
 
 #[test]
+fn ledger_save_replaces_an_existing_file_portably() {
+    let temp = tempfile::tempdir().expect("temp");
+    let ledger_path = temp.path().join("merge-steward.json");
+    let mut ledger = StewardLedger::default();
+    save_ledger(&ledger_path, &ledger).expect("initial ledger");
+    ledger
+        .transient_attempts
+        .insert("Generous-Corp/pulp#1:head:2".to_owned(), 1);
+    save_ledger(&ledger_path, &ledger).expect("replacement ledger");
+    assert_eq!(
+        load_ledger(&ledger_path)
+            .expect("load replacement")
+            .transient_attempts,
+        ledger.transient_attempts
+    );
+}
+
+#[test]
 fn final_ledger_failure_is_renderable_and_marks_tick_unhealthy() {
     let temp = tempfile::tempdir().expect("temp");
     let parent_file = temp.path().join("not-a-directory");

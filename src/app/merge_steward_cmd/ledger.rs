@@ -1,6 +1,7 @@
 use super::{
     CliFailure, LedgerAudit, OpenOptions, Path, PendingMutationKind, StewardLedger, Utc, Write, fs,
 };
+use crate::queue::replace_file_with_windows_retry;
 
 pub(super) fn attempt_key(repo: &str, pr: u64, head: &str, run_id: u64) -> String {
     format!("{repo}#{pr}:{head}:{run_id}")
@@ -93,7 +94,7 @@ pub(super) fn save_ledger(path: &Path, ledger: &StewardLedger) -> Result<(), Cli
             format!("could not sync steward ledger {}: {error}", temp.display()),
         )
     })?;
-    fs::rename(&temp, path).map_err(|error| {
+    replace_file_with_windows_retry(&temp, path).map_err(|error| {
         CliFailure::new(
             1,
             format!(
@@ -102,21 +103,34 @@ pub(super) fn save_ledger(path: &Path, ledger: &StewardLedger) -> Result<(), Cli
             ),
         )
     })?;
-    if let Some(parent) = path
+    sync_parent_directory(path)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> Result<(), CliFailure> {
+    let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                CliFailure::new(
-                    1,
-                    format!(
-                        "could not sync steward state directory {}: {error}",
-                        parent.display()
-                    ),
-                )
-            })?;
-    }
+    else {
+        return Ok(());
+    };
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            CliFailure::new(
+                1,
+                format!(
+                    "could not sync steward state directory {}: {error}",
+                    parent.display()
+                ),
+            )
+        })
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<(), CliFailure> {
+    // Windows does not support opening a directory with std::fs::File for
+    // sync_all(). The temp file itself is flushed before the atomic replace.
     Ok(())
 }

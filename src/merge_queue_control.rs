@@ -881,7 +881,7 @@ fn append_audit(path: &Path, value: &serde_json::Value) -> io::Result<()> {
     result.and(unlock_result)
 }
 
-fn lock_is_contended(error: &io::Error) -> bool {
+pub(crate) fn lock_is_contended(error: &io::Error) -> bool {
     if error.kind() == io::ErrorKind::WouldBlock {
         return true;
     }
