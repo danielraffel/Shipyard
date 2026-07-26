@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0790"></a>
+## [0.79.1]
+
 ## [0.79.0] - 2026-07-23
 
 - fix(merge): prove complete queue authority before arming ([#379](https://github.com/danielraffel/Shipyard/pull/379))
