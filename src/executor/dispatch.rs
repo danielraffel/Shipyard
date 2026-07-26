@@ -117,6 +117,42 @@ impl ResolvedTarget {
         }
         self
     }
+
+    /// Return a copy whose local backends use `cwd` when they do not declare
+    /// an explicit working directory.
+    ///
+    /// Queue workers use the submitting job's durable cwd rather than the cwd
+    /// of whichever cooperative drainer happened to acquire the queue lock.
+    #[must_use]
+    pub fn with_default_local_workdir(mut self, cwd: &std::path::Path) -> Self {
+        match &mut self.backend {
+            ResolvedBackend::Local(target) => {
+                if target.cwd.is_none() {
+                    target.cwd = Some(cwd.to_path_buf());
+                }
+            }
+            ResolvedBackend::HostPool(pool) => {
+                for member in &mut pool.members {
+                    *member.target = member
+                        .target
+                        .as_ref()
+                        .clone()
+                        .with_default_local_workdir(cwd);
+                }
+            }
+            ResolvedBackend::Fallback(chain) => {
+                for backend in &mut chain.backends {
+                    *backend.target = backend
+                        .target
+                        .as_ref()
+                        .clone()
+                        .with_default_local_workdir(cwd);
+                }
+            }
+            ResolvedBackend::Ssh(_) | ResolvedBackend::Windows(_) | ResolvedBackend::Cloud(_) => {}
+        }
+        self
+    }
 }
 
 /// Backend-specific target settings.
@@ -2392,6 +2428,29 @@ mod tests {
             .with_workdir(r"D:\warm");
 
         assert_eq!(target.workdir(), Some(r"D:\warm".to_owned()));
+    }
+
+    #[test]
+    fn default_local_workdir_fills_only_an_implicit_path() {
+        let implicit = resolved_local_target("implicit")
+            .with_default_local_workdir(std::path::Path::new("/submitted"));
+        let explicit = resolve_targets_from_table(
+            &table(
+                r#"
+                [targets.explicit]
+                backend = "local"
+                platform = "linux-x64"
+                cwd = "/configured"
+                "#,
+            ),
+            ValidationMode::Full,
+        )
+        .expect("target")
+        .remove(0)
+        .with_default_local_workdir(std::path::Path::new("/submitted"));
+
+        assert_eq!(implicit.workdir().as_deref(), Some("/submitted"));
+        assert_eq!(explicit.workdir().as_deref(), Some("/configured"));
     }
 
     fn resolved_local_target(name: &str) -> super::ResolvedTarget {

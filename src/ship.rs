@@ -555,9 +555,9 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         evidence,
         ship_state,
         warm_pool,
+        cwd,
         state_dir,
         config,
-        ..
     } = stores;
     let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
     let transient_retry = crate::ship_retry::transient_local_retry_policy(config);
@@ -602,6 +602,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         dispatcher,
         job,
         TargetExecOptions {
+            cwd,
             defer_host_pool_lease_unavailable,
             reclassify_vitals_path: reclassify_vitals_path.as_deref(),
             transient_retry,
@@ -810,9 +811,9 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         queue,
         evidence,
         warm_pool,
+        cwd,
         state_dir,
         config,
-        ..
     } = stores;
     let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
     let transient_retry = crate::ship_retry::transient_local_retry_policy(config);
@@ -846,6 +847,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         dispatcher,
         job,
         TargetExecOptions {
+            cwd,
             defer_host_pool_lease_unavailable,
             reclassify_vitals_path: reclassify_vitals_path.as_deref(),
             transient_retry,
@@ -1409,6 +1411,8 @@ fn unsaved_ship_state(request: &ShipExecutionRequest, target_names: &[String]) -
 /// more positional argument. Resolved once at the command layer.
 #[derive(Clone, Copy)]
 struct TargetExecOptions<'a> {
+    /// Durable submission cwd used by local targets without an explicit path.
+    cwd: &'a Path,
     /// Return scheduler-owned deferral results for transient host-pool lease
     /// contention instead of final busy target results.
     defer_host_pool_lease_unavailable: bool,
@@ -1445,9 +1449,10 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
             continue;
         }
         let base_log_path = target_log_path(state_dir, &job.id, &target.name);
+        let execution_target = target.clone().with_default_local_workdir(options.cwd);
         let decision = apply_warm_reuse(
             warm_pool,
-            target,
+            &execution_target,
             &request.sha,
             request.resume_from.as_deref(),
             request.warm_disabled,
@@ -2322,6 +2327,24 @@ mod tests {
             .remove(0)
     }
 
+    fn local_target_without_cwd(name: &str, platform: &str) -> ResolvedTarget {
+        let config = format!(
+            r#"
+            [validation.default]
+            command = "true"
+
+            [targets.{name}]
+            backend = "local"
+            platform = "{platform}"
+            "#
+        )
+        .parse::<Table>()
+        .expect("config");
+        resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0)
+    }
+
     fn ship_request(targets: Vec<ResolvedTarget>) -> ShipExecutionRequest {
         ShipExecutionRequest {
             pr: 42,
@@ -2452,6 +2475,10 @@ mod tests {
 
         fn seen_count(&self) -> usize {
             self.seen_workdirs.lock().expect("seen lock").len()
+        }
+
+        fn workdirs(&self) -> Vec<Option<String>> {
+            self.seen_workdirs.lock().expect("seen lock").clone()
         }
     }
 
@@ -2826,6 +2853,81 @@ mod tests {
     }
 
     #[test]
+    fn cooperative_drain_uses_each_queued_jobs_submitted_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let first_cwd = temp.path().join("first");
+        let second_cwd = temp.path().join("second");
+        std::fs::create_dir_all(&first_cwd).expect("first cwd");
+        std::fs::create_dir_all(&second_cwd).expect("second cwd");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let first_request = RunExecutionRequest {
+            branch: "feature/first".to_owned(),
+            sha: "first".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![local_target_without_cwd("first", "linux-x64")],
+        };
+        let second_request = RunExecutionRequest {
+            branch: "feature/second".to_owned(),
+            sha: "second".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![local_target_without_cwd("second", "linux-x64")],
+        };
+        let first_job =
+            submit_run(&first_request, &mut queue, &first_cwd, &state_dir).expect("submit first");
+        let second_job = submit_run(&second_request, &mut queue, &second_cwd, &state_dir)
+            .expect("submit second");
+
+        let outcome = drain_or_wait_run(
+            &first_request,
+            first_job,
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: &first_cwd,
+                state_dir: &state_dir,
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+        )
+        .expect("drain");
+
+        assert!(outcome.job.passed());
+        assert_eq!(
+            queue
+                .get(&second_job.id)
+                .expect("queue")
+                .expect("second job")
+                .status,
+            JobStatus::Completed
+        );
+        let mut workdirs = dispatcher
+            .workdirs()
+            .into_iter()
+            .map(|path| path.expect("local cwd"))
+            .collect::<Vec<_>>();
+        workdirs.sort();
+        let mut expected = vec![
+            first_cwd.to_string_lossy().into_owned(),
+            second_cwd.to_string_lossy().into_owned(),
+        ];
+        expected.sort();
+        assert_eq!(workdirs, expected);
+    }
+
+    #[test]
     fn cooperative_run_wait_does_not_dispatch_without_drain_ownership() {
         let target = ssh_target();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3139,6 +3241,7 @@ mod tests {
             &dispatcher,
             started.clone(),
             super::TargetExecOptions {
+                cwd: temp.path(),
                 defer_host_pool_lease_unavailable: true,
                 reclassify_vitals_path: None,
                 transient_retry: crate::ship_retry::TransientRetryPolicy::disabled(),
@@ -3797,6 +3900,7 @@ mod tests {
             dispatcher,
             started,
             TargetExecOptions {
+                cwd: temp.path(),
                 defer_host_pool_lease_unavailable: false,
                 reclassify_vitals_path: None,
                 transient_retry: policy,
@@ -4040,6 +4144,7 @@ mod tests {
             &dispatcher,
             started,
             TargetExecOptions {
+                cwd: temp.path(),
                 defer_host_pool_lease_unavailable: true,
                 reclassify_vitals_path: None,
                 transient_retry: crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
