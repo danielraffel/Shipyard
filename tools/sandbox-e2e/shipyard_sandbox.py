@@ -18,6 +18,7 @@ from typing import Mapping, Sequence
 
 BINARY_NAME = "shipyard.exe" if sys.platform == "win32" else "shipyard"
 PYTHON_BINARY_NAME = "shipyard-py"
+QUEUE_TEMP_RE = re.compile(r"^\.queue-(\d+)-\d+-\d+\.json\.tmp$")
 
 PROTECTED_PATHS: tuple[Path, ...] = (
     Path.home() / "Library" / "Application Support" / "shipyard",
@@ -112,7 +113,37 @@ def _snapshot_paths(root: Path) -> set[Path]:
         return set()
 
 
-def _find_newer(root: Path, sentinel_mtime: float, pre_existing: set[Path]) -> list[Path]:
+def _active_process_ids() -> frozenset[int]:
+    if os.name != "posix":
+        return frozenset()
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    return frozenset(
+        int(pid) for pid in result.stdout.split() if pid.isdigit()
+    )
+
+
+def _is_queue_temp_from_pre_existing_process(
+    path: Path, pre_existing_process_ids: frozenset[int]
+) -> bool:
+    match = QUEUE_TEMP_RE.fullmatch(path.name)
+    return match is not None and int(match.group(1)) in pre_existing_process_ids
+
+
+def _find_newer(
+    root: Path,
+    sentinel_mtime: float,
+    pre_existing: set[Path],
+    pre_existing_process_ids: frozenset[int] = frozenset(),
+) -> list[Path]:
     if not root.exists():
         return []
     offenders: list[Path] = []
@@ -128,6 +159,15 @@ def _find_newer(root: Path, sentinel_mtime: float, pre_existing: set[Path]) -> l
         except OSError:
             continue
         if stat.st_mtime > sentinel_mtime:
+            # A pooled macOS runner can host another legitimate Shipyard process
+            # while this sandbox runs. Its atomic queue temp file is not evidence
+            # that the isolated child escaped. Only exempt writers that already
+            # existed when the sandbox started; a child created by this sandbox
+            # remains attributable and must still fail the contamination check.
+            if _is_queue_temp_from_pre_existing_process(
+                path, pre_existing_process_ids
+            ):
+                continue
             offenders.append(path)
     return offenders
 
@@ -228,6 +268,7 @@ class Sandbox:
         self.root: Path | None = None
         self._sentinel_mtime: float | None = None
         self._pre_existing: dict[Path, set[Path]] = {}
+        self._pre_existing_process_ids: frozenset[int] = frozenset()
 
     @property
     def bin_dir(self) -> Path:
@@ -253,6 +294,7 @@ class Sandbox:
         self.home_dir.mkdir(parents=True)
         self.work_dir.mkdir(parents=True)
         self._pre_existing = {path: _snapshot_paths(path) for path in PROTECTED_PATHS}
+        self._pre_existing_process_ids = _active_process_ids()
         sentinel = self.root / ".sentinel"
         sentinel.write_text("sandbox-start\n", encoding="utf-8")
         now = time.time()
@@ -338,7 +380,12 @@ class Sandbox:
         offenders: list[Path] = []
         for path in PROTECTED_PATHS:
             offenders.extend(
-                _find_newer(path, self._sentinel_mtime, self._pre_existing.get(path, set()))
+                _find_newer(
+                    path,
+                    self._sentinel_mtime,
+                    self._pre_existing.get(path, set()),
+                    self._pre_existing_process_ids,
+                )
             )
         report = ContaminationReport(tuple(sorted(offenders)), self._sentinel_mtime)
         if not report.clean:
