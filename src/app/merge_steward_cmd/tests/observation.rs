@@ -1,7 +1,8 @@
 use super::*;
 use crate::app::merge_steward_cmd::observation::{
-    canonical_repo_name, check_runs_for_head, encode_path_segment, evaluated_required_checks,
-    hydrate_preemption_jobs, parse_check, parse_rest_check, required_checks,
+    canonical_repo_name, check_runs_for_head, effective_merge_method, encode_path_segment,
+    evaluated_required_checks, hydrate_preemption_jobs, parse_check, parse_rest_check,
+    required_checks,
 };
 
 #[test]
@@ -75,6 +76,56 @@ fn entitlement_match_is_exact_enough_not_to_swallow_generic_forbidden() {
         "HTTP 403: Must have admin rights to Repository"
     ));
     assert!(!is_admin_protection_denied("HTTP 403 forbidden"));
+}
+
+#[test]
+fn effective_merge_method_respects_branch_rules_and_repository_capabilities() {
+    let all_methods = serde_json::json!({
+        "allow_merge_commit": true,
+        "allow_squash_merge": true,
+        "allow_rebase_merge": true
+    });
+    assert_eq!(
+        effective_merge_method(
+            &all_methods,
+            &serde_json::json!([[{"type": "required_linear_history"}]])
+        )
+        .expect("linear history policy"),
+        Some("squash".to_owned())
+    );
+    assert_eq!(
+        effective_merge_method(
+            &all_methods,
+            &serde_json::json!([[{
+                "type": "pull_request",
+                "parameters": {"allowed_merge_methods": ["rebase"]}
+            }]])
+        )
+        .expect("allowed method policy"),
+        Some("rebase".to_owned())
+    );
+    assert_eq!(
+        effective_merge_method(
+            &serde_json::json!({
+                "allow_merge_commit": true,
+                "allow_squash_merge": false,
+                "allow_rebase_merge": false
+            }),
+            &serde_json::json!([[{
+                "type": "pull_request",
+                "parameters": {"allowed_merge_methods": ["squash"]}
+            }]])
+        )
+        .expect("disjoint policy"),
+        None
+    );
+    assert!(
+        effective_merge_method(
+            &all_methods,
+            &serde_json::json!([[{"type": "pull_request", "parameters": {}}]])
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -182,6 +233,47 @@ esac
             },
         ]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn required_context_transport_falls_back_from_admin_denial_to_evaluated_rules() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"rules/branches/main --paginate --slurp"*)
+    printf '%s' '[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos","integration_id":42}]}}]]' ;;
+  *"protection/required_status_checks"*)
+    echo "HTTP 403: Must have admin rights to Repository" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+
+    assert_eq!(
+        required_checks(&actions, "owner/repo", "main").expect("evaluated fallback"),
+        vec![RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: Some(42),
+        }]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn required_context_transport_fails_closed_when_evaluated_rules_are_unreadable() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+echo "HTTP 403: Must have admin rights to Repository" >&2
+exit 1
+"#,
+    );
+
+    assert!(required_checks(&actions, "owner/repo", "main").is_err());
 }
 
 #[test]

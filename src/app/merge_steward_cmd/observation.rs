@@ -1,5 +1,5 @@
 use super::{
-    BTreeMap, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
+    BTreeMap, BTreeSet, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
     MergeQueueSnapshot, ObservedPr, Path, RepoObservation, RequiredCheck, StewardCheck, StewardJob,
     StewardPullRequest, StewardRun, Value, is_admin_protection_denied,
     is_capacity_preemption_workflow, is_full_sha, is_private_free_entitlement,
@@ -43,28 +43,10 @@ pub(super) fn observe_repo(
         .get("allow_auto_merge")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let merge_method = if settings
-        .get("allow_merge_commit")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        Some("merge".to_owned())
-    } else if settings
-        .get("allow_squash_merge")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        Some("squash".to_owned())
-    } else if settings
-        .get("allow_rebase_merge")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        Some("rebase".to_owned())
-    } else {
-        None
-    };
-    let required_checks = required_checks(actions, &repo, base)?;
+    let evaluated_rules = evaluated_branch_rules(actions, &repo, base)?;
+    let merge_method = effective_merge_method(&settings, &evaluated_rules)?;
+    let required_checks =
+        required_checks_with_evaluated_rules(actions, &repo, base, &evaluated_rules)?;
     let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
         merge_queue_snapshot(actions, &repo, base)?;
     let mut prs = pull_requests(actions, &repo, base, &queue_positions)?;
@@ -140,10 +122,21 @@ pub(super) fn gh_json_timeout(
         .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
 }
 
+#[cfg(test)]
 pub(super) fn required_checks(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
+) -> Result<Vec<RequiredCheck>, String> {
+    let evaluated_rules = evaluated_branch_rules(actions, repo, base)?;
+    required_checks_with_evaluated_rules(actions, repo, base, &evaluated_rules)
+}
+
+fn required_checks_with_evaluated_rules(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    evaluated_rules: &Value,
 ) -> Result<Vec<RequiredCheck>, String> {
     let encoded_base = encode_path_segment(base);
     let args = vec![
@@ -156,10 +149,10 @@ pub(super) fn required_checks(
             if is_private_free_entitlement(&error.to_string())
                 || is_admin_protection_denied(&error.to_string()) =>
         {
-            return Ok(Vec::new());
+            return evaluated_required_checks(evaluated_rules);
         }
         Err(error) if error.to_string().contains("HTTP 404") => {
-            return required_checks_from_evaluated_rules(actions, repo, base);
+            return evaluated_required_checks(evaluated_rules);
         }
         Err(error) => return Err(format!("required-check policy read failed: {error}")),
     };
@@ -187,17 +180,17 @@ pub(super) fn required_checks(
             });
         }
     }
-    checks.extend(required_checks_from_evaluated_rules(actions, repo, base)?);
+    checks.extend(evaluated_required_checks(evaluated_rules)?);
     Ok(normalize_required_checks(checks))
 }
 
-pub(super) fn required_checks_from_evaluated_rules(
+pub(super) fn evaluated_branch_rules(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
-) -> Result<Vec<RequiredCheck>, String> {
+) -> Result<Value, String> {
     let encoded_base = encode_path_segment(base);
-    let value = gh_json(
+    gh_json(
         actions,
         &[
             "api".to_owned(),
@@ -206,8 +199,7 @@ pub(super) fn required_checks_from_evaluated_rules(
             "--slurp".to_owned(),
         ],
         "evaluated branch rules",
-    )?;
-    evaluated_required_checks(&value)
+    )
 }
 
 pub(super) fn encode_path_segment(value: &str) -> String {
@@ -226,17 +218,7 @@ pub(super) fn encode_path_segment(value: &str) -> String {
 }
 
 pub(super) fn evaluated_required_checks(value: &Value) -> Result<Vec<RequiredCheck>, String> {
-    let pages = value
-        .as_array()
-        .ok_or_else(|| "evaluated branch rules was not an array".to_owned())?;
-    let rules = if pages.iter().all(Value::is_array) {
-        pages
-            .iter()
-            .flat_map(|page| page.as_array().into_iter().flatten())
-            .collect::<Vec<_>>()
-    } else {
-        pages.iter().collect()
-    };
+    let rules = evaluated_rules(value)?;
     let checks = rules
         .iter()
         .filter(|rule| rule.get("type").and_then(Value::as_str) == Some("required_status_checks"))
@@ -258,6 +240,89 @@ pub(super) fn evaluated_required_checks(value: &Value) -> Result<Vec<RequiredChe
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(normalize_required_checks(checks))
+}
+
+pub(super) fn effective_merge_method(
+    settings: &Value,
+    evaluated: &Value,
+) -> Result<Option<String>, String> {
+    let mut allowed = BTreeSet::new();
+    for (field, method) in [
+        ("allow_merge_commit", "merge"),
+        ("allow_squash_merge", "squash"),
+        ("allow_rebase_merge", "rebase"),
+    ] {
+        if settings
+            .get(field)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            allowed.insert(method);
+        }
+    }
+
+    let rules = evaluated_rules(evaluated)?;
+    let mut constrained = false;
+    let mut linear_history = false;
+    for rule in rules {
+        match rule.get("type").and_then(Value::as_str) {
+            Some("required_linear_history") => linear_history = true,
+            Some("pull_request") => {
+                let methods = rule
+                    .pointer("/parameters/allowed_merge_methods")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "pull-request rule missing allowed_merge_methods".to_owned())?;
+                let mut rule_allowed = BTreeSet::new();
+                for method in methods {
+                    let method = method
+                        .as_str()
+                        .ok_or_else(|| "allowed merge method was not a string".to_owned())?
+                        .to_ascii_lowercase();
+                    match method.as_str() {
+                        "merge" => {
+                            rule_allowed.insert("merge");
+                        }
+                        "squash" => {
+                            rule_allowed.insert("squash");
+                        }
+                        "rebase" => {
+                            rule_allowed.insert("rebase");
+                        }
+                        _ => return Err(format!("unknown allowed merge method `{method}`")),
+                    }
+                }
+                allowed.retain(|method| rule_allowed.contains(method));
+                constrained = true;
+            }
+            _ => {}
+        }
+    }
+    if linear_history {
+        allowed.remove("merge");
+    }
+    let preference = if constrained || linear_history {
+        ["squash", "rebase", "merge"]
+    } else {
+        ["merge", "squash", "rebase"]
+    };
+    Ok(preference
+        .into_iter()
+        .find(|method| allowed.contains(method))
+        .map(str::to_owned))
+}
+
+fn evaluated_rules(value: &Value) -> Result<Vec<&Value>, String> {
+    let pages = value
+        .as_array()
+        .ok_or_else(|| "evaluated branch rules was not an array".to_owned())?;
+    Ok(if pages.iter().all(Value::is_array) {
+        pages
+            .iter()
+            .flat_map(|page| page.as_array().into_iter().flatten())
+            .collect()
+    } else {
+        pages.iter().collect()
+    })
 }
 
 fn normalize_required_checks(mut checks: Vec<RequiredCheck>) -> Vec<RequiredCheck> {
