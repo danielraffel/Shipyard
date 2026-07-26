@@ -52,8 +52,8 @@ use observation::{
 };
 #[cfg(all(test, unix))]
 use observation::{
-    count_releasable_commits, enrollment_snapshot_path, fetch_merge_queue_entries,
-    reconcile_enrollment_snapshot,
+    count_releasable_commits, enrollment_snapshot_path, fetch_check_observations,
+    fetch_merge_queue_entries, reconcile_enrollment_snapshot,
 };
 #[cfg(test)]
 pub(in crate::app) use policy::FleetLivenessPolicy;
@@ -80,6 +80,7 @@ const OBSERVATION_MAX_PAGES: u32 = 5;
 // driving the watchdog into its own rate-limit wedge.
 const MAX_DETAILED_WORKFLOW_RUNS: u32 = 50;
 const MAX_ENROLLMENT_LOOKUPS_PER_TICK: usize = 25;
+const MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK: usize = 25;
 const MERGE_QUEUE_QUERY: &str = "query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
 
 #[allow(clippy::too_many_lines)]

@@ -1,10 +1,11 @@
 use super::{
     ActiveRunObservation, BTreeSet, CheckObservation, DateTime, Deserialize, Digest, Engine,
     GitHubActions, JobObservation, LoadedConfig, MAX_DETAILED_WORKFLOW_RUNS,
-    MAX_ENROLLMENT_LOOKUPS_PER_TICK, MERGE_QUEUE_QUERY, MergeQueueLivenessInputs, MergeQueueProbe,
-    OBSERVATION_MAX_PAGES, OBSERVATION_PAGE_SIZE, ObservationReason, Path, PathBuf, QueuedSummary,
-    ReleaseProbe, Serialize, Sha256, Utc, Value, assess_merge_queue_liveness,
-    assess_release_liveness, fs, parse_check_observations, parse_merge_queue_entries,
+    MAX_ENROLLMENT_LOOKUPS_PER_TICK, MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK, MERGE_QUEUE_QUERY,
+    MergeQueueLivenessInputs, MergeQueueProbe, OBSERVATION_MAX_PAGES, OBSERVATION_PAGE_SIZE,
+    ObservationReason, Path, PathBuf, QueuedSummary, ReleaseProbe, Serialize, Sha256, Utc, Value,
+    assess_merge_queue_liveness, assess_release_liveness, fs, parse_check_observations,
+    parse_merge_queue_entries,
 };
 
 pub(super) struct ObservedRuns {
@@ -355,6 +356,7 @@ pub(super) fn fetch_check_observations(
     sha: &str,
 ) -> Result<(Vec<CheckObservation>, bool), String> {
     let mut checks = Vec::new();
+    let mut truncated = false;
     for page in 1..=OBSERVATION_MAX_PAGES {
         let raw = actions
             .run_gh(&[
@@ -370,10 +372,57 @@ pub(super) fn fetch_check_observations(
         let page_len = page_checks.len();
         checks.extend(page_checks);
         if page_len < OBSERVATION_PAGE_SIZE {
-            return Ok((checks, false));
+            break;
+        }
+        if page == OBSERVATION_MAX_PAGES {
+            truncated = true;
         }
     }
-    Ok((checks, true))
+    for page in 1..=OBSERVATION_MAX_PAGES {
+        let raw = actions
+            .run_gh(&[
+                "api".to_owned(),
+                format!(
+                    "repos/{repo}/commits/{sha}/statuses?per_page={OBSERVATION_PAGE_SIZE}&page={page}"
+                ),
+            ])
+            .map_err(|error| format!("inspect front commit statuses failed: {error}"))?;
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("could not parse front commit-statuses JSON: {error}"))?;
+        let statuses = value
+            .as_array()
+            .ok_or_else(|| "commit-statuses response is not an array".to_owned())?;
+        checks.extend(statuses.iter().filter_map(|status| {
+            let state = status.get("state")?.as_str()?;
+            Some(CheckObservation {
+                name: status.get("context")?.as_str()?.to_owned(),
+                status: if state == "pending" {
+                    "in_progress".to_owned()
+                } else {
+                    "completed".to_owned()
+                },
+                started_at: status
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .or_else(|| status.get("created_at").and_then(Value::as_str))
+                    .map(str::to_owned),
+                conclusion: (state != "pending").then(|| {
+                    if state == "error" {
+                        "failure".to_owned()
+                    } else {
+                        state.to_owned()
+                    }
+                }),
+            })
+        }));
+        if statuses.len() < OBSERVATION_PAGE_SIZE {
+            break;
+        }
+        if page == OBSERVATION_MAX_PAGES {
+            truncated = true;
+        }
+    }
+    Ok((checks, truncated))
 }
 
 pub(super) fn fetch_observed_workflow_runs(
@@ -623,16 +672,35 @@ pub(super) fn count_releasable_commits(
     if u64::try_from(commits.len()).ok() != Some(commits_ahead) {
         return Ok((commits_ahead, true));
     }
-    let mut releasable = 0;
-    let mut truncated = false;
-    for commit in commits {
+    let unskipped = commits
+        .iter()
+        .map(|commit| {
+            let message = commit
+                .pointer("/commit/message")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "release comparison commit missing message".to_owned())?;
+            Ok((!release_is_skipped(message)).then_some(commit))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut releasable = u64::try_from(
+        unskipped
+            .len()
+            .saturating_sub(MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK),
+    )
+    .expect("bounded commit count fits u64");
+    let mut truncated = unskipped.len() > MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK;
+    for commit in unskipped
+        .into_iter()
+        .take(MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK)
+    {
         let message = commit
             .pointer("/commit/message")
             .and_then(Value::as_str)
             .ok_or_else(|| "release comparison commit missing message".to_owned())?;
-        if release_is_skipped(message) {
-            continue;
-        }
+        debug_assert!(!release_is_skipped(message));
         let sha = commit
             .get("sha")
             .and_then(Value::as_str)

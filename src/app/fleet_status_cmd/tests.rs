@@ -304,6 +304,72 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn release_commit_detail_lookups_are_bounded_and_fail_closed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            "printf x >> '{}'\nprintf '%s' '{{\"files\":[{{\"filename\":\"docs/readme.md\"}}]}}'",
+            calls.display()
+        ),
+    );
+    let commits = (0..=MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK)
+        .map(|index| {
+            serde_json::json!({
+                "sha": format!("sha-{index}"),
+                "commit": {"message": "docs"}
+            })
+        })
+        .collect::<Vec<_>>();
+    let comparison = serde_json::json!({"commits": commits});
+    assert_eq!(
+        count_releasable_commits(
+            &actions,
+            "owner/repo",
+            &comparison,
+            u64::try_from(MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK + 1).expect("count")
+        )
+        .expect("bounded comparison"),
+        (1, true)
+    );
+    assert_eq!(
+        fs::read_to_string(calls).expect("calls").len(),
+        MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_observations_include_legacy_commit_statuses() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"/check-runs"*) printf '%s' '{"check_runs":[]}' ;;
+  *"/statuses"*) printf '%s' '[{"context":"legacy-ci","state":"success","created_at":"2026-07-26T00:00:00Z","updated_at":"2026-07-26T00:01:00Z"},{"context":"legacy-pending","state":"pending","created_at":"2026-07-26T00:02:00Z"}]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let (checks, truncated) =
+        fetch_check_observations(&actions, "owner/repo", "abc").expect("checks");
+    assert!(!truncated);
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0].name, "legacy-ci");
+    assert_eq!(checks[0].status, "completed");
+    assert_eq!(checks[0].conclusion.as_deref(), Some("success"));
+    assert_eq!(
+        checks[0].started_at.as_deref(),
+        Some("2026-07-26T00:01:00Z")
+    );
+    assert_eq!(checks[1].status, "in_progress");
+    assert_eq!(checks[1].conclusion, None);
+}
+
+#[cfg(unix)]
+#[test]
 fn durable_snapshot_detects_open_pr_whose_auto_merge_was_cleared() {
     let temp = tempfile::tempdir().expect("temp");
     let calls = temp.path().join("calls");
