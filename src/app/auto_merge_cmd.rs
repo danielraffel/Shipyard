@@ -1902,6 +1902,14 @@ fn repository_requires_merge_queue(
 }
 
 fn live_merge_queue_present(body: &Value) -> Result<bool, String> {
+    if let Some(errors) = body.get("errors") {
+        let errors = errors.as_array().ok_or_else(|| {
+            "branch merge-queue query returned malformed GraphQL errors".to_owned()
+        })?;
+        if !errors.is_empty() {
+            return Err("branch merge-queue query returned GraphQL errors".to_owned());
+        }
+    }
     body.pointer("/data/repository/mergeQueue")
         .map(|queue| !queue.is_null())
         .ok_or_else(|| "branch merge-queue query omitted repository authority".to_owned())
@@ -1912,12 +1920,11 @@ const PRIVATE_FREE_RULES_ENTITLEMENT: &str =
 
 fn evaluated_rules_unavailable_on_private_free_plan(stderr: &str) -> bool {
     let expected = format!("{PRIVATE_FREE_RULES_ENTITLEMENT} (HTTP 403)");
-    stderr.lines().any(|line| {
-        line.trim()
-            .strip_prefix("gh: ")
-            .unwrap_or_else(|| line.trim())
-            == expected
-    })
+    stderr
+        .trim()
+        .strip_prefix("gh: ")
+        .unwrap_or_else(|| stderr.trim())
+        == expected
 }
 
 pub(super) fn target_requires_merge_queue(
@@ -2408,6 +2415,9 @@ mod tests {
         assert!(!evaluated_rules_unavailable_on_private_free_plan(
             "gh: Upgrade to GitHub Pro or make this repository public. (HTTP 403)"
         ));
+        assert!(!evaluated_rules_unavailable_on_private_free_plan(
+            "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\ngh: Resource not accessible by integration (HTTP 403)"
+        ));
     }
 
     #[test]
@@ -2430,6 +2440,14 @@ mod tests {
             }))
             .expect_err("missing queue authority must fail closed")
             .contains("omitted repository authority")
+        );
+        assert!(
+            live_merge_queue_present(&serde_json::json!({
+                "errors": [{"message": "partial failure"}],
+                "data": {"repository": {"mergeQueue": null}}
+            }))
+            .expect_err("GraphQL errors plus null queue must fail closed")
+            .contains("GraphQL errors")
         );
     }
 

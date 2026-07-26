@@ -223,11 +223,18 @@ pub fn rules_require_merge_queue(body: &serde_json::Value) -> Result<bool, Strin
     let rules = body
         .as_array()
         .ok_or_else(|| "evaluated branch rules response is not an array".to_owned())?;
-    Ok(rules.iter().any(|rule| {
-        rule.get("type")
+    let mut requires_merge_queue = false;
+    for (index, rule) in rules.iter().enumerate() {
+        let kind = rule
+            .get("type")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| kind == "merge_queue")
-    }))
+            .filter(|kind| !kind.is_empty())
+            .ok_or_else(|| {
+                format!("evaluated branch rule at index {index} has no valid string type")
+            })?;
+        requires_merge_queue |= kind == "merge_queue";
+    }
+    Ok(requires_merge_queue)
 }
 
 /// Parse a merge-queue GraphQL poll response into a [`QueuePollParse`].
@@ -608,6 +615,19 @@ mod tests {
             Ok(false)
         );
         assert!(rules_require_merge_queue(&serde_json::json!({"rules": []})).is_err());
+        assert!(
+            rules_require_merge_queue(&serde_json::json!([
+                { "type": "merge_queue" },
+                { "parameters": {} }
+            ]))
+            .is_err()
+        );
+        assert!(
+            rules_require_merge_queue(&serde_json::json!([
+                { "type": 403 }
+            ]))
+            .is_err()
+        );
     }
 
     // --- F2: a truncated page must not manufacture an eviction ---
