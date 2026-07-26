@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0790"></a>
-## [0.79.1]
+<a id="v0791"></a>
+## [0.79.1] - 2026-07-26
 
+- test(merge): cover composed fallback decision ([#380](https://github.com/danielraffel/Shipyard/pull/380))
+
+<a id="v0790"></a>
 ## [0.79.0] - 2026-07-23
 
 - fix(merge): prove complete queue authority before arming ([#379](https://github.com/danielraffel/Shipyard/pull/379))
@@ -702,6 +705,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.79.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.79.1
 [0.79.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.79.0
 [0.78.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.78.0
 [0.77.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.77.1
