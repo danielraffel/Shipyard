@@ -236,7 +236,7 @@ mod tests {
                 &request,
             ))
             .expect("save envelope");
-        Queue::new(state_dir.join("queue"))
+        Queue::new(state_dir)
             .expect("queue")
             .enqueue(job)
             .expect("enqueue");

@@ -23,6 +23,8 @@ use crate::config::LoadedConfig;
 use crate::executor::ssh::shlex_quote;
 use crate::output::write_json_envelope;
 
+const FLEET_LANE_TARGET: &str = "macos";
+
 pub(super) struct FleetStatusArgs {
     pub(super) repo: Option<String>,
     pub(super) target: String,
@@ -46,6 +48,8 @@ struct HostFleetStatus {
     github_runner_count: usize,
     stale_vm_count: usize,
     routable: bool,
+    problems: Vec<Value>,
+    supervisors: Vec<Value>,
 }
 
 pub(super) fn fleet_status_command<W: Write>(
@@ -81,7 +85,11 @@ pub(super) fn fleet_status_command<W: Write>(
                 source: "capacity missing for host class".to_owned(),
             });
         let doctor = probe_doctor(class);
-        hosts.push(analyze_host(capacity, doctor));
+        // `--target` is a GitHub job-name substring, not a TartCI routing
+        // label. FleetStatus is the macOS VM fleet command, so host health is
+        // always scoped to the macOS lane even for custom job names such as
+        // `required-apple-tests`.
+        hosts.push(analyze_host(capacity, doctor, FLEET_LANE_TARGET));
     }
 
     let queue_run_limit = args.queue_run_limit.clamp(1, 100);
@@ -287,6 +295,9 @@ fn probe_doctor(class: &HostClassConfig) -> DoctorProbe {
             .output()
     } else {
         let mut command = Command::new(&class.tartci_bin);
+        if let Some(github_cli) = &class.github_cli {
+            command.env("TARTCI_GH_CLI", github_cli);
+        }
         if let Some(tart_home) = &class.tart_home {
             command.env("TART_HOME", tart_home);
         }
@@ -355,13 +366,18 @@ fn doctor_probe_from_output(output: &Output, base_source: &str) -> DoctorProbe {
     }
 }
 
-fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe) -> HostFleetStatus {
+fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe, target: &str) -> HostFleetStatus {
     let digest = doctor.digest.as_ref();
-    let supervisors = digest
+    let all_supervisors = digest
         .and_then(|value| value.get("supervisors"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let supervisors = all_supervisors
+        .iter()
+        .filter(|supervisor| item_matches_target(supervisor, target))
+        .cloned()
+        .collect::<Vec<_>>();
     let heartbeat_stale_secs = digest
         .and_then(|value| value.pointer("/config/heartbeat_stale_secs"))
         .and_then(Value::as_i64)
@@ -372,14 +388,33 @@ fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe) -> HostFleetStatus 
         .count();
     let supervisor_count = supervisors.len();
     let stale_supervisor_count = supervisor_count.saturating_sub(fresh_supervisor_count);
-    let problem_count = array_len(digest, "problems");
-    let github_runner_count = array_len(digest, "github_runners");
+    let problems = digest
+        .and_then(|value| value.get("problems"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|problem| problem_matches_target(problem, &all_supervisors, target))
+        .cloned()
+        .collect::<Vec<_>>();
+    let problem_count = problems.len();
+    let github_runner_count = digest
+        .and_then(|value| value.get("github_runners"))
+        .and_then(Value::as_array)
+        .map_or(0, |runners| {
+            runners
+                .iter()
+                .filter(|runner| item_matches_target(runner, target))
+                .count()
+        });
     let stale_vm_count = digest
         .and_then(|value| value.get("vms"))
         .and_then(Value::as_array)
         .map_or(0, |vms| {
             vms.iter()
                 .filter(|vm| vm.get("stale").and_then(Value::as_bool).unwrap_or(false))
+                .filter(|vm| {
+                    item_or_related_supervisor_matches_target(vm, &all_supervisors, target)
+                })
                 .count()
         });
     let routable = capacity.readable()
@@ -397,7 +432,87 @@ fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe) -> HostFleetStatus 
         github_runner_count,
         stale_vm_count,
         routable,
+        problems,
+        supervisors,
     }
+}
+
+fn normalized_target(target: &str) -> String {
+    let normalized = target.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "mac" | "darwin" => "macos".to_owned(),
+        "win" => "windows".to_owned(),
+        _ if normalized.starts_with("macos-") || normalized.starts_with("darwin-") => {
+            "macos".to_owned()
+        }
+        _ if normalized.starts_with("windows-") => "windows".to_owned(),
+        _ if normalized.starts_with("linux-") => "linux".to_owned(),
+        _ => normalized,
+    }
+}
+
+fn labels_match_target(labels: &Value, target: &str) -> bool {
+    let target = normalized_target(target);
+    let matches = |label: &str| {
+        let label = label.trim().to_ascii_lowercase();
+        label == target || (target == "macos" && label == "darwin")
+    };
+    if let Some(labels) = labels.as_str() {
+        return labels.split(',').any(matches);
+    }
+    labels
+        .as_array()
+        .is_some_and(|labels| labels.iter().filter_map(Value::as_str).any(matches))
+}
+
+fn item_matches_target(item: &Value, target: &str) -> bool {
+    item.get("labels")
+        .is_some_and(|labels| labels_match_target(labels, target))
+}
+
+fn item_identity(item: &Value) -> Option<&str> {
+    item.get("name")
+        .or_else(|| item.get("vm"))
+        .or_else(|| item.get("runner"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+}
+
+fn item_or_related_supervisor_matches_target(
+    item: &Value,
+    supervisors: &[Value],
+    target: &str,
+) -> bool {
+    if item_matches_target(item, target) {
+        return true;
+    }
+    let Some(identity) = item_identity(item) else {
+        return true;
+    };
+    let related = supervisors.iter().filter(|supervisor| {
+        ["name", "vm", "runner"]
+            .iter()
+            .any(|key| supervisor.get(*key).and_then(Value::as_str) == Some(identity))
+    });
+    let mut found = false;
+    for supervisor in related {
+        found = true;
+        if item_matches_target(supervisor, target) {
+            return true;
+        }
+    }
+    !found
+}
+
+fn problem_matches_target(problem: &Value, supervisors: &[Value], target: &str) -> bool {
+    let Some(problem) = problem.as_str() else {
+        return true;
+    };
+    let Some((_, identity)) = problem.split_once(':') else {
+        return true;
+    };
+    let item = serde_json::json!({"name": identity});
+    item_or_related_supervisor_matches_target(&item, supervisors, target)
 }
 
 fn supervisor_is_fresh(supervisor: &Value, stale_after_secs: i64) -> bool {
@@ -412,17 +527,13 @@ fn supervisor_is_fresh(supervisor: &Value, stale_after_secs: i64) -> bool {
     owner_alive && heartbeat_age <= stale_after_secs
 }
 
-fn array_len(digest: Option<&Value>, key: &str) -> usize {
-    digest
-        .and_then(|value| value.get(key))
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len)
-}
-
 fn remote_tartci_command(class: &HostClassConfig) -> String {
     let mut parts = vec!["env".to_owned(), format!("PATH={REMOTE_PROBE_PATH}")];
     if let Some(tart_home) = &class.tart_home {
         parts.push(format!("TART_HOME={}", shlex_quote(tart_home)));
+    }
+    if let Some(github_cli) = &class.github_cli {
+        parts.push(format!("TARTCI_GH_CLI={}", shlex_quote(github_cli)));
     }
     parts.push(shlex_quote(&class.tartci_bin));
     parts.extend(
@@ -576,14 +687,11 @@ fn host_to_json(host: &HostFleetStatus) -> Value {
         "stale_vm_count".to_owned(),
         Value::from(host.stale_vm_count),
     );
-    if let Some(digest) = &host.doctor.digest {
-        m.insert(
-            "problems".to_owned(),
-            digest.get("problems").cloned().unwrap_or(Value::Null),
-        );
+    if host.doctor.digest.is_some() {
+        m.insert("problems".to_owned(), Value::from(host.problems.clone()));
         m.insert(
             "supervisors".to_owned(),
-            digest.get("supervisors").cloned().unwrap_or(Value::Null),
+            Value::from(host.supervisors.clone()),
         );
     }
     Value::Object(m)
@@ -628,13 +736,87 @@ mod tests {
             cap: 2,
             tart_bin: "/opt/homebrew/bin/tart".to_owned(),
             tartci_bin: "/Users/ci user/.local/bin/tartci".to_owned(),
+            github_cli: Some("ghapp".to_owned()),
             tart_home: Some("/Users/ci user/VMs".to_owned()),
             labels: Vec::new(),
         };
         assert_eq!(
             remote_tartci_command(&class),
-            "env PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin TART_HOME='/Users/ci user/VMs' '/Users/ci user/.local/bin/tartci' doctor --reap --json"
+            "env PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin TART_HOME='/Users/ci user/VMs' TARTCI_GH_CLI=ghapp '/Users/ci user/.local/bin/tartci' doctor --reap --json"
         );
+    }
+
+    #[test]
+    fn remote_tartci_command_leaves_github_cli_unset_by_default() {
+        let class = HostClassConfig {
+            class: "studio".to_owned(),
+            ssh: Some("studio".to_owned()),
+            cap: 2,
+            tart_bin: "tart".to_owned(),
+            tartci_bin: "tartci".to_owned(),
+            github_cli: None,
+            tart_home: None,
+            labels: Vec::new(),
+        };
+
+        assert!(!remote_tartci_command(&class).contains("TARTCI_GH_CLI"));
+    }
+
+    #[test]
+    fn composite_platform_target_matches_lane_labels() {
+        let labels = serde_json::json!(["self-hosted", "macOS", "ARM64"]);
+
+        assert!(labels_match_target(&labels, "macos-arm64"));
+        assert!(labels_match_target(&labels, "darwin-arm64"));
+        assert!(!labels_match_target(&labels, "linux-arm64"));
+    }
+
+    #[test]
+    fn fleet_lane_is_independent_of_custom_queue_job_name() {
+        let custom_queue_target = "required-apple-tests";
+        let labels = serde_json::json!(["self-hosted", "macOS", "ARM64"]);
+
+        assert!(!labels_match_target(&labels, custom_queue_target));
+        assert!(labels_match_target(&labels, FLEET_LANE_TARGET));
+    }
+
+    #[test]
+    fn analyze_host_scopes_health_to_requested_target() {
+        let doctor = DoctorProbe {
+            readable: true,
+            source: "test".to_owned(),
+            digest: Some(serde_json::json!({
+                "config": {"heartbeat_stale_secs": 900},
+                "problems": ["suspect_live_owner_stale_heartbeat:linux-ephr-1"],
+                "supervisors": [
+                    {"runner":"pulp-vm-01", "vm":"pulp-vm-01-x", "labels":"self-hosted,macOS,ARM64", "owner_pid_alive":true, "heartbeat_age_secs":5},
+                    {"runner":"linux-ephr-1", "vm":"linux-ephr-1", "labels":"self-hosted,Linux,ARM64", "owner_pid_alive":true, "heartbeat_age_secs":5000}
+                ],
+                "vms": [
+                    {"name":"linux-ephr-1", "stale":true}
+                ],
+                "github_runners": [
+                    {"name":"pulp-vm-01", "labels":["self-hosted", "macOS", "ARM64"]},
+                    {"name":"linux-ephr-1", "labels":["self-hosted", "Linux", "ARM64"]}
+                ]
+            })),
+        };
+        let host = analyze_host(
+            HostCapacity {
+                class: "studio".to_owned(),
+                ssh: None,
+                cap: 2,
+                running: Some(0),
+                source: "test".to_owned(),
+            },
+            doctor,
+            "macos",
+        );
+        assert!(host.routable);
+        assert_eq!(host.problem_count, 0);
+        assert_eq!(host.supervisor_count, 1);
+        assert_eq!(host.github_runner_count, 1);
+        assert_eq!(host.stale_vm_count, 0);
     }
 
     #[test]
@@ -650,6 +832,14 @@ mod tests {
 
         assert!(probe.readable);
         assert_eq!(probe.source, "ssh (doctor exit 1)");
-        assert_eq!(array_len(probe.digest.as_ref(), "problems"), 1);
+        assert_eq!(
+            probe
+                .digest
+                .as_ref()
+                .and_then(|digest| digest.get("problems"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            1
+        );
     }
 }

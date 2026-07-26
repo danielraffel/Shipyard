@@ -12,6 +12,7 @@ use super::CliFailure;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
+use crate::queue::Queue;
 use crate::ship_state::ShipStateStore;
 
 const ACTIVE_SHIP_STATE_DAYS: i64 = 14;
@@ -121,7 +122,7 @@ struct ShipStateCleanupReport {
 
 fn cleanup_retention(state_dir: &Path, dry_run: bool) -> Result<CleanupResult, CliFailure> {
     let mut items = Vec::new();
-    let active_ids = load_active_job_ids(&state_dir.join("queue").join("queue.json"));
+    let active_ids = load_active_job_ids(&Queue::queue_file_at(state_dir));
     scan_orphaned_logs(state_dir, &active_ids, dry_run, &mut items)?;
     scan_bundles(state_dir, dry_run, &mut items)?;
     scan_evidence(state_dir, dry_run, &mut items)?;

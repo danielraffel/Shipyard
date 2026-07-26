@@ -165,6 +165,14 @@ fleet-status` before admitting jobs that claim a macOS VM slot. If every local
 macOS slot is occupied, the macOS job stays queued; Linux/Windows/cloud jobs do
 not consume that `macos` slot and can still run.
 
+`runner fleet-status --target macos` scopes supervisor freshness and problems
+to macOS-labeled providers. A wedged Linux provider remains visible to a Linux
+fleet query but does not falsely remove healthy macOS capacity. When tartci must
+use an App-authenticated GitHub wrapper, set `github_cli = "ghapp"` on each
+`[host_class.<name>]`; Shipyard passes it to local and SSH doctor probes as
+`TARTCI_GH_CLI`. When omitted, local probes preserve any inherited
+`TARTCI_GH_CLI` and remote probes retain tartci's default.
+
 ## Explicit Cloud Fallback
 
 GitHub-hosted macOS fallback must be explicit and should be reserved for a local

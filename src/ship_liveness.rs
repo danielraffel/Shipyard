@@ -375,19 +375,20 @@ pub fn with_liveness_context<R>(
     stale_after: Duration,
     f: impl FnOnce(&LivenessContext<'_>) -> R,
 ) -> R {
-    // The durable `Queue` lives at `<state_dir>/queue`; `QueueRequestStore` roots
-    // at the base state dir (it appends `queue/requests` internally). Only touch
-    // them when the queue already exists so a diagnostic never materializes state.
-    let queue_dir = state_dir.join("queue");
-    let (jobs, request_store) = if queue_dir.is_dir() {
-        let jobs = match Queue::new(&queue_dir) {
+    // The durable `Queue` lives directly in `state_dir`; `QueueRequestStore`
+    // appends `queue/requests` internally. Only touch them when queue.json
+    // already exists so a diagnostic never materializes state.
+    let queue_file = Queue::queue_file_at(state_dir);
+    let request_dir = state_dir.join("queue").join("requests");
+    let (jobs, request_store) = if queue_file.is_file() {
+        let jobs = match Queue::new(state_dir) {
             Ok(mut queue) => queue.get_all().ok(),
             Err(_) => None,
         };
         // Only open the request store when it already exists — otherwise its
         // constructor would `create_dir_all`. Absent means no ship jobs were ever
         // enqueued, so there is nothing to map and time-fallback is correct.
-        let request_store = if queue_dir.join("requests").is_dir() {
+        let request_store = if request_dir.is_dir() {
             QueueRequestStore::new(state_dir).ok()
         } else {
             None
