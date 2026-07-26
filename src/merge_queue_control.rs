@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use fs2::FileExt;
@@ -19,6 +20,7 @@ use crate::ship_state::{ShipState, ShipStateStore};
 pub const HOLD_FILE: &str = "merge_queue/HOLD";
 const CONTROL_LOCK_FILE: &str = "merge_queue/control.lock";
 const AUDIT_FILE: &str = "merge_queue/mutations.jsonl";
+static CORRELATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct ControlLock(Option<File>);
@@ -365,7 +367,7 @@ pub fn supersede_uncertainty(
     global_dir: &Path,
     correlation_id: &str,
     reason: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut control_lock = acquire_control_lock(state_root, false)?;
     let hold_path = state_root.join(HOLD_FILE);
     if hold_path.exists() {
@@ -383,9 +385,7 @@ pub fn supersede_uncertainty(
             .and_then(serde_json::Value::as_str)
             == Some(correlation_id)
     }) {
-        return Err(format!(
-            "no uncertain merge-queue mutation has correlation id `{correlation_id}`"
-        ));
+        return Ok(false);
     }
     append_audit(
         &state_root.join(AUDIT_FILE),
@@ -401,7 +401,8 @@ pub fn supersede_uncertainty(
     .map_err(|error| format!("failed to supersede merge-queue mutation: {error}"))?;
     control_lock
         .unlock()
-        .map_err(|error| format!("failed to release merge-queue control lock: {error}"))
+        .map_err(|error| format!("failed to release merge-queue control lock: {error}"))?;
+    Ok(true)
 }
 
 /// Exclusive authority for one repository/base merge queue mutation.
@@ -503,11 +504,7 @@ impl DurableMutationIntent {
         global_dir: &Path,
         reason: &str,
     ) -> Result<bool, String> {
-        if !self.is_uncertain(state_root)? {
-            return Ok(false);
-        }
-        supersede_uncertainty(state_root, global_dir, &self.correlation_id, reason)?;
-        Ok(true)
+        supersede_uncertainty(state_root, global_dir, &self.correlation_id, reason)
     }
 }
 
@@ -621,9 +618,10 @@ impl MergeQueueMutationGuard {
     #[must_use]
     pub fn new_correlation_id() -> String {
         format!(
-            "mq-{}-{}",
+            "mq-{}-{}-{}",
             Utc::now().format("%Y%m%dT%H%M%S%.6fZ"),
-            process::id()
+            process::id(),
+            CORRELATION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         )
     }
 
@@ -941,6 +939,8 @@ mod tests {
     #[test]
     fn durable_mutation_intent_round_trips_fresh_and_legacy_correlations() {
         let fresh = DurableMutationIntent::new();
+        let second = DurableMutationIntent::new();
+        assert_ne!(fresh.correlation_id(), second.correlation_id());
         let resumed =
             DurableMutationIntent::resume(fresh.correlation_id()).expect("valid correlation");
         assert_eq!(resumed, fresh);

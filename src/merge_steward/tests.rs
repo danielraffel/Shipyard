@@ -85,6 +85,24 @@ fn newest_duplicate_required_context_is_authoritative() {
 }
 
 #[test]
+fn undated_pending_duplicate_blocks_older_success() {
+    let mut pr = green_pr();
+    pr.checks[0].observed_at = Some("2026-07-26T00:00:00Z".to_owned());
+    pr.checks.push(StewardCheck {
+        name: "required".to_owned(),
+        app_id: None,
+        status: "QUEUED".to_owned(),
+        conclusion: None,
+        run_id: Some(12),
+        observed_at: None,
+    });
+    assert!(matches!(
+        classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
+        StewardDecision::WaitingRequired { .. }
+    ));
+}
+
+#[test]
 fn app_bound_requirement_accepts_only_the_matching_check_producer() {
     let mut policy = queue_policy();
     policy.required_checks[0].app_id = Some(42);

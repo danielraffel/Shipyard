@@ -3,9 +3,8 @@ use super::{
     Path, PendingCancellation, PendingCancellationPhase, PendingMutationKind, RepoObservation,
     RunCancellation, StewardLedger, StewardRun, Utc, acquire_pending_cancellation_guard,
     cancellation_reason_label, clear_pending_cancellation, complete_capacity_cancellation,
-    current_pending_run_identity_matches, merge_group_pr_number, preemption_key, queue_front_head,
-    record_audit, revalidate_capacity_preemption, save_ledger,
-    validate_pending_cancellation_authority,
+    merge_group_pr_number, preemption_key, queue_front_head, record_audit,
+    revalidate_capacity_preemption, save_ledger, validate_pending_cancellation_authority,
 };
 
 pub(super) fn apply_capacity_preemption(
@@ -36,9 +35,16 @@ pub(super) fn apply_capacity_preemption(
             }
             Err(error) => return (None, Some(error)),
         };
-    match current_pending_run_identity_matches(context.actions, &pending) {
-        Ok(true) => {}
-        Ok(false) => {
+    match revalidate_capacity_preemption(
+        context.actions,
+        context.observation,
+        context.cancellation,
+        observed,
+        expected_front,
+        opt_out_label,
+    ) {
+        Ok(Some(latest)) if latest.candidate == cancel_live.candidate => {}
+        Ok(Some(_) | None) => {
             let key = pending_cancellation_key(&pending);
             if let Err(error) = mark_cancellation_skipped(ledger, context.ledger_path, &key) {
                 return (None, Some(error));

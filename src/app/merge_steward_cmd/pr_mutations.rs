@@ -1,8 +1,8 @@
 use super::{
-    BTreeMap, GitHubActions, MutationApplyContext, ObservedPr, Path, RepoObservation,
-    StewardDecision, StewardLedger, StewardPolicy, Value, acquire_pr_mutation_guard, attempt_key,
-    attempts_for, classify_pr, enqueue_requirements_pending, gh_json, merge_queue_snapshot,
-    parse_run, pull_request_with_required_checks, record_audit, save_ledger,
+    GitHubActions, MutationApplyContext, ObservedPr, Path, RepoObservation, StewardDecision,
+    StewardLedger, StewardPolicy, Value, acquire_pr_mutation_guard, attempt_key, attempts_for,
+    classify_pr, enqueue_requirements_pending, gh_json, merge_queue_snapshot, parse_run,
+    pull_request_with_required_checks, record_audit, save_ledger,
 };
 
 pub(super) fn mutate_pr(
@@ -25,7 +25,13 @@ pub(super) fn mutate_pr(
         &context.observation.repo,
         &context.observation.base,
     ) {
-        Ok((_, positions, _, _)) => positions,
+        Ok((enabled, positions, _, _)) if enabled == policy.merge_queue => positions,
+        Ok(_) => {
+            return (
+                Some("skipped_after_queue_capability_change".to_owned()),
+                None,
+            );
+        }
         Err(error) => return (None, Some(error)),
     };
     let live_pr = match pull_request_with_required_checks(
@@ -154,7 +160,14 @@ pub(super) fn enqueue_pull_request(
         format!("head={}", pr.fact.head_sha),
     ]);
     match result {
-        Ok(_) => {
+        Ok(raw)
+            if serde_json::from_str::<Value>(&raw).is_ok_and(|value| {
+                value
+                    .pointer("/data/enqueuePullRequest/mergeQueueEntry")
+                    .is_some_and(|entry| !entry.is_null())
+                    && value.get("errors").is_none()
+            }) =>
+        {
             if let Err(error) = guard.finish("enqueued") {
                 return (
                     Some("enqueued".to_owned()),
@@ -170,6 +183,20 @@ pub(super) fn enqueue_pull_request(
                 "enqueue_exact_head",
             );
             (Some("enqueued".to_owned()), None)
+        }
+        Ok(raw) => {
+            let audit_error = guard
+                .finish("rejected")
+                .err()
+                .map_or_else(String::new, |error| {
+                    format!("; mutation audit also failed: {error}")
+                });
+            (
+                None,
+                Some(format!(
+                    "GitHub enqueue returned no mergeQueueEntry: {raw}{audit_error}"
+                )),
+            )
         }
         Err(error) => {
             let message = error.to_string();
@@ -357,11 +384,13 @@ pub(super) fn revalidate_transient_rerun(
     run_id: u64,
     ledger: &StewardLedger,
 ) -> Result<bool, String> {
+    let (_, queue_positions, _, _) =
+        merge_queue_snapshot(actions, &observation.repo, &observation.base)?;
     let Some(live_pr) = pull_request_with_required_checks(
         actions,
         &observation.repo,
         observed_pr.fact.number,
-        &BTreeMap::new(),
+        &queue_positions,
         &policy.required_checks,
     )?
     else {

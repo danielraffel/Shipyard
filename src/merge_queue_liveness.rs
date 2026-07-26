@@ -30,7 +30,7 @@ pub struct CheckObservation {
     pub name: String,
     /// GitHub status (`queued`, `in_progress`, or `completed`).
     pub status: String,
-    /// Time at which GitHub started the check.
+    /// Time at which GitHub created or started the check.
     pub started_at: Option<String>,
     /// Terminal conclusion, when completed.
     pub conclusion: Option<String>,
@@ -327,6 +327,7 @@ pub fn parse_check_observations(body: &Value) -> Result<Vec<CheckObservation>, S
                 started_at: check
                     .get("started_at")
                     .and_then(Value::as_str)
+                    .or_else(|| check.get("created_at").and_then(Value::as_str))
                     .map(str::to_owned),
                 conclusion: check
                     .get("conclusion")
@@ -341,7 +342,7 @@ pub fn parse_check_observations(body: &Value) -> Result<Vec<CheckObservation>, S
 #[must_use]
 pub fn merge_group_pr(branch: &str) -> Option<u64> {
     let rest = branch.strip_prefix("gh-readonly-queue/")?;
-    let marker = rest.find("/pr-")?;
+    let marker = rest.rfind("/pr-")?;
     rest[marker + 4..]
         .split('-')
         .next()
@@ -573,8 +574,9 @@ fn current_check_observations(checks: &[CheckObservation]) -> Vec<CheckObservati
     current.into_values().cloned().collect()
 }
 
-fn check_observation_recency(check: &CheckObservation) -> (&str, bool) {
+fn check_observation_recency(check: &CheckObservation) -> (bool, &str, bool) {
     (
+        check.started_at.is_none() && !check.status.eq_ignore_ascii_case("completed"),
         check.started_at.as_deref().unwrap_or_default(),
         check.status.eq_ignore_ascii_case("completed"),
     )
@@ -1180,5 +1182,14 @@ mod tests {
                 .reason_codes
                 .contains(&LivenessReason::FrontRequiredStaleOrMissing)
         );
+    }
+
+    #[test]
+    fn merge_group_parser_uses_final_pr_marker_for_slash_base() {
+        assert_eq!(
+            merge_group_pr("gh-readonly-queue/release/pr-preview/pr-42-deadbeef"),
+            Some(42)
+        );
+        assert_eq!(merge_group_pr("topic/pr-42-deadbeef"), None);
     }
 }

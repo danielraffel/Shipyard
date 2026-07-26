@@ -376,8 +376,9 @@ fn selected_checks<'a>(
         .collect()
 }
 
-fn check_recency(check: &StewardCheck) -> (&str, bool) {
+fn check_recency(check: &StewardCheck) -> (bool, &str, bool) {
     (
+        check.observed_at.is_none() && !check.status.eq_ignore_ascii_case("COMPLETED"),
         check.observed_at.as_deref().unwrap_or_default(),
         check.status.eq_ignore_ascii_case("COMPLETED"),
     )
@@ -764,14 +765,7 @@ fn run_pull_request_number(run: &StewardRun) -> Option<u64> {
 /// Extract a PR number from GitHub's merge-group branch convention.
 #[must_use]
 pub fn merge_group_pr(branch: &str) -> Option<u64> {
-    let marker = branch.strip_prefix("gh-readonly-queue/")?.find("/pr-")?;
-    branch
-        .strip_prefix("gh-readonly-queue/")?
-        .get(marker + 4..)?
-        .split('-')
-        .next()?
-        .parse()
-        .ok()
+    crate::merge_queue_liveness::merge_group_pr(branch)
 }
 
 #[cfg(test)]

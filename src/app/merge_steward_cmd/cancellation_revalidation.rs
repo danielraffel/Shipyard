@@ -278,6 +278,7 @@ pub(super) fn revalidate_coalescing_cancellation(
     };
     Ok(exact.status.eq_ignore_ascii_case("queued")
         && exact.workflow_id == observed.workflow_id
+        && exact.run_attempt == observed.run_attempt
         && exact.event == observed.event
         && exact.head_sha.eq_ignore_ascii_case(&observed.head_sha)
         && exact
@@ -290,10 +291,7 @@ pub(super) fn merge_group_pr_number(run: &StewardRun) -> Option<u64> {
     if run.event != "merge_group" {
         return None;
     }
-    run.head_branch
-        .split_once("/pr-")
-        .and_then(|(_, suffix)| suffix.split('-').next())
-        .and_then(|number| number.parse().ok())
+    crate::merge_queue_liveness::merge_group_pr(&run.head_branch)
 }
 
 pub(super) fn attempts_for(
