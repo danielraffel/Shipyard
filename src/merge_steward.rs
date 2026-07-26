@@ -204,9 +204,19 @@ fn selected_checks<'a>(
         if pr.checks.is_empty() {
             return vec![("at-least-one-current-head-check".to_owned(), None)];
         }
-        return pr
-            .checks
-            .iter()
+        let mut newest_by_context = BTreeMap::<String, &StewardCheck>::new();
+        for check in &pr.checks {
+            newest_by_context
+                .entry(check.name.to_ascii_lowercase())
+                .and_modify(|current| {
+                    if check_recency(check) > check_recency(current) {
+                        *current = check;
+                    }
+                })
+                .or_insert(check);
+        }
+        return newest_by_context
+            .into_values()
             .map(|check| (check.name.clone(), Some(check)))
             .collect();
     }
@@ -219,15 +229,17 @@ fn selected_checks<'a>(
                 pr.checks
                     .iter()
                     .filter(|check| check.name.eq_ignore_ascii_case(required))
-                    .max_by_key(|check| {
-                        (
-                            check.observed_at.as_deref().unwrap_or_default(),
-                            check.status.eq_ignore_ascii_case("COMPLETED"),
-                        )
-                    }),
+                    .max_by_key(|check| check_recency(check)),
             )
         })
         .collect()
+}
+
+fn check_recency(check: &StewardCheck) -> (&str, bool) {
+    (
+        check.observed_at.as_deref().unwrap_or_default(),
+        check.status.eq_ignore_ascii_case("COMPLETED"),
+    )
 }
 
 fn is_transient_conclusion(conclusion: &str) -> bool {
@@ -736,6 +748,30 @@ mod tests {
             classify_pr(&red, &policy, &BTreeMap::new()),
             StewardDecision::RequiredFailed { .. }
         ));
+    }
+
+    #[test]
+    fn private_free_repo_uses_newest_duplicate_observed_check() {
+        let mut policy = queue_policy();
+        policy.merge_queue = false;
+        policy.native_auto_merge = false;
+        policy.required_contexts.clear();
+        let mut pr = green_pr();
+        pr.checks[0].name = "Required".to_owned();
+        pr.checks[0].conclusion = Some("FAILURE".to_owned());
+        pr.checks[0].observed_at = Some("2026-07-25T00:00:00Z".to_owned());
+        pr.checks.push(StewardCheck {
+            name: "required".to_owned(),
+            status: "COMPLETED".to_owned(),
+            conclusion: Some("SUCCESS".to_owned()),
+            run_id: Some(12),
+            observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
+        });
+
+        assert_eq!(
+            classify_pr(&pr, &policy, &BTreeMap::new()),
+            StewardDecision::ExactHeadMerge
+        );
     }
 
     #[test]

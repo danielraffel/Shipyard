@@ -3263,6 +3263,7 @@ fn enqueue_pull_request(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn mutate_transient_reruns(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
@@ -3291,7 +3292,7 @@ fn mutate_transient_reruns(
             &pr.fact.head_sha,
             *run_id,
         );
-        *ledger.transient_attempts.entry(key).or_default() += 1;
+        *ledger.transient_attempts.entry(key.clone()).or_default() += 1;
         record_audit(
             ledger,
             &context.observation.repo,
@@ -3320,24 +3321,45 @@ fn mutate_transient_reruns(
             ledger,
         ) {
             Ok(false) => {
-                record_audit(
-                    ledger,
-                    &context.observation.repo,
-                    &format!("run:{run_id}:{}", pr.fact.head_sha),
-                    "rerun_transient_skipped_after_live_revalidation",
-                );
                 if let Err(error) = guard.finish("skipped_after_live_revalidation") {
                     errors.push(format!("rerun skip mutation audit failed: {error}"));
+                    continue;
+                }
+                if let Err(error) = rollback_transient_attempt(
+                    ledger,
+                    context.ledger_path,
+                    &key,
+                    &context.observation.repo,
+                    *run_id,
+                    &pr.fact.head_sha,
+                    "rerun_transient_skipped_after_live_revalidation",
+                ) {
+                    errors.push(error);
                 }
                 continue;
             }
             Err(error) => {
                 let audit_error = guard.finish("revalidation_failed").err();
+                let rollback_error = audit_error.is_none().then(|| {
+                    rollback_transient_attempt(
+                        ledger,
+                        context.ledger_path,
+                        &key,
+                        &context.observation.repo,
+                        *run_id,
+                        &pr.fact.head_sha,
+                        "rerun_transient_revalidation_failed",
+                    )
+                    .err()
+                });
                 errors.push(format!(
-                    "{error}{}",
+                    "{error}{}{}",
                     audit_error.map_or_else(String::new, |error| format!(
                         "; mutation audit also failed: {error}"
-                    ))
+                    )),
+                    rollback_error
+                        .flatten()
+                        .map_or_else(String::new, |error| format!("; {error}"))
                 ));
                 continue;
             }
@@ -3370,6 +3392,34 @@ fn mutate_transient_reruns(
     } else {
         (None, Some(errors.join("; ")))
     }
+}
+
+fn rollback_transient_attempt(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    key: &str,
+    repo: &str,
+    run_id: u64,
+    head_sha: &str,
+    action: &str,
+) -> Result<(), String> {
+    let prior = ledger.transient_attempts.get(key).copied().unwrap_or(0);
+    if prior <= 1 {
+        ledger.transient_attempts.remove(key);
+    } else {
+        ledger
+            .transient_attempts
+            .insert(key.to_owned(), prior.saturating_sub(1));
+    }
+    record_audit(ledger, repo, &format!("run:{run_id}:{head_sha}"), action);
+    if let Err(error) = save_ledger(ledger_path, ledger) {
+        ledger.transient_attempts.insert(key.to_owned(), prior);
+        return Err(format!(
+            "could not persist transient rerun rollback: {}",
+            error.message
+        ));
+    }
+    Ok(())
 }
 
 fn revalidate_transient_rerun(
@@ -4143,6 +4193,37 @@ esac
         assert!(ledger.transient_attempts.is_empty());
         let calls = fs::read_to_string(log).expect("calls");
         assert!(!calls.contains("rerun-failed-jobs"), "{calls}");
+    }
+
+    #[test]
+    fn known_unperformed_transient_rerun_does_not_consume_budget() {
+        let temp = tempfile::tempdir().expect("temp");
+        let ledger_path = temp.path().join("ledger.json");
+        let key = "owner/repo#42:head:100".to_owned();
+        let mut ledger = StewardLedger {
+            transient_attempts: BTreeMap::from([(key.clone(), 1)]),
+            ..StewardLedger::default()
+        };
+        save_ledger(&ledger_path, &ledger).expect("seed intent");
+
+        rollback_transient_attempt(
+            &mut ledger,
+            &ledger_path,
+            &key,
+            "owner/repo",
+            100,
+            "head",
+            "rerun_transient_skipped_after_live_revalidation",
+        )
+        .expect("rollback");
+
+        assert!(!ledger.transient_attempts.contains_key(&key));
+        assert!(
+            !load_ledger(&ledger_path)
+                .expect("reload")
+                .transient_attempts
+                .contains_key(&key)
+        );
     }
 
     #[test]
