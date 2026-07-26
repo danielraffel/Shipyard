@@ -42,8 +42,8 @@ use assessment::{
 };
 #[cfg(test)]
 use observation::{
-    base_version_path, path_requires_release, release_compare_path, release_workflow_runs_path,
-    select_bounded_runs,
+    base_version_path, enrollment_snapshot_path, path_requires_release, release_compare_path,
+    release_workflow_runs_path, select_bounded_runs,
 };
 use observation::{
     classify_observation_error, fetch_observed_workflow_runs, inspect_merge_queue_liveness,
@@ -52,8 +52,8 @@ use observation::{
 };
 #[cfg(all(test, unix))]
 use observation::{
-    count_releasable_commits, enrollment_snapshot_path, fetch_check_observations,
-    fetch_merge_queue_entries, reconcile_enrollment_snapshot,
+    count_releasable_commits, fetch_check_observations, fetch_merge_queue_entries,
+    reconcile_enrollment_snapshot,
 };
 #[cfg(test)]
 pub(in crate::app) use policy::FleetLivenessPolicy;

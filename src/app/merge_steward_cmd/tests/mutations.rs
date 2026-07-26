@@ -1,5 +1,7 @@
 use super::*;
+#[cfg(unix)]
 use crate::app::merge_steward_cmd::cancellation::{apply_pr_plans, apply_run_cancellation};
+#[cfg(unix)]
 use crate::app::merge_steward_cmd::cancellation_recovery::{
     pending_uncertainty, resolve_rejected_pending_intent, resume_pending_cancellation,
 };
