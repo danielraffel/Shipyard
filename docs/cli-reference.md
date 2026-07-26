@@ -96,7 +96,11 @@ shipyard runner steward --no-preempt-capacity       # disable bounded preamble p
 the trusted machine-global `[merge_queue].mutation_machine`, rejects the
 central merge-queue `HOLD`, and serializes plus write-ahead audits every
 enqueue, merge, rerun, and cancellation through the shared mutation guard.
-Dry-run does not require mutation authority.
+Accepted capacity cancellations remain in the handoff ledger until an exact
+run/job read proves terminal; each apply pass resumes those records with an
+exact-run force-cancel before planning new work. Read failures keep the record
+pending and make the pass unhealthy. Dry-run does not require mutation
+authority.
 
 # Self-hosted runner provisioning (register / list / remove on this machine)
 shipyard runner tag --set studio          # set this box's machine tag (m1, m5, …)

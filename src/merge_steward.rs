@@ -250,6 +250,8 @@ pub struct StewardRun {
     pub id: u64,
     /// Stable workflow ID.
     pub workflow_id: u64,
+    /// GitHub workflow attempt number for this run ID.
+    pub run_attempt: u64,
     /// Workflow display name.
     pub workflow: String,
     /// Immutable run head SHA.
@@ -788,6 +790,7 @@ mod tests {
             StewardRun {
                 id: 1,
                 workflow_id: 8,
+                run_attempt: 1,
                 workflow: "Build and Test".to_owned(),
                 head_sha: sha('a'),
                 head_branch: "feature".to_owned(),
@@ -800,6 +803,7 @@ mod tests {
             StewardRun {
                 id: 2,
                 workflow_id: 8,
+                run_attempt: 1,
                 workflow: "Build and Test".to_owned(),
                 head_sha: sha('a'),
                 head_branch: "feature".to_owned(),
@@ -812,6 +816,7 @@ mod tests {
             StewardRun {
                 id: 3,
                 workflow_id: 9,
+                run_attempt: 1,
                 workflow: "Build and Test".to_owned(),
                 head_sha: sha('b'),
                 head_branch: "feature".to_owned(),
@@ -848,6 +853,7 @@ mod tests {
         let run = StewardRun {
             id: 1,
             workflow_id: 8,
+            run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('a'),
             head_branch: "feature".to_owned(),
@@ -874,6 +880,7 @@ mod tests {
             StewardRun {
                 id: 1,
                 workflow_id: 1,
+                run_attempt: 1,
                 workflow: "Build and Test".to_owned(),
                 head_sha: sha('a'),
                 head_branch: "feature".to_owned(),
@@ -886,6 +893,7 @@ mod tests {
             StewardRun {
                 id: 2,
                 workflow_id: 2,
+                run_attempt: 1,
                 workflow: "Build and Test".to_owned(),
                 head_sha: sha('b'),
                 head_branch: "main".to_owned(),
@@ -913,6 +921,7 @@ mod tests {
             StewardRun {
                 id: 10,
                 workflow_id: 8,
+                run_attempt: 1,
                 workflow: "Build and Test".to_owned(),
                 head_sha: sha('a'),
                 head_branch: "same-name".to_owned(),
@@ -925,6 +934,7 @@ mod tests {
             StewardRun {
                 id: 11,
                 workflow_id: 8,
+                run_attempt: 1,
                 workflow: "Build and Test".to_owned(),
                 head_sha: sha('b'),
                 head_branch: "same-name".to_owned(),
@@ -951,6 +961,7 @@ mod tests {
         let run = StewardRun {
             id: 12,
             workflow_id: 8,
+            run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('a'),
             head_branch: "feature".to_owned(),
@@ -986,6 +997,7 @@ mod tests {
             StewardRun {
                 id: 100,
                 workflow_id: 1,
+                run_attempt: 1,
                 workflow: "Build and Test".to_owned(),
                 head_sha: sha('f'),
                 head_branch: "gh-readonly-queue/main/pr-7-deadbeef".to_owned(),
@@ -1002,6 +1014,7 @@ mod tests {
             StewardRun {
                 id: 200,
                 workflow_id: 2,
+                run_attempt: 1,
                 workflow: "Example validation".to_owned(),
                 head_sha: sha('a'),
                 head_branch: "feature-a".to_owned(),
@@ -1025,6 +1038,7 @@ mod tests {
             StewardRun {
                 id: 300,
                 workflow_id: 3,
+                run_attempt: 1,
                 workflow: "Build and Test".to_owned(),
                 head_sha: sha('b'),
                 head_branch: "feature-b".to_owned(),

@@ -652,6 +652,12 @@ polls once more. If that still does not terminalize, the pass is unhealthy with
 an auditable `job@runner` handoff target. The steward does not remotely kill or
 restart a runner; any service recycle is an explicit exact-host, exact-run
 operator action followed by proof that the runner reconnects and claims work.
+The ledger keeps a pending-cancellation record keyed by canonical repository,
+run ID, immutable candidate head, and queue-front head until exact run and job
+reads prove terminal. Every apply pass resumes these records before candidate
+filtering, using the shared mutation guard for exact-run force-cancel. A
+transient observation failure leaves the record pending and makes the pass
+unhealthy for a later retry.
 
 ### Reroute watcher (cloud→local drain)
 

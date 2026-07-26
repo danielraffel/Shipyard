@@ -357,6 +357,53 @@ pub fn resolve_uncertainty(
         .map_err(|error| format!("failed to release merge-queue control lock: {error}"))
 }
 
+/// Close an uncertain mutation without claiming whether the remote request was
+/// accepted. Used when an exact terminal observation or a freshly revalidated
+/// idempotent retry makes the ambiguous request irrelevant.
+pub fn supersede_uncertainty(
+    state_root: &Path,
+    global_dir: &Path,
+    correlation_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let mut control_lock = acquire_control_lock(state_root, false)?;
+    let hold_path = state_root.join(HOLD_FILE);
+    if hold_path.exists() {
+        return Err(format!(
+            "merge-queue mutations are centrally held by {}",
+            hold_path.display()
+        ));
+    }
+    let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+        .map_err(|error| format!("failed to load merge-queue mutation policy: {error}"))?;
+    validate_machine_authority(&config, state_root)?;
+    if !uncertain_mutations(state_root)?.iter().any(|entry| {
+        entry
+            .get("correlation_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(correlation_id)
+    }) {
+        return Err(format!(
+            "no uncertain merge-queue mutation has correlation id `{correlation_id}`"
+        ));
+    }
+    append_audit(
+        &state_root.join(AUDIT_FILE),
+        &json!({
+            "timestamp": Utc::now(),
+            "correlation_id": correlation_id,
+            "phase": "finished",
+            "outcome": "superseded",
+            "reason": reason,
+            "resolver_pid": process::id(),
+        }),
+    )
+    .map_err(|error| format!("failed to supersede merge-queue mutation: {error}"))?;
+    control_lock
+        .unlock()
+        .map_err(|error| format!("failed to release merge-queue control lock: {error}"))
+}
+
 /// Exclusive authority for one repository/base merge queue mutation.
 #[derive(Debug)]
 pub struct MergeQueueMutationGuard {
@@ -369,6 +416,12 @@ pub struct MergeQueueMutationGuard {
 }
 
 impl MergeQueueMutationGuard {
+    /// Stable audit identity for durable state that brackets this mutation.
+    #[must_use]
+    pub fn correlation_id(&self) -> &str {
+        &self.correlation_id
+    }
+
     /// Verify machine authority and the central hold, then serialize mutations
     /// for this repository/base pair.
     pub fn acquire(
@@ -399,7 +452,42 @@ impl MergeQueueMutationGuard {
         let control_lock = acquire_control_lock(state_root, true)?;
         let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
             .map_err(|error| format!("failed to load merge-queue mutation policy: {error}"))?;
-        Self::acquire_with_control_lock(store, &config, state, action, control_lock)
+        Self::acquire_with_control_lock(store, &config, state, action, control_lock, None)
+    }
+
+    /// Acquire using a correlation ID already persisted by a crash-resumable
+    /// caller, closing the gap between guard creation and caller state.
+    pub fn acquire_in_mode_with_correlation(
+        store: &ShipStateStore,
+        _cwd: &Path,
+        _mode: RuntimeMode,
+        global_dir: &Path,
+        state: &ShipState,
+        action: &str,
+        correlation_id: &str,
+    ) -> Result<Self, String> {
+        let state_root = store.path().parent().unwrap_or_else(|| store.path());
+        let control_lock = acquire_control_lock(state_root, true)?;
+        let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+            .map_err(|error| format!("failed to load merge-queue mutation policy: {error}"))?;
+        Self::acquire_with_control_lock(
+            store,
+            &config,
+            state,
+            action,
+            control_lock,
+            Some(correlation_id),
+        )
+    }
+
+    /// Generate the same collision-resistant audit identity used by guards.
+    #[must_use]
+    pub fn new_correlation_id() -> String {
+        format!(
+            "mq-{}-{}",
+            Utc::now().format("%Y%m%dT%H%M%S%.6fZ"),
+            process::id()
+        )
     }
 
     /// Convert a preflight covering earlier remote branch work into the
@@ -414,7 +502,7 @@ impl MergeQueueMutationGuard {
     ) -> Result<Self, String> {
         let config = LoadedConfig::load_machine_global_from_dir(preflight.global_dir)
             .map_err(|error| format!("failed to load merge-queue mutation policy: {error}"))?;
-        Self::acquire_with_control_lock(store, &config, state, action, preflight.control_lock)
+        Self::acquire_with_control_lock(store, &config, state, action, preflight.control_lock, None)
     }
 
     fn acquire_with_control_lock(
@@ -423,6 +511,7 @@ impl MergeQueueMutationGuard {
         state: &ShipState,
         action: &str,
         control_lock: ControlLock,
+        correlation_id: Option<&str>,
     ) -> Result<Self, String> {
         let state_root = store.path().parent().unwrap_or_else(|| store.path());
         let control_dir = state_root.join("merge_queue");
@@ -477,11 +566,7 @@ impl MergeQueueMutationGuard {
             }
         }
 
-        let correlation_id = format!(
-            "mq-{}-{}",
-            Utc::now().format("%Y%m%dT%H%M%S%.6fZ"),
-            process::id()
-        );
+        let correlation_id = correlation_id.map_or_else(Self::new_correlation_id, str::to_owned);
         lock.set_len(0)
             .and_then(|()| {
                 writeln!(

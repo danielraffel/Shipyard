@@ -15,7 +15,9 @@ use serde_json::Value;
 use super::CliFailure;
 use crate::cloud::GitHubActions;
 use crate::identity::RuntimeMode;
-use crate::merge_queue_control::MergeQueueMutationGuard;
+use crate::merge_queue_control::{
+    MergeQueueMutationGuard, supersede_uncertainty, uncertain_mutations,
+};
 use crate::merge_steward::{
     QueueFrontPressure, RunCancellation, RunCancellationReason, StewardCheck, StewardDecision,
     StewardJob, StewardPolicy, StewardPullRequest, StewardRun, classify_pr,
@@ -103,7 +105,42 @@ struct StewardLedger {
     #[serde(default)]
     preemption_attempts: BTreeMap<String, u32>,
     #[serde(default)]
+    pending_cancellations: BTreeMap<String, PendingCancellation>,
+    #[serde(default)]
     audit: Vec<LedgerAudit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PendingCancellation {
+    repo: String,
+    base: String,
+    run_id: u64,
+    workflow_id: u64,
+    run_attempt: u64,
+    head_sha: String,
+    head_branch: String,
+    pr_number: u64,
+    front_head: String,
+    initiated_at: String,
+    phase: PendingCancellationPhase,
+    mutation_correlation_id: String,
+    mutation_kind: PendingMutationKind,
+    reason: String,
+    opt_out_label: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PendingCancellationPhase {
+    Intent,
+    Accepted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PendingMutationKind {
+    NormalCancel,
+    ForceCancel,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -117,6 +154,11 @@ struct LedgerAudit {
 struct NonTerminalRun {
     status: String,
     jobs: Vec<StewardJob>,
+}
+
+enum PendingRunState {
+    Terminal,
+    NonTerminal(NonTerminalRun),
 }
 
 struct CapacityRevalidation {
@@ -187,13 +229,21 @@ pub(super) fn steward_command<W: Write>(
         None
     };
     let mut ledger = load_ledger(&ledger_path)?;
+    let recovery_owned_preemption_budget = !ledger.pending_cancellations.is_empty();
+    let (mut recovery_errors, mut recovery_cancellations) =
+        if let Some(control) = mutation_control.as_ref() {
+            resume_pending_cancellations(actions, &ledger_path, &mut ledger, control)
+        } else {
+            (BTreeMap::new(), BTreeMap::new())
+        };
     let mut reports = Vec::new();
     let mut unhealthy = false;
-    let mut remaining_preemptions = 1;
+    let mut remaining_preemptions =
+        usize::from(!recovery_owned_preemption_budget && ledger.pending_cancellations.is_empty());
     for repo in repos {
         match observe_repo(actions, &repo, &args.base) {
             Ok(observation) => {
-                let (report, failed, planned_preemptions) = apply_repo_plan(
+                let (mut report, failed, planned_preemptions) = apply_repo_plan(
                     actions,
                     args,
                     &observation,
@@ -202,8 +252,14 @@ pub(super) fn steward_command<W: Write>(
                     remaining_preemptions,
                     mutation_control.as_ref(),
                 );
+                if let Some(errors) = recovery_errors.remove(&observation.repo) {
+                    report.errors.extend(errors);
+                }
+                if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
+                    report.cancellations.extend(cancellations);
+                }
                 remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
-                unhealthy |= failed;
+                unhealthy |= failed || !report.errors.is_empty();
                 reports.push(report);
             }
             Err(error) => {
@@ -222,6 +278,14 @@ pub(super) fn steward_command<W: Write>(
             }
         }
     }
+    append_unmatched_recovery_errors(
+        recovery_errors,
+        recovery_cancellations,
+        &ledger,
+        &args.base,
+        &mut reports,
+        &mut unhealthy,
+    );
     if args.apply {
         persist_final_ledger(
             &ledger_path,
@@ -237,6 +301,42 @@ pub(super) fn steward_command<W: Write>(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn append_unmatched_recovery_errors(
+    mut recovery_errors: BTreeMap<String, Vec<String>>,
+    mut recovery_cancellations: BTreeMap<String, Vec<CancellationReport>>,
+    ledger: &StewardLedger,
+    default_base: &str,
+    reports: &mut Vec<RepoReport>,
+    unhealthy: &mut bool,
+) {
+    let repos = recovery_errors
+        .keys()
+        .chain(recovery_cancellations.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for repo in repos {
+        let errors = recovery_errors.remove(&repo).unwrap_or_default();
+        let cancellations = recovery_cancellations.remove(&repo).unwrap_or_default();
+        *unhealthy |= !errors.is_empty();
+        let base = ledger
+            .pending_cancellations
+            .values()
+            .find(|pending| pending.repo == repo)
+            .map_or_else(|| default_base.to_owned(), |pending| pending.base.clone());
+        reports.push(RepoReport {
+            repo,
+            base,
+            allow_auto_merge: false,
+            merge_queue: false,
+            merge_path: "pending_cancellation_recovery".to_owned(),
+            required_contexts: Vec::new(),
+            prs: Vec::new(),
+            cancellations,
+            errors,
+        });
+    }
 }
 
 fn persist_final_ledger(
@@ -789,6 +889,10 @@ fn parse_run(value: &Value) -> Option<StewardRun> {
     Some(StewardRun {
         id: value.get("id")?.as_u64()?,
         workflow_id: value.get("workflow_id")?.as_u64()?,
+        run_attempt: value
+            .get("run_attempt")
+            .and_then(Value::as_u64)
+            .unwrap_or(1),
         workflow: value.get("name")?.as_str()?.to_owned(),
         head_sha: value.get("head_sha")?.as_str()?.to_owned(),
         head_branch: value.get("head_branch")?.as_str()?.to_owned(),
@@ -1267,6 +1371,16 @@ fn apply_capacity_preemption(
         .cancel_workflow_run(&context.observation.repo, context.cancellation.run_id)
     {
         Ok(()) => {
+            if let Err(error) =
+                mark_cancellation_accepted(context, expected_front, &cancel_live.candidate, ledger)
+            {
+                return (
+                    Some("cancelled_after_job_revalidation".to_owned()),
+                    Some(format!(
+                        "cancel accepted but pending recovery persistence failed: {error}"
+                    )),
+                );
+            }
             if let Err(error) = guard.finish("cancel_accepted") {
                 return (
                     Some("cancelled_after_job_revalidation".to_owned()),
@@ -1362,7 +1476,118 @@ fn prepare_capacity_preemption(
             ))
         ));
     }
+    let pending = pending_cancellation(
+        context,
+        expected_front,
+        &cancel_live.candidate,
+        guard.correlation_id(),
+        PendingCancellationPhase::Intent,
+        opt_out_label,
+    )?;
+    if let Err(error) = persist_pending_cancellation(context.ledger_path, ledger, pending) {
+        let audit_error = guard.finish("pending_persistence_failed").err();
+        return Err(format!(
+            "{error}{}",
+            audit_error.map_or_else(String::new, |audit_error| format!(
+                "; mutation audit also failed: {audit_error}"
+            ))
+        ));
+    }
     Ok(Some((guard, cancel_live)))
+}
+
+fn persist_pending_cancellation(
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    pending: PendingCancellation,
+) -> Result<(), String> {
+    let key = pending_cancellation_key(&pending);
+    let repo = pending.repo.clone();
+    let run_id = pending.run_id;
+    let phase = pending.phase;
+    ledger.pending_cancellations.insert(key, pending);
+    record_audit(
+        ledger,
+        &repo,
+        &format!("capacity-run:{run_id}"),
+        &format!("capacity_preemption_pending:{phase:?}"),
+    );
+    save_ledger(ledger_path, ledger).map_err(|error| error.message)
+}
+
+fn mark_cancellation_accepted(
+    context: &CapacityApplyContext<'_>,
+    expected_front: &str,
+    run: &StewardRun,
+    ledger: &mut StewardLedger,
+) -> Result<(), String> {
+    let probe = pending_cancellation_key_parts(
+        &context.observation.repo,
+        context.cancellation.run_id,
+        &run.head_sha,
+        expected_front,
+    );
+    let pending = ledger
+        .pending_cancellations
+        .get_mut(&probe)
+        .ok_or_else(|| "pending cancellation intent disappeared".to_owned())?;
+    pending.phase = PendingCancellationPhase::Accepted;
+    record_audit(
+        ledger,
+        &context.observation.repo,
+        &format!("capacity-run:{}", context.cancellation.run_id),
+        "capacity_preemption_pending_after_acceptance",
+    );
+    save_ledger(context.ledger_path, ledger).map_err(|error| error.message)
+}
+
+fn pending_cancellation(
+    context: &CapacityApplyContext<'_>,
+    front_head: &str,
+    run: &StewardRun,
+    correlation_id: &str,
+    phase: PendingCancellationPhase,
+    opt_out_label: &str,
+) -> Result<PendingCancellation, String> {
+    let pr_number = run
+        .pull_request_number
+        .or_else(|| merge_group_pr_number(run))
+        .ok_or_else(|| {
+            format!(
+                "workflow run {} has no pull-request identity; refusing an unaudited cancellation",
+                run.id
+            )
+        })?;
+    Ok(PendingCancellation {
+        repo: context.observation.repo.clone(),
+        base: context.observation.base.clone(),
+        run_id: run.id,
+        workflow_id: run.workflow_id,
+        run_attempt: run.run_attempt,
+        head_sha: run.head_sha.clone(),
+        head_branch: run.head_branch.clone(),
+        pr_number,
+        front_head: front_head.to_owned(),
+        initiated_at: Utc::now().to_rfc3339(),
+        phase,
+        mutation_correlation_id: correlation_id.to_owned(),
+        mutation_kind: PendingMutationKind::NormalCancel,
+        reason: cancellation_reason_label(context.cancellation.reason),
+        opt_out_label: opt_out_label.to_owned(),
+    })
+}
+
+fn pending_cancellation_key(pending: &PendingCancellation) -> String {
+    pending_cancellation_key_parts(
+        &pending.repo,
+        pending.run_id,
+        &pending.head_sha,
+        &pending.front_head,
+    )
+}
+
+fn pending_cancellation_key_parts(repo: &str, run_id: u64, head: &str, front: &str) -> String {
+    format!("{repo}#{run_id}:{head}:{front}")
 }
 
 fn persist_capacity_evidence(
@@ -1394,6 +1619,571 @@ fn persist_capacity_evidence(
             error.message
         )
     })
+}
+
+fn resume_pending_cancellations(
+    actions: &GitHubActions,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    mutation_control: &MutationControl,
+) -> (
+    BTreeMap<String, Vec<String>>,
+    BTreeMap<String, Vec<CancellationReport>>,
+) {
+    let pending = ledger
+        .pending_cancellations
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let mut errors = BTreeMap::<String, Vec<String>>::new();
+    let mut cancellations = BTreeMap::<String, Vec<CancellationReport>>::new();
+    for (key, cancellation) in pending {
+        match resume_pending_cancellation(
+            actions,
+            ledger_path,
+            ledger,
+            mutation_control,
+            &key,
+            &cancellation,
+        ) {
+            Ok(mutation) => cancellations
+                .entry(cancellation.repo.clone())
+                .or_default()
+                .push(CancellationReport {
+                    run_id: cancellation.run_id,
+                    reason: cancellation.reason.clone(),
+                    mutation: Some(mutation),
+                    error: None,
+                }),
+            Err(error) => {
+                record_audit(
+                    ledger,
+                    &cancellation.repo,
+                    &format!("capacity-run:{}", cancellation.run_id),
+                    "pending_cancellation_recovery_unhealthy",
+                );
+                let persistence = save_ledger(ledger_path, ledger).err();
+                errors
+                    .entry(cancellation.repo.clone())
+                    .or_default()
+                    .push(format!(
+                        "pending cancellation recovery for run {} failed: {error}{}",
+                        cancellation.run_id,
+                        persistence.map_or_else(String::new, |save_error| format!(
+                            "; recovery audit persistence also failed: {}",
+                            save_error.message
+                        ))
+                    ));
+            }
+        }
+    }
+    (errors, cancellations)
+}
+
+fn resume_pending_cancellation(
+    actions: &GitHubActions,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    mutation_control: &MutationControl,
+    key: &str,
+    pending: &PendingCancellation,
+) -> Result<String, String> {
+    match read_pending_run(actions, pending)? {
+        PendingRunState::Terminal => {
+            supersede_pending_uncertainty(mutation_control, pending)?;
+            clear_pending_cancellation(
+                ledger,
+                ledger_path,
+                key,
+                pending,
+                "pending_cancellation_observed_terminal",
+            )?;
+            Ok("recovered_terminal".to_owned())
+        }
+        PendingRunState::NonTerminal(_active)
+            if pending.phase == PendingCancellationPhase::Intent =>
+        {
+            resume_pending_intent(actions, ledger_path, ledger, mutation_control, key, pending)
+        }
+        PendingRunState::NonTerminal(_active) => {
+            supersede_pending_uncertainty(mutation_control, pending)?;
+            let Some(active) = wait_for_pending_normal_terminalization(actions, pending)? else {
+                clear_pending_cancellation(
+                    ledger,
+                    ledger_path,
+                    key,
+                    pending,
+                    "pending_normal_cancel_terminalized",
+                )?;
+                return Ok("recovered_normal_cancel_terminal".to_owned());
+            };
+            let targets = active_runner_targets(&active.jobs);
+            persist_force_cancel_intent(
+                ledger,
+                ledger_path,
+                &pending.repo,
+                pending.run_id,
+                &active.status,
+                &targets,
+            )
+            .map_err(|error| error.message)?;
+            let correlation_id = MergeQueueMutationGuard::new_correlation_id();
+            persist_pending_mutation_correlation(
+                ledger,
+                ledger_path,
+                key,
+                &correlation_id,
+                PendingMutationKind::ForceCancel,
+                "pending_force_cancel_intent",
+            )?;
+            let guard = acquire_pending_cancellation_guard_with_correlation(
+                mutation_control,
+                pending,
+                &format!("runner steward resume force-cancel run {}", pending.run_id),
+                &correlation_id,
+            )?;
+            read_current_pending_run_identity(actions, pending)?;
+            actions
+                .force_cancel_workflow_run(&pending.repo, pending.run_id)
+                .map_err(|error| format!("exact force-cancel failed: {error}"))?;
+            guard
+                .finish("force_cancel_accepted")
+                .map_err(|error| format!("force-cancel mutation audit failed: {error}"))?;
+            record_audit(
+                ledger,
+                &pending.repo,
+                &format!("capacity-run:{}", pending.run_id),
+                "pending_force_cancel_accepted",
+            );
+            save_ledger(ledger_path, ledger).map_err(|error| {
+                format!(
+                    "force-cancel accepted but recovery audit persistence failed: {}",
+                    error.message
+                )
+            })?;
+            match wait_for_pending_terminalization(actions, pending)? {
+                None => clear_pending_cancellation(
+                    ledger,
+                    ledger_path,
+                    key,
+                    pending,
+                    "pending_force_cancel_terminalized",
+                )
+                .map(|()| "recovered_force_cancel_terminal".to_owned()),
+                Some(still_active) => Err(format!(
+                    "exact force-cancel accepted but run remains {} with active={}",
+                    still_active.status,
+                    active_runner_targets(&still_active.jobs)
+                )),
+            }
+        }
+    }
+}
+
+fn wait_for_pending_terminalization(
+    actions: &GitHubActions,
+    pending: &PendingCancellation,
+) -> Result<Option<NonTerminalRun>, String> {
+    let deadline = Instant::now() + CANCEL_TERMINAL_WAIT;
+    loop {
+        match read_pending_run(actions, pending)? {
+            PendingRunState::Terminal => return Ok(None),
+            PendingRunState::NonTerminal(active)
+                if Instant::now() + CANCEL_TERMINAL_POLL >= deadline =>
+            {
+                return Ok(Some(active));
+            }
+            PendingRunState::NonTerminal(_) => {
+                thread::sleep(
+                    CANCEL_TERMINAL_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+    }
+}
+
+fn wait_for_pending_normal_terminalization(
+    actions: &GitHubActions,
+    pending: &PendingCancellation,
+) -> Result<Option<NonTerminalRun>, String> {
+    let elapsed = DateTime::parse_from_rfc3339(&pending.initiated_at)
+        .ok()
+        .and_then(|started| (Utc::now() - started.with_timezone(&Utc)).to_std().ok())
+        .unwrap_or(CANCEL_TERMINAL_WAIT);
+    if elapsed >= CANCEL_TERMINAL_WAIT {
+        return match read_pending_run(actions, pending)? {
+            PendingRunState::Terminal => Ok(None),
+            PendingRunState::NonTerminal(active) => Ok(Some(active)),
+        };
+    }
+    let deadline = Instant::now()
+        + CANCEL_TERMINAL_WAIT
+            .checked_sub(elapsed)
+            .expect("elapsed was checked against cancellation wait");
+    loop {
+        match read_pending_run(actions, pending)? {
+            PendingRunState::Terminal => return Ok(None),
+            PendingRunState::NonTerminal(active)
+                if Instant::now() + CANCEL_TERMINAL_POLL >= deadline =>
+            {
+                return Ok(Some(active));
+            }
+            PendingRunState::NonTerminal(_) => thread::sleep(
+                CANCEL_TERMINAL_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            ),
+        }
+    }
+}
+
+fn persist_pending_mutation_correlation(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    key: &str,
+    correlation_id: &str,
+    mutation_kind: PendingMutationKind,
+    action: &str,
+) -> Result<(), String> {
+    let pending = ledger
+        .pending_cancellations
+        .get_mut(key)
+        .ok_or_else(|| "pending cancellation record disappeared".to_owned())?;
+    correlation_id.clone_into(&mut pending.mutation_correlation_id);
+    pending.mutation_kind = mutation_kind;
+    let repo = pending.repo.clone();
+    let run_id = pending.run_id;
+    record_audit(ledger, &repo, &format!("capacity-run:{run_id}"), action);
+    save_ledger(ledger_path, ledger).map_err(|error| {
+        format!(
+            "could not persist pending mutation correlation: {}",
+            error.message
+        )
+    })
+}
+
+fn resume_pending_intent(
+    actions: &GitHubActions,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    mutation_control: &MutationControl,
+    key: &str,
+    pending: &PendingCancellation,
+) -> Result<String, String> {
+    let was_uncertain = pending_uncertainty(mutation_control, pending)?;
+    let observation = observe_repo(actions, &pending.repo, &pending.base)?;
+    let observed = observation
+        .runs
+        .iter()
+        .find(|run| run.id == pending.run_id)
+        .ok_or_else(|| {
+            format!(
+                "pending cancellation run {} disappeared from active observations",
+                pending.run_id
+            )
+        })?;
+    let cancellation = pending_run_cancellation(pending)?;
+    let evidence = revalidate_capacity_preemption(
+        actions,
+        &observation,
+        &cancellation,
+        observed,
+        &pending.front_head,
+        &pending.opt_out_label,
+    )?;
+    evidence.ok_or_else(|| {
+        format!(
+            "cancellation intent for run {} no longer passes exact capacity-safety revalidation",
+            pending.run_id
+        )
+    })?;
+    if was_uncertain {
+        supersede_pending_uncertainty(mutation_control, pending)?;
+    }
+    let correlation_id = MergeQueueMutationGuard::new_correlation_id();
+    persist_pending_mutation_correlation(
+        ledger,
+        ledger_path,
+        key,
+        &correlation_id,
+        PendingMutationKind::NormalCancel,
+        "pending_normal_cancel_retry_intent",
+    )?;
+    let guard = acquire_pending_cancellation_guard_with_correlation(
+        mutation_control,
+        pending,
+        &format!("runner steward retry cancel run {}", pending.run_id),
+        &correlation_id,
+    )?;
+    read_current_pending_run_identity(actions, pending)?;
+    actions
+        .cancel_workflow_run(&pending.repo, pending.run_id)
+        .map_err(|error| format!("exact normal cancellation retry failed: {error}"))?;
+    let accepted = ledger
+        .pending_cancellations
+        .get_mut(key)
+        .ok_or_else(|| "refreshed cancellation intent disappeared".to_owned())?;
+    accepted.phase = PendingCancellationPhase::Accepted;
+    record_audit(
+        ledger,
+        &pending.repo,
+        &format!("capacity-run:{}", pending.run_id),
+        "capacity_preemption_pending_after_recovery_acceptance",
+    );
+    save_ledger(ledger_path, ledger).map_err(|error| {
+        format!(
+            "normal cancellation retry accepted but pending phase persistence failed: {}",
+            error.message
+        )
+    })?;
+    guard
+        .finish("cancel_accepted")
+        .map_err(|error| format!("normal cancellation retry audit failed: {error}"))?;
+    let accepted = ledger
+        .pending_cancellations
+        .get(key)
+        .cloned()
+        .ok_or_else(|| "accepted cancellation recovery record disappeared".to_owned())?;
+    resume_pending_cancellation(
+        actions,
+        ledger_path,
+        ledger,
+        mutation_control,
+        key,
+        &accepted,
+    )
+}
+
+fn pending_cancellation_reason(value: &str) -> Result<RunCancellationReason, String> {
+    match value {
+        "advisory_preamble_capacity_theft" => {
+            Ok(RunCancellationReason::AdvisoryPreambleCapacityTheft)
+        }
+        "lower_priority_branch_preamble" => Ok(RunCancellationReason::LowerPriorityBranchPreamble),
+        _ => Err(format!("unsupported pending cancellation reason `{value}`")),
+    }
+}
+
+fn pending_run_cancellation(pending: &PendingCancellation) -> Result<RunCancellation, String> {
+    Ok(RunCancellation {
+        run_id: pending.run_id,
+        reason: pending_cancellation_reason(&pending.reason)?,
+    })
+}
+
+fn pending_uncertainty(
+    control: &MutationControl,
+    pending: &PendingCancellation,
+) -> Result<bool, String> {
+    let state_root = control
+        .store
+        .path()
+        .parent()
+        .unwrap_or(control.store.path());
+    Ok(uncertain_mutations(state_root)?.iter().any(|entry| {
+        entry.get("correlation_id").and_then(Value::as_str)
+            == Some(pending.mutation_correlation_id.as_str())
+    }))
+}
+
+fn supersede_pending_uncertainty(
+    control: &MutationControl,
+    pending: &PendingCancellation,
+) -> Result<(), String> {
+    if !pending_uncertainty(control, pending)? {
+        return Ok(());
+    }
+    let state_root = control
+        .store
+        .path()
+        .parent()
+        .unwrap_or(control.store.path());
+    supersede_uncertainty(
+        state_root,
+        &control.global_dir,
+        &pending.mutation_correlation_id,
+        &format!("steward durable {:?} recovery", pending.mutation_kind),
+    )
+}
+
+fn read_pending_run(
+    actions: &GitHubActions,
+    pending: &PendingCancellation,
+) -> Result<PendingRunState, String> {
+    let run = read_pending_run_identity(actions, pending)?;
+    let active_jobs = fetch_pending_run_jobs(actions, pending)?
+        .into_iter()
+        .filter(is_active_job)
+        .collect::<Vec<_>>();
+    let final_run = read_pending_run_identity(actions, pending)?;
+    if final_run.status != run.status {
+        return Err(format!(
+            "pending cancellation run {} changed status during exact observation",
+            pending.run_id
+        ));
+    }
+    if run.status.eq_ignore_ascii_case("completed") && active_jobs.is_empty() {
+        Ok(PendingRunState::Terminal)
+    } else {
+        Ok(PendingRunState::NonTerminal(NonTerminalRun {
+            status: run.status,
+            jobs: active_jobs,
+        }))
+    }
+}
+
+fn read_pending_run_identity(
+    actions: &GitHubActions,
+    pending: &PendingCancellation,
+) -> Result<StewardRun, String> {
+    let value = gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!(
+                "repos/{}/actions/runs/{}/attempts/{}",
+                pending.repo, pending.run_id, pending.run_attempt
+            ),
+        ],
+        "pending cancellation workflow run",
+    )?;
+    let run = parse_run(&value).ok_or_else(|| {
+        format!(
+            "pending cancellation run {} response is malformed",
+            pending.run_id
+        )
+    })?;
+    if run.id != pending.run_id
+        || run.workflow_id != pending.workflow_id
+        || run.run_attempt != pending.run_attempt
+        || !run.head_sha.eq_ignore_ascii_case(&pending.head_sha)
+        || run.head_branch != pending.head_branch
+    {
+        return Err(format!(
+            "pending cancellation run {} immutable identity changed",
+            pending.run_id
+        ));
+    }
+    Ok(run)
+}
+
+fn read_current_pending_run_identity(
+    actions: &GitHubActions,
+    pending: &PendingCancellation,
+) -> Result<(), String> {
+    let value = gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!("repos/{}/actions/runs/{}", pending.repo, pending.run_id),
+        ],
+        "current pending cancellation workflow run",
+    )?;
+    let run = parse_run(&value).ok_or_else(|| {
+        format!(
+            "current pending cancellation run {} response is malformed",
+            pending.run_id
+        )
+    })?;
+    if run.id != pending.run_id
+        || run.workflow_id != pending.workflow_id
+        || run.run_attempt != pending.run_attempt
+        || !run.head_sha.eq_ignore_ascii_case(&pending.head_sha)
+        || run.head_branch != pending.head_branch
+    {
+        return Err(format!(
+            "current workflow run {} no longer matches pending attempt {}",
+            pending.run_id, pending.run_attempt
+        ));
+    }
+    Ok(())
+}
+
+fn fetch_pending_run_jobs(
+    actions: &GitHubActions,
+    pending: &PendingCancellation,
+) -> Result<Vec<StewardJob>, String> {
+    let mut all = Vec::new();
+    for page in 1..=10 {
+        let value = gh_json(
+            actions,
+            &[
+                "api".to_owned(),
+                format!(
+                    "repos/{}/actions/runs/{}/attempts/{}/jobs?filter=all&per_page=100&page={page}",
+                    pending.repo, pending.run_id, pending.run_attempt
+                ),
+            ],
+            "pending cancellation workflow jobs",
+        )?;
+        let rows = value
+            .get("jobs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("workflow run {} response missing jobs", pending.run_id))?;
+        let count = rows.len();
+        for row in rows {
+            all.push(parse_job(row)?);
+        }
+        if count < 100 {
+            return Ok(all);
+        }
+    }
+    Err(format!(
+        "workflow run {} attempt {} exceeds 1000 jobs; refusing partial recovery scan",
+        pending.run_id, pending.run_attempt
+    ))
+}
+
+fn acquire_pending_cancellation_guard_with_correlation(
+    control: &MutationControl,
+    pending: &PendingCancellation,
+    action: &str,
+    correlation_id: &str,
+) -> Result<MergeQueueMutationGuard, String> {
+    let state = ShipState::new(
+        pending.pr_number,
+        &pending.repo,
+        &pending.head_branch,
+        &pending.base,
+        &pending.head_sha,
+        "runner-steward",
+    );
+    MergeQueueMutationGuard::acquire_in_mode_with_correlation(
+        &control.store,
+        &control.cwd,
+        control.mode,
+        &control.global_dir,
+        &state,
+        action,
+        correlation_id,
+    )
+}
+
+fn clear_pending_cancellation(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    key: &str,
+    pending: &PendingCancellation,
+    action: &str,
+) -> Result<(), String> {
+    let Some(record) = ledger.pending_cancellations.remove(key) else {
+        return Err(format!(
+            "pending cancellation record for run {} disappeared",
+            pending.run_id
+        ));
+    };
+    record_audit(
+        ledger,
+        &pending.repo,
+        &format!("capacity-run:{}", pending.run_id),
+        action,
+    );
+    if let Err(error) = save_ledger(ledger_path, ledger) {
+        ledger.pending_cancellations.insert(key.to_owned(), record);
+        return Err(format!(
+            "could not persist terminal pending-cancellation state: {}",
+            error.message
+        ));
+    }
+    Ok(())
 }
 
 fn complete_capacity_cancellation(
@@ -1429,30 +2219,25 @@ fn complete_capacity_cancellation(
         context.cancellation.run_id,
     ) {
         Ok(None) => {
-            record_audit(
+            if let Err(error) = clear_pending_for_run(
                 ledger,
+                context.ledger_path,
                 &context.observation.repo,
-                &format!("capacity-run:{}", context.cancellation.run_id),
+                final_live.id,
                 "capacity_preemption_terminalized",
-            );
-            if let Err(error) = save_ledger(context.ledger_path, ledger) {
+            ) {
                 return (
                     Some("cancelled_terminal".to_owned()),
                     Some(format!(
-                        "cancel terminalized but completion audit failed: {}",
-                        error.message
+                        "cancel terminalized but completion audit failed: {error}"
                     )),
                 );
             }
             (Some("cancelled_terminal".to_owned()), None)
         }
-        Ok(Some(active)) => force_cancel_nonterminal_run(
-            context,
-            context.cancellation.run_id,
-            &active,
-            final_live,
-            ledger,
-        ),
+        Ok(Some(active)) => {
+            force_cancel_nonterminal_run(context, context.cancellation.run_id, &active, ledger)
+        }
         Err(error) => {
             record_audit(
                 ledger,
@@ -1475,7 +2260,6 @@ fn force_cancel_nonterminal_run(
     context: &CapacityApplyContext<'_>,
     run_id: u64,
     active: &NonTerminalRun,
-    run: &StewardRun,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
     let targets = active_runner_targets(&active.jobs);
@@ -1495,11 +2279,21 @@ fn force_cancel_nonterminal_run(
             )),
         );
     }
-    let guard = match acquire_run_mutation_guard(
+    let correlation_id = MergeQueueMutationGuard::new_correlation_id();
+    if let Err(error) = persist_force_cancel_correlation(context, ledger, &correlation_id, run_id) {
+        return (Some("cancel_not_terminal".to_owned()), Some(error));
+    }
+    let pending = ledger
+        .pending_cancellations
+        .values()
+        .find(|pending| pending.repo == context.observation.repo && pending.run_id == run_id)
+        .cloned()
+        .expect("persist_force_cancel_correlation required pending record");
+    let guard = match acquire_pending_cancellation_guard_with_correlation(
         context.mutation_control,
-        context.observation,
-        run,
+        &pending,
         &format!("runner steward force-cancel run {run_id}"),
+        &correlation_id,
     ) {
         Ok(guard) => guard,
         Err(error) => {
@@ -1511,6 +2305,14 @@ fn force_cancel_nonterminal_run(
             );
         }
     };
+    if let Err(error) = revalidate_force_cancel_attempt(context, ledger, run_id) {
+        return (
+            Some("cancel_not_terminal".to_owned()),
+            Some(format!(
+                "exact force-cancel attempt revalidation failed: {error}"
+            )),
+        );
+    }
     if let Err(error) = context
         .actions
         .force_cancel_workflow_run(&context.observation.repo, run_id)
@@ -1554,6 +2356,43 @@ fn force_cancel_nonterminal_run(
     verify_force_cancel_terminalization(context, run_id, ledger)
 }
 
+fn revalidate_force_cancel_attempt(
+    context: &CapacityApplyContext<'_>,
+    ledger: &StewardLedger,
+    run_id: u64,
+) -> Result<(), String> {
+    let pending = ledger
+        .pending_cancellations
+        .values()
+        .find(|pending| pending.repo == context.observation.repo && pending.run_id == run_id)
+        .ok_or_else(|| "pending cancellation record disappeared before force-cancel".to_owned())?;
+    read_current_pending_run_identity(context.actions, pending)
+}
+
+fn persist_force_cancel_correlation(
+    context: &CapacityApplyContext<'_>,
+    ledger: &mut StewardLedger,
+    correlation_id: &str,
+    run_id: u64,
+) -> Result<(), String> {
+    let key = ledger
+        .pending_cancellations
+        .iter()
+        .find(|(_, pending)| pending.repo == context.observation.repo && pending.run_id == run_id)
+        .map(|(key, _)| key.clone())
+        .ok_or_else(|| {
+            format!("cancel_not_terminal run {run_id}; pending cancellation record disappeared")
+        })?;
+    persist_pending_mutation_correlation(
+        ledger,
+        context.ledger_path,
+        &key,
+        correlation_id,
+        PendingMutationKind::ForceCancel,
+        "force_cancel_intent",
+    )
+}
+
 fn verify_force_cancel_terminalization(
     context: &CapacityApplyContext<'_>,
     run_id: u64,
@@ -1561,19 +2400,18 @@ fn verify_force_cancel_terminalization(
 ) -> (Option<String>, Option<String>) {
     match wait_for_run_terminalization(context.actions, &context.observation.repo, run_id) {
         Ok(None) => {
-            record_audit(
+            match clear_pending_for_run(
                 ledger,
+                context.ledger_path,
                 &context.observation.repo,
-                &format!("capacity-run:{run_id}"),
+                run_id,
                 "force_cancel_terminalized",
-            );
-            match save_ledger(context.ledger_path, ledger) {
+            ) {
                 Ok(()) => (Some("force_cancelled_terminal".to_owned()), None),
                 Err(error) => (
                     Some("force_cancelled_terminal".to_owned()),
                     Some(format!(
-                        "force-cancel terminalized run {run_id}, but audit persistence failed: {}",
-                        error.message
+                        "force-cancel terminalized run {run_id}, but audit persistence failed: {error}"
                     )),
                 ),
             }
@@ -1614,6 +2452,22 @@ fn verify_force_cancel_terminalization(
             )
         }
     }
+}
+
+fn clear_pending_for_run(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    repo: &str,
+    run_id: u64,
+    action: &str,
+) -> Result<(), String> {
+    let (key, pending) = ledger
+        .pending_cancellations
+        .iter()
+        .find(|(_, pending)| pending.repo == repo && pending.run_id == run_id)
+        .map(|(key, pending)| (key.clone(), pending.clone()))
+        .ok_or_else(|| format!("pending cancellation record for run {run_id} disappeared"))?;
+    clear_pending_cancellation(ledger, ledger_path, &key, &pending, action)
 }
 
 fn audit_force_cancel_failure(
@@ -1676,15 +2530,7 @@ fn wait_for_run_terminalization(
             .ok_or_else(|| "cancel terminalization response missing status".to_owned())?
             .to_owned();
         let jobs = fetch_run_jobs_before(actions, repo, run_id, deadline)?;
-        let active_jobs = jobs
-            .into_iter()
-            .filter(|job| {
-                matches!(
-                    job.status.as_str(),
-                    "queued" | "waiting" | "pending" | "requested" | "in_progress"
-                )
-            })
-            .collect::<Vec<_>>();
+        let active_jobs = jobs.into_iter().filter(is_active_job).collect::<Vec<_>>();
         if status == "completed" && active_jobs.is_empty() {
             return Ok(None);
         }
@@ -1696,6 +2542,13 @@ fn wait_for_run_terminalization(
         }
         thread::sleep(CANCEL_TERMINAL_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
+}
+
+fn is_active_job(job: &StewardJob) -> bool {
+    matches!(
+        job.status.as_str(),
+        "queued" | "waiting" | "pending" | "requested" | "in_progress"
+    )
 }
 
 fn active_runner_targets(jobs: &[StewardJob]) -> String {
@@ -2721,6 +3574,7 @@ mod tests {
         StewardRun {
             id,
             workflow_id: 77,
+            run_attempt: 1,
             workflow: "Required".to_owned(),
             head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             head_branch: "feature".to_owned(),
@@ -2729,6 +3583,26 @@ mod tests {
             pull_request_number: Some(42),
             created_at: created_at.to_owned(),
             jobs: Vec::new(),
+        }
+    }
+
+    fn pending_cancellation_record() -> PendingCancellation {
+        PendingCancellation {
+            repo: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            run_id: 100,
+            workflow_id: 77,
+            run_attempt: 1,
+            head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            head_branch: "feature".to_owned(),
+            pr_number: 42,
+            front_head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            initiated_at: "2026-07-26T00:00:00Z".to_owned(),
+            phase: PendingCancellationPhase::Accepted,
+            mutation_correlation_id: "finished-test-mutation".to_owned(),
+            mutation_kind: PendingMutationKind::NormalCancel,
+            reason: "advisory_preamble_capacity_theft".to_owned(),
+            opt_out_label: "steward:skip".to_owned(),
         }
     }
 
@@ -3120,6 +3994,140 @@ esac
         );
         assert!(ledger.preemption_attempts.is_empty());
         assert!(ledger.audit.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_capacity_cancellation_resumes_after_cancel_accepted_restart() {
+        let temp = tempfile::tempdir().expect("temp");
+        let calls = temp.path().join("calls");
+        let reads = temp.path().join("reads");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"/force-cancel") exit 0 ;;
+  *"/jobs?"*) printf '%s' '{{"jobs":[]}}' ;;
+  *"actions/runs/100/attempts/1"|*"actions/runs/100")
+    count=0
+    test ! -f '{}' || count=$(cat '{}')
+    count=$((count + 1))
+    printf '%s' "$count" > '{}'
+    if test "$count" -le 5; then status=in_progress; else status=completed; fi
+    printf '%s' '{{"id":100,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"'"$status"'","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+                calls.display(),
+                reads.display(),
+                reads.display(),
+                reads.display(),
+            ),
+        );
+        let control = mutation_control(&temp, "studio", "studio");
+        let mut pending = pending_cancellation_record();
+        let correlation_id = MergeQueueMutationGuard::new_correlation_id();
+        let interrupted_guard = acquire_pending_cancellation_guard_with_correlation(
+            &control,
+            &pending,
+            "runner steward preempt capacity run 100",
+            &correlation_id,
+        )
+        .expect("interrupted guard");
+        interrupted_guard
+            .correlation_id()
+            .clone_into(&mut pending.mutation_correlation_id);
+        drop(interrupted_guard);
+        let key = pending_cancellation_key(&pending);
+        let mut ledger = StewardLedger {
+            preemption_attempts: BTreeMap::from([(
+                "owner/repo:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                1,
+            )]),
+            pending_cancellations: BTreeMap::from([(key, pending)]),
+            ..StewardLedger::default()
+        };
+        let ledger_path = temp.path().join("ledger.json");
+        save_ledger(&ledger_path, &ledger).expect("seed ledger");
+
+        let (errors, cancellations) =
+            resume_pending_cancellations(&actions, &ledger_path, &mut ledger, &control);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(cancellations["owner/repo"][0].run_id, 100);
+        assert!(ledger.pending_cancellations.is_empty());
+        assert_eq!(ledger.preemption_attempts.values().copied().sum::<u32>(), 1);
+        let calls = fs::read_to_string(calls).expect("calls");
+        assert!(calls.contains("/force-cancel"), "{calls}");
+        let reloaded = load_ledger(&ledger_path).expect("reload");
+        assert!(reloaded.pending_cancellations.is_empty());
+        assert!(
+            uncertain_mutations(control.store.path().parent().expect("state root"))
+                .expect("uncertainties")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_cancellation_survives_transient_read_failure_then_recovers() {
+        let temp = tempfile::tempdir().expect("temp");
+        let ledger_path = temp.path().join("ledger.json");
+        let pending = pending_cancellation_record();
+        let key = pending_cancellation_key(&pending);
+        let mut ledger = StewardLedger {
+            pending_cancellations: BTreeMap::from([(key.clone(), pending)]),
+            ..StewardLedger::default()
+        };
+        save_ledger(&ledger_path, &ledger).expect("seed ledger");
+        let control = mutation_control(&temp, "studio", "studio");
+        let failing = fake_gh(&temp, r#"echo "temporary read failure" >&2; exit 1"#);
+
+        let (errors, cancellations) =
+            resume_pending_cancellations(&failing, &ledger_path, &mut ledger, &control);
+
+        assert_eq!(errors.len(), 1);
+        assert!(cancellations.is_empty());
+        assert!(ledger.pending_cancellations.contains_key(&key));
+        assert!(
+            load_ledger(&ledger_path)
+                .expect("reload failed recovery")
+                .pending_cancellations
+                .contains_key(&key)
+        );
+
+        let reads = temp.path().join("reads");
+        let recovered = fake_gh(
+            &temp,
+            &format!(
+                r#"
+case "$*" in
+  *"/force-cancel") exit 0 ;;
+  *"/jobs?"*) printf '%s' '{{"jobs":[]}}' ;;
+  *"actions/runs/100/attempts/1"|*"actions/runs/100")
+    count=0
+    test ! -f '{}' || count=$(cat '{}')
+    count=$((count + 1))
+    printf '%s' "$count" > '{}'
+    if test "$count" -le 5; then status=in_progress; else status=completed; fi
+    printf '%s' '{{"id":100,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"'"$status"'","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+                reads.display(),
+                reads.display(),
+                reads.display(),
+            ),
+        );
+
+        let (errors, cancellations) =
+            resume_pending_cancellations(&recovered, &ledger_path, &mut ledger, &control);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(cancellations["owner/repo"][0].run_id, 100);
+        assert!(ledger.pending_cancellations.is_empty());
     }
 
     #[cfg(unix)]
