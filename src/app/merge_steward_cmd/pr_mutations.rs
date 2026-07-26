@@ -38,6 +38,7 @@ pub(super) fn mutate_pr(
         context.actions,
         &context.observation.repo,
         pr.fact.number,
+        &context.observation.base,
         &queue_positions,
         &policy.required_checks,
     ) {
@@ -390,6 +391,7 @@ pub(super) fn revalidate_transient_rerun(
         actions,
         &observation.repo,
         observed_pr.fact.number,
+        &observation.base,
         &queue_positions,
         &policy.required_checks,
     )?

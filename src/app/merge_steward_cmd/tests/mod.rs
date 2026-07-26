@@ -52,6 +52,7 @@ fn ready_pr() -> ObservedPr {
             "number": 42,
             "state": "OPEN",
             "isDraft": false,
+            "baseRefName": "main",
             "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "headRefName": "feature",
             "mergeStateStatus": "CLEAN",

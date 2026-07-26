@@ -357,7 +357,7 @@ fn live_pr_revalidation_hydrates_required_check_identity() {
         r#"
 case "$*" in
   *"pr view"*)
-    printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS"}]}' ;;
+    printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS"}]}' ;;
   *"commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs"*)
     printf '%s' '{"check_runs":[{"name":"macos","app":{"id":42},"status":"completed","conclusion":"success"}]}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
@@ -368,10 +368,16 @@ esac
         context: "macos".to_owned(),
         app_id: Some(42),
     }];
-    let pr =
-        pull_request_with_required_checks(&actions, "owner/repo", 42, &BTreeMap::new(), &required)
-            .expect("live PR")
-            .expect("open PR");
+    let pr = pull_request_with_required_checks(
+        &actions,
+        "owner/repo",
+        42,
+        "main",
+        &BTreeMap::new(),
+        &required,
+    )
+    .expect("live PR")
+    .expect("open PR");
     assert!(
         pr.fact
             .checks
@@ -399,6 +405,7 @@ fn truncated_rollup_fetches_complete_head_checks_before_merge_classification() {
         "number": 42,
         "state": "OPEN",
         "isDraft": false,
+        "baseRefName": "main",
         "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "headRefName": "feature",
         "mergeStateStatus": "CLEAN",
@@ -436,10 +443,16 @@ esac
 "#
         ),
     );
-    let observed =
-        pull_request_with_required_checks(&actions, "owner/repo", 42, &BTreeMap::new(), &[])
-            .expect("live PR")
-            .expect("open PR");
+    let observed = pull_request_with_required_checks(
+        &actions,
+        "owner/repo",
+        42,
+        "main",
+        &BTreeMap::new(),
+        &[],
+    )
+    .expect("live PR")
+    .expect("open PR");
     let mut policy = queue_policy();
     policy.merge_queue = false;
     assert_eq!(
@@ -463,11 +476,11 @@ fn pull_request_transport_preserves_fresh_queue_position() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(
         &temp,
-        r#"printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[]}'"#,
+        r#"printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[]}'"#,
     );
     let positions = BTreeMap::from([(42, 3)]);
 
-    let pr = pull_request(&actions, "owner/repo", 42, &positions)
+    let pr = pull_request(&actions, "owner/repo", 42, "main", &positions)
         .expect("transport")
         .expect("open PR");
     assert_eq!(pr.fact.queue_position, Some(3));

@@ -455,7 +455,7 @@ pub(super) fn pull_requests(
         "--limit".to_owned(),
         "100".to_owned(),
         "--json".to_owned(),
-        "id,number,isDraft,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
+        "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
     ];
     let value = gh_json(actions, &args, "open PR list")?;
     let rows = value

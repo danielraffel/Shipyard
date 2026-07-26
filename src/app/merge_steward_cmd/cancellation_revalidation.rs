@@ -58,6 +58,7 @@ pub(super) fn revalidate_capacity_preemption(
         actions,
         &observation.repo,
         candidate_pr_number,
+        &observation.base,
         &BTreeMap::new(),
     )?
     else {
@@ -124,6 +125,7 @@ pub(super) fn pull_request(
     actions: &GitHubActions,
     repo: &str,
     number: u64,
+    expected_base: &str,
     queue_positions: &BTreeMap<u64, u64>,
 ) -> Result<Option<ObservedPr>, String> {
     let value = gh_json(
@@ -135,11 +137,14 @@ pub(super) fn pull_request(
             "--repo".to_owned(),
             repo.to_owned(),
             "--json".to_owned(),
-            "id,number,state,isDraft,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
+            "id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
         ],
         "capacity-preemption candidate PR",
     )?;
     if value.get("state").and_then(Value::as_str) != Some("OPEN") {
+        return Ok(None);
+    }
+    if value.get("baseRefName").and_then(Value::as_str) != Some(expected_base) {
         return Ok(None);
     }
     parse_pr(&value, queue_positions).map(Some)
@@ -149,10 +154,11 @@ pub(super) fn pull_request_with_required_checks(
     actions: &GitHubActions,
     repo: &str,
     number: u64,
+    expected_base: &str,
     queue_positions: &BTreeMap<u64, u64>,
     required_checks: &[RequiredCheck],
 ) -> Result<Option<ObservedPr>, String> {
-    let Some(mut pr) = pull_request(actions, repo, number, queue_positions)? else {
+    let Some(mut pr) = pull_request(actions, repo, number, expected_base, queue_positions)? else {
         return Ok(None);
     };
     hydrate_required_check_identities(
@@ -240,7 +246,13 @@ pub(super) fn revalidate_coalescing_cancellation(
     else {
         return Ok(false);
     };
-    let Some(candidate_pr) = pull_request(actions, &observation.repo, pr_number, &BTreeMap::new())?
+    let Some(candidate_pr) = pull_request(
+        actions,
+        &observation.repo,
+        pr_number,
+        &observation.base,
+        &BTreeMap::new(),
+    )?
     else {
         return Ok(false);
     };
