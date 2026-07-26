@@ -88,6 +88,8 @@ shipyard runner watch --reap-stale-runs   # also cancel stale workflow runs repo
 shipyard runner watch --reap-stale-runs --dry-run   # preview reaper, cancel nothing
 shipyard runner fleet-status --repo OWNER/REPO      # read-only TartCI + queue liveness
 shipyard runner fleet-status --json                 # periodic-monitor JSON + nonzero alerts
+shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
+shipyard runner steward --apply                     # exact-head, green-gated mutations
 
 # Self-hosted runner provisioning (register / list / remove on this machine)
 shipyard runner tag --set studio          # set this box's machine tag (m1, m5, …)

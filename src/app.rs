@@ -29,6 +29,7 @@ mod fleet_status_cmd;
 mod governance_cmd;
 mod init_cmd;
 mod merge_queue_control_cmd;
+mod merge_steward_cmd;
 mod metrics_cmd;
 mod paths_cmd;
 mod pin_cmd;

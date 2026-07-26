@@ -598,6 +598,25 @@ uses Orchard and never mutates GitHub.
 The watcher resolves the repository default branch; use `--fleet-base` or
 `runner.watchdog.fleet_base` for a different merge target.
 
+Use `shipyard runner steward` as the agent-neutral merge-on-green reconciler:
+
+```bash
+shipyard runner steward \
+  --repo Generous-Corp/pulp \
+  --repo Generous-Corp/forge \
+  --repo Generous-Corp/vellum \
+  --json
+```
+
+It is audit-only unless `--apply` is present. The apply path uses server-side
+exact-head guards for queue admission and merge, preserves existing native
+merge-queue positions, does not rerun genuine failures, limits transient
+reruns durably, and live-revalidates queued state plus immutable head before
+cancelling a duplicate or superseded run. Repositories without
+private-plan branch-protection/merge-queue entitlement use GitHub's REST merge
+endpoint with the same exact-head guard and treat every observed check as
+gating. Add the `shipyard:no-auto-merge` label to opt a PR out.
+
 ### Reroute watcher (cloud→local drain)
 
 ```bash

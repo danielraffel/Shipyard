@@ -923,6 +923,34 @@ pub(super) enum RunnerCommand {
         #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
         release_stale_threshold_secs: i64,
     },
+    /// Audit and conservatively advance merge-on-green across repositories.
+    ///
+    /// Dry-run is the default. `--apply` may enqueue an exact green head,
+    /// exact-head merge a private/free-plan PR, rerun a bounded transient
+    /// failure, or cancel only provably duplicate/superseded queued runs.
+    Steward {
+        /// Owner/repo slug. Repeatable; defaults to the current repository.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Target branch.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Label that opts a PR out of stewardship.
+        #[arg(long = "opt-out-label", default_value = "shipyard:no-auto-merge")]
+        opt_out_label: String,
+        /// Maximum reruns of the same transiently-failed run on one exact head.
+        #[arg(long = "max-transient-reruns", default_value_t = 1)]
+        max_transient_reruns: u32,
+        /// Disable queued-run duplicate/superseded-head coalescing.
+        #[arg(long = "no-coalesce")]
+        no_coalesce: bool,
+        /// Perform the planned mutations. Without this flag, only audit.
+        #[arg(long)]
+        apply: bool,
+        /// Override the durable retry/audit ledger path. Test hook.
+        #[arg(long = "ledger", hide = true)]
+        ledger: Option<PathBuf>,
+    },
     /// Watch for cloud-queued macOS jobs and drain them to a local runner when
     /// a VM slot frees up. Observe-only unless `--apply`.
     RerouteWatch {
