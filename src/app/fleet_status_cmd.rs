@@ -23,6 +23,8 @@ use crate::config::LoadedConfig;
 use crate::executor::ssh::shlex_quote;
 use crate::output::write_json_envelope;
 
+const FLEET_LANE_TARGET: &str = "macos";
+
 pub(super) struct FleetStatusArgs {
     pub(super) repo: Option<String>,
     pub(super) target: String,
@@ -83,7 +85,11 @@ pub(super) fn fleet_status_command<W: Write>(
                 source: "capacity missing for host class".to_owned(),
             });
         let doctor = probe_doctor(class);
-        hosts.push(analyze_host(capacity, doctor, &args.target));
+        // `--target` is a GitHub job-name substring, not a TartCI routing
+        // label. FleetStatus is the macOS VM fleet command, so host health is
+        // always scoped to the macOS lane even for custom job names such as
+        // `required-apple-tests`.
+        hosts.push(analyze_host(capacity, doctor, FLEET_LANE_TARGET));
     }
 
     let queue_run_limit = args.queue_run_limit.clamp(1, 100);
@@ -763,6 +769,15 @@ mod tests {
         assert!(labels_match_target(&labels, "macos-arm64"));
         assert!(labels_match_target(&labels, "darwin-arm64"));
         assert!(!labels_match_target(&labels, "linux-arm64"));
+    }
+
+    #[test]
+    fn fleet_lane_is_independent_of_custom_queue_job_name() {
+        let custom_queue_target = "required-apple-tests";
+        let labels = serde_json::json!(["self-hosted", "macOS", "ARM64"]);
+
+        assert!(!labels_match_target(&labels, custom_queue_target));
+        assert!(labels_match_target(&labels, FLEET_LANE_TARGET));
     }
 
     #[test]
