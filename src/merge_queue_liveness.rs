@@ -144,8 +144,8 @@ pub struct MergeQueueLivenessReport {
     /// Required contexts that have not materialized, remain queued, or have
     /// stayed in progress past the stall threshold.
     pub stalled_required_contexts: Vec<String>,
-    /// Required contexts with a terminal failing conclusion. Advisory checks
-    /// are excluded because matching is limited to governance-required names.
+    /// Required contexts with a terminal failing conclusion. When governance
+    /// exposes no configured names, all observed checks are liveness signals.
     pub failed_required_contexts: Vec<String>,
     /// True when an aged front has no required-check progress despite idle,
     /// routable M1/M3/M5 capacity.
@@ -373,7 +373,8 @@ pub fn assess_merge_queue_liveness(
             })
         })
     });
-    let matching_checks = checks
+    let current_checks = current_check_observations(checks);
+    let matching_checks = current_checks
         .iter()
         .filter(|check| {
             required_contexts.is_empty()
@@ -387,31 +388,32 @@ pub fn assess_merge_queue_liveness(
         .filter(|check| check.status != "queued")
         .count();
     let stalled_required_contexts = stalled_contexts(
-        checks,
+        &current_checks,
         required_contexts,
         stall_threshold_secs,
         now,
         front_old_enough,
     );
-    let failed_required_contexts = required_contexts
-        .iter()
-        .filter(|required| {
-            checks.iter().any(|check| {
-                required.eq_ignore_ascii_case(&check.name)
-                    && check.conclusion.as_deref().is_some_and(|conclusion| {
-                        matches!(
-                            conclusion,
-                            "failure"
-                                | "cancelled"
-                                | "timed_out"
-                                | "action_required"
-                                | "startup_failure"
-                        )
-                    })
+    let failed_required_contexts: Vec<String> = if required_contexts.is_empty() {
+        current_checks
+            .iter()
+            .filter(|check| is_terminal_failure(check.conclusion.as_deref()))
+            .map(|check| check.name.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        required_contexts
+            .iter()
+            .filter(|required| {
+                current_checks.iter().any(|check| {
+                    required.eq_ignore_ascii_case(&check.name)
+                        && is_terminal_failure(check.conclusion.as_deref())
+                })
             })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+            .cloned()
+            .collect()
+    };
     let queued_prs = entries
         .iter()
         .map(|entry| entry.pr)
@@ -547,6 +549,36 @@ fn stalled_contexts(
         })
         .cloned()
         .collect()
+}
+
+fn current_check_observations(checks: &[CheckObservation]) -> Vec<CheckObservation> {
+    let mut current = std::collections::BTreeMap::<String, &CheckObservation>::new();
+    for check in checks {
+        let key = check.name.to_ascii_lowercase();
+        current
+            .entry(key)
+            .and_modify(|observed| {
+                if check_observation_recency(check) > check_observation_recency(observed) {
+                    *observed = check;
+                }
+            })
+            .or_insert(check);
+    }
+    current.into_values().cloned().collect()
+}
+
+fn check_observation_recency(check: &CheckObservation) -> (&str, bool) {
+    (
+        check.started_at.as_deref().unwrap_or_default(),
+        check.status.eq_ignore_ascii_case("completed"),
+    )
+}
+
+fn is_terminal_failure(conclusion: Option<&str>) -> bool {
+    matches!(
+        conclusion,
+        Some("failure" | "cancelled" | "timed_out" | "action_required" | "startup_failure")
+    )
 }
 
 fn job_is_on_eligible_host(job: &JobObservation, classes: &[String]) -> bool {
@@ -910,6 +942,100 @@ mod tests {
                 .reason_codes
                 .contains(&LivenessReason::FrontRequiredFailed)
         );
+    }
+
+    #[test]
+    fn observed_failure_is_reported_when_required_context_names_are_unavailable() {
+        let entries = vec![MergeQueueEntry {
+            pr: 11,
+            position: 0,
+            head_sha: Some("aaa".to_owned()),
+            enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+        }];
+        let checks = vec![CheckObservation {
+            name: "macos".to_owned(),
+            status: "completed".to_owned(),
+            started_at: Some("1970-01-01T00:00:10Z".to_owned()),
+            conclusion: Some("failure".to_owned()),
+        }];
+        let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &entries,
+            checks: &checks,
+            active_runs: &[],
+            required_contexts: &[],
+            eligible_host_classes: &["m5".to_owned()],
+            routable_free_slots: 1,
+            stall_threshold_secs: 60,
+            now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
+        });
+        assert_eq!(report.failed_required_contexts, ["macos"]);
+        assert!(
+            report
+                .reason_codes
+                .contains(&LivenessReason::FrontRequiredFailed)
+        );
+    }
+
+    #[test]
+    fn observed_success_is_not_a_failure_when_required_context_names_are_unavailable() {
+        let checks = vec![CheckObservation {
+            name: "macos".to_owned(),
+            status: "completed".to_owned(),
+            started_at: Some("1970-01-01T00:00:10Z".to_owned()),
+            conclusion: Some("success".to_owned()),
+        }];
+        let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &[],
+            checks: &checks,
+            active_runs: &[],
+            required_contexts: &[],
+            eligible_host_classes: &[],
+            routable_free_slots: 0,
+            stall_threshold_secs: 60,
+            now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
+        });
+        assert!(report.failed_required_contexts.is_empty());
+        assert!(
+            !report
+                .reason_codes
+                .contains(&LivenessReason::FrontRequiredFailed)
+        );
+    }
+
+    #[test]
+    fn newer_success_supersedes_older_failure_when_context_names_are_unavailable() {
+        let checks = vec![
+            CheckObservation {
+                name: "macos".to_owned(),
+                status: "completed".to_owned(),
+                started_at: Some("1970-01-01T00:00:10Z".to_owned()),
+                conclusion: Some("failure".to_owned()),
+            },
+            CheckObservation {
+                name: "macOS".to_owned(),
+                status: "completed".to_owned(),
+                started_at: Some("1970-01-01T00:00:20Z".to_owned()),
+                conclusion: Some("success".to_owned()),
+            },
+        ];
+        let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &[],
+            checks: &checks,
+            active_runs: &[],
+            required_contexts: &[],
+            eligible_host_classes: &[],
+            routable_free_slots: 0,
+            stall_threshold_secs: 60,
+            now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
+        });
+        assert_eq!(report.materialized_required_checks, 1);
+        assert!(report.failed_required_contexts.is_empty());
     }
 
     #[test]

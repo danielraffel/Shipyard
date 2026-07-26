@@ -598,66 +598,15 @@ uses Orchard and never mutates GitHub.
 The watcher resolves the repository default branch; use `--fleet-base` or
 `runner.watchdog.fleet_base` for a different merge target.
 
-Use `shipyard runner steward` as the agent-neutral merge-on-green reconciler:
+Use `shipyard runner steward` for agent-neutral merge-on-green reconciliation.
+It observes by default; `--apply` enables exact-head guarded queue, merge,
+rerun, and narrowly policy-scoped capacity-preemption mutations. Apply mode is
+restricted by central mutation authority, durable write-ahead intent, and
+live revalidation immediately before every GitHub write. The built-in capacity
+preemption preset applies only to Pulp; unknown repositories are disabled.
 
-```bash
-shipyard runner steward \
-  --repo Generous-Corp/pulp \
-  --repo Generous-Corp/forge \
-  --repo Generous-Corp/vellum \
-  --json
-```
-
-It is audit-only unless `--apply` is present. The apply path uses server-side
-exact-head guards for queue admission and merge, preserves existing native
-merge-queue positions, does not rerun genuine failures, limits transient
-reruns durably, and live-revalidates queued state plus immutable head before
-cancelling a duplicate or superseded run. Repositories without
-private-plan branch-protection/merge-queue entitlement use GitHub's REST merge
-endpoint with the same exact-head guard and treat every observed check as
-gating. Add the `shipyard:no-auto-merge` label to opt a PR out.
-
-When an exact merge-group front has waited at least 15 minutes, the steward may
-preempt at most one in-progress PR workflow per pass if that run is an
-allow-listed advisory or a `Build and Test` workflow on a superseded immutable
-PR head, it is
-actively holding a `pulp-preamble` runner, and every `pulp-build` or
-`pulp-build-*` leg is still queued or skipped. It fetches the live run and all
-jobs again immediately before cancellation. Pushes, merge groups, unknown
-workflows/jobs, and any run with a started or completed expensive leg are never
-cancelled. The hard cross-repository pass cap is one; no CLI option can raise
-it. `--no-preempt-capacity` disables this behavior; the per-head attempt
-budget and write-ahead audit live in the `handoff_ledger` path emitted by JSON.
-Apply mode holds an exclusive sibling lock for the whole reconciliation and
-routes every enqueue, exact-head merge, rerun, and cancellation through the
-machine-global merge-queue mutation guard. The configured authority machine,
-central `HOLD`, process-wide mutation lock, and durable uncertainty audit all
-apply before GitHub is mutated; dry-run remains independent of those controls.
-This prevents multiple agents on the authority host from racing or losing
-attempt/audit state and rejects apply on any other host.
-Immediately before a preemption it also re-reads the native queue and the
-front run's jobs, requiring the same exact speculative front SHA and at least
-one recognized pool job still queued/waiting/pending; front advancement or a
-front job starting turns the action into a reported no-op.
-This also covers an organization scheduler active-workflow cap: an exact-front
-`resolve-provider` job queued on `pulp-preamble` is pressure even when a
-matching runner is idle.
-This policy never creates VMs or changes governor leases, host caps, or Tart
-capacity, so a governor denial remains authoritative and cannot be bypassed.
-After GitHub accepts a cancellation, the steward polls the exact run and all
-job attempts for up to 15 seconds. Capacity is considered released only after
-the run is completed and no job remains queued/in-progress. A nonterminal run
-records `cancel_not_terminal`, then sends GitHub's exact-run `force-cancel` and
-polls once more. If that still does not terminalize, the pass is unhealthy with
-an auditable `job@runner` handoff target. The steward does not remotely kill or
-restart a runner; any service recycle is an explicit exact-host, exact-run
-operator action followed by proof that the runner reconnects and claims work.
-The ledger keeps a pending-cancellation record keyed by canonical repository,
-run ID, immutable candidate head, and queue-front head until exact run and job
-reads prove terminal. Every apply pass resumes these records before candidate
-filtering, using the shared mutation guard for exact-run force-cancel. A
-transient observation failure leaves the record pending and makes the pass
-unhealthy for a later retry.
+Read [references/merge-steward.md](references/merge-steward.md) before operating
+the steward, changing its policy, or recovering a pending cancellation.
 
 ### Reroute watcher (cloud→local drain)
 

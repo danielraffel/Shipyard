@@ -415,6 +415,108 @@ pub struct MergeQueueMutationGuard {
     finished: bool,
 }
 
+/// A mutation correlation that may be persisted before authority is acquired.
+///
+/// Crash-resumable callers write this identifier into their own durable state,
+/// then acquire the normal mutation guard with the same identifier. On restart,
+/// [`Self::resume`] provides typed access to uncertainty reconciliation without
+/// exposing the mutation audit's JSON representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableMutationIntent {
+    correlation_id: String,
+}
+
+impl DurableMutationIntent {
+    /// Allocate a fresh correlation for a write-ahead mutation intent.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            correlation_id: MergeQueueMutationGuard::new_correlation_id(),
+        }
+    }
+
+    /// Rehydrate a correlation previously persisted by the caller.
+    pub fn resume(correlation_id: &str) -> Result<Self, String> {
+        if correlation_id.trim().is_empty() {
+            return Err("invalid durable merge-queue mutation correlation".to_owned());
+        }
+        Ok(Self {
+            correlation_id: correlation_id.to_owned(),
+        })
+    }
+
+    /// Identifier the caller must persist before acquiring mutation authority.
+    #[must_use]
+    pub fn correlation_id(&self) -> &str {
+        &self.correlation_id
+    }
+
+    /// Validate authority before the caller persists its write-ahead record.
+    pub fn validate(
+        &self,
+        store: &ShipStateStore,
+        global_dir: &Path,
+        state: &ShipState,
+    ) -> Result<(), String> {
+        if self.correlation_id.is_empty() {
+            return Err("durable merge-queue mutation correlation is empty".to_owned());
+        }
+        MergeQueueMutationGuard::validate_in_mode(store, global_dir, state)
+    }
+
+    /// Acquire mutation authority using this already-persisted correlation.
+    pub fn acquire(
+        &self,
+        store: &ShipStateStore,
+        mode: RuntimeMode,
+        global_dir: &Path,
+        state: &ShipState,
+        action: &str,
+    ) -> Result<MergeQueueMutationGuard, String> {
+        MergeQueueMutationGuard::acquire_in_mode_with_correlation(
+            store,
+            store.path(),
+            mode,
+            global_dir,
+            state,
+            action,
+            &self.correlation_id,
+        )
+    }
+
+    /// Whether this exact persisted mutation remains unresolved.
+    pub fn is_uncertain(&self, state_root: &Path) -> Result<bool, String> {
+        Ok(uncertain_mutations(state_root)?.iter().any(|entry| {
+            entry
+                .get("correlation_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(self.correlation_id.as_str())
+        }))
+    }
+
+    /// Close this exact uncertainty when fresh evidence makes it irrelevant.
+    ///
+    /// Returns `false` when the correlation is already terminal.
+    pub fn supersede_if_uncertain(
+        &self,
+        state_root: &Path,
+        global_dir: &Path,
+        reason: &str,
+    ) -> Result<bool, String> {
+        if !self.is_uncertain(state_root)? {
+            return Ok(false);
+        }
+        supersede_uncertainty(state_root, global_dir, &self.correlation_id, reason)?;
+        Ok(true)
+    }
+}
+
+impl Default for DurableMutationIntent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MergeQueueMutationGuard {
     /// Validate authority, HOLD, and exact-PR uncertainty before a caller
     /// persists a correlation that will be handed to a later guard acquire.
@@ -798,8 +900,8 @@ fn lock_is_contended(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        HOLD_FILE, MergeQueueMutationGuard, hold, hold_status, preflight_mutation_authority,
-        resolve_uncertainty, resume, uncertain_mutations,
+        DurableMutationIntent, HOLD_FILE, MergeQueueMutationGuard, hold, hold_status,
+        preflight_mutation_authority, resolve_uncertainty, resume, uncertain_mutations,
     };
     use crate::identity::RuntimeMode;
     use crate::ship_state::{ShipState, ShipStateStore};
@@ -834,6 +936,21 @@ mod tests {
 
     fn trusted_global_dir(cwd: &std::path::Path) -> std::path::PathBuf {
         cwd.join(".shipyard")
+    }
+
+    #[test]
+    fn durable_mutation_intent_round_trips_fresh_and_legacy_correlations() {
+        let fresh = DurableMutationIntent::new();
+        let resumed =
+            DurableMutationIntent::resume(fresh.correlation_id()).expect("valid correlation");
+        assert_eq!(resumed, fresh);
+        assert_eq!(
+            DurableMutationIntent::resume("legacy-persisted-id")
+                .expect("legacy durable correlation")
+                .correlation_id(),
+            "legacy-persisted-id"
+        );
+        assert!(DurableMutationIntent::resume("").is_err());
     }
 
     fn acquire_guard(
