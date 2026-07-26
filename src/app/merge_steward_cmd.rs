@@ -14,6 +14,8 @@ use serde_json::Value;
 
 use super::CliFailure;
 use crate::cloud::GitHubActions;
+use crate::identity::RuntimeMode;
+use crate::merge_queue_control::MergeQueueMutationGuard;
 use crate::merge_steward::{
     QueueFrontPressure, RunCancellation, RunCancellationReason, StewardCheck, StewardDecision,
     StewardJob, StewardPolicy, StewardPullRequest, StewardRun, classify_pr,
@@ -21,6 +23,8 @@ use crate::merge_steward::{
     plan_capacity_preemptions, plan_run_coalescing, preemption_key, queue_front_waits_for_pool,
 };
 use crate::output::write_json_envelope;
+use crate::paths::RuntimePaths;
+use crate::ship_state::{ShipState, ShipStateStore};
 
 pub(super) struct StewardCommandArgs {
     pub(super) repos: Vec<String>,
@@ -122,6 +126,28 @@ struct CapacityRevalidation {
     current_pr_head: Option<String>,
 }
 
+struct MutationControl {
+    store: ShipStateStore,
+    cwd: PathBuf,
+    mode: RuntimeMode,
+    global_dir: PathBuf,
+}
+
+struct MutationApplyContext<'a> {
+    actions: &'a GitHubActions,
+    observation: &'a RepoObservation,
+    ledger_path: &'a Path,
+    mutation_control: &'a MutationControl,
+}
+
+struct CapacityApplyContext<'a> {
+    actions: &'a GitHubActions,
+    observation: &'a RepoObservation,
+    cancellation: &'a RunCancellation,
+    ledger_path: &'a Path,
+    mutation_control: &'a MutationControl,
+}
+
 const CANCEL_TERMINAL_WAIT: Duration = Duration::from_secs(15);
 const CANCEL_TERMINAL_POLL: Duration = Duration::from_secs(2);
 const PREEMPT_AFTER_SECS: i64 = 900;
@@ -129,7 +155,8 @@ const PREEMPT_AFTER_SECS: i64 = 900;
 pub(super) fn steward_command<W: Write>(
     args: &StewardCommandArgs,
     cwd: &Path,
-    state_dir: &Path,
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
     actions: &GitHubActions,
     json_output: bool,
     stdout: &mut W,
@@ -138,9 +165,24 @@ pub(super) fn steward_command<W: Write>(
     let ledger_path = args
         .ledger
         .clone()
-        .unwrap_or_else(|| state_dir.join("merge-steward.json"));
+        .unwrap_or_else(|| runtime_paths.state_dir.join("merge-steward.json"));
     let _ledger_lock = if args.apply {
         Some(acquire_ledger_lock(&ledger_path)?)
+    } else {
+        None
+    };
+    let mutation_control = if args.apply {
+        Some(MutationControl {
+            store: ShipStateStore::new(runtime_paths.state_dir.join("ship")).map_err(|error| {
+                CliFailure::new(
+                    1,
+                    format!("could not open merge-queue mutation state: {error}"),
+                )
+            })?,
+            cwd: cwd.to_path_buf(),
+            mode,
+            global_dir: runtime_paths.global_dir.clone(),
+        })
     } else {
         None
     };
@@ -158,6 +200,7 @@ pub(super) fn steward_command<W: Write>(
                     &ledger_path,
                     &mut ledger,
                     remaining_preemptions,
+                    mutation_control.as_ref(),
                 );
                 remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
                 unhealthy |= failed;
@@ -303,6 +346,7 @@ fn observe_repo(
         &["api".to_owned(), format!("repos/{repo}")],
         "repository settings",
     )?;
+    let repo = canonical_repo_name(&settings)?;
     let allow_auto_merge = settings
         .get("allow_auto_merge")
         .and_then(Value::as_bool)
@@ -328,19 +372,19 @@ fn observe_repo(
     } else {
         None
     };
-    let required_contexts = required_contexts(actions, repo, base)?;
+    let required_contexts = required_contexts(actions, &repo, base)?;
     let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
-        merge_queue_snapshot(actions, repo, base)?;
-    let prs = pull_requests(actions, repo, base, &queue_positions)?;
-    let mut runs = active_runs(actions, repo)?;
+        merge_queue_snapshot(actions, &repo, base)?;
+    let prs = pull_requests(actions, &repo, base, &queue_positions)?;
+    let mut runs = active_runs(actions, &repo)?;
     let front_head = queue_positions
         .iter()
         .min_by_key(|(_, position)| **position)
         .and_then(|(number, _)| merge_group_heads.get(number))
         .map(String::as_str);
-    let preemption_error = hydrate_preemption_jobs(actions, repo, front_head, &mut runs).err();
+    let preemption_error = hydrate_preemption_jobs(actions, &repo, front_head, &mut runs).err();
     Ok(RepoObservation {
-        repo: repo.to_owned(),
+        repo,
         base: base.to_owned(),
         allow_auto_merge,
         merge_queue,
@@ -352,6 +396,21 @@ fn observe_repo(
         merge_group_enqueued_at,
         preemption_error,
     })
+}
+
+fn canonical_repo_name(settings: &Value) -> Result<String, String> {
+    let full_name = settings
+        .get("full_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "repository settings missing canonical full_name".to_owned())?;
+    let Some((owner, name)) = full_name.split_once('/') else {
+        return Err("repository settings returned malformed canonical full_name".to_owned());
+    };
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err("repository settings returned malformed canonical full_name".to_owned());
+    }
+    Ok(full_name.to_owned())
 }
 
 fn gh_json(actions: &GitHubActions, args: &[String], purpose: &str) -> Result<Value, String> {
@@ -876,6 +935,7 @@ fn apply_repo_plan(
     ledger_path: &Path,
     ledger: &mut StewardLedger,
     remaining_preemptions: usize,
+    mutation_control: Option<&MutationControl>,
 ) -> (RepoReport, bool, usize) {
     let policy = StewardPolicy {
         merge_queue: observation.merge_queue,
@@ -884,8 +944,15 @@ fn apply_repo_plan(
         opt_out_label: args.opt_out_label.clone(),
         max_transient_reruns: args.max_transient_reruns,
     };
-    let (reports, pr_mutation_failed) =
-        apply_pr_plans(actions, args, observation, &policy, ledger_path, ledger);
+    let (reports, pr_mutation_failed) = apply_pr_plans(
+        actions,
+        args,
+        observation,
+        &policy,
+        ledger_path,
+        ledger,
+        mutation_control,
+    );
     let mut unhealthy = observation.preemption_error.is_some() || pr_mutation_failed;
     let mut planned_cancellations = Vec::new();
     if args.coalesce {
@@ -924,6 +991,7 @@ fn apply_repo_plan(
                 &args.opt_out_label,
                 ledger_path,
                 ledger,
+                mutation_control.expect("apply mode requires mutation control"),
             )
         } else {
             (None, None)
@@ -966,8 +1034,15 @@ fn apply_pr_plans(
     policy: &StewardPolicy,
     ledger_path: &Path,
     ledger: &mut StewardLedger,
+    mutation_control: Option<&MutationControl>,
 ) -> (Vec<PrReport>, bool) {
     let mut unhealthy = false;
+    let mutation_context = mutation_control.map(|mutation_control| MutationApplyContext {
+        actions,
+        observation,
+        ledger_path,
+        mutation_control,
+    });
     let reports = observation
         .prs
         .iter()
@@ -976,12 +1051,12 @@ fn apply_pr_plans(
             let decision = classify_pr(&pr.fact, policy, &attempts);
             let (mutation, error) = if args.apply {
                 mutate_pr(
-                    actions,
-                    observation,
+                    mutation_context
+                        .as_ref()
+                        .expect("apply mode requires mutation control"),
                     pr,
                     policy,
                     &decision,
-                    ledger_path,
                     ledger,
                 )
             } else {
@@ -1090,6 +1165,7 @@ fn apply_run_cancellation(
     opt_out_label: &str,
     ledger_path: &Path,
     ledger: &mut StewardLedger,
+    mutation_control: &MutationControl,
 ) -> (Option<String>, Option<String>) {
     if matches!(
         cancellation.reason,
@@ -1097,11 +1173,14 @@ fn apply_run_cancellation(
             | RunCancellationReason::LowerPriorityBranchPreamble
     ) {
         return apply_capacity_preemption(
-            actions,
-            observation,
-            cancellation,
+            &CapacityApplyContext {
+                actions,
+                observation,
+                cancellation,
+                ledger_path,
+                mutation_control,
+            },
             opt_out_label,
-            ledger_path,
             ledger,
         );
     }
@@ -1120,101 +1199,170 @@ fn apply_run_cancellation(
         opt_out_label,
     ) {
         Ok(false) => (Some("skipped_after_live_revalidation".to_owned()), None),
-        Ok(true) => match actions.cancel_workflow_run(&observation.repo, cancellation.run_id) {
-            Ok(()) => {
-                record_audit(
-                    ledger,
-                    &observation.repo,
-                    &format!("run:{}", cancellation.run_id),
-                    "cancel_revalidated_queued_run",
-                );
-                (Some("cancelled".to_owned()), None)
+        Ok(true) => {
+            let guard = match acquire_run_mutation_guard(
+                mutation_control,
+                observation,
+                observed,
+                &format!("runner steward cancel run {}", cancellation.run_id),
+            ) {
+                Ok(guard) => guard,
+                Err(error) => return (None, Some(error)),
+            };
+            match actions.cancel_workflow_run(&observation.repo, cancellation.run_id) {
+                Ok(()) => {
+                    if let Err(error) = guard.finish("cancel_accepted") {
+                        return (
+                            Some("cancelled".to_owned()),
+                            Some(format!(
+                                "cancel accepted but mutation audit failed: {error}"
+                            )),
+                        );
+                    }
+                    record_audit(
+                        ledger,
+                        &observation.repo,
+                        &format!("run:{}", cancellation.run_id),
+                        "cancel_revalidated_queued_run",
+                    );
+                    (Some("cancelled".to_owned()), None)
+                }
+                Err(error) => (None, Some(error.to_string())),
             }
-            Err(error) => (None, Some(error.to_string())),
-        },
+        }
         Err(error) => (None, Some(error)),
     }
 }
 
 fn apply_capacity_preemption(
-    actions: &GitHubActions,
-    observation: &RepoObservation,
-    cancellation: &RunCancellation,
+    context: &CapacityApplyContext<'_>,
     opt_out_label: &str,
-    ledger_path: &Path,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
-    let Some(observed) = observation
+    let Some(observed) = context
+        .observation
         .runs
         .iter()
-        .find(|run| run.id == cancellation.run_id)
+        .find(|run| run.id == context.cancellation.run_id)
     else {
         return (None, Some("planned run observation disappeared".to_owned()));
     };
-    let Some(expected_front) = queue_front_head(observation) else {
+    let Some(expected_front) = queue_front_head(context.observation) else {
         return (Some("skipped_after_front_revalidation".to_owned()), None);
     };
-    let key = format!("{}:{}", observation.repo, preemption_key(observed));
+    let (guard, cancel_live) =
+        match prepare_capacity_preemption(context, opt_out_label, ledger, observed, expected_front)
+        {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => {
+                return (
+                    Some("skipped_after_precancel_revalidation".to_owned()),
+                    None,
+                );
+            }
+            Err(error) => return (None, Some(error)),
+        };
+    match context
+        .actions
+        .cancel_workflow_run(&context.observation.repo, context.cancellation.run_id)
+    {
+        Ok(()) => {
+            if let Err(error) = guard.finish("cancel_accepted") {
+                return (
+                    Some("cancelled_after_job_revalidation".to_owned()),
+                    Some(format!(
+                        "cancel accepted but mutation audit failed: {error}"
+                    )),
+                );
+            }
+            complete_capacity_cancellation(context, expected_front, &cancel_live.candidate, ledger)
+        }
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+fn prepare_capacity_preemption(
+    context: &CapacityApplyContext<'_>,
+    opt_out_label: &str,
+    ledger: &mut StewardLedger,
+    observed: &StewardRun,
+    expected_front: &str,
+) -> Result<Option<(MergeQueueMutationGuard, CapacityRevalidation)>, String> {
+    let guard = acquire_run_mutation_guard(
+        context.mutation_control,
+        context.observation,
+        observed,
+        &format!(
+            "runner steward preempt capacity run {}",
+            context.cancellation.run_id
+        ),
+    )?;
+    let key = format!("{}:{}", context.observation.repo, preemption_key(observed));
     *ledger.preemption_attempts.entry(key).or_default() += 1;
     record_audit(
         ledger,
-        &observation.repo,
+        &context.observation.repo,
         &format!(
             "front:{expected_front}:capacity-run:{}:{}",
-            cancellation.run_id, observed.head_sha
+            context.cancellation.run_id, observed.head_sha
         ),
-        &format!("capacity_preemption_started:{:?}", cancellation.reason),
+        &format!(
+            "capacity_preemption_started:{:?}",
+            context.cancellation.reason
+        ),
     );
-    if let Err(error) = save_ledger(ledger_path, ledger) {
-        return (
-            None,
-            Some(format!(
-                "could not persist preemption intent: {}",
-                error.message
-            )),
-        );
+    if let Err(error) = save_ledger(context.ledger_path, ledger) {
+        let audit_error = guard.finish("intent_persistence_failed").err();
+        return Err(format!(
+            "could not persist preemption intent: {}{}",
+            error.message,
+            audit_error.map_or_else(String::new, |error| format!(
+                "; mutation audit also failed: {error}"
+            ))
+        ));
     }
-    // The one full live proof is fetched after the write-ahead intent. Persist
-    // that exact proof durably before issuing the irreversible cancellation.
     let cancel_live = match revalidate_capacity_preemption(
-        actions,
-        observation,
-        cancellation,
+        context.actions,
+        context.observation,
+        context.cancellation,
         observed,
         expected_front,
         opt_out_label,
     ) {
         Ok(Some(evidence)) => evidence,
         Ok(None) => {
-            return (
-                Some("skipped_after_precancel_revalidation".to_owned()),
-                None,
-            );
+            guard
+                .finish("skipped_after_precancel_revalidation")
+                .map_err(|error| format!("mutation audit failed: {error}"))?;
+            return Ok(None);
         }
-        Err(error) => return (None, Some(error)),
+        Err(error) => {
+            let audit_error = guard.finish("revalidation_failed").err();
+            return Err(format!(
+                "{error}{}",
+                audit_error.map_or_else(String::new, |error| format!(
+                    "; mutation audit also failed: {error}"
+                ))
+            ));
+        }
     };
     if let Err(error) = persist_capacity_evidence(
-        observation,
-        cancellation,
+        context.observation,
+        context.cancellation,
         expected_front,
         &cancel_live,
-        ledger_path,
+        context.ledger_path,
         ledger,
     ) {
-        return (None, Some(error));
+        let audit_error = guard.finish("evidence_persistence_failed").err();
+        return Err(format!(
+            "{error}{}",
+            audit_error.map_or_else(String::new, |error| format!(
+                "; mutation audit also failed: {error}"
+            ))
+        ));
     }
-    match actions.cancel_workflow_run(&observation.repo, cancellation.run_id) {
-        Ok(()) => complete_capacity_cancellation(
-            actions,
-            observation,
-            cancellation,
-            expected_front,
-            &cancel_live.candidate,
-            ledger_path,
-            ledger,
-        ),
-        Err(error) => (None, Some(error.to_string())),
-    }
+    Ok(Some((guard, cancel_live)))
 }
 
 fn persist_capacity_evidence(
@@ -1249,24 +1397,24 @@ fn persist_capacity_evidence(
 }
 
 fn complete_capacity_cancellation(
-    actions: &GitHubActions,
-    observation: &RepoObservation,
-    cancellation: &RunCancellation,
+    context: &CapacityApplyContext<'_>,
     expected_front: &str,
     final_live: &StewardRun,
-    ledger_path: &Path,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
     record_audit(
         ledger,
-        &observation.repo,
+        &context.observation.repo,
         &format!(
             "front:{expected_front}:capacity-run:{}:{}",
-            cancellation.run_id, final_live.head_sha
+            context.cancellation.run_id, final_live.head_sha
         ),
-        &format!("capacity_preemption_accepted:{:?}", cancellation.reason),
+        &format!(
+            "capacity_preemption_accepted:{:?}",
+            context.cancellation.reason
+        ),
     );
-    if let Err(error) = save_ledger(ledger_path, ledger) {
+    if let Err(error) = save_ledger(context.ledger_path, ledger) {
         return (
             Some("cancelled_after_job_revalidation".to_owned()),
             Some(format!(
@@ -1275,15 +1423,19 @@ fn complete_capacity_cancellation(
             )),
         );
     }
-    match wait_for_run_terminalization(actions, &observation.repo, cancellation.run_id) {
+    match wait_for_run_terminalization(
+        context.actions,
+        &context.observation.repo,
+        context.cancellation.run_id,
+    ) {
         Ok(None) => {
             record_audit(
                 ledger,
-                &observation.repo,
-                &format!("capacity-run:{}", cancellation.run_id),
+                &context.observation.repo,
+                &format!("capacity-run:{}", context.cancellation.run_id),
                 "capacity_preemption_terminalized",
             );
-            if let Err(error) = save_ledger(ledger_path, ledger) {
+            if let Err(error) = save_ledger(context.ledger_path, ledger) {
                 return (
                     Some("cancelled_terminal".to_owned()),
                     Some(format!(
@@ -1295,21 +1447,20 @@ fn complete_capacity_cancellation(
             (Some("cancelled_terminal".to_owned()), None)
         }
         Ok(Some(active)) => force_cancel_nonterminal_run(
-            actions,
-            observation,
-            cancellation.run_id,
+            context,
+            context.cancellation.run_id,
             &active,
-            ledger_path,
+            final_live,
             ledger,
         ),
         Err(error) => {
             record_audit(
                 ledger,
-                &observation.repo,
-                &format!("capacity-run:{}", cancellation.run_id),
+                &context.observation.repo,
+                &format!("capacity-run:{}", context.cancellation.run_id),
                 "cancel_terminalization_unreadable",
             );
-            let _ = save_ledger(ledger_path, ledger);
+            let _ = save_ledger(context.ledger_path, ledger);
             (
                 Some("cancel_terminalization_unreadable".to_owned()),
                 Some(format!(
@@ -1321,18 +1472,17 @@ fn complete_capacity_cancellation(
 }
 
 fn force_cancel_nonterminal_run(
-    actions: &GitHubActions,
-    observation: &RepoObservation,
+    context: &CapacityApplyContext<'_>,
     run_id: u64,
     active: &NonTerminalRun,
-    ledger_path: &Path,
+    run: &StewardRun,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
     let targets = active_runner_targets(&active.jobs);
     if let Err(error) = persist_force_cancel_intent(
         ledger,
-        ledger_path,
-        &observation.repo,
+        context.ledger_path,
+        &context.observation.repo,
         run_id,
         &active.status,
         &targets,
@@ -1345,8 +1495,32 @@ fn force_cancel_nonterminal_run(
             )),
         );
     }
-    if let Err(error) = actions.force_cancel_workflow_run(&observation.repo, run_id) {
-        audit_force_cancel_failure(ledger, ledger_path, &observation.repo, run_id);
+    let guard = match acquire_run_mutation_guard(
+        context.mutation_control,
+        context.observation,
+        run,
+        &format!("runner steward force-cancel run {run_id}"),
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return (
+                Some("cancel_not_terminal".to_owned()),
+                Some(format!(
+                    "cancel_not_terminal run {run_id} active={targets}; force-cancel authority failed: {error}"
+                )),
+            );
+        }
+    };
+    if let Err(error) = context
+        .actions
+        .force_cancel_workflow_run(&context.observation.repo, run_id)
+    {
+        audit_force_cancel_failure(
+            ledger,
+            context.ledger_path,
+            &context.observation.repo,
+            run_id,
+        );
         return (
             Some("cancel_not_terminal".to_owned()),
             Some(format!(
@@ -1354,13 +1528,21 @@ fn force_cancel_nonterminal_run(
             )),
         );
     }
+    if let Err(error) = guard.finish("force_cancel_accepted") {
+        return (
+            Some("force_cancel_accepted_unverified".to_owned()),
+            Some(format!(
+                "force-cancel accepted for run {run_id}, but mutation audit failed: {error}"
+            )),
+        );
+    }
     record_audit(
         ledger,
-        &observation.repo,
+        &context.observation.repo,
         &format!("capacity-run:{run_id}"),
         "force_cancel_accepted",
     );
-    if let Err(error) = save_ledger(ledger_path, ledger) {
+    if let Err(error) = save_ledger(context.ledger_path, ledger) {
         return (
             Some("force_cancel_accepted_unverified".to_owned()),
             Some(format!(
@@ -1369,15 +1551,23 @@ fn force_cancel_nonterminal_run(
             )),
         );
     }
-    match wait_for_run_terminalization(actions, &observation.repo, run_id) {
+    verify_force_cancel_terminalization(context, run_id, ledger)
+}
+
+fn verify_force_cancel_terminalization(
+    context: &CapacityApplyContext<'_>,
+    run_id: u64,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    match wait_for_run_terminalization(context.actions, &context.observation.repo, run_id) {
         Ok(None) => {
             record_audit(
                 ledger,
-                &observation.repo,
+                &context.observation.repo,
                 &format!("capacity-run:{run_id}"),
                 "force_cancel_terminalized",
             );
-            match save_ledger(ledger_path, ledger) {
+            match save_ledger(context.ledger_path, ledger) {
                 Ok(()) => (Some("force_cancelled_terminal".to_owned()), None),
                 Err(error) => (
                     Some("force_cancelled_terminal".to_owned()),
@@ -1392,11 +1582,11 @@ fn force_cancel_nonterminal_run(
             let still_targets = active_runner_targets(&still_active.jobs);
             record_audit(
                 ledger,
-                &observation.repo,
+                &context.observation.repo,
                 &format!("capacity-run:{run_id}"),
                 &format!("force_cancel_not_terminal:targets={still_targets}"),
             );
-            let _ = save_ledger(ledger_path, ledger);
+            let _ = save_ledger(context.ledger_path, ledger);
             (
                 Some("force_cancel_not_terminal".to_owned()),
                 Some(format!(
@@ -1407,11 +1597,11 @@ fn force_cancel_nonterminal_run(
         Err(error) => {
             record_audit(
                 ledger,
-                &observation.repo,
+                &context.observation.repo,
                 &format!("capacity-run:{run_id}"),
                 "force_cancel_terminalization_unreadable",
             );
-            let audit_error = save_ledger(ledger_path, ledger).err();
+            let audit_error = save_ledger(context.ledger_path, ledger).err();
             (
                 Some("force_cancel_terminalization_unreadable".to_owned()),
                 Some(format!(
@@ -1791,13 +1981,73 @@ fn attempts_for(ledger: &StewardLedger, repo: &str, pr: &StewardPullRequest) -> 
         .collect()
 }
 
-fn mutate_pr(
-    actions: &GitHubActions,
+fn acquire_pr_mutation_guard(
+    control: &MutationControl,
     observation: &RepoObservation,
+    pr: &ObservedPr,
+    action: &str,
+) -> Result<MergeQueueMutationGuard, String> {
+    let state = ShipState::new(
+        pr.fact.number,
+        &observation.repo,
+        &pr.fact.head_branch,
+        &observation.base,
+        &pr.fact.head_sha,
+        "runner-steward",
+    );
+    MergeQueueMutationGuard::acquire_in_mode(
+        &control.store,
+        &control.cwd,
+        control.mode,
+        &control.global_dir,
+        &state,
+        action,
+    )
+}
+
+fn acquire_run_mutation_guard(
+    control: &MutationControl,
+    observation: &RepoObservation,
+    run: &StewardRun,
+    action: &str,
+) -> Result<MergeQueueMutationGuard, String> {
+    let pr_number = run
+        .pull_request_number
+        .or_else(|| merge_group_pr_number(run))
+        .ok_or_else(|| {
+            format!(
+                "workflow run {} has no pull-request identity; refusing an unaudited mutation",
+                run.id
+            )
+        })?;
+    let branch = observation
+        .prs
+        .iter()
+        .find(|pr| pr.fact.number == pr_number)
+        .map_or(run.head_branch.as_str(), |pr| pr.fact.head_branch.as_str());
+    let state = ShipState::new(
+        pr_number,
+        &observation.repo,
+        branch,
+        &observation.base,
+        &run.head_sha,
+        "runner-steward",
+    );
+    MergeQueueMutationGuard::acquire_in_mode(
+        &control.store,
+        &control.cwd,
+        control.mode,
+        &control.global_dir,
+        &state,
+        action,
+    )
+}
+
+fn mutate_pr(
+    context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     policy: &StewardPolicy,
     decision: &StewardDecision,
-    ledger_path: &Path,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
     if !matches!(
@@ -1808,85 +2058,129 @@ fn mutate_pr(
     ) {
         return (None, None);
     }
-    let queue_positions = match merge_queue_snapshot(actions, &observation.repo, &observation.base)
-    {
+    let queue_positions = match merge_queue_snapshot(
+        context.actions,
+        &context.observation.repo,
+        &context.observation.base,
+    ) {
         Ok((_, positions, _, _)) => positions,
         Err(error) => return (None, Some(error)),
     };
-    let live_pr = match pull_request(actions, &observation.repo, pr.fact.number, &queue_positions) {
+    let live_pr = match pull_request(
+        context.actions,
+        &context.observation.repo,
+        pr.fact.number,
+        &queue_positions,
+    ) {
         Ok(Some(live_pr)) => live_pr,
         Ok(None) => return (Some("skipped_after_live_revalidation".to_owned()), None),
         Err(error) => return (None, Some(error)),
     };
-    let attempts = attempts_for(ledger, &observation.repo, &live_pr.fact);
+    let attempts = attempts_for(ledger, &context.observation.repo, &live_pr.fact);
     if classify_pr(&live_pr.fact, policy, &attempts) != *decision {
         return (Some("skipped_after_live_revalidation".to_owned()), None);
     }
     let pr = &live_pr;
     match decision {
-        StewardDecision::ArmMergeQueue => enqueue_pull_request(actions, observation, pr, ledger),
-        StewardDecision::ExactHeadMerge => {
-            let Some(merge_method) = observation.merge_method.as_deref() else {
-                return (Some("waiting_merge_method_configuration".to_owned()), None);
-            };
-            let result = gh_json(
-                actions,
-                &[
-                    "api".to_owned(),
-                    "--method".to_owned(),
-                    "PUT".to_owned(),
-                    format!("repos/{}/pulls/{}/merge", observation.repo, pr.fact.number),
-                    "-f".to_owned(),
-                    format!("sha={}", pr.fact.head_sha),
-                    "-f".to_owned(),
-                    format!("merge_method={merge_method}"),
-                ],
-                "exact-head merge",
-            );
-            match result {
-                Ok(value) if value.get("merged").and_then(Value::as_bool) == Some(true) => {
-                    record_audit(
-                        ledger,
-                        &observation.repo,
-                        &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
-                        "merge_exact_head",
-                    );
-                    (Some("merged".to_owned()), None)
-                }
-                Ok(value) => (
-                    None,
-                    Some(format!(
-                        "GitHub refused exact-head merge: {}",
-                        value
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown reason")
-                    )),
-                ),
-                Err(error) => (None, Some(error)),
-            }
+        StewardDecision::ArmMergeQueue => enqueue_pull_request(context, pr, ledger),
+        StewardDecision::ExactHeadMerge => exact_head_merge(context, pr, ledger),
+        StewardDecision::RerunTransient { run_ids } => {
+            mutate_transient_reruns(context, pr, policy, run_ids, ledger)
         }
-        StewardDecision::RerunTransient { run_ids } => mutate_transient_reruns(
-            actions,
-            observation,
-            pr,
-            policy,
-            run_ids,
-            ledger_path,
-            ledger,
-        ),
         _ => (None, None),
     }
 }
 
-fn enqueue_pull_request(
-    actions: &GitHubActions,
-    observation: &RepoObservation,
+fn exact_head_merge(
+    context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
+    let Some(merge_method) = context.observation.merge_method.as_deref() else {
+        return (Some("waiting_merge_method_configuration".to_owned()), None);
+    };
+    let guard = match acquire_pr_mutation_guard(
+        context.mutation_control,
+        context.observation,
+        pr,
+        "runner steward exact-head merge",
+    ) {
+        Ok(guard) => guard,
+        Err(error) => return (None, Some(error)),
+    };
+    let result = gh_json(
+        context.actions,
+        &[
+            "api".to_owned(),
+            "--method".to_owned(),
+            "PUT".to_owned(),
+            format!(
+                "repos/{}/pulls/{}/merge",
+                context.observation.repo, pr.fact.number
+            ),
+            "-f".to_owned(),
+            format!("sha={}", pr.fact.head_sha),
+            "-f".to_owned(),
+            format!("merge_method={merge_method}"),
+        ],
+        "exact-head merge",
+    );
+    match result {
+        Ok(value) if value.get("merged").and_then(Value::as_bool) == Some(true) => {
+            if let Err(error) = guard.finish("merged") {
+                return (
+                    Some("merged".to_owned()),
+                    Some(format!(
+                        "merge succeeded but mutation audit failed: {error}"
+                    )),
+                );
+            }
+            record_audit(
+                ledger,
+                &context.observation.repo,
+                &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
+                "merge_exact_head",
+            );
+            (Some("merged".to_owned()), None)
+        }
+        Ok(value) => {
+            let audit_error = guard
+                .finish("rejected")
+                .err()
+                .map_or_else(String::new, |error| {
+                    format!("; mutation audit also failed: {error}")
+                });
+            (
+                None,
+                Some(format!(
+                    "GitHub refused exact-head merge: {}{audit_error}",
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown reason")
+                )),
+            )
+        }
+        Err(error) => (None, Some(error)),
+    }
+}
+
+fn enqueue_pull_request(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    let guard = match acquire_pr_mutation_guard(
+        context.mutation_control,
+        context.observation,
+        pr,
+        "runner steward enqueue pull request",
+    ) {
+        Ok(guard) => guard,
+        Err(error) => return (None, Some(error)),
+    };
     let query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
-    let result = actions.run_gh(&[
+    let result = context.actions.run_gh(&[
         "api".to_owned(),
         "graphql".to_owned(),
         "-f".to_owned(),
@@ -1898,9 +2192,17 @@ fn enqueue_pull_request(
     ]);
     match result {
         Ok(_) => {
+            if let Err(error) = guard.finish("enqueued") {
+                return (
+                    Some("enqueued".to_owned()),
+                    Some(format!(
+                        "enqueue succeeded but mutation audit failed: {error}"
+                    )),
+                );
+            }
             record_audit(
                 ledger,
-                &observation.repo,
+                &context.observation.repo,
                 &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
                 "enqueue_exact_head",
             );
@@ -1909,7 +2211,15 @@ fn enqueue_pull_request(
         Err(error) => {
             let message = error.to_string();
             if enqueue_requirements_pending(&message) {
-                (Some("waiting_enqueue_requirements".to_owned()), None)
+                match guard.finish("rejected_requirements") {
+                    Ok(()) => (Some("waiting_enqueue_requirements".to_owned()), None),
+                    Err(error) => (
+                        Some("waiting_enqueue_requirements".to_owned()),
+                        Some(format!(
+                            "enqueue requirements rejected but mutation audit failed: {error}"
+                        )),
+                    ),
+                }
             } else {
                 (None, Some(message))
             }
@@ -1918,19 +2228,29 @@ fn enqueue_pull_request(
 }
 
 fn mutate_transient_reruns(
-    actions: &GitHubActions,
-    observation: &RepoObservation,
+    context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     policy: &StewardPolicy,
     run_ids: &[u64],
-    ledger_path: &Path,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
     let mut errors = Vec::new();
     let mut rerun = Vec::new();
     for run_id in run_ids {
+        let guard = match acquire_pr_mutation_guard(
+            context.mutation_control,
+            context.observation,
+            pr,
+            &format!("runner steward rerun failed run {run_id}"),
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
         let key = attempt_key(
-            &observation.repo,
+            &context.observation.repo,
             pr.fact.number,
             &pr.fact.head_sha,
             *run_id,
@@ -1938,41 +2258,70 @@ fn mutate_transient_reruns(
         *ledger.transient_attempts.entry(key).or_default() += 1;
         record_audit(
             ledger,
-            &observation.repo,
+            &context.observation.repo,
             &format!("run:{run_id}:{}", pr.fact.head_sha),
             "rerun_transient_intent",
         );
-        if let Err(error) = save_ledger(ledger_path, ledger) {
+        if let Err(error) = save_ledger(context.ledger_path, ledger) {
+            let audit_error = guard.finish("intent_persistence_failed").err();
             return (
                 None,
                 Some(format!(
-                    "could not persist transient rerun intent: {}",
-                    error.message
+                    "could not persist transient rerun intent: {}{}",
+                    error.message,
+                    audit_error.map_or_else(String::new, |error| format!(
+                        "; mutation audit also failed: {error}"
+                    ))
                 )),
             );
         }
-        match revalidate_transient_rerun(actions, observation, pr, policy, *run_id, ledger) {
+        match revalidate_transient_rerun(
+            context.actions,
+            context.observation,
+            pr,
+            policy,
+            *run_id,
+            ledger,
+        ) {
             Ok(false) => {
                 record_audit(
                     ledger,
-                    &observation.repo,
+                    &context.observation.repo,
                     &format!("run:{run_id}:{}", pr.fact.head_sha),
                     "rerun_transient_skipped_after_live_revalidation",
                 );
+                if let Err(error) = guard.finish("skipped_after_live_revalidation") {
+                    errors.push(format!("rerun skip mutation audit failed: {error}"));
+                }
                 continue;
             }
             Err(error) => {
-                errors.push(error);
+                let audit_error = guard.finish("revalidation_failed").err();
+                errors.push(format!(
+                    "{error}{}",
+                    audit_error.map_or_else(String::new, |error| format!(
+                        "; mutation audit also failed: {error}"
+                    ))
+                ));
                 continue;
             }
             Ok(true) => {}
         }
-        match actions.rerun_failed_run(&observation.repo, *run_id) {
+        match context
+            .actions
+            .rerun_failed_run(&context.observation.repo, *run_id)
+        {
             Ok(()) => {
+                if let Err(error) = guard.finish("rerun_accepted") {
+                    errors.push(format!(
+                        "rerun accepted for run {run_id}, but mutation audit failed: {error}"
+                    ));
+                    continue;
+                }
                 rerun.push(*run_id);
                 record_audit(
                     ledger,
-                    &observation.repo,
+                    &context.observation.repo,
                     &format!("run:{run_id}:{}", pr.fact.head_sha),
                     "rerun_transient",
                 );
@@ -2280,6 +2629,43 @@ mod tests {
         GitHubActions::new(temp.path()).with_gh_binary_for_tests(path)
     }
 
+    fn mutation_control(
+        temp: &tempfile::TempDir,
+        authority: &str,
+        machine: &str,
+    ) -> MutationControl {
+        let global_dir = temp.path().join("global");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&global_dir).expect("global config");
+        fs::create_dir_all(&state_dir).expect("state");
+        fs::write(
+            global_dir.join("config.toml"),
+            format!("[merge_queue]\nmutation_machine = \"{authority}\"\n"),
+        )
+        .expect("authority config");
+        fs::write(state_dir.join("machine-tag"), format!("{machine}\n")).expect("machine tag");
+        MutationControl {
+            store: ShipStateStore::new(state_dir.join("ship")).expect("ship store"),
+            cwd: temp.path().to_path_buf(),
+            mode: RuntimeMode::Shipyard,
+            global_dir,
+        }
+    }
+
+    fn mutation_apply_context<'a>(
+        actions: &'a GitHubActions,
+        observation: &'a RepoObservation,
+        ledger_path: &'a Path,
+        mutation_control: &'a MutationControl,
+    ) -> MutationApplyContext<'a> {
+        MutationApplyContext {
+            actions,
+            observation,
+            ledger_path,
+            mutation_control,
+        }
+    }
+
     fn ready_pr() -> ObservedPr {
         parse_pr(
             &serde_json::json!({
@@ -2321,6 +2707,16 @@ mod tests {
         }
     }
 
+    fn queue_policy() -> StewardPolicy {
+        StewardPolicy {
+            merge_queue: true,
+            native_auto_merge: true,
+            required_contexts: Vec::new(),
+            opt_out_label: "steward:skip".to_owned(),
+            max_transient_reruns: 1,
+        }
+    }
+
     fn queued_run(id: u64, created_at: &str) -> StewardRun {
         StewardRun {
             id,
@@ -2356,6 +2752,19 @@ mod tests {
         .expect("context");
         assert_eq!(context.status, "IN_PROGRESS");
         assert_eq!(context.run_id, Some(789));
+    }
+
+    #[test]
+    fn repository_settings_supply_canonical_guard_identity() {
+        assert_eq!(
+            canonical_repo_name(&serde_json::json!({"full_name": "Owner/Repo"}))
+                .expect("canonical"),
+            "Owner/Repo"
+        );
+        assert!(canonical_repo_name(&serde_json::json!({})).is_err());
+        assert!(
+            canonical_repo_name(&serde_json::json!({"full_name": "owner/repo/extra"})).is_err()
+        );
     }
 
     #[test]
@@ -2549,22 +2958,18 @@ esac
         );
         let pr = ready_pr();
         let observation = observation_for(pr.clone(), true);
-        let policy = StewardPolicy {
-            merge_queue: true,
-            native_auto_merge: true,
-            required_contexts: Vec::new(),
-            opt_out_label: "steward:skip".to_owned(),
-            max_transient_reruns: 1,
-        };
+        let policy = queue_policy();
         let mut ledger = StewardLedger::default();
+        let mutation_control = mutation_control(&temp, "studio", "studio");
+        let ledger_path = temp.path().join("ledger.json");
+        let context =
+            mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
 
         let (mutation, error) = mutate_pr(
-            &actions,
-            &observation,
+            &context,
             &pr,
             &policy,
             &StewardDecision::ArmMergeQueue,
-            &temp.path().join("ledger.json"),
             &mut ledger,
         );
 
@@ -2574,6 +2979,303 @@ esac
         assert!(calls.contains("mergeQueue"), "{calls}");
         assert!(calls.contains("pr view 42"), "{calls}");
         assert!(calls.contains("enqueuePullRequest"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steward_apply_rejects_unauthorized_host_before_remote_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"enqueuePullRequest"*) echo "mutation must not run" >&2; exit 90 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let pr = ready_pr();
+        let observation = observation_for(pr.clone(), true);
+        let mut ledger = StewardLedger::default();
+        let mutation_control = mutation_control(&temp, "studio", "m1");
+        let ledger_path = temp.path().join("ledger.json");
+        let context =
+            mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+        let (mutation, error) = mutate_pr(
+            &context,
+            &pr,
+            &queue_policy(),
+            &StewardDecision::ArmMergeQueue,
+            &mut ledger,
+        );
+
+        assert!(mutation.is_none());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("authority is `studio`")),
+            "{error:?}"
+        );
+        let calls = fs::read_to_string(log).expect("calls");
+        assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unauthorized_steward_does_not_consume_transient_rerun_budget() {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"TIMED_OUT","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"rerun-failed-jobs"*) echo "mutation must not run" >&2; exit 90 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let mut pr = ready_pr();
+        pr.fact.checks[0].conclusion = Some("TIMED_OUT".to_owned());
+        let observation = observation_for(pr.clone(), true);
+        let mut ledger = StewardLedger::default();
+        let mutation_control = mutation_control(&temp, "studio", "m1");
+        let ledger_path = temp.path().join("ledger.json");
+        let context =
+            mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+        let (mutation, error) = mutate_pr(
+            &context,
+            &pr,
+            &queue_policy(),
+            &StewardDecision::RerunTransient { run_ids: vec![100] },
+            &mut ledger,
+        );
+
+        assert!(mutation.is_none());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("authority is `studio`")),
+            "{error:?}"
+        );
+        assert!(ledger.transient_attempts.is_empty());
+        let calls = fs::read_to_string(log).expect("calls");
+        assert!(!calls.contains("rerun-failed-jobs"), "{calls}");
+    }
+
+    #[test]
+    fn unauthorized_steward_does_not_consume_capacity_preemption_budget() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = GitHubActions::new(temp.path());
+        let mut pr = ready_pr();
+        pr.fact.queue_position = Some(1);
+        let mut observation = observation_for(pr, true);
+        observation.merge_group_heads.insert(42, "b".repeat(40));
+        observation.merge_group_enqueued_at.insert(
+            42,
+            (Utc::now() - chrono::Duration::minutes(20)).to_rfc3339(),
+        );
+        observation.runs = vec![queued_run(100, "2026-07-26T00:00:00Z")];
+        let cancellation = RunCancellation {
+            run_id: 100,
+            reason: RunCancellationReason::AdvisoryPreambleCapacityTheft,
+        };
+        let mut ledger = StewardLedger::default();
+        let mutation_control = mutation_control(&temp, "studio", "m1");
+        let ledger_path = temp.path().join("ledger.json");
+        let context = CapacityApplyContext {
+            actions: &actions,
+            observation: &observation,
+            cancellation: &cancellation,
+            ledger_path: &ledger_path,
+            mutation_control: &mutation_control,
+        };
+
+        let (mutation, error) = apply_capacity_preemption(&context, "steward:skip", &mut ledger);
+
+        assert!(mutation.is_none());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("authority is `studio`")),
+            "{error:?}"
+        );
+        assert!(ledger.preemption_attempts.is_empty());
+        assert!(ledger.audit.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steward_apply_obeys_central_hold_before_remote_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"enqueuePullRequest"*) echo "mutation must not run" >&2; exit 90 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let pr = ready_pr();
+        let observation = observation_for(pr.clone(), true);
+        let mut ledger = StewardLedger::default();
+        let mutation_control = mutation_control(&temp, "studio", "studio");
+        let state_root = mutation_control.store.path().parent().expect("state root");
+        crate::merge_queue_control::hold(state_root, "incident").expect("hold");
+        let ledger_path = temp.path().join("ledger.json");
+        let context =
+            mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+        let (mutation, error) = mutate_pr(
+            &context,
+            &pr,
+            &queue_policy(),
+            &StewardDecision::ArmMergeQueue,
+            &mut ledger,
+        );
+
+        assert!(mutation.is_none());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("centrally held")),
+            "{error:?}"
+        );
+        let calls = fs::read_to_string(log).expect("calls");
+        assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steward_ambiguous_failure_is_durable_shared_uncertainty() {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"enqueuePullRequest"*) echo "connection reset after request body" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let pr = ready_pr();
+        let observation = observation_for(pr.clone(), true);
+        let mut ledger = StewardLedger::default();
+        let mutation_control = mutation_control(&temp, "studio", "studio");
+        let ledger_path = temp.path().join("ledger.json");
+        let context =
+            mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+        let first = mutate_pr(
+            &context,
+            &pr,
+            &queue_policy(),
+            &StewardDecision::ArmMergeQueue,
+            &mut ledger,
+        );
+        assert!(first.0.is_none());
+        assert!(first.1.is_some());
+        let state_root = mutation_control.store.path().parent().expect("state root");
+        let uncertain =
+            crate::merge_queue_control::uncertain_mutations(state_root).expect("uncertainty");
+        assert_eq!(uncertain.len(), 1);
+        assert_eq!(
+            uncertain[0]["action"],
+            "runner steward enqueue pull request"
+        );
+        assert_eq!(uncertain[0]["pr"], 42);
+
+        let second = mutate_pr(
+            &context,
+            &pr,
+            &queue_policy(),
+            &StewardDecision::ArmMergeQueue,
+            &mut ledger,
+        );
+        assert!(
+            second
+                .1
+                .as_deref()
+                .is_some_and(|message| message.contains("is uncertain")),
+            "{second:?}"
+        );
+        let calls = fs::read_to_string(log).expect("calls");
+        assert_eq!(calls.matches("enqueuePullRequest").count(), 1, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(&temp, r#"echo "unexpected mutation: $*" >&2; exit 90"#);
+        let pr = ready_pr();
+        let observation = observation_for(pr, true);
+        let args = StewardCommandArgs {
+            repos: vec!["owner/repo".to_owned()],
+            base: "main".to_owned(),
+            opt_out_label: "steward:skip".to_owned(),
+            max_transient_reruns: 1,
+            coalesce: true,
+            preempt_capacity: true,
+            max_preemptions_per_head: 1,
+            apply: false,
+            ledger: None,
+        };
+        let mut ledger = StewardLedger::default();
+
+        let (reports, failed) = apply_pr_plans(
+            &actions,
+            &args,
+            &observation,
+            &queue_policy(),
+            &temp.path().join("ledger.json"),
+            &mut ledger,
+            None,
+        );
+
+        assert!(!failed);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].decision, StewardDecision::ArmMergeQueue);
+        assert!(reports[0].mutation.is_none());
+        assert!(reports[0].error.is_none());
+        assert!(!temp.path().join("state/ship").exists());
     }
 
     #[cfg(unix)]
@@ -2598,22 +3300,18 @@ esac
         let mut pr = ready_pr();
         pr.fact.merge_state = "BLOCKED".to_owned();
         let observation = observation_for(pr.clone(), true);
-        let policy = StewardPolicy {
-            merge_queue: true,
-            native_auto_merge: true,
-            required_contexts: Vec::new(),
-            opt_out_label: "steward:skip".to_owned(),
-            max_transient_reruns: 1,
-        };
+        let policy = queue_policy();
         let mut ledger = StewardLedger::default();
+        let mutation_control = mutation_control(&temp, "studio", "studio");
+        let ledger_path = temp.path().join("ledger.json");
+        let context =
+            mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
 
         let (mutation, error) = mutate_pr(
-            &actions,
-            &observation,
+            &context,
             &pr,
             &policy,
             &StewardDecision::ArmMergeQueue,
-            &temp.path().join("ledger.json"),
             &mut ledger,
         );
 
@@ -2665,6 +3363,7 @@ esac
             reason: RunCancellationReason::DuplicateImmutableHead,
         };
         let mut ledger = StewardLedger::default();
+        let mutation_control = mutation_control(&temp, "studio", "studio");
 
         let (mutation, error) = apply_run_cancellation(
             &actions,
@@ -2673,6 +3372,7 @@ esac
             "steward:skip",
             &temp.path().join("ledger.json"),
             &mut ledger,
+            &mutation_control,
         );
 
         assert_eq!(mutation.as_deref(), Some("cancelled"));

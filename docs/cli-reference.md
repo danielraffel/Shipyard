@@ -92,6 +92,12 @@ shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
 shipyard runner steward --apply                     # exact-head, green-gated mutations
 shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
 
+`runner steward` is read-only unless `--apply` is present. Apply mode requires
+the trusted machine-global `[merge_queue].mutation_machine`, rejects the
+central merge-queue `HOLD`, and serializes plus write-ahead audits every
+enqueue, merge, rerun, and cancellation through the shared mutation guard.
+Dry-run does not require mutation authority.
+
 # Self-hosted runner provisioning (register / list / remove on this machine)
 shipyard runner tag --set studio          # set this box's machine tag (m1, m5, …)
 shipyard runner tag                       # print the stored machine tag

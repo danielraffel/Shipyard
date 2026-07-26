@@ -628,8 +628,13 @@ workflows/jobs, and any run with a started or completed expensive leg are never
 cancelled. The hard cross-repository pass cap is one; no CLI option can raise
 it. `--no-preempt-capacity` disables this behavior; the per-head attempt
 budget and write-ahead audit live in the `handoff_ledger` path emitted by JSON.
-Apply mode holds an exclusive sibling lock for the whole reconciliation, so
-multiple agents on the authority host cannot race or lose attempt/audit state.
+Apply mode holds an exclusive sibling lock for the whole reconciliation and
+routes every enqueue, exact-head merge, rerun, and cancellation through the
+machine-global merge-queue mutation guard. The configured authority machine,
+central `HOLD`, process-wide mutation lock, and durable uncertainty audit all
+apply before GitHub is mutated; dry-run remains independent of those controls.
+This prevents multiple agents on the authority host from racing or losing
+attempt/audit state and rejects apply on any other host.
 Immediately before a preemption it also re-reads the native queue and the
 front run's jobs, requiring the same exact speculative front SHA and at least
 one recognized pool job still queued/waiting/pending; front advancement or a

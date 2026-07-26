@@ -21,7 +21,9 @@ use super::CliFailure;
 use super::cli::RunnerCommand;
 use crate::cloud::{GitHubActions, QueuedRun};
 use crate::config::LoadedConfig;
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
+use crate::paths::RuntimePaths;
 use crate::runner_watchdog::{
     DEFAULT_MAX_JOB_MIN, DEFAULT_MAX_QUEUE_AGE_HOURS, DEFAULT_REAP_IN_PROGRESS_MAX_MIN,
     DEFAULT_REAP_QUEUED_MAX_MIN, DEFAULT_WATCH_INTERVAL_SECONDS, ReaperThresholds, RunnerHealth,
@@ -42,11 +44,13 @@ const REAP_RUNS_MAX_PAGES: u32 = 5;
 pub(super) fn runner_command<W: Write>(
     command: RunnerCommand,
     config: &LoadedConfig,
+    mode: RuntimeMode,
     cwd: &Path,
-    state_dir: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let state_dir = &runtime_paths.state_dir;
     let actions = GitHubActions::from_loaded_config(cwd, config);
     match command {
         RunnerCommand::Status {
@@ -206,7 +210,8 @@ pub(super) fn runner_command<W: Write>(
                 ledger,
             },
             cwd,
-            state_dir,
+            mode,
+            runtime_paths,
             &actions,
             json,
             stdout,

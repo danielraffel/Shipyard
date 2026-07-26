@@ -323,7 +323,7 @@ fn handle_operational_variant<W: Write>(
             Ok(ExitCode::SUCCESS)
         }
         Command::Runner { command } => {
-            handle_runner_command(command, mode, cwd, &runtime_paths.state_dir, json, stdout)
+            handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
         }
         Command::Paths
         | Command::Pin { .. }
@@ -512,13 +512,13 @@ fn handle_runner_command<W: Write>(
     command: self::cli::RunnerCommand,
     mode: RuntimeMode,
     cwd: &Path,
-    state_dir: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let config = crate::config::LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    runner_command(command, &config, cwd, state_dir, json, stdout)
+    runner_command(command, &config, mode, cwd, runtime_paths, json, stdout)
 }
 
 struct AutoMergeInvocation {
