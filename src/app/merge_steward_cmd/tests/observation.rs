@@ -1,8 +1,11 @@
 use super::*;
 use crate::app::merge_steward_cmd::observation::{
-    canonical_repo_name, check_runs_for_head, effective_merge_method, encode_path_segment,
-    evaluated_required_checks, hydrate_preemption_jobs, parse_check, parse_rest_check,
-    required_checks,
+    canonical_repo_name, effective_merge_method, encode_path_segment, evaluated_required_checks,
+    hydrate_required_check_identities, parse_check, parse_rest_check,
+};
+#[cfg(unix)]
+use crate::app::merge_steward_cmd::observation::{
+    check_runs_for_head, hydrate_preemption_jobs, required_checks,
 };
 
 #[test]
@@ -64,6 +67,36 @@ fn repository_settings_supply_canonical_guard_identity() {
     );
     assert!(canonical_repo_name(&serde_json::json!({})).is_err());
     assert!(canonical_repo_name(&serde_json::json!({"full_name": "owner/repo/extra"})).is_err());
+}
+
+#[test]
+fn invalid_pr_head_skips_app_identity_hydration_without_blocking_repo() {
+    let actions = GitHubActions::new(".");
+    let mut prs = vec![ObservedPr {
+        node_id: "PR_bad".to_owned(),
+        fact: StewardPullRequest {
+            number: 42,
+            head_sha: "malformed".to_owned(),
+            head_branch: "topic".to_owned(),
+            draft: false,
+            merge_state: "UNKNOWN".to_owned(),
+            auto_merge_active: false,
+            queue_position: None,
+            labels: Vec::new(),
+            checks: Vec::new(),
+        },
+    }];
+    hydrate_required_check_identities(
+        &actions,
+        "owner/repo",
+        &[RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: Some(42),
+        }],
+        &mut prs,
+    )
+    .expect("invalid head is classified locally");
+    assert!(prs[0].fact.checks.is_empty());
 }
 
 #[test]

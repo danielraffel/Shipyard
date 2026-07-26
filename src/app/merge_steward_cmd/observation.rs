@@ -122,7 +122,7 @@ pub(super) fn gh_json_timeout(
         .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn required_checks(
     actions: &GitHubActions,
     repo: &str,
@@ -544,6 +544,7 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
                 .get("completedAt")
                 .and_then(Value::as_str)
                 .or_else(|| value.get("startedAt").and_then(Value::as_str))
+                .or_else(|| value.get("createdAt").and_then(Value::as_str))
                 .map(str::to_owned),
         }),
         "StatusContext" => {
@@ -586,6 +587,9 @@ pub(super) fn hydrate_required_check_identities(
         return Ok(());
     }
     for pr in prs {
+        if !is_full_sha(&pr.fact.head_sha) {
+            continue;
+        }
         pr.fact
             .checks
             .extend(check_runs_for_head(actions, repo, &pr.fact.head_sha)?);

@@ -106,7 +106,7 @@ pub(super) fn reconcile_enrollment_snapshot(
     repo: &str,
     base: &str,
     state_dir: &Path,
-    entries: &[crate::merge_queue_liveness::MergeQueueEntry],
+    entries: &mut [crate::merge_queue_liveness::MergeQueueEntry],
 ) -> Result<(Vec<u64>, bool), String> {
     let path = enrollment_snapshot_path(state_dir, repo, base);
     let previous = match fs::read_to_string(&path) {
@@ -115,6 +115,27 @@ pub(super) fn reconcile_enrollment_snapshot(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => EnrollmentSnapshot::default(),
         Err(error) => return Err(format!("read fleet enrollment snapshot failed: {error}")),
     };
+    let prior_exact_heads = previous
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                (entry.pr, entry.head_sha.as_ref()?.clone()),
+                entry.observed_at.clone(),
+            ))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for entry in entries.iter_mut() {
+        let Some(head) = entry.head_sha.as_ref() else {
+            continue;
+        };
+        entry.enqueued_at = Some(
+            prior_exact_heads
+                .get(&(entry.pr, head.clone()))
+                .cloned()
+                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        );
+    }
     let current = entries
         .iter()
         .map(|entry| entry.pr)
@@ -191,7 +212,10 @@ pub(super) fn reconcile_enrollment_snapshot(
             .map(|entry| EnrollmentSnapshotEntry {
                 pr: entry.pr,
                 head_sha: entry.head_sha.clone(),
-                observed_at: Utc::now().to_rfc3339(),
+                observed_at: entry
+                    .enqueued_at
+                    .clone()
+                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
                 auto_merge_cleared: false,
                 last_checked_at: None,
             })
@@ -266,10 +290,10 @@ pub(super) fn inspect_merge_queue_liveness(
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
-    let (entries, queue_truncated) =
+    let (mut entries, queue_truncated) =
         fetch_merge_queue_entries(actions, owner, name, base, OBSERVATION_MAX_PAGES)?;
     let (enrollment_cleared_prs, enrollment_truncated) =
-        reconcile_enrollment_snapshot(actions, repo, base, state_dir, &entries)?;
+        reconcile_enrollment_snapshot(actions, repo, base, state_dir, &mut entries)?;
     let mut observation_truncated =
         observation_truncated || queue_truncated || enrollment_truncated;
     let Some(front) = entries.first() else {
@@ -538,29 +562,8 @@ pub(super) fn inspect_release_liveness(
         .get("ahead_by")
         .and_then(Value::as_u64)
         .ok_or_else(|| "release comparison response missing ahead_by".to_owned())?;
-    let changed_files = comparison.get("files").and_then(Value::as_array);
-    // GitHub caps compare-file output at 300 paths. If that bound is reached,
-    // treat the comparison as release-relevant rather than allowing omitted
-    // paths to create a false healthy signal.
-    let comparison_truncated = changed_files.is_some_and(|files| files.len() == 300);
-    let releasable_commits_ahead = if commits_ahead == 0 {
-        0
-    } else if comparison_truncated {
-        commits_ahead
-    } else {
-        changed_files.map_or(commits_ahead, |files| {
-            if files.is_empty()
-                || files
-                    .iter()
-                    .filter_map(|file| file.get("filename").and_then(Value::as_str))
-                    .any(path_requires_release)
-            {
-                commits_ahead
-            } else {
-                0
-            }
-        })
-    };
+    let (releasable_commits_ahead, comparison_truncated) =
+        count_releasable_commits(actions, repo, &comparison, commits_ahead)?;
     let base_version = fetch_base_version(actions, repo, base)?;
     let mut optional_reason_codes = Vec::new();
     let (open_release_incident_issues, issues_truncated) =
@@ -601,6 +604,76 @@ pub(super) fn inspect_release_liveness(
             stale_threshold_secs,
             Utc::now(),
         )?),
+    })
+}
+
+pub(super) fn count_releasable_commits(
+    actions: &GitHubActions,
+    repo: &str,
+    comparison: &Value,
+    commits_ahead: u64,
+) -> Result<(u64, bool), String> {
+    if commits_ahead == 0 {
+        return Ok((0, false));
+    }
+    let commits = comparison
+        .get("commits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "release comparison response missing commits".to_owned())?;
+    if u64::try_from(commits.len()).ok() != Some(commits_ahead) {
+        return Ok((commits_ahead, true));
+    }
+    let mut releasable = 0;
+    let mut truncated = false;
+    for commit in commits {
+        let message = commit
+            .pointer("/commit/message")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "release comparison commit missing message".to_owned())?;
+        if release_is_skipped(message) {
+            continue;
+        }
+        let sha = commit
+            .get("sha")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "release comparison commit missing sha".to_owned())?;
+        let detail = gh_json_value(
+            actions,
+            &["api".to_owned(), format!("repos/{repo}/commits/{sha}")],
+            "inspect release commit",
+        )?;
+        let files = detail
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("release commit {sha} missing files"))?;
+        if files.len() == 300 {
+            truncated = true;
+            releasable += 1;
+        } else if files.is_empty()
+            || files
+                .iter()
+                .filter_map(|file| file.get("filename").and_then(Value::as_str))
+                .any(path_requires_release)
+        {
+            releasable += 1;
+        }
+    }
+    Ok((releasable, truncated))
+}
+
+fn gh_json_value(actions: &GitHubActions, args: &[String], purpose: &str) -> Result<Value, String> {
+    let raw = actions
+        .run_gh(args)
+        .map_err(|error| format!("{purpose} failed: {error}"))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
+}
+
+fn release_is_skipped(message: &str) -> bool {
+    message.lines().any(|line| {
+        line.strip_prefix("Release: skip reason=\"")
+            .and_then(|reason| reason.strip_suffix('"'))
+            .is_some_and(|reason| !reason.is_empty())
     })
 }
 

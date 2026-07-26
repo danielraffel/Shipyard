@@ -49,7 +49,7 @@ pub(super) fn render_report<W: Write>(
                 stdout,
                 "  #{} {} {:?}{}{}",
                 pr.number,
-                &pr.head_sha[..pr.head_sha.len().min(12)],
+                pr.head_sha.chars().take(12).collect::<String>(),
                 pr.decision,
                 pr.mutation
                     .as_ref()

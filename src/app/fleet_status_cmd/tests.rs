@@ -264,6 +264,46 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn release_skip_is_per_commit_and_does_not_hide_unskipped_source() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"commits/docs"*) printf '%s' '{"files":[{"filename":"docs/readme.md"}]}' ;;
+  *"commits/source"*) printf '%s' '{"files":[{"filename":"src/lib.rs"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let skipped_source = serde_json::json!({
+        "commits": [{
+            "sha": "source",
+            "commit": {"message": "bot\n\nRelease: skip reason=\"generated release\""}
+        }]
+    });
+    assert_eq!(
+        count_releasable_commits(&actions, "owner/repo", &skipped_source, 1)
+            .expect("complete comparison"),
+        (0, false)
+    );
+    let mixed = serde_json::json!({
+        "commits": [
+            {
+                "sha": "source",
+                "commit": {"message": "bot\n\nRelease: skip reason=\"generated release\""}
+            },
+            {"sha": "docs", "commit": {"message": "docs"}}
+        ]
+    });
+    assert_eq!(
+        count_releasable_commits(&actions, "owner/repo", &mixed, 2).expect("complete comparison"),
+        (0, false)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn durable_snapshot_detects_open_pr_whose_auto_merge_was_cleared() {
     let temp = tempfile::tempdir().expect("temp");
     let calls = temp.path().join("calls");
@@ -282,12 +322,12 @@ fn durable_snapshot_detects_open_pr_whose_auto_merge_was_cleared() {
     )
     .expect("snapshot");
     let (cleared, truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &[])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
             .expect("reconcile");
     assert_eq!(cleared, [11]);
     assert!(!truncated);
     let (still_cleared, still_truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &[])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
             .expect("reconcile again");
     assert_eq!(still_cleared, [11]);
     assert!(!still_truncated);
@@ -310,7 +350,7 @@ fn retained_enrollment_alert_is_revalidated_and_clears_when_pr_closes() {
     )
     .expect("snapshot");
     let (cleared, truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &[])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
             .expect("reconcile");
     assert!(cleared.is_empty());
     assert!(!truncated);
@@ -332,7 +372,7 @@ fn retargeted_pr_is_not_reported_as_cleared_enrollment() {
     )
     .expect("snapshot");
     let (cleared, truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &[])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
             .expect("reconcile");
     assert!(cleared.is_empty());
     assert!(!truncated);
@@ -346,7 +386,7 @@ fn malformed_enrollment_snapshot_fails_closed_without_overwrite() {
     let path = enrollment_snapshot_path(temp.path(), "owner/repo", "main");
     fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
     fs::write(&path, "not json").expect("snapshot");
-    let error = reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &[])
+    let error = reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
         .expect_err("corrupt history must be visible");
     assert!(error.contains("parse fleet enrollment snapshot failed"));
     assert_eq!(fs::read_to_string(path).expect("snapshot"), "not json");
@@ -381,7 +421,7 @@ fn enrollment_reconciliation_has_a_fixed_per_tick_api_budget() {
     )
     .expect("snapshot");
     let (cleared, truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &[])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
             .expect("reconcile");
     assert!(cleared.is_empty());
     assert!(truncated);
