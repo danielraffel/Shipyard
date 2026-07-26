@@ -1876,18 +1876,52 @@ fn repository_requires_merge_queue(
         .map_err(|error| format!("failed to inspect evaluated branch rules: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        if evaluated_rules_unavailable_on_private_free_plan(&stderr) {
-            eprintln!(
-                "shipyard: evaluated branch rules are unavailable on this private-free repository; the authoritative mergeQueue query returned null, so continuing with classic exact-head merge"
-            );
-            return Ok(false);
-        }
-        return Err(format!(
-            "failed to inspect evaluated branch rules for {repo}:{base_branch}: {stderr}"
-        ));
+        return match merge_queue_requirement_from_observations(&queue_body, Err(&stderr)).map_err(
+            |error| {
+                format!(
+                    "failed to inspect evaluated branch rules for {repo}:{base_branch}: {error}"
+                )
+            },
+        )? {
+            MergeQueueRequirement::Required => Ok(true),
+            MergeQueueRequirement::Classic => Ok(false),
+            MergeQueueRequirement::PrivateFreeClassicFallback => {
+                eprintln!(
+                    "shipyard: evaluated branch rules are unavailable on this private-free repository; the authoritative mergeQueue query returned null, so continuing with classic exact-head merge"
+                );
+                Ok(false)
+            }
+        };
     }
     let body: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("evaluated branch rules returned invalid JSON: {error}"))?;
+    Ok(matches!(
+        merge_queue_requirement_from_observations(&queue_body, Ok(&body))?,
+        MergeQueueRequirement::Required
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeQueueRequirement {
+    Required,
+    Classic,
+    PrivateFreeClassicFallback,
+}
+
+fn merge_queue_requirement_from_observations(
+    queue_body: &Value,
+    evaluated_rules: Result<&Value, &str>,
+) -> Result<MergeQueueRequirement, String> {
+    if live_merge_queue_present(queue_body)? {
+        return Ok(MergeQueueRequirement::Required);
+    }
+    let body = match evaluated_rules {
+        Ok(body) => body,
+        Err(stderr) if evaluated_rules_unavailable_on_private_free_plan(stderr) => {
+            return Ok(MergeQueueRequirement::PrivateFreeClassicFallback);
+        }
+        Err(stderr) => return Err(stderr.to_owned()),
+    };
     let pages = body
         .as_array()
         .ok_or_else(|| "paginated evaluated branch rules response is not an array".to_owned())?;
@@ -1898,7 +1932,13 @@ fn repository_requires_merge_queue(
             .ok_or_else(|| "evaluated branch rules page is not an array".to_owned())?;
         rules.extend(page.iter().cloned());
     }
-    crate::merge_queue::rules_require_merge_queue(&Value::Array(rules))
+    crate::merge_queue::rules_require_merge_queue(&Value::Array(rules)).map(|required| {
+        if required {
+            MergeQueueRequirement::Required
+        } else {
+            MergeQueueRequirement::Classic
+        }
+    })
 }
 
 fn live_merge_queue_present(body: &Value) -> Result<bool, String> {
@@ -2448,6 +2488,37 @@ mod tests {
             }))
             .expect_err("GraphQL errors plus null queue must fail closed")
             .contains("GraphQL errors")
+        );
+    }
+
+    #[test]
+    fn private_free_fallback_requires_authoritative_null_and_exact_rules_error() {
+        let queue_null = serde_json::json!({
+            "data": {"repository": {"mergeQueue": null}}
+        });
+        let exact_error = format!("gh: {PRIVATE_FREE_RULES_ENTITLEMENT} (HTTP 403)");
+        assert_eq!(
+            merge_queue_requirement_from_observations(&queue_null, Err(&exact_error)),
+            Ok(MergeQueueRequirement::PrivateFreeClassicFallback)
+        );
+
+        let errors_and_null = serde_json::json!({
+            "errors": [{"message": "partial failure"}],
+            "data": {"repository": {"mergeQueue": null}}
+        });
+        assert!(
+            merge_queue_requirement_from_observations(&errors_and_null, Err(&exact_error)).is_err()
+        );
+
+        let mixed_error =
+            format!("{exact_error}\ngh: Resource not accessible by integration (HTTP 403)");
+        assert!(merge_queue_requirement_from_observations(&queue_null, Err(&mixed_error)).is_err());
+
+        let malformed_rules = serde_json::json!([
+            [{"type": "merge_queue"}, {"parameters": {}}]
+        ]);
+        assert!(
+            merge_queue_requirement_from_observations(&queue_null, Ok(&malformed_rules)).is_err()
         );
     }
 
