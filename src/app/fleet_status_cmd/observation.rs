@@ -116,27 +116,6 @@ pub(super) fn reconcile_enrollment_snapshot(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => EnrollmentSnapshot::default(),
         Err(error) => return Err(format!("read fleet enrollment snapshot failed: {error}")),
     };
-    let prior_exact_heads = previous
-        .entries
-        .iter()
-        .filter_map(|entry| {
-            Some((
-                (entry.pr, entry.head_sha.as_ref()?.clone()),
-                entry.observed_at.clone(),
-            ))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for entry in entries.iter_mut() {
-        let Some(head) = entry.head_sha.as_ref() else {
-            continue;
-        };
-        entry.enqueued_at = Some(
-            prior_exact_heads
-                .get(&(entry.pr, head.clone()))
-                .cloned()
-                .unwrap_or_else(|| Utc::now().to_rfc3339()),
-        );
-    }
     let current = entries
         .iter()
         .map(|entry| entry.pr)

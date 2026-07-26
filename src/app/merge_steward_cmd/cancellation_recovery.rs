@@ -259,7 +259,7 @@ pub(super) fn resume_pending_intent(
     pending: &PendingCancellation,
 ) -> Result<String, String> {
     let was_uncertain = pending_uncertainty(mutation_control, pending)?;
-    let observation = observe_repo(actions, &pending.repo, &pending.base)?;
+    let observation = observe_repo(actions, &pending.repo, &pending.base, true)?;
     let observed = observation
         .runs
         .iter()

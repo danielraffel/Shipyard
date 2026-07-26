@@ -757,6 +757,41 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
     assert!(!temp.path().join("state/ship").exists());
 }
 
+#[test]
+fn disabled_preemption_ignores_preemption_only_observation_errors() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = GitHubActions::new(".");
+    let pr = ready_pr();
+    let mut observation = observation_for(pr, true);
+    observation.preemption_error = Some("preemption job hydration failed".to_owned());
+    let args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        max_transient_reruns: 1,
+        coalesce: false,
+        preempt_capacity: false,
+        max_preemptions_per_head: 1,
+        apply: false,
+        ledger: None,
+    };
+    let mut ledger = StewardLedger::default();
+
+    let (report, failed, planned) = apply_repo_plan(
+        &actions,
+        &args,
+        &observation,
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        1,
+        None,
+    );
+
+    assert!(!failed);
+    assert_eq!(planned, 0);
+    assert!(report.errors.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn enqueue_skips_when_pr_is_retargeted_between_observation_and_apply() {

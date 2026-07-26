@@ -33,7 +33,8 @@ pub(super) fn apply_repo_plan(
         ledger,
         mutation_control,
     );
-    let mut unhealthy = observation.preemption_error.is_some() || pr_mutation_failed;
+    let mut unhealthy =
+        (args.preempt_capacity && observation.preemption_error.is_some()) || pr_mutation_failed;
     let mut planned_cancellations = Vec::new();
     if args.coalesce {
         let current_heads = current_pull_request_heads(&observation.prs);
@@ -104,7 +105,11 @@ pub(super) fn apply_repo_plan(
                 .collect(),
             prs: reports,
             cancellations,
-            errors: observation.preemption_error.iter().cloned().collect(),
+            errors: if args.preempt_capacity {
+                observation.preemption_error.iter().cloned().collect()
+            } else {
+                Vec::new()
+            },
         },
         unhealthy,
         capacity_preemptions_planned,

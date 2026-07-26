@@ -432,6 +432,34 @@ fn durable_snapshot_detects_open_pr_whose_auto_merge_was_cleared() {
 
 #[cfg(unix)]
 #[test]
+fn enrollment_snapshot_preserves_authoritative_reentry_timestamp() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, "echo unexpected >&2; exit 2");
+    let path = enrollment_snapshot_path(temp.path(), "owner/repo", "main");
+    fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    fs::write(
+        &path,
+        r#"{"entries":[{"pr":11,"head_sha":"aaa","observed_at":"2026-07-25T00:00:00Z"}]}"#,
+    )
+    .expect("snapshot");
+    let mut entries = vec![crate::merge_queue_liveness::MergeQueueEntry {
+        pr: 11,
+        position: 0,
+        head_sha: Some("aaa".to_owned()),
+        enqueued_at: Some("2026-07-26T12:00:00Z".to_owned()),
+    }];
+
+    reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut entries)
+        .expect("reconcile");
+
+    assert_eq!(
+        entries[0].enqueued_at.as_deref(),
+        Some("2026-07-26T12:00:00Z")
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn retained_enrollment_alert_is_revalidated_and_clears_when_pr_closes() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(

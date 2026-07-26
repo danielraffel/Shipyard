@@ -249,7 +249,7 @@ pub(super) fn steward_command<W: Write>(
     let mut remaining_preemptions =
         usize::from(!recovery_owned_preemption_budget && ledger.pending_cancellations.is_empty());
     for repo in repos {
-        match observe_repo(actions, &repo, &args.base) {
+        match observe_repo(actions, &repo, &args.base, args.preempt_capacity) {
             Ok(observation) => {
                 let (mut report, failed, planned_preemptions) = apply_repo_plan(
                     actions,

@@ -32,6 +32,7 @@ pub(super) fn observe_repo(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
+    preempt_capacity: bool,
 ) -> Result<RepoObservation, String> {
     let settings = gh_json(
         actions,
@@ -58,14 +59,18 @@ pub(super) fn observe_repo(
         .min_by_key(|(_, position)| **position)
         .and_then(|(number, _)| merge_group_heads.get(number))
         .map(String::as_str);
-    let preemption_error = hydrate_preemption_jobs(
-        actions,
-        &repo,
-        front_head,
-        &capacity_preemption_policy,
-        &mut runs,
-    )
-    .err();
+    let preemption_error = if preempt_capacity {
+        hydrate_preemption_jobs(
+            actions,
+            &repo,
+            front_head,
+            &capacity_preemption_policy,
+            &mut runs,
+        )
+        .err()
+    } else {
+        None
+    };
     Ok(RepoObservation {
         repo,
         base: base.to_owned(),
