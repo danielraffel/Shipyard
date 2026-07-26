@@ -265,7 +265,7 @@ impl GitHubActions {
     }
 
     #[cfg(all(test, unix))]
-    fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
         self.gh_binary_override = Some(gh_binary.into());
         self
     }

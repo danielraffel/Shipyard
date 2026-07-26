@@ -754,6 +754,10 @@ pub(super) enum RunnerCommand {
         /// Polling cadence in seconds.
         #[arg(long)]
         interval: Option<u64>,
+        /// Base branch monitored by the durable fleet-liveness tick. Defaults
+        /// to `runner.watchdog.fleet_base`, then the repository default branch.
+        #[arg(long = "fleet-base")]
+        fleet_base: Option<String>,
         /// Auto-cancel stale queued runs.
         #[arg(long = "fix")]
         fix: bool,
@@ -906,7 +910,8 @@ pub(super) enum RunnerCommand {
         /// Alert when queued macOS work is older than this and a routable slot exists.
         #[arg(long = "queued-age-threshold-secs", default_value_t = 900)]
         queued_age_threshold_secs: i64,
-        /// Maximum queued workflow runs to inspect for matching macOS jobs.
+        /// Maximum queued and in-progress workflow runs to inspect in total
+        /// (bounded to 50) for queue and capacity-owner attribution.
         #[arg(long = "queue-run-limit", default_value_t = 100)]
         queue_run_limit: u32,
         /// Alert when the queue front has no required-check progress after this

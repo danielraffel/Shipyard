@@ -58,6 +58,12 @@ pub struct ActiveRunObservation {
     pub workflow: String,
     /// Merge-group branch.
     pub head_branch: String,
+    /// Exact workflow-run head commit.
+    pub head_sha: Option<String>,
+    /// GitHub workflow-run status.
+    pub status: String,
+    /// Time at which GitHub created the run.
+    pub created_at: Option<String>,
     /// Pull requests associated with this run.
     pub pull_requests: Vec<u64>,
     /// Browser URL, when present.
@@ -98,6 +104,10 @@ pub enum LivenessReason {
     SupersededCapacityTheft,
     /// A later queue entry owns queue-eligible capacity.
     NonFrontCapacityOwner,
+    /// A previously queued PR is now open without auto-merge enrollment.
+    AutoMergeEnrollmentCleared,
+    /// A bounded GitHub observation omitted additional records.
+    ObservationTruncated,
 }
 
 /// An active non-front merge-group job assigned to an eligible runner.
@@ -145,6 +155,8 @@ pub struct MergeQueueLivenessReport {
     pub front_blocked_by_capacity_occupiers: bool,
     /// Active merge-group jobs consuming eligible runners away from the front.
     pub capacity_occupiers: Vec<CapacityOccupier>,
+    /// Previously queued PRs now open without auto-merge enrollment.
+    pub enrollment_cleared_prs: Vec<u64>,
     /// Stable reasons for agents, schedulers, and dashboards.
     pub reason_codes: Vec<LivenessReason>,
 }
@@ -158,6 +170,18 @@ pub struct ReleaseLivenessReport {
     pub published_at: String,
     /// Commits by which the base branch is ahead of the release tag.
     pub commits_ahead: u64,
+    /// Commits that are not obvious docs/changelog/skip-only updates.
+    pub releasable_commits_ahead: u64,
+    /// Version recorded on the monitored base, when exposed by the repository.
+    pub base_version: Option<String>,
+    /// Release tag normalized to a plain version.
+    pub released_version: String,
+    /// Whether the base version has failed to move beyond the release.
+    pub version_unchanged: Option<bool>,
+    /// Open issue count whose title describes a release incident.
+    pub open_release_incident_issues: Option<u64>,
+    /// Most recent successful auto-release workflow completion, when present.
+    pub latest_successful_release_workflow_at: Option<String>,
     /// Age of the latest release at observation time.
     pub age_secs: i64,
     /// True when unreleased commits exist and the release is older than policy.
@@ -165,22 +189,38 @@ pub struct ReleaseLivenessReport {
 }
 
 /// Classify release freshness without making any release mutation.
+#[allow(clippy::too_many_arguments)]
 pub fn assess_release_liveness(
     tag: String,
     published_at: String,
     commits_ahead: u64,
+    releasable_commits_ahead: u64,
+    base_version: Option<String>,
+    open_release_incident_issues: Option<u64>,
+    latest_successful_release_workflow_at: Option<String>,
     stale_threshold_secs: i64,
     now: DateTime<Utc>,
 ) -> Result<ReleaseLivenessReport, String> {
     let published = DateTime::parse_from_rfc3339(&published_at)
         .map_err(|error| format!("invalid latest release published_at: {error}"))?;
     let age_secs = (now - published.with_timezone(&Utc)).num_seconds().max(0);
+    let released_version = tag.trim_start_matches('v').to_owned();
+    let version_unchanged = base_version
+        .as_deref()
+        .map(|version| version.trim_start_matches('v') == released_version);
     Ok(ReleaseLivenessReport {
         tag,
         published_at,
         commits_ahead,
+        releasable_commits_ahead,
+        base_version,
+        released_version,
+        version_unchanged,
+        open_release_incident_issues,
+        latest_successful_release_workflow_at,
         age_secs,
-        stale_with_unreleased_commits: commits_ahead > 0 && age_secs >= stale_threshold_secs.max(0),
+        stale_with_unreleased_commits: releasable_commits_ahead > 0
+            && age_secs >= stale_threshold_secs.max(0),
     })
 }
 
@@ -194,6 +234,7 @@ impl MergeQueueLivenessReport {
                 .capacity_occupiers
                 .iter()
                 .any(|occupier| occupier.kind == OccupierKind::Superseded)
+            || !self.enrollment_cleared_prs.is_empty()
     }
 }
 
@@ -216,6 +257,10 @@ pub struct MergeQueueLivenessInputs<'a> {
     pub stall_threshold_secs: i64,
     /// Observation time.
     pub now: DateTime<Utc>,
+    /// Durable enrollment-loss observations from the transport.
+    pub enrollment_cleared_prs: &'a [u64],
+    /// Whether a bounded observation omitted records.
+    pub observation_truncated: bool,
 }
 
 /// Parse merge-queue entries from the dedicated GraphQL observation.
@@ -317,6 +362,8 @@ pub fn assess_merge_queue_liveness(
         routable_free_slots,
         stall_threshold_secs,
         now,
+        enrollment_cleared_prs,
+        observation_truncated,
     } = inputs;
     let front = entries.iter().min_by_key(|entry| entry.position).cloned();
     let matching_checks = checks
@@ -368,10 +415,20 @@ pub fn assess_merge_queue_liveness(
     let mut capacity_occupiers = Vec::new();
     for run in active_runs {
         let merge_pr = merge_group_pr(&run.head_branch);
-        if merge_pr == front_pr {
+        // GitHub materializes MergeQueueEntry.headCommit as the temporary
+        // merge-group commit (distinct from pullRequest.headRefOid). Actions
+        // merge_group runs use that same commit as workflow_run.head_sha.
+        let exact_front = merge_pr == front_pr
+            && front
+                .as_ref()
+                .and_then(|entry| entry.head_sha.as_deref())
+                .zip(run.head_sha.as_deref())
+                .is_some_and(|(front_sha, run_sha)| front_sha == run_sha);
+        if exact_front {
             continue;
         }
         let kind = match merge_pr {
+            Some(pr) if Some(pr) == front_pr => OccupierKind::Superseded,
             Some(pr) if queued_prs.contains(&pr) => OccupierKind::NonFront,
             Some(_) => OccupierKind::Superseded,
             None => OccupierKind::OptionalNonQueue,
@@ -415,6 +472,12 @@ pub fn assess_merge_queue_liveness(
     if front_stalled_with_idle_capacity {
         reason_codes.push(LivenessReason::IdleEligibleCapacity);
     }
+    if !enrollment_cleared_prs.is_empty() {
+        reason_codes.push(LivenessReason::AutoMergeEnrollmentCleared);
+    }
+    if observation_truncated {
+        reason_codes.push(LivenessReason::ObservationTruncated);
+    }
     for occupier in &capacity_occupiers {
         let reason = match occupier.kind {
             OccupierKind::OptionalNonQueue => LivenessReason::OptionalCapacityTheft,
@@ -436,6 +499,7 @@ pub fn assess_merge_queue_liveness(
         front_stalled_with_idle_capacity,
         front_blocked_by_capacity_occupiers,
         capacity_occupiers,
+        enrollment_cleared_prs: enrollment_cleared_prs.to_vec(),
         reason_codes,
     }
 }
@@ -540,6 +604,8 @@ mod tests {
             routable_free_slots: 2,
             stall_threshold_secs: 60,
             now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
         });
         assert!(report.front_stalled_with_idle_capacity);
         assert_eq!(report.materialized_required_checks, 1);
@@ -569,6 +635,8 @@ mod tests {
             routable_free_slots: 1,
             stall_threshold_secs: 60,
             now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
         });
         assert!(!progressed.front_stalled_with_idle_capacity);
         assert_eq!(progressed.reason_codes, [LivenessReason::NormalSerialWait]);
@@ -581,6 +649,8 @@ mod tests {
             routable_free_slots: 0,
             stall_threshold_secs: 60,
             now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
         });
         assert!(!no_capacity.front_stalled_with_idle_capacity);
     }
@@ -605,6 +675,9 @@ mod tests {
             run_id: id,
             workflow: "Build / Test".to_owned(),
             head_branch: format!("gh-readonly-queue/main/pr-{pr}-deadbeef"),
+            head_sha: Some(format!("{pr:040x}")),
+            status: "in_progress".to_owned(),
+            created_at: None,
             pull_requests: vec![pr],
             url: None,
             jobs: vec![JobObservation {
@@ -624,6 +697,8 @@ mod tests {
             routable_free_slots: 0,
             stall_threshold_secs: 60,
             now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
         });
         assert_eq!(report.capacity_occupiers.len(), 2);
         assert_eq!(report.capacity_occupiers[0].kind, OccupierKind::NonFront);
@@ -643,6 +718,9 @@ mod tests {
             run_id: 9,
             workflow: "Build".to_owned(),
             head_branch: "gh-readonly-queue/main/pr-99-deadbeef".to_owned(),
+            head_sha: Some("deadbeef".to_owned()),
+            status: "in_progress".to_owned(),
+            created_at: None,
             pull_requests: vec![99],
             url: None,
             jobs: vec![JobObservation {
@@ -661,6 +739,8 @@ mod tests {
             routable_free_slots: 1,
             stall_threshold_secs: 60,
             now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
         });
         assert!(report.capacity_occupiers.is_empty());
     }
@@ -683,6 +763,9 @@ mod tests {
             run_id: 77,
             workflow: "Examples".to_owned(),
             head_branch: "feature/example".to_owned(),
+            head_sha: Some("optional".to_owned()),
+            status: "in_progress".to_owned(),
+            created_at: None,
             pull_requests: vec![99],
             url: None,
             jobs: vec![JobObservation {
@@ -701,6 +784,8 @@ mod tests {
             routable_free_slots: 0,
             stall_threshold_secs: 60,
             now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
         });
         assert_eq!(report.stalled_required_contexts, ["macos"]);
         assert!(report.front_blocked_by_capacity_occupiers);
@@ -721,20 +806,30 @@ mod tests {
             "v1.0.0".to_owned(),
             "1970-01-01T00:00:00Z".to_owned(),
             3,
+            3,
+            Some("1.1.0".to_owned()),
+            Some(3),
+            Some("1970-01-01T00:01:00Z".to_owned()),
             60,
             ts(120),
         )
         .expect("release");
         assert!(stale.stale_with_unreleased_commits);
+        assert_eq!(stale.version_unchanged, Some(false));
         let current = assess_release_liveness(
             "v1.0.0".to_owned(),
             "1970-01-01T00:00:00Z".to_owned(),
             0,
+            0,
+            Some("1.0.0".to_owned()),
+            Some(0),
+            None,
             60,
             ts(120),
         )
         .expect("release");
         assert!(!current.stale_with_unreleased_commits);
+        assert_eq!(current.version_unchanged, Some(true));
     }
 
     #[test]
@@ -768,12 +863,76 @@ mod tests {
             routable_free_slots: 1,
             stall_threshold_secs: 60,
             now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
         });
         assert_eq!(report.failed_required_contexts, ["macos"]);
         assert!(
             report
                 .reason_codes
                 .contains(&LivenessReason::FrontRequiredFailed)
+        );
+    }
+
+    #[test]
+    fn same_pr_old_merge_group_head_is_superseded_not_front() {
+        let entries = vec![MergeQueueEntry {
+            pr: 11,
+            position: 0,
+            head_sha: Some("new-head".to_owned()),
+            enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+        }];
+        let old_run = ActiveRunObservation {
+            run_id: 77,
+            workflow: "Build".to_owned(),
+            head_branch: "gh-readonly-queue/main/pr-11-old".to_owned(),
+            head_sha: Some("old-head".to_owned()),
+            status: "in_progress".to_owned(),
+            created_at: None,
+            pull_requests: vec![11],
+            url: None,
+            jobs: vec![JobObservation {
+                name: "macOS".to_owned(),
+                status: "in_progress".to_owned(),
+                runner_name: Some("pulp-vm-m5-01".to_owned()),
+                labels: vec!["pulp-build-m5".to_owned()],
+            }],
+        };
+        let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &entries,
+            checks: &[],
+            active_runs: &[old_run],
+            required_contexts: &["macOS".to_owned()],
+            eligible_host_classes: &["m5".to_owned()],
+            routable_free_slots: 0,
+            stall_threshold_secs: 60,
+            now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
+        });
+        assert_eq!(report.capacity_occupiers[0].kind, OccupierKind::Superseded);
+        assert!(report.needs_attention());
+    }
+
+    #[test]
+    fn enrollment_loss_is_stable_attention_reason() {
+        let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &[],
+            checks: &[],
+            active_runs: &[],
+            required_contexts: &[],
+            eligible_host_classes: &[],
+            routable_free_slots: 0,
+            stall_threshold_secs: 60,
+            now: ts(120),
+            enrollment_cleared_prs: &[11],
+            observation_truncated: false,
+        });
+        assert!(report.needs_attention());
+        assert!(
+            report
+                .reason_codes
+                .contains(&LivenessReason::AutoMergeEnrollmentCleared)
         );
     }
 }

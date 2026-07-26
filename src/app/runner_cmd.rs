@@ -88,7 +88,7 @@ pub(super) fn runner_command<W: Write>(
             stdout,
         ),
         command @ RunnerCommand::Watch { .. } => {
-            dispatch_watch(command, config, cwd, &actions, json, stdout)
+            dispatch_watch(command, config, cwd, state_dir, &actions, json, stdout)
         }
         RunnerCommand::Kill {
             pid,
@@ -178,6 +178,7 @@ pub(super) fn runner_command<W: Write>(
             },
             config,
             cwd,
+            state_dir,
             &actions,
             json,
             stdout,
@@ -550,6 +551,7 @@ fn dispatch_watch<W: Write>(
     command: RunnerCommand,
     config: &LoadedConfig,
     cwd: &Path,
+    state_dir: &Path,
     actions: &GitHubActions,
     json: bool,
     stdout: &mut W,
@@ -559,6 +561,7 @@ fn dispatch_watch<W: Write>(
         repo,
         runner_dir,
         interval,
+        fleet_base,
         fix,
         kill_hung_workers,
         reap_stale_runs,
@@ -574,11 +577,13 @@ fn dispatch_watch<W: Write>(
     watch_command(WatchCommandArgs {
         config,
         cwd,
+        state_dir,
         actions,
         runner_id_override: runner_id,
         repo_override: repo,
         runner_dir_override: runner_dir,
         interval_override: interval,
+        fleet_base_override: fleet_base,
         fix: fix || kill_hung_workers,
         kill_hung_workers,
         reap_stale_runs,
@@ -596,11 +601,13 @@ fn dispatch_watch<W: Write>(
 pub(super) struct WatchCommandArgs<'a, W: Write> {
     pub(super) config: &'a LoadedConfig,
     pub(super) cwd: &'a Path,
+    pub(super) state_dir: &'a Path,
     pub(super) actions: &'a GitHubActions,
     pub(super) runner_id_override: Option<u64>,
     pub(super) repo_override: Option<String>,
     pub(super) runner_dir_override: Option<PathBuf>,
     pub(super) interval_override: Option<u64>,
+    pub(super) fleet_base_override: Option<String>,
     pub(super) fix: bool,
     pub(super) kill_hung_workers: bool,
     pub(super) reap_stale_runs: bool,
@@ -613,15 +620,18 @@ pub(super) struct WatchCommandArgs<'a, W: Write> {
     pub(super) stdout: &'a mut W,
 }
 
+#[allow(clippy::too_many_lines)]
 fn watch_command<W: Write>(args: WatchCommandArgs<'_, W>) -> Result<ExitCode, CliFailure> {
     let WatchCommandArgs {
         config,
         cwd,
+        state_dir,
         actions,
         runner_id_override,
         repo_override,
         runner_dir_override,
         interval_override,
+        fleet_base_override,
         fix,
         kill_hung_workers,
         reap_stale_runs,
@@ -633,6 +643,9 @@ fn watch_command<W: Write>(args: WatchCommandArgs<'_, W>) -> Result<ExitCode, Cl
         json,
         stdout,
     } = args;
+    if max_iterations == Some(0) {
+        return Ok(ExitCode::SUCCESS);
+    }
     let settings = resolve_watchdog_settings(
         config,
         cwd,
@@ -646,10 +659,9 @@ fn watch_command<W: Write>(args: WatchCommandArgs<'_, W>) -> Result<ExitCode, Cl
     let reaper_thresholds =
         resolve_reaper_thresholds(config, reap_in_progress_max_min, reap_queued_max_min);
     let interval = Duration::from_secs(settings.thresholds.watch_interval_seconds.max(1));
-    if max_iterations == Some(0) {
-        return Ok(ExitCode::SUCCESS);
-    }
+    let mut fleet_base = None;
     let mut iterations = 0u32;
+    let mut fleet_failed = false;
     let last_health = loop {
         let snapshot_result = fetch_runner_snapshot(actions, &settings);
         let queued_runs_result = fetch_queued_runs(actions, &settings.repo_slug);
@@ -691,6 +703,57 @@ fn watch_command<W: Write>(args: WatchCommandArgs<'_, W>) -> Result<ExitCode, Cl
             }
         };
 
+        if fleet_liveness_due(config, iterations) {
+            let base = fleet_base.clone().map_or_else(
+                || {
+                    resolve_fleet_base(
+                        actions,
+                        config,
+                        &settings.repo_slug,
+                        fleet_base_override.clone(),
+                    )
+                },
+                Ok,
+            );
+            let result = base.and_then(|base| {
+                fleet_base = Some(base.clone());
+                let fleet_args = super::fleet_status_cmd::FleetStatusArgs {
+                    repo: Some(settings.repo_slug.clone()),
+                    base,
+                    target: "macos".to_owned(),
+                    queued_age_threshold_secs: 900,
+                    queue_run_limit: 100,
+                    merge_queue_stall_threshold_secs: 900,
+                    release_stale_threshold_secs: 86_400,
+                };
+                if json {
+                    let mut fleet_output = Vec::new();
+                    let code = super::fleet_status_cmd::fleet_status_command(
+                        fleet_args,
+                        config,
+                        cwd,
+                        state_dir,
+                        actions,
+                        true,
+                        &mut fleet_output,
+                    )?;
+                    emit_fleet_watch_json(stdout, &fleet_output)?;
+                    Ok(code)
+                } else {
+                    super::fleet_status_cmd::fleet_status_command(
+                        fleet_args, config, cwd, state_dir, actions, false, stdout,
+                    )
+                }
+            });
+            match result {
+                Ok(code) => fleet_failed |= code != ExitCode::SUCCESS,
+                Err(error) => {
+                    fleet_failed = true;
+                    emit_watch_error(stdout, &settings, &error, json)?;
+                }
+            }
+        }
+
         iterations = iterations.saturating_add(1);
         if let Some(limit) = max_iterations
             && iterations >= limit
@@ -699,7 +762,82 @@ fn watch_command<W: Write>(args: WatchCommandArgs<'_, W>) -> Result<ExitCode, Cl
         }
         sleep(interval);
     };
-    Ok(ExitCode::from(last_health.exit_code()))
+    Ok(ExitCode::from(watch_exit_code(last_health, fleet_failed)))
+}
+
+fn watch_exit_code(health: RunnerHealth, fleet_failed: bool) -> u8 {
+    if fleet_failed && health == RunnerHealth::Healthy {
+        1
+    } else {
+        health.exit_code()
+    }
+}
+
+fn emit_fleet_watch_json<W: Write>(stdout: &mut W, fleet_output: &[u8]) -> Result<(), CliFailure> {
+    let mut value = serde_json::from_slice::<Value>(fleet_output)
+        .map_err(|error| CliFailure::new(1, format!("parse fleet watch event failed: {error}")))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| CliFailure::new(1, "fleet watch event is not a JSON object"))?;
+    object.insert("command".to_owned(), Value::from("runner.watch"));
+    object.insert("event".to_owned(), Value::from("fleet_liveness"));
+    serde_json::to_writer_pretty(&mut *stdout, &value)
+        .map_err(|error| CliFailure::new(1, format!("write fleet watch event failed: {error}")))?;
+    writeln!(stdout).map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+fn fleet_liveness_due(config: &LoadedConfig, iteration: u32) -> bool {
+    if !fleet_liveness_enabled(config) {
+        return false;
+    }
+    let every = config
+        .get("runner.watchdog.fleet_liveness_every_ticks")
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(1)
+        .max(1);
+    iteration.is_multiple_of(every)
+}
+
+fn fleet_liveness_enabled(config: &LoadedConfig) -> bool {
+    let enabled = config
+        .get("runner.watchdog.fleet_liveness")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+    if !enabled
+        || crate::capacity::parse_host_classes(&config.data).is_ok_and(|classes| classes.is_empty())
+    {
+        return false;
+    }
+    true
+}
+
+fn resolve_fleet_base(
+    actions: &GitHubActions,
+    config: &LoadedConfig,
+    repo: &str,
+    override_base: Option<String>,
+) -> Result<String, CliFailure> {
+    if let Some(base) = override_base.or_else(|| {
+        config
+            .get("runner.watchdog.fleet_base")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    }) {
+        return Ok(base);
+    }
+    let raw = actions
+        .run_gh(&["api".to_owned(), format!("repos/{repo}")])
+        .map_err(|error| CliFailure::new(1, format!("resolve fleet base failed: {error}")))?;
+    serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("default_branch")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| CliFailure::new(1, "repository response missing default_branch"))
 }
 
 fn report_has_hung_worker(report: &crate::runner_watchdog::RunnerReport) -> bool {
@@ -1487,6 +1625,44 @@ mod tests {
     fn dry_run_overridden_only_respects_fix_flag() {
         assert!(dry_run_overridden_only(true, false));
         assert!(!dry_run_overridden_only(true, true));
+    }
+
+    #[test]
+    fn fleet_liveness_is_default_on_for_configured_pool_and_has_cadence() {
+        let config = config_with(
+            "[host_class.m5]\ncap = 2\n[runner.watchdog]\nfleet_liveness_every_ticks = 3\n",
+        );
+        assert!(fleet_liveness_due(&config, 0));
+        assert!(!fleet_liveness_due(&config, 1));
+        assert!(fleet_liveness_due(&config, 3));
+    }
+
+    #[test]
+    fn fleet_liveness_can_be_delegated_or_has_no_work_without_pool() {
+        let delegated =
+            config_with("[host_class.m5]\ncap = 2\n[runner.watchdog]\nfleet_liveness = false\n");
+        assert!(!fleet_liveness_due(&delegated, 0));
+        let no_pool = config_with("[project]\nname = \"x\"\n");
+        assert!(!fleet_liveness_due(&no_pool, 0));
+    }
+
+    #[test]
+    fn bounded_watch_propagates_fleet_failure_without_masking_offline_health() {
+        assert_eq!(watch_exit_code(RunnerHealth::Healthy, true), 1);
+        assert_eq!(watch_exit_code(RunnerHealth::Stuck, true), 1);
+        assert_eq!(watch_exit_code(RunnerHealth::Offline, true), 2);
+        assert_eq!(watch_exit_code(RunnerHealth::Healthy, false), 0);
+    }
+
+    #[test]
+    fn fleet_json_is_embedded_as_runner_watch_event() {
+        let input = br#"{"schema_version":1,"command":"runner.fleet-status","repo":"o/r"}"#;
+        let mut output = Vec::new();
+        emit_fleet_watch_json(&mut output, input).expect("embed");
+        let value: Value = serde_json::from_slice(&output).expect("JSON");
+        assert_eq!(value["command"], "runner.watch");
+        assert_eq!(value["event"], "fleet_liveness");
+        assert_eq!(value["repo"], "o/r");
     }
 
     fn config_with(body: &str) -> crate::config::LoadedConfig {
