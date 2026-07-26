@@ -113,36 +113,60 @@ def _snapshot_paths(root: Path) -> set[Path]:
         return set()
 
 
-def _active_process_ids() -> frozenset[int]:
+def _active_process_identities() -> dict[int, str]:
     if os.name != "posix":
-        return frozenset()
+        return {}
     try:
         result = subprocess.run(
-            ["ps", "-axo", "pid="],
+            ["ps", "-axo", "pid=,lstart="],
             check=True,
             capture_output=True,
             text=True,
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
-        return frozenset()
-    return frozenset(
-        int(pid) for pid in result.stdout.split() if pid.isdigit()
-    )
+        return {}
+    identities: dict[int, str] = {}
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) == 2 and fields[0].isdigit():
+            identities[int(fields[0])] = fields[1]
+    return identities
+
+
+def _process_start_identity(pid: int) -> str | None:
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
 
 
 def _is_queue_temp_from_pre_existing_process(
-    path: Path, pre_existing_process_ids: frozenset[int]
+    path: Path, pre_existing_process_identities: Mapping[int, str]
 ) -> bool:
     match = QUEUE_TEMP_RE.fullmatch(path.name)
-    return match is not None and int(match.group(1)) in pre_existing_process_ids
+    if match is None:
+        return False
+    pid = int(match.group(1))
+    prior_identity = pre_existing_process_identities.get(pid)
+    return (
+        prior_identity is not None
+        and _process_start_identity(pid) == prior_identity
+    )
 
 
 def _find_newer(
     root: Path,
     sentinel_mtime: float,
     pre_existing: set[Path],
-    pre_existing_process_ids: frozenset[int] = frozenset(),
+    pre_existing_process_identities: Mapping[int, str] | None = None,
 ) -> list[Path]:
     if not root.exists():
         return []
@@ -165,7 +189,7 @@ def _find_newer(
             # existed when the sandbox started; a child created by this sandbox
             # remains attributable and must still fail the contamination check.
             if _is_queue_temp_from_pre_existing_process(
-                path, pre_existing_process_ids
+                path, pre_existing_process_identities or {}
             ):
                 continue
             offenders.append(path)
@@ -268,7 +292,7 @@ class Sandbox:
         self.root: Path | None = None
         self._sentinel_mtime: float | None = None
         self._pre_existing: dict[Path, set[Path]] = {}
-        self._pre_existing_process_ids: frozenset[int] = frozenset()
+        self._pre_existing_process_identities: dict[int, str] = {}
 
     @property
     def bin_dir(self) -> Path:
@@ -294,7 +318,7 @@ class Sandbox:
         self.home_dir.mkdir(parents=True)
         self.work_dir.mkdir(parents=True)
         self._pre_existing = {path: _snapshot_paths(path) for path in PROTECTED_PATHS}
-        self._pre_existing_process_ids = _active_process_ids()
+        self._pre_existing_process_identities = _active_process_identities()
         sentinel = self.root / ".sentinel"
         sentinel.write_text("sandbox-start\n", encoding="utf-8")
         now = time.time()
@@ -384,7 +408,7 @@ class Sandbox:
                     path,
                     self._sentinel_mtime,
                     self._pre_existing.get(path, set()),
-                    self._pre_existing_process_ids,
+                    self._pre_existing_process_identities,
                 )
             )
         report = ContaminationReport(tuple(sorted(offenders)), self._sentinel_mtime)
