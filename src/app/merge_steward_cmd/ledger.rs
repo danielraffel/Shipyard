@@ -57,7 +57,10 @@ pub(super) fn load_ledger(path: &Path) -> Result<StewardLedger, CliFailure> {
 }
 
 pub(super) fn save_ledger(path: &Path, ledger: &StewardLedger) -> Result<(), CliFailure> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent).map_err(|error| {
             CliFailure::new(
                 1,
@@ -103,7 +106,10 @@ pub(super) fn save_ledger(path: &Path, ledger: &StewardLedger) -> Result<(), Cli
             ),
         )
     })?;
+    #[cfg(not(windows))]
     sync_parent_directory(path)?;
+    #[cfg(windows)]
+    sync_parent_directory(path);
     Ok(())
 }
 
@@ -129,8 +135,7 @@ fn sync_parent_directory(path: &Path) -> Result<(), CliFailure> {
 }
 
 #[cfg(windows)]
-fn sync_parent_directory(_path: &Path) -> Result<(), CliFailure> {
+fn sync_parent_directory(_path: &Path) {
     // Windows does not support opening a directory with std::fs::File for
     // sync_all(). The temp file itself is flushed before the atomic replace.
-    Ok(())
 }

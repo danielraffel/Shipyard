@@ -376,7 +376,10 @@ fn persist_final_ledger(
 }
 
 fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent).map_err(|error| {
             CliFailure::new(
                 1,
@@ -434,7 +437,7 @@ use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,
 };
 use cancellation_recovery::resume_pending_cancellations;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use cancellation_revalidation::pull_request;
 use cancellation_revalidation::{
     acquire_pr_mutation_guard, acquire_run_mutation_guard, attempts_for,
@@ -444,9 +447,8 @@ use cancellation_revalidation::{
 };
 use cancellation_terminalization::{
     acquire_pending_cancellation_guard, active_runner_targets, clear_pending_cancellation,
-    complete_capacity_cancellation, current_pending_run_identity_matches,
-    persist_force_cancel_intent, read_current_pending_run_identity, read_pending_run,
-    validate_pending_cancellation_authority,
+    complete_capacity_cancellation, persist_force_cancel_intent, read_current_pending_run_identity,
+    read_pending_run, validate_pending_cancellation_authority,
 };
 use capacity_cancellation::{
     apply_capacity_preemption, mark_cancellation_skipped, persist_capacity_evidence,

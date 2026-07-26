@@ -224,7 +224,7 @@ pub(super) fn wait_for_pending_normal_terminalization(
     let elapsed = DateTime::parse_from_rfc3339(&pending.initiated_at)
         .ok()
         .and_then(|started| (Utc::now() - started.with_timezone(&Utc)).to_std().ok())
-        .unwrap_or(CANCEL_TERMINAL_WAIT);
+        .unwrap_or_default();
     if elapsed >= CANCEL_TERMINAL_WAIT {
         return match read_pending_run(actions, pending)? {
             PendingRunState::Terminal => Ok(None),

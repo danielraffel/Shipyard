@@ -62,6 +62,7 @@ fn ready_pr() -> ObservedPr {
                 "name": "macos",
                 "status": "COMPLETED",
                 "conclusion": "SUCCESS",
+                "completedAt": "2026-07-26T00:00:00Z",
                 "detailsUrl": "https://github.com/owner/repo/actions/runs/100"
             }]
         }),

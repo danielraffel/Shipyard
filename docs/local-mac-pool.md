@@ -196,7 +196,7 @@ queued macOS jobs inside an `in_progress` workflow. A reached bound emits
 `OBSERVATION_TRUNCATED` instead of consuming an unbounded API budget;
 durable enrollment reconciliation is separately capped at 25 PR lookups per
 tick and uses the same explicit truncation signal.
-authentication and rate-limit failures use stable `GITHUB_*` codes.
+Authentication and rate-limit failures use stable `GITHUB_*` codes.
 The optional open release-incident count does not require `Issues: read`;
 when unavailable it emits non-fatal `AUXILIARY_OBSERVATION_UNAVAILABLE`.
 If `governance.required_status_checks` is empty, every check observed
