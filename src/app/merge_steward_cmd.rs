@@ -134,6 +134,7 @@ struct PendingCancellation {
 enum PendingCancellationPhase {
     Intent,
     Accepted,
+    Skipped,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -208,6 +209,10 @@ pub(super) fn steward_command<W: Write>(
         .ledger
         .clone()
         .unwrap_or_else(|| runtime_paths.state_dir.join("merge-steward.json"));
+    // Keep this guard alive for the entire apply pass. In particular, it
+    // serializes the durable pending-correlation write that precedes mutation
+    // guard acquisition, so two steward processes cannot race the shared
+    // ledger's temporary file or replace one another's correlation.
     let _ledger_lock = if args.apply {
         Some(acquire_ledger_lock(&ledger_path)?)
     } else {
@@ -1354,7 +1359,7 @@ fn apply_capacity_preemption(
     let Some(expected_front) = queue_front_head(context.observation) else {
         return (Some("skipped_after_front_revalidation".to_owned()), None);
     };
-    let (guard, cancel_live) =
+    let (guard, cancel_live, pending) =
         match prepare_capacity_preemption(context, opt_out_label, ledger, observed, expected_front)
         {
             Ok(Some(prepared)) => prepared,
@@ -1366,6 +1371,40 @@ fn apply_capacity_preemption(
             }
             Err(error) => return (None, Some(error)),
         };
+    match current_pending_run_identity_matches(context.actions, &pending) {
+        Ok(true) => {}
+        Ok(false) => {
+            let key = pending_cancellation_key(&pending);
+            if let Err(error) = mark_cancellation_skipped(ledger, context.ledger_path, &key) {
+                return (None, Some(error));
+            }
+            if let Err(error) = guard.finish("skipped_after_attempt_revalidation") {
+                return (None, Some(format!("mutation audit failed: {error}")));
+            }
+            if let Err(error) = clear_pending_cancellation(
+                ledger,
+                context.ledger_path,
+                &key,
+                &pending,
+                "skipped_after_attempt_revalidation",
+            ) {
+                return (None, Some(error));
+            }
+            return (Some("skipped_after_attempt_revalidation".to_owned()), None);
+        }
+        Err(error) => {
+            let audit_error = guard.finish("attempt_revalidation_failed").err();
+            return (
+                None,
+                Some(format!(
+                    "{error}{}",
+                    audit_error.map_or_else(String::new, |audit_error| format!(
+                        "; mutation audit also failed: {audit_error}"
+                    ))
+                )),
+            );
+        }
+    }
     match context
         .actions
         .cancel_workflow_run(&context.observation.repo, context.cancellation.run_id)
@@ -1401,40 +1440,16 @@ fn prepare_capacity_preemption(
     ledger: &mut StewardLedger,
     observed: &StewardRun,
     expected_front: &str,
-) -> Result<Option<(MergeQueueMutationGuard, CapacityRevalidation)>, String> {
-    let guard = acquire_run_mutation_guard(
-        context.mutation_control,
-        context.observation,
-        observed,
-        &format!(
-            "runner steward preempt capacity run {}",
-            context.cancellation.run_id
-        ),
-    )?;
-    let key = format!("{}:{}", context.observation.repo, preemption_key(observed));
-    *ledger.preemption_attempts.entry(key).or_default() += 1;
-    record_audit(
-        ledger,
-        &context.observation.repo,
-        &format!(
-            "front:{expected_front}:capacity-run:{}:{}",
-            context.cancellation.run_id, observed.head_sha
-        ),
-        &format!(
-            "capacity_preemption_started:{:?}",
-            context.cancellation.reason
-        ),
-    );
-    if let Err(error) = save_ledger(context.ledger_path, ledger) {
-        let audit_error = guard.finish("intent_persistence_failed").err();
-        return Err(format!(
-            "could not persist preemption intent: {}{}",
-            error.message,
-            audit_error.map_or_else(String::new, |error| format!(
-                "; mutation audit also failed: {error}"
-            ))
-        ));
-    }
+) -> Result<
+    Option<(
+        MergeQueueMutationGuard,
+        CapacityRevalidation,
+        PendingCancellation,
+    )>,
+    String,
+> {
+    let (guard, pending) =
+        start_capacity_preemption(context, opt_out_label, ledger, observed, expected_front)?;
     let cancel_live = match revalidate_capacity_preemption(
         context.actions,
         context.observation,
@@ -1445,9 +1460,21 @@ fn prepare_capacity_preemption(
     ) {
         Ok(Some(evidence)) => evidence,
         Ok(None) => {
+            mark_cancellation_skipped(
+                ledger,
+                context.ledger_path,
+                &pending_cancellation_key(&pending),
+            )?;
             guard
                 .finish("skipped_after_precancel_revalidation")
                 .map_err(|error| format!("mutation audit failed: {error}"))?;
+            clear_pending_cancellation(
+                ledger,
+                context.ledger_path,
+                &pending_cancellation_key(&pending),
+                &pending,
+                "skipped_after_precancel_revalidation",
+            )?;
             return Ok(None);
         }
         Err(error) => {
@@ -1476,24 +1503,51 @@ fn prepare_capacity_preemption(
             ))
         ));
     }
+    Ok(Some((guard, cancel_live, pending)))
+}
+
+fn start_capacity_preemption(
+    context: &CapacityApplyContext<'_>,
+    opt_out_label: &str,
+    ledger: &mut StewardLedger,
+    observed: &StewardRun,
+    expected_front: &str,
+) -> Result<(MergeQueueMutationGuard, PendingCancellation), String> {
+    let correlation_id = MergeQueueMutationGuard::new_correlation_id();
     let pending = pending_cancellation(
         context,
         expected_front,
-        &cancel_live.candidate,
-        guard.correlation_id(),
+        observed,
+        &correlation_id,
         PendingCancellationPhase::Intent,
         opt_out_label,
     )?;
-    if let Err(error) = persist_pending_cancellation(context.ledger_path, ledger, pending) {
-        let audit_error = guard.finish("pending_persistence_failed").err();
-        return Err(format!(
-            "{error}{}",
-            audit_error.map_or_else(String::new, |audit_error| format!(
-                "; mutation audit also failed: {audit_error}"
-            ))
-        ));
-    }
-    Ok(Some((guard, cancel_live)))
+    validate_pending_cancellation_authority(context.mutation_control, &pending)?;
+    let key = format!("{}:{}", context.observation.repo, preemption_key(observed));
+    *ledger.preemption_attempts.entry(key).or_default() += 1;
+    record_audit(
+        ledger,
+        &context.observation.repo,
+        &format!(
+            "front:{expected_front}:capacity-run:{}:{}",
+            context.cancellation.run_id, observed.head_sha
+        ),
+        &format!(
+            "capacity_preemption_started:{:?}",
+            context.cancellation.reason
+        ),
+    );
+    persist_pending_cancellation(context.ledger_path, ledger, pending.clone())?;
+    let guard = acquire_pending_cancellation_guard_with_correlation(
+        context.mutation_control,
+        &pending,
+        &format!(
+            "runner steward preempt capacity run {}",
+            context.cancellation.run_id
+        ),
+        &correlation_id,
+    )?;
+    Ok((guard, pending))
 }
 
 fn persist_pending_cancellation(
@@ -1539,6 +1593,27 @@ fn mark_cancellation_accepted(
         "capacity_preemption_pending_after_acceptance",
     );
     save_ledger(context.ledger_path, ledger).map_err(|error| error.message)
+}
+
+fn mark_cancellation_skipped(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    key: &str,
+) -> Result<(), String> {
+    let pending = ledger
+        .pending_cancellations
+        .get_mut(key)
+        .ok_or_else(|| "pending cancellation intent disappeared".to_owned())?;
+    pending.phase = PendingCancellationPhase::Skipped;
+    let repo = pending.repo.clone();
+    let run_id = pending.run_id;
+    record_audit(
+        ledger,
+        &repo,
+        &format!("capacity-run:{run_id}"),
+        "capacity_preemption_skipped_before_mutation",
+    );
+    save_ledger(ledger_path, ledger).map_err(|error| error.message)
 }
 
 fn pending_cancellation(
@@ -1688,6 +1763,15 @@ fn resume_pending_cancellation(
     key: &str,
     pending: &PendingCancellation,
 ) -> Result<String, String> {
+    if pending.phase == PendingCancellationPhase::Skipped {
+        return clear_recovered_skipped_cancellation(
+            ledger,
+            ledger_path,
+            mutation_control,
+            key,
+            pending,
+        );
+    }
     match read_pending_run(actions, pending)? {
         PendingRunState::Terminal => {
             supersede_pending_uncertainty(mutation_control, pending)?;
@@ -1778,6 +1862,24 @@ fn resume_pending_cancellation(
             }
         }
     }
+}
+
+fn clear_recovered_skipped_cancellation(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    mutation_control: &MutationControl,
+    key: &str,
+    pending: &PendingCancellation,
+) -> Result<String, String> {
+    supersede_pending_uncertainty(mutation_control, pending)?;
+    clear_pending_cancellation(
+        ledger,
+        ledger_path,
+        key,
+        pending,
+        "pending_skipped_cancellation_cleared",
+    )?;
+    Ok("recovered_skipped_cancellation".to_owned())
 }
 
 fn wait_for_pending_terminalization(
@@ -1889,12 +1991,26 @@ fn resume_pending_intent(
         &pending.front_head,
         &pending.opt_out_label,
     )?;
-    evidence.ok_or_else(|| {
-        format!(
-            "cancellation intent for run {} no longer passes exact capacity-safety revalidation",
-            pending.run_id
-        )
-    })?;
+    let Some(evidence) = evidence else {
+        mark_cancellation_skipped(ledger, ledger_path, key)?;
+        supersede_pending_uncertainty(mutation_control, pending)?;
+        clear_pending_cancellation(
+            ledger,
+            ledger_path,
+            key,
+            pending,
+            "pending_intent_skipped_after_revalidation",
+        )?;
+        return Ok("recovered_skipped_cancellation".to_owned());
+    };
+    persist_capacity_evidence(
+        &observation,
+        &cancellation,
+        &pending.front_head,
+        &evidence,
+        ledger_path,
+        ledger,
+    )?;
     if was_uncertain {
         supersede_pending_uncertainty(mutation_control, pending)?;
     }
@@ -2069,6 +2185,19 @@ fn read_current_pending_run_identity(
     actions: &GitHubActions,
     pending: &PendingCancellation,
 ) -> Result<(), String> {
+    if !current_pending_run_identity_matches(actions, pending)? {
+        return Err(format!(
+            "current workflow run {} no longer matches pending attempt {}",
+            pending.run_id, pending.run_attempt
+        ));
+    }
+    Ok(())
+}
+
+fn current_pending_run_identity_matches(
+    actions: &GitHubActions,
+    pending: &PendingCancellation,
+) -> Result<bool, String> {
     let value = gh_json(
         actions,
         &[
@@ -2083,18 +2212,11 @@ fn read_current_pending_run_identity(
             pending.run_id
         )
     })?;
-    if run.id != pending.run_id
-        || run.workflow_id != pending.workflow_id
-        || run.run_attempt != pending.run_attempt
-        || !run.head_sha.eq_ignore_ascii_case(&pending.head_sha)
-        || run.head_branch != pending.head_branch
-    {
-        return Err(format!(
-            "current workflow run {} no longer matches pending attempt {}",
-            pending.run_id, pending.run_attempt
-        ));
-    }
-    Ok(())
+    Ok(run.id == pending.run_id
+        && run.workflow_id == pending.workflow_id
+        && run.run_attempt == pending.run_attempt
+        && run.head_sha.eq_ignore_ascii_case(&pending.head_sha)
+        && run.head_branch == pending.head_branch)
 }
 
 fn fetch_pending_run_jobs(
@@ -2138,14 +2260,7 @@ fn acquire_pending_cancellation_guard_with_correlation(
     action: &str,
     correlation_id: &str,
 ) -> Result<MergeQueueMutationGuard, String> {
-    let state = ShipState::new(
-        pending.pr_number,
-        &pending.repo,
-        &pending.head_branch,
-        &pending.base,
-        &pending.head_sha,
-        "runner-steward",
-    );
+    let state = pending_cancellation_ship_state(pending);
     MergeQueueMutationGuard::acquire_in_mode_with_correlation(
         &control.store,
         &control.cwd,
@@ -2154,6 +2269,28 @@ fn acquire_pending_cancellation_guard_with_correlation(
         &state,
         action,
         correlation_id,
+    )
+}
+
+fn validate_pending_cancellation_authority(
+    control: &MutationControl,
+    pending: &PendingCancellation,
+) -> Result<(), String> {
+    MergeQueueMutationGuard::validate_in_mode(
+        &control.store,
+        &control.global_dir,
+        &pending_cancellation_ship_state(pending),
+    )
+}
+
+fn pending_cancellation_ship_state(pending: &PendingCancellation) -> ShipState {
+    ShipState::new(
+        pending.pr_number,
+        &pending.repo,
+        &pending.head_branch,
+        &pending.base,
+        &pending.head_sha,
+        "runner-steward",
     )
 }
 
@@ -2601,9 +2738,7 @@ fn revalidate_capacity_preemption(
     )?;
     let mut live =
         parse_run(&value).ok_or_else(|| "live capacity-preemption run was malformed".to_owned())?;
-    if !live.head_sha.eq_ignore_ascii_case(&observed.head_sha)
-        || live.workflow_id != observed.workflow_id
-    {
+    if !same_workflow_attempt(observed, &live) {
         return Ok(None);
     }
     live.jobs = fetch_run_jobs(actions, &observation.repo, cancellation.run_id)?;
@@ -2649,6 +2784,12 @@ fn revalidate_capacity_preemption(
         front_jobs,
         current_pr_head,
     }))
+}
+
+fn same_workflow_attempt(observed: &StewardRun, live: &StewardRun) -> bool {
+    live.head_sha.eq_ignore_ascii_case(&observed.head_sha)
+        && live.workflow_id == observed.workflow_id
+        && live.run_attempt == observed.run_attempt
 }
 
 fn live_current_pull_request_state(
@@ -3994,6 +4135,126 @@ esac
         );
         assert!(ledger.preemption_attempts.is_empty());
         assert!(ledger.audit.is_empty());
+    }
+
+    #[test]
+    fn capacity_revalidation_rejects_a_new_workflow_attempt() {
+        let observed = queued_run(100, "2026-07-26T00:00:00Z");
+        let mut rerun = observed.clone();
+        rerun.run_attempt += 1;
+
+        assert!(!same_workflow_attempt(&observed, &rerun));
+    }
+
+    #[test]
+    fn initial_capacity_guard_correlation_is_durable_before_started_audit_can_be_orphaned() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = GitHubActions::new(temp.path());
+        let mut observation = observation_for(ready_pr(), true);
+        let run = queued_run(100, "2026-07-26T00:00:00Z");
+        observation.runs = vec![run.clone()];
+        let cancellation = RunCancellation {
+            run_id: 100,
+            reason: RunCancellationReason::AdvisoryPreambleCapacityTheft,
+        };
+        let ledger_path = temp.path().join("ledger.json");
+        let control = mutation_control(&temp, "studio", "studio");
+        let context = CapacityApplyContext {
+            actions: &actions,
+            observation: &observation,
+            cancellation: &cancellation,
+            ledger_path: &ledger_path,
+            mutation_control: &control,
+        };
+        let mut ledger = StewardLedger::default();
+
+        let (guard, pending) = start_capacity_preemption(
+            &context,
+            "steward:skip",
+            &mut ledger,
+            &run,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .expect("durable guard start");
+        let persisted = load_ledger(&ledger_path).expect("persisted ledger");
+        assert_eq!(
+            persisted
+                .pending_cancellations
+                .get(&pending_cancellation_key(&pending))
+                .expect("pending before crash")
+                .mutation_correlation_id,
+            guard.correlation_id()
+        );
+
+        drop(guard);
+
+        let uncertain = uncertain_mutations(control.store.path().parent().expect("state root"))
+            .expect("uncertainty");
+        assert_eq!(
+            uncertain[0]["correlation_id"].as_str(),
+            Some(pending.mutation_correlation_id.as_str())
+        );
+    }
+
+    #[test]
+    fn skipped_capacity_intent_recovers_without_sending_a_cancellation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = GitHubActions::new(temp.path());
+        let mut observation = observation_for(ready_pr(), true);
+        let run = queued_run(100, "2026-07-26T00:00:00Z");
+        observation.runs = vec![run.clone()];
+        let cancellation = RunCancellation {
+            run_id: 100,
+            reason: RunCancellationReason::AdvisoryPreambleCapacityTheft,
+        };
+        let ledger_path = temp.path().join("ledger.json");
+        let control = mutation_control(&temp, "studio", "studio");
+        let context = CapacityApplyContext {
+            actions: &actions,
+            observation: &observation,
+            cancellation: &cancellation,
+            ledger_path: &ledger_path,
+            mutation_control: &control,
+        };
+        let mut ledger = StewardLedger::default();
+        let (guard, pending) = start_capacity_preemption(
+            &context,
+            "steward:skip",
+            &mut ledger,
+            &run,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .expect("durable guard start");
+        let key = pending_cancellation_key(&pending);
+        mark_cancellation_skipped(&mut ledger, &ledger_path, &key).expect("durable tombstone");
+
+        drop(guard);
+
+        let mut recovered = load_ledger(&ledger_path).expect("persisted tombstone");
+        let tombstone = recovered
+            .pending_cancellations
+            .get(&key)
+            .expect("skipped pending")
+            .clone();
+        assert_eq!(tombstone.phase, PendingCancellationPhase::Skipped);
+        assert_eq!(
+            resume_pending_cancellation(
+                &actions,
+                &ledger_path,
+                &mut recovered,
+                &control,
+                &key,
+                &tombstone,
+            )
+            .expect("skip recovery"),
+            "recovered_skipped_cancellation"
+        );
+        assert!(recovered.pending_cancellations.is_empty());
+        assert!(
+            uncertain_mutations(control.store.path().parent().expect("state root"))
+                .expect("uncertainty")
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]

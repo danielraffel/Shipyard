@@ -416,6 +416,41 @@ pub struct MergeQueueMutationGuard {
 }
 
 impl MergeQueueMutationGuard {
+    /// Validate authority, HOLD, and exact-PR uncertainty before a caller
+    /// persists a correlation that will be handed to a later guard acquire.
+    pub fn validate_in_mode(
+        store: &ShipStateStore,
+        global_dir: &Path,
+        state: &ShipState,
+    ) -> Result<(), String> {
+        let state_root = store.path().parent().unwrap_or_else(|| store.path());
+        let _control_lock = acquire_control_lock(state_root, true)?;
+        let hold_path = state_root.join(HOLD_FILE);
+        if hold_path.exists() {
+            return Err(format!(
+                "merge-queue mutations are centrally held by {}",
+                hold_path.display()
+            ));
+        }
+        if let Some(uncertain) = uncertain_mutations(state_root)?.into_iter().find(|entry| {
+            entry.get("repo").and_then(serde_json::Value::as_str) == Some(state.repo.as_str())
+                && entry.get("base").and_then(serde_json::Value::as_str)
+                    == Some(state.base_branch.as_str())
+                && entry.get("pr").and_then(serde_json::Value::as_u64) == Some(state.pr)
+        }) {
+            let correlation_id = uncertain["correlation_id"]
+                .as_str()
+                .unwrap_or("<correlation-id>");
+            return Err(format!(
+                "merge-queue mutation {correlation_id} for {}/{} PR #{} is uncertain",
+                state.repo, state.base_branch, state.pr
+            ));
+        }
+        let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+            .map_err(|error| format!("failed to load merge-queue mutation policy: {error}"))?;
+        validate_machine_authority(&config, state_root).map(|_| ())
+    }
+
     /// Stable audit identity for durable state that brackets this mutation.
     #[must_use]
     pub fn correlation_id(&self) -> &str {
