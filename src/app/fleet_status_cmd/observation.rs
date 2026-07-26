@@ -383,9 +383,6 @@ pub(super) fn fetch_observed_workflow_runs(
     truncated |= runs_by_status.iter().map(Vec::len).sum::<usize>() > raw_runs.len();
     let mut observations = Vec::new();
     for run in &raw_runs {
-        let Some(head_branch) = run.get("head_branch").and_then(Value::as_str) else {
-            continue;
-        };
         let Some(run_id) = run.get("id").and_then(Value::as_u64) else {
             continue;
         };
@@ -398,7 +395,11 @@ pub(super) fn fetch_observed_workflow_runs(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_owned(),
-            head_branch: head_branch.to_owned(),
+            head_branch: run
+                .get("head_branch")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             head_sha: run
                 .get("head_sha")
                 .and_then(Value::as_str)

@@ -2,7 +2,7 @@ use super::{
     BTreeMap, GitHubActions, MutationApplyContext, ObservedPr, Path, RepoObservation,
     StewardDecision, StewardLedger, StewardPolicy, Value, acquire_pr_mutation_guard, attempt_key,
     attempts_for, classify_pr, enqueue_requirements_pending, gh_json, merge_queue_snapshot,
-    parse_run, pull_request, record_audit, save_ledger,
+    parse_run, pull_request_with_required_checks, record_audit, save_ledger,
 };
 
 pub(super) fn mutate_pr(
@@ -28,11 +28,12 @@ pub(super) fn mutate_pr(
         Ok((_, positions, _, _)) => positions,
         Err(error) => return (None, Some(error)),
     };
-    let live_pr = match pull_request(
+    let live_pr = match pull_request_with_required_checks(
         context.actions,
         &context.observation.repo,
         pr.fact.number,
         &queue_positions,
+        &policy.required_checks,
     ) {
         Ok(Some(live_pr)) => live_pr,
         Ok(None) => return (Some("skipped_after_live_revalidation".to_owned()), None),
@@ -356,11 +357,12 @@ pub(super) fn revalidate_transient_rerun(
     run_id: u64,
     ledger: &StewardLedger,
 ) -> Result<bool, String> {
-    let Some(live_pr) = pull_request(
+    let Some(live_pr) = pull_request_with_required_checks(
         actions,
         &observation.repo,
         observed_pr.fact.number,
         &BTreeMap::new(),
+        &policy.required_checks,
     )?
     else {
         return Ok(false);

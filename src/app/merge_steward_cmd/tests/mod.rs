@@ -77,7 +77,7 @@ fn observation_for(pr: ObservedPr, merge_queue: bool) -> RepoObservation {
         allow_auto_merge: merge_queue,
         merge_queue,
         merge_method: Some("merge".to_owned()),
-        required_contexts: Vec::new(),
+        required_checks: Vec::new(),
         prs: vec![pr],
         runs: Vec::new(),
         merge_group_heads: BTreeMap::new(),
@@ -91,7 +91,7 @@ fn queue_policy() -> StewardPolicy {
     StewardPolicy {
         merge_queue: true,
         native_auto_merge: true,
-        required_contexts: Vec::new(),
+        required_checks: Vec::new(),
         opt_out_label: "steward:skip".to_owned(),
         max_transient_reruns: 1,
     }

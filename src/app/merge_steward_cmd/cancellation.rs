@@ -1,10 +1,10 @@
 use super::{
     CancellationReport, CapacityApplyContext, DateTime, GitHubActions, MutationApplyContext,
     MutationControl, ObservedPr, PREEMPT_AFTER_SECS, Path, PrReport, QueueFrontPressure,
-    RepoObservation, RepoReport, RunCancellation, RunCancellationReason, StewardCommandArgs,
-    StewardLedger, StewardPolicy, Utc, acquire_run_mutation_guard, apply_capacity_preemption,
-    attempts_for, classify_pr, current_pull_request_heads, mutate_pr, opted_out_pull_requests,
-    plan_capacity_preemptions, plan_run_coalescing, record_audit,
+    RepoObservation, RepoReport, RequiredCheck, RunCancellation, RunCancellationReason,
+    StewardCommandArgs, StewardLedger, StewardPolicy, Utc, acquire_run_mutation_guard,
+    apply_capacity_preemption, attempts_for, classify_pr, current_pull_request_heads, mutate_pr,
+    opted_out_pull_requests, plan_capacity_preemptions, plan_run_coalescing, record_audit,
     revalidate_coalescing_cancellation,
 };
 
@@ -20,7 +20,7 @@ pub(super) fn apply_repo_plan(
     let policy = StewardPolicy {
         merge_queue: observation.merge_queue,
         native_auto_merge: observation.allow_auto_merge,
-        required_contexts: observation.required_contexts.clone(),
+        required_checks: observation.required_checks.clone(),
         opt_out_label: args.opt_out_label.clone(),
         max_transient_reruns: args.max_transient_reruns,
     };
@@ -97,7 +97,11 @@ pub(super) fn apply_repo_plan(
             } else {
                 "private_free_exact_head_rest".to_owned()
             },
-            required_contexts: observation.required_contexts.clone(),
+            required_contexts: observation
+                .required_checks
+                .iter()
+                .map(RequiredCheck::label)
+                .collect(),
             prs: reports,
             cancellations,
             errors: observation.preemption_error.iter().cloned().collect(),

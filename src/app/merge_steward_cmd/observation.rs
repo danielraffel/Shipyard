@@ -1,6 +1,6 @@
 use super::{
     BTreeMap, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
-    MergeQueueSnapshot, ObservedPr, Path, RepoObservation, StewardCheck, StewardJob,
+    MergeQueueSnapshot, ObservedPr, Path, RepoObservation, RequiredCheck, StewardCheck, StewardJob,
     StewardPullRequest, StewardRun, Value, is_admin_protection_denied,
     is_capacity_preemption_workflow, is_full_sha, is_private_free_entitlement,
 };
@@ -64,10 +64,11 @@ pub(super) fn observe_repo(
     } else {
         None
     };
-    let required_contexts = required_contexts(actions, &repo, base)?;
+    let required_checks = required_checks(actions, &repo, base)?;
     let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
         merge_queue_snapshot(actions, &repo, base)?;
-    let prs = pull_requests(actions, &repo, base, &queue_positions)?;
+    let mut prs = pull_requests(actions, &repo, base, &queue_positions)?;
+    hydrate_required_check_identities(actions, &repo, &required_checks, &mut prs)?;
     let mut runs = active_runs(actions, &repo)?;
     let capacity_preemption_policy = CapacityPreemptionPolicy::for_repository(&repo);
     let front_head = queue_positions
@@ -89,7 +90,7 @@ pub(super) fn observe_repo(
         allow_auto_merge,
         merge_queue,
         merge_method,
-        required_contexts,
+        required_checks,
         prs,
         runs,
         merge_group_heads,
@@ -139,11 +140,11 @@ pub(super) fn gh_json_timeout(
         .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
 }
 
-pub(super) fn required_contexts(
+pub(super) fn required_checks(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<RequiredCheck>, String> {
     let encoded_base = encode_path_segment(base);
     let args = vec![
         "api".to_owned(),
@@ -158,39 +159,43 @@ pub(super) fn required_contexts(
             return Ok(Vec::new());
         }
         Err(error) if error.to_string().contains("HTTP 404") => {
-            return required_contexts_from_evaluated_rules(actions, repo, base);
+            return required_checks_from_evaluated_rules(actions, repo, base);
         }
         Err(error) => return Err(format!("required-check policy read failed: {error}")),
     };
     let value: Value = serde_json::from_str(&raw)
         .map_err(|error| format!("required-check policy returned malformed JSON: {error}"))?;
-    let mut contexts = value
+    let mut checks = value
         .get("contexts")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(str::to_owned)
+        .map(|context| RequiredCheck {
+            context: context.to_owned(),
+            app_id: None,
+        })
         .collect::<Vec<_>>();
-    if let Some(checks) = value.get("checks").and_then(Value::as_array) {
-        contexts.extend(checks.iter().filter_map(|check| {
-            check
-                .get("context")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        }));
+    if let Some(required) = value.get("checks").and_then(Value::as_array) {
+        for check in required {
+            let Some(context) = check.get("context").and_then(Value::as_str) else {
+                continue;
+            };
+            checks.push(RequiredCheck {
+                context: context.to_owned(),
+                app_id: optional_app_id(check, "app_id")?,
+            });
+        }
     }
-    contexts.extend(required_contexts_from_evaluated_rules(actions, repo, base)?);
-    contexts.sort();
-    contexts.dedup();
-    Ok(contexts)
+    checks.extend(required_checks_from_evaluated_rules(actions, repo, base)?);
+    Ok(normalize_required_checks(checks))
 }
 
-pub(super) fn required_contexts_from_evaluated_rules(
+pub(super) fn required_checks_from_evaluated_rules(
     actions: &GitHubActions,
     repo: &str,
     base: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<RequiredCheck>, String> {
     let encoded_base = encode_path_segment(base);
     let value = gh_json(
         actions,
@@ -202,7 +207,7 @@ pub(super) fn required_contexts_from_evaluated_rules(
         ],
         "evaluated branch rules",
     )?;
-    evaluated_required_contexts(&value)
+    evaluated_required_checks(&value)
 }
 
 pub(super) fn encode_path_segment(value: &str) -> String {
@@ -220,7 +225,7 @@ pub(super) fn encode_path_segment(value: &str) -> String {
     encoded
 }
 
-pub(super) fn evaluated_required_contexts(value: &Value) -> Result<Vec<String>, String> {
+pub(super) fn evaluated_required_checks(value: &Value) -> Result<Vec<RequiredCheck>, String> {
     let pages = value
         .as_array()
         .ok_or_else(|| "evaluated branch rules was not an array".to_owned())?;
@@ -232,7 +237,7 @@ pub(super) fn evaluated_required_contexts(value: &Value) -> Result<Vec<String>, 
     } else {
         pages.iter().collect()
     };
-    let mut contexts = rules
+    let checks = rules
         .iter()
         .filter(|rule| rule.get("type").and_then(Value::as_str) == Some("required_status_checks"))
         .flat_map(|rule| {
@@ -241,12 +246,48 @@ pub(super) fn evaluated_required_contexts(value: &Value) -> Result<Vec<String>, 
                 .into_iter()
                 .flatten()
         })
-        .filter_map(|check| check.get("context").and_then(Value::as_str))
-        .map(str::to_owned)
+        .map(|check| {
+            let context = check
+                .get("context")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "required status check missing context".to_owned())?;
+            Ok(RequiredCheck {
+                context: context.to_owned(),
+                app_id: optional_app_id(check, "integration_id")?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(normalize_required_checks(checks))
+}
+
+fn normalize_required_checks(mut checks: Vec<RequiredCheck>) -> Vec<RequiredCheck> {
+    checks.sort();
+    checks.dedup();
+    let pinned_contexts = checks
+        .iter()
+        .filter(|check| check.app_id.is_some())
+        .map(|check| check.context.clone())
         .collect::<Vec<_>>();
-    contexts.sort();
-    contexts.dedup();
-    Ok(contexts)
+    checks.retain(|check| {
+        check.app_id.is_some()
+            || !pinned_contexts
+                .iter()
+                .any(|context| context.eq_ignore_ascii_case(&check.context))
+    });
+    checks
+}
+
+fn optional_app_id(value: &Value, field: &str) -> Result<Option<u64>, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_i64() {
+            Some(-1) => Ok(None),
+            Some(app_id) if app_id >= 0 => u64::try_from(app_id)
+                .map(Some)
+                .map_err(|_| format!("required status check has invalid {field}")),
+            _ => Err(format!("required status check has invalid {field}")),
+        },
+    }
 }
 
 pub(super) fn merge_queue_snapshot(
@@ -420,6 +461,10 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
     match value.get("__typename").and_then(Value::as_str)? {
         "CheckRun" => Some(StewardCheck {
             name: value.get("name")?.as_str()?.to_owned(),
+            app_id: value
+                .pointer("/checkSuite/app/databaseId")
+                .or_else(|| value.pointer("/app/id"))
+                .and_then(Value::as_u64),
             status: value.get("status")?.as_str()?.to_owned(),
             conclusion: value
                 .get("conclusion")
@@ -440,6 +485,7 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
             let state = value.get("state")?.as_str()?;
             Some(StewardCheck {
                 name: value.get("context")?.as_str()?.to_owned(),
+                app_id: None,
                 status: if matches!(state, "PENDING" | "EXPECTED") {
                     "IN_PROGRESS"
                 } else {
@@ -463,6 +509,73 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
         }
         _ => None,
     }
+}
+
+pub(super) fn hydrate_required_check_identities(
+    actions: &GitHubActions,
+    repo: &str,
+    required_checks: &[RequiredCheck],
+    prs: &mut [ObservedPr],
+) -> Result<(), String> {
+    if !required_checks.iter().any(|check| check.app_id.is_some()) {
+        return Ok(());
+    }
+    for pr in prs {
+        pr.fact
+            .checks
+            .extend(check_runs_for_head(actions, repo, &pr.fact.head_sha)?);
+    }
+    Ok(())
+}
+
+pub(super) fn check_runs_for_head(
+    actions: &GitHubActions,
+    repo: &str,
+    head_sha: &str,
+) -> Result<Vec<StewardCheck>, String> {
+    let mut checks = Vec::new();
+    for page in 1..=10 {
+        let value = gh_json(
+            actions,
+            &[
+                "api".to_owned(),
+                format!("repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}"),
+            ],
+            "current-head check identities",
+        )?;
+        let rows = value
+            .get("check_runs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "current-head check identities missing check_runs".to_owned())?;
+        let count = rows.len();
+        checks.extend(rows.iter().filter_map(parse_rest_check));
+        if count < 100 {
+            return Ok(checks);
+        }
+    }
+    Err("current-head check runs exceed 1000; refusing partial identity scan".to_owned())
+}
+
+pub(super) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
+    Some(StewardCheck {
+        name: value.get("name")?.as_str()?.to_owned(),
+        app_id: value.pointer("/app/id").and_then(Value::as_u64),
+        status: value.get("status")?.as_str()?.to_owned(),
+        conclusion: value
+            .get("conclusion")
+            .and_then(Value::as_str)
+            .filter(|conclusion| !conclusion.is_empty())
+            .map(str::to_owned),
+        run_id: value
+            .get("details_url")
+            .and_then(Value::as_str)
+            .and_then(run_id_from_url),
+        observed_at: value
+            .get("completed_at")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("started_at").and_then(Value::as_str))
+            .map(str::to_owned),
+    })
 }
 
 pub(super) fn run_id_from_url(url: &str) -> Option<u64> {

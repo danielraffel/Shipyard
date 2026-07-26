@@ -16,6 +16,7 @@ fn green_pr() -> StewardPullRequest {
         labels: Vec::new(),
         checks: vec![StewardCheck {
             name: "required".to_owned(),
+            app_id: None,
             status: "COMPLETED".to_owned(),
             conclusion: Some("SUCCESS".to_owned()),
             run_id: Some(10),
@@ -28,7 +29,10 @@ fn queue_policy() -> StewardPolicy {
     StewardPolicy {
         merge_queue: true,
         native_auto_merge: true,
-        required_contexts: vec!["required".to_owned()],
+        required_checks: vec![RequiredCheck {
+            context: "required".to_owned(),
+            app_id: None,
+        }],
         opt_out_label: "shipyard:no-auto-merge".to_owned(),
         max_transient_reruns: 1,
     }
@@ -49,6 +53,7 @@ fn ignores_advisory_failure_when_required_context_is_green() {
     let mut pr = green_pr();
     pr.checks.push(StewardCheck {
         name: "advisory".to_owned(),
+        app_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("FAILURE".to_owned()),
         run_id: Some(11),
@@ -67,6 +72,7 @@ fn newest_duplicate_required_context_is_authoritative() {
     pr.checks[0].observed_at = Some("2026-07-25T00:00:00Z".to_owned());
     pr.checks.push(StewardCheck {
         name: "required".to_owned(),
+        app_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("SUCCESS".to_owned()),
         run_id: Some(12),
@@ -79,11 +85,42 @@ fn newest_duplicate_required_context_is_authoritative() {
 }
 
 #[test]
+fn app_bound_requirement_accepts_only_the_matching_check_producer() {
+    let mut policy = queue_policy();
+    policy.required_checks[0].app_id = Some(42);
+    let mut pr = green_pr();
+    pr.checks[0].app_id = Some(42);
+    assert_eq!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    );
+
+    pr.checks[0].app_id = Some(7);
+    assert!(matches!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::WaitingRequired { contexts }
+            if contexts == vec!["required (app_id=42)"]
+    ));
+}
+
+#[test]
+fn app_bound_requirement_fails_closed_when_producer_identity_is_unavailable() {
+    let mut policy = queue_policy();
+    policy.required_checks[0].app_id = Some(42);
+    let pr = green_pr();
+    assert!(matches!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::WaitingRequired { contexts }
+            if contexts == vec!["required (app_id=42)"]
+    ));
+}
+
+#[test]
 fn private_free_repo_requires_all_observed_checks_and_exact_head_merge() {
     let mut policy = queue_policy();
     policy.merge_queue = false;
     policy.native_auto_merge = false;
-    policy.required_contexts.clear();
+    policy.required_checks.clear();
     assert_eq!(
         classify_pr(&green_pr(), &policy, &BTreeMap::new()),
         StewardDecision::ExactHeadMerge
@@ -101,13 +138,14 @@ fn private_free_repo_uses_newest_duplicate_observed_check() {
     let mut policy = queue_policy();
     policy.merge_queue = false;
     policy.native_auto_merge = false;
-    policy.required_contexts.clear();
+    policy.required_checks.clear();
     let mut pr = green_pr();
     pr.checks[0].name = "Required".to_owned();
     pr.checks[0].conclusion = Some("FAILURE".to_owned());
     pr.checks[0].observed_at = Some("2026-07-25T00:00:00Z".to_owned());
     pr.checks.push(StewardCheck {
         name: "required".to_owned(),
+        app_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("SUCCESS".to_owned()),
         run_id: Some(12),
@@ -146,7 +184,7 @@ fn never_direct_merges_a_behind_private_pr() {
     pr.merge_state = "BEHIND".to_owned();
     let mut policy = queue_policy();
     policy.merge_queue = false;
-    policy.required_contexts.clear();
+    policy.required_checks.clear();
     assert!(matches!(
         classify_pr(&pr, &policy, &BTreeMap::new()),
         StewardDecision::NeedsUpdate { .. }

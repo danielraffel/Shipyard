@@ -17,10 +17,11 @@ use crate::cloud::GitHubActions;
 use crate::identity::RuntimeMode;
 use crate::merge_queue_control::{DurableMutationIntent, MergeQueueMutationGuard};
 use crate::merge_steward::{
-    CapacityPreemptionPolicy, QueueFrontPressure, RunCancellation, RunCancellationReason,
-    StewardCheck, StewardDecision, StewardJob, StewardPolicy, StewardPullRequest, StewardRun,
-    classify_pr, is_capacity_preemption_workflow, is_full_sha, is_safe_capacity_preemption,
-    plan_capacity_preemptions, plan_run_coalescing, preemption_key, queue_front_waits_for_pool,
+    CapacityPreemptionPolicy, QueueFrontPressure, RequiredCheck, RunCancellation,
+    RunCancellationReason, StewardCheck, StewardDecision, StewardJob, StewardPolicy,
+    StewardPullRequest, StewardRun, classify_pr, is_capacity_preemption_workflow, is_full_sha,
+    is_safe_capacity_preemption, plan_capacity_preemptions, plan_run_coalescing, preemption_key,
+    queue_front_waits_for_pool,
 };
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
@@ -51,7 +52,7 @@ struct RepoObservation {
     allow_auto_merge: bool,
     merge_queue: bool,
     merge_method: Option<String>,
-    required_contexts: Vec<String>,
+    required_checks: Vec<RequiredCheck>,
     prs: Vec<ObservedPr>,
     runs: Vec<StewardRun>,
     merge_group_heads: BTreeMap<u64, String>,
@@ -431,10 +432,13 @@ use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,
 };
 use cancellation_recovery::resume_pending_cancellations;
+#[cfg(test)]
+use cancellation_revalidation::pull_request;
 use cancellation_revalidation::{
     acquire_pr_mutation_guard, acquire_run_mutation_guard, attempts_for,
-    current_pull_request_heads, merge_group_pr_number, opted_out_pull_requests, pull_request,
-    revalidate_capacity_preemption, revalidate_coalescing_cancellation,
+    current_pull_request_heads, merge_group_pr_number, opted_out_pull_requests,
+    pull_request_with_required_checks, revalidate_capacity_preemption,
+    revalidate_coalescing_cancellation,
 };
 use cancellation_terminalization::{
     acquire_pending_cancellation_guard, active_runner_targets, clear_pending_cancellation,
@@ -448,8 +452,8 @@ use capacity_cancellation::{
 use ledger::{attempt_key, load_ledger, record_audit, save_ledger};
 use observation::{
     active_runs, fetch_run_jobs, fetch_run_jobs_before, gh_json, gh_json_timeout,
-    merge_queue_snapshot, observe_repo, parse_job, parse_pr, parse_run, pull_requests,
-    resolve_repos,
+    hydrate_required_check_identities, merge_queue_snapshot, observe_repo, parse_job, parse_pr,
+    parse_run, pull_requests, resolve_repos,
 };
 use pr_mutations::mutate_pr;
 use render::{

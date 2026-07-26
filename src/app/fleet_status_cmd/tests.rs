@@ -209,20 +209,31 @@ case "$*" in
   *"actions/runs?status=in_progress"*)
 printf '%s' '{"workflow_runs":[
   {"id":10,"name":"Required","head_branch":"gh-readonly-queue/main/pr-11-a","head_sha":"aaa","status":"in_progress","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":11}]},
-  {"id":20,"name":"Examples","head_branch":"feature/demo","head_sha":"bbb","status":"in_progress","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":22}]}
+  {"id":20,"name":"Examples","head_branch":"feature/demo","head_sha":"bbb","status":"in_progress","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":22}]},
+  {"id":30,"name":"Scheduled maintenance","head_branch":null,"head_sha":"ccc","status":"in_progress","created_at":"2026-07-26T00:00:00Z","pull_requests":[]}
 ]}' ;;
   *"actions/runs?status=queued"*) printf '%s' '{"workflow_runs":[]}' ;;
   *"actions/runs/10/jobs"*)
 printf '%s' '{"jobs":[{"name":"macOS required","status":"queued","runner_name":"","labels":["self-hosted","pulp-build-m5"]}]}' ;;
   *"actions/runs/20/jobs"*)
 printf '%s' '{"jobs":[{"name":"Validate examples (macOS)","status":"in_progress","runner_name":"pulp-vm-m1-01","labels":["self-hosted","pulp-build-m1"]}]}' ;;
+  *"actions/runs/30/jobs"*)
+printf '%s' '{"jobs":[{"name":"Maintenance","status":"in_progress","runner_name":"pulp-vm-m5-01","labels":["self-hosted","pulp-build-m5"]}]}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
     );
     let observed = fetch_observed_workflow_runs(&actions, "owner/repo", 100).expect("observe runs");
-    assert_eq!(observed.runs.len(), 2);
-    assert_eq!(observed.runs[1].head_branch, "feature/demo");
+    assert_eq!(observed.runs.len(), 3);
+    assert_eq!(
+        observed
+            .runs
+            .iter()
+            .find(|run| run.run_id == 30)
+            .expect("null-head run retained")
+            .head_branch,
+        ""
+    );
     let queued = queued_macos_summary(&observed.runs, "macos");
     assert_eq!(queued.count, 1);
 }

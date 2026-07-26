@@ -14,6 +14,9 @@ use serde::Serialize;
 pub struct StewardCheck {
     /// Check/status context.
     pub name: String,
+    /// GitHub App database ID that produced this check run. Legacy commit
+    /// statuses and observations whose producer is unavailable have no ID.
+    pub app_id: Option<u64>,
     /// GitHub state (`QUEUED`, `IN_PROGRESS`, or `COMPLETED`).
     pub status: String,
     /// Terminal conclusion, when any.
@@ -22,6 +25,24 @@ pub struct StewardCheck {
     pub run_id: Option<u64>,
     /// GitHub observation timestamp used to disambiguate duplicate contexts.
     pub observed_at: Option<String>,
+}
+
+/// One required status-check rule from repository governance.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RequiredCheck {
+    /// Required check/status context.
+    pub context: String,
+    /// GitHub App database ID required to produce the check, when pinned.
+    pub app_id: Option<u64>,
+}
+
+impl RequiredCheck {
+    pub(crate) fn label(&self) -> String {
+        self.app_id.map_or_else(
+            || self.context.clone(),
+            |app_id| format!("{} (app_id={app_id})", self.context),
+        )
+    }
 }
 
 /// One open pull request observed at an immutable head.
@@ -54,8 +75,8 @@ pub struct StewardPolicy {
     pub merge_queue: bool,
     /// Repository allows native auto-merge.
     pub native_auto_merge: bool,
-    /// Required check contexts. Empty means every observed check gates.
-    pub required_contexts: Vec<String>,
+    /// Required check rules. Empty means every observed check gates.
+    pub required_checks: Vec<RequiredCheck>,
     /// Label that opts a PR out of stewardship.
     pub opt_out_label: String,
     /// Maximum transient reruns allowed per immutable head and run.
@@ -315,7 +336,7 @@ fn selected_checks<'a>(
     pr: &'a StewardPullRequest,
     policy: &'a StewardPolicy,
 ) -> Vec<(String, Option<&'a StewardCheck>)> {
-    if policy.required_contexts.is_empty() {
+    if policy.required_checks.is_empty() {
         if pr.checks.is_empty() {
             return vec![("at-least-one-current-head-check".to_owned(), None)];
         }
@@ -336,14 +357,19 @@ fn selected_checks<'a>(
             .collect();
     }
     policy
-        .required_contexts
+        .required_checks
         .iter()
         .map(|required| {
             (
-                required.clone(),
+                required.label(),
                 pr.checks
                     .iter()
-                    .filter(|check| check.name.eq_ignore_ascii_case(required))
+                    .filter(|check| {
+                        check.name.eq_ignore_ascii_case(&required.context)
+                            && required
+                                .app_id
+                                .is_none_or(|app_id| check.app_id == Some(app_id))
+                    })
                     .max_by_key(|check| check_recency(check)),
             )
         })

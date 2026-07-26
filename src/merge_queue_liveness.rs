@@ -228,7 +228,8 @@ impl MergeQueueLivenessReport {
     /// Whether the observation should make a fleet monitor exit non-zero.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
-        self.front_stalled_with_idle_capacity
+        !self.failed_required_contexts.is_empty()
+            || self.front_stalled_with_idle_capacity
             || self.front_blocked_by_capacity_occupiers
             || self
                 .capacity_occupiers
@@ -458,8 +459,7 @@ pub fn assess_merge_queue_liveness(
             });
         }
     }
-    let required_work_stalled = front_old_enough
-        && (!stalled_required_contexts.is_empty() || !failed_required_contexts.is_empty());
+    let required_work_stalled = front_old_enough && !stalled_required_contexts.is_empty();
     let front_stalled_with_idle_capacity = required_work_stalled && routable_free_slots > 0;
     let front_blocked_by_capacity_occupiers =
         required_work_stalled && !capacity_occupiers.is_empty();
@@ -467,7 +467,7 @@ pub fn assess_merge_queue_liveness(
     let mut reason_codes = Vec::new();
     if front.is_none() {
         reason_codes.push(LivenessReason::QueueEmpty);
-    } else if !required_work_stalled {
+    } else if stalled_required_contexts.is_empty() && failed_required_contexts.is_empty() {
         reason_codes.push(LivenessReason::NormalSerialWait);
     }
     if !stalled_required_contexts.is_empty() {
@@ -486,6 +486,9 @@ pub fn assess_merge_queue_liveness(
         reason_codes.push(LivenessReason::ObservationTruncated);
     }
     for occupier in &capacity_occupiers {
+        if !front_blocked_by_capacity_occupiers && occupier.kind != OccupierKind::Superseded {
+            continue;
+        }
         let reason = match occupier.kind {
             OccupierKind::OptionalNonQueue => LivenessReason::OptionalCapacityTheft,
             OccupierKind::Superseded => LivenessReason::SupersededCapacityTheft,
@@ -832,7 +835,7 @@ mod tests {
         let optional = ActiveRunObservation {
             run_id: 77,
             workflow: "Examples".to_owned(),
-            head_branch: "feature/example".to_owned(),
+            head_branch: String::new(),
             head_sha: Some("optional".to_owned()),
             status: "in_progress".to_owned(),
             created_at: None,
@@ -924,12 +927,28 @@ mod tests {
                 conclusion: Some("failure".to_owned()),
             },
         ];
+        let optional = ActiveRunObservation {
+            run_id: 77,
+            workflow: "Examples".to_owned(),
+            head_branch: String::new(),
+            head_sha: Some("optional".to_owned()),
+            status: "in_progress".to_owned(),
+            created_at: None,
+            pull_requests: Vec::new(),
+            url: None,
+            jobs: vec![JobObservation {
+                name: "Validate examples (macOS)".to_owned(),
+                status: "in_progress".to_owned(),
+                runner_name: Some("pulp-vm-m1-01".to_owned()),
+                labels: vec!["self-hosted".to_owned()],
+            }],
+        };
         let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
             entries: &entries,
             checks: &checks,
-            active_runs: &[],
+            active_runs: &[optional],
             required_contexts: &["macos".to_owned()],
-            eligible_host_classes: &["m5".to_owned()],
+            eligible_host_classes: &["m1".to_owned()],
             routable_free_slots: 1,
             stall_threshold_secs: 60,
             now: ts(120),
@@ -937,10 +956,28 @@ mod tests {
             observation_truncated: false,
         });
         assert_eq!(report.failed_required_contexts, ["macos"]);
+        assert!(report.needs_attention());
+        assert!(!report.front_stalled_with_idle_capacity);
+        assert!(!report.front_blocked_by_capacity_occupiers);
         assert!(
             report
                 .reason_codes
                 .contains(&LivenessReason::FrontRequiredFailed)
+        );
+        assert!(
+            !report
+                .reason_codes
+                .contains(&LivenessReason::IdleEligibleCapacity)
+        );
+        assert!(
+            !report
+                .reason_codes
+                .contains(&LivenessReason::OptionalCapacityTheft)
+        );
+        assert!(
+            !report
+                .reason_codes
+                .contains(&LivenessReason::NormalSerialWait)
         );
     }
 

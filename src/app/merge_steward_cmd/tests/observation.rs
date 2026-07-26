@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::merge_steward_cmd::observation::{
-    canonical_repo_name, encode_path_segment, evaluated_required_contexts, hydrate_preemption_jobs,
-    parse_check, required_contexts,
+    canonical_repo_name, check_runs_for_head, encode_path_segment, evaluated_required_checks,
+    hydrate_preemption_jobs, parse_check, parse_rest_check, required_checks,
 };
 
 #[test]
@@ -15,6 +15,7 @@ fn parses_both_check_rollup_shapes() {
     }))
     .expect("check");
     assert_eq!(check.run_id, Some(123));
+    assert_eq!(check.app_id, None);
     let context = parse_check(&serde_json::json!({
         "__typename": "StatusContext",
         "context": "freeze",
@@ -94,15 +95,17 @@ fn job_parser_and_reason_labels_fail_closed_and_stay_stable() {
 }
 
 #[test]
-fn evaluated_rules_extract_required_contexts_and_reject_malformed_payloads() {
-    let contexts = evaluated_required_contexts(&serde_json::json!([[
+fn evaluated_rules_extract_required_checks_and_reject_malformed_payloads() {
+    let checks = evaluated_required_checks(&serde_json::json!([[
             {
                 "type": "required_status_checks",
                 "parameters": {
                     "required_status_checks": [
                         {"context": "macos"},
+                        {"context": "macos", "integration_id": 42},
                         {"context": "linux"},
-                        {"context": "macos"}
+                        {"context": "any-app", "integration_id": -1},
+                        {"context": "macos", "integration_id": 42}
                     ]
                 }
             }
@@ -112,8 +115,33 @@ fn evaluated_rules_extract_required_contexts_and_reject_malformed_payloads() {
         ]
     ]))
     .expect("rules");
-    assert_eq!(contexts, vec!["linux", "macos"]);
-    assert!(evaluated_required_contexts(&serde_json::json!({})).is_err());
+    assert_eq!(
+        checks,
+        vec![
+            RequiredCheck {
+                context: "any-app".to_owned(),
+                app_id: None,
+            },
+            RequiredCheck {
+                context: "linux".to_owned(),
+                app_id: None,
+            },
+            RequiredCheck {
+                context: "macos".to_owned(),
+                app_id: Some(42),
+            },
+        ]
+    );
+    assert!(evaluated_required_checks(&serde_json::json!({})).is_err());
+    assert!(
+        evaluated_required_checks(&serde_json::json!([{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "macos", "integration_id": "unknown"}
+            ]}
+        }]))
+        .is_err()
+    );
 }
 
 #[cfg(unix)]
@@ -125,7 +153,7 @@ fn required_context_transport_unions_classic_checks_and_paginated_rules() {
         r#"
 case "$*" in
   *"protection/required_status_checks"*)
-    printf '%s' '{"contexts":["classic"],"checks":[{"context":"app-bound"}]}' ;;
+    printf '%s' '{"contexts":["classic","app-bound"],"checks":[{"context":"app-bound","app_id":42}]}' ;;
   *"rules/branches/main --paginate --slurp"*)
     printf '%s' '[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"rules-a"}]}}],[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"rules-b"}]}}]]' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
@@ -134,8 +162,95 @@ esac
     );
 
     assert_eq!(
-        required_contexts(&actions, "owner/repo", "main").expect("required contexts"),
-        vec!["app-bound", "classic", "rules-a", "rules-b"]
+        required_checks(&actions, "owner/repo", "main").expect("required checks"),
+        vec![
+            RequiredCheck {
+                context: "app-bound".to_owned(),
+                app_id: Some(42),
+            },
+            RequiredCheck {
+                context: "classic".to_owned(),
+                app_id: None,
+            },
+            RequiredCheck {
+                context: "rules-a".to_owned(),
+                app_id: None,
+            },
+            RequiredCheck {
+                context: "rules-b".to_owned(),
+                app_id: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn rest_check_parser_preserves_app_identity_and_unavailable_identity() {
+    let check = parse_rest_check(&serde_json::json!({
+        "name": "macos",
+        "app": {"id": 42},
+        "status": "completed",
+        "conclusion": "success",
+        "details_url": "https://github.com/o/r/actions/runs/123/job/456",
+        "completed_at": "2026-07-26T02:00:00Z"
+    }))
+    .expect("check");
+    assert_eq!(check.app_id, Some(42));
+    assert_eq!(check.run_id, Some(123));
+
+    let unavailable = parse_rest_check(&serde_json::json!({
+        "name": "macos",
+        "app": null,
+        "status": "completed",
+        "conclusion": "success"
+    }))
+    .expect("check without app identity");
+    assert_eq!(unavailable.app_id, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn current_head_check_transport_preserves_producer_identity() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"printf '%s' '{"check_runs":[{"name":"macos","app":{"id":42},"status":"completed","conclusion":"success","details_url":"https://github.com/o/r/actions/runs/123","completed_at":"2026-07-26T02:00:00Z"}]}'"#,
+    );
+    let checks = check_runs_for_head(&actions, "owner/repo", &"a".repeat(40))
+        .expect("current-head check identities");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].app_id, Some(42));
+}
+
+#[cfg(unix)]
+#[test]
+fn live_pr_revalidation_hydrates_required_check_identity() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"pr view"*)
+    printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS"}]}' ;;
+  *"commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs"*)
+    printf '%s' '{"check_runs":[{"name":"macos","app":{"id":42},"status":"completed","conclusion":"success"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let required = vec![RequiredCheck {
+        context: "macos".to_owned(),
+        app_id: Some(42),
+    }];
+    let pr =
+        pull_request_with_required_checks(&actions, "owner/repo", 42, &BTreeMap::new(), &required)
+            .expect("live PR")
+            .expect("open PR");
+    assert!(
+        pr.fact
+            .checks
+            .iter()
+            .any(|check| check.name == "macos" && check.app_id == Some(42))
     );
 }
 

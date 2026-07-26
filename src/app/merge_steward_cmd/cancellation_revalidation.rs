@@ -1,10 +1,11 @@
 use super::{
     BTreeMap, BTreeSet, CapacityPreemptionPolicy, CapacityRevalidation, GitHubActions,
-    MergeQueueMutationGuard, MutationControl, ObservedPr, RepoObservation, RunCancellation,
-    RunCancellationReason, ShipState, StewardJob, StewardLedger, StewardPullRequest, StewardRun,
-    Value, active_runs, attempt_key, fetch_run_jobs, gh_json, is_full_sha,
-    is_safe_capacity_preemption, merge_queue_snapshot, parse_pr, parse_run, plan_run_coalescing,
-    pull_requests, queue_front_waits_for_pool, timestamp_old_enough,
+    MergeQueueMutationGuard, MutationControl, ObservedPr, RepoObservation, RequiredCheck,
+    RunCancellation, RunCancellationReason, ShipState, StewardJob, StewardLedger,
+    StewardPullRequest, StewardRun, Value, active_runs, attempt_key, fetch_run_jobs, gh_json,
+    hydrate_required_check_identities, is_full_sha, is_safe_capacity_preemption,
+    merge_queue_snapshot, parse_pr, parse_run, plan_run_coalescing, pull_requests,
+    queue_front_waits_for_pool, timestamp_old_enough,
 };
 
 pub(super) fn revalidate_capacity_preemption(
@@ -142,6 +143,25 @@ pub(super) fn pull_request(
         return Ok(None);
     }
     parse_pr(&value, queue_positions).map(Some)
+}
+
+pub(super) fn pull_request_with_required_checks(
+    actions: &GitHubActions,
+    repo: &str,
+    number: u64,
+    queue_positions: &BTreeMap<u64, u64>,
+    required_checks: &[RequiredCheck],
+) -> Result<Option<ObservedPr>, String> {
+    let Some(mut pr) = pull_request(actions, repo, number, queue_positions)? else {
+        return Ok(None);
+    };
+    hydrate_required_check_identities(
+        actions,
+        repo,
+        required_checks,
+        std::slice::from_mut(&mut pr),
+    )?;
+    Ok(Some(pr))
 }
 
 pub(super) fn current_pull_request_heads(prs: &[ObservedPr]) -> BTreeMap<u64, String> {
