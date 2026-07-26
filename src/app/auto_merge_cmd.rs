@@ -664,7 +664,15 @@ fn merge_pr(
             }
         }
     }
-    if !custom_command {
+    if custom_command {
+        command.arg(merge_method.gh_flag());
+        if delete_branch {
+            command.arg("--delete-branch");
+        }
+        if admin {
+            command.arg("--admin");
+        }
+    } else {
         verify_live_merge_target(
             client
                 .as_ref()
@@ -673,20 +681,12 @@ fn merge_pr(
             state,
             "at classic merge mutation boundary",
         )?;
-        command.args(["pr", "merge", &state.pr.to_string(), "--repo", &state.repo]);
-        // Defense in depth (issue #321): tell GitHub the exact head we
-        // validated so the SERVER rejects the merge if the head drifted
-        // between the preflight and this call. A custom `--merge-command`
-        // path can't get this guard — the preflight above is its only
-        // protection.
-        command.args(["--match-head-commit", &state.head_sha]);
-    }
-    command.arg(merge_method.gh_flag());
-    if delete_branch && !queue_required {
-        command.arg("--delete-branch");
-    }
-    if admin {
-        command.arg("--admin");
+        command.args(classic_merge_args(
+            state,
+            merge_method,
+            delete_branch,
+            admin,
+        ));
     }
     let output = command
         .current_dir(cwd)
@@ -1859,10 +1859,7 @@ fn repository_requires_merge_queue(
     }
     let queue_body: Value = serde_json::from_slice(&queue_output.stdout)
         .map_err(|error| format!("branch merge-queue query returned invalid JSON: {error}"))?;
-    let queue = queue_body
-        .pointer("/data/repository/mergeQueue")
-        .ok_or_else(|| "branch merge-queue query omitted repository authority".to_owned())?;
-    if !queue.is_null() {
+    if live_merge_queue_present(&queue_body)? {
         return Ok(true);
     }
 
@@ -1879,12 +1876,52 @@ fn repository_requires_merge_queue(
         .map_err(|error| format!("failed to inspect evaluated branch rules: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(format!(
-            "failed to inspect evaluated branch rules for {repo}:{base_branch}: {stderr}"
-        ));
+        return match merge_queue_requirement_from_observations(&queue_body, Err(&stderr)).map_err(
+            |error| {
+                format!(
+                    "failed to inspect evaluated branch rules for {repo}:{base_branch}: {error}"
+                )
+            },
+        )? {
+            MergeQueueRequirement::Required => Ok(true),
+            MergeQueueRequirement::Classic => Ok(false),
+            MergeQueueRequirement::PrivateFreeClassicFallback => {
+                eprintln!(
+                    "shipyard: evaluated branch rules are unavailable on this private-free repository; the authoritative mergeQueue query returned null, so continuing with classic exact-head merge"
+                );
+                Ok(false)
+            }
+        };
     }
     let body: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("evaluated branch rules returned invalid JSON: {error}"))?;
+    Ok(matches!(
+        merge_queue_requirement_from_observations(&queue_body, Ok(&body))?,
+        MergeQueueRequirement::Required
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeQueueRequirement {
+    Required,
+    Classic,
+    PrivateFreeClassicFallback,
+}
+
+fn merge_queue_requirement_from_observations(
+    queue_body: &Value,
+    evaluated_rules: Result<&Value, &str>,
+) -> Result<MergeQueueRequirement, String> {
+    if live_merge_queue_present(queue_body)? {
+        return Ok(MergeQueueRequirement::Required);
+    }
+    let body = match evaluated_rules {
+        Ok(body) => body,
+        Err(stderr) if evaluated_rules_unavailable_on_private_free_plan(stderr) => {
+            return Ok(MergeQueueRequirement::PrivateFreeClassicFallback);
+        }
+        Err(stderr) => return Err(stderr.to_owned()),
+    };
     let pages = body
         .as_array()
         .ok_or_else(|| "paginated evaluated branch rules response is not an array".to_owned())?;
@@ -1895,7 +1932,39 @@ fn repository_requires_merge_queue(
             .ok_or_else(|| "evaluated branch rules page is not an array".to_owned())?;
         rules.extend(page.iter().cloned());
     }
-    crate::merge_queue::rules_require_merge_queue(&Value::Array(rules))
+    crate::merge_queue::rules_require_merge_queue(&Value::Array(rules)).map(|required| {
+        if required {
+            MergeQueueRequirement::Required
+        } else {
+            MergeQueueRequirement::Classic
+        }
+    })
+}
+
+fn live_merge_queue_present(body: &Value) -> Result<bool, String> {
+    if let Some(errors) = body.get("errors") {
+        let errors = errors.as_array().ok_or_else(|| {
+            "branch merge-queue query returned malformed GraphQL errors".to_owned()
+        })?;
+        if !errors.is_empty() {
+            return Err("branch merge-queue query returned GraphQL errors".to_owned());
+        }
+    }
+    body.pointer("/data/repository/mergeQueue")
+        .map(|queue| !queue.is_null())
+        .ok_or_else(|| "branch merge-queue query omitted repository authority".to_owned())
+}
+
+const PRIVATE_FREE_RULES_ENTITLEMENT: &str =
+    "Upgrade to GitHub Pro or make this repository public to enable this feature.";
+
+fn evaluated_rules_unavailable_on_private_free_plan(stderr: &str) -> bool {
+    let expected = format!("{PRIVATE_FREE_RULES_ENTITLEMENT} (HTTP 403)");
+    stderr
+        .trim()
+        .strip_prefix("gh: ")
+        .unwrap_or_else(|| stderr.trim())
+        == expected
 }
 
 pub(super) fn target_requires_merge_queue(
@@ -2054,16 +2123,7 @@ fn attempt_merge_put(
     cwd: &Path,
 ) -> Result<(), String> {
     let output = gh(client, cwd)?
-        .args([
-            "api",
-            "-X",
-            "PUT",
-            endpoint,
-            "-f",
-            &format!("merge_method={}", merge_method.rest_value()),
-            "-f",
-            &format!("sha={head_sha}"),
-        ])
+        .args(rest_merge_args(endpoint, head_sha, merge_method))
         .output()
         .map_err(|error| format!("REST fallback: failed to invoke gh api: {error}"))?;
     if output.status.success() {
@@ -2075,6 +2135,44 @@ fn attempt_merge_put(
         "REST fallback: gh api PUT {endpoint} failed: {}",
         if stderr.is_empty() { stdout } else { stderr }
     ))
+}
+
+fn classic_merge_args(
+    state: &ShipState,
+    merge_method: MergeMethod,
+    delete_branch: bool,
+    admin: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "pr".to_owned(),
+        "merge".to_owned(),
+        state.pr.to_string(),
+        "--repo".to_owned(),
+        state.repo.clone(),
+        "--match-head-commit".to_owned(),
+        state.head_sha.clone(),
+        merge_method.gh_flag().to_owned(),
+    ];
+    if delete_branch {
+        args.push("--delete-branch".to_owned());
+    }
+    if admin {
+        args.push("--admin".to_owned());
+    }
+    args
+}
+
+fn rest_merge_args(endpoint: &str, head_sha: &str, merge_method: MergeMethod) -> Vec<String> {
+    vec![
+        "api".to_owned(),
+        "-X".to_owned(),
+        "PUT".to_owned(),
+        endpoint.to_owned(),
+        "-f".to_owned(),
+        format!("merge_method={}", merge_method.rest_value()),
+        "-f".to_owned(),
+        format!("sha={head_sha}"),
+    ]
 }
 
 /// Detect the canonical GitHub error body for "the base branch
@@ -2331,6 +2429,153 @@ mod tests {
         assert!(!is_graphql_merge_integration_blocked(
             "REST: Resource not accessible by integration (mergePullRequest)"
         ));
+    }
+
+    #[test]
+    fn detects_exact_private_free_rules_entitlement() {
+        assert!(evaluated_rules_unavailable_on_private_free_plan(
+            "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+        ));
+        assert!(evaluated_rules_unavailable_on_private_free_plan(
+            "Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+        ));
+    }
+
+    #[test]
+    fn private_free_rules_detector_rejects_other_auth_and_entitlement_errors() {
+        assert!(!evaluated_rules_unavailable_on_private_free_plan(
+            "gh: Resource not accessible by integration (HTTP 403)"
+        ));
+        assert!(!evaluated_rules_unavailable_on_private_free_plan(
+            "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 401)"
+        ));
+        assert!(!evaluated_rules_unavailable_on_private_free_plan(
+            "gh: upgrade to github pro or make this repository public to enable this feature. (HTTP 403)"
+        ));
+        assert!(!evaluated_rules_unavailable_on_private_free_plan(
+            "gh: Upgrade to GitHub Pro or make this repository public. (HTTP 403)"
+        ));
+        assert!(!evaluated_rules_unavailable_on_private_free_plan(
+            "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\ngh: Resource not accessible by integration (HTTP 403)"
+        ));
+    }
+
+    #[test]
+    fn live_merge_queue_requires_explicit_null_before_classic_fallback() {
+        assert!(
+            live_merge_queue_present(&serde_json::json!({
+                "data": {"repository": {"mergeQueue": {"id": "MQ_kwDO"}}}
+            }))
+            .expect("non-null queue")
+        );
+        assert!(
+            !live_merge_queue_present(&serde_json::json!({
+                "data": {"repository": {"mergeQueue": null}}
+            }))
+            .expect("explicit null queue")
+        );
+        assert!(
+            live_merge_queue_present(&serde_json::json!({
+                "data": {"repository": {}}
+            }))
+            .expect_err("missing queue authority must fail closed")
+            .contains("omitted repository authority")
+        );
+        assert!(
+            live_merge_queue_present(&serde_json::json!({
+                "errors": [{"message": "partial failure"}],
+                "data": {"repository": {"mergeQueue": null}}
+            }))
+            .expect_err("GraphQL errors plus null queue must fail closed")
+            .contains("GraphQL errors")
+        );
+    }
+
+    #[test]
+    fn private_free_fallback_requires_authoritative_null_and_exact_rules_error() {
+        let queue_null = serde_json::json!({
+            "data": {"repository": {"mergeQueue": null}}
+        });
+        let exact_error = format!("gh: {PRIVATE_FREE_RULES_ENTITLEMENT} (HTTP 403)");
+        assert_eq!(
+            merge_queue_requirement_from_observations(&queue_null, Err(&exact_error)),
+            Ok(MergeQueueRequirement::PrivateFreeClassicFallback)
+        );
+
+        let errors_and_null = serde_json::json!({
+            "errors": [{"message": "partial failure"}],
+            "data": {"repository": {"mergeQueue": null}}
+        });
+        assert!(
+            merge_queue_requirement_from_observations(&errors_and_null, Err(&exact_error)).is_err()
+        );
+
+        let mixed_error =
+            format!("{exact_error}\ngh: Resource not accessible by integration (HTTP 403)");
+        assert!(merge_queue_requirement_from_observations(&queue_null, Err(&mixed_error)).is_err());
+
+        let malformed_rules = serde_json::json!([
+            [{"type": "merge_queue"}, {"parameters": {}}]
+        ]);
+        assert!(
+            merge_queue_requirement_from_observations(&queue_null, Ok(&malformed_rules)).is_err()
+        );
+    }
+
+    #[test]
+    fn classic_and_rest_merge_commands_keep_server_side_head_guards() {
+        let state = ShipState::new(
+            30,
+            "Generous-Corp/forge",
+            "feature/x",
+            "main",
+            "b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
+            "policy",
+        );
+        let mut classic = Command::new("gh");
+        classic.args(classic_merge_args(&state, MergeMethod::Squash, true, false));
+        let classic_args = classic
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classic_args,
+            vec![
+                "pr",
+                "merge",
+                "30",
+                "--repo",
+                "Generous-Corp/forge",
+                "--match-head-commit",
+                "b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
+                "--squash",
+                "--delete-branch",
+            ]
+        );
+
+        let mut rest = Command::new("gh");
+        rest.args(rest_merge_args(
+            "repos/Generous-Corp/forge/pulls/30/merge",
+            &state.head_sha,
+            MergeMethod::Squash,
+        ));
+        let rest_args = rest
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rest_args,
+            vec![
+                "api",
+                "-X",
+                "PUT",
+                "repos/Generous-Corp/forge/pulls/30/merge",
+                "-f",
+                "merge_method=squash",
+                "-f",
+                "sha=b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
+            ]
+        );
     }
 
     // ── short_sha helper ────────────────────────────────────────────────

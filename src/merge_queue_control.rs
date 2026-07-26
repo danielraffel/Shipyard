@@ -20,9 +20,31 @@ pub const HOLD_FILE: &str = "merge_queue/HOLD";
 const CONTROL_LOCK_FILE: &str = "merge_queue/control.lock";
 const AUDIT_FILE: &str = "merge_queue/mutations.jsonl";
 
+#[derive(Debug)]
+struct ControlLock(Option<File>);
+
+impl ControlLock {
+    fn new(file: File) -> Self {
+        Self(Some(file))
+    }
+
+    fn unlock(&mut self) -> io::Result<()> {
+        let Some(file) = self.0.take() else {
+            return Ok(());
+        };
+        file.unlock()
+    }
+}
+
+impl Drop for ControlLock {
+    fn drop(&mut self) {
+        let _ = self.unlock();
+    }
+}
+
 /// Create or replace the local authority hold with a durable reason record.
 pub fn hold(state_root: &Path, reason: &str) -> Result<PathBuf, String> {
-    let control_lock = acquire_control_lock(state_root, false)?;
+    let mut control_lock = acquire_control_lock(state_root, false)?;
     let path = state_root.join(HOLD_FILE);
     let parent = path
         .parent()
@@ -49,7 +71,7 @@ pub fn hold(state_root: &Path, reason: &str) -> Result<PathBuf, String> {
 
 /// Remove the local authority hold. Returns false when no hold existed.
 pub fn resume(state_root: &Path) -> Result<bool, String> {
-    let control_lock = acquire_control_lock(state_root, false)?;
+    let mut control_lock = acquire_control_lock(state_root, false)?;
     let path = state_root.join(HOLD_FILE);
     if !path.exists() {
         control_lock
@@ -127,7 +149,7 @@ pub fn authority_status(
 /// later merge-queue mutation but does not yet know the PR identity.
 #[derive(Debug)]
 pub struct MergeQueueMutationPreflight {
-    control_lock: File,
+    control_lock: ControlLock,
     global_dir: PathBuf,
 }
 
@@ -259,7 +281,7 @@ pub fn resolve_uncertainty(
     if !matches!(outcome, "accepted" | "rejected") {
         return Err("uncertain mutation outcome must be `accepted` or `rejected`".to_owned());
     }
-    let control_lock = acquire_control_lock(state_root, false)?;
+    let mut control_lock = acquire_control_lock(state_root, false)?;
     let unresolved = uncertain_mutations(state_root)?;
     let Some(entry) = unresolved.iter().find(|entry| {
         entry
@@ -338,7 +360,7 @@ pub fn resolve_uncertainty(
 /// Exclusive authority for one repository/base merge queue mutation.
 #[derive(Debug)]
 pub struct MergeQueueMutationGuard {
-    control_lock: File,
+    control_lock: ControlLock,
     lock: File,
     audit_path: PathBuf,
     correlation_id: String,
@@ -400,7 +422,7 @@ impl MergeQueueMutationGuard {
         config: &LoadedConfig,
         state: &ShipState,
         action: &str,
-        control_lock: File,
+        control_lock: ControlLock,
     ) -> Result<Self, String> {
         let state_root = store.path().parent().unwrap_or_else(|| store.path());
         let control_dir = state_root.join("merge_queue");
@@ -572,7 +594,7 @@ fn validate_machine_authority(
     Ok(machine_tag)
 }
 
-fn acquire_control_lock(state_root: &Path, nonblocking: bool) -> Result<File, String> {
+fn acquire_control_lock(state_root: &Path, nonblocking: bool) -> Result<ControlLock, String> {
     let path = state_root.join(CONTROL_LOCK_FILE);
     let parent = path
         .parent()
@@ -592,7 +614,7 @@ fn acquire_control_lock(state_root: &Path, nonblocking: bool) -> Result<File, St
         lock.lock_exclusive()
     };
     match result {
-        Ok(()) => Ok(lock),
+        Ok(()) => Ok(ControlLock::new(lock)),
         Err(error) if nonblocking && lock_is_contended(&error) => {
             Err("another Shipyard process is performing a merge-queue mutation".to_owned())
         }
@@ -733,10 +755,10 @@ mod tests {
         std::fs::write(state_root.join("machine-tag"), "m1\n").expect("tag");
         let error = acquire_guard(&store, &cwd, &state, "enqueue pull request")
             .expect_err("wrong machine rejected");
-        assert!(error.contains("authority is `studio`"));
+        assert!(error.contains("authority is `studio`"), "{error}");
         let error = preflight(state_root, &cwd, "owner/repo", "main")
             .expect_err("wrong machine preflight rejected");
-        assert!(error.contains("authority is `studio`"));
+        assert!(error.contains("authority is `studio`"), "{error}");
 
         std::fs::write(state_root.join("machine-tag"), "studio\n").expect("tag");
         let hold_path = hold(state_root, "incident").expect("hold");
@@ -871,15 +893,21 @@ mod tests {
 
         let error = acquire_guard(&store, &cwd, &state, "enqueue pull request")
             .expect_err("malformed audit rejected");
-        assert!(error.contains("malformed merge-queue mutation audit"));
-        assert!(error.contains("mutations remain blocked"));
+        assert!(
+            error.contains("malformed merge-queue mutation audit"),
+            "{error}"
+        );
+        assert!(error.contains("mutations remain blocked"), "{error}");
 
         std::fs::remove_file(&audit_path).expect("remove audit");
         std::fs::create_dir(&audit_path).expect("unreadable audit path");
         let error = acquire_guard(&store, &cwd, &state, "enqueue pull request")
             .expect_err("unreadable audit rejected");
-        assert!(error.contains("failed to read merge-queue mutation audit"));
-        assert!(error.contains("mutations remain blocked"));
+        assert!(
+            error.contains("failed to read merge-queue mutation audit"),
+            "{error}"
+        );
+        assert!(error.contains("mutations remain blocked"), "{error}");
     }
 
     #[test]

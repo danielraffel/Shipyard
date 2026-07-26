@@ -40,6 +40,12 @@ passing `shipyard ship` calls GitHub's queue mutation with
 one-shot `shipyard auto-merge` returns exit 3 while queued and retains
 ship-state for later ticks.
 
+For private-free repositories, GitHub may return an explicit null live queue
+and its exact plan-entitlement 403 from evaluated rules. That one combination
+selects classic merge while retaining the validated-head preflight,
+`--match-head-commit`, and REST `sha=` guard. Generic 401/403 responses,
+malformed authority, and a non-null queue still stop or select the queue path.
+
 Never treat queue absence alone as permission to rearm. The PR must first have
 been observed in the queue (durably recorded across restarts), and only an
 `invalid_merge_commit` removal may be re-enqueued automatically. Failed checks,

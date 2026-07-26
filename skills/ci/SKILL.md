@@ -639,6 +639,11 @@ On a base branch whose live queue object or evaluated rules require GitHub's
 merge queue, Shipyard does not issue a direct merge. It enqueues with GitHub's
 server-atomic `expectedHeadOid` set to the exact validated head SHA, then
 `shipyard ship` waits for the queue result.
+On private repositories whose plan cannot expose evaluated rules, Shipyard
+continues to classic exact-head merge only when the authoritative live
+`mergeQueue` object is null and GitHub returns its exact private-free
+plan-entitlement 403. Other authorization failures and malformed responses
+remain fail-closed.
 `shipyard auto-merge` remains a cron-safe one-shot: it returns exit 3 after
 arming or observing the queue and leaves ship-state active. A queue supervisor
 re-enqueues only after it previously observed the PR (persisted across process
