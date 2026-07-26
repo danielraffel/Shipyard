@@ -1992,16 +1992,14 @@ fn resume_pending_intent(
         &pending.opt_out_label,
     )?;
     let Some(evidence) = evidence else {
-        mark_cancellation_skipped(ledger, ledger_path, key)?;
-        supersede_pending_uncertainty(mutation_control, pending)?;
-        clear_pending_cancellation(
+        return resolve_rejected_pending_intent(
             ledger,
             ledger_path,
+            mutation_control,
             key,
             pending,
-            "pending_intent_skipped_after_revalidation",
-        )?;
-        return Ok("recovered_skipped_cancellation".to_owned());
+            was_uncertain,
+        );
     };
     persist_capacity_evidence(
         &observation,
@@ -2066,6 +2064,33 @@ fn resume_pending_intent(
         key,
         &accepted,
     )
+}
+
+fn resolve_rejected_pending_intent(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    mutation_control: &MutationControl,
+    key: &str,
+    pending: &PendingCancellation,
+    was_uncertain: bool,
+) -> Result<String, String> {
+    if was_uncertain {
+        return Err(format!(
+            "cancellation intent for run {} no longer passes capacity-safety revalidation, \
+             but mutation {} is uncertain; preserving pending state until terminal proof",
+            pending.run_id, pending.mutation_correlation_id
+        ));
+    }
+    mark_cancellation_skipped(ledger, ledger_path, key)?;
+    supersede_pending_uncertainty(mutation_control, pending)?;
+    clear_pending_cancellation(
+        ledger,
+        ledger_path,
+        key,
+        pending,
+        "pending_intent_skipped_after_revalidation",
+    )?;
+    Ok("recovered_skipped_cancellation".to_owned())
 }
 
 fn pending_cancellation_reason(value: &str) -> Result<RunCancellationReason, String> {
@@ -4255,6 +4280,72 @@ esac
                 .expect("uncertainty")
                 .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_accepted_crash_does_not_clear_uncertain_intent_when_evidence_disappears() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(
+            &temp,
+            r#"
+case "$*" in
+  *"actions/runs/100/cancel") exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+        );
+        let control = mutation_control(&temp, "studio", "studio");
+        let mut pending = pending_cancellation_record();
+        pending.phase = PendingCancellationPhase::Intent;
+        let correlation_id = MergeQueueMutationGuard::new_correlation_id();
+        let guard = acquire_pending_cancellation_guard_with_correlation(
+            &control,
+            &pending,
+            "runner steward preempt capacity run 100",
+            &correlation_id,
+        )
+        .expect("guard");
+        correlation_id.clone_into(&mut pending.mutation_correlation_id);
+        let key = pending_cancellation_key(&pending);
+        let ledger_path = temp.path().join("ledger.json");
+        let mut ledger = StewardLedger {
+            pending_cancellations: BTreeMap::from([(key.clone(), pending.clone())]),
+            ..StewardLedger::default()
+        };
+        save_ledger(&ledger_path, &ledger).expect("intent persisted");
+
+        actions
+            .cancel_workflow_run(&pending.repo, pending.run_id)
+            .expect("POST accepted");
+        drop(guard);
+
+        assert!(pending_uncertainty(&control, &pending).expect("uncertain"));
+        let error = resolve_rejected_pending_intent(
+            &mut ledger,
+            &ledger_path,
+            &control,
+            &key,
+            &pending,
+            true,
+        )
+        .expect_err("uncertain POST cannot become skipped");
+        assert!(error.contains("preserving pending state"), "{error}");
+        assert_eq!(
+            ledger
+                .pending_cancellations
+                .get(&key)
+                .expect("pending preserved")
+                .phase,
+            PendingCancellationPhase::Intent
+        );
+        assert!(
+            load_ledger(&ledger_path)
+                .expect("reload")
+                .pending_cancellations
+                .contains_key(&key)
+        );
+        assert!(pending_uncertainty(&control, &pending).expect("uncertainty preserved"));
     }
 
     #[cfg(unix)]
