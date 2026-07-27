@@ -614,12 +614,11 @@ pub(super) fn inspect_release_liveness(
         optional_reason_codes.push(ObservationReason::AuxiliaryObservationUnavailable);
     }
     let latest_successful_release_workflow_at =
-        match fetch_latest_successful_release_workflow(actions, repo, base) {
-            Ok(value) => value,
-            Err(error) => {
-                optional_reason_codes.push(classify_observation_error(&error));
-                None
-            }
+        if let Ok(value) = fetch_latest_successful_release_workflow(actions, repo, base) {
+            value
+        } else {
+            optional_reason_codes.push(ObservationReason::AuxiliaryObservationUnavailable);
+            None
         };
     let observation_truncated = comparison_truncated;
     Ok(ReleaseProbe {

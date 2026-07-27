@@ -371,6 +371,35 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn optional_release_workflow_failure_is_nonfatal_auxiliary_observation() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"releases/latest"*) printf '%s' '{"tag_name":"v1.0.0","published_at":"2026-07-26T00:00:00Z"}' ;;
+  *"/compare/"*) printf '%s' '{"ahead_by":0,"commits":[]}' ;;
+  *"/contents/VERSION"*) printf '%s' '{"content":"MC44MC4wCg=="}' ;;
+  *"/issues?"*) printf '%s' '[]' ;;
+  *"/actions/workflows/auto-release.yml/"*) echo "HTTP 403 Forbidden" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+
+    let probe =
+        inspect_release_liveness(&actions, "owner/repo", "main", 86_400).expect("release probe");
+
+    assert!(probe.readable);
+    assert_eq!(
+        probe.reason_codes,
+        [ObservationReason::AuxiliaryObservationUnavailable]
+    );
+    assert!(probe.report.is_some());
+}
+
+#[cfg(unix)]
+#[test]
 fn check_observations_include_legacy_commit_statuses() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(
