@@ -309,11 +309,17 @@ esac
 fn release_skip_grammar_matches_case_insensitive_workflow_guard() {
     for message in [
         "bot\n\nrelease: skip reason=\"generated release\"",
-        "bot\n\nReLeAsE: SkIp reason=\"generated release\"",
+        "bot\n\nReLeAsE: SkIp reason=\"generated release\"\nReviewed-by: Bot <bot@example.com>",
+        "bot\n\nRelease: skip\n continuation text\n# trailing comment",
     ] {
         assert!(release_is_skipped(message), "{message}");
     }
     for message in [
+        "Release: skip",
+        "bot\n\nRelease: skip reason=\"quoted prose\"\n\nMore prose follows.",
+        "bot\n\nRelease: skip reason=\"not final\"\n\nReviewed-by: Bot <bot@example.com>",
+        "bot\n\nRelease: skip\nnot a trailer",
+        "bot\n\nRelease:",
         "bot\n\nRelease: ship",
         "bot\n\nRelease-notes: skip",
         "bot\n\nRelease skip",

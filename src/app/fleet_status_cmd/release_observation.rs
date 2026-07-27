@@ -167,16 +167,53 @@ fn gh_json_value(actions: &GitHubActions, args: &[String], purpose: &str) -> Res
 }
 
 pub(super) fn release_is_skipped(message: &str) -> bool {
-    message.lines().any(|line| {
-        let Some((key, value)) = line.split_once(':') else {
+    let mut lines = message.lines().collect::<Vec<_>>();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let Some(separator) = lines.iter().rposition(|line| line.trim().is_empty()) else {
+        return false;
+    };
+    if !lines[..separator]
+        .iter()
+        .any(|line| !line.trim().is_empty())
+    {
+        return false;
+    }
+    let trailer_start = separator + 1;
+    let mut trailers = Vec::new();
+    for line in &lines[trailer_start..] {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.len() != line.len() {
+            if trailers.is_empty() {
+                return false;
+            }
+            continue;
+        }
+        let Some(trailer) = parse_trailer(line) else {
             return false;
         };
+        trailers.push(trailer);
+    }
+    trailers.iter().any(|(key, value)| {
         key.eq_ignore_ascii_case("release")
             && value
-                .trim_start()
                 .get(..4)
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("skip"))
     })
+}
+
+fn parse_trailer(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim();
+    (!key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then_some((key, value.trim_start()))
 }
 
 pub(super) fn path_requires_release(path: &str) -> bool {
