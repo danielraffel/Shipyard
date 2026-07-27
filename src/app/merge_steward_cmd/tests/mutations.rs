@@ -1,14 +1,13 @@
 use super::*;
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::cancellation::{apply_pr_plans, apply_run_cancellation};
+use crate::app::merge_steward_cmd::cancellation_recovery::resume_pending_cancellation;
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::cancellation_recovery::{
-    pending_uncertainty, resolve_rejected_pending_intent,
-};
-use crate::app::merge_steward_cmd::cancellation_recovery::{
-    resume_force_cancel_after_normal_wait, resume_pending_cancellation,
+    pending_uncertainty, resolve_rejected_pending_intent, resume_force_cancel_after_normal_wait,
 };
 use crate::app::merge_steward_cmd::cancellation_revalidation::same_workflow_attempt;
+#[cfg(unix)]
 use crate::app::merge_steward_cmd::cancellation_terminalization::force_cancel_nonterminal_run;
 use crate::app::merge_steward_cmd::capacity_cancellation::{
     pending_cancellation_key, start_capacity_preemption,
