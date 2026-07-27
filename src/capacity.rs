@@ -72,9 +72,12 @@ pub struct HostClassConfig {
 /// table, non-string `ssh`/`tart_bin`/`tartci_bin`/`github_cli`/`tart_home`,
 /// non-integer/negative `cap`, or a `labels` that is not an array of strings).
 pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> {
-    let Some(classes) = data.get("host_class").and_then(TomlValue::as_table) else {
+    let Some(value) = data.get("host_class") else {
         return Ok(Vec::new());
     };
+    let classes = value
+        .as_table()
+        .ok_or_else(|| "host_class must be a table".to_owned())?;
     let mut out = Vec::with_capacity(classes.len());
     for (class, value) in classes {
         let table = value
@@ -435,6 +438,11 @@ mod tests {
                 .expect("parse")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn parse_host_classes_rejects_non_table_section() {
+        assert!(parse_host_classes(&table("host_class = \"disabled\"\n")).is_err());
     }
 
     #[test]

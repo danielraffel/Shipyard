@@ -225,6 +225,8 @@ pub enum AuditIssue {
     /// The class in the name and the class in the labels disagree — the name
     /// may be lying about which host the runner is on.
     NameLabelClassMismatch,
+    /// Advisory-only and required-work routing labels overlap on one runner.
+    AdvisoryRequiredLabelOverlap,
 }
 
 impl AuditIssue {
@@ -236,14 +238,18 @@ impl AuditIssue {
             Self::MissingRoutingLabel => "missing_routing_label",
             Self::MissingHostClassLabel => "missing_host_class_label",
             Self::NameLabelClassMismatch => "name_label_class_mismatch",
+            Self::AdvisoryRequiredLabelOverlap => "advisory_required_label_overlap",
         }
     }
 
-    /// A class-vs-name mismatch is the only drift that means the name is
-    /// untrustworthy; everything else is a fixable label gap.
+    /// Whether the runner has a routing policy violation requiring operator
+    /// attention rather than merely a missing label.
     #[must_use]
     pub fn is_drift(self) -> bool {
-        matches!(self, Self::NameLabelClassMismatch)
+        matches!(
+            self,
+            Self::NameLabelClassMismatch | Self::AdvisoryRequiredLabelOverlap
+        )
     }
 
     /// Human-readable description for the audit table.
@@ -254,6 +260,9 @@ impl AuditIssue {
             Self::MissingRoutingLabel => "missing shared <repo>-build routing label",
             Self::MissingHostClassLabel => "missing <repo>-build-<class> pin label",
             Self::NameLabelClassMismatch => "name class and label class disagree",
+            Self::AdvisoryRequiredLabelOverlap => {
+                "advisory and required-work routing labels overlap"
+            }
         }
     }
 }
@@ -278,7 +287,7 @@ impl AuditFinding {
         !self.issues.is_empty()
     }
 
-    /// Whether any issue is name-untrustworthy drift (vs a fixable label gap).
+    /// Whether any issue is a routing-policy violation (vs a missing label).
     #[must_use]
     pub fn is_drift(&self) -> bool {
         self.issues.iter().any(|issue| issue.is_drift())
@@ -286,9 +295,10 @@ impl AuditFinding {
 }
 
 /// Audit a repo's runners for host-class naming/label drift. Each runner is
-/// checked for a conforming `<repo>-<class>-NN` name, the shared `<repo>-build`
-/// routing label, a `<repo>-build-<class>` pin label, and agreement between the
-/// class in the name and the class in the labels.
+/// checked for a conforming `<repo>-<class>-NN` name. Required-work runners
+/// must also carry the shared `<repo>-build` routing label and a
+/// `<repo>-build-<class>` pin label; advisory-only runners deliberately must
+/// not carry those required-work labels.
 ///
 /// This is pure naming/label logic. Physically confirming that a `*-studio-*`
 /// runner is really on the Studio requires reading the host's machine tag over
@@ -303,19 +313,32 @@ pub fn audit_runners(repo_short: &str, runners: &[ApiRunner]) -> Vec<AuditFindin
             let name_class = class_from_name(&runner.name, repo_short);
             let label_class = class_from_labels(&labels, repo_short);
             let mut issues = Vec::new();
+            let prefix = repo_short.to_ascii_lowercase();
+            let advertises_advisory = labels
+                .iter()
+                .any(|label| label.starts_with(&format!("{prefix}-advisory-")));
+            let advertises_required = labels.iter().any(|label| {
+                label == &format!("{prefix}-build")
+                    || label.starts_with(&format!("{prefix}-build-"))
+                    || label == &format!("{prefix}-preamble")
+                    || label.starts_with(&format!("{prefix}-preamble-"))
+            });
             if name_class.is_none() {
                 issues.push(AuditIssue::NonConformingName);
             }
-            if !has_routing_label(&labels, repo_short) {
+            if !advertises_advisory && !has_routing_label(&labels, repo_short) {
                 issues.push(AuditIssue::MissingRoutingLabel);
             }
-            if label_class.is_none() {
+            if !advertises_advisory && label_class.is_none() {
                 issues.push(AuditIssue::MissingHostClassLabel);
             }
             if let (Some(name_c), Some(label_c)) = (&name_class, &label_class)
                 && name_c != label_c
             {
                 issues.push(AuditIssue::NameLabelClassMismatch);
+            }
+            if advertises_advisory && advertises_required {
+                issues.push(AuditIssue::AdvisoryRequiredLabelOverlap);
             }
             AuditFinding {
                 name: runner.name.clone(),
@@ -770,6 +793,42 @@ mod tests {
                 .contains(&AuditIssue::NameLabelClassMismatch)
         );
         assert!(findings[0].is_drift());
+    }
+
+    #[test]
+    fn audit_fails_advisory_and_required_label_overlap() {
+        let runners = vec![runner_with(
+            "pulp-m5-01",
+            &[
+                "self-hosted",
+                "pulp-build",
+                "pulp-build-m5",
+                "pulp-advisory-macos",
+            ],
+        )];
+        let findings = audit_runners("pulp", &runners);
+        assert!(
+            findings[0]
+                .issues
+                .contains(&AuditIssue::AdvisoryRequiredLabelOverlap)
+        );
+        assert!(findings[0].is_drift());
+    }
+
+    #[test]
+    fn audit_accepts_isolated_advisory_runner_without_required_labels() {
+        let runners = vec![runner_with(
+            "pulp-m5-01",
+            &["self-hosted", "macos", "arm64", "pulp-advisory-macos"],
+        )];
+        let findings = audit_runners("pulp", &runners);
+        assert!(
+            !findings[0].has_issues(),
+            "isolated advisory runner should pass: {:?}",
+            findings[0].issues
+        );
+        assert_eq!(findings[0].name_class, Some("m5".to_owned()));
+        assert_eq!(findings[0].label_class, None);
     }
 
     #[test]

@@ -754,6 +754,10 @@ pub(super) enum RunnerCommand {
         /// Polling cadence in seconds.
         #[arg(long)]
         interval: Option<u64>,
+        /// Base branch monitored by the durable fleet-liveness tick. Defaults
+        /// to `runner.watchdog.fleet_base`, then the repository default branch.
+        #[arg(long = "fleet-base")]
+        fleet_base: Option<String>,
         /// Auto-cancel stale queued runs.
         #[arg(long = "fix")]
         fix: bool,
@@ -897,15 +901,62 @@ pub(super) enum RunnerCommand {
         /// Owner/repo slug. Defaults to the current checkout's repo.
         #[arg(long)]
         repo: Option<String>,
+        /// Base branch whose merge queue should be monitored.
+        #[arg(long, default_value = "main")]
+        base: String,
         /// Job-name substring used to identify macOS queued work.
         #[arg(long, default_value = "macos")]
         target: String,
         /// Alert when queued macOS work is older than this and a routable slot exists.
         #[arg(long = "queued-age-threshold-secs", default_value_t = 900)]
         queued_age_threshold_secs: i64,
-        /// Maximum queued workflow runs to inspect for matching macOS jobs.
+        /// Maximum queued and in-progress workflow runs to inspect in total
+        /// (bounded to 50) for queue and capacity-owner attribution.
         #[arg(long = "queue-run-limit", default_value_t = 100)]
         queue_run_limit: u32,
+        /// Alert when the queue front has no required-check progress after this
+        /// age while routable fleet capacity is idle.
+        #[arg(long = "merge-queue-stall-threshold-secs", default_value_t = 900)]
+        merge_queue_stall_threshold_secs: i64,
+        /// Alert when releasable work, measured no earlier than publication, exceeds this age.
+        #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
+        release_stale_threshold_secs: i64,
+    },
+    /// Audit and conservatively advance merge-on-green across repositories.
+    ///
+    /// Dry-run is the default. `--apply` may enqueue an exact green head,
+    /// rerun a bounded transient failure, or cancel only queued runs with a
+    /// provably superseded PR/merge-group head. Same-head duplicates are never
+    /// cancelled. Repositories without a server-owned
+    /// merge queue are reported as direct-merge refusals.
+    Steward {
+        /// Owner/repo slug. Repeatable; defaults to the current repository.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Target branch.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Label that opts a PR out of stewardship.
+        #[arg(long = "opt-out-label", default_value = "shipyard:no-auto-merge")]
+        opt_out_label: String,
+        /// Maximum reruns of the same transiently-failed run on one exact head.
+        #[arg(long = "max-transient-reruns", default_value_t = 1)]
+        max_transient_reruns: u32,
+        /// Disable queued-run superseded-head cleanup.
+        #[arg(long = "no-coalesce")]
+        no_coalesce: bool,
+        /// Disable bounded preemption of safe preamble-only capacity thieves.
+        #[arg(long = "no-preempt-capacity")]
+        no_preempt_capacity: bool,
+        /// Maximum preemptions of one workflow on one immutable PR head.
+        #[arg(long = "max-preemptions-per-head", default_value_t = 1)]
+        max_preemptions_per_head: u32,
+        /// Perform the planned mutations. Without this flag, only audit.
+        #[arg(long)]
+        apply: bool,
+        /// Override the durable retry/audit ledger path. Test hook.
+        #[arg(long = "ledger", hide = true)]
+        ledger: Option<PathBuf>,
     },
     /// Watch for cloud-queued macOS jobs and drain them to a local runner when
     /// a VM slot frees up. Observe-only unless `--apply`.

@@ -86,6 +86,27 @@ shipyard runner watch --fix               # auto-cancel stale queued runs each t
 shipyard runner watch --kill-hung-workers # also auto-kill hung Worker processes
 shipyard runner watch --reap-stale-runs   # also cancel stale workflow runs repo-wide
 shipyard runner watch --reap-stale-runs --dry-run   # preview reaper, cancel nothing
+shipyard runner fleet-status --repo OWNER/REPO      # read-only TartCI + queue liveness
+shipyard runner fleet-status --json                 # periodic-monitor JSON + nonzero alerts
+shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
+shipyard runner steward --apply                     # exact-head, green-gated mutations
+shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
+
+`runner steward` is read-only unless `--apply` is present. Same-head duplicate
+runs are never cancelled; cancellation authority requires an immutable PR or
+merge-group head that differs from GitHub's current head. Apply mode requires
+the trusted machine-global `[merge_queue].mutation_machine`, rejects the
+central merge-queue `HOLD`, and serializes plus write-ahead audits every
+enqueue, rerun, and cancellation through the shared mutation guard. A
+repository without a GitHub-native merge queue receives a typed
+`direct_merge_refused` decision; Shipyard does not issue a client-side REST
+merge because that endpoint cannot atomically enforce complete check
+materialization and the validated base revision.
+Accepted capacity cancellations remain in the handoff ledger until an exact
+run/job read proves terminal; each apply pass resumes those records with an
+exact-run force-cancel before planning new work. Read failures keep the record
+pending and make the pass unhealthy. Dry-run does not require mutation
+authority.
 
 # Self-hosted runner provisioning (register / list / remove on this machine)
 shipyard runner tag --set studio          # set this box's machine tag (m1, m5, …)

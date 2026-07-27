@@ -49,9 +49,10 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Runner provisioning: register N runners for a repo** | `shipyard runner register --repo <owner/repo> --count <N> [--ci-root <dir>]` (names `<repo>-<tag>-NN`, continues the index) |
 | **Runner provisioning: dry-run the registration plan** | `shipyard runner register --repo <owner/repo> --count <N> --dry-run` |
 | **Runner provisioning: live cross-repo pool view** | `shipyard runner list [--repo <owner/repo>]` (groups by machine; flags orphaned local dirs) |
-| **Runner provisioning: audit host-class naming/label drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels; exit 1 on drift) |
+| **Runner provisioning: audit host-class naming/label drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels and fatally rejects any runner combining `<repo>-advisory-*` with `<repo>-build*` / `<repo>-preamble*`; exit 1 on drift) |
 | **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` + `tart get` per `[host_class.*]`, using configured `tart_home` as `TART_HOME`; counts only running macOS/darwin VMs; `free = Σ max(0, cap − running_macos)`; fail-closed, exit 1 if any host/VM OS unreadable) |
-| **Runner fleet visibility: capacity + tartci health + queue age** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (runs host-local `tartci doctor --reap --json` via configured `tartci_bin`, checks supervisor freshness, per-host routability, and oldest queued macOS age; exits 1 on unreadable/problem hosts or queued-age-with-capacity) |
+| **Runner fleet visibility: exact-head queue/release liveness** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (bounded pagination; stable auth/rate/truncation reasons; detects optional/superseded capacity owners and cleared enrollment) |
+| **Cross-repo merge-on-green stewardship** | `shipyard runner steward --repo <owner/pulp> --repo <owner/forge> --repo <owner/vellum> [--json]` (dry-run by default; `--apply` requires the trusted machine-global mutation authority, obeys central `HOLD`, serializes and write-ahead audits every GitHub mutation, resumes durable exact-run pending cancellations before planning, re-enrolls only the current exact green head, preserves native queue order, refuses mutation without authoritative required-check governance and refuses client-side direct merge when GitHub cannot atomically bind the validated base revision, bounds transient reruns, cancels only queued runs whose immutable PR/merge-group head is provably superseded, and may preempt one exact allow-listed advisory Pulp workflow holding `pulp-preamble` after a 15-minute exact-front pool wait; same-head duplicates, required workflows, pushes, and unknown work are never cancelled; opt out with `shipyard:no-auto-merge` or disable preemption with `--no-preempt-capacity`) |
 | **Drain cloud-queued macOS jobs to local when a slot frees** | `shipyard runner reroute-watch [--apply] [--once] [--interval N] [--flap-window N]` (observe-only without `--apply`; logs per-host capacity + candidate list; flap-guard, one-reroute-per-tick, slot/fail-closed) |
 | **Runner provisioning: deregister a runner** | `shipyard runner remove --name <repo>-<tag>-NN --yes [--purge-dir]` |
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
@@ -485,6 +486,15 @@ on a specific run ID outside the PR-scoped flow.
 
 `shipyard rescue` recovers from a wedge after the fact. The companion
 preventive surface is the auto-kill mode of `runner watch`:
+
+With `[host_class.*]` configured, `runner watch` also runs read-only fleet
+liveness by default. Consume its stable reason codes: `NORMAL_SERIAL_WAIT`
+means a follower is not blocked; cleared enrollment and optional/superseded
+capacity theft require attention. Never infer a wedge solely from an unchanged
+follower queue position.
+The watcher resolves the repository default branch. For a different merge
+target, pass `--fleet-base <branch>` or configure
+`runner.watchdog.fleet_base`.
 
 ```sh
 # Daemon mode that auto-cancels stale queued runs AND auto-kills hung Workers

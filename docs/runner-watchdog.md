@@ -173,6 +173,15 @@ The loop never exits on its own; press Ctrl-C or run it under
 `launchd` / `systemd` for unattended operation. A hidden
 `--max-iterations N` flag exists for tests.
 
+When `[host_class.*]` is configured, every watchdog tick also runs the
+read-only fleet/merge-queue observation by default. This remains active when an
+interactive agent exits or reaches a usage limit. Set
+`runner.watchdog.fleet_liveness = false` only when another durable scheduler
+owns it; use `fleet_liveness_every_ticks = N` to reduce its cadence. The
+monitor resolves the repository default branch automatically. Override it with
+`shipyard runner watch --fleet-base <branch>` or
+`runner.watchdog.fleet_base = "<branch>"`.
+
 #### `--reap-stale-runs` — repo-wide stale-run reaper
 
 `--kill-hung-workers` reaps hung *processes* on the runner host;

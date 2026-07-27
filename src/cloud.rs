@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -265,7 +266,7 @@ impl GitHubActions {
     }
 
     #[cfg(all(test, unix))]
-    fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
         self.gh_binary_override = Some(gh_binary.into());
         self
     }
@@ -474,6 +475,21 @@ impl GitHubActions {
         self.run_gh(&args).map(|_| ())
     }
 
+    /// Force-cancel an exact workflow run after normal cancellation failed to terminalize it.
+    pub fn force_cancel_workflow_run(
+        &self,
+        repository: &str,
+        run_id: u64,
+    ) -> Result<(), GitHubError> {
+        let args = vec![
+            "api".to_owned(),
+            "-X".to_owned(),
+            "POST".to_owned(),
+            format!("repos/{repository}/actions/runs/{run_id}/force-cancel"),
+        ];
+        self.run_gh(&args).map(|_| ())
+    }
+
     /// Re-trigger only the failed jobs in a workflow run. Used by the runner
     /// kill recovery path to immediately re-queue a PR whose Worker we just
     /// terminated.
@@ -671,6 +687,103 @@ impl GitHubActions {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    pub(crate) fn run_gh_with_timeout(
+        &self,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<String, GitHubError> {
+        let mut command = self.prepare_gh_command()?;
+        command
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
+        })?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| GitHubError::new("failed to capture gh stdout".to_owned()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| GitHubError::new("failed to capture gh stderr".to_owned()))?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < timeout => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    terminate_process_group(&mut child);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(GitHubError::new(format!(
+                        "gh {} timed out after {}ms",
+                        args.join(" "),
+                        timeout.as_millis()
+                    )));
+                }
+                Err(error) => {
+                    terminate_process_group(&mut child);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(GitHubError::new(format!(
+                        "failed waiting for gh {}: {error}",
+                        args.join(" ")
+                    )));
+                }
+            }
+        };
+        while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
+            && started.elapsed() < timeout
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            terminate_process_group(&mut child);
+            let drain_deadline = Instant::now() + Duration::from_millis(500);
+            while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
+                && Instant::now() < drain_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            return Err(GitHubError::new(format!(
+                "gh {} left output pipes open after {}ms",
+                args.join(" "),
+                timeout.as_millis()
+            )));
+        }
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| GitHubError::new("gh stdout reader panicked".to_owned()))?
+            .map_err(|error| GitHubError::new(format!("failed reading gh stdout: {error}")))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| GitHubError::new("gh stderr reader panicked".to_owned()))?
+            .map_err(|error| GitHubError::new(format!("failed reading gh stderr: {error}")))?;
+        if !status.success() {
+            return Err(GitHubError::command_failed(args, status.code(), &stderr));
+        }
+        Ok(String::from_utf8_lossy(&stdout).to_string())
+    }
+
     fn prepare_gh_command(&self) -> Result<std::process::Command, GitHubError> {
         let client = self
             .gh
@@ -686,6 +799,17 @@ impl GitHubActions {
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
 }
+
+#[cfg(unix)]
+fn terminate_process_group(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &group])
+        .status();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_child: &mut std::process::Child) {}
 
 /// Discover workflow-dispatchable GitHub Actions workflows below `repo_root`.
 #[must_use]

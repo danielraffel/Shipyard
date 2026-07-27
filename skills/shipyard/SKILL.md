@@ -586,6 +586,33 @@ and exits non-zero when a host is unreadable/unhealthy or when queued macOS work
 is older than `--queued-age-threshold-secs` while routable capacity exists. Use
 `--queue-run-limit N` to keep live debugging snappy on a large queued backlog.
 
+The report retains optional workflows, finds queued jobs inside `in_progress`
+workflows, and compares exact merge-group SHAs. A tick spends at most two
+active-run list requests plus 50 per-run job requests; larger observations
+fail visibly with `OBSERVATION_TRUNCATED` instead of exhausting the monitor's
+own API budget. Its local snapshot detects cleared auto-merge enrollment with
+a separate 25-PR reconciliation cap and the same truncation signal.
+Consume the stable reason codes rather than chat-turn counts. With host classes
+configured, `runner watch` invokes this observer by default. This path never
+uses Orchard and never mutates GitHub.
+The watcher resolves the repository default branch; use `--fleet-base` or
+`runner.watchdog.fleet_base` for a different merge target.
+
+Use `shipyard runner steward` for agent-neutral merge-on-green reconciliation.
+It observes by default; `--apply` enables exact-head guarded queue admission,
+reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
+REST direct merge is refused because GitHub cannot atomically bind both complete
+check materialization and the validated base revision; use a server-owned merge
+queue or manual merge instead. Apply mode is restricted by central mutation
+authority, durable write-ahead intent, and live revalidation immediately before
+every GitHub write. The built-in capacity preemption preset applies only to
+explicitly advisory Pulp workflows; required workflows and unknown repositories
+are disabled because GitHub cannot bind a cancellation to an atomic job-state
+snapshot.
+
+Read [references/merge-steward.md](references/merge-steward.md) before operating
+the steward, changing its policy, or recovering a pending cancellation.
+
 ### Reroute watcher (cloud→local drain)
 
 ```bash

@@ -173,6 +173,63 @@ use an App-authenticated GitHub wrapper, set `github_cli = "ghapp"` on each
 `TARTCI_GH_CLI`. When omitted, local probes preserve any inherited
 `TARTCI_GH_CLI` and remote probes retain tartci's default.
 
+`shipyard runner fleet-status` is the read-only GitHub monitoring surface for
+this pool (it writes only a local observation snapshot). In addition to TartCI
+capacity and supervisor freshness, it correlates
+the configured `governance.required_status_checks` with the front merge-group
+commit. It exits nonzero when an aged queue front has no required-check
+progress while a routable slot is free, and reports active non-front
+merge-group and optional jobs assigned to configured host classes. Exact
+merge-group SHAs distinguish the current front from a superseded run for the
+same PR. A run whose PR is no
+longer present in the queue is labeled `superseded`; the command only reports
+it and never cancels it. This makes `runner fleet-status --json` safe for a
+periodic queue-tick or launchd monitor. `runner watch` invokes this fleet tick
+by default whenever `[host_class.*]` is configured, so an existing durable
+watch service does not depend on an interactive agent.
+
+Use `--base` for a non-`main` merge queue and
+`--merge-queue-stall-threshold-secs` to tune the default 15-minute front-stall
+window. Each tick inspects one page of each active-run status and at most 50
+workflow-job pages in total (`--queue-run-limit` can lower that cap), including
+queued macOS jobs inside an `in_progress` workflow. A reached bound emits
+`OBSERVATION_TRUNCATED` instead of consuming an unbounded API budget;
+durable enrollment reconciliation is separately capped at 25 PR lookups per
+tick and uses the same explicit truncation signal.
+Authentication and rate-limit failures use stable `GITHUB_*` codes.
+The optional open release-incident count does not require `Issues: read`;
+when unavailable it emits non-fatal `AUXILIARY_OBSERVATION_UNAVAILABLE`.
+If `governance.required_status_checks` is empty, every check observed
+on the front merge-group commit is treated as a liveness signal. The same
+report compares the latest GitHub release tag with the monitored base and
+flags when the oldest non-doc/non-changelog commit has remained unreleased past
+`--release-stale-threshold-secs` (24 hours by default), with age measured no
+earlier than the latest release publication time. Future commit timestamps fail
+the release observation closed. A root `VERSION` file
+also exposes whether the version
+itself is unchanged.
+
+A PR behind a healthy, progressing queue front is a normal serialized wait,
+even when its own exact-head required checks are green. It is not a blocked
+goal and does not need re-arming. The fleet report alerts only when the timed
+front signal is stale or missing, when queue-eligible capacity is idle, or
+when non-front/superseded work owns that capacity; each occupier row names the
+run, job, runner, and PR so the current bottleneck owner is explicit.
+
+All agents and automation must consume the same command:
+
+```sh
+shipyard runner fleet-status --repo OWNER/REPO --json
+```
+
+The JSON `reason_codes` are the stable policy API (including
+`NORMAL_SERIAL_WAIT`); skills and chat agents must not reimplement the
+classifier. Run this command from launchd or the existing queue tick on a fixed
+cadence so detection continues independently of any agent session or model
+rate limit. The durable snapshot additionally emits
+`AUTO_MERGE_ENROLLMENT_CLEARED` when a previously queued PR remains open after
+both its queue entry and auto-merge request disappear.
+
 ## Explicit Cloud Fallback
 
 GitHub-hosted macOS fallback must be explicit and should be reserved for a local

@@ -61,6 +61,10 @@ pub mod lane_policy;
 pub mod merge_queue;
 /// Fleet authority, serialization, hold, and audit controls for queue writes.
 pub mod merge_queue_control;
+/// Read-only merge-queue front/check/fleet liveness correlation.
+pub mod merge_queue_liveness;
+/// Conservative cross-repository merge and queued-run stewardship.
+pub mod merge_steward;
 /// Runner and CI timing metrics store and analysis helpers.
 pub mod metrics;
 /// Structured JSON output helpers.

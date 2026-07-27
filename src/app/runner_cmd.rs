@@ -19,15 +19,24 @@ use serde_json::Value;
 
 use super::CliFailure;
 use super::cli::RunnerCommand;
+use super::fleet_status_cmd::fleet_liveness_policy;
 use crate::cloud::{GitHubActions, QueuedRun};
 use crate::config::LoadedConfig;
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
+use crate::paths::RuntimePaths;
 use crate::runner_watchdog::{
     DEFAULT_MAX_JOB_MIN, DEFAULT_MAX_QUEUE_AGE_HOURS, DEFAULT_REAP_IN_PROGRESS_MAX_MIN,
     DEFAULT_REAP_QUEUED_MAX_MIN, DEFAULT_WATCH_INTERVAL_SECONDS, ReaperThresholds, RunnerHealth,
     RunnerReport, RunnerSnapshot, StaleQueuedRun, StaleRun, Symptom, WatchdogThresholds,
     assess_runner, compute_stale_queued_runs, compute_stale_runs, report_to_json,
 };
+
+mod watch;
+
+use watch::dispatch_watch;
+#[cfg(test)]
+use watch::{fleet_liveness_due, resolve_reaper_thresholds, watch_exit_code};
 
 const QUEUED_RUNS_LIMIT: u32 = 100;
 /// Cap on the number of paginated `gh api` calls per reaper tick, per status.
@@ -42,11 +51,13 @@ const REAP_RUNS_MAX_PAGES: u32 = 5;
 pub(super) fn runner_command<W: Write>(
     command: RunnerCommand,
     config: &LoadedConfig,
+    mode: RuntimeMode,
     cwd: &Path,
-    state_dir: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let state_dir = &runtime_paths.state_dir;
     let actions = GitHubActions::from_loaded_config(cwd, config);
     match command {
         RunnerCommand::Status {
@@ -88,7 +99,7 @@ pub(super) fn runner_command<W: Write>(
             stdout,
         ),
         command @ RunnerCommand::Watch { .. } => {
-            dispatch_watch(command, config, cwd, &actions, json, stdout)
+            dispatch_watch(command, config, cwd, state_dir, &actions, json, stdout)
         }
         RunnerCommand::Kill {
             pid,
@@ -160,18 +171,54 @@ pub(super) fn runner_command<W: Write>(
         RunnerCommand::Capacity => super::capacity_cmd::capacity_command(config, json, stdout),
         RunnerCommand::FleetStatus {
             repo,
+            base,
             target,
             queued_age_threshold_secs,
             queue_run_limit,
+            merge_queue_stall_threshold_secs,
+            release_stale_threshold_secs,
         } => super::fleet_status_cmd::fleet_status_command(
             super::fleet_status_cmd::FleetStatusArgs {
                 repo,
+                base,
                 target,
                 queued_age_threshold_secs,
                 queue_run_limit,
+                merge_queue_stall_threshold_secs,
+                release_stale_threshold_secs,
             },
             config,
             cwd,
+            state_dir,
+            &actions,
+            json,
+            stdout,
+        ),
+        RunnerCommand::Steward {
+            repo,
+            base,
+            opt_out_label,
+            max_transient_reruns,
+            no_coalesce,
+            no_preempt_capacity,
+            max_preemptions_per_head,
+            apply,
+            ledger,
+        } => super::merge_steward_cmd::steward_command(
+            &super::merge_steward_cmd::StewardCommandArgs {
+                repos: repo,
+                base,
+                opt_out_label,
+                max_transient_reruns,
+                coalesce: !no_coalesce,
+                preempt_capacity: !no_preempt_capacity,
+                max_preemptions_per_head,
+                apply,
+                ledger,
+            },
+            cwd,
+            mode,
+            runtime_paths,
             &actions,
             json,
             stdout,
@@ -537,530 +584,6 @@ fn emit_cleanup_report<W: Write>(
     result.map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
-// ---------- watch ----------
-
-#[allow(clippy::too_many_arguments)]
-fn dispatch_watch<W: Write>(
-    command: RunnerCommand,
-    config: &LoadedConfig,
-    cwd: &Path,
-    actions: &GitHubActions,
-    json: bool,
-    stdout: &mut W,
-) -> Result<ExitCode, CliFailure> {
-    let RunnerCommand::Watch {
-        runner_id,
-        repo,
-        runner_dir,
-        interval,
-        fix,
-        kill_hung_workers,
-        reap_stale_runs,
-        reap_in_progress_max_min,
-        reap_queued_max_min,
-        dry_run,
-        max_iterations,
-        kill_grace_secs,
-    } = command
-    else {
-        unreachable!("dispatch_watch only handles Watch")
-    };
-    watch_command(WatchCommandArgs {
-        config,
-        cwd,
-        actions,
-        runner_id_override: runner_id,
-        repo_override: repo,
-        runner_dir_override: runner_dir,
-        interval_override: interval,
-        fix: fix || kill_hung_workers,
-        kill_hung_workers,
-        reap_stale_runs,
-        reap_in_progress_max_min,
-        reap_queued_max_min,
-        dry_run,
-        max_iterations,
-        kill_grace_secs,
-        json,
-        stdout,
-    })
-}
-
-#[allow(clippy::struct_excessive_bools)]
-pub(super) struct WatchCommandArgs<'a, W: Write> {
-    pub(super) config: &'a LoadedConfig,
-    pub(super) cwd: &'a Path,
-    pub(super) actions: &'a GitHubActions,
-    pub(super) runner_id_override: Option<u64>,
-    pub(super) repo_override: Option<String>,
-    pub(super) runner_dir_override: Option<PathBuf>,
-    pub(super) interval_override: Option<u64>,
-    pub(super) fix: bool,
-    pub(super) kill_hung_workers: bool,
-    pub(super) reap_stale_runs: bool,
-    pub(super) reap_in_progress_max_min: Option<i64>,
-    pub(super) reap_queued_max_min: Option<i64>,
-    pub(super) dry_run: bool,
-    pub(super) max_iterations: Option<u32>,
-    pub(super) kill_grace_secs: Option<u64>,
-    pub(super) json: bool,
-    pub(super) stdout: &'a mut W,
-}
-
-fn watch_command<W: Write>(args: WatchCommandArgs<'_, W>) -> Result<ExitCode, CliFailure> {
-    let WatchCommandArgs {
-        config,
-        cwd,
-        actions,
-        runner_id_override,
-        repo_override,
-        runner_dir_override,
-        interval_override,
-        fix,
-        kill_hung_workers,
-        reap_stale_runs,
-        reap_in_progress_max_min,
-        reap_queued_max_min,
-        dry_run,
-        max_iterations,
-        kill_grace_secs,
-        json,
-        stdout,
-    } = args;
-    let settings = resolve_watchdog_settings(
-        config,
-        cwd,
-        runner_id_override,
-        repo_override.clone(),
-        runner_dir_override.clone(),
-        None,
-        None,
-        interval_override,
-    )?;
-    let reaper_thresholds =
-        resolve_reaper_thresholds(config, reap_in_progress_max_min, reap_queued_max_min);
-    let interval = Duration::from_secs(settings.thresholds.watch_interval_seconds.max(1));
-    if max_iterations == Some(0) {
-        return Ok(ExitCode::SUCCESS);
-    }
-    let mut iterations = 0u32;
-    let last_health = loop {
-        let snapshot_result = fetch_runner_snapshot(actions, &settings);
-        let queued_runs_result = fetch_queued_runs(actions, &settings.repo_slug);
-
-        let health = match (snapshot_result, queued_runs_result) {
-            (Ok(snapshot), Ok(queued_runs)) => {
-                let report =
-                    assess_runner(&snapshot, &queued_runs, settings.thresholds, Utc::now());
-                emit_watch_tick(stdout, &settings, &report, json)?;
-                if fix && report.health == RunnerHealth::Stuck {
-                    cancel_stale_inline(actions, &settings, &report, stdout, json)?;
-                }
-                if kill_hung_workers && report_has_hung_worker(&report) {
-                    auto_kill_hung_workers(
-                        config,
-                        cwd,
-                        actions,
-                        &settings,
-                        kill_grace_secs,
-                        json,
-                        stdout,
-                    )?;
-                }
-                if reap_stale_runs {
-                    reap_stale_runs_tick(
-                        actions,
-                        &settings,
-                        reaper_thresholds,
-                        dry_run,
-                        json,
-                        stdout,
-                    )?;
-                }
-                report.health
-            }
-            (Err(err), _) | (_, Err(err)) => {
-                emit_watch_error(stdout, &settings, &err, json)?;
-                RunnerHealth::Offline
-            }
-        };
-
-        iterations = iterations.saturating_add(1);
-        if let Some(limit) = max_iterations
-            && iterations >= limit
-        {
-            break health;
-        }
-        sleep(interval);
-    };
-    Ok(ExitCode::from(last_health.exit_code()))
-}
-
-fn report_has_hung_worker(report: &crate::runner_watchdog::RunnerReport) -> bool {
-    use crate::runner_watchdog::Symptom;
-    report
-        .symptoms
-        .iter()
-        .any(|s| matches!(s, Symptom::HungWorker { .. }))
-}
-
-fn auto_kill_hung_workers<W: Write>(
-    config: &LoadedConfig,
-    cwd: &Path,
-    actions: &GitHubActions,
-    settings: &WatchdogSettings,
-    grace_secs: Option<u64>,
-    json: bool,
-    stdout: &mut W,
-) -> Result<(), CliFailure> {
-    let workers = discover_hung_workers(&settings.runner_dir, settings.thresholds.max_job_min);
-    if workers.is_empty() {
-        emit_kill_event(
-            stdout,
-            &settings.repo_slug,
-            json,
-            "no-pid-found",
-            None,
-            None,
-        )?;
-        return Ok(());
-    }
-    for worker in workers {
-        let reason = format!(
-            "watchdog: worker etime {}min exceeds threshold {}min",
-            worker.etime_min, settings.thresholds.max_job_min
-        );
-        emit_kill_event(
-            stdout,
-            &settings.repo_slug,
-            json,
-            "attempt",
-            Some(worker.pid),
-            Some(&reason),
-        )?;
-        let kill_args = super::runner_kill_cmd::KillCommandArgs {
-            config,
-            cwd,
-            actions,
-            pid: Some(worker.pid),
-            reason: Some(reason.clone()),
-            retrigger: false,
-            yes: true,
-            repo_override: Some(settings.repo_slug.clone()),
-            runner_dir_override: Some(settings.runner_dir.clone()),
-            history: false,
-            last: None,
-            recover: None,
-            grace_secs,
-            recovery_log_override: None,
-            quarantine_root_override: None,
-            no_wait_github: false,
-            json,
-        };
-        let outcome = super::runner_kill_cmd::kill_command(kill_args, stdout);
-        match outcome {
-            Ok(_code) => emit_kill_event(
-                stdout,
-                &settings.repo_slug,
-                json,
-                "killed",
-                Some(worker.pid),
-                None,
-            )?,
-            Err(err) => emit_kill_event(
-                stdout,
-                &settings.repo_slug,
-                json,
-                "failed",
-                Some(worker.pid),
-                Some(&err.message),
-            )?,
-        }
-    }
-    Ok(())
-}
-
-fn emit_kill_event<W: Write>(
-    stdout: &mut W,
-    repo: &str,
-    json: bool,
-    phase: &str,
-    pid: Option<u32>,
-    detail: Option<&str>,
-) -> Result<(), CliFailure> {
-    if json {
-        let mut data = BTreeMap::new();
-        data.insert("event".to_owned(), Value::from("auto_kill_worker"));
-        data.insert("phase".to_owned(), Value::from(phase.to_owned()));
-        data.insert("repo".to_owned(), Value::from(repo.to_owned()));
-        if let Some(pid) = pid {
-            data.insert("pid".to_owned(), Value::from(pid));
-        }
-        if let Some(detail) = detail {
-            data.insert("detail".to_owned(), Value::from(detail.to_owned()));
-        }
-        return write_json_envelope(stdout, "runner.watch", data)
-            .map_err(|error| CliFailure::new(1, error.to_string()));
-    }
-    let ts = Utc::now().format("%H:%M:%S");
-    let pid_part = pid.map_or_else(String::new, |p| format!(" pid={p}"));
-    let detail_part = detail.map_or_else(String::new, |d| format!(" — {d}"));
-    writeln!(stdout, "[{ts}] auto-kill {phase}{pid_part}{detail_part}")
-        .map_err(|error| CliFailure::new(1, error.to_string()))
-}
-
-fn emit_watch_tick<W: Write>(
-    stdout: &mut W,
-    settings: &WatchdogSettings,
-    report: &RunnerReport,
-    json: bool,
-) -> Result<(), CliFailure> {
-    if json {
-        let mut data = report_to_json(report);
-        data.insert("event".to_owned(), Value::from("tick"));
-        data.insert("repo".to_owned(), Value::from(settings.repo_slug.clone()));
-        return write_json_envelope(stdout, "runner.watch", data)
-            .map_err(|error| CliFailure::new(1, error.to_string()));
-    }
-    let ts = Utc::now().format("%H:%M:%S");
-    let line = match report.health {
-        RunnerHealth::Healthy => format!(
-            "[{ts}] OK: runner healthy (busy={}, workers={}, stale=0)",
-            report.busy, report.worker_count,
-        ),
-        RunnerHealth::Stuck => format!(
-            "[{ts}] WARN: stuck runner — {} symptom(s); {} stale queued",
-            report.symptoms.len(),
-            report.stale_queued_runs.len(),
-        ),
-        RunnerHealth::Offline => format!("[{ts}] ERR: runner status={}", report.status),
-    };
-    writeln!(stdout, "{line}").map_err(|error| CliFailure::new(1, error.to_string()))
-}
-
-fn emit_watch_error<W: Write>(
-    stdout: &mut W,
-    settings: &WatchdogSettings,
-    err: &CliFailure,
-    json: bool,
-) -> Result<(), CliFailure> {
-    if json {
-        let mut data = BTreeMap::new();
-        data.insert("event".to_owned(), Value::from("error"));
-        data.insert("repo".to_owned(), Value::from(settings.repo_slug.clone()));
-        data.insert("error".to_owned(), Value::from(err.message.clone()));
-        return write_json_envelope(stdout, "runner.watch", data)
-            .map_err(|error| CliFailure::new(1, error.to_string()));
-    }
-    let ts = Utc::now().format("%H:%M:%S");
-    writeln!(stdout, "[{ts}] ERR: {}", err.message)
-        .map_err(|error| CliFailure::new(1, error.to_string()))
-}
-
-fn cancel_stale_inline<W: Write>(
-    actions: &GitHubActions,
-    settings: &WatchdogSettings,
-    report: &RunnerReport,
-    stdout: &mut W,
-    json: bool,
-) -> Result<(), CliFailure> {
-    let mut cancelled = Vec::new();
-    let mut failed = Vec::new();
-    for run in &report.stale_queued_runs {
-        match actions.cancel_workflow_run(&settings.repo_slug, run.run_id) {
-            Ok(()) => cancelled.push(run.run_id),
-            Err(err) => failed.push((run.run_id, err.to_string())),
-        }
-    }
-    if json {
-        let mut data = BTreeMap::new();
-        data.insert("event".to_owned(), Value::from("auto_fix"));
-        data.insert("repo".to_owned(), Value::from(settings.repo_slug.clone()));
-        data.insert(
-            "cancelled_run_ids".to_owned(),
-            serde_json::to_value(&cancelled).expect("cancelled serialization"),
-        );
-        data.insert(
-            "failed".to_owned(),
-            serde_json::to_value(
-                failed
-                    .iter()
-                    .map(|(id, msg)| {
-                        BTreeMap::from([
-                            ("run_id".to_owned(), Value::from(*id)),
-                            ("error".to_owned(), Value::from(msg.clone())),
-                        ])
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .expect("failed serialization"),
-        );
-        return write_json_envelope(stdout, "runner.watch", data)
-            .map_err(|error| CliFailure::new(1, error.to_string()));
-    }
-    if !cancelled.is_empty() {
-        writeln!(stdout, "  auto-fix: cancelled {cancelled:?}")
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    }
-    if !failed.is_empty() {
-        for (id, msg) in failed {
-            writeln!(stdout, "  auto-fix FAILED for run {id}: {msg}")
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-// ---------- stale-run reaper ----------
-
-/// Resolve [`ReaperThresholds`] from flags, then `[runner.watchdog]` config,
-/// then the built-in defaults — matching the precedence used by
-/// `resolve_watchdog_settings`.
-fn resolve_reaper_thresholds(
-    config: &LoadedConfig,
-    in_progress_override: Option<i64>,
-    queued_override: Option<i64>,
-) -> ReaperThresholds {
-    let in_progress_max_min = in_progress_override
-        .or_else(|| {
-            config
-                .get("runner.watchdog.reap_in_progress_max_min")
-                .and_then(toml::Value::as_integer)
-        })
-        .unwrap_or(DEFAULT_REAP_IN_PROGRESS_MAX_MIN);
-    let queued_max_min = queued_override
-        .or_else(|| {
-            config
-                .get("runner.watchdog.reap_queued_max_min")
-                .and_then(toml::Value::as_integer)
-        })
-        .unwrap_or(DEFAULT_REAP_QUEUED_MAX_MIN);
-    ReaperThresholds {
-        in_progress_max_min,
-        queued_max_min,
-    }
-}
-
-/// One stale-run reaper pass: list `in_progress` + `queued` runs, select the
-/// genuinely-stale ones, and cancel them (unless `--dry-run`). Emits one
-/// `event=reap_stale_run` envelope per run, mirroring the `auto_kill_worker`
-/// event style used by `--kill-hung-workers`.
-fn reap_stale_runs_tick<W: Write>(
-    actions: &GitHubActions,
-    settings: &WatchdogSettings,
-    thresholds: ReaperThresholds,
-    dry_run: bool,
-    json: bool,
-    stdout: &mut W,
-) -> Result<(), CliFailure> {
-    // Paginate both status queries so repos with more than one page of
-    // `in_progress` / `queued` runs are fully covered — a single 100-item
-    // page would silently miss the oldest (and most likely stale) entries.
-    let in_progress = actions
-        .list_runs_with_status_paginated(
-            &settings.repo_slug,
-            "in_progress",
-            None,
-            REAP_RUNS_MAX_PAGES,
-        )
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let queued = actions
-        .list_runs_with_status_paginated(&settings.repo_slug, "queued", None, REAP_RUNS_MAX_PAGES)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-
-    let stale = compute_stale_runs(&in_progress, &queued, thresholds, Utc::now());
-    for run in &stale {
-        let detail = format!(
-            "{} run {} ({}, branch={}) {} for {}s — threshold {}min",
-            run.kind.as_str(),
-            run.run_id,
-            run.workflow,
-            run.branch,
-            run.status,
-            run.age_secs,
-            match run.kind {
-                crate::runner_watchdog::StaleRunKind::HungInProgress => {
-                    thresholds.in_progress_max_min
-                }
-                crate::runner_watchdog::StaleRunKind::OrphanedQueued => thresholds.queued_max_min,
-            },
-        );
-        emit_reap_event(
-            stdout,
-            &settings.repo_slug,
-            json,
-            "attempt",
-            run,
-            Some(&detail),
-        )?;
-        if dry_run {
-            emit_reap_event(
-                stdout,
-                &settings.repo_slug,
-                json,
-                "skipped",
-                run,
-                Some("dry-run: not cancelling"),
-            )?;
-            continue;
-        }
-        match actions.cancel_workflow_run(&settings.repo_slug, run.run_id) {
-            Ok(()) => {
-                emit_reap_event(stdout, &settings.repo_slug, json, "cancelled", run, None)?;
-            }
-            Err(err) => {
-                emit_reap_event(
-                    stdout,
-                    &settings.repo_slug,
-                    json,
-                    "failed",
-                    run,
-                    Some(&err.to_string()),
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn emit_reap_event<W: Write>(
-    stdout: &mut W,
-    repo: &str,
-    json: bool,
-    phase: &str,
-    run: &StaleRun,
-    detail: Option<&str>,
-) -> Result<(), CliFailure> {
-    if json {
-        let mut data = BTreeMap::new();
-        data.insert("event".to_owned(), Value::from("reap_stale_run"));
-        data.insert("phase".to_owned(), Value::from(phase.to_owned()));
-        data.insert("repo".to_owned(), Value::from(repo.to_owned()));
-        data.insert("run_id".to_owned(), Value::from(run.run_id));
-        data.insert("kind".to_owned(), Value::from(run.kind.as_str()));
-        data.insert("status".to_owned(), Value::from(run.status.clone()));
-        data.insert("workflow".to_owned(), Value::from(run.workflow.clone()));
-        data.insert("branch".to_owned(), Value::from(run.branch.clone()));
-        data.insert("age_secs".to_owned(), Value::from(run.age_secs));
-        if let Some(url) = &run.url {
-            data.insert("url".to_owned(), Value::from(url.clone()));
-        }
-        if let Some(detail) = detail {
-            data.insert("detail".to_owned(), Value::from(detail.to_owned()));
-        }
-        return write_json_envelope(stdout, "runner.watch", data)
-            .map_err(|error| CliFailure::new(1, error.to_string()));
-    }
-    let ts = Utc::now().format("%H:%M:%S");
-    let detail_part = detail.map_or_else(String::new, |d| format!(" — {d}"));
-    writeln!(
-        stdout,
-        "[{ts}] reap-stale-run {phase} run={}{detail_part}",
-        run.run_id
-    )
-    .map_err(|error| CliFailure::new(1, error.to_string()))
-}
-
 // ---------- settings / config wiring ----------
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1390,145 +913,4 @@ fn parse_etime_minutes(raw: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_etime_handles_mm_ss() {
-        assert_eq!(parse_etime_minutes("45:12"), Some(45));
-    }
-
-    #[test]
-    fn parse_etime_handles_hh_mm_ss() {
-        assert_eq!(parse_etime_minutes("01:30:00"), Some(90));
-    }
-
-    #[test]
-    fn parse_etime_handles_days() {
-        assert_eq!(parse_etime_minutes("2-03:15:00"), Some(2 * 24 * 60 + 195));
-    }
-
-    #[test]
-    fn parse_etime_rejects_garbage() {
-        assert_eq!(parse_etime_minutes("not-a-time"), None);
-    }
-
-    #[test]
-    fn parse_ps_row_handles_typical_macos_line() {
-        let row = parse_ps_pid_etime_command(
-            " 12345 01:30:00 /Users/foo/actions-runner/bin/Runner.Worker spawnclient 0 0",
-        )
-        .expect("row");
-        assert_eq!(row.pid, 12345);
-        assert_eq!(row.etime_min, 90);
-        assert!(
-            row.command
-                .starts_with("/Users/foo/actions-runner/bin/Runner.Worker")
-        );
-    }
-
-    #[test]
-    fn parse_ps_row_rejects_missing_command() {
-        assert!(parse_ps_pid_etime_command("12345 01:30:00").is_none());
-    }
-
-    #[test]
-    fn parse_ps_row_rejects_non_numeric_pid() {
-        assert!(parse_ps_pid_etime_command("abcd 01:30:00 /bin/Runner.Worker").is_none());
-    }
-
-    #[test]
-    fn parse_ps_row_collapses_multispace_columns() {
-        // Real `ps -ax -o pid=,etime=,command=` output pads PID + etime to
-        // fixed-width columns separated by runs of spaces, not single spaces.
-        // The previous splitn-based parser silently rejected these rows.
-        let row = parse_ps_pid_etime_command(
-            "  12345    01:30:00    /Users/foo/actions-runner/bin/Runner.Worker spawnclient 0 0",
-        )
-        .expect("row");
-        assert_eq!(row.pid, 12345);
-        assert_eq!(row.etime_min, 90);
-        assert!(
-            row.command
-                .starts_with("/Users/foo/actions-runner/bin/Runner.Worker")
-        );
-    }
-
-    #[test]
-    fn parse_ps_row_preserves_command_internal_spaces() {
-        // After collapsing the column gaps, internal spaces in the command
-        // (e.g. argv tokens) must survive unchanged.
-        let row =
-            parse_ps_pid_etime_command(" 1 00:01 /bin/Runner.Worker arg with multiple   spaces")
-                .expect("row");
-        assert!(row.command.contains("arg with multiple   spaces"));
-    }
-
-    #[test]
-    fn parse_github_slug_supports_https_and_ssh() {
-        assert_eq!(
-            parse_github_repo_slug("git@github.com:danielraffel/Shipyard.git"),
-            Some("danielraffel/Shipyard".to_owned())
-        );
-        assert_eq!(
-            parse_github_repo_slug("https://github.com/danielraffel/pulp"),
-            Some("danielraffel/pulp".to_owned())
-        );
-        assert_eq!(parse_github_repo_slug("not-a-github-url"), None);
-    }
-
-    #[test]
-    fn dry_run_overridden_only_respects_fix_flag() {
-        assert!(dry_run_overridden_only(true, false));
-        assert!(!dry_run_overridden_only(true, true));
-    }
-
-    fn config_with(body: &str) -> crate::config::LoadedConfig {
-        use crate::config::{LoadedConfig, LocalOverlaySource};
-        let sandbox = tempfile::TempDir::new().expect("tempdir");
-        let project_dir = sandbox.path().join(".shipyard");
-        std::fs::create_dir_all(&project_dir).expect("project dir");
-        std::fs::write(project_dir.join("config.toml"), body).expect("write config");
-        // Keep the TempDir alive for the lifetime of the test by leaking it;
-        // tests are short-lived processes and this avoids a lifetime dance.
-        let dir = sandbox.keep();
-        LoadedConfig::load(
-            Some(dir.join("global-missing")),
-            Some(dir.join(".shipyard")),
-            None,
-            LocalOverlaySource::None,
-        )
-        .expect("load config")
-    }
-
-    #[test]
-    fn reaper_thresholds_fall_back_to_built_in_defaults() {
-        let config = config_with("[project]\nname = \"x\"\n");
-        let thresholds = resolve_reaper_thresholds(&config, None, None);
-        assert_eq!(
-            thresholds.in_progress_max_min,
-            DEFAULT_REAP_IN_PROGRESS_MAX_MIN
-        );
-        assert_eq!(thresholds.queued_max_min, DEFAULT_REAP_QUEUED_MAX_MIN);
-    }
-
-    #[test]
-    fn reaper_thresholds_read_from_config() {
-        let config = config_with(
-            "[runner.watchdog]\nreap_in_progress_max_min = 120\nreap_queued_max_min = 240\n",
-        );
-        let thresholds = resolve_reaper_thresholds(&config, None, None);
-        assert_eq!(thresholds.in_progress_max_min, 120);
-        assert_eq!(thresholds.queued_max_min, 240);
-    }
-
-    #[test]
-    fn reaper_thresholds_flags_win_over_config() {
-        let config = config_with(
-            "[runner.watchdog]\nreap_in_progress_max_min = 120\nreap_queued_max_min = 240\n",
-        );
-        let thresholds = resolve_reaper_thresholds(&config, Some(30), Some(60));
-        assert_eq!(thresholds.in_progress_max_min, 30);
-        assert_eq!(thresholds.queued_max_min, 60);
-    }
-}
+mod tests;
