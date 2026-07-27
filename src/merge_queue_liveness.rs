@@ -585,7 +585,9 @@ fn check_observation_recency(check: &CheckObservation) -> (bool, &str, bool) {
 fn is_terminal_failure(conclusion: Option<&str>) -> bool {
     matches!(
         conclusion,
-        Some("failure" | "cancelled" | "timed_out" | "action_required" | "startup_failure")
+        Some(
+            "failure" | "cancelled" | "timed_out" | "action_required" | "startup_failure" | "stale"
+        )
     )
 }
 
@@ -1013,6 +1015,47 @@ mod tests {
             !report
                 .reason_codes
                 .contains(&LivenessReason::OptionalCapacityTheft)
+        );
+        assert!(
+            !report
+                .reason_codes
+                .contains(&LivenessReason::NormalSerialWait)
+        );
+    }
+
+    #[test]
+    fn required_stale_check_is_reported_as_terminal_failure() {
+        let entries = vec![MergeQueueEntry {
+            pr: 11,
+            position: 0,
+            head_sha: Some("aaa".to_owned()),
+            enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+        }];
+        let checks = vec![CheckObservation {
+            name: "macos".to_owned(),
+            status: "completed".to_owned(),
+            started_at: Some("1970-01-01T00:00:10Z".to_owned()),
+            conclusion: Some("stale".to_owned()),
+        }];
+        let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &entries,
+            checks: &checks,
+            active_runs: &[],
+            required_contexts: &["macos".to_owned()],
+            eligible_host_classes: &["m1".to_owned()],
+            routable_free_slots: 1,
+            stall_threshold_secs: 60,
+            now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
+        });
+
+        assert_eq!(report.failed_required_contexts, ["macos"]);
+        assert!(report.needs_attention());
+        assert!(
+            report
+                .reason_codes
+                .contains(&LivenessReason::FrontRequiredFailed)
         );
         assert!(
             !report
