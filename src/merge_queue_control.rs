@@ -46,7 +46,16 @@ impl Drop for ControlLock {
 
 /// Create or replace the local authority hold with a durable reason record.
 pub fn hold(state_root: &Path, reason: &str) -> Result<PathBuf, String> {
-    let mut control_lock = acquire_control_lock(state_root, false)?;
+    hold_with_lock_boundary_signal(state_root, reason, || {})
+}
+
+fn hold_with_lock_boundary_signal(
+    state_root: &Path,
+    reason: &str,
+    at_lock_boundary: impl FnOnce(),
+) -> Result<PathBuf, String> {
+    let mut control_lock =
+        acquire_control_lock_with_boundary_signal(state_root, false, at_lock_boundary)?;
     let path = state_root.join(HOLD_FILE);
     let parent = path
         .parent()
@@ -815,6 +824,14 @@ fn validate_machine_authority(
 }
 
 fn acquire_control_lock(state_root: &Path, nonblocking: bool) -> Result<ControlLock, String> {
+    acquire_control_lock_with_boundary_signal(state_root, nonblocking, || {})
+}
+
+fn acquire_control_lock_with_boundary_signal(
+    state_root: &Path,
+    nonblocking: bool,
+    at_lock_boundary: impl FnOnce(),
+) -> Result<ControlLock, String> {
     let path = state_root.join(CONTROL_LOCK_FILE);
     let parent = path
         .parent()
@@ -828,6 +845,7 @@ fn acquire_control_lock(state_root: &Path, nonblocking: bool) -> Result<ControlL
         .write(true)
         .open(&path)
         .map_err(|error| format!("failed to open merge-queue control lock: {error}"))?;
+    at_lock_boundary();
     let result = if nonblocking {
         lock.try_lock_exclusive()
     } else {

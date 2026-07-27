@@ -305,6 +305,23 @@ esac
     );
 }
 
+#[test]
+fn release_skip_grammar_matches_case_insensitive_workflow_guard() {
+    for message in [
+        "bot\n\nrelease: skip reason=\"generated release\"",
+        "bot\n\nReLeAsE: SkIp reason=\"generated release\"",
+    ] {
+        assert!(release_is_skipped(message), "{message}");
+    }
+    for message in [
+        "bot\n\nRelease: ship",
+        "bot\n\nRelease-notes: skip",
+        "bot\n\nRelease skip",
+    ] {
+        assert!(!release_is_skipped(message), "{message}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn release_commit_detail_lookups_are_bounded_and_fail_closed() {

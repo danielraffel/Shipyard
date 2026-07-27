@@ -171,11 +171,16 @@ fn gh_json_value(actions: &GitHubActions, args: &[String], purpose: &str) -> Res
         .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
 }
 
-fn release_is_skipped(message: &str) -> bool {
+pub(super) fn release_is_skipped(message: &str) -> bool {
     message.lines().any(|line| {
-        line.strip_prefix("Release: skip reason=\"")
-            .and_then(|reason| reason.strip_suffix('"'))
-            .is_some_and(|reason| !reason.is_empty())
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        key.eq_ignore_ascii_case("release")
+            && value
+                .trim_start()
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("skip"))
     })
 }
 

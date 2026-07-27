@@ -1,6 +1,7 @@
 use super::{
     DurableMutationIntent, HOLD_FILE, MergeQueueMutationGuard, hold, hold_status,
-    preflight_mutation_authority, resolve_uncertainty, resume, uncertain_mutations,
+    hold_with_lock_boundary_signal, preflight_mutation_authority, resolve_uncertainty, resume,
+    uncertain_mutations,
 };
 use crate::identity::RuntimeMode;
 use crate::ship_state::{ShipState, ShipStateStore};
@@ -364,15 +365,18 @@ fn hold_waits_for_admitted_mutation_and_blocks_later_writers() {
     std::fs::write(state_root.join("machine-tag"), "studio\n").expect("tag");
     let guard =
         acquire_guard(&store, &cwd, &state, "enqueue pull request").expect("mutation admitted");
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (boundary_tx, boundary_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let hold_root = state_root.clone();
     let thread = std::thread::spawn(move || {
-        started_tx.send(()).expect("started");
-        let result = hold(&hold_root, "incident");
+        let result = hold_with_lock_boundary_signal(&hold_root, "incident", || {
+            boundary_tx.send(()).expect("lock boundary");
+        });
         done_tx.send(result).expect("done");
     });
-    started_rx.recv().expect("hold thread started");
+    boundary_rx
+        .recv()
+        .expect("hold reached control-lock boundary");
     assert!(
         done_rx
             .recv_timeout(std::time::Duration::from_millis(50))
@@ -397,13 +401,23 @@ fn preflight_keeps_control_serialized_through_audited_handoff() {
     let state_root = store.path().parent().expect("state root").to_path_buf();
     std::fs::write(state_root.join("machine-tag"), "studio\n").expect("tag");
     let preflight = preflight(&state_root, &cwd, "owner/repo", "main").expect("preflight");
+    let (boundary_tx, boundary_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let hold_root = state_root.clone();
     let thread = std::thread::spawn(move || {
         done_tx
-            .send(hold(&hold_root, "incident"))
+            .send(hold_with_lock_boundary_signal(
+                &hold_root,
+                "incident",
+                || {
+                    boundary_tx.send(()).expect("lock boundary");
+                },
+            ))
             .expect("send hold result");
     });
+    boundary_rx
+        .recv()
+        .expect("hold reached control-lock boundary");
     assert!(
         done_rx
             .recv_timeout(std::time::Duration::from_millis(50))

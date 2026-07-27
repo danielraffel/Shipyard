@@ -342,7 +342,6 @@ fn write_release_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Resul
     Ok(())
 }
 
-fn text_write_failure(error: std::io::Error) -> CliFailure {
-    let source: Box<dyn std::error::Error> = Box::new(error);
-    CliFailure::new(1, format!("failed to write fleet status: {source}"))
+fn text_write_failure(error: impl std::fmt::Display) -> CliFailure {
+    CliFailure::new(1, format!("failed to write fleet status: {error}"))
 }
