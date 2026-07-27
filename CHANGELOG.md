@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0801"></a>
+## [0.80.2]
+
 ## [0.80.1] - 2026-07-26
 
 - fix/windows conditional steward test imports ([#383](https://github.com/danielraffel/Shipyard/pull/383))
