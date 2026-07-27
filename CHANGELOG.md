@@ -6,6 +6,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 <a id="v0800"></a>
 ## [0.80.0] - 2026-07-26
 
+- feature/cross repo merge steward ([#382](https://github.com/danielraffel/Shipyard/pull/382))
+
 <a id="v0792"></a>
 ## [0.79.2] - 2026-07-26
 
