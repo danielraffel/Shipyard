@@ -34,30 +34,33 @@ use crate::merge_queue_liveness::{
 mod assessment;
 mod observation;
 mod policy;
+mod release_observation;
 mod render;
 
 pub(in crate::app) use assessment::FleetAssessment;
 use assessment::{
     DoctorProbe, HostFleetStatus, MergeQueueProbe, ObservationReason, QueuedSummary, ReleaseProbe,
 };
-#[cfg(test)]
-use observation::{
-    base_version_path, enrollment_snapshot_path, path_requires_release, release_compare_path,
-    release_workflow_runs_path, select_bounded_runs,
-};
 use observation::{
     classify_observation_error, fetch_observed_workflow_runs, inspect_merge_queue_liveness,
-    inspect_release_liveness, observation_reason_codes, queued_macos_summary,
-    required_status_checks,
+    observation_reason_codes, queued_macos_summary, required_status_checks,
 };
+#[cfg(test)]
+use observation::{enrollment_snapshot_path, select_bounded_runs};
 #[cfg(all(test, unix))]
 use observation::{
-    count_releasable_commits, fetch_check_observations, fetch_merge_queue_entries,
-    reconcile_enrollment_snapshot,
+    fetch_check_observations, fetch_merge_queue_entries, reconcile_enrollment_snapshot,
 };
 #[cfg(test)]
 pub(in crate::app) use policy::FleetLivenessPolicy;
 pub(in crate::app) use policy::fleet_liveness_policy;
+#[cfg(all(test, unix))]
+use release_observation::count_releasable_commits;
+use release_observation::inspect_release_liveness;
+#[cfg(test)]
+use release_observation::{
+    base_version_path, path_requires_release, release_compare_path, release_workflow_runs_path,
+};
 pub(in crate::app) use render::{render_fleet_assessment, render_fleet_watch_event};
 
 const FLEET_LANE_TARGET: &str = "macos";
