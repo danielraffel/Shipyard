@@ -114,6 +114,7 @@ fn queued_run(id: u64, created_at: &str) -> StewardRun {
     }
 }
 
+#[cfg(unix)]
 fn pending_cancellation_record() -> PendingCancellation {
     PendingCancellation {
         repo: "owner/repo".to_owned(),
