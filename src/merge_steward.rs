@@ -92,7 +92,6 @@ pub struct StewardPolicy {
 /// therefore receive [`Self::disabled`] rather than inheriting Pulp names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapacityPreemptionPolicy {
-    required_workflows: Vec<String>,
     advisory_workflows: Vec<String>,
     preamble_labels: Vec<String>,
     expensive_label_prefixes: Vec<String>,
@@ -104,7 +103,6 @@ impl CapacityPreemptionPolicy {
     #[must_use]
     pub fn disabled() -> Self {
         Self {
-            required_workflows: Vec::new(),
             advisory_workflows: Vec::new(),
             preamble_labels: Vec::new(),
             expensive_label_prefixes: Vec::new(),
@@ -116,7 +114,6 @@ impl CapacityPreemptionPolicy {
     #[must_use]
     pub fn pulp() -> Self {
         Self {
-            required_workflows: vec!["Build and Test".to_owned()],
             advisory_workflows: vec![
                 "Example validation".to_owned(),
                 "GPU Web Plugins".to_owned(),
@@ -157,14 +154,7 @@ impl CapacityPreemptionPolicy {
     /// Whether this policy authorizes any capacity-preemption observation or mutation.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
-        !self.preamble_labels.is_empty()
-            && (!self.required_workflows.is_empty() || !self.advisory_workflows.is_empty())
-    }
-
-    fn workflow_is_required(&self, workflow: &str) -> bool {
-        self.required_workflows
-            .iter()
-            .any(|candidate| candidate == workflow)
+        !self.preamble_labels.is_empty() && !self.advisory_workflows.is_empty()
     }
 
     fn workflow_is_advisory(&self, workflow: &str) -> bool {
@@ -462,7 +452,8 @@ pub enum RunCancellationReason {
     SupersededMergeGroupHead,
     /// An advisory PR workflow owns shared preamble capacity.
     AdvisoryPreambleCapacityTheft,
-    /// A superseded branch validation head holds capacity ahead of the queue front.
+    /// Legacy ledger value retained so interrupted pre-release state can be
+    /// read and safely rejected; this reason never authorizes a cancellation.
     LowerPriorityBranchPreamble,
 }
 
@@ -486,13 +477,13 @@ pub struct QueueFrontPressure {
 
 /// Plan at most `max_preemptions` incident-safe in-progress cancellations.
 ///
-/// Only PR workflows with a running shared-preamble job are eligible. Pushes,
-/// merge groups, unknown workflows/jobs, and any run whose expensive
-/// `pulp-build` leg started are never selected.
+/// Only explicitly advisory PR workflows with a running shared-preamble job
+/// are eligible. Required workflows, pushes, merge groups, unknown
+/// workflows/jobs, and any run whose expensive `pulp-build` leg was already
+/// observed as started are never selected.
 #[must_use]
 pub fn plan_capacity_preemptions(
     runs: &[StewardRun],
-    current_pull_request_heads: &BTreeMap<u64, String>,
     opted_out_pull_requests: &BTreeSet<u64>,
     policy: &CapacityPreemptionPolicy,
     pressure: &QueueFrontPressure,
@@ -513,12 +504,7 @@ pub fn plan_capacity_preemptions(
     let mut candidates = runs
         .iter()
         .filter_map(|run| {
-            let reason = preemption_reason(
-                run,
-                current_pull_request_heads,
-                opted_out_pull_requests,
-                policy,
-            )?;
+            let reason = preemption_reason(run, opted_out_pull_requests, policy)?;
             if attempted_heads.contains(&preemption_key(run)) {
                 return None;
             }
@@ -561,7 +547,6 @@ pub fn queue_front_waits_for_pool(
 
 fn preemption_reason(
     run: &StewardRun,
-    current_pull_request_heads: &BTreeMap<u64, String>,
     opted_out_pull_requests: &BTreeSet<u64>,
     policy: &CapacityPreemptionPolicy,
 ) -> Option<RunCancellationReason> {
@@ -589,12 +574,6 @@ fn preemption_reason(
     }
     if policy.workflow_is_advisory(&run.workflow) {
         Some(RunCancellationReason::AdvisoryPreambleCapacityTheft)
-    } else if policy.workflow_is_required(&run.workflow)
-        && current_pull_request_heads
-            .get(&run.pull_request_number?)
-            .is_some_and(|head| !head.eq_ignore_ascii_case(&run.head_sha))
-    {
-        Some(RunCancellationReason::LowerPriorityBranchPreamble)
     } else {
         None
     }
@@ -606,24 +585,18 @@ fn preemption_reason(
 /// the word "advisory" must not gain cancellation authority.
 #[must_use]
 pub fn is_capacity_preemption_workflow(workflow: &str, policy: &CapacityPreemptionPolicy) -> bool {
-    policy.workflow_is_required(workflow) || policy.workflow_is_advisory(workflow)
+    policy.workflow_is_advisory(workflow)
 }
 
 /// Revalidate that a live run still satisfies the exact planned preemption.
 #[must_use]
 pub fn is_safe_capacity_preemption(
     run: &StewardRun,
-    current_pull_request_heads: &BTreeMap<u64, String>,
     opted_out_pull_requests: &BTreeSet<u64>,
     policy: &CapacityPreemptionPolicy,
     expected_reason: RunCancellationReason,
 ) -> bool {
-    preemption_reason(
-        run,
-        current_pull_request_heads,
-        opted_out_pull_requests,
-        policy,
-    ) == Some(expected_reason)
+    preemption_reason(run, opted_out_pull_requests, policy) == Some(expected_reason)
 }
 
 fn expensive_leg_started(job: &StewardJob, policy: &CapacityPreemptionPolicy) -> bool {

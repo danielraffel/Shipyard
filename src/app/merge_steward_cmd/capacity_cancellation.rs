@@ -1,10 +1,10 @@
 use super::{
     CapacityApplyContext, CapacityRevalidation, DurableMutationIntent, GitHubActions,
     MergeQueueMutationGuard, Path, PendingCancellation, PendingCancellationPhase,
-    PendingMutationKind, RepoObservation, RunCancellation, StewardLedger, StewardRun, Utc,
-    acquire_pending_cancellation_guard, cancellation_reason_label, clear_pending_cancellation,
-    complete_capacity_cancellation, merge_group_pr_number, preemption_key, queue_front_head,
-    record_audit, revalidate_capacity_preemption, save_ledger,
+    PendingMutationKind, RepoObservation, RunCancellation, RunCancellationReason, StewardLedger,
+    StewardRun, Utc, acquire_pending_cancellation_guard, cancellation_reason_label,
+    clear_pending_cancellation, complete_capacity_cancellation, merge_group_pr_number,
+    preemption_key, queue_front_head, record_audit, revalidate_capacity_preemption, save_ledger,
     validate_pending_cancellation_authority,
 };
 
@@ -21,6 +21,9 @@ pub(super) fn cancel_capacity_preemption_after_revalidation(
     expected_front: &str,
     opt_out_label: &str,
 ) -> Result<Option<CapacityRevalidation>, CapacityCancelError> {
+    if cancellation.reason != RunCancellationReason::AdvisoryPreambleCapacityTheft {
+        return Ok(None);
+    }
     let evidence = revalidate_capacity_preemption(
         actions,
         observation,

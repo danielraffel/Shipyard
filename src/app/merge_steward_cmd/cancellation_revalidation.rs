@@ -1,11 +1,10 @@
 use super::{
     BTreeMap, BTreeSet, CapacityPreemptionPolicy, CapacityRevalidation, GitHubActions,
     MergeQueueMutationGuard, MutationControl, ObservedPr, RepoObservation, RequiredCheck,
-    RunCancellation, RunCancellationReason, ShipState, StewardJob, StewardLedger,
-    StewardPullRequest, StewardRun, Value, active_runs, attempt_key, fetch_run_jobs, gh_json,
-    hydrate_required_check_identities, is_full_sha, is_safe_capacity_preemption,
-    merge_queue_snapshot, parse_pr, parse_run, plan_run_coalescing, pull_requests,
-    queue_front_waits_for_pool, timestamp_old_enough,
+    RunCancellation, ShipState, StewardJob, StewardLedger, StewardPullRequest, StewardRun, Value,
+    active_runs, attempt_key, fetch_run_jobs, gh_json, hydrate_required_check_identities,
+    is_full_sha, is_safe_capacity_preemption, merge_queue_snapshot, parse_pr, parse_run,
+    plan_run_coalescing, pull_requests, queue_front_waits_for_pool, timestamp_old_enough,
 };
 
 pub(super) fn revalidate_capacity_preemption(
@@ -74,17 +73,8 @@ pub(super) fn revalidate_capacity_preemption(
     if pull_request_opted_out(&candidate_pr, opt_out_label) {
         opted_out.insert(candidate_pr.fact.number);
     }
-    let current_heads = if matches!(
-        cancellation.reason,
-        RunCancellationReason::LowerPriorityBranchPreamble
-    ) {
-        all_current_heads.clone()
-    } else {
-        BTreeMap::new()
-    };
     if !is_safe_capacity_preemption(
         &live,
-        &current_heads,
         &opted_out,
         &observation.capacity_preemption_policy,
         cancellation.reason,

@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn required_workflow_capacity_reason_is_rejected_before_github_reads_or_writes() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, r#"echo "unexpected GitHub call: $*" >&2; exit 90"#);
+    let observed = queued_run(100, "2026-07-26T00:00:00Z");
+    let observation = observation_for(ready_pr(), true);
+    let cancellation = RunCancellation {
+        run_id: observed.id,
+        reason: RunCancellationReason::LowerPriorityBranchPreamble,
+    };
+
+    assert!(matches!(
+        cancel_capacity_preemption_after_revalidation(
+            &actions,
+            &observation,
+            &cancellation,
+            &observed,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "steward:skip",
+        ),
+        Ok(None)
+    ));
+}
+
+#[test]
 fn second_revalidation_uses_latest_safe_runner_assignment() {
     let temp = tempfile::tempdir().expect("temp");
     let calls = temp.path().join("calls");

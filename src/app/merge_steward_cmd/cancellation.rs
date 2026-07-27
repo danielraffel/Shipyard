@@ -186,11 +186,9 @@ pub(super) fn plan_repo_capacity_preemptions(
         .filter(|(_, count)| **count >= args.max_preemptions_per_head)
         .filter_map(|(key, _)| key.strip_prefix(&prefix).map(str::to_owned))
         .collect();
-    let current_heads = current_pull_request_heads(&observation.prs);
     let opted_out = opted_out_pull_requests(&observation.prs, &args.opt_out_label);
     plan_capacity_preemptions(
         &observation.runs,
-        &current_heads,
         &opted_out,
         &observation.capacity_preemption_policy,
         &pressure,

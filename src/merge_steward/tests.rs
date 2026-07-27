@@ -527,15 +527,10 @@ fn pressure_runs() -> Vec<StewardRun> {
     ]
 }
 
-fn current_heads() -> BTreeMap<u64, String> {
-    BTreeMap::from([(8, sha('a')), (9, sha('c'))])
-}
-
 #[test]
-fn preempts_one_advisory_before_lower_priority_branch() {
+fn preempts_one_explicitly_advisory_workflow() {
     let plan = plan_capacity_preemptions(
         &pressure_runs(),
-        &current_heads(),
         &BTreeSet::new(),
         &CapacityPreemptionPolicy::pulp(),
         &QueueFrontPressure {
@@ -560,7 +555,6 @@ fn gpu_web_plugins_is_exact_advisory_capacity_work_not_cached_supersedence() {
     runs[1].workflow = "GPU Web Plugins".to_owned();
     let plan = plan_capacity_preemptions(
         &runs,
-        &current_heads(),
         &BTreeSet::new(),
         &CapacityPreemptionPolicy::pulp(),
         &QueueFrontPressure {
@@ -626,7 +620,6 @@ fn never_preempts_started_expensive_push_or_unknown_work() {
     for runs in cases {
         let plan = plan_capacity_preemptions(
             &runs,
-            &current_heads(),
             &BTreeSet::new(),
             &CapacityPreemptionPolicy::pulp(),
             &QueueFrontPressure {
@@ -644,12 +637,11 @@ fn never_preempts_started_expensive_push_or_unknown_work() {
 }
 
 #[test]
-fn requires_aged_exact_front_and_durable_attempt_budget() {
+fn requires_aged_exact_front_and_never_falls_back_to_required_work() {
     let runs = pressure_runs();
     let attempted = BTreeSet::from([preemption_key(&runs[1])]);
     let plan = plan_capacity_preemptions(
         &runs,
-        &current_heads(),
         &BTreeSet::new(),
         &CapacityPreemptionPolicy::pulp(),
         &QueueFrontPressure {
@@ -659,28 +651,13 @@ fn requires_aged_exact_front_and_durable_attempt_budget() {
         &attempted,
         1,
     );
-    assert_eq!(plan[0].run_id, 300);
-    let wrong_pr_identity = BTreeMap::from([(10, sha('c'))]);
     assert!(
-        plan_capacity_preemptions(
-            &runs,
-            &wrong_pr_identity,
-            &BTreeSet::new(),
-            &CapacityPreemptionPolicy::pulp(),
-            &QueueFrontPressure {
-                head_sha: sha('f'),
-                old_enough: true,
-            },
-            &attempted,
-            1,
-        )
-        .is_empty(),
-        "a same-name branch from another PR must not prove stale identity"
+        plan.is_empty(),
+        "an exhausted advisory candidate must not fall back to required work"
     );
     assert!(
         plan_capacity_preemptions(
             &runs,
-            &current_heads(),
             &BTreeSet::new(),
             &CapacityPreemptionPolicy::pulp(),
             &QueueFrontPressure {
@@ -695,7 +672,6 @@ fn requires_aged_exact_front_and_durable_attempt_budget() {
     assert!(
         plan_capacity_preemptions(
             &runs,
-            &current_heads(),
             &BTreeSet::new(),
             &CapacityPreemptionPolicy::pulp(),
             &QueueFrontPressure {
@@ -713,7 +689,6 @@ fn requires_aged_exact_front_and_durable_attempt_budget() {
     assert!(
         plan_capacity_preemptions(
             &running_front,
-            &current_heads(),
             &BTreeSet::new(),
             &CapacityPreemptionPolicy::pulp(),
             &QueueFrontPressure {
@@ -739,7 +714,6 @@ fn queued_front_preamble_models_global_scheduler_cap_pressure() {
     assert_eq!(
         plan_capacity_preemptions(
             &runs,
-            &current_heads(),
             &BTreeSet::new(),
             &CapacityPreemptionPolicy::pulp(),
             &QueueFrontPressure {
@@ -758,7 +732,6 @@ fn queued_front_preamble_models_global_scheduler_cap_pressure() {
     assert_eq!(
         plan_capacity_preemptions(
             &runs,
-            &current_heads(),
             &BTreeSet::new(),
             &CapacityPreemptionPolicy::pulp(),
             &QueueFrontPressure {
@@ -781,7 +754,6 @@ fn completed_skipped_expensive_leg_remains_unstarted() {
     assert_eq!(
         plan_capacity_preemptions(
             &runs,
-            &current_heads(),
             &BTreeSet::new(),
             &CapacityPreemptionPolicy::pulp(),
             &QueueFrontPressure {
@@ -805,18 +777,19 @@ fn opted_out_pull_request_is_never_preempted() {
     };
     let plan = plan_capacity_preemptions(
         &runs,
-        &current_heads(),
         &BTreeSet::from([8]),
         &CapacityPreemptionPolicy::pulp(),
         &pressure,
         &BTreeSet::new(),
         1,
     );
-    assert_eq!(plan[0].run_id, 300);
+    assert!(
+        plan.is_empty(),
+        "an opted-out advisory candidate must not fall back to required work"
+    );
     assert!(
         plan_capacity_preemptions(
             &runs,
-            &current_heads(),
             &BTreeSet::from([8, 9]),
             &CapacityPreemptionPolicy::pulp(),
             &pressure,
@@ -844,7 +817,6 @@ fn capacity_preemption_policy_is_explicitly_pulp_only() {
     assert!(
         plan_capacity_preemptions(
             &pressure_runs(),
-            &current_heads(),
             &BTreeSet::new(),
             &CapacityPreemptionPolicy::disabled(),
             &QueueFrontPressure {

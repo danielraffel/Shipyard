@@ -606,7 +606,9 @@ check materialization and the validated base revision; use a server-owned merge
 queue or manual merge instead. Apply mode is restricted by central mutation
 authority, durable write-ahead intent, and live revalidation immediately before
 every GitHub write. The built-in capacity preemption preset applies only to
-Pulp; unknown repositories are disabled.
+explicitly advisory Pulp workflows; required workflows and unknown repositories
+are disabled because GitHub cannot bind a cancellation to an atomic job-state
+snapshot.
 
 Read [references/merge-steward.md](references/merge-steward.md) before operating
 the steward, changing its policy, or recovering a pending cancellation.

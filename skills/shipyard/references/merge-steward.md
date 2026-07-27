@@ -23,17 +23,21 @@ queue. Add the `shipyard:no-auto-merge` label to opt a PR out.
 Capacity preemption is an explicit repository policy. The built-in Pulp policy
 may preempt at most one in-progress PR workflow per pass when an exact
 merge-group front has waited at least 15 minutes. The candidate must be an
-allow-listed advisory workflow, or a `Build and Test` workflow on a superseded
-immutable PR head, actively holding a `pulp-preamble` runner while every
-`pulp-build` or `pulp-build-*` leg remains queued or skipped. Unknown
-repositories have preemption disabled.
+allow-listed advisory workflow actively holding a `pulp-preamble` runner while
+every `pulp-build` or `pulp-build-*` leg remains queued or skipped. Required
+workflows, including `Build and Test`, are never capacity-preemption
+candidates. Unknown repositories have preemption disabled.
 
 The steward fetches the live run and all jobs immediately before cancellation.
-Pushes, merge groups, unknown workflows/jobs, and any run with a started or
-completed expensive leg are never cancelled. The hard cross-repository pass
-cap is one; no CLI option can raise it. `--no-preempt-capacity` disables this
-behavior. The per-head attempt budget and write-ahead audit live in the
-`handoff_ledger` path emitted by JSON.
+Pushes, merge groups, required workflows, unknown workflows/jobs, and any
+advisory run already observed with a started or completed expensive leg are
+not selected. GitHub does not offer a conditional cancellation tied to that
+job snapshot, so correctness rests on the whole selected workflow being
+explicitly advisory; the final job read is a waste-avoidance check, not
+required-work protection. The hard cross-repository pass cap is one; no CLI
+option can raise it. `--no-preempt-capacity` disables this behavior. The
+per-head attempt budget and write-ahead audit live in the `handoff_ledger`
+path emitted by JSON.
 
 Apply mode holds an exclusive sibling lock for the whole reconciliation and
 routes every enqueue, rerun, and cancellation through the
