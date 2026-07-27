@@ -23,7 +23,7 @@ pub(super) fn apply_capacity_preemption(
     let Some(expected_front) = queue_front_head(context.observation) else {
         return (Some("skipped_after_front_revalidation".to_owned()), None);
     };
-    let (guard, cancel_live, pending) =
+    let (guard, pending) =
         match prepare_capacity_preemption(context, opt_out_label, ledger, observed, expected_front)
         {
             Ok(Some(prepared)) => prepared,
@@ -35,7 +35,7 @@ pub(super) fn apply_capacity_preemption(
             }
             Err(error) => return (None, Some(error)),
         };
-    match revalidate_capacity_preemption(
+    let latest = match revalidate_capacity_preemption(
         context.actions,
         context.observation,
         context.cancellation,
@@ -43,25 +43,9 @@ pub(super) fn apply_capacity_preemption(
         expected_front,
         opt_out_label,
     ) {
-        Ok(Some(latest)) if latest.candidate == cancel_live.candidate => {}
-        Ok(Some(_) | None) => {
-            let key = pending_cancellation_key(&pending);
-            if let Err(error) = mark_cancellation_skipped(ledger, context.ledger_path, &key) {
-                return (None, Some(error));
-            }
-            if let Err(error) = guard.finish("skipped_after_attempt_revalidation") {
-                return (None, Some(format!("mutation audit failed: {error}")));
-            }
-            if let Err(error) = clear_pending_cancellation(
-                ledger,
-                context.ledger_path,
-                &key,
-                &pending,
-                "skipped_after_attempt_revalidation",
-            ) {
-                return (None, Some(error));
-            }
-            return (Some("skipped_after_attempt_revalidation".to_owned()), None);
+        Ok(Some(latest)) => latest,
+        Ok(None) => {
+            return skip_after_attempt_revalidation(guard, &pending, context.ledger_path, ledger);
         }
         Err(error) => {
             let audit_error = guard.finish("attempt_revalidation_failed").err();
@@ -75,6 +59,25 @@ pub(super) fn apply_capacity_preemption(
                 )),
             );
         }
+    };
+    if let Err(error) = persist_capacity_evidence(
+        context.observation,
+        context.cancellation,
+        expected_front,
+        &latest,
+        context.ledger_path,
+        ledger,
+    ) {
+        let audit_error = guard.finish("attempt_evidence_persistence_failed").err();
+        return (
+            None,
+            Some(format!(
+                "{error}{}",
+                audit_error.map_or_else(String::new, |audit_error| format!(
+                    "; mutation audit also failed: {audit_error}"
+                ))
+            )),
+        );
     }
     match context
         .actions
@@ -82,7 +85,7 @@ pub(super) fn apply_capacity_preemption(
     {
         Ok(()) => {
             if let Err(error) =
-                mark_cancellation_accepted(context, expected_front, &cancel_live.candidate, ledger)
+                mark_cancellation_accepted(context, expected_front, &latest.candidate, ledger)
             {
                 return (
                     Some("cancelled_after_job_revalidation".to_owned()),
@@ -99,10 +102,35 @@ pub(super) fn apply_capacity_preemption(
                     )),
                 );
             }
-            complete_capacity_cancellation(context, expected_front, &cancel_live.candidate, ledger)
+            complete_capacity_cancellation(context, expected_front, &latest.candidate, ledger)
         }
         Err(error) => (None, Some(error.to_string())),
     }
+}
+
+fn skip_after_attempt_revalidation(
+    guard: MergeQueueMutationGuard,
+    pending: &PendingCancellation,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    let key = pending_cancellation_key(pending);
+    if let Err(error) = mark_cancellation_skipped(ledger, ledger_path, &key) {
+        return (None, Some(error));
+    }
+    if let Err(error) = guard.finish("skipped_after_attempt_revalidation") {
+        return (None, Some(format!("mutation audit failed: {error}")));
+    }
+    if let Err(error) = clear_pending_cancellation(
+        ledger,
+        ledger_path,
+        &key,
+        pending,
+        "skipped_after_attempt_revalidation",
+    ) {
+        return (None, Some(error));
+    }
+    (Some("skipped_after_attempt_revalidation".to_owned()), None)
 }
 
 pub(super) fn prepare_capacity_preemption(
@@ -111,14 +139,7 @@ pub(super) fn prepare_capacity_preemption(
     ledger: &mut StewardLedger,
     observed: &StewardRun,
     expected_front: &str,
-) -> Result<
-    Option<(
-        MergeQueueMutationGuard,
-        CapacityRevalidation,
-        PendingCancellation,
-    )>,
-    String,
-> {
+) -> Result<Option<(MergeQueueMutationGuard, PendingCancellation)>, String> {
     let (guard, pending) =
         start_capacity_preemption(context, opt_out_label, ledger, observed, expected_front)?;
     let cancel_live = match revalidate_capacity_preemption(
@@ -174,7 +195,7 @@ pub(super) fn prepare_capacity_preemption(
             ))
         ));
     }
-    Ok(Some((guard, cancel_live, pending)))
+    Ok(Some((guard, pending)))
 }
 
 pub(super) fn start_capacity_preemption(
