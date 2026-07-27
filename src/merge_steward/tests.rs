@@ -150,10 +150,34 @@ fn direct_merge_refuses_partially_materialized_checks_without_authoritative_poli
     );
     let mut red = green_pr();
     red.checks[0].conclusion = Some("FAILURE".to_owned());
-    assert!(matches!(
+    assert_eq!(
         classify_pr(&red, &policy, &BTreeMap::new()),
-        StewardDecision::RequiredFailed { .. }
-    ));
+        StewardDecision::DirectMergeRefused {
+            reasons: vec![
+                DirectMergeRefusal::RequiredCheckMaterializationNotAuthoritative,
+                DirectMergeRefusal::ValidatedBaseRevisionNotAtomic,
+            ]
+        }
+    );
+}
+
+#[test]
+fn merge_queue_refuses_partially_materialized_checks_without_authoritative_policy() {
+    let mut policy = queue_policy();
+    policy.required_checks.clear();
+    let expected = StewardDecision::WaitingRequired {
+        contexts: vec!["authoritative-required-check-policy".to_owned()],
+    };
+    let mut no_checks = green_pr();
+    no_checks.checks.clear();
+    let green = green_pr();
+    let mut failed = green_pr();
+    failed.checks[0].conclusion = Some("FAILURE".to_owned());
+    let mut transient = green_pr();
+    transient.checks[0].conclusion = Some("TIMED_OUT".to_owned());
+    for pr in [no_checks, green, failed, transient] {
+        assert_eq!(classify_pr(&pr, &policy, &BTreeMap::new()), expected);
+    }
 }
 
 #[test]

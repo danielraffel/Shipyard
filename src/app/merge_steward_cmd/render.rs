@@ -38,7 +38,7 @@ pub(super) fn render_report<W: Write>(
             repo.merge_queue,
             repo.allow_auto_merge,
             if repo.required_contexts.is_empty() {
-                "all-observed".to_owned()
+                "not-authoritative".to_owned()
             } else {
                 repo.required_contexts.join(",")
             }

@@ -78,7 +78,10 @@ fn observation_for(pr: ObservedPr, merge_queue: bool) -> RepoObservation {
         base: "main".to_owned(),
         allow_auto_merge: merge_queue,
         merge_queue,
-        required_checks: Vec::new(),
+        required_checks: vec![RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: None,
+        }],
         prs: vec![pr],
         runs: Vec::new(),
         merge_group_heads: BTreeMap::new(),
@@ -92,7 +95,10 @@ fn queue_policy() -> StewardPolicy {
     StewardPolicy {
         merge_queue: true,
         native_auto_merge: true,
-        required_checks: Vec::new(),
+        required_checks: vec![RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: None,
+        }],
         opt_out_label: "steward:skip".to_owned(),
         max_transient_reruns: 1,
     }

@@ -184,7 +184,7 @@ pub(super) fn release_is_skipped(message: &str) -> bool {
     let mut trailers = Vec::new();
     for line in &lines[trailer_start..] {
         let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
+        if line.starts_with('#') {
             continue;
         }
         if trimmed.len() != line.len() {

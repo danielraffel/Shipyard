@@ -393,18 +393,23 @@ esac
 "#
         ),
     );
+    let required = vec![RequiredCheck {
+        context: "omitted-failure".to_owned(),
+        app_id: None,
+    }];
     let observed = pull_request_with_required_checks(
         &actions,
         "owner/repo",
         42,
         "main",
         &BTreeMap::new(),
-        &[],
+        &required,
     )
     .expect("live PR")
     .expect("open PR");
     let mut policy = queue_policy();
     policy.merge_queue = false;
+    policy.required_checks = required;
     assert_eq!(
         classify_pr(&observed.fact, &policy, &BTreeMap::new()),
         StewardDecision::RequiredFailed {

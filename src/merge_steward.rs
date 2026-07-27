@@ -75,7 +75,8 @@ pub struct StewardPolicy {
     pub merge_queue: bool,
     /// Repository allows native auto-merge.
     pub native_auto_merge: bool,
-    /// Required check rules. Empty means every observed check gates.
+    /// Authoritative required check rules. Empty means mutation is refused
+    /// because the observed check set cannot prove complete materialization.
     pub required_checks: Vec<RequiredCheck>,
     /// Label that opts a PR out of stewardship.
     pub opt_out_label: String,
@@ -284,6 +285,20 @@ pub fn classify_pr(
             merge_state: pr.merge_state.clone(),
         };
     }
+    if policy.required_checks.is_empty() {
+        return if policy.merge_queue {
+            StewardDecision::WaitingRequired {
+                contexts: vec!["authoritative-required-check-policy".to_owned()],
+            }
+        } else {
+            StewardDecision::DirectMergeRefused {
+                reasons: vec![
+                    DirectMergeRefusal::RequiredCheckMaterializationNotAuthoritative,
+                    DirectMergeRefusal::ValidatedBaseRevisionNotAtomic,
+                ],
+            }
+        };
+    }
 
     let selected = selected_checks(pr, policy);
     let mut waiting = Vec::new();
@@ -342,12 +357,9 @@ pub fn classify_pr(
         // request can remain armed without ever materializing a queue entry.
         StewardDecision::ArmMergeQueue
     } else {
-        let mut reasons = Vec::new();
-        if policy.required_checks.is_empty() {
-            reasons.push(DirectMergeRefusal::RequiredCheckMaterializationNotAuthoritative);
+        StewardDecision::DirectMergeRefused {
+            reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
         }
-        reasons.push(DirectMergeRefusal::ValidatedBaseRevisionNotAtomic);
-        StewardDecision::DirectMergeRefused { reasons }
     }
 }
 
@@ -355,26 +367,6 @@ fn selected_checks<'a>(
     pr: &'a StewardPullRequest,
     policy: &'a StewardPolicy,
 ) -> Vec<(String, Option<&'a StewardCheck>)> {
-    if policy.required_checks.is_empty() {
-        if pr.checks.is_empty() {
-            return vec![("at-least-one-current-head-check".to_owned(), None)];
-        }
-        let mut newest_by_context = BTreeMap::<String, &StewardCheck>::new();
-        for check in &pr.checks {
-            newest_by_context
-                .entry(check.name.to_ascii_lowercase())
-                .and_modify(|current| {
-                    if check_recency(check) > check_recency(current) {
-                        *current = check;
-                    }
-                })
-                .or_insert(check);
-        }
-        return newest_by_context
-            .into_values()
-            .map(|check| (check.name.clone(), Some(check)))
-            .collect();
-    }
     policy
         .required_checks
         .iter()

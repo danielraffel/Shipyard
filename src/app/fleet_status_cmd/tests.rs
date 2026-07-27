@@ -323,6 +323,7 @@ fn release_skip_grammar_matches_case_insensitive_workflow_guard() {
         "bot\n\nRelease: ship",
         "bot\n\nRelease-notes: skip",
         "bot\n\nRelease skip",
+        "bot\n\n  # indented comment prevents trailer parsing\nRelease: skip",
     ] {
         assert!(!release_is_skipped(message), "{message}");
     }
