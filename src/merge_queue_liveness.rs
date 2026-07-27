@@ -353,6 +353,18 @@ pub fn merge_group_pr(branch: &str) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
+fn entry_liveness_started_at(entry: &MergeQueueEntry) -> Option<DateTime<Utc>> {
+    let parse = |timestamp: Option<&str>| {
+        timestamp
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()
+            .map(|value| value.map(|timestamp| timestamp.with_timezone(&Utc)))
+    };
+    let enqueued_at = parse(entry.enqueued_at.as_deref()).ok()?;
+    let head_observed_at = parse(entry.head_observed_at.as_deref()).ok()?;
+    [enqueued_at, head_observed_at].into_iter().flatten().max()
+}
+
 /// Correlate merge-queue, check-run, active-run, and fleet observations.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -373,16 +385,7 @@ pub fn assess_merge_queue_liveness(
     } = inputs;
     let front = entries.iter().min_by_key(|entry| entry.position).cloned();
     let front_old_enough = front.as_ref().is_some_and(|entry| {
-        [
-            entry.enqueued_at.as_deref(),
-            entry.head_observed_at.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .max()
-        .is_some_and(|liveness_started_at| {
+        entry_liveness_started_at(entry).is_some_and(|liveness_started_at| {
             (now - liveness_started_at).num_seconds() >= stall_threshold_secs.max(0)
         })
     });
@@ -734,6 +737,31 @@ mod tests {
         });
 
         assert_eq!(report.reason_codes, [LivenessReason::NormalSerialWait]);
+        assert!(!report.needs_attention());
+    }
+
+    #[test]
+    fn malformed_head_observation_fails_closed_without_stale_alert() {
+        let entries = vec![MergeQueueEntry {
+            pr: 11,
+            position: 0,
+            head_sha: Some("new-head".to_owned()),
+            enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: Some("not-a-timestamp".to_owned()),
+        }];
+        let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &entries,
+            checks: &[],
+            active_runs: &[],
+            required_contexts: &["macOS".to_owned()],
+            eligible_host_classes: &["m5".to_owned()],
+            routable_free_slots: 1,
+            stall_threshold_secs: 60,
+            now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
+        });
+
         assert!(!report.needs_attention());
     }
 
