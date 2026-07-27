@@ -918,7 +918,7 @@ pub(super) enum RunnerCommand {
         /// age while routable fleet capacity is idle.
         #[arg(long = "merge-queue-stall-threshold-secs", default_value_t = 900)]
         merge_queue_stall_threshold_secs: i64,
-        /// Alert when the oldest releasable base commit is older than this.
+        /// Alert when releasable work, measured no earlier than publication, exceeds this age.
         #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
         release_stale_threshold_secs: i64,
     },

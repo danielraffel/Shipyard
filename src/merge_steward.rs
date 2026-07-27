@@ -659,7 +659,10 @@ fn preemption_rank(reason: RunCancellationReason) -> u8 {
 
 /// Plan queued-run supersedence cleanup.
 ///
-/// In-progress work is never cancelled. Push/schedule runs are never touched.
+/// Runs observed in progress are never planned; a queued run that advances
+/// before cancellation is re-read and left alone. GitHub may still reject a
+/// cancellation when its run state changes after that final observation.
+/// Push/schedule runs are never touched.
 /// The planner only acts when a PR or merge-group run's immutable full SHA is
 /// different from the corresponding current authoritative head. Same-head
 /// duplicates are deliberately left to GitHub.

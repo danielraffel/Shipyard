@@ -265,6 +265,16 @@ pub(super) fn revalidate_coalescing_cancellation(
     if !reason_reproved {
         return Ok(false);
     }
+    exact_run_still_queued(actions, observation, observed, cancellation, pr_number)
+}
+
+pub(super) fn exact_run_still_queued(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    observed: &StewardRun,
+    cancellation: &RunCancellation,
+    pr_number: u64,
+) -> Result<bool, String> {
     let value = gh_json(
         actions,
         &[

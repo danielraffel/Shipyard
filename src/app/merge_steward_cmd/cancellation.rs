@@ -1,11 +1,12 @@
 use super::{
-    CancellationReport, CapacityApplyContext, DateTime, GitHubActions, MutationApplyContext,
-    MutationControl, ObservedPr, PREEMPT_AFTER_SECS, Path, PrReport, QueueFrontPressure,
-    RepoObservation, RepoReport, RequiredCheck, RunCancellation, RunCancellationReason,
-    StewardCommandArgs, StewardLedger, StewardPolicy, StewardRun, Utc, acquire_run_mutation_guard,
-    apply_capacity_preemption, attempts_for, authoritative_head_still_superseded, classify_pr,
-    coalescing_reason_authorizes, current_pull_request_heads, mutate_pr, opted_out_pull_requests,
-    plan_capacity_preemptions, plan_run_coalescing, record_audit,
+    CancellationReport, CapacityApplyContext, DateTime, GitHubActions, MergeQueueMutationGuard,
+    MutationApplyContext, MutationControl, ObservedPr, PREEMPT_AFTER_SECS, Path, PrReport,
+    QueueFrontPressure, RepoObservation, RepoReport, RequiredCheck, RunCancellation,
+    RunCancellationReason, StewardCommandArgs, StewardLedger, StewardPolicy, StewardRun, Utc,
+    acquire_run_mutation_guard, apply_capacity_preemption, attempts_for,
+    authoritative_head_still_superseded, classify_pr, coalescing_reason_authorizes,
+    current_pull_request_heads, exact_run_still_queued, merge_group_pr_number, mutate_pr,
+    opted_out_pull_requests, plan_capacity_preemptions, plan_run_coalescing, record_audit,
     revalidate_coalescing_cancellation,
 };
 
@@ -314,94 +315,184 @@ fn apply_superseded_run_cancellation(
         opt_out_label,
     ) {
         Ok(false) => (Some("skipped_after_live_revalidation".to_owned()), None),
-        Ok(true) => {
-            let guard = match acquire_run_mutation_guard(
-                mutation_control,
-                observation,
-                observed,
-                &format!("runner steward cancel run {}", cancellation.run_id),
-            ) {
-                Ok(guard) => guard,
-                Err(error) => return (None, Some(error)),
-            };
-            match revalidate_coalescing_cancellation(
-                actions,
-                observation,
-                observed,
-                cancellation,
-                opt_out_label,
-            ) {
-                Ok(false) => {
-                    return match guard.finish("skipped_after_final_live_revalidation") {
-                        Ok(()) => (
-                            Some("skipped_after_final_live_revalidation".to_owned()),
-                            None,
-                        ),
-                        Err(error) => (None, Some(error)),
-                    };
-                }
-                Err(error) => {
-                    let audit_error = guard.finish("final_revalidation_failed").err();
-                    return (
-                        None,
-                        Some(format!(
-                            "{error}{}",
-                            audit_error.map_or_else(String::new, |audit_error| format!(
-                                "; mutation audit also failed: {audit_error}"
-                            ))
-                        )),
-                    );
-                }
-                Ok(true) => {}
+        Ok(true) => match acquire_final_cancellation_guard(
+            actions,
+            observation,
+            observed,
+            cancellation,
+            opt_out_label,
+            mutation_control,
+        ) {
+            Ok(guard) => {
+                send_superseded_cancellation(actions, observation, cancellation, ledger, guard)
             }
-            match authoritative_head_still_superseded(
-                actions,
-                observation,
-                observed,
-                cancellation,
-                opt_out_label,
-            ) {
-                Ok(false) => {
-                    return match guard.finish("skipped_after_final_authority_check") {
-                        Ok(()) => (Some("skipped_after_final_authority_check".to_owned()), None),
-                        Err(error) => (None, Some(error)),
-                    };
-                }
-                Err(error) => {
-                    let audit_error = guard.finish("final_authority_check_failed").err();
-                    return (
-                        None,
-                        Some(format!(
-                            "{error}{}",
-                            audit_error.map_or_else(String::new, |audit_error| format!(
-                                "; mutation audit also failed: {audit_error}"
-                            ))
-                        )),
-                    );
-                }
-                Ok(true) => {}
-            }
-            match actions.cancel_workflow_run(&observation.repo, cancellation.run_id) {
-                Ok(()) => {
-                    if let Err(error) = guard.finish("cancel_accepted") {
-                        return (
-                            Some("cancelled".to_owned()),
-                            Some(format!(
-                                "cancel accepted but mutation audit failed: {error}"
-                            )),
-                        );
-                    }
-                    record_audit(
-                        ledger,
-                        &observation.repo,
-                        &format!("run:{}", cancellation.run_id),
-                        "cancel_revalidated_queued_run",
-                    );
-                    (Some("cancelled".to_owned()), None)
-                }
-                Err(error) => (None, Some(error.to_string())),
-            }
-        }
+            Err(result) => result,
+        },
         Err(error) => (None, Some(error)),
     }
+}
+
+fn acquire_final_cancellation_guard(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    observed: &StewardRun,
+    cancellation: &RunCancellation,
+    opt_out_label: &str,
+    mutation_control: &MutationControl,
+) -> Result<MergeQueueMutationGuard, (Option<String>, Option<String>)> {
+    let guard = acquire_run_mutation_guard(
+        mutation_control,
+        observation,
+        observed,
+        &format!("runner steward cancel run {}", cancellation.run_id),
+    )
+    .map_err(|error| (None, Some(error)))?;
+    match revalidate_coalescing_cancellation(
+        actions,
+        observation,
+        observed,
+        cancellation,
+        opt_out_label,
+    ) {
+        Ok(false) => {
+            return Err(finish_guard_skip(
+                guard,
+                "skipped_after_final_live_revalidation",
+            ));
+        }
+        Err(error) => {
+            return Err(finish_guard_error(
+                guard,
+                "final_revalidation_failed",
+                &error,
+            ));
+        }
+        Ok(true) => {}
+    }
+    match authoritative_head_still_superseded(
+        actions,
+        observation,
+        observed,
+        cancellation,
+        opt_out_label,
+    ) {
+        Ok(false) => {
+            return Err(finish_guard_skip(
+                guard,
+                "skipped_after_final_authority_check",
+            ));
+        }
+        Err(error) => {
+            return Err(finish_guard_error(
+                guard,
+                "final_authority_check_failed",
+                &error,
+            ));
+        }
+        Ok(true) => {}
+    }
+    let Some(pr_number) = observed
+        .pull_request_number
+        .or_else(|| merge_group_pr_number(observed))
+    else {
+        let error = format!("workflow run {} lost pull-request identity", observed.id);
+        return Err(finish_guard_error(
+            guard,
+            "final_run_identity_missing",
+            &error,
+        ));
+    };
+    match exact_run_still_queued(actions, observation, observed, cancellation, pr_number) {
+        Ok(true) => Ok(guard),
+        Ok(false) => Err(finish_guard_skip(
+            guard,
+            "skipped_after_final_exact_run_check",
+        )),
+        Err(error) => Err(finish_guard_error(
+            guard,
+            "final_exact_run_check_failed",
+            &error,
+        )),
+    }
+}
+
+fn finish_guard_skip(
+    guard: MergeQueueMutationGuard,
+    outcome: &str,
+) -> (Option<String>, Option<String>) {
+    match guard.finish(outcome) {
+        Ok(()) => (Some(outcome.to_owned()), None),
+        Err(error) => (None, Some(error)),
+    }
+}
+
+fn finish_guard_error(
+    guard: MergeQueueMutationGuard,
+    outcome: &str,
+    error: &str,
+) -> (Option<String>, Option<String>) {
+    let audit_error = guard.finish(outcome).err();
+    (
+        None,
+        Some(format!(
+            "{error}{}",
+            audit_error.map_or_else(String::new, |audit_error| format!(
+                "; mutation audit also failed: {audit_error}"
+            ))
+        )),
+    )
+}
+
+fn send_superseded_cancellation(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    cancellation: &RunCancellation,
+    ledger: &mut StewardLedger,
+    guard: MergeQueueMutationGuard,
+) -> (Option<String>, Option<String>) {
+    match actions.cancel_workflow_run(&observation.repo, cancellation.run_id) {
+        Ok(()) => {
+            if let Err(error) = guard.finish("cancel_accepted") {
+                return (
+                    Some("cancelled".to_owned()),
+                    Some(format!(
+                        "cancel accepted but mutation audit failed: {error}"
+                    )),
+                );
+            }
+            record_audit(
+                ledger,
+                &observation.repo,
+                &format!("run:{}", cancellation.run_id),
+                "cancel_revalidated_queued_run",
+            );
+            (Some("cancelled".to_owned()), None)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if definitive_cancel_rejection(&message) {
+                let audit_error = guard.finish("rejected").err();
+                return (
+                    Some("cancel_rejected".to_owned()),
+                    Some(format!(
+                        "{message}{}",
+                        audit_error.map_or_else(String::new, |audit_error| format!(
+                            "; mutation audit also failed: {audit_error}"
+                        ))
+                    )),
+                );
+            }
+            (None, Some(message))
+        }
+    }
+}
+
+fn definitive_cancel_rejection(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("http 409")
+        || lower.contains("http 422")
+        || lower.contains("already completed")
+        || lower.contains("cannot cancel")
+        || lower.contains("can't cancel")
+        || lower.contains("not in progress")
 }

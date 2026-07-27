@@ -367,7 +367,7 @@ fn stale_required_check_and_optional_work_expose_useful_progress_wedge() {
 fn release_staleness_uses_oldest_releasable_commit_age() {
     let stale = assess_release_liveness(
         "v1.0.0".to_owned(),
-        "1970-01-01T00:01:50Z".to_owned(),
+        "1970-01-01T00:00:00Z".to_owned(),
         3,
         3,
         Some("1970-01-01T00:00:00Z".to_owned()),
@@ -381,6 +381,21 @@ fn release_staleness_uses_oldest_releasable_commit_age() {
     assert!(stale.stale_with_unreleased_commits);
     assert_eq!(stale.age_secs, 120);
     assert_eq!(stale.version_unchanged, Some(false));
+    let predating_commit = assess_release_liveness(
+        "v1.0.0".to_owned(),
+        "1970-01-01T00:01:50Z".to_owned(),
+        1,
+        1,
+        Some("1970-01-01T00:00:00Z".to_owned()),
+        Some("1.1.0".to_owned()),
+        Some(0),
+        None,
+        60,
+        ts(120),
+    )
+    .expect("release");
+    assert!(!predating_commit.stale_with_unreleased_commits);
+    assert_eq!(predating_commit.age_secs, 10);
     let fresh_unreleased = assess_release_liveness(
         "v1.0.0".to_owned(),
         "1970-01-01T00:00:00Z".to_owned(),
@@ -411,6 +426,20 @@ fn release_staleness_uses_oldest_releasable_commit_age() {
     .expect("release");
     assert!(!current.stale_with_unreleased_commits);
     assert_eq!(current.version_unchanged, Some(true));
+    let future = assess_release_liveness(
+        "v1.0.0".to_owned(),
+        "1970-01-01T00:00:00Z".to_owned(),
+        1,
+        1,
+        Some("1970-01-01T00:02:01Z".to_owned()),
+        None,
+        None,
+        None,
+        60,
+        ts(120),
+    )
+    .expect_err("future commit timestamps must fail closed");
+    assert!(future.contains("is in the future"), "{future}");
 }
 
 #[test]

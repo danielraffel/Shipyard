@@ -203,7 +203,9 @@ If `governance.required_status_checks` is empty, every check observed
 on the front merge-group commit is treated as a liveness signal. The same
 report compares the latest GitHub release tag with the monitored base and
 flags when the oldest non-doc/non-changelog commit has remained unreleased past
-`--release-stale-threshold-secs` (24 hours by default). A root `VERSION` file
+`--release-stale-threshold-secs` (24 hours by default), with age measured no
+earlier than the latest release publication time. Future commit timestamps fail
+the release observation closed. A root `VERSION` file
 also exposes whether the version
 itself is unchanged.
 

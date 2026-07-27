@@ -330,7 +330,7 @@ fn write_release_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Resul
     };
     writeln!(
         stdout,
-        "  release: tag={} oldest_releasable_age_secs={} commits_ahead={} stale={} threshold={} readable={}",
+        "  release: tag={} releasable_age_secs={} commits_ahead={} stale={} threshold={} readable={}",
         report.tag,
         report.age_secs,
         report.commits_ahead,

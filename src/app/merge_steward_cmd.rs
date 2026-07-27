@@ -441,9 +441,9 @@ use cancellation_recovery::resume_pending_cancellations;
 use cancellation_revalidation::pull_request;
 use cancellation_revalidation::{
     acquire_pr_mutation_guard, acquire_run_mutation_guard, attempts_for,
-    authoritative_head_still_superseded, current_pull_request_heads, merge_group_pr_number,
-    opted_out_pull_requests, pull_request_with_required_checks, revalidate_capacity_preemption,
-    revalidate_coalescing_cancellation,
+    authoritative_head_still_superseded, current_pull_request_heads, exact_run_still_queued,
+    merge_group_pr_number, opted_out_pull_requests, pull_request_with_required_checks,
+    revalidate_capacity_preemption, revalidate_coalescing_cancellation,
 };
 use cancellation_terminalization::{
     acquire_pending_cancellation_guard, active_runner_targets, clear_pending_cancellation,

@@ -187,9 +187,9 @@ pub struct ReleaseLivenessReport {
     pub open_release_incident_issues: Option<u64>,
     /// Most recent successful auto-release workflow completion, when present.
     pub latest_successful_release_workflow_at: Option<String>,
-    /// Age of the oldest classified releasable commit, or zero when none/unknown.
+    /// Age of releasable work, bounded to begin no earlier than publication.
     pub age_secs: i64,
-    /// True when the oldest classified releasable commit exceeds policy.
+    /// True when bounded releasable-work age exceeds policy.
     pub stale_with_unreleased_commits: bool,
 }
 
@@ -207,16 +207,29 @@ pub fn assess_release_liveness(
     stale_threshold_secs: i64,
     now: DateTime<Utc>,
 ) -> Result<ReleaseLivenessReport, String> {
-    DateTime::parse_from_rfc3339(&published_at)
-        .map_err(|error| format!("invalid latest release published_at: {error}"))?;
+    let published = DateTime::parse_from_rfc3339(&published_at)
+        .map_err(|error| format!("invalid latest release published_at: {error}"))?
+        .with_timezone(&Utc);
+    if published > now {
+        return Err(format!(
+            "latest release published_at {published} is in the future"
+        ));
+    }
     let age_secs = oldest_releasable_commit_at
         .as_deref()
         .map(DateTime::parse_from_rfc3339)
         .transpose()
         .map_err(|error| format!("invalid oldest releasable commit timestamp: {error}"))?
-        .map_or(0, |committed| {
-            (now - committed.with_timezone(&Utc)).num_seconds().max(0)
+        .map(|committed| committed.with_timezone(&Utc))
+        .map_or(Ok(0), |committed| {
+            if committed > now {
+                return Err(format!(
+                    "oldest releasable commit timestamp {committed} is in the future"
+                ));
+            }
+            Ok((now - committed.max(published)).num_seconds().max(0))
         });
+    let age_secs = age_secs?;
     let has_releasable_timestamp = oldest_releasable_commit_at.is_some();
     let released_version = tag.trim_start_matches('v').to_owned();
     let version_unchanged = base_version

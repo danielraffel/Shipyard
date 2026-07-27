@@ -1237,3 +1237,131 @@ esac
     assert_eq!(calls.matches("pr view 42").count(), 3, "{calls}");
     assert!(!calls.contains("actions/runs/1/cancel"), "{calls}");
 }
+
+#[cfg(unix)]
+#[test]
+fn superseded_head_cancel_is_rejected_if_exact_run_starts_after_authority_read() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[]}}' ;;
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  *"actions/runs?status=queued"*)
+    printf '%s' '{{"workflow_runs":[{{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}]}}' ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  "api repos/owner/repo/actions/runs/1")
+    if [ "$(grep -c '^api repos/owner/repo/actions/runs/1$' '{}')" -le 2 ]; then
+      status="queued"
+    else
+      status="in_progress"
+    fi
+    printf '%s' '{{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"'"$status"'","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+  *"actions/runs/1/cancel"*) echo "unexpected cancel" >&2; exit 2 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            log.display(),
+            log.display()
+        ),
+    );
+    let mut pr = ready_pr();
+    pr.fact.head_sha = "b".repeat(40);
+    let mut observation = observation_for(pr, true);
+    observation.runs = vec![queued_run(1, "2026-07-26T00:00:00Z")];
+    let cancellation = RunCancellation {
+        run_id: 1,
+        reason: RunCancellationReason::SupersededPullRequestHead,
+    };
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+
+    let (mutation, error) = apply_run_cancellation(
+        &actions,
+        &observation,
+        &cancellation,
+        "steward:skip",
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        &mutation_control,
+    );
+
+    assert_eq!(
+        mutation.as_deref(),
+        Some("skipped_after_final_exact_run_check")
+    );
+    assert!(error.is_none(), "{error:?}");
+    let calls = fs::read_to_string(log).expect("calls");
+    assert_eq!(
+        calls
+            .matches("api repos/owner/repo/actions/runs/1\n")
+            .count(),
+        3,
+        "{calls}"
+    );
+    assert!(!calls.contains("actions/runs/1/cancel"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn definitive_superseded_cancel_rejection_finishes_guard_without_uncertainty() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  "pr view "*)
+    printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[]}' ;;
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{"data":{"repository":{"mergeQueue":null}}}' ;;
+  *"actions/runs?status=queued"*)
+    printf '%s' '{"workflow_runs":[{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}]}' ;;
+  *"actions/runs?status="*) printf '%s' '{"workflow_runs":[]}' ;;
+  "api repos/owner/repo/actions/runs/1")
+    printf '%s' '{"id":1,"workflow_id":77,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"queued","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{"number":42}]}' ;;
+  *"actions/runs/1/cancel"*) echo "HTTP 422: Cannot cancel a completed workflow run" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let mut pr = ready_pr();
+    pr.fact.head_sha = "b".repeat(40);
+    let mut observation = observation_for(pr, true);
+    observation.runs = vec![queued_run(1, "2026-07-26T00:00:00Z")];
+    let cancellation = RunCancellation {
+        run_id: 1,
+        reason: RunCancellationReason::SupersededPullRequestHead,
+    };
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+
+    let (mutation, error) = apply_run_cancellation(
+        &actions,
+        &observation,
+        &cancellation,
+        "steward:skip",
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        &mutation_control,
+    );
+
+    assert_eq!(mutation.as_deref(), Some("cancel_rejected"));
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|message| message.contains("HTTP 422")),
+        "{error:?}"
+    );
+    let state_root = mutation_control.store.path().parent().expect("state root");
+    assert!(
+        crate::merge_queue_control::uncertain_mutations(state_root)
+            .expect("uncertainties")
+            .is_empty()
+    );
+}
