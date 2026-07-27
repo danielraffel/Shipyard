@@ -291,14 +291,17 @@ esac
         "commits": [
             {
                 "sha": "source",
-                "commit": {"message": "bot\n\nRelease: skip reason=\"generated release\""}
+                "commit": {"message": "feat: source behavior"}
             },
-            {"sha": "docs", "commit": {"message": "docs"}}
+            {
+                "sha": "docs",
+                "commit": {"message": "docs\n\nRelease: skip reason=\"generated release\""}
+            },
         ]
     });
     assert_eq!(
         count_releasable_commits(&actions, "owner/repo", &mixed, 2).expect("complete comparison"),
-        (0, false)
+        (1, false)
     );
 }
 
@@ -500,6 +503,7 @@ fn enrollment_snapshot_preserves_authoritative_reentry_timestamp() {
         position: 0,
         head_sha: Some("aaa".to_owned()),
         enqueued_at: Some("2026-07-26T12:00:00Z".to_owned()),
+        head_observed_at: None,
     }];
 
     reconcile_enrollment_snapshot(
@@ -515,6 +519,124 @@ fn enrollment_snapshot_preserves_authoritative_reentry_timestamp() {
     assert_eq!(
         entries[0].enqueued_at.as_deref(),
         Some("2026-07-26T12:00:00Z")
+    );
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(path).expect("persisted enrollment snapshot"))
+            .expect("snapshot JSON");
+    assert_eq!(
+        persisted["entries"][0]["head_observed_at"],
+        entries[0]
+            .head_observed_at
+            .as_deref()
+            .expect("head observation timestamp")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_snapshot_resets_head_age_when_exact_head_changes() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, "echo unexpected >&2; exit 2");
+    let path = enrollment_snapshot_path(temp.path(), "owner/repo", "main");
+    fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    fs::write(
+        &path,
+        r#"{"entries":[{"pr":11,"head_sha":"old","observed_at":"2026-07-25T00:00:00Z","head_observed_at":"2026-07-25T00:01:00Z"}]}"#,
+    )
+    .expect("snapshot");
+    let mut entries = vec![crate::merge_queue_liveness::MergeQueueEntry {
+        pr: 11,
+        position: 0,
+        head_sha: Some("new".to_owned()),
+        enqueued_at: Some("2026-07-25T00:00:00Z".to_owned()),
+        head_observed_at: None,
+    }];
+
+    reconcile_enrollment_snapshot(
+        &actions,
+        "owner/repo",
+        "main",
+        temp.path(),
+        &mut entries,
+        true,
+    )
+    .expect("reconcile");
+
+    assert_ne!(
+        entries[0].head_observed_at.as_deref(),
+        Some("2026-07-25T00:01:00Z")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_snapshot_preserves_head_age_for_same_enrollment_and_head() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, "echo unexpected >&2; exit 2");
+    let path = enrollment_snapshot_path(temp.path(), "owner/repo", "main");
+    fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    fs::write(
+        &path,
+        r#"{"entries":[{"pr":11,"head_sha":"same","enqueued_at":"2026-07-25T00:00:00Z","head_observed_at":"2026-07-25T00:01:00Z"}]}"#,
+    )
+    .expect("snapshot");
+    let mut entries = vec![crate::merge_queue_liveness::MergeQueueEntry {
+        pr: 11,
+        position: 0,
+        head_sha: Some("same".to_owned()),
+        enqueued_at: Some("2026-07-25T00:00:00Z".to_owned()),
+        head_observed_at: None,
+    }];
+
+    reconcile_enrollment_snapshot(
+        &actions,
+        "owner/repo",
+        "main",
+        temp.path(),
+        &mut entries,
+        true,
+    )
+    .expect("reconcile");
+
+    assert_eq!(
+        entries[0].head_observed_at.as_deref(),
+        Some("2026-07-25T00:01:00Z")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_snapshot_resets_head_age_when_enrollment_changes() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, "echo unexpected >&2; exit 2");
+    let path = enrollment_snapshot_path(temp.path(), "owner/repo", "main");
+    fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    fs::write(
+        &path,
+        r#"{"entries":[{"pr":11,"head_sha":"same","observed_at":"2026-07-25T00:00:00Z","head_observed_at":"2026-07-25T00:01:00Z"}]}"#,
+    )
+    .expect("snapshot");
+    let mut entries = vec![crate::merge_queue_liveness::MergeQueueEntry {
+        pr: 11,
+        position: 0,
+        head_sha: Some("same".to_owned()),
+        enqueued_at: Some("2026-07-26T00:00:00Z".to_owned()),
+        head_observed_at: None,
+    }];
+
+    reconcile_enrollment_snapshot(
+        &actions,
+        "owner/repo",
+        "main",
+        temp.path(),
+        &mut entries,
+        true,
+    )
+    .expect("reconcile");
+
+    assert_ne!(
+        entries[0].head_observed_at.as_deref(),
+        Some("2026-07-25T00:01:00Z")
     );
 }
 

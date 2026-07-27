@@ -22,7 +22,10 @@ struct EnrollmentSnapshot {
 struct EnrollmentSnapshotEntry {
     pr: u64,
     head_sha: Option<String>,
-    observed_at: String,
+    #[serde(alias = "observed_at")]
+    enqueued_at: String,
+    #[serde(default)]
+    head_observed_at: Option<String>,
     #[serde(default)]
     auto_merge_cleared: bool,
     #[serde(default)]
@@ -117,6 +120,19 @@ pub(super) fn reconcile_enrollment_snapshot(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => EnrollmentSnapshot::default(),
         Err(error) => return Err(format!("read fleet enrollment snapshot failed: {error}")),
     };
+    let observed_now = Utc::now().to_rfc3339();
+    for entry in entries.iter_mut() {
+        let previous_entry = previous.entries.iter().find(|candidate| {
+            candidate.pr == entry.pr
+                && candidate.head_sha == entry.head_sha
+                && entry.enqueued_at.as_deref() == Some(candidate.enqueued_at.as_str())
+        });
+        entry.head_observed_at = Some(
+            previous_entry
+                .and_then(|candidate| candidate.head_observed_at.clone())
+                .unwrap_or_else(|| observed_now.clone()),
+        );
+    }
     let current = entries
         .iter()
         .map(|entry| entry.pr)
@@ -134,12 +150,12 @@ pub(super) fn reconcile_enrollment_snapshot(
     candidates.sort_by(|left, right| {
         left.last_checked_at
             .as_deref()
-            .unwrap_or(&left.observed_at)
+            .unwrap_or(&left.enqueued_at)
             .cmp(
                 right
                     .last_checked_at
                     .as_deref()
-                    .unwrap_or(&right.observed_at),
+                    .unwrap_or(&right.enqueued_at),
             )
     });
     let mut truncated = false;
@@ -181,7 +197,8 @@ pub(super) fn reconcile_enrollment_snapshot(
             retained.push(EnrollmentSnapshotEntry {
                 pr: previous_entry.pr,
                 head_sha: previous_entry.head_sha,
-                observed_at: previous_entry.observed_at,
+                enqueued_at: previous_entry.enqueued_at,
+                head_observed_at: previous_entry.head_observed_at,
                 auto_merge_cleared: pull.get("auto_merge").is_none_or(Value::is_null),
                 last_checked_at: Some(Utc::now().to_rfc3339()),
             });
@@ -196,10 +213,11 @@ pub(super) fn reconcile_enrollment_snapshot(
             .map(|entry| EnrollmentSnapshotEntry {
                 pr: entry.pr,
                 head_sha: entry.head_sha.clone(),
-                observed_at: entry
+                enqueued_at: entry
                     .enqueued_at
                     .clone()
-                    .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                    .unwrap_or_else(|| observed_now.clone()),
+                head_observed_at: entry.head_observed_at.clone(),
                 auto_merge_cleared: false,
                 last_checked_at: None,
             })

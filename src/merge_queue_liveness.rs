@@ -21,6 +21,9 @@ pub struct MergeQueueEntry {
     pub head_sha: Option<String>,
     /// Time at which GitHub enqueued the entry.
     pub enqueued_at: Option<String>,
+    /// First durable observation of this exact merge-group head within the
+    /// current queue enrollment.
+    pub head_observed_at: Option<String>,
 }
 
 /// One check run observed on the front merge-group commit.
@@ -306,6 +309,7 @@ pub fn parse_merge_queue_entries(body: &Value) -> Result<Vec<MergeQueueEntry>, S
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
+            head_observed_at: None,
         });
     }
     entries.sort_by_key(|entry| entry.position);
@@ -369,10 +373,17 @@ pub fn assess_merge_queue_liveness(
     } = inputs;
     let front = entries.iter().min_by_key(|entry| entry.position).cloned();
     let front_old_enough = front.as_ref().is_some_and(|entry| {
-        entry.enqueued_at.as_deref().is_some_and(|enqueued_at| {
-            DateTime::parse_from_rfc3339(enqueued_at).is_ok_and(|enqueued| {
-                (now - enqueued.with_timezone(&Utc)).num_seconds() >= stall_threshold_secs.max(0)
-            })
+        [
+            entry.enqueued_at.as_deref(),
+            entry.head_observed_at.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .max()
+        .is_some_and(|liveness_started_at| {
+            (now - liveness_started_at).num_seconds() >= stall_threshold_secs.max(0)
         })
     });
     let current_checks = current_check_observations(checks);
@@ -639,6 +650,7 @@ mod tests {
             position: 0,
             head_sha: Some("aaa".to_owned()),
             enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: None,
         }];
         let checks = vec![CheckObservation {
             name: "macOS".to_owned(),
@@ -670,6 +682,7 @@ mod tests {
             position: 0,
             head_sha: Some("aaa".to_owned()),
             enqueued_at: Some("1970-01-01T00:01:30Z".to_owned()),
+            head_observed_at: None,
         }];
         for checks in [
             Vec::new(),
@@ -699,12 +712,39 @@ mod tests {
     }
 
     #[test]
+    fn newly_observed_exact_head_gets_its_own_stall_grace() {
+        let entries = vec![MergeQueueEntry {
+            pr: 11,
+            position: 0,
+            head_sha: Some("new-head".to_owned()),
+            enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: Some("1970-01-01T00:01:30Z".to_owned()),
+        }];
+        let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
+            entries: &entries,
+            checks: &[],
+            active_runs: &[],
+            required_contexts: &["macOS".to_owned()],
+            eligible_host_classes: &["m5".to_owned()],
+            routable_free_slots: 1,
+            stall_threshold_secs: 60,
+            now: ts(120),
+            enrollment_cleared_prs: &[],
+            observation_truncated: false,
+        });
+
+        assert_eq!(report.reason_codes, [LivenessReason::NormalSerialWait]);
+        assert!(!report.needs_attention());
+    }
+
+    #[test]
     fn aged_front_with_no_configured_or_observed_checks_alerts() {
         let entries = vec![MergeQueueEntry {
             pr: 11,
             position: 0,
             head_sha: Some("aaa".to_owned()),
             enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: None,
         }];
         let report = assess_merge_queue_liveness(MergeQueueLivenessInputs {
             entries: &entries,
@@ -734,6 +774,7 @@ mod tests {
             position: 0,
             head_sha: Some("aaa".to_owned()),
             enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: None,
         }];
         let checks = vec![CheckObservation {
             name: "macOS".to_owned(),
@@ -778,12 +819,14 @@ mod tests {
                 position: 0,
                 head_sha: Some("aaa".to_owned()),
                 enqueued_at: None,
+                head_observed_at: None,
             },
             MergeQueueEntry {
                 pr: 22,
                 position: 1,
                 head_sha: Some("bbb".to_owned()),
                 enqueued_at: None,
+                head_observed_at: None,
             },
         ];
         let run = |id, pr, runner: &str| ActiveRunObservation {
@@ -828,6 +871,7 @@ mod tests {
             position: 0,
             head_sha: None,
             enqueued_at: None,
+            head_observed_at: None,
         }];
         let run = ActiveRunObservation {
             run_id: 9,
@@ -867,6 +911,7 @@ mod tests {
             position: 0,
             head_sha: Some("aaa".to_owned()),
             enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: None,
         }];
         let checks = vec![CheckObservation {
             name: "macos".to_owned(),
@@ -954,6 +999,7 @@ mod tests {
             position: 0,
             head_sha: Some("aaa".to_owned()),
             enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: None,
         }];
         let checks = vec![
             CheckObservation {
@@ -1030,6 +1076,7 @@ mod tests {
             position: 0,
             head_sha: Some("aaa".to_owned()),
             enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: None,
         }];
         let checks = vec![CheckObservation {
             name: "macos".to_owned(),
@@ -1071,6 +1118,7 @@ mod tests {
             position: 0,
             head_sha: Some("aaa".to_owned()),
             enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: None,
         }];
         let checks = vec![CheckObservation {
             name: "macos".to_owned(),
@@ -1165,6 +1213,7 @@ mod tests {
             position: 0,
             head_sha: Some("new-head".to_owned()),
             enqueued_at: Some("1970-01-01T00:00:00Z".to_owned()),
+            head_observed_at: None,
         }];
         let old_run = ActiveRunObservation {
             run_id: 77,
