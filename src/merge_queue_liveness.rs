@@ -610,15 +610,25 @@ fn job_is_on_eligible_host(job: &JobObservation, classes: &[String]) -> bool {
         .iter()
         .chain(job.labels.iter())
         .any(|value| {
-            let tokens = value
-                .split(|character: char| !character.is_ascii_alphanumeric())
-                .filter(|token| !token.is_empty());
-            tokens.into_iter().any(|token| {
-                classes
-                    .iter()
-                    .any(|class| token.eq_ignore_ascii_case(class))
-            })
+            classes
+                .iter()
+                .any(|class| delimited_class_match(value, class))
         })
+}
+
+fn delimited_class_match(value: &str, class: &str) -> bool {
+    let value = value.as_bytes();
+    let class = class.as_bytes();
+    !class.is_empty()
+        && value
+            .windows(class.len())
+            .enumerate()
+            .any(|(start, window)| {
+                let end = start + class.len();
+                window.eq_ignore_ascii_case(class)
+                    && (start == 0 || !value[start - 1].is_ascii_alphanumeric())
+                    && (end == value.len() || !value[end].is_ascii_alphanumeric())
+            })
 }
 
 #[cfg(test)]

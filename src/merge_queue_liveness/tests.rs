@@ -680,6 +680,30 @@ fn enrollment_loss_is_stable_attention_reason() {
 }
 
 #[test]
+fn punctuated_host_classes_match_only_at_delimiter_boundaries() {
+    let punctuated = JobObservation {
+        name: "macOS".to_owned(),
+        status: "in_progress".to_owned(),
+        runner_name: Some("pulp-vm-m5-blackbook-01".to_owned()),
+        labels: vec!["pulp-build-m5-blackbook".to_owned()],
+    };
+    assert!(job_is_on_eligible_host(
+        &punctuated,
+        &["m5-blackbook".to_owned()]
+    ));
+
+    let partial = JobObservation {
+        runner_name: Some("pulp-vm-m5-blackbookish-01".to_owned()),
+        labels: vec!["pulp-build-m5-blackbookish".to_owned()],
+        ..punctuated
+    };
+    assert!(!job_is_on_eligible_host(
+        &partial,
+        &["m5-blackbook".to_owned()]
+    ));
+}
+
+#[test]
 fn merge_group_parser_uses_final_pr_marker_for_slash_base() {
     assert_eq!(
         merge_group_pr("gh-readonly-queue/release/pr-preview/pr-42-deadbeef"),

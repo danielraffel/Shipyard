@@ -6,9 +6,9 @@ use super::{
     PendingMutationKind, PendingRunState, RunCancellation, RunCancellationReason, StewardLedger,
     Utc, acquire_pending_cancellation_guard, active_runner_targets,
     cancel_capacity_preemption_after_revalidation, clear_pending_cancellation,
-    mark_cancellation_skipped, observe_repo, persist_capacity_evidence,
-    persist_force_cancel_intent, read_current_pending_run_identity, read_pending_run, record_audit,
-    revalidate_capacity_preemption, save_ledger, thread,
+    finish_force_cancel_revalidation_failure, mark_cancellation_skipped, observe_repo,
+    persist_capacity_evidence, persist_force_cancel_intent, read_current_pending_run_identity,
+    read_pending_run, record_audit, revalidate_capacity_preemption, save_ledger, thread,
 };
 
 pub(super) fn resume_pending_cancellations(
@@ -116,66 +116,102 @@ pub(super) fn resume_pending_cancellation(
                 )?;
                 return Ok("recovered_normal_cancel_terminal".to_owned());
             };
-            let targets = active_runner_targets(&active.jobs);
-            persist_force_cancel_intent(
-                ledger,
+            resume_force_cancel_after_normal_wait(
+                actions,
                 ledger_path,
-                &pending.repo,
-                pending.run_id,
-                &active.status,
-                &targets,
-            )
-            .map_err(|error| error.message)?;
-            let intent = DurableMutationIntent::new();
-            persist_pending_mutation_correlation(
                 ledger,
-                ledger_path,
-                key,
-                intent.correlation_id(),
-                PendingMutationKind::ForceCancel,
-                "pending_force_cancel_intent",
-            )?;
-            let guard = acquire_pending_cancellation_guard(
                 mutation_control,
+                key,
                 pending,
-                &format!("runner steward resume force-cancel run {}", pending.run_id),
-                &intent,
-            )?;
-            read_current_pending_run_identity(actions, pending)?;
-            actions
-                .force_cancel_workflow_run(&pending.repo, pending.run_id)
-                .map_err(|error| format!("exact force-cancel failed: {error}"))?;
-            guard
-                .finish("force_cancel_accepted")
-                .map_err(|error| format!("force-cancel mutation audit failed: {error}"))?;
-            record_audit(
-                ledger,
-                &pending.repo,
-                &format!("capacity-run:{}", pending.run_id),
-                "pending_force_cancel_accepted",
-            );
-            save_ledger(ledger_path, ledger).map_err(|error| {
-                format!(
-                    "force-cancel accepted but recovery audit persistence failed: {}",
-                    error.message
-                )
-            })?;
-            match wait_for_pending_terminalization(actions, pending)? {
-                None => clear_pending_cancellation(
-                    ledger,
-                    ledger_path,
-                    key,
-                    pending,
-                    "pending_force_cancel_terminalized",
-                )
-                .map(|()| "recovered_force_cancel_terminal".to_owned()),
-                Some(still_active) => Err(format!(
-                    "exact force-cancel accepted but run remains {} with active={}",
-                    still_active.status,
-                    active_runner_targets(&still_active.jobs)
-                )),
-            }
+                &active,
+            )
         }
+    }
+}
+
+pub(super) fn resume_force_cancel_after_normal_wait(
+    actions: &GitHubActions,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    mutation_control: &MutationControl,
+    key: &str,
+    pending: &PendingCancellation,
+    active: &NonTerminalRun,
+) -> Result<String, String> {
+    let targets = active_runner_targets(&active.jobs);
+    persist_force_cancel_intent(
+        ledger,
+        ledger_path,
+        &pending.repo,
+        pending.run_id,
+        &active.status,
+        &targets,
+    )
+    .map_err(|error| error.message)?;
+    let intent = DurableMutationIntent::new();
+    persist_pending_mutation_correlation(
+        ledger,
+        ledger_path,
+        key,
+        intent.correlation_id(),
+        PendingMutationKind::ForceCancel,
+        "pending_force_cancel_intent",
+    )?;
+    let guard = acquire_pending_cancellation_guard(
+        mutation_control,
+        pending,
+        &format!("runner steward resume force-cancel run {}", pending.run_id),
+        &intent,
+    )?;
+    if let Err(error) = read_current_pending_run_identity(actions, pending) {
+        let audit_error = finish_force_cancel_revalidation_failure(
+            guard,
+            ledger,
+            ledger_path,
+            &pending.repo,
+            pending.run_id,
+            "pending_force_cancel_revalidation_failed",
+        )
+        .err();
+        return Err(format!(
+            "exact force-cancel attempt revalidation failed: {error}{}",
+            audit_error.map_or_else(String::new, |audit_error| format!(
+                "; rejection audit also failed: {audit_error}"
+            ))
+        ));
+    }
+    actions
+        .force_cancel_workflow_run(&pending.repo, pending.run_id)
+        .map_err(|error| format!("exact force-cancel failed: {error}"))?;
+    guard
+        .finish("force_cancel_accepted")
+        .map_err(|error| format!("force-cancel mutation audit failed: {error}"))?;
+    record_audit(
+        ledger,
+        &pending.repo,
+        &format!("capacity-run:{}", pending.run_id),
+        "pending_force_cancel_accepted",
+    );
+    save_ledger(ledger_path, ledger).map_err(|error| {
+        format!(
+            "force-cancel accepted but recovery audit persistence failed: {}",
+            error.message
+        )
+    })?;
+    match wait_for_pending_terminalization(actions, pending)? {
+        None => clear_pending_cancellation(
+            ledger,
+            ledger_path,
+            key,
+            pending,
+            "pending_force_cancel_terminalized",
+        )
+        .map(|()| "recovered_force_cancel_terminal".to_owned()),
+        Some(still_active) => Err(format!(
+            "exact force-cancel accepted but run remains {} with active={}",
+            still_active.status,
+            active_runner_targets(&still_active.jobs)
+        )),
     }
 }
 

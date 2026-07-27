@@ -1,12 +1,15 @@
 use super::*;
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::cancellation::{apply_pr_plans, apply_run_cancellation};
-use crate::app::merge_steward_cmd::cancellation_recovery::resume_pending_cancellation;
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::cancellation_recovery::{
     pending_uncertainty, resolve_rejected_pending_intent,
 };
+use crate::app::merge_steward_cmd::cancellation_recovery::{
+    resume_force_cancel_after_normal_wait, resume_pending_cancellation,
+};
 use crate::app::merge_steward_cmd::cancellation_revalidation::same_workflow_attempt;
+use crate::app::merge_steward_cmd::cancellation_terminalization::force_cancel_nonterminal_run;
 use crate::app::merge_steward_cmd::capacity_cancellation::{
     pending_cancellation_key, start_capacity_preemption,
 };
@@ -295,6 +298,162 @@ fn capacity_revalidation_rejects_a_new_workflow_attempt() {
     rerun.run_attempt += 1;
 
     assert!(!same_workflow_attempt(&observed, &rerun));
+}
+
+#[cfg(unix)]
+#[test]
+fn initial_force_cancel_revalidation_failure_is_durably_rejected_before_post() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("calls");
+    let actions = mismatched_force_cancel_identity(&temp, &calls);
+    let control = mutation_control(&temp, "studio", "studio");
+    let pending = pending_cancellation_record();
+    let key = pending_cancellation_key(&pending);
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger {
+        pending_cancellations: BTreeMap::from([(key, pending.clone())]),
+        ..StewardLedger::default()
+    };
+    save_ledger(&ledger_path, &ledger).expect("seed ledger");
+    let observation = observation_for(ready_pr(), true);
+    let cancellation = RunCancellation {
+        run_id: 100,
+        reason: RunCancellationReason::AdvisoryPreambleCapacityTheft,
+    };
+    let context = CapacityApplyContext {
+        actions: &actions,
+        observation: &observation,
+        cancellation: &cancellation,
+        ledger_path: &ledger_path,
+        mutation_control: &control,
+    };
+    let active = NonTerminalRun {
+        status: "in_progress".to_owned(),
+        jobs: Vec::new(),
+    };
+
+    let (mutation, error) =
+        force_cancel_nonterminal_run(&context, pending.run_id, &active, &mut ledger);
+
+    assert_eq!(mutation.as_deref(), Some("cancel_not_terminal"));
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|message| message.contains("revalidation failed")),
+        "{error:?}"
+    );
+    assert_force_cancel_revalidation_rejected(
+        &calls,
+        &control,
+        &ledger_path,
+        &ledger,
+        "force_cancel_revalidation_failed",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn recovered_force_cancel_revalidation_failure_is_durably_rejected_before_post() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("calls");
+    let actions = mismatched_force_cancel_identity(&temp, &calls);
+    let control = mutation_control(&temp, "studio", "studio");
+    let pending = pending_cancellation_record();
+    let key = pending_cancellation_key(&pending);
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger {
+        pending_cancellations: BTreeMap::from([(key.clone(), pending.clone())]),
+        ..StewardLedger::default()
+    };
+    save_ledger(&ledger_path, &ledger).expect("seed ledger");
+    let active = NonTerminalRun {
+        status: "in_progress".to_owned(),
+        jobs: Vec::new(),
+    };
+
+    let error = resume_force_cancel_after_normal_wait(
+        &actions,
+        &ledger_path,
+        &mut ledger,
+        &control,
+        &key,
+        &pending,
+        &active,
+    )
+    .expect_err("identity drift must reject force-cancel");
+
+    assert!(error.contains("revalidation failed"), "{error}");
+    assert_force_cancel_revalidation_rejected(
+        &calls,
+        &control,
+        &ledger_path,
+        &ledger,
+        "pending_force_cancel_revalidation_failed",
+    );
+}
+
+#[cfg(unix)]
+fn mismatched_force_cancel_identity(temp: &tempfile::TempDir, calls: &Path) -> GitHubActions {
+    fake_gh(
+        temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  "api repos/owner/repo/actions/runs/100")
+    printf '%s' '{{"id":100,"workflow_id":77,"run_attempt":2,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"in_progress","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
+  *"/force-cancel") echo "force-cancel POST must not run" >&2; exit 90 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn assert_force_cancel_revalidation_rejected(
+    calls: &Path,
+    control: &MutationControl,
+    ledger_path: &Path,
+    ledger: &StewardLedger,
+    expected_action: &str,
+) {
+    let calls = fs::read_to_string(calls).expect("calls");
+    assert!(!calls.contains("/force-cancel"), "{calls}");
+    let pending = ledger
+        .pending_cancellations
+        .values()
+        .next()
+        .expect("pending force-cancel");
+    assert!(
+        !DurableMutationIntent::resume(&pending.mutation_correlation_id)
+            .expect("durable intent")
+            .is_uncertain(control.store.path().parent().expect("state root"))
+            .expect("uncertainty")
+    );
+    assert!(
+        crate::merge_queue_control::uncertain_mutations(
+            control.store.path().parent().expect("state root")
+        )
+        .expect("global uncertainty")
+        .is_empty()
+    );
+    assert!(
+        ledger
+            .audit
+            .iter()
+            .any(|entry| entry.action == expected_action),
+        "missing {expected_action}"
+    );
+    let persisted = load_ledger(ledger_path).expect("persisted rejection audit");
+    assert!(
+        persisted
+            .audit
+            .iter()
+            .any(|entry| entry.action == expected_action),
+        "missing persisted {expected_action}"
+    );
 }
 
 #[test]

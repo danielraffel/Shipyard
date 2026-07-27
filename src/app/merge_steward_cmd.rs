@@ -447,8 +447,9 @@ use cancellation_revalidation::{
 };
 use cancellation_terminalization::{
     acquire_pending_cancellation_guard, active_runner_targets, clear_pending_cancellation,
-    complete_capacity_cancellation, persist_force_cancel_intent, read_current_pending_run_identity,
-    read_pending_run, validate_pending_cancellation_authority,
+    complete_capacity_cancellation, finish_force_cancel_revalidation_failure,
+    persist_force_cancel_intent, read_current_pending_run_identity, read_pending_run,
+    validate_pending_cancellation_authority,
 };
 use capacity_cancellation::{
     CapacityCancelError, apply_capacity_preemption, cancel_capacity_preemption_after_revalidation,

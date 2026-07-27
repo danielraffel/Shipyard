@@ -329,12 +329,7 @@ pub(super) fn force_cancel_nonterminal_run(
         }
     };
     if let Err(error) = revalidate_force_cancel_attempt(context, ledger, run_id) {
-        return (
-            Some("cancel_not_terminal".to_owned()),
-            Some(format!(
-                "exact force-cancel attempt revalidation failed: {error}"
-            )),
-        );
+        return reject_initial_force_cancel_revalidation(guard, context, ledger, run_id, &error);
     }
     if let Err(error) = context
         .actions
@@ -377,6 +372,33 @@ pub(super) fn force_cancel_nonterminal_run(
         );
     }
     verify_force_cancel_terminalization(context, run_id, ledger)
+}
+
+fn reject_initial_force_cancel_revalidation(
+    guard: MergeQueueMutationGuard,
+    context: &CapacityApplyContext<'_>,
+    ledger: &mut StewardLedger,
+    run_id: u64,
+    error: &str,
+) -> (Option<String>, Option<String>) {
+    let audit_error = finish_force_cancel_revalidation_failure(
+        guard,
+        ledger,
+        context.ledger_path,
+        &context.observation.repo,
+        run_id,
+        "force_cancel_revalidation_failed",
+    )
+    .err();
+    (
+        Some("cancel_not_terminal".to_owned()),
+        Some(format!(
+            "exact force-cancel attempt revalidation failed: {error}{}",
+            audit_error.map_or_else(String::new, |audit_error| format!(
+                "; rejection audit also failed: {audit_error}"
+            ))
+        )),
+    )
 }
 
 pub(super) fn revalidate_force_cancel_attempt(
@@ -506,6 +528,28 @@ pub(super) fn audit_force_cancel_failure(
         "force_cancel_failed",
     );
     let _ = save_ledger(ledger_path, ledger);
+}
+
+pub(super) fn finish_force_cancel_revalidation_failure(
+    guard: MergeQueueMutationGuard,
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    repo: &str,
+    run_id: u64,
+    action: &str,
+) -> Result<(), String> {
+    let mutation_audit_error = guard.finish(action).err();
+    record_audit(ledger, repo, &format!("capacity-run:{run_id}"), action);
+    let ledger_audit_error = save_ledger(ledger_path, ledger).err();
+    match (mutation_audit_error, ledger_audit_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(format!("mutation audit failed: {error}")),
+        (None, Some(error)) => Err(format!("ledger audit failed: {}", error.message)),
+        (Some(mutation), Some(ledger)) => Err(format!(
+            "mutation audit failed: {mutation}; ledger audit failed: {}",
+            ledger.message
+        )),
+    }
 }
 
 pub(super) fn persist_force_cancel_intent(
