@@ -14,7 +14,9 @@ It is audit-only unless `--apply` is present. The apply path uses GitHub's
 server-owned exact-head guard for queue admission, preserves existing native
 merge-queue positions, does not rerun genuine failures, limits transient
 reruns durably, and live-revalidates queued state plus immutable head before
-cancelling a duplicate or superseded run. Repositories without a server-owned
+cancelling a run whose PR or merge-group head is provably superseded.
+Same-head duplicate runs are never cancelled because their unobserved inputs
+may differ. Repositories without a server-owned
 merge queue receive a typed `direct_merge_refused` decision: the REST merge
 endpoint cannot atomically prove complete required-check materialization or
 bind the validated base revision. Use manual merge or enable a native merge

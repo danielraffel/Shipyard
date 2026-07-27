@@ -444,7 +444,10 @@ pub struct StewardJob {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunCancellationReason {
-    /// Same workflow and immutable SHA already has a preferred run.
+    /// Legacy non-authorizing value retained for backwards-compatible reports.
+    ///
+    /// Same-head runs can differ in inputs that GitHub's run observation does
+    /// not expose, so this reason must never authorize cancellation.
     DuplicateImmutableHead,
     /// Pull-request branch has advanced to a different immutable head.
     SupersededPullRequestHead,
@@ -654,10 +657,12 @@ fn preemption_rank(reason: RunCancellationReason) -> u8 {
     }
 }
 
-/// Plan queued-run coalescing.
+/// Plan queued-run supersedence cleanup.
 ///
 /// In-progress work is never cancelled. Push/schedule runs are never touched.
-/// The planner only acts on immutable, full-SHA PR/merge-group observations.
+/// The planner only acts when a PR or merge-group run's immutable full SHA is
+/// different from the corresponding current authoritative head. Same-head
+/// duplicates are deliberately left to GitHub.
 #[must_use]
 pub fn plan_run_coalescing(
     runs: &[StewardRun],
@@ -691,51 +696,21 @@ pub fn plan_run_coalescing(
         }
     }
 
-    let mut groups = BTreeMap::<(String, u64, String, u64), Vec<&StewardRun>>::new();
-    for run in runs {
-        let Some(pr_number) = run_pull_request_number(run) else {
-            continue;
-        };
-        if matches!(run.event.as_str(), "pull_request" | "merge_group")
-            && is_full_sha(&run.head_sha)
-            && !opted_out_pull_requests.contains(&pr_number)
-        {
-            groups
-                .entry((
-                    run.event.clone(),
-                    run.workflow_id,
-                    run.head_sha.to_ascii_lowercase(),
-                    pr_number,
-                ))
-                .or_default()
-                .push(run);
-        }
-    }
-    for group in groups.values_mut() {
-        if group.len() < 2 {
-            continue;
-        }
-        group.sort_by(|left, right| {
-            let left_running = left.status.eq_ignore_ascii_case("in_progress");
-            let right_running = right.status.eq_ignore_ascii_case("in_progress");
-            right_running
-                .cmp(&left_running)
-                .then_with(|| right.created_at.cmp(&left.created_at))
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        let retained_id = group[0].id;
-        for duplicate in group.iter().skip(1) {
-            if duplicate.id != retained_id && duplicate.status.eq_ignore_ascii_case("queued") {
-                reasons
-                    .entry(duplicate.id)
-                    .or_insert(RunCancellationReason::DuplicateImmutableHead);
-            }
-        }
-    }
     reasons
         .into_iter()
         .map(|(run_id, reason)| RunCancellation { run_id, reason })
         .collect()
+}
+
+/// Whether a coalescing reason proves immutable-head supersedence strongly
+/// enough to authorize GitHub cancellation.
+#[must_use]
+pub fn coalescing_reason_authorizes(reason: RunCancellationReason) -> bool {
+    matches!(
+        reason,
+        RunCancellationReason::SupersededPullRequestHead
+            | RunCancellationReason::SupersededMergeGroupHead
+    )
 }
 
 fn run_pull_request_number(run: &StewardRun) -> Option<u64> {

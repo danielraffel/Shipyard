@@ -92,7 +92,9 @@ shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
 shipyard runner steward --apply                     # exact-head, green-gated mutations
 shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
 
-`runner steward` is read-only unless `--apply` is present. Apply mode requires
+`runner steward` is read-only unless `--apply` is present. Same-head duplicate
+runs are never cancelled; cancellation authority requires an immutable PR or
+merge-group head that differs from GitHub's current head. Apply mode requires
 the trusted machine-global `[merge_queue].mutation_machine`, rejects the
 central merge-queue `HOLD`, and serializes plus write-ahead audits every
 enqueue, rerun, and cancellation through the shared mutation guard. A

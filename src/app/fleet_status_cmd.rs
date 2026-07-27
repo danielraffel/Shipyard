@@ -54,9 +54,9 @@ use observation::{
 #[cfg(test)]
 pub(in crate::app) use policy::FleetLivenessPolicy;
 pub(in crate::app) use policy::fleet_liveness_policy;
-#[cfg(all(test, unix))]
-use release_observation::count_releasable_commits;
 use release_observation::inspect_release_liveness;
+#[cfg(all(test, unix))]
+use release_observation::{ReleasableCommitSummary, count_releasable_commits};
 #[cfg(test)]
 use release_observation::{
     base_version_path, file_change_requires_release, path_requires_release, release_compare_path,

@@ -1,10 +1,11 @@
 use super::{
     BTreeMap, BTreeSet, CapacityPreemptionPolicy, CapacityRevalidation, GitHubActions,
     MergeQueueMutationGuard, MutationControl, ObservedPr, RepoObservation, RequiredCheck,
-    RunCancellation, ShipState, StewardJob, StewardLedger, StewardPullRequest, StewardRun, Value,
-    active_runs, attempt_key, fetch_run_jobs, gh_json, hydrate_required_check_identities,
-    is_full_sha, is_safe_capacity_preemption, merge_queue_snapshot, parse_pr, parse_run,
-    plan_run_coalescing, pull_requests, queue_front_waits_for_pool, timestamp_old_enough,
+    RunCancellation, RunCancellationReason, ShipState, StewardJob, StewardLedger,
+    StewardPullRequest, StewardRun, Value, active_runs, attempt_key, coalescing_reason_authorizes,
+    fetch_run_jobs, gh_json, hydrate_required_check_identities, is_full_sha,
+    is_safe_capacity_preemption, merge_queue_snapshot, parse_pr, parse_run, plan_run_coalescing,
+    pull_requests, queue_front_waits_for_pool, timestamp_old_enough,
 };
 
 pub(super) fn revalidate_capacity_preemption(
@@ -227,7 +228,7 @@ pub(super) fn revalidate_coalescing_cancellation(
     cancellation: &RunCancellation,
     opt_out_label: &str,
 ) -> Result<bool, String> {
-    if !is_full_sha(&observed.head_sha) {
+    if !coalescing_reason_authorizes(cancellation.reason) || !is_full_sha(&observed.head_sha) {
         return Ok(false);
     }
     let Some(pr_number) = observed
@@ -287,6 +288,47 @@ pub(super) fn revalidate_coalescing_cancellation(
             .pull_request_number
             .or_else(|| merge_group_pr_number(&exact))
             == Some(pr_number))
+}
+
+pub(super) fn authoritative_head_still_superseded(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    observed: &StewardRun,
+    cancellation: &RunCancellation,
+    opt_out_label: &str,
+) -> Result<bool, String> {
+    let Some(pr_number) = observed
+        .pull_request_number
+        .or_else(|| merge_group_pr_number(observed))
+    else {
+        return Ok(false);
+    };
+    let Some(candidate_pr) = pull_request(
+        actions,
+        &observation.repo,
+        pr_number,
+        &observation.base,
+        &BTreeMap::new(),
+    )?
+    else {
+        return Ok(false);
+    };
+    if pull_request_opted_out(&candidate_pr, opt_out_label) {
+        return Ok(false);
+    }
+    let current_head = match cancellation.reason {
+        RunCancellationReason::SupersededPullRequestHead => candidate_pr.fact.head_sha,
+        RunCancellationReason::SupersededMergeGroupHead => {
+            let (_, _, merge_group_heads, _) =
+                merge_queue_snapshot(actions, &observation.repo, &observation.base)?;
+            let Some(head) = merge_group_heads.get(&pr_number) else {
+                return Ok(false);
+            };
+            head.clone()
+        }
+        _ => return Ok(false),
+    };
+    Ok(!current_head.eq_ignore_ascii_case(&observed.head_sha))
 }
 
 pub(super) fn merge_group_pr_number(run: &StewardRun) -> Option<u64> {

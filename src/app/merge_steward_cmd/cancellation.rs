@@ -2,9 +2,10 @@ use super::{
     CancellationReport, CapacityApplyContext, DateTime, GitHubActions, MutationApplyContext,
     MutationControl, ObservedPr, PREEMPT_AFTER_SECS, Path, PrReport, QueueFrontPressure,
     RepoObservation, RepoReport, RequiredCheck, RunCancellation, RunCancellationReason,
-    StewardCommandArgs, StewardLedger, StewardPolicy, Utc, acquire_run_mutation_guard,
-    apply_capacity_preemption, attempts_for, classify_pr, current_pull_request_heads, mutate_pr,
-    opted_out_pull_requests, plan_capacity_preemptions, plan_run_coalescing, record_audit,
+    StewardCommandArgs, StewardLedger, StewardPolicy, StewardRun, Utc, acquire_run_mutation_guard,
+    apply_capacity_preemption, attempts_for, authoritative_head_still_superseded, classify_pr,
+    coalescing_reason_authorizes, current_pull_request_heads, mutate_pr, opted_out_pull_requests,
+    plan_capacity_preemptions, plan_run_coalescing, record_audit,
     revalidate_coalescing_cancellation,
 };
 
@@ -272,6 +273,12 @@ pub(super) fn apply_run_cancellation(
             ledger,
         );
     }
+    if !coalescing_reason_authorizes(cancellation.reason) {
+        return (
+            Some("skipped_non_authorizing_cancellation_reason".to_owned()),
+            None,
+        );
+    }
     let Some(observed) = observation
         .runs
         .iter()
@@ -279,6 +286,26 @@ pub(super) fn apply_run_cancellation(
     else {
         return (None, Some("planned run observation disappeared".to_owned()));
     };
+    apply_superseded_run_cancellation(
+        actions,
+        observation,
+        observed,
+        cancellation,
+        opt_out_label,
+        ledger,
+        mutation_control,
+    )
+}
+
+fn apply_superseded_run_cancellation(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    observed: &StewardRun,
+    cancellation: &RunCancellation,
+    opt_out_label: &str,
+    ledger: &mut StewardLedger,
+    mutation_control: &MutationControl,
+) -> (Option<String>, Option<String>) {
     match revalidate_coalescing_cancellation(
         actions,
         observation,
@@ -297,6 +324,63 @@ pub(super) fn apply_run_cancellation(
                 Ok(guard) => guard,
                 Err(error) => return (None, Some(error)),
             };
+            match revalidate_coalescing_cancellation(
+                actions,
+                observation,
+                observed,
+                cancellation,
+                opt_out_label,
+            ) {
+                Ok(false) => {
+                    return match guard.finish("skipped_after_final_live_revalidation") {
+                        Ok(()) => (
+                            Some("skipped_after_final_live_revalidation".to_owned()),
+                            None,
+                        ),
+                        Err(error) => (None, Some(error)),
+                    };
+                }
+                Err(error) => {
+                    let audit_error = guard.finish("final_revalidation_failed").err();
+                    return (
+                        None,
+                        Some(format!(
+                            "{error}{}",
+                            audit_error.map_or_else(String::new, |audit_error| format!(
+                                "; mutation audit also failed: {audit_error}"
+                            ))
+                        )),
+                    );
+                }
+                Ok(true) => {}
+            }
+            match authoritative_head_still_superseded(
+                actions,
+                observation,
+                observed,
+                cancellation,
+                opt_out_label,
+            ) {
+                Ok(false) => {
+                    return match guard.finish("skipped_after_final_authority_check") {
+                        Ok(()) => (Some("skipped_after_final_authority_check".to_owned()), None),
+                        Err(error) => (None, Some(error)),
+                    };
+                }
+                Err(error) => {
+                    let audit_error = guard.finish("final_authority_check_failed").err();
+                    return (
+                        None,
+                        Some(format!(
+                            "{error}{}",
+                            audit_error.map_or_else(String::new, |audit_error| format!(
+                                "; mutation audit also failed: {audit_error}"
+                            ))
+                        )),
+                    );
+                }
+                Ok(true) => {}
+            }
             match actions.cancel_workflow_run(&observation.repo, cancellation.run_id) {
                 Ok(()) => {
                     if let Err(error) = guard.finish("cancel_accepted") {

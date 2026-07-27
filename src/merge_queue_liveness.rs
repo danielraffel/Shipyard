@@ -175,6 +175,8 @@ pub struct ReleaseLivenessReport {
     pub commits_ahead: u64,
     /// Commits that are not obvious docs/changelog/skip-only updates.
     pub releasable_commits_ahead: u64,
+    /// Oldest classified releasable commit after the latest release.
+    pub oldest_releasable_commit_at: Option<String>,
     /// Version recorded on the monitored base, when exposed by the repository.
     pub base_version: Option<String>,
     /// Release tag normalized to a plain version.
@@ -185,9 +187,9 @@ pub struct ReleaseLivenessReport {
     pub open_release_incident_issues: Option<u64>,
     /// Most recent successful auto-release workflow completion, when present.
     pub latest_successful_release_workflow_at: Option<String>,
-    /// Age of the latest release at observation time.
+    /// Age of the oldest classified releasable commit, or zero when none/unknown.
     pub age_secs: i64,
-    /// True when unreleased commits exist and the release is older than policy.
+    /// True when the oldest classified releasable commit exceeds policy.
     pub stale_with_unreleased_commits: bool,
 }
 
@@ -198,15 +200,24 @@ pub fn assess_release_liveness(
     published_at: String,
     commits_ahead: u64,
     releasable_commits_ahead: u64,
+    oldest_releasable_commit_at: Option<String>,
     base_version: Option<String>,
     open_release_incident_issues: Option<u64>,
     latest_successful_release_workflow_at: Option<String>,
     stale_threshold_secs: i64,
     now: DateTime<Utc>,
 ) -> Result<ReleaseLivenessReport, String> {
-    let published = DateTime::parse_from_rfc3339(&published_at)
+    DateTime::parse_from_rfc3339(&published_at)
         .map_err(|error| format!("invalid latest release published_at: {error}"))?;
-    let age_secs = (now - published.with_timezone(&Utc)).num_seconds().max(0);
+    let age_secs = oldest_releasable_commit_at
+        .as_deref()
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|error| format!("invalid oldest releasable commit timestamp: {error}"))?
+        .map_or(0, |committed| {
+            (now - committed.with_timezone(&Utc)).num_seconds().max(0)
+        });
+    let has_releasable_timestamp = oldest_releasable_commit_at.is_some();
     let released_version = tag.trim_start_matches('v').to_owned();
     let version_unchanged = base_version
         .as_deref()
@@ -216,6 +227,7 @@ pub fn assess_release_liveness(
         published_at,
         commits_ahead,
         releasable_commits_ahead,
+        oldest_releasable_commit_at,
         base_version,
         released_version,
         version_unchanged,
@@ -223,6 +235,7 @@ pub fn assess_release_liveness(
         latest_successful_release_workflow_at,
         age_secs,
         stale_with_unreleased_commits: releasable_commits_ahead > 0
+            && has_releasable_timestamp
             && age_secs >= stale_threshold_secs.max(0),
     })
 }

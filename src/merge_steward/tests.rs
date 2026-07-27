@@ -253,7 +253,7 @@ fn private_exact_head_merge_never_bypasses_blocked_ruleset_state() {
 }
 
 #[test]
-fn coalesces_only_queued_duplicate_and_superseded_pr_runs() {
+fn coalesces_only_queued_superseded_pr_runs() {
     let runs = vec![
         StewardRun {
             id: 1,
@@ -303,21 +303,15 @@ fn coalesces_only_queued_duplicate_and_superseded_pr_runs() {
     );
     assert_eq!(
         plan,
-        vec![
-            RunCancellation {
-                run_id: 2,
-                reason: RunCancellationReason::DuplicateImmutableHead,
-            },
-            RunCancellation {
-                run_id: 3,
-                reason: RunCancellationReason::SupersededPullRequestHead,
-            },
-        ]
+        vec![RunCancellation {
+            run_id: 3,
+            reason: RunCancellationReason::SupersededPullRequestHead,
+        }]
     );
 }
 
 #[test]
-fn repeated_observation_of_same_run_id_is_not_a_duplicate_run() {
+fn same_head_runs_never_authorize_cancellation() {
     let run = StewardRun {
         id: 1,
         workflow_id: 8,
@@ -331,15 +325,27 @@ fn repeated_observation_of_same_run_id_is_not_a_duplicate_run() {
         created_at: "2026-01-01T00:00:00Z".to_owned(),
         jobs: Vec::new(),
     };
+    let mut later = run.clone();
+    later.id = 2;
+    later.created_at = "2026-01-01T00:01:00Z".to_owned();
     assert!(
         plan_run_coalescing(
-            &[run.clone(), run],
+            &[run, later],
             &BTreeMap::from([(1, sha('a'))]),
             &BTreeMap::new(),
             &BTreeSet::new(),
         )
         .is_empty()
     );
+    assert!(!coalescing_reason_authorizes(
+        RunCancellationReason::DuplicateImmutableHead
+    ));
+    assert!(coalescing_reason_authorizes(
+        RunCancellationReason::SupersededPullRequestHead
+    ));
+    assert!(coalescing_reason_authorizes(
+        RunCancellationReason::SupersededMergeGroupHead
+    ));
 }
 
 #[test]

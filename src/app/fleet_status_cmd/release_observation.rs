@@ -1,7 +1,14 @@
 use super::{
-    Engine, GitHubActions, MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK, OBSERVATION_MAX_PAGES,
+    DateTime, Engine, GitHubActions, MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK, OBSERVATION_MAX_PAGES,
     OBSERVATION_PAGE_SIZE, ObservationReason, ReleaseProbe, Utc, Value, assess_release_liveness,
 };
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct ReleasableCommitSummary {
+    pub(super) count: u64,
+    pub(super) truncated: bool,
+    pub(super) oldest_committed_at: Option<String>,
+}
 
 pub(super) fn inspect_release_liveness(
     actions: &GitHubActions,
@@ -42,8 +49,7 @@ pub(super) fn inspect_release_liveness(
         .get("ahead_by")
         .and_then(Value::as_u64)
         .ok_or_else(|| "release comparison response missing ahead_by".to_owned())?;
-    let (releasable_commits_ahead, comparison_truncated) =
-        count_releasable_commits(actions, repo, &comparison, commits_ahead)?;
+    let releasable = count_releasable_commits(actions, repo, &comparison, commits_ahead)?;
     let base_version = fetch_base_version(actions, repo, base)?;
     let mut optional_reason_codes = Vec::new();
     let (open_release_incident_issues, issues_truncated) =
@@ -63,7 +69,7 @@ pub(super) fn inspect_release_liveness(
             optional_reason_codes.push(ObservationReason::AuxiliaryObservationUnavailable);
             None
         };
-    let observation_truncated = comparison_truncated;
+    let observation_truncated = releasable.truncated;
     Ok(ReleaseProbe {
         readable: true,
         source: "github".to_owned(),
@@ -76,7 +82,8 @@ pub(super) fn inspect_release_liveness(
             tag.to_owned(),
             published_at.to_owned(),
             commits_ahead,
-            releasable_commits_ahead,
+            releasable.count,
+            releasable.oldest_committed_at,
             base_version,
             open_release_incident_issues,
             latest_successful_release_workflow_at,
@@ -95,16 +102,24 @@ pub(super) fn count_releasable_commits(
     repo: &str,
     comparison: &Value,
     commits_ahead: u64,
-) -> Result<(u64, bool), String> {
+) -> Result<ReleasableCommitSummary, String> {
     if commits_ahead == 0 {
-        return Ok((0, false));
+        return Ok(ReleasableCommitSummary {
+            count: 0,
+            truncated: false,
+            oldest_committed_at: None,
+        });
     }
     let commits = comparison
         .get("commits")
         .and_then(Value::as_array)
         .ok_or_else(|| "release comparison response missing commits".to_owned())?;
     if u64::try_from(commits.len()).ok() != Some(commits_ahead) {
-        return Ok((commits_ahead, true));
+        return Ok(ReleasableCommitSummary {
+            count: commits_ahead,
+            truncated: true,
+            oldest_committed_at: None,
+        });
     }
     let unskipped = commits
         .iter()
@@ -126,6 +141,7 @@ pub(super) fn count_releasable_commits(
     )
     .expect("bounded commit count fits u64");
     let mut truncated = unskipped.len() > MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK;
+    let mut oldest = None::<(DateTime<Utc>, String)>;
     for commit in unskipped
         .into_iter()
         .take(MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK)
@@ -148,14 +164,33 @@ pub(super) fn count_releasable_commits(
             .get("files")
             .and_then(Value::as_array)
             .ok_or_else(|| format!("release commit {sha} missing files"))?;
-        if files.len() == 300 {
+        let requires_release = if files.len() == 300 {
             truncated = true;
+            true
+        } else {
+            files.is_empty() || files.iter().any(file_change_requires_release)
+        };
+        if requires_release {
             releasable += 1;
-        } else if files.is_empty() || files.iter().any(file_change_requires_release) {
-            releasable += 1;
+            let timestamp = commit
+                .pointer("/commit/committer/date")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("release commit {sha} missing committer date"))?;
+            let parsed = DateTime::parse_from_rfc3339(timestamp)
+                .map_err(|error| {
+                    format!("release commit {sha} has invalid committer date: {error}")
+                })?
+                .with_timezone(&Utc);
+            if oldest.as_ref().is_none_or(|(current, _)| parsed < *current) {
+                oldest = Some((parsed, timestamp.to_owned()));
+            }
         }
     }
-    Ok((releasable, truncated))
+    Ok(ReleasableCommitSummary {
+        count: releasable,
+        truncated,
+        oldest_committed_at: oldest.map(|(_, timestamp)| timestamp),
+    })
 }
 
 fn gh_json_value(actions: &GitHubActions, args: &[String], purpose: &str) -> Result<Value, String> {

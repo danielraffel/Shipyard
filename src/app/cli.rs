@@ -918,16 +918,16 @@ pub(super) enum RunnerCommand {
         /// age while routable fleet capacity is idle.
         #[arg(long = "merge-queue-stall-threshold-secs", default_value_t = 900)]
         merge_queue_stall_threshold_secs: i64,
-        /// Alert when the latest release is older than this while the base
-        /// branch contains unreleased commits.
+        /// Alert when the oldest releasable base commit is older than this.
         #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
         release_stale_threshold_secs: i64,
     },
     /// Audit and conservatively advance merge-on-green across repositories.
     ///
     /// Dry-run is the default. `--apply` may enqueue an exact green head,
-    /// rerun a bounded transient failure, or cancel only provably
-    /// duplicate/superseded queued runs. Repositories without a server-owned
+    /// rerun a bounded transient failure, or cancel only queued runs with a
+    /// provably superseded PR/merge-group head. Same-head duplicates are never
+    /// cancelled. Repositories without a server-owned
     /// merge queue are reported as direct-merge refusals.
     Steward {
         /// Owner/repo slug. Repeatable; defaults to the current repository.
@@ -942,7 +942,7 @@ pub(super) enum RunnerCommand {
         /// Maximum reruns of the same transiently-failed run on one exact head.
         #[arg(long = "max-transient-reruns", default_value_t = 1)]
         max_transient_reruns: u32,
-        /// Disable queued-run duplicate/superseded-head coalescing.
+        /// Disable queued-run superseded-head cleanup.
         #[arg(long = "no-coalesce")]
         no_coalesce: bool,
         /// Disable bounded preemption of safe preamble-only capacity thieves.

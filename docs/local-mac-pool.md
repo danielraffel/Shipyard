@@ -202,8 +202,9 @@ when unavailable it emits non-fatal `AUXILIARY_OBSERVATION_UNAVAILABLE`.
 If `governance.required_status_checks` is empty, every check observed
 on the front merge-group commit is treated as a liveness signal. The same
 report compares the latest GitHub release tag with the monitored base and
-flags non-doc/non-changelog commits after `--release-stale-threshold-secs`
-(24 hours by default). A root `VERSION` file also exposes whether the version
+flags when the oldest non-doc/non-changelog commit has remained unreleased past
+`--release-stale-threshold-secs` (24 hours by default). A root `VERSION` file
+also exposes whether the version
 itself is unchanged.
 
 A PR behind a healthy, progressing queue front is a normal serialized wait,

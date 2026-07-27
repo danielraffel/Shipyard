@@ -364,12 +364,13 @@ fn stale_required_check_and_optional_work_expose_useful_progress_wedge() {
 }
 
 #[test]
-fn release_staleness_requires_age_and_unreleased_commits() {
+fn release_staleness_uses_oldest_releasable_commit_age() {
     let stale = assess_release_liveness(
         "v1.0.0".to_owned(),
-        "1970-01-01T00:00:00Z".to_owned(),
+        "1970-01-01T00:01:50Z".to_owned(),
         3,
         3,
+        Some("1970-01-01T00:00:00Z".to_owned()),
         Some("1.1.0".to_owned()),
         Some(3),
         Some("1970-01-01T00:01:00Z".to_owned()),
@@ -378,12 +379,29 @@ fn release_staleness_requires_age_and_unreleased_commits() {
     )
     .expect("release");
     assert!(stale.stale_with_unreleased_commits);
+    assert_eq!(stale.age_secs, 120);
     assert_eq!(stale.version_unchanged, Some(false));
+    let fresh_unreleased = assess_release_liveness(
+        "v1.0.0".to_owned(),
+        "1970-01-01T00:00:00Z".to_owned(),
+        1,
+        1,
+        Some("1970-01-01T00:01:50Z".to_owned()),
+        Some("1.1.0".to_owned()),
+        Some(0),
+        None,
+        60,
+        ts(120),
+    )
+    .expect("release");
+    assert!(!fresh_unreleased.stale_with_unreleased_commits);
+    assert_eq!(fresh_unreleased.age_secs, 10);
     let current = assess_release_liveness(
         "v1.0.0".to_owned(),
         "1970-01-01T00:00:00Z".to_owned(),
         0,
         0,
+        None,
         Some("1.0.0".to_owned()),
         Some(0),
         None,

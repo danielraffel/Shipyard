@@ -271,6 +271,7 @@ fn release_skip_is_per_commit_and_does_not_hide_unskipped_source() {
         r#"
 case "$*" in
   *"commits/docs"*) printf '%s' '{"files":[{"filename":"docs/readme.md"}]}' ;;
+  *"commits/source-old"*) printf '%s' '{"files":[{"filename":"src/old.rs"}]}' ;;
   *"commits/source"*) printf '%s' '{"files":[{"filename":"src/lib.rs"}]}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -285,23 +286,41 @@ esac
     assert_eq!(
         count_releasable_commits(&actions, "owner/repo", &skipped_source, 1)
             .expect("complete comparison"),
-        (0, false)
+        ReleasableCommitSummary {
+            count: 0,
+            truncated: false,
+            oldest_committed_at: None,
+        }
     );
     let mixed = serde_json::json!({
         "commits": [
             {
                 "sha": "source",
-                "commit": {"message": "feat: source behavior"}
+                "commit": {
+                    "message": "feat: source behavior",
+                    "committer": {"date": "2026-07-25T12:00:00Z"}
+                }
             },
             {
                 "sha": "docs",
                 "commit": {"message": "docs\n\nRelease: skip reason=\"generated release\""}
             },
+            {
+                "sha": "source-old",
+                "commit": {
+                    "message": "feat: older source behavior",
+                    "committer": {"date": "2026-07-24T12:00:00Z"}
+                }
+            },
         ]
     });
     assert_eq!(
-        count_releasable_commits(&actions, "owner/repo", &mixed, 2).expect("complete comparison"),
-        (1, false)
+        count_releasable_commits(&actions, "owner/repo", &mixed, 3).expect("complete comparison"),
+        ReleasableCommitSummary {
+            count: 2,
+            truncated: false,
+            oldest_committed_at: Some("2026-07-24T12:00:00Z".to_owned()),
+        }
     );
 }
 
@@ -358,7 +377,11 @@ fn release_commit_detail_lookups_are_bounded_and_fail_closed() {
             u64::try_from(MAX_RELEASE_COMMIT_LOOKUPS_PER_TICK + 1).expect("count")
         )
         .expect("bounded comparison"),
-        (1, true)
+        ReleasableCommitSummary {
+            count: 1,
+            truncated: true,
+            oldest_committed_at: None,
+        }
     );
     assert_eq!(
         fs::read_to_string(calls).expect("calls").len(),

@@ -21,9 +21,9 @@ use crate::merge_queue_control::{
 use crate::merge_steward::{
     CapacityPreemptionPolicy, QueueFrontPressure, RequiredCheck, RunCancellation,
     RunCancellationReason, StewardCheck, StewardDecision, StewardJob, StewardPolicy,
-    StewardPullRequest, StewardRun, classify_pr, is_capacity_preemption_workflow, is_full_sha,
-    is_safe_capacity_preemption, plan_capacity_preemptions, plan_run_coalescing, preemption_key,
-    queue_front_waits_for_pool,
+    StewardPullRequest, StewardRun, classify_pr, coalescing_reason_authorizes,
+    is_capacity_preemption_workflow, is_full_sha, is_safe_capacity_preemption,
+    plan_capacity_preemptions, plan_run_coalescing, preemption_key, queue_front_waits_for_pool,
 };
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
@@ -441,8 +441,8 @@ use cancellation_recovery::resume_pending_cancellations;
 use cancellation_revalidation::pull_request;
 use cancellation_revalidation::{
     acquire_pr_mutation_guard, acquire_run_mutation_guard, attempts_for,
-    current_pull_request_heads, merge_group_pr_number, opted_out_pull_requests,
-    pull_request_with_required_checks, revalidate_capacity_preemption,
+    authoritative_head_still_superseded, current_pull_request_heads, merge_group_pr_number,
+    opted_out_pull_requests, pull_request_with_required_checks, revalidate_capacity_preemption,
     revalidate_coalescing_cancellation,
 };
 use cancellation_terminalization::{
