@@ -926,8 +926,9 @@ pub(super) enum RunnerCommand {
     /// Audit and conservatively advance merge-on-green across repositories.
     ///
     /// Dry-run is the default. `--apply` may enqueue an exact green head,
-    /// exact-head merge a private/free-plan PR, rerun a bounded transient
-    /// failure, or cancel only provably duplicate/superseded queued runs.
+    /// rerun a bounded transient failure, or cancel only provably
+    /// duplicate/superseded queued runs. Repositories without a server-owned
+    /// merge queue are reported as direct-merge refusals.
     Steward {
         /// Owner/repo slug. Repeatable; defaults to the current repository.
         #[arg(long)]

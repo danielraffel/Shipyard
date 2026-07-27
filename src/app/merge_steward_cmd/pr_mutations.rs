@@ -14,9 +14,7 @@ pub(super) fn mutate_pr(
 ) -> (Option<String>, Option<String>) {
     if !matches!(
         decision,
-        StewardDecision::ArmMergeQueue
-            | StewardDecision::ExactHeadMerge
-            | StewardDecision::RerunTransient { .. }
+        StewardDecision::ArmMergeQueue | StewardDecision::RerunTransient { .. }
     ) {
         return (None, None);
     }
@@ -53,85 +51,10 @@ pub(super) fn mutate_pr(
     let pr = &live_pr;
     match decision {
         StewardDecision::ArmMergeQueue => enqueue_pull_request(context, pr, ledger),
-        StewardDecision::ExactHeadMerge => exact_head_merge(context, pr, ledger),
         StewardDecision::RerunTransient { run_ids } => {
             mutate_transient_reruns(context, pr, policy, run_ids, ledger)
         }
         _ => (None, None),
-    }
-}
-
-pub(super) fn exact_head_merge(
-    context: &MutationApplyContext<'_>,
-    pr: &ObservedPr,
-    ledger: &mut StewardLedger,
-) -> (Option<String>, Option<String>) {
-    let Some(merge_method) = context.observation.merge_method.as_deref() else {
-        return (Some("waiting_merge_method_configuration".to_owned()), None);
-    };
-    let guard = match acquire_pr_mutation_guard(
-        context.mutation_control,
-        context.observation,
-        pr,
-        "runner steward exact-head merge",
-    ) {
-        Ok(guard) => guard,
-        Err(error) => return (None, Some(error)),
-    };
-    let result = gh_json(
-        context.actions,
-        &[
-            "api".to_owned(),
-            "--method".to_owned(),
-            "PUT".to_owned(),
-            format!(
-                "repos/{}/pulls/{}/merge",
-                context.observation.repo, pr.fact.number
-            ),
-            "-f".to_owned(),
-            format!("sha={}", pr.fact.head_sha),
-            "-f".to_owned(),
-            format!("merge_method={merge_method}"),
-        ],
-        "exact-head merge",
-    );
-    match result {
-        Ok(value) if value.get("merged").and_then(Value::as_bool) == Some(true) => {
-            if let Err(error) = guard.finish("merged") {
-                return (
-                    Some("merged".to_owned()),
-                    Some(format!(
-                        "merge succeeded but mutation audit failed: {error}"
-                    )),
-                );
-            }
-            record_audit(
-                ledger,
-                &context.observation.repo,
-                &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
-                "merge_exact_head",
-            );
-            (Some("merged".to_owned()), None)
-        }
-        Ok(value) => {
-            let audit_error = guard
-                .finish("rejected")
-                .err()
-                .map_or_else(String::new, |error| {
-                    format!("; mutation audit also failed: {error}")
-                });
-            (
-                None,
-                Some(format!(
-                    "GitHub refused exact-head merge: {}{audit_error}",
-                    value
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown reason")
-                )),
-            )
-        }
-        Err(error) => (None, Some(error)),
     }
 }
 

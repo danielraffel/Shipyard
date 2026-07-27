@@ -1,5 +1,5 @@
 use super::{
-    BTreeMap, BTreeSet, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
+    BTreeMap, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
     MergeQueueSnapshot, ObservedPr, Path, RepoObservation, RequiredCheck, StewardCheck, StewardJob,
     StewardPullRequest, StewardRun, Value, is_admin_protection_denied,
     is_capacity_preemption_workflow, is_full_sha, is_private_free_entitlement,
@@ -45,7 +45,6 @@ pub(super) fn observe_repo(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let evaluated_rules = evaluated_branch_rules(actions, &repo, base)?;
-    let merge_method = effective_merge_method(&settings, &evaluated_rules)?;
     let required_checks =
         required_checks_with_evaluated_rules(actions, &repo, base, &evaluated_rules)?;
     let (merge_queue, queue_positions, merge_group_heads, merge_group_enqueued_at) =
@@ -76,7 +75,6 @@ pub(super) fn observe_repo(
         base: base.to_owned(),
         allow_auto_merge,
         merge_queue,
-        merge_method,
         required_checks,
         prs,
         runs,
@@ -245,75 +243,6 @@ pub(super) fn evaluated_required_checks(value: &Value) -> Result<Vec<RequiredChe
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(normalize_required_checks(checks))
-}
-
-pub(super) fn effective_merge_method(
-    settings: &Value,
-    evaluated: &Value,
-) -> Result<Option<String>, String> {
-    let mut allowed = BTreeSet::new();
-    for (field, method) in [
-        ("allow_merge_commit", "merge"),
-        ("allow_squash_merge", "squash"),
-        ("allow_rebase_merge", "rebase"),
-    ] {
-        if settings
-            .get(field)
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            allowed.insert(method);
-        }
-    }
-
-    let rules = evaluated_rules(evaluated)?;
-    let mut constrained = false;
-    let mut linear_history = false;
-    for rule in rules {
-        match rule.get("type").and_then(Value::as_str) {
-            Some("required_linear_history") => linear_history = true,
-            Some("pull_request") => {
-                let methods = rule
-                    .pointer("/parameters/allowed_merge_methods")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| "pull-request rule missing allowed_merge_methods".to_owned())?;
-                let mut rule_allowed = BTreeSet::new();
-                for method in methods {
-                    let method = method
-                        .as_str()
-                        .ok_or_else(|| "allowed merge method was not a string".to_owned())?
-                        .to_ascii_lowercase();
-                    match method.as_str() {
-                        "merge" => {
-                            rule_allowed.insert("merge");
-                        }
-                        "squash" => {
-                            rule_allowed.insert("squash");
-                        }
-                        "rebase" => {
-                            rule_allowed.insert("rebase");
-                        }
-                        _ => return Err(format!("unknown allowed merge method `{method}`")),
-                    }
-                }
-                allowed.retain(|method| rule_allowed.contains(method));
-                constrained = true;
-            }
-            _ => {}
-        }
-    }
-    if linear_history {
-        allowed.remove("merge");
-    }
-    let preference = if constrained || linear_history {
-        ["squash", "rebase", "merge"]
-    } else {
-        ["merge", "squash", "rebase"]
-    };
-    Ok(preference
-        .into_iter()
-        .find(|method| allowed.contains(method))
-        .map(str::to_owned))
 }
 
 fn evaluated_rules(value: &Value) -> Result<Vec<&Value>, String> {

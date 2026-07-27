@@ -794,6 +794,34 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
     assert!(report.errors.is_empty());
 }
 
+#[test]
+fn direct_mode_refusal_never_reaches_rest_merge_mutation() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = GitHubActions::new(".");
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), false);
+    let mut policy = queue_policy();
+    policy.merge_queue = false;
+    let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+    assert!(matches!(
+        decision,
+        StewardDecision::DirectMergeRefused { ref reasons }
+            if reasons.contains(
+                &crate::merge_steward::DirectMergeRefusal::ValidatedBaseRevisionNotAtomic
+            )
+    ));
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+    let (mutation, error) = mutate_pr(&context, &pr, &policy, &decision, &mut ledger);
+
+    assert!(mutation.is_none());
+    assert!(error.is_none());
+    assert!(ledger.audit.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn enqueue_skips_when_pr_is_retargeted_between_observation_and_apply() {

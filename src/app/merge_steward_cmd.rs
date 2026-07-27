@@ -54,7 +54,6 @@ struct RepoObservation {
     base: String,
     allow_auto_merge: bool,
     merge_queue: bool,
-    merge_method: Option<String>,
     required_checks: Vec<RequiredCheck>,
     prs: Vec<ObservedPr>,
     runs: Vec<StewardRun>,

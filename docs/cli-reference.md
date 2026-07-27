@@ -95,7 +95,11 @@ shipyard runner steward --no-preempt-capacity       # disable bounded preamble p
 `runner steward` is read-only unless `--apply` is present. Apply mode requires
 the trusted machine-global `[merge_queue].mutation_machine`, rejects the
 central merge-queue `HOLD`, and serializes plus write-ahead audits every
-enqueue, merge, rerun, and cancellation through the shared mutation guard.
+enqueue, rerun, and cancellation through the shared mutation guard. A
+repository without a GitHub-native merge queue receives a typed
+`direct_merge_refused` decision; Shipyard does not issue a client-side REST
+merge because that endpoint cannot atomically enforce complete check
+materialization and the validated base revision.
 Accepted capacity cancellations remain in the handoff ledger until an exact
 run/job read proves terminal; each apply pass resumes those records with an
 exact-run force-cancel before planning new work. Read failures keep the record

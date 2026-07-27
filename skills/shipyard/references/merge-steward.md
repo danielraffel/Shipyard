@@ -10,14 +10,15 @@ shipyard runner steward \
   --json
 ```
 
-It is audit-only unless `--apply` is present. The apply path uses server-side
-exact-head guards for queue admission and merge, preserves existing native
+It is audit-only unless `--apply` is present. The apply path uses GitHub's
+server-owned exact-head guard for queue admission, preserves existing native
 merge-queue positions, does not rerun genuine failures, limits transient
 reruns durably, and live-revalidates queued state plus immutable head before
-cancelling a duplicate or superseded run. Repositories without private-plan
-branch-protection/merge-queue entitlement use GitHub's REST merge endpoint
-with the same exact-head guard and treat every observed check as gating. Add
-the `shipyard:no-auto-merge` label to opt a PR out.
+cancelling a duplicate or superseded run. Repositories without a server-owned
+merge queue receive a typed `direct_merge_refused` decision: the REST merge
+endpoint cannot atomically prove complete required-check materialization or
+bind the validated base revision. Use manual merge or enable a native merge
+queue. Add the `shipyard:no-auto-merge` label to opt a PR out.
 
 Capacity preemption is an explicit repository policy. The built-in Pulp policy
 may preempt at most one in-progress PR workflow per pass when an exact
@@ -35,7 +36,7 @@ behavior. The per-head attempt budget and write-ahead audit live in the
 `handoff_ledger` path emitted by JSON.
 
 Apply mode holds an exclusive sibling lock for the whole reconciliation and
-routes every enqueue, exact-head merge, rerun, and cancellation through the
+routes every enqueue, rerun, and cancellation through the
 machine-global merge-queue mutation guard. The configured authority machine,
 central `HOLD`, process-wide mutation lock, and durable uncertainty audit all
 apply before GitHub is mutated; dry-run remains independent of those controls.

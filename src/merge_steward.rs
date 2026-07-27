@@ -235,8 +235,22 @@ pub enum StewardDecision {
     },
     /// Arm native merge-queue admission for this exact head.
     ArmMergeQueue,
-    /// Merge a private/free-plan repository via REST with an exact-head guard.
-    ExactHeadMerge,
+    /// Refuse client-side direct merge because GitHub cannot atomically enforce
+    /// all admission facts used by the steward.
+    DirectMergeRefused {
+        /// Server guarantees missing from the direct-merge path.
+        reasons: Vec<DirectMergeRefusal>,
+    },
+}
+
+/// Atomic server guarantees required before the steward may merge directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectMergeRefusal {
+    /// The observed check set does not prove every intended check materialized.
+    RequiredCheckMaterializationNotAuthoritative,
+    /// GitHub's REST merge guard binds the head SHA but not the validated base.
+    ValidatedBaseRevisionNotAtomic,
 }
 
 /// Classify one PR without performing a mutation.
@@ -328,7 +342,12 @@ pub fn classify_pr(
         // request can remain armed without ever materializing a queue entry.
         StewardDecision::ArmMergeQueue
     } else {
-        StewardDecision::ExactHeadMerge
+        let mut reasons = Vec::new();
+        if policy.required_checks.is_empty() {
+            reasons.push(DirectMergeRefusal::RequiredCheckMaterializationNotAuthoritative);
+        }
+        reasons.push(DirectMergeRefusal::ValidatedBaseRevisionNotAtomic);
+        StewardDecision::DirectMergeRefused { reasons }
     }
 }
 

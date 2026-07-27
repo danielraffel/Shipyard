@@ -78,7 +78,6 @@ fn observation_for(pr: ObservedPr, merge_queue: bool) -> RepoObservation {
         base: "main".to_owned(),
         allow_auto_merge: merge_queue,
         merge_queue,
-        merge_method: Some("merge".to_owned()),
         required_checks: Vec::new(),
         prs: vec![pr],
         runs: Vec::new(),

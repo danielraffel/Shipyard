@@ -96,7 +96,7 @@ pub(super) fn apply_repo_plan(
             merge_path: if observation.merge_queue {
                 "native_queue_exact_head".to_owned()
             } else {
-                "private_free_exact_head_rest".to_owned()
+                "direct_merge_refused_server_enforcement_required".to_owned()
             },
             required_contexts: observation
                 .required_checks

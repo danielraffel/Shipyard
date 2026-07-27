@@ -134,14 +134,19 @@ fn app_bound_requirement_fails_closed_when_producer_identity_is_unavailable() {
 }
 
 #[test]
-fn private_free_repo_requires_all_observed_checks_and_exact_head_merge() {
+fn direct_merge_refuses_partially_materialized_checks_without_authoritative_policy() {
     let mut policy = queue_policy();
     policy.merge_queue = false;
     policy.native_auto_merge = false;
     policy.required_checks.clear();
     assert_eq!(
         classify_pr(&green_pr(), &policy, &BTreeMap::new()),
-        StewardDecision::ExactHeadMerge
+        StewardDecision::DirectMergeRefused {
+            reasons: vec![
+                DirectMergeRefusal::RequiredCheckMaterializationNotAuthoritative,
+                DirectMergeRefusal::ValidatedBaseRevisionNotAtomic,
+            ]
+        }
     );
     let mut red = green_pr();
     red.checks[0].conclusion = Some("FAILURE".to_owned());
@@ -152,11 +157,10 @@ fn private_free_repo_requires_all_observed_checks_and_exact_head_merge() {
 }
 
 #[test]
-fn private_free_repo_uses_newest_duplicate_observed_check() {
+fn direct_merge_refuses_unvalidated_base_advance_even_with_authoritative_checks() {
     let mut policy = queue_policy();
     policy.merge_queue = false;
     policy.native_auto_merge = false;
-    policy.required_checks.clear();
     let mut pr = green_pr();
     pr.checks[0].name = "Required".to_owned();
     pr.checks[0].conclusion = Some("FAILURE".to_owned());
@@ -172,7 +176,9 @@ fn private_free_repo_uses_newest_duplicate_observed_check() {
 
     assert_eq!(
         classify_pr(&pr, &policy, &BTreeMap::new()),
-        StewardDecision::ExactHeadMerge
+        StewardDecision::DirectMergeRefused {
+            reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic]
+        }
     );
 }
 

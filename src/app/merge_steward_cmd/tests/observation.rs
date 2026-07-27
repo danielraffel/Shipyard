@@ -1,6 +1,6 @@
 use super::*;
 use crate::app::merge_steward_cmd::observation::{
-    canonical_repo_name, effective_merge_method, encode_path_segment, evaluated_required_checks,
+    canonical_repo_name, encode_path_segment, evaluated_required_checks,
     hydrate_required_check_identities, parse_check, parse_rest_check,
 };
 #[cfg(unix)]
@@ -110,56 +110,6 @@ fn entitlement_match_is_exact_enough_not_to_swallow_generic_forbidden() {
         "HTTP 403: Must have admin rights to Repository"
     ));
     assert!(!is_admin_protection_denied("HTTP 403 forbidden"));
-}
-
-#[test]
-fn effective_merge_method_respects_branch_rules_and_repository_capabilities() {
-    let all_methods = serde_json::json!({
-        "allow_merge_commit": true,
-        "allow_squash_merge": true,
-        "allow_rebase_merge": true
-    });
-    assert_eq!(
-        effective_merge_method(
-            &all_methods,
-            &serde_json::json!([[{"type": "required_linear_history"}]])
-        )
-        .expect("linear history policy"),
-        Some("squash".to_owned())
-    );
-    assert_eq!(
-        effective_merge_method(
-            &all_methods,
-            &serde_json::json!([[{
-                "type": "pull_request",
-                "parameters": {"allowed_merge_methods": ["rebase"]}
-            }]])
-        )
-        .expect("allowed method policy"),
-        Some("rebase".to_owned())
-    );
-    assert_eq!(
-        effective_merge_method(
-            &serde_json::json!({
-                "allow_merge_commit": true,
-                "allow_squash_merge": false,
-                "allow_rebase_merge": false
-            }),
-            &serde_json::json!([[{
-                "type": "pull_request",
-                "parameters": {"allowed_merge_methods": ["squash"]}
-            }]])
-        )
-        .expect("disjoint policy"),
-        None
-    );
-    assert!(
-        effective_merge_method(
-            &all_methods,
-            &serde_json::json!([[{"type": "pull_request", "parameters": {}}]])
-        )
-        .is_err()
-    );
 }
 
 #[test]

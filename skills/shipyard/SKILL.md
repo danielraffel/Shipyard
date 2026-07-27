@@ -599,11 +599,14 @@ The watcher resolves the repository default branch; use `--fleet-base` or
 `runner.watchdog.fleet_base` for a different merge target.
 
 Use `shipyard runner steward` for agent-neutral merge-on-green reconciliation.
-It observes by default; `--apply` enables exact-head guarded queue, merge,
-rerun, and narrowly policy-scoped capacity-preemption mutations. Apply mode is
-restricted by central mutation authority, durable write-ahead intent, and
-live revalidation immediately before every GitHub write. The built-in capacity
-preemption preset applies only to Pulp; unknown repositories are disabled.
+It observes by default; `--apply` enables exact-head guarded queue admission,
+reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
+REST direct merge is refused because GitHub cannot atomically bind both complete
+check materialization and the validated base revision; use a server-owned merge
+queue or manual merge instead. Apply mode is restricted by central mutation
+authority, durable write-ahead intent, and live revalidation immediately before
+every GitHub write. The built-in capacity preemption preset applies only to
+Pulp; unknown repositories are disabled.
 
 Read [references/merge-steward.md](references/merge-steward.md) before operating
 the steward, changing its policy, or recovering a pending cancellation.
