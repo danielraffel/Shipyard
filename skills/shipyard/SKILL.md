@@ -855,11 +855,29 @@ cargo fmt --all --check \
   && cargo test --all-targets --locked
 ```
 
-**`Cargo.lock` gotcha after a version bump:** `shipyard pr` rewrites
-`Cargo.toml` / `.claude-plugin/plugin.json` but does NOT touch `Cargo.lock`,
-so the `--locked` steps then fail with a lock-vs-manifest mismatch. After any
-bump, refresh the lock (`cargo build`/`cargo check`) and commit `Cargo.lock`
-in the same PR. (`cargo fmt --all` on new modules is the other easy miss.)
+**`Cargo.lock` after a version bump — now automatic.**
+`version_bump_check.py --mode=apply` used to rewrite `Cargo.toml` and leave
+`Cargo.lock` on the old version, so the `--locked` steps above failed with
+
+```
+error: cannot update the lock file … because --locked was passed
+```
+
+before compiling anything. Every self-ship that bumped the version hit it. The
+apply step now rewrites the lockfile's workspace-member entry and stages it with
+the bump (`refresh_cargo_lock`), so no manual step is needed.
+
+It is deliberately narrow, and stays silent when it cannot be sure: it rewrites
+only the `[[package]]` block whose `name` matches and which has **no** `source`
+key, because a registry crate sharing the name does have one. Zero matches or
+more than one means it writes nothing and the `--locked` failure returns — that
+is the intended behaviour, not a regression to patch over. If you see that error
+after a bump, check `Cargo.lock` actually contains a source-less entry for the
+crate rather than reaching for `cargo update`. The rewrite is textual, so it
+works in the Python-only version-skill-check job where no `cargo` exists, and it
+is idempotent across a re-applied bump.
+
+(`cargo fmt --all` on new modules is the other easy miss.)
 
 **Ship-state SHA drift recovery (`--adopt-head`, #346):** if you amend or
 force-push a PR's tip after Shipyard recorded ship-state (e.g. adding a
