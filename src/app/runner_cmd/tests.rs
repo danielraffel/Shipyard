@@ -1,5 +1,7 @@
 use super::*;
 use crate::app::fleet_status_cmd::FleetLivenessPolicy;
+#[cfg(unix)]
+use crate::app::runner_cmd::watch::reap_stale_runs_tick;
 
 #[test]
 fn parse_etime_handles_mm_ss() {
@@ -181,4 +183,70 @@ fn reaper_thresholds_flags_win_over_config() {
     let thresholds = resolve_reaper_thresholds(&config, Some(30), Some(60));
     assert_eq!(thresholds.in_progress_max_min, 30);
     assert_eq!(thresholds.queued_max_min, 60);
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_run_reaper_continues_after_individual_cancellation_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("calls");
+    let gh = temp.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> '{calls}'
+case "$*" in
+  *"status=in_progress"*)
+    printf '%s' '{{"workflow_runs":[
+      {{"id":101,"name":"first","head_branch":"a","created_at":"2020-01-01T00:00:00Z","run_started_at":"2020-01-01T00:00:00Z","status":"in_progress"}},
+      {{"id":102,"name":"second","head_branch":"b","created_at":"2020-01-01T00:00:00Z","run_started_at":"2020-01-01T00:00:00Z","status":"in_progress"}}
+    ]}}' ;;
+  *"status=queued"*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *"runs/101/cancel"*) echo "first cancellation rejected" >&2; exit 1 ;;
+  *"runs/102/cancel"*) printf '%s' '{{}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls = calls.display()
+        ),
+    )
+    .expect("fake gh");
+    let mut permissions = std::fs::metadata(&gh)
+        .expect("fake gh metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&gh, permissions).expect("chmod fake gh");
+    let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(gh);
+    let settings = WatchdogSettings {
+        repo_slug: "owner/repo".to_owned(),
+        runner_id: None,
+        runner_dir: temp.path().join("runner"),
+        thresholds: WatchdogThresholds::default(),
+    };
+    let mut output = Vec::new();
+
+    let error = reap_stale_runs_tick(
+        &actions,
+        &settings,
+        ReaperThresholds {
+            in_progress_max_min: 1,
+            queued_max_min: 1,
+        },
+        false,
+        false,
+        &mut output,
+    )
+    .expect_err("one failed cancellation must fail the tick");
+
+    assert!(error.message.contains("run 101"), "{}", error.message);
+    let calls = std::fs::read_to_string(calls).expect("calls");
+    assert!(calls.contains("runs/101/cancel"), "{calls}");
+    assert!(calls.contains("runs/102/cancel"), "{calls}");
+    let output = String::from_utf8(output).expect("UTF-8");
+    assert!(output.contains("failed run=101"), "{output}");
+    assert!(output.contains("cancelled run=102"), "{output}");
 }

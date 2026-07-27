@@ -535,6 +535,7 @@ pub(super) fn reap_stale_runs_tick<W: Write>(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
 
     let stale = compute_stale_runs(&in_progress, &queued, thresholds, Utc::now());
+    let mut failures = Vec::new();
     for run in &stale {
         let detail = format!(
             "{} run {} ({}, branch={}) {} for {}s — threshold {}min",
@@ -583,14 +584,22 @@ pub(super) fn reap_stale_runs_tick<W: Write>(
                     run,
                     Some(&err.to_string()),
                 )?;
-                return Err(CliFailure::new(
-                    1,
-                    format!("stale-run cancellation failed: {err}"),
-                ));
+                failures.push(format!("run {}: {err}", run.run_id));
             }
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(CliFailure::new(
+            1,
+            format!(
+                "{} stale-run cancellation(s) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            ),
+        ))
+    }
 }
 
 pub(super) fn emit_reap_event<W: Write>(
