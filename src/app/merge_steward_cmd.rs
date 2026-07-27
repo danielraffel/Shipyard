@@ -451,7 +451,8 @@ use cancellation_terminalization::{
     read_pending_run, validate_pending_cancellation_authority,
 };
 use capacity_cancellation::{
-    apply_capacity_preemption, mark_cancellation_skipped, persist_capacity_evidence,
+    CapacityCancelError, apply_capacity_preemption, cancel_capacity_preemption_after_revalidation,
+    mark_cancellation_skipped, persist_capacity_evidence,
 };
 use ledger::{attempt_key, load_ledger, record_audit, save_ledger};
 use observation::{

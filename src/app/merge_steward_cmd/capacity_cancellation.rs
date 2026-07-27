@@ -1,11 +1,43 @@
 use super::{
-    CapacityApplyContext, CapacityRevalidation, DurableMutationIntent, MergeQueueMutationGuard,
-    Path, PendingCancellation, PendingCancellationPhase, PendingMutationKind, RepoObservation,
-    RunCancellation, StewardLedger, StewardRun, Utc, acquire_pending_cancellation_guard,
-    cancellation_reason_label, clear_pending_cancellation, complete_capacity_cancellation,
-    merge_group_pr_number, preemption_key, queue_front_head, record_audit,
-    revalidate_capacity_preemption, save_ledger, validate_pending_cancellation_authority,
+    CapacityApplyContext, CapacityRevalidation, DurableMutationIntent, GitHubActions,
+    MergeQueueMutationGuard, Path, PendingCancellation, PendingCancellationPhase,
+    PendingMutationKind, RepoObservation, RunCancellation, StewardLedger, StewardRun, Utc,
+    acquire_pending_cancellation_guard, cancellation_reason_label, clear_pending_cancellation,
+    complete_capacity_cancellation, merge_group_pr_number, preemption_key, queue_front_head,
+    record_audit, revalidate_capacity_preemption, save_ledger,
+    validate_pending_cancellation_authority,
 };
+
+pub(super) enum CapacityCancelError {
+    Revalidation(String),
+    Mutation(String),
+}
+
+pub(super) fn cancel_capacity_preemption_after_revalidation(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    cancellation: &RunCancellation,
+    observed: &StewardRun,
+    expected_front: &str,
+    opt_out_label: &str,
+) -> Result<Option<CapacityRevalidation>, CapacityCancelError> {
+    let evidence = revalidate_capacity_preemption(
+        actions,
+        observation,
+        cancellation,
+        observed,
+        expected_front,
+        opt_out_label,
+    )
+    .map_err(CapacityCancelError::Revalidation)?;
+    let Some(evidence) = evidence else {
+        return Ok(None);
+    };
+    actions
+        .cancel_workflow_run(&observation.repo, cancellation.run_id)
+        .map_err(|error| CapacityCancelError::Mutation(error.to_string()))?;
+    Ok(Some(evidence))
+}
 
 pub(super) fn apply_capacity_preemption(
     context: &CapacityApplyContext<'_>,
@@ -79,33 +111,59 @@ pub(super) fn apply_capacity_preemption(
             )),
         );
     }
-    match context
-        .actions
-        .cancel_workflow_run(&context.observation.repo, context.cancellation.run_id)
-    {
-        Ok(()) => {
-            if let Err(error) =
-                mark_cancellation_accepted(context, expected_front, &latest.candidate, ledger)
-            {
-                return (
-                    Some("cancelled_after_job_revalidation".to_owned()),
-                    Some(format!(
-                        "cancel accepted but pending recovery persistence failed: {error}"
-                    )),
-                );
-            }
-            if let Err(error) = guard.finish("cancel_accepted") {
-                return (
-                    Some("cancelled_after_job_revalidation".to_owned()),
-                    Some(format!(
-                        "cancel accepted but mutation audit failed: {error}"
-                    )),
-                );
-            }
-            complete_capacity_cancellation(context, expected_front, &latest.candidate, ledger)
+    let latest = match cancel_capacity_preemption_after_revalidation(
+        context.actions,
+        context.observation,
+        context.cancellation,
+        observed,
+        expected_front,
+        opt_out_label,
+    ) {
+        Ok(Some(latest)) => latest,
+        Ok(None) => {
+            return skip_after_attempt_revalidation(guard, &pending, context.ledger_path, ledger);
         }
-        Err(error) => (None, Some(error.to_string())),
+        Err(CapacityCancelError::Revalidation(error)) => {
+            let audit_error = guard.finish("final_revalidation_failed").err();
+            return (
+                None,
+                Some(format!(
+                    "{error}{}",
+                    audit_error.map_or_else(String::new, |audit_error| format!(
+                        "; mutation audit also failed: {audit_error}"
+                    ))
+                )),
+            );
+        }
+        Err(CapacityCancelError::Mutation(error)) => return (None, Some(error)),
+    };
+    finish_accepted_capacity_preemption(context, expected_front, &latest.candidate, guard, ledger)
+}
+
+fn finish_accepted_capacity_preemption(
+    context: &CapacityApplyContext<'_>,
+    expected_front: &str,
+    latest: &StewardRun,
+    guard: MergeQueueMutationGuard,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    if let Err(error) = mark_cancellation_accepted(context, expected_front, latest, ledger) {
+        return (
+            Some("cancelled_after_job_revalidation".to_owned()),
+            Some(format!(
+                "cancel accepted but pending recovery persistence failed: {error}"
+            )),
+        );
     }
+    if let Err(error) = guard.finish("cancel_accepted") {
+        return (
+            Some("cancelled_after_job_revalidation".to_owned()),
+            Some(format!(
+                "cancel accepted but mutation audit failed: {error}"
+            )),
+        );
+    }
+    complete_capacity_cancellation(context, expected_front, latest, ledger)
 }
 
 fn skip_after_attempt_revalidation(

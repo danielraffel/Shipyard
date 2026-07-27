@@ -1,12 +1,14 @@
 use super::ledger::persist_pending_mutation_correlation;
 use super::{
-    BTreeMap, CANCEL_TERMINAL_POLL, CANCEL_TERMINAL_WAIT, CancellationReport, DateTime,
-    DurableMutationIntent, GitHubActions, Instant, MutationControl, NonTerminalRun, Path,
-    PendingCancellation, PendingCancellationPhase, PendingMutationKind, PendingRunState,
-    RunCancellation, RunCancellationReason, StewardLedger, Utc, acquire_pending_cancellation_guard,
-    active_runner_targets, clear_pending_cancellation, mark_cancellation_skipped, observe_repo,
-    persist_capacity_evidence, persist_force_cancel_intent, read_current_pending_run_identity,
-    read_pending_run, record_audit, revalidate_capacity_preemption, save_ledger, thread,
+    BTreeMap, CANCEL_TERMINAL_POLL, CANCEL_TERMINAL_WAIT, CancellationReport, CapacityCancelError,
+    DateTime, DurableMutationIntent, GitHubActions, Instant, MergeQueueMutationGuard,
+    MutationControl, NonTerminalRun, Path, PendingCancellation, PendingCancellationPhase,
+    PendingMutationKind, PendingRunState, RunCancellation, RunCancellationReason, StewardLedger,
+    Utc, acquire_pending_cancellation_guard, active_runner_targets,
+    cancel_capacity_preemption_after_revalidation, clear_pending_cancellation,
+    mark_cancellation_skipped, observe_repo, persist_capacity_evidence,
+    persist_force_cancel_intent, read_current_pending_run_identity, read_pending_run, record_audit,
+    revalidate_capacity_preemption, save_ledger, thread,
 };
 
 pub(super) fn resume_pending_cancellations(
@@ -315,10 +317,51 @@ pub(super) fn resume_pending_intent(
         &format!("runner steward retry cancel run {}", pending.run_id),
         &intent,
     )?;
-    read_current_pending_run_identity(actions, pending)?;
-    actions
-        .cancel_workflow_run(&pending.repo, pending.run_id)
-        .map_err(|error| format!("exact normal cancellation retry failed: {error}"))?;
+    match cancel_capacity_preemption_after_revalidation(
+        actions,
+        &observation,
+        &cancellation,
+        observed,
+        &pending.front_head,
+        &pending.opt_out_label,
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return skip_recovered_intent_after_final_revalidation(ledger, ledger_path, key, guard);
+        }
+        Err(CapacityCancelError::Revalidation(error)) => {
+            let audit_error = guard.finish("recovery_final_revalidation_failed").err();
+            return Err(format!(
+                "{error}{}",
+                audit_error.map_or_else(String::new, |audit_error| format!(
+                    "; mutation audit also failed: {audit_error}"
+                ))
+            ));
+        }
+        Err(CapacityCancelError::Mutation(error)) => {
+            return Err(format!("exact normal cancellation retry failed: {error}"));
+        }
+    }
+    finish_recovered_normal_cancel(
+        actions,
+        ledger_path,
+        ledger,
+        mutation_control,
+        key,
+        pending,
+        guard,
+    )
+}
+
+fn finish_recovered_normal_cancel(
+    actions: &GitHubActions,
+    ledger_path: &Path,
+    ledger: &mut StewardLedger,
+    mutation_control: &MutationControl,
+    key: &str,
+    pending: &PendingCancellation,
+    guard: MergeQueueMutationGuard,
+) -> Result<String, String> {
     let accepted = ledger
         .pending_cancellations
         .get_mut(key)
@@ -352,6 +395,31 @@ pub(super) fn resume_pending_intent(
         key,
         &accepted,
     )
+}
+
+fn skip_recovered_intent_after_final_revalidation(
+    ledger: &mut StewardLedger,
+    ledger_path: &Path,
+    key: &str,
+    guard: MergeQueueMutationGuard,
+) -> Result<String, String> {
+    let pending = ledger
+        .pending_cancellations
+        .get(key)
+        .cloned()
+        .ok_or_else(|| "refreshed cancellation intent disappeared".to_owned())?;
+    mark_cancellation_skipped(ledger, ledger_path, key)?;
+    guard
+        .finish("skipped_after_recovery_final_revalidation")
+        .map_err(|error| format!("mutation audit failed: {error}"))?;
+    clear_pending_cancellation(
+        ledger,
+        ledger_path,
+        key,
+        &pending,
+        "pending_intent_skipped_after_recovery_final_revalidation",
+    )?;
+    Ok("recovered_skipped_cancellation".to_owned())
 }
 
 pub(super) fn resolve_rejected_pending_intent(
