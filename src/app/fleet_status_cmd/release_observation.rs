@@ -151,12 +151,7 @@ pub(super) fn count_releasable_commits(
         if files.len() == 300 {
             truncated = true;
             releasable += 1;
-        } else if files.is_empty()
-            || files
-                .iter()
-                .filter_map(|file| file.get("filename").and_then(Value::as_str))
-                .any(path_requires_release)
-        {
+        } else if files.is_empty() || files.iter().any(file_change_requires_release) {
             releasable += 1;
         }
     }
@@ -202,6 +197,20 @@ pub(super) fn path_requires_release(path: &str) -> bool {
                 | "license"
                 | "license.md"
         ))
+}
+
+pub(super) fn file_change_requires_release(file: &Value) -> bool {
+    let Some(filename) = file.get("filename").and_then(Value::as_str) else {
+        return true;
+    };
+    if path_requires_release(filename) {
+        return true;
+    }
+    match file.get("previous_filename") {
+        None => false,
+        Some(Value::String(previous)) => path_requires_release(previous),
+        Some(_) => true,
+    }
 }
 
 pub(super) fn fetch_release_incident_issue_count(

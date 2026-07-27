@@ -844,6 +844,31 @@ fn release_classification_uses_changed_paths_not_commit_labels() {
 }
 
 #[test]
+fn release_classification_accounts_for_both_sides_of_renames() {
+    assert!(file_change_requires_release(&serde_json::json!({
+        "filename": "docs/removed-source.md",
+        "previous_filename": "src/removed.rs"
+    })));
+    assert!(file_change_requires_release(&serde_json::json!({
+        "filename": "src/promoted.rs",
+        "previous_filename": "docs/promoted.md"
+    })));
+    assert!(!file_change_requires_release(&serde_json::json!({
+        "filename": "docs/new-name.md",
+        "previous_filename": "docs/old-name.md"
+    })));
+}
+
+#[test]
+fn malformed_release_file_changes_fail_closed() {
+    assert!(file_change_requires_release(&serde_json::json!({})));
+    assert!(file_change_requires_release(&serde_json::json!({
+        "filename": "docs/new-name.md",
+        "previous_filename": 42
+    })));
+}
+
+#[test]
 fn release_api_paths_encode_custom_tags_and_branch_refs() {
     assert_eq!(
         release_compare_path("owner/repo", "release/v1 + hotfix", "release/1.2"),

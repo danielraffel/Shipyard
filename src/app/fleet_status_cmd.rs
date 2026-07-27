@@ -59,8 +59,8 @@ use release_observation::count_releasable_commits;
 use release_observation::inspect_release_liveness;
 #[cfg(test)]
 use release_observation::{
-    base_version_path, path_requires_release, release_compare_path, release_is_skipped,
-    release_workflow_runs_path,
+    base_version_path, file_change_requires_release, path_requires_release, release_compare_path,
+    release_is_skipped, release_workflow_runs_path,
 };
 pub(in crate::app) use render::{render_fleet_assessment, render_fleet_watch_event};
 
