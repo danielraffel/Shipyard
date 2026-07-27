@@ -269,12 +269,24 @@ pub struct MergeQueueLivenessInputs<'a> {
 
 /// Parse merge-queue entries from the dedicated GraphQL observation.
 pub fn parse_merge_queue_entries(body: &Value) -> Result<Vec<MergeQueueEntry>, String> {
-    if body
+    if let Some(errors) = body
         .get("errors")
         .and_then(Value::as_array)
-        .is_some_and(|errors| !errors.is_empty())
+        .filter(|errors| !errors.is_empty())
     {
-        return Err("merge-queue GraphQL response contains errors".to_owned());
+        let details = errors
+            .iter()
+            .map(|error| {
+                error.get("message").and_then(Value::as_str).map_or_else(
+                    || error.to_string(),
+                    |message| format!("{message} ({error})"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "merge-queue GraphQL response contains errors: {details}"
+        ));
     }
     let queue = body
         .pointer("/data/repository/mergeQueue")

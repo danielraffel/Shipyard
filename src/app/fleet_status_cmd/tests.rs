@@ -772,6 +772,33 @@ fn observation_failures_have_stable_auth_and_rate_limit_reasons() {
         classify_observation_error("HTTP 401: Bad credentials"),
         ObservationReason::GitHubAuthFailed
     );
+    let rate_error = parse_merge_queue_entries(&serde_json::json!({
+        "data": null,
+        "errors": [{
+            "message": "Something went wrong while executing your query",
+            "extensions": {"type": "RATE_LIMITED"}
+        }]
+    }))
+    .expect_err("GraphQL rate limit must fail");
+    assert!(rate_error.contains("RATE_LIMITED"), "{rate_error}");
+    assert_eq!(
+        classify_observation_error(&rate_error),
+        ObservationReason::GitHubRateLimited
+    );
+
+    let auth_error = parse_merge_queue_entries(&serde_json::json!({
+        "data": null,
+        "errors": [{"message": "Resource not accessible by integration"}]
+    }))
+    .expect_err("GraphQL auth failure must fail");
+    assert!(
+        auth_error.contains("Resource not accessible by integration"),
+        "{auth_error}"
+    );
+    assert_eq!(
+        classify_observation_error(&auth_error),
+        ObservationReason::GitHubAuthFailed
+    );
 }
 
 #[test]

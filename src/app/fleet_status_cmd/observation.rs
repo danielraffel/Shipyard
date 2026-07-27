@@ -240,10 +240,16 @@ pub(super) fn reconcile_enrollment_snapshot(
 
 pub(super) fn classify_observation_error(reason: &str) -> ObservationReason {
     let reason = reason.to_ascii_lowercase();
-    if reason.contains("rate limit") || reason.contains("secondary rate") {
+    if reason.contains("rate limit")
+        || reason.contains("rate_limit")
+        || reason.contains("secondary rate")
+    {
         ObservationReason::GitHubRateLimited
     } else if reason.contains("authentication")
         || reason.contains("bad credentials")
+        || reason.contains("resource not accessible")
+        || reason.contains("forbidden")
+        || reason.contains("unauthorized")
         || reason.contains("http 401")
         || reason.contains("http 403")
     {
