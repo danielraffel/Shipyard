@@ -447,16 +447,40 @@ fn durable_snapshot_detects_open_pr_whose_auto_merge_was_cleared() {
     )
     .expect("snapshot");
     let (cleared, truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [], true)
             .expect("reconcile");
     assert_eq!(cleared, [11]);
     assert!(!truncated);
     let (still_cleared, still_truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [], true)
             .expect("reconcile again");
     assert_eq!(still_cleared, [11]);
     assert!(!still_truncated);
     assert_eq!(fs::read_to_string(calls).expect("calls"), "xx");
+}
+
+#[cfg(unix)]
+#[test]
+fn truncated_queue_snapshot_retains_unseen_enrollment_without_alert_or_lookup() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, "echo unexpected >&2; exit 2");
+    let path = enrollment_snapshot_path(temp.path(), "owner/repo", "main");
+    fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    fs::write(
+        &path,
+        r#"{"entries":[{"pr":501,"head_sha":"aaa","observed_at":"2026-07-26T00:00:00Z","auto_merge_cleared":true}]}"#,
+    )
+    .expect("snapshot");
+
+    let (cleared, enrollment_truncated) =
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [], false)
+            .expect("partial reconciliation");
+
+    assert!(cleared.is_empty());
+    assert!(!enrollment_truncated);
+    let persisted: Value =
+        serde_json::from_str(&fs::read_to_string(path).expect("snapshot")).expect("JSON");
+    assert_eq!(persisted["entries"][0]["pr"], 501);
 }
 
 #[cfg(unix)]
@@ -478,8 +502,15 @@ fn enrollment_snapshot_preserves_authoritative_reentry_timestamp() {
         enqueued_at: Some("2026-07-26T12:00:00Z".to_owned()),
     }];
 
-    reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut entries)
-        .expect("reconcile");
+    reconcile_enrollment_snapshot(
+        &actions,
+        "owner/repo",
+        "main",
+        temp.path(),
+        &mut entries,
+        true,
+    )
+    .expect("reconcile");
 
     assert_eq!(
         entries[0].enqueued_at.as_deref(),
@@ -503,7 +534,7 @@ fn retained_enrollment_alert_is_revalidated_and_clears_when_pr_closes() {
     )
     .expect("snapshot");
     let (cleared, truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [], true)
             .expect("reconcile");
     assert!(cleared.is_empty());
     assert!(!truncated);
@@ -525,7 +556,7 @@ fn retargeted_pr_is_not_reported_as_cleared_enrollment() {
     )
     .expect("snapshot");
     let (cleared, truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [], true)
             .expect("reconcile");
     assert!(cleared.is_empty());
     assert!(!truncated);
@@ -539,8 +570,9 @@ fn malformed_enrollment_snapshot_fails_closed_without_overwrite() {
     let path = enrollment_snapshot_path(temp.path(), "owner/repo", "main");
     fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
     fs::write(&path, "not json").expect("snapshot");
-    let error = reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
-        .expect_err("corrupt history must be visible");
+    let error =
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [], true)
+            .expect_err("corrupt history must be visible");
     assert!(error.contains("parse fleet enrollment snapshot failed"));
     assert_eq!(fs::read_to_string(path).expect("snapshot"), "not json");
 }
@@ -574,7 +606,7 @@ fn enrollment_reconciliation_has_a_fixed_per_tick_api_budget() {
     )
     .expect("snapshot");
     let (cleared, truncated) =
-        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [])
+        reconcile_enrollment_snapshot(&actions, "owner/repo", "main", temp.path(), &mut [], true)
             .expect("reconcile");
     assert!(cleared.is_empty());
     assert!(truncated);

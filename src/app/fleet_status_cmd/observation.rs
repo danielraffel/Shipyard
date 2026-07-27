@@ -108,6 +108,7 @@ pub(super) fn reconcile_enrollment_snapshot(
     base: &str,
     state_dir: &Path,
     entries: &mut [crate::merge_queue_liveness::MergeQueueEntry],
+    queue_snapshot_complete: bool,
 ) -> Result<(Vec<u64>, bool), String> {
     let path = enrollment_snapshot_path(state_dir, repo, base);
     let previous = match fs::read_to_string(&path) {
@@ -127,6 +128,9 @@ pub(super) fn reconcile_enrollment_snapshot(
         .into_iter()
         .filter(|entry| !current.contains(&entry.pr))
         .collect::<Vec<_>>();
+    if !queue_snapshot_complete {
+        retained.append(&mut candidates);
+    }
     candidates.sort_by(|left, right| {
         left.last_checked_at
             .as_deref()
@@ -272,8 +276,14 @@ pub(super) fn inspect_merge_queue_liveness(
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
     let (mut entries, queue_truncated) =
         fetch_merge_queue_entries(actions, owner, name, base, OBSERVATION_MAX_PAGES)?;
-    let (enrollment_cleared_prs, enrollment_truncated) =
-        reconcile_enrollment_snapshot(actions, repo, base, state_dir, &mut entries)?;
+    let (enrollment_cleared_prs, enrollment_truncated) = reconcile_enrollment_snapshot(
+        actions,
+        repo,
+        base,
+        state_dir,
+        &mut entries,
+        !queue_truncated,
+    )?;
     let mut observation_truncated =
         observation_truncated || queue_truncated || enrollment_truncated;
     let Some(front) = entries.first() else {
