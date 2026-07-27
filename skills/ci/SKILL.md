@@ -674,6 +674,7 @@ render) first:
 | `validation_failed` | 1 | A target genuinely failed. | Read `shipyard logs`. |
 | `green_not_merged` | 0 | GitHub rejected the merge — usually a required check Shipyard does not supervise still in flight. | Re-run `shipyard ship --pr <n>` once the remaining checks finish. |
 | `green_not_merged_flaky_required` | 0 | A required check is RED on the exact SHA Shipyard validated green. | `shipyard rescue` — see [Rescuing wedged runners](#rescuing-wedged-runners-shipyard-rescue). |
+| `green_not_merged_head_superseded` | 0 | The head moved after validation; Shipyard refused rather than land an unvalidated commit. GitHub rejected nothing. | `shipyard ship --pr <n> --adopt-head`. If you did not expect the head to move, look for an unpushed local commit first. |
 | `green_not_merged_client_defect` | 8 | **Shipyard sent GitHub a malformed request.** Nothing is wrong with the PR. | Report it with the `merge_error` verbatim. The PR is almost certainly mergeable now; `gh pr merge <n> --auto` lands it without bypassing any gate. |
 
 `merge_error` carries the underlying failure verbatim for every non-merged
