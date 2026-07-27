@@ -369,6 +369,14 @@ pub fn supersede_uncertainty(
     reason: &str,
 ) -> Result<bool, String> {
     let mut control_lock = acquire_control_lock(state_root, false)?;
+    if !uncertain_mutations(state_root)?.iter().any(|entry| {
+        entry
+            .get("correlation_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(correlation_id)
+    }) {
+        return Ok(false);
+    }
     let hold_path = state_root.join(HOLD_FILE);
     if hold_path.exists() {
         return Err(format!(
@@ -379,14 +387,6 @@ pub fn supersede_uncertainty(
     let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
         .map_err(|error| format!("failed to load merge-queue mutation policy: {error}"))?;
     validate_machine_authority(&config, state_root)?;
-    if !uncertain_mutations(state_root)?.iter().any(|entry| {
-        entry
-            .get("correlation_id")
-            .and_then(serde_json::Value::as_str)
-            == Some(correlation_id)
-    }) {
-        return Ok(false);
-    }
     append_audit(
         &state_root.join(AUDIT_FILE),
         &json!({
@@ -951,6 +951,100 @@ mod tests {
             "legacy-persisted-id"
         );
         assert!(DurableMutationIntent::resume("").is_err());
+    }
+
+    fn write_terminal_mutation(state_root: &std::path::Path, correlation_id: &str) {
+        std::fs::create_dir_all(state_root.join("merge_queue")).expect("control dir");
+        std::fs::write(
+            state_root.join("merge_queue/mutations.jsonl"),
+            format!(
+                "{{\"correlation_id\":\"{correlation_id}\",\"phase\":\"started\"}}\n\
+                 {{\"correlation_id\":\"{correlation_id}\",\"phase\":\"finished\",\"outcome\":\"superseded\"}}\n"
+            ),
+        )
+        .expect("terminal audit");
+    }
+
+    #[test]
+    fn terminal_mutation_is_idempotent_while_mutations_are_held() {
+        let (_temp, cwd, store, _state) = fixture();
+        let state_root = store.path().parent().expect("state root");
+        let intent = DurableMutationIntent::resume("already-terminal").expect("intent");
+        write_terminal_mutation(state_root, intent.correlation_id());
+        hold(state_root, "incident").expect("hold");
+
+        assert!(
+            !intent
+                .supersede_if_uncertain(
+                    state_root,
+                    &trusted_global_dir(&cwd),
+                    "fresh terminal observation",
+                )
+                .expect("terminal correlation is an idempotent no-op")
+        );
+    }
+
+    #[test]
+    fn terminal_mutation_is_idempotent_without_local_authority() {
+        let (_temp, cwd, store, _state) = fixture();
+        let state_root = store.path().parent().expect("state root");
+        let intent = DurableMutationIntent::resume("already-terminal").expect("intent");
+        write_terminal_mutation(state_root, intent.correlation_id());
+
+        std::fs::write(state_root.join("machine-tag"), "other-machine\n").expect("wrong tag");
+        assert!(
+            !intent
+                .supersede_if_uncertain(
+                    state_root,
+                    &trusted_global_dir(&cwd),
+                    "fresh terminal observation",
+                )
+                .expect("terminal correlation does not require matching authority")
+        );
+
+        std::fs::remove_file(cwd.join(".shipyard/config.toml")).expect("remove policy");
+        std::fs::remove_file(state_root.join("machine-tag")).expect("remove tag");
+        assert!(
+            !intent
+                .supersede_if_uncertain(
+                    state_root,
+                    &trusted_global_dir(&cwd),
+                    "fresh terminal observation",
+                )
+                .expect("terminal correlation does not require configured authority")
+        );
+    }
+
+    #[test]
+    fn uncertain_mutation_still_fails_closed_without_local_authority() {
+        let (_temp, cwd, store, _state) = fixture();
+        let state_root = store.path().parent().expect("state root");
+        let intent = DurableMutationIntent::resume("still-uncertain").expect("intent");
+        std::fs::create_dir_all(state_root.join("merge_queue")).expect("control dir");
+        std::fs::write(
+            state_root.join("merge_queue/mutations.jsonl"),
+            format!(
+                "{{\"correlation_id\":\"{}\",\"phase\":\"started\"}}\n",
+                intent.correlation_id()
+            ),
+        )
+        .expect("uncertain audit");
+        std::fs::write(state_root.join("machine-tag"), "other-machine\n").expect("wrong tag");
+
+        let error = intent
+            .supersede_if_uncertain(
+                state_root,
+                &trusted_global_dir(&cwd),
+                "fresh terminal observation",
+            )
+            .expect_err("uncertain correlation requires matching authority");
+        assert!(error.contains("authority is `studio`"), "{error}");
+        assert!(
+            intent
+                .is_uncertain(state_root)
+                .expect("uncertainty remains"),
+            "failed authority must not append a terminal audit record"
+        );
     }
 
     fn acquire_guard(
