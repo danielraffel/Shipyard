@@ -764,6 +764,46 @@ guard above, because GraphQL auto-merge can otherwise land a commit
 pushed *after* validation completed (the bug that merged pulp #3128 at a
 pre-fix SHA).
 
+### GraphQL selection sets are unverified until something runs them
+
+`gh api graphql` failures arrive as prose on stderr with no machine-readable
+code, and a malformed *document* is indistinguishable at the call site from a
+legitimate rejection. Two rules follow.
+
+**Verify a new or edited selection set against the live schema.** Nothing in
+`cargo build` checks that a field exists; a wrong guess fails only when the
+query runs, in front of an operator. Shipyard ≤0.80.1 selected
+`autoMergeRequest{id}` in the merge-queue poll query — `AutoMergeRequest` is a
+plain OBJECT implementing no interfaces, so it is not a `Node` and has never had
+an `id`. GitHub rejected the entire document. Since `queue_admission` issues that
+query *before* any mutation, merge-queue admission failed outright for every
+queue-governed repository: PRs validated green and were never enqueued.
+
+```sh
+gh api graphql -f query='{__type(name:"AutoMergeRequest"){fields{name}}}'
+```
+
+The poll query is now built by `queue_poll_query()` from a named probe constant,
+with the type's real field list pinned in `AUTO_MERGE_REQUEST_FIELDS` and
+asserted by tests — so a stale selection fails in `cargo test`, not at merge
+time. Follow that shape for any query whose selection set could drift: build it
+from constants and assert the shape, rather than inlining a string literal. Note
+that GraphQL forbids an empty selection set, so a mere presence probe still has
+to name one real field.
+
+**Never let a client defect render as a PR problem.**
+`is_graphql_malformed_query_error` classifies malformed-document stderr, and
+`post_run_merge_state` routes it to `ShipRenderState::GreenNotMergedClientDefect`
+*before* any PR-inspecting classification runs. That state renders a diagnostic
+naming Shipyard as the fault, reports `status:"green_not_merged_client_defect"`
+in `--json`, and exits `8` — distinct from `1` (validation genuinely failed) and
+from the `0` the other green-but-unmerged states keep. The classifier fails
+closed: unrecognized stderr stays an ordinary merge rejection, so genuine blocks
+never lose their branch-protection guidance. Extend
+`GRAPHQL_MALFORMED_QUERY_SIGNATURES` when GitHub adds a phrasing, and keep the
+"must NOT match" test cases — a false positive would tell an operator to report a
+Shipyard bug when their PR really was blocked.
+
 ### Flaky-required-leg wedge → rescue hand-off (`auto_rescue`)
 
 When Shipyard validated every target green but `gh pr merge` is *rejected*
