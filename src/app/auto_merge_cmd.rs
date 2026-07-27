@@ -1507,6 +1507,47 @@ fn with_current_queue_state_locked<T>(
     action().map(Some)
 }
 
+/// Every field GitHub's GraphQL `AutoMergeRequest` type exposes. The type is a
+/// plain OBJECT implementing no interfaces — notably not `Node` — so it has no
+/// `id`, and selecting one makes GitHub reject the *whole* enclosing query with
+/// `Field 'id' doesn't exist on type 'AutoMergeRequest'`.
+///
+/// Refresh with:
+/// `gh api graphql -f query='{__type(name:"AutoMergeRequest"){fields{name}}}'`
+///
+/// Exists to be asserted against, not read at run time — the tests below check
+/// the poll query's selection against it.
+#[cfg_attr(not(test), allow(dead_code))]
+const AUTO_MERGE_REQUEST_FIELDS: [&str; 7] = [
+    "authorEmail",
+    "commitBody",
+    "commitHeadline",
+    "enabledAt",
+    "enabledBy",
+    "mergeMethod",
+    "pullRequest",
+];
+
+/// Presence probe for `pullRequest.autoMergeRequest`. The poll only needs to
+/// know whether the node is null, but GraphQL forbids an empty selection set on
+/// an object, so exactly one real field must be named. Keep this a member of
+/// [`AUTO_MERGE_REQUEST_FIELDS`]; `queue_poll_query_selects_only_real_auto_merge_fields`
+/// enforces that.
+const AUTO_MERGE_REQUEST_PROBE: &str = "enabledAt";
+
+/// The merge-queue poll query.
+///
+/// Built rather than inlined so the `autoMergeRequest` selection is a single
+/// named constant a test can validate against the schema field list. An invalid
+/// selection here is not cosmetic: [`queue_admission`] issues this query before
+/// any mutation, so it takes down merge-queue admission for every
+/// queue-governed repository.
+fn queue_poll_query() -> String {
+    format!(
+        "query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){{repository(owner:$owner,name:$name){{pullRequest(number:$pr){{id headRefOid baseRefName merged autoMergeRequest{{{AUTO_MERGE_REQUEST_PROBE}}} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){{nodes{{... on RemovedFromMergeQueueEvent{{reason createdAt}}}}}}}} mergeQueue(branch:$branch){{entries(first:100,after:$after){{nodes{{position pullRequest{{number}}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
+    )
+}
+
 fn fetch_queue_poll_pages(
     client: &GhClient,
     cwd: &Path,
@@ -1516,7 +1557,7 @@ fn fetch_queue_poll_pages(
         .repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug {:?}", state.repo))?;
-    let query = r"query($owner:String!,$name:String!,$branch:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$pr){id headRefOid baseRefName merged autoMergeRequest{id} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason createdAt}}}} mergeQueue(branch:$branch){entries(first:100,after:$after){nodes{position pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}";
+    let query = queue_poll_query();
     let mut pages = Vec::new();
     let mut cursor: Option<String> = None;
     let mut seen_cursors = BTreeSet::new();
@@ -1955,6 +1996,35 @@ fn live_merge_queue_present(body: &Value) -> Result<bool, String> {
         .ok_or_else(|| "branch merge-queue query omitted repository authority".to_owned())
 }
 
+/// Signature phrases GitHub uses when it rejects a GraphQL *document* — the
+/// query Shipyard sent is invalid, independent of the PR, the repository, or
+/// branch protection. Kept narrow and phrase-based because these arrive as
+/// prose on `gh`'s stderr with no machine-readable code attached.
+const GRAPHQL_MALFORMED_QUERY_SIGNATURES: [&str; 6] = [
+    // Selecting a field the type does not expose (`undefinedField`).
+    "doesn't exist on type",
+    "does not exist on type",
+    // Selecting an object without subfields, or a scalar with them.
+    "must have a selection of subfields",
+    "must not have a selection since type",
+    // Bad argument name/value, or an undeclared/unused variable.
+    "is not defined by operation",
+    "parse error on",
+];
+
+/// Whether a `gh` failure means Shipyard sent a malformed GraphQL query.
+///
+/// This distinction matters for the hand-back: a malformed query is a *Shipyard
+/// defect* the operator cannot fix by waiting or by adjusting branch protection,
+/// so the merge diagnostic must not send them to investigate the PR. Fails
+/// closed — an unrecognised message is treated as an ordinary merge rejection.
+pub(super) fn is_graphql_malformed_query_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    GRAPHQL_MALFORMED_QUERY_SIGNATURES
+        .iter()
+        .any(|signature| lower.contains(signature))
+}
+
 const PRIVATE_FREE_RULES_ENTITLEMENT: &str =
     "Upgrade to GitHub Pro or make this repository public to enable this feature.";
 
@@ -2387,6 +2457,122 @@ fn fields(items: impl IntoIterator<Item = (&'static str, Value)>) -> BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── merge-queue poll query shape ────────────────────────────────────
+
+    /// Extract the selection set of `autoMergeRequest{…}` from a query string.
+    fn auto_merge_request_selection(query: &str) -> Vec<String> {
+        let start = query
+            .find("autoMergeRequest{")
+            .map(|at| at + "autoMergeRequest{".len())
+            .expect("poll query selects autoMergeRequest");
+        let end = start
+            + query[start..]
+                .find('}')
+                .expect("autoMergeRequest selection is closed");
+        query[start..end]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn queue_poll_query_selects_only_real_auto_merge_fields() {
+        // A field GitHub's schema does not expose makes the whole poll query
+        // fail, and `queue_admission` runs it before any mutation — so a stale
+        // selection breaks merge-queue admission for every queue-governed repo.
+        // Catch that here rather than at merge time.
+        let selection = auto_merge_request_selection(&queue_poll_query());
+        assert!(
+            !selection.is_empty(),
+            "GraphQL forbids an empty selection set on an object"
+        );
+        for field in &selection {
+            assert!(
+                AUTO_MERGE_REQUEST_FIELDS.contains(&field.as_str()),
+                "autoMergeRequest{{{field}}} is not a field of GitHub's AutoMergeRequest type; \
+                 valid fields: {AUTO_MERGE_REQUEST_FIELDS:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_poll_query_never_selects_auto_merge_request_id() {
+        // `AutoMergeRequest` is a plain OBJECT implementing no interfaces, so it
+        // is not a `Node` and has never had an `id`. Selecting one produced
+        // `gh: Field 'id' doesn't exist on type 'AutoMergeRequest'`.
+        assert!(
+            !queue_poll_query().contains("autoMergeRequest{id}"),
+            "autoMergeRequest has no id field"
+        );
+        assert!(!AUTO_MERGE_REQUEST_FIELDS.contains(&"id"));
+    }
+
+    #[test]
+    fn queue_poll_query_keeps_the_fields_the_parsers_read() {
+        // The poll response feeds `parse_pr_observation` and
+        // `parse_queue_pages`; dropping any of these silently degrades the
+        // queue state machine rather than failing loudly.
+        let query = queue_poll_query();
+        for required in [
+            "headRefOid",
+            "baseRefName",
+            "merged",
+            "autoMergeRequest{",
+            "REMOVED_FROM_MERGE_QUEUE_EVENT",
+            "mergeQueue(branch:$branch)",
+            "hasNextPage",
+            "endCursor",
+        ] {
+            assert!(query.contains(required), "poll query lost {required}");
+        }
+    }
+
+    // ── malformed-GraphQL-query detector ────────────────────────────────
+
+    #[test]
+    fn detects_the_auto_merge_request_id_schema_error_verbatim() {
+        // Exactly what `gh` printed on stderr when the poll query selected
+        // `autoMergeRequest{id}`.
+        assert!(is_graphql_malformed_query_error(
+            "gh: Field 'id' doesn't exist on type 'AutoMergeRequest'"
+        ));
+    }
+
+    #[test]
+    fn detects_other_malformed_query_shapes() {
+        for message in [
+            "gh: Field 'mergeQueue' must have a selection of subfields",
+            "gh: Field 'merged' must not have a selection since type 'Boolean' has no subfields",
+            "gh: Variable $after is not defined by operation 'poll'",
+            "gh: Parse error on '}' (RCURLY)",
+            "Field 'headRefOid' does not exist on type 'PullRequest'",
+        ] {
+            assert!(
+                is_graphql_malformed_query_error(message),
+                "should classify as malformed: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_classify_genuine_merge_rejections_as_malformed() {
+        // These are real, PR-side blocks. Misclassifying them would suppress the
+        // branch-protection guidance that is correct for them.
+        for message in [
+            "gh: Pull request is not mergeable",
+            "gh: Required status check \"macos\" is expected.",
+            "gh: Changes must be approved by a reviewer",
+            "! The merge strategy for main is set by the merge queue",
+            "gh: Resource not accessible by integration (mergePullRequest)",
+            "HTTP 405: Base branch was modified. Review and try the merge again.",
+        ] {
+            assert!(
+                !is_graphql_malformed_query_error(message),
+                "should NOT classify as malformed: {message}"
+            );
+        }
+    }
 
     // ── 405 base-branch-modified detector (issue #266) ──────────────────
 
