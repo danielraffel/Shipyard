@@ -568,7 +568,7 @@ mod tests {
                     "headRefOid": "0123456789abcdef",
                     "baseRefName": "main",
                     "merged": false,
-                    "autoMergeRequest": { "id": "AMR_1" },
+                    "autoMergeRequest": { "enabledAt": "2026-01-01T00:00:00Z" },
                     "timelineItems": { "nodes": [
                         { "reason": "FAILED_CHECKS" }
                     ] }

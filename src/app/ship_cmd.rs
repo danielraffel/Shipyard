@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -6,9 +7,10 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 
 use super::{
-    CliFailure,
+    CliFailure, SHIP_EXIT_MERGE_CLIENT_DEFECT,
     auto_merge_cmd::{
-        AutoMergeOutcome, AutoMergeRequest, execute_auto_merge, supervise_merge_queue,
+        AutoMergeOutcome, AutoMergeRequest, execute_auto_merge, is_graphql_malformed_query_error,
+        supervise_merge_queue,
     },
     cli::{MergeMethod, MergeResult},
     wait_cmd::parse_github_repo_slug,
@@ -177,11 +179,7 @@ pub(super) fn ship_command<W: Write>(
     } else {
         render_human(stdout, pr_context.number, &render_state, &diagnostics)?;
     }
-    Ok(if render_state == ShipRenderState::ValidationFailed {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(render_state.exit_code())
 }
 
 /// One element per failed target. Built by `collect_failure_diagnostics`.
@@ -525,11 +523,72 @@ enum ShipRenderState {
         /// Names of the red required checks (all validated green by Shipyard).
         red_contexts: Vec<String>,
     },
+    /// Validation passed and nothing about the PR blocked the merge — Shipyard
+    /// sent GitHub a malformed GraphQL query. A *client* defect: the operator
+    /// cannot fix it by waiting or by editing branch protection, and the PR is
+    /// very likely mergeable right now. Rendered and exit-coded separately so a
+    /// green PR stalled by a Shipyard bug never reads as a red one.
+    GreenNotMergedClientDefect(String),
+    /// The live PR head advanced past the SHA Shipyard validated (issue #321),
+    /// so the merge was refused rather than landing unvalidated work. Branch
+    /// protection is not involved and waiting cannot clear it — the fix is
+    /// always to re-ship the new head — so this carries its own render instead
+    /// of the generic branch-protection guidance.
+    GreenNotMergedHeadSuperseded {
+        /// The SHA Shipyard validated green.
+        validated: String,
+        /// The SHA that is live on the PR now.
+        current: String,
+    },
 }
 
 impl ShipRenderState {
     fn merged(&self) -> bool {
         matches!(self, Self::Merged)
+    }
+
+    /// The merge-rejection reason for states that carry one. Verbatim where a
+    /// `gh` error exists; composed for the superseded-head case, which Shipyard
+    /// refuses client-side without ever calling `gh`.
+    fn merge_error(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::ValidationFailed | Self::Merged => None,
+            Self::GreenNotMerged(error)
+            | Self::GreenNotMergedClientDefect(error)
+            | Self::GreenNotMergedFlakyRequired { error, .. } => Some(Cow::Borrowed(error)),
+            Self::GreenNotMergedHeadSuperseded { validated, current } => Some(Cow::Owned(format!(
+                "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
+            ))),
+        }
+    }
+
+    /// Stable machine-readable tag for the `--json` envelope, so automation can
+    /// tell "validation failed" from "validated green, merge call malformed"
+    /// without pattern-matching on prose.
+    fn status(&self) -> &'static str {
+        match self {
+            Self::ValidationFailed => "validation_failed",
+            Self::Merged => "merged",
+            Self::GreenNotMerged(_) => "green_not_merged",
+            Self::GreenNotMergedFlakyRequired { .. } => "green_not_merged_flaky_required",
+            Self::GreenNotMergedClientDefect(_) => "green_not_merged_client_defect",
+            Self::GreenNotMergedHeadSuperseded { .. } => "green_not_merged_head_superseded",
+        }
+    }
+
+    /// Process exit code. `validation_failed` keeps its historical `1`, and the
+    /// green-but-blocked states keep their historical `0` so existing callers do
+    /// not change meaning — only the new client-defect state gets a distinct,
+    /// nonzero code, because that one is a Shipyard bug an operator must see.
+    fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::ValidationFailed => ExitCode::from(1),
+            Self::GreenNotMergedClientDefect(_) => ExitCode::from(SHIP_EXIT_MERGE_CLIENT_DEFECT),
+            Self::Merged
+            | Self::GreenNotMerged(_)
+            | Self::GreenNotMergedFlakyRequired { .. }
+            | Self::GreenNotMergedHeadSuperseded { .. } => ExitCode::SUCCESS,
+        }
     }
 }
 
@@ -572,13 +631,11 @@ fn post_run_merge_state(
                     Ok(ShipRenderState::Merged)
                 }
                 AutoMergeOutcome::SupersededSha { validated, current } => {
-                    Ok(ShipRenderState::GreenNotMerged(format!(
-                        "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
-                    )))
+                    Ok(ShipRenderState::GreenNotMergedHeadSuperseded { validated, current })
                 }
-                AutoMergeOutcome::MergeFailed { error } => {
-                    Ok(ShipRenderState::GreenNotMerged(error))
-                }
+                // Queue supervision re-runs the merge-queue poll query, so it can
+                // surface the same malformed-query defect as admission does.
+                AutoMergeOutcome::MergeFailed { error } => Ok(green_not_merged(error)),
                 AutoMergeOutcome::Enqueued
                 | AutoMergeOutcome::PrNotFound
                 | AutoMergeOutcome::InFlight { .. }
@@ -592,13 +649,10 @@ fn post_run_merge_state(
             Ok(classify_merge_failure(store, config, cwd, repo, pr, error))
         }
         // Validation passed but the live head advanced past the validated SHA
-        // (issue #321). Report green-not-merged so `shipyard ship` surfaces
-        // merged:false / status:"green_not_merged" and the operator re-ships
-        // to validate the new head.
+        // (issue #321): the green evidence describes a commit that is no longer
+        // the head, so merging it would land unvalidated work.
         AutoMergeOutcome::SupersededSha { validated, current } => {
-            Ok(ShipRenderState::GreenNotMerged(format!(
-                "live PR head {current} superseded the validated SHA {validated}; re-run shipyard ship to validate the new head"
-            )))
+            Ok(ShipRenderState::GreenNotMergedHeadSuperseded { validated, current })
         }
         AutoMergeOutcome::PrNotFound
         | AutoMergeOutcome::InFlight { .. }
@@ -606,6 +660,17 @@ fn post_run_merge_state(
             1,
             format!("PR #{pr}: validation passed but ship-state was not merge-ready"),
         )),
+    }
+}
+
+/// Green-but-unmerged hand-back for paths with no rollup context to inspect.
+/// Still splits out the client-defect case, because "Shipyard sent a malformed
+/// query" must never render as "the PR is blocked".
+fn green_not_merged(error: String) -> ShipRenderState {
+    if is_graphql_malformed_query_error(&error) {
+        ShipRenderState::GreenNotMergedClientDefect(error)
+    } else {
+        ShipRenderState::GreenNotMerged(error)
     }
 }
 
@@ -625,6 +690,12 @@ fn classify_merge_failure(
     pr: u64,
     error: String,
 ) -> ShipRenderState {
+    // Check the client-defect case before anything that inspects the PR: a
+    // malformed GraphQL query says nothing about the PR's mergeability, and the
+    // rollup-based flaky-leg classification below would only add noise.
+    if is_graphql_malformed_query_error(&error) {
+        return ShipRenderState::GreenNotMergedClientDefect(error);
+    }
     let Some(state) = store.get(pr) else {
         return ShipRenderState::GreenNotMerged(error);
     };
@@ -699,6 +770,13 @@ fn render_json<W: Write>(
         fields([
             ("pr", Value::from(pr)),
             ("merged", Value::Bool(merged)),
+            // `merged:false` alone cannot tell a caller whether validation failed
+            // or validation passed and only the merge call broke. These two do.
+            ("status", Value::from(state.status())),
+            (
+                "merge_error",
+                state.merge_error().map_or(Value::Null, Value::from),
+            ),
             ("run", outcome.job.to_json_value()),
             ("ship_state", json!(outcome.ship_state)),
             (
@@ -722,6 +800,12 @@ fn render_human<W: Write>(
         ShipRenderState::ValidationFailed => render_validation_failed(stdout, pr, diagnostics),
         ShipRenderState::Merged => writeln!(stdout, "PR #{pr} merged. All green."),
         ShipRenderState::GreenNotMerged(error) => render_green_not_merged(stdout, pr, error),
+        ShipRenderState::GreenNotMergedClientDefect(error) => {
+            render_green_not_merged_client_defect(stdout, pr, error)
+        }
+        ShipRenderState::GreenNotMergedHeadSuperseded { validated, current } => {
+            render_green_not_merged_head_superseded(stdout, pr, validated, current)
+        }
         ShipRenderState::GreenNotMergedFlakyRequired {
             error,
             red_contexts,
@@ -759,6 +843,94 @@ fn render_green_not_merged<W: Write>(stdout: &mut W, pr: u64, error: &str) -> st
         stdout,
         "  * enable native auto-merge: `gh pr merge {pr} --squash --auto`"
     )?;
+    Ok(())
+}
+
+/// Hand-back for a merge blocked by Shipyard's *own* malformed request. The
+/// generic [`render_green_not_merged`] guidance is actively wrong here: it blames
+/// branch protection and unsupervised checks, sending the reader to investigate a
+/// PR that is very likely mergeable. Name the defect, and give the unblock that
+/// works — the merge itself is safe to arm, because every gate already passed.
+fn render_green_not_merged_client_defect<W: Write>(
+    stdout: &mut W,
+    pr: u64,
+    error: &str,
+) -> std::io::Result<()> {
+    writeln!(
+        stdout,
+        "Shipyard-validated targets passed. The merge was NOT rejected by GitHub's"
+    )?;
+    writeln!(
+        stdout,
+        "branch protection — Shipyard sent a malformed GraphQL request:"
+    )?;
+    writeln!(stdout, "  reason: {error}")?;
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "This is a Shipyard defect, not a problem with PR #{pr}. Waiting will not"
+    )?;
+    writeln!(
+        stdout,
+        "clear it and branch protection is not worth investigating. Please report it"
+    )?;
+    writeln!(
+        stdout,
+        "with the reason above: https://github.com/danielraffel/Shipyard/issues"
+    )?;
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "To land PR #{pr} now — every gate already passed, so this bypasses nothing:"
+    )?;
+    writeln!(stdout, "  gh pr merge {pr} --auto")?;
+    writeln!(
+        stdout,
+        "Omit any merge-strategy flag: on a merge-queue-governed branch the queue"
+    )?;
+    writeln!(
+        stdout,
+        "owns the strategy and `--squash` is refused. Add it only if the base branch"
+    )?;
+    writeln!(stdout, "has no merge queue.")?;
+    Ok(())
+}
+
+/// Hand-back for a merge Shipyard itself refused because the head moved. GitHub
+/// never rejected anything here, so the generic branch-protection guidance is
+/// wrong twice over: there is no protection rule to inspect, and waiting cannot
+/// help — the green evidence describes a commit that is no longer the head. The
+/// only fix is to validate the new head.
+fn render_green_not_merged_head_superseded<W: Write>(
+    stdout: &mut W,
+    pr: u64,
+    validated: &str,
+    current: &str,
+) -> std::io::Result<()> {
+    writeln!(
+        stdout,
+        "Shipyard-validated targets passed, but PR #{pr} was NOT merged: its head"
+    )?;
+    writeln!(stdout, "moved after validation completed.")?;
+    writeln!(stdout, "  validated: {validated}")?;
+    writeln!(stdout, "  live head: {current}")?;
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "Merging now would land a commit no target ever validated, so Shipyard"
+    )?;
+    writeln!(
+        stdout,
+        "refused. GitHub rejected nothing — branch protection is not involved and"
+    )?;
+    writeln!(stdout, "waiting will not clear it. Validate the new head:")?;
+    writeln!(stdout, "  shipyard ship --pr {pr} --adopt-head")?;
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "If you did not expect the head to move, check for an unpushed local commit"
+    )?;
+    writeln!(stdout, "or a concurrent push before re-shipping.")?;
     Ok(())
 }
 
@@ -933,8 +1105,9 @@ mod tests {
     use toml::Table;
 
     use super::{
-        ShipCommandArgs, ShipRenderState, render_green_not_merged, render_green_not_merged_flaky,
-        ship_command,
+        SHIP_EXIT_MERGE_CLIENT_DEFECT, ShipCommandArgs, ShipRenderState, green_not_merged,
+        render_green_not_merged, render_green_not_merged_client_defect,
+        render_green_not_merged_flaky, render_green_not_merged_head_superseded, ship_command,
     };
     use crate::app::cli::MergeResult;
     use crate::config::{LoadedConfig, LocalOverlaySource};
@@ -980,12 +1153,163 @@ mod tests {
         assert!(ShipRenderState::Merged.merged());
         assert!(!ShipRenderState::ValidationFailed.merged());
         assert!(!ShipRenderState::GreenNotMerged("err".to_owned()).merged());
+        assert!(!ShipRenderState::GreenNotMergedClientDefect("err".to_owned()).merged());
         assert!(
             !ShipRenderState::GreenNotMergedFlakyRequired {
                 error: "err".to_owned(),
                 red_contexts: vec!["macos".to_owned()],
             }
             .merged()
+        );
+    }
+
+    /// The exact stderr from the `autoMergeRequest{id}` schema bug must land in
+    /// the client-defect state, not in the generic branch-protection hand-back.
+    #[test]
+    fn malformed_graphql_query_classifies_as_a_client_defect() {
+        let err = "gh: Field 'id' doesn't exist on type 'AutoMergeRequest'".to_owned();
+        assert_eq!(
+            green_not_merged(err.clone()),
+            ShipRenderState::GreenNotMergedClientDefect(err)
+        );
+    }
+
+    #[test]
+    fn genuine_merge_rejection_stays_a_generic_green_not_merged() {
+        let err = "gh: Required status check \"macos\" is expected.".to_owned();
+        assert_eq!(
+            green_not_merged(err.clone()),
+            ShipRenderState::GreenNotMerged(err)
+        );
+    }
+
+    /// A green PR stalled by a Shipyard defect must be distinguishable from a red
+    /// one by exit code alone, while every pre-existing state keeps its code.
+    #[test]
+    fn client_defect_gets_a_distinct_nonzero_exit_code() {
+        assert_eq!(
+            format!("{:?}", ShipRenderState::Merged.exit_code()),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            format!("{:?}", ShipRenderState::ValidationFailed.exit_code()),
+            format!("{:?}", ExitCode::from(1))
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                ShipRenderState::GreenNotMerged("e".to_owned()).exit_code()
+            ),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                ShipRenderState::GreenNotMergedClientDefect("e".to_owned()).exit_code()
+            ),
+            format!("{:?}", ExitCode::from(SHIP_EXIT_MERGE_CLIENT_DEFECT))
+        );
+        // Must not collide with validation-failed, or the distinction is lost.
+        assert_ne!(SHIP_EXIT_MERGE_CLIENT_DEFECT, 0);
+        assert_ne!(SHIP_EXIT_MERGE_CLIENT_DEFECT, 1);
+    }
+
+    #[test]
+    fn json_status_and_merge_error_separate_the_failure_modes() {
+        assert_eq!(ShipRenderState::Merged.status(), "merged");
+        assert_eq!(ShipRenderState::Merged.merge_error(), None);
+        assert_eq!(
+            ShipRenderState::ValidationFailed.status(),
+            "validation_failed"
+        );
+        assert_eq!(ShipRenderState::ValidationFailed.merge_error(), None);
+
+        let err = "gh: Field 'id' doesn't exist on type 'AutoMergeRequest'";
+        let defect = ShipRenderState::GreenNotMergedClientDefect(err.to_owned());
+        assert_eq!(defect.status(), "green_not_merged_client_defect");
+        assert_eq!(defect.merge_error().as_deref(), Some(err));
+
+        let blocked = ShipRenderState::GreenNotMerged("blocked".to_owned());
+        assert_eq!(blocked.status(), "green_not_merged");
+        assert_eq!(blocked.merge_error().as_deref(), Some("blocked"));
+
+        // Shipyard refuses this one client-side, so there is no `gh` error to
+        // quote — the envelope still has to carry a reason.
+        let superseded = ShipRenderState::GreenNotMergedHeadSuperseded {
+            validated: "aaaa".to_owned(),
+            current: "bbbb".to_owned(),
+        };
+        assert_eq!(superseded.status(), "green_not_merged_head_superseded");
+        let reason = superseded.merge_error().expect("reason");
+        assert!(reason.contains("aaaa"), "must name the validated SHA");
+        assert!(reason.contains("bbbb"), "must name the live SHA");
+
+        // No two green-but-unmerged states may share a status tag.
+        let tags = [blocked.status(), defect.status(), superseded.status()];
+        assert_eq!(
+            tags.len(),
+            tags.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            "status tags must be distinct: {tags:?}"
+        );
+    }
+
+    /// Shipyard refuses a superseded head itself — GitHub rejected nothing — so
+    /// the render must not send the reader to branch protection.
+    #[test]
+    fn head_superseded_render_does_not_blame_branch_protection() {
+        let mut buf = Vec::<u8>::new();
+        render_green_not_merged_head_superseded(&mut buf, 384, "aaaa111", "bbbb222")
+            .expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            out.contains("aaaa111"),
+            "must name validated SHA; got:\n{out}"
+        );
+        assert!(out.contains("bbbb222"), "must name live SHA; got:\n{out}");
+        assert!(
+            !out.contains("branch protection requires"),
+            "must NOT blame branch protection; got:\n{out}"
+        );
+        assert!(
+            out.contains("--adopt-head"),
+            "must point at the re-ship that adopts the new head; got:\n{out}"
+        );
+    }
+
+    /// The generic render blames branch protection, which is wrong for this
+    /// failure. The client-defect render must not repeat that misdirection.
+    #[test]
+    fn client_defect_render_blames_shipyard_not_branch_protection() {
+        let mut buf = Vec::<u8>::new();
+        let err = "gh: Field 'id' doesn't exist on type 'AutoMergeRequest'";
+        render_green_not_merged_client_defect(&mut buf, 6682, err).expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("PR #6682"), "must name the PR; got:\n{out}");
+        assert!(
+            out.contains(err),
+            "must surface the error verbatim; got:\n{out}"
+        );
+        assert!(
+            out.contains("malformed GraphQL request"),
+            "must name the actual cause; got:\n{out}"
+        );
+        assert!(
+            out.contains("Shipyard defect"),
+            "must attribute the fault to Shipyard; got:\n{out}"
+        );
+        assert!(
+            !out.contains("branch protection requires"),
+            "must NOT repeat the branch-protection misdirection; got:\n{out}"
+        );
+        // The queue owns the strategy on a queue-governed branch, so the
+        // suggested unblock must not hardcode --squash.
+        assert!(
+            out.contains("gh pr merge 6682 --auto"),
+            "must offer a strategy-free unblock; got:\n{out}"
+        );
+        assert!(
+            !out.contains("--squash --auto"),
+            "must not suggest a strategy the merge queue would refuse; got:\n{out}"
         );
     }
 

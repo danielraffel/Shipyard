@@ -111,6 +111,13 @@ impl CliFailure {
     }
 }
 
+/// `shipyard ship` validated every target green but could not merge because the
+/// request Shipyard sent GitHub was malformed — a Shipyard defect, not a PR
+/// problem. Distinct from `1` (validation genuinely failed) and from `0` (merged,
+/// or blocked by something on the PR) so automation can tell a stalled-green PR
+/// from a red one.
+pub(super) const SHIP_EXIT_MERGE_CLIENT_DEFECT: u8 = 8;
+
 pub(super) const WAIT_EXIT_TIMEOUT: u8 = 1;
 pub(super) const WAIT_EXIT_RUN_TERMINAL_WRONG: u8 = 4;
 pub(super) const WAIT_EXIT_INVALID: u8 = 5;

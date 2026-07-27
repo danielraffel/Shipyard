@@ -661,6 +661,45 @@ restarts) and GitHub reports `invalid_merge_commit`; `failed_checks`,
 manual/unknown removal, head drift, and HTTP 403/rate-limit responses stop
 fail-closed.
 
+### "Validated green but not merged" — read the status before blaming the PR
+
+`shipyard ship` can validate every target green and still not merge. The
+reason is not always on the PR, so do not start by inspecting branch
+protection. Read the `status` field in `--json` (or the headline of the human
+render) first:
+
+| `status` | Exit | What it means | What to do |
+|---|---|---|---|
+| `merged` | 0 | Landed. | Nothing. |
+| `validation_failed` | 1 | A target genuinely failed. | Read `shipyard logs`. |
+| `green_not_merged` | 0 | GitHub rejected the merge — usually a required check Shipyard does not supervise still in flight. | Re-run `shipyard ship --pr <n>` once the remaining checks finish. |
+| `green_not_merged_flaky_required` | 0 | A required check is RED on the exact SHA Shipyard validated green. | `shipyard rescue` — see [Rescuing wedged runners](#rescuing-wedged-runners-shipyard-rescue). |
+| `green_not_merged_head_superseded` | 0 | The head moved after validation; Shipyard refused rather than land an unvalidated commit. GitHub rejected nothing. | `shipyard ship --pr <n> --adopt-head`. If you did not expect the head to move, look for an unpushed local commit first. |
+| `green_not_merged_client_defect` | 8 | **Shipyard sent GitHub a malformed request.** Nothing is wrong with the PR. | Report it with the `merge_error` verbatim. The PR is almost certainly mergeable now; `gh pr merge <n> --auto` lands it without bypassing any gate. |
+
+`merge_error` carries the underlying failure verbatim for every non-merged
+state, so automation never has to scrape prose out of the human render.
+
+Two things worth knowing about that last row. It is exit **8**, deliberately
+distinct from `1`, so a script can tell a *stalled-green* PR from a *red* one —
+the pre-existing states keep their historical exit codes. And when you arm the
+merge by hand on a merge-queue-governed branch, pass **no strategy flag**: the
+queue owns the merge method and `--squash` is refused with `! The merge strategy
+for main is set by the merge queue`.
+
+The known instance of this class: Shipyard ≤0.80.1 selected
+`autoMergeRequest{id}` in the merge-queue poll query. GitHub's
+`AutoMergeRequest` is a plain OBJECT implementing no interfaces — not a `Node`,
+so it has no `id` — and GitHub rejected the whole document with `Field 'id'
+doesn't exist on type 'AutoMergeRequest'`. Because that query runs at queue
+*admission*, before any mutation, merge-queue admission failed outright on every
+queue-governed repo. When adding or editing a GraphQL selection set, verify it
+against the live schema rather than assuming a field exists:
+
+```sh
+gh api graphql -f query='{__type(name:"AutoMergeRequest"){fields{name}}}'
+```
+
 On a multi-host fleet, set `[merge_queue].mutation_machine` to one stored
 runner tag in every host's trusted machine-global `config.toml` reported by
 `shipyard paths`. Project and checkout-local config cannot select authority.
