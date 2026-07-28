@@ -280,6 +280,76 @@ def read_version(repo: Path, vf: VersionFile) -> str | None:
     return None
 
 
+_CARGO_PACKAGE_NAME_RE = re.compile(
+    r'(?ms)^\[package\].*?^name\s*=\s*"([^"]+)"'
+)
+
+
+def cargo_crate_name(manifest_text: str) -> str | None:
+    """The `[package] name` of a Cargo.toml, or None if it declares none.
+
+    Regex rather than a TOML parser to match the rest of this module and to stay
+    importable on Pythons without `tomllib`.
+    """
+    m = _CARGO_PACKAGE_NAME_RE.search(manifest_text)
+    return m.group(1) if m else None
+
+
+def refresh_cargo_lock(repo: Path, manifest_rel: str, new: str) -> str | None:
+    """Point Cargo.lock's own entry for this crate at `new`.
+
+    A version bump that edits Cargo.toml and leaves Cargo.lock behind breaks any
+    `cargo build/test --locked`, which refuses to update the lock:
+
+        error: cannot update the lock file ... because --locked was passed
+
+    Shipyard validates itself that way, so every self-ship that bumped the
+    version failed its own validation until the lock was refreshed by hand.
+
+    Rewrites only the workspace-member entry — the `[[package]]` block whose
+    `name` matches and which has no `source` key, since a registry dependency
+    that happens to share the crate name does carry one. Returns the lockfile's
+    repo-relative path when it changed, else None. Deliberately textual: no
+    `cargo` binary is required, so this works wherever the gate runs.
+    """
+    manifest = repo / manifest_rel
+    lock = manifest.parent / "Cargo.lock"
+    if not manifest.exists() or not lock.exists():
+        return None
+    crate = cargo_crate_name(manifest.read_text())
+    if not crate:
+        return None
+
+    text = lock.read_text()
+    # Split on the block delimiter, keeping it, so each chunk is one package.
+    blocks = text.split("[[package]]")
+    rewritten: list[str] = []
+    changed = 0
+    for block in blocks:
+        if (
+            re.search(rf'(?m)^name\s*=\s*"{re.escape(crate)}"$', block)
+            and not re.search(r"(?m)^source\s*=", block)
+        ):
+            block, count = re.subn(
+                r'(?m)^(version\s*=\s*")([^"]+)(")',
+                lambda m: f"{m.group(1)}{new}{m.group(3)}",
+                block,
+                count=1,
+            )
+            changed += count
+        rewritten.append(block)
+    # Exactly one workspace-member entry must match. Zero means the lock does not
+    # describe this crate; more than one is ambiguous. Either way, leave the file
+    # alone and let the build fail loudly rather than guess.
+    if changed != 1:
+        return None
+    lock.write_text("[[package]]".join(rewritten))
+    try:
+        return str(lock.relative_to(repo))
+    except ValueError:
+        return str(lock)
+
+
 def write_version(repo: Path, vf: VersionFile, new: str) -> bool:
     p = repo / vf.path
     if not p.exists():
@@ -679,6 +749,12 @@ def apply_bumps(
         for vf in v.surface.version_files:
             if write_version(repo, vf, new_ver):
                 edited.append(vf.path)
+                # A Cargo.toml bump must carry its lockfile or `--locked`
+                # validation fails on the stale version.
+                if Path(vf.path).name == "Cargo.toml":
+                    lock_rel = refresh_cargo_lock(repo, vf.path, new_ver)
+                    if lock_rel:
+                        edited.append(lock_rel)
         # Changelog stub.
         if v.surface.changelog:
             cl_path = repo / v.surface.changelog
