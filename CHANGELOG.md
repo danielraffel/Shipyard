@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0803"></a>
+## [0.80.4]
+
 ## [0.80.3] - 2026-08-01
 
 - fix(release): cover root-level Rust sources ([#388](https://github.com/danielraffel/Shipyard/pull/388))
