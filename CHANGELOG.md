@@ -4,7 +4,11 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0803"></a>
-## [0.80.3]
+## [0.80.3] - 2026-08-01
+
+- fix(release): cover root-level Rust sources ([#388](https://github.com/danielraffel/Shipyard/pull/388))
+- fix(queue): refill workers as slots finish ([#387](https://github.com/danielraffel/Shipyard/pull/387))
+- fix(versioning): carry Cargo.lock through a version bump ([#385](https://github.com/danielraffel/Shipyard/pull/385))
 
 <a id="v0802"></a>
 ## [0.80.2] - 2026-07-27
@@ -728,6 +732,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.80.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.80.3
 [0.80.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.80.2
 [0.80.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.80.1
 [0.80.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.80.0
