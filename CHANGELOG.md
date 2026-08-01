@@ -3,6 +3,9 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0803"></a>
+## [0.80.3]
+
 <a id="v0802"></a>
 ## [0.80.2] - 2026-07-27
 
