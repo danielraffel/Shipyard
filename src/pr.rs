@@ -57,7 +57,7 @@ impl Error for PrError {}
 pub fn push_branch(cwd: &Path, branch: &str) -> Result<(), PrError> {
     // Supervised git push — sets SHIPYARD_PR_RUNNING=1 so downstream
     // pre-push hooks know this push originated from `shipyard pr`.
-    let output = crate::supervised::git_supervised()
+    let output = crate::supervised::git_push_supervised()
         .args(["push", "-u", "origin", branch])
         .current_dir(cwd)
         .output()

@@ -704,6 +704,10 @@ route through the helpers in `src/supervised.rs`:
   helper in `src/pr.rs`).
 - `crate::supervised::git_supervised()` instead of
   `Command::new("git")`.
+- `crate::supervised::git_push_supervised()` for a supervised push. It adds
+  OpenSSH server-alive probes when `GIT_SSH_COMMAND` is unset, preventing a
+  long pre-push gate from losing an otherwise idle GitHub SSH connection while
+  preserving caller-supplied SSH identity/proxy commands.
 - `crate::supervised::supervised(cmd)` when wrapping an
   injection-style `git_command.map_or_else(..., Command::new)`
   pattern (see `src/branch.rs` for the precedent).
