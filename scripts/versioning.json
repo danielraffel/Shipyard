@@ -16,6 +16,7 @@
       "trigger_paths": [
         "Cargo.toml",
         "Cargo.lock",
+        "src/*.rs",
         "src/**/*.rs",
         "install.sh",
         ".github/workflows/ci.yml",
@@ -29,6 +30,7 @@
         "scripts/release-macos-local.sh",
         "scripts/ci_matrix.py",
         "scripts/finish_line_status.py",
+        "scripts/versioning.json",
         "tools/sandbox-e2e/**"
       ],
       "public_api_paths": [
