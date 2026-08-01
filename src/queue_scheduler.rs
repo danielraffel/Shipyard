@@ -384,6 +384,10 @@ pub fn plan_admit_pass_from_jobs_with_vm_slots(
     let pending = sorted_pending_jobs(jobs)
         .iter()
         .filter(|job| !same_pr_excluded.contains(job.id.as_str()))
+        .filter(|job| {
+            job.scheduler_defer_until
+                .is_none_or(|defer_until| defer_until <= now)
+        })
         .map(|job| pending_admission_request(job, request_store))
         .collect::<Vec<_>>();
     // Only the stale running jobs this pass will actually reap (dead same-PR
@@ -1275,6 +1279,31 @@ mod tests {
             plan.orphaned[0].reason,
             format!("{ORPHANED_PENDING_REQUEST_REASON}: No such file")
         );
+    }
+
+    #[test]
+    fn request_backed_admit_pass_waits_until_scheduler_deferral_expires() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("request store");
+        let now = Utc::now();
+        let mut deferred = job("deferred", JobStatus::Pending, Priority::High, -1);
+        deferred.scheduler_defer_until = Some(now + Duration::seconds(5));
+        let ready = job("ready", JobStatus::Pending, Priority::Normal, 0);
+        save_plan(&store, &deferred.id, cloud_plan("deferred"));
+        save_plan(&store, &ready.id, cloud_plan("ready"));
+
+        let waiting =
+            plan_admit_pass_from_jobs(&[deferred.clone(), ready.clone()], &store, &[], &[], now);
+        assert_eq!(waiting.plan.admitted, std::slice::from_ref(&ready.id));
+
+        let expired = plan_admit_pass_from_jobs(
+            &[deferred, ready],
+            &store,
+            &[],
+            &[],
+            now + Duration::seconds(5),
+        );
+        assert_eq!(expired.plan.admitted, ["deferred", "ready"]);
     }
 
     #[test]

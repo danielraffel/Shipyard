@@ -995,6 +995,14 @@ serialize when they claim the same checkout, PR state, evidence lane, or
 exhausted pool capacity. See `docs/local-mac-pool.md` before claiming
 multi-Mac throughput.
 
+The durable drain refills capacity per worker completion, not per admitted
+batch: when one worker finishes, Shipyard replans immediately and may start the
+next eligible job while slower siblings continue. A scheduler-deferred job must
+respect `scheduler_defer_until` and wait for a later paced pass; it must never
+hot-loop back into the slot it just released. If refill admission itself fails,
+Shipyard preserves that error but still drains active worker completions and
+durably requeues any deferred jobs before returning.
+
 For Pulp/tartci macOS VM work, prefer local queueing over hosted overflow: a
 full local fleet should leave jobs queued on the self-hosted VM labels until a
 controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an

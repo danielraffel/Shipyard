@@ -215,7 +215,25 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   drain owner and execute it, instead of trying to start it again. If the
   scheduler starts a job only to defer it for host-pool capacity or an
   unavailable local lease, the drain owner requeues that transient `Running`
-  job so a later local macOS slot can pick it up.
+  job with a retry timestamp; admission ignores it until that timestamp expires.
+  The drain owner starts a replacement as each worker completes instead of
+  waiting for the whole admitted batch, so an independent idle slot is refilled
+  while slower siblings continue. If refill admission itself fails, the owner
+  retains that first error but still consumes every active worker completion and
+  durably applies any scheduler deferral before returning the error. Completed
+  worker threads are joined as each completion arrives, keeping retained thread
+  resources bounded by active concurrency. Once the
+  job awaited by the invoking command becomes terminal, the owner stops admitting
+  replacements but drains workers it already started, allowing the command to
+  return without consuming an unbounded stream of unrelated queued work. If the
+  admission pass itself cancels the awaited job, its cancellation is applied but
+  planned replacement starts are suppressed. Refill
+  host-pool accounting counts an active worker once only when its lease member
+  is eligible for that `Running` job's matching pool reservation; fallback
+  leases outside the reserved capability set remain visible. macOS VM admission remains
+  conservative because the live Tart probe cannot identify which VMs correspond
+  to queue reservations; treating every reservation as already live can exceed
+  the fleet cap while a mixed-target job has not reached its macOS target.
 - **Externals:** `workflow_dispatch` (cloud), `find_dispatched_run` (best-effort run id discovery), `ExecutorDispatcher.{probe,diagnose,validate}`.
 - **Failure modes**
   - `workflow_dispatch` fails in add-lane → `sys.exit(1)` at cli.py:2328 before any DispatchedRun is appended. *Recovery: retry.*
