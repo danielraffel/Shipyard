@@ -1062,6 +1062,13 @@ advisory = true
 
 A red advisory lane surfaces in `shipyard watch` and the PR body but does **not** block `shipyard ship` / `shipyard auto-merge`. Required lanes (the default — `advisory = false` or unset) still must be green.
 
+Queue capacity is replenished per completed worker. A fast job finishing beside
+a slow job should admit the next eligible queued job immediately instead of
+leaving that slot idle until the whole batch ends. Scheduler deferrals retain
+their backoff timestamp, and an admission error must not strand another active
+worker's durable job in `running`; the coordinator drains and records active
+completions before returning the original error.
+
 ### Overriding per PR — the `Lane-Policy:` trailer
 
 Sometimes a release candidate needs to treat a normally-advisory lane as must-green (or vice versa). Put a trailer on the **tip commit** (never in the PR body):
