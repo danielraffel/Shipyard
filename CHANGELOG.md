@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0812"></a>
+## [0.82.0]
+
 ## [0.81.2] - 2026-08-01
 
 - fix(release): fully qualify generated branch pushes ([#392](https://github.com/danielraffel/Shipyard/pull/392))
