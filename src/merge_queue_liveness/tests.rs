@@ -443,6 +443,26 @@ fn release_staleness_uses_oldest_releasable_commit_age() {
 }
 
 #[test]
+fn release_staleness_falls_back_to_release_age_when_commit_scan_is_truncated() {
+    let report = assess_release_liveness(
+        "v1.0.0".to_owned(),
+        "1970-01-01T00:00:00Z".to_owned(),
+        263,
+        263,
+        None,
+        Some("1.1.0".to_owned()),
+        Some(263),
+        None,
+        60,
+        ts(120),
+    )
+    .expect("release");
+
+    assert_eq!(report.age_secs, 120);
+    assert!(report.stale_with_unreleased_commits);
+}
+
+#[test]
 fn required_failure_is_distinct_from_advisory_red() {
     let entries = vec![MergeQueueEntry {
         pr: 11,

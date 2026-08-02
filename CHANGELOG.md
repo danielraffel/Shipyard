@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0804"></a>
+## [0.81.0]
+
 ## [0.80.4] - 2026-08-01
 
 - fix(pr): keep SSH alive through long pre-push gates ([#389](https://github.com/danielraffel/Shipyard/pull/389))

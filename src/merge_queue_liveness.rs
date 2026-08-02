@@ -221,16 +221,24 @@ pub fn assess_release_liveness(
         .transpose()
         .map_err(|error| format!("invalid oldest releasable commit timestamp: {error}"))?
         .map(|committed| committed.with_timezone(&Utc))
-        .map_or(Ok(0), |committed| {
-            if committed > now {
-                return Err(format!(
-                    "oldest releasable commit timestamp {committed} is in the future"
-                ));
-            }
-            Ok((now - committed.max(published)).num_seconds().max(0))
-        });
+        .map_or_else(
+            || {
+                Ok(if releasable_commits_ahead > 0 {
+                    (now - published).num_seconds().max(0)
+                } else {
+                    0
+                })
+            },
+            |committed| {
+                if committed > now {
+                    return Err(format!(
+                        "oldest releasable commit timestamp {committed} is in the future"
+                    ));
+                }
+                Ok((now - committed.max(published)).num_seconds().max(0))
+            },
+        );
     let age_secs = age_secs?;
-    let has_releasable_timestamp = oldest_releasable_commit_at.is_some();
     let released_version = tag.trim_start_matches('v').to_owned();
     let version_unchanged = base_version
         .as_deref()
@@ -248,7 +256,6 @@ pub fn assess_release_liveness(
         latest_successful_release_workflow_at,
         age_secs,
         stale_with_unreleased_commits: releasable_commits_ahead > 0
-            && has_releasable_timestamp
             && age_secs >= stale_threshold_secs.max(0),
     })
 }

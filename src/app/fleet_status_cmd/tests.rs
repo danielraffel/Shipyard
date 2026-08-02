@@ -36,6 +36,13 @@ fn assessment_renders_command_and_watch_json_without_round_trip() {
             reason_codes: Vec::new(),
         },
         hosts: Vec::new(),
+        runners: RunnerInventory {
+            readable: true,
+            source: "github".to_owned(),
+            runners: Vec::new(),
+        },
+        expected_hosts: Vec::new(),
+        routing_mismatches: Vec::new(),
         observation_reason_codes: Vec::new(),
         observation_incomplete: false,
         should_fail: false,
@@ -153,13 +160,61 @@ fn analyze_host_scopes_health_to_requested_target() {
             source: "test".to_owned(),
         },
         doctor,
+        StorageProbe {
+            readable: true,
+            source: "test".to_owned(),
+            disk_path: "/tmp".to_owned(),
+            disk_available_kibibyte: Some(DEFAULT_DISK_FLOOR_KIBIBYTE * 2),
+            disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
+            ccache_size_kibibyte: Some(1),
+            ccache_max_kibibyte: Some(2),
+        },
         "macos",
+        true,
     );
     assert!(host.routable);
     assert_eq!(host.problem_count, 0);
     assert_eq!(host.supervisor_count, 1);
     assert_eq!(host.github_runner_count, 1);
     assert_eq!(host.stale_vm_count, 0);
+}
+
+#[test]
+fn central_runner_inventory_supersedes_host_github_rate_limit_problem() {
+    let doctor = DoctorProbe {
+        readable: true,
+        source: "test".to_owned(),
+        digest: Some(serde_json::json!({
+            "config": {"heartbeat_stale_secs": 900},
+            "problems": ["github_unreadable:HTTP 403 rate limit exceeded"],
+            "supervisors": [{
+                "runner":"pulp-vm-m5-01",
+                "labels":"self-hosted,macOS,ARM64",
+                "owner_pid_alive":true,
+                "heartbeat_age_secs":5
+            }]
+        })),
+    };
+    let capacity = HostCapacity {
+        class: "m5".to_owned(),
+        ssh: Some("m5".to_owned()),
+        cap: 2,
+        running: Some(0),
+        source: "test".to_owned(),
+    };
+    let storage = StorageProbe {
+        readable: true,
+        source: "test".to_owned(),
+        disk_path: "/Users/ci/VMs".to_owned(),
+        disk_available_kibibyte: Some(DEFAULT_DISK_FLOOR_KIBIBYTE * 2),
+        disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
+        ccache_size_kibibyte: Some(1),
+        ccache_max_kibibyte: Some(2),
+    };
+
+    let centrally_observed = analyze_host(capacity, doctor, storage, "macos", true);
+    assert!(centrally_observed.routable);
+    assert_eq!(centrally_observed.problem_count, 0);
 }
 
 #[test]
@@ -184,6 +239,198 @@ fn doctor_probe_parses_json_even_when_doctor_exits_nonzero() {
             .map_or(0, Vec::len),
         1
     );
+}
+
+#[test]
+fn storage_probe_flags_disk_floor_and_ccache_limit_mismatch() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "printf 'disk_path\\t/Users/ci/VMs\\ndisk_available_kibibyte\\t20342374\\ncache_size_kibibyte\\t29255270\\nmax_cache_size_kibibyte\\t5242880\\n'",
+        ])
+        .output()
+        .expect("sh");
+    let probe = storage_probe_from_output(&output, "/fallback");
+    let problems = storage_problems(&probe);
+
+    assert!(probe.readable);
+    assert_eq!(probe.disk_path, "/Users/ci/VMs");
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.starts_with("disk_floor_unmet:"))
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.starts_with("ccache_over_limit:"))
+    );
+}
+
+#[test]
+fn routing_mismatch_reports_idle_linux_pool_for_hosted_merge_group() {
+    let inventory = RunnerInventory {
+        readable: true,
+        source: "github".to_owned(),
+        runners: vec![RepositoryRunner {
+            id: 200,
+            name: "pulp-ci-ephemeral-200".to_owned(),
+            status: "online".to_owned(),
+            busy: false,
+            labels: vec![
+                "self-hosted".to_owned(),
+                "Linux".to_owned(),
+                "X64".to_owned(),
+                "pulp-host-macpro".to_owned(),
+            ],
+        }],
+    };
+    let runs = vec![ActiveRunObservation {
+        run_id: 42,
+        workflow: "Build and Test".to_owned(),
+        head_branch: "gh-readonly-queue/main/pr-7-deadbeef".to_owned(),
+        head_sha: Some("deadbeef".to_owned()),
+        status: "in_progress".to_owned(),
+        created_at: None,
+        pull_requests: vec![7],
+        url: None,
+        jobs: vec![JobObservation {
+            name: "Linux (x64) [github-hosted]".to_owned(),
+            status: "queued".to_owned(),
+            runner_name: None,
+            labels: vec!["ubuntu-latest".to_owned()],
+        }],
+    }];
+
+    let mismatches = detect_routing_mismatches(&runs, &inventory);
+    assert_eq!(mismatches.len(), 1);
+    assert_eq!(mismatches[0].idle_candidates, ["pulp-ci-ephemeral-200"]);
+
+    let completed = vec![ActiveRunObservation {
+        jobs: vec![JobObservation {
+            status: "completed".to_owned(),
+            ..runs[0].jobs[0].clone()
+        }],
+        ..runs[0].clone()
+    }];
+    assert!(detect_routing_mismatches(&completed, &inventory).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_runner_inventory_retains_platform_and_pool_labels() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+printf '%s\n' \
+  '{"id":200,"name":"pulp-ci-ephemeral-200","status":"online","busy":false,"labels":[{"name":"self-hosted"},{"name":"Linux"},{"name":"X64"},{"name":"pulp-host-macpro"}]}' \
+  '{"id":300,"name":"pulp-intel-metal","status":"offline","busy":false,"labels":[{"name":"self-hosted"},{"name":"macOS"},{"name":"X64"},{"name":"pulp-host-macmini"}]}'
+"#,
+    );
+
+    let inventory = fetch_repository_runners(&actions, "Generous-Corp/pulp");
+
+    assert!(inventory.readable);
+    assert_eq!(inventory.runners.len(), 2);
+    assert_eq!(inventory.runners[0].name, "pulp-ci-ephemeral-200");
+    assert!(
+        inventory.runners[0]
+            .labels
+            .iter()
+            .any(|label| label == "pulp-host-macpro")
+    );
+    assert_eq!(inventory.runners[1].status, "offline");
+    assert!(
+        inventory.runners[1]
+            .labels
+            .iter()
+            .any(|label| label == "pulp-host-macmini")
+    );
+}
+
+#[test]
+fn expected_host_config_tracks_active_missing_and_inactive_future_machines() {
+    let config: toml::Table = toml::from_str(
+        r#"
+[runner.fleet.expected_host.macpro]
+labels = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
+min_online = 2
+
+[runner.fleet.expected_host.macmini]
+labels = ["self-hosted", "macOS", "X64", "pulp-host-macmini"]
+
+[runner.fleet.expected_host.macbook_air]
+active = false
+labels = ["self-hosted", "Linux", "ARM64", "pulp-host-macbook-air"]
+"#,
+    )
+    .expect("config");
+    let expected = parse_expected_hosts(&config).expect("expected hosts");
+    let inventory = RunnerInventory {
+        readable: true,
+        source: "github".to_owned(),
+        runners: vec![RepositoryRunner {
+            id: 200,
+            name: "pulp-ci-ephemeral-200".to_owned(),
+            status: "online".to_owned(),
+            busy: false,
+            labels: vec![
+                "self-hosted".to_owned(),
+                "Linux".to_owned(),
+                "X64".to_owned(),
+                "pulp-host-macpro".to_owned(),
+            ],
+        }],
+    };
+
+    let statuses = assess_expected_hosts(&expected, &inventory);
+
+    let macpro = statuses.iter().find(|host| host.name == "macpro").unwrap();
+    assert_eq!(macpro.online, 1);
+    assert!(macpro.problem.is_some(), "two MacPro runners are expected");
+    let macmini = statuses.iter().find(|host| host.name == "macmini").unwrap();
+    assert_eq!(macmini.matching_runners.len(), 0);
+    assert!(
+        macmini.problem.is_some(),
+        "unfinished active host must alert"
+    );
+    let future = statuses
+        .iter()
+        .find(|host| host.name == "macbook_air")
+        .unwrap();
+    assert!(!future.active);
+    assert!(
+        future.problem.is_none(),
+        "inactive future host is inventory only"
+    );
+
+    let unreadable = assess_expected_hosts(
+        &expected,
+        &RunnerInventory {
+            readable: false,
+            source: "rate limited".to_owned(),
+            runners: Vec::new(),
+        },
+    );
+    assert_eq!(
+        unreadable
+            .iter()
+            .find(|host| host.name == "macmini")
+            .and_then(|host| host.problem.as_deref()),
+        Some("runner_inventory_unreadable")
+    );
+}
+
+#[test]
+fn expected_host_config_rejects_missing_or_malformed_labels() {
+    let missing: toml::Table =
+        toml::from_str("[runner.fleet.expected_host.macmini]\nactive = true\n").unwrap();
+    assert!(parse_expected_hosts(&missing).is_err());
+    let malformed: toml::Table =
+        toml::from_str("[runner.fleet.expected_host.macmini]\nlabels = [\"self-hosted\", 3]\n")
+            .unwrap();
+    assert!(parse_expected_hosts(&malformed).is_err());
 }
 
 #[cfg(unix)]
