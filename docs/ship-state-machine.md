@@ -425,6 +425,15 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **To:** active ship-state plus a GitHub-native merge-queue entry; ultimately
   archived ship-state only after GitHub reports the PR merged
 - **Trigger:** `shipyard ship` or the one-shot `shipyard auto-merge <pr>`
+- **Stack boundary:** at each merge or enqueue mutation boundary, Shipyard
+  queries formal `PullRequest.stack` and `stackEntry` metadata. The initial
+  integration refuses a stacked PR before mutation because GitHub requires the
+  asynchronous merge API and exposes a separate durable request UUID/lifecycle.
+  If the classic boundary inspection itself exhausts GraphQL, Shipyard preserves
+  its exact-head REST fallback; GitHub's classic REST endpoint cannot merge a
+  formal stack. Observe-only pilots validate each layer and merge with
+  `gh stack merge <pr> --merge`; T15 remains the unstacked merge-queue state
+  machine until that lifecycle is modeled.
 - **Externals:** the configured `GhClient` reads the live branch merge-queue
   object plus evaluated rules, then performs sparse GraphQL queue/PR polls and
   calls `enqueuePullRequest(expectedHeadOid: <validated-sha>)`.

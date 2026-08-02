@@ -52,6 +52,15 @@ been observed in the queue (durably recorded across restarts), and only an
 manual/unknown removal, head drift, malformed authority data, or a
 403/rate-limit response stop fail-closed.
 
+Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard
+inspects `PullRequest.stack` and `stackEntry` at each merge or enqueue mutation
+boundary and refuses its unstacked mutation path when either identifies a
+stack. Validate each layer, then use `gh stack merge <pr> --merge` until
+Shipyard durably models the asynchronous request UUID and result polling. A
+classic-boundary GraphQL exhaustion retains the exact-head REST fallback because
+GitHub requires the asynchronous endpoint for formal stacks; queue admission
+and re-enqueue inspections remain fail-closed.
+
 For fleets, configure exactly one mutation host in the trusted machine-global
 `config.toml` reported by `shipyard paths` (never in tracked project config):
 
