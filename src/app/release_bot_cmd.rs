@@ -913,7 +913,7 @@ fn push_direct(cwd: &Path, config: &HookConfig, result: &mut HookResult) -> Resu
         result.attempts = attempt;
         if run_git(
             cwd,
-            &["push", &config.remote, &format!("HEAD:{}", config.branch)],
+            &["push", &config.remote, &branch_push_refspec(&config.branch)],
         )
         .is_ok()
         {
@@ -931,6 +931,10 @@ fn push_direct(cwd: &Path, config: &HookConfig, result: &mut HookResult) -> Resu
         "git push failed after {} attempt(s)",
         config.max_push_attempts.max(1)
     ))
+}
+
+fn branch_push_refspec(branch: &str) -> String {
+    format!("HEAD:refs/heads/{branch}")
 }
 
 // push_mode = "pr": push the bot commit to an immutable branch, open a PR,
@@ -996,7 +1000,10 @@ fn push_via_pr(
         }
         (target, commit)
     } else {
-        run_git(cwd, &["push", &config.remote, &format!("HEAD:{pr_branch}")])?;
+        run_git(
+            cwd,
+            &["push", &config.remote, &branch_push_refspec(&pr_branch)],
+        )?;
         result.pushed = true;
         create_release_bot_pr(cwd, config, tag, &pr_branch)?;
         let target = run_gh_json(
@@ -2445,7 +2452,7 @@ enabled = true
 
     #[cfg(unix)]
     #[test]
-    fn run_hook_commits_and_pushes_watched_docs_diff() {
+    fn run_hook_from_detached_head_commits_and_pushes_watched_docs_diff() {
         let temp = tempfile::tempdir().expect("tempdir");
         let remote = temp.path().join("origin.git");
         let repo = temp.path().join("repo");
@@ -2472,6 +2479,7 @@ enabled = true
             ],
         );
         git(&repo, &["push", "origin", "main"]);
+        git(&repo, &["checkout", "--detach"]);
         let config = HookConfig {
             enabled: true,
             command: String::from("printf '\\nentry\\n' >> CHANGELOG.md"),

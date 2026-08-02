@@ -72,7 +72,9 @@ Queue writes are serialized process-wide and recorded in machine-global
 After changing `mutation_machine` or upgrading the release bot, regenerate the
 post-tag workflow with `shipyard release-bot hook install`. Its tag extraction
 must remain literal Bash, `tag="${GITHUB_REF#refs/tags/}"`; the double-braced
-`${{GITHUB_REF#refs/tags/}}` form is not a valid GitHub expression.
+`${{GITHUB_REF#refs/tags/}}` form is not a valid GitHub expression. Because the
+workflow checks out the release tag in detached-HEAD state, branch pushes must
+use the fully qualified `HEAD:refs/heads/<branch>` refspec.
 
 ## Local/SSH VM Watch
 
