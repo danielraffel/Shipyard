@@ -668,7 +668,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{{{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}}}
         run: |
-          tag="${{{{GITHUB_REF#refs/tags/}}}}"
+          tag="${{GITHUB_REF#refs/tags/}}"
           shipyard release-bot hook run --tag "$tag"
 "#
     )
@@ -1976,6 +1976,8 @@ esac
         assert!(workflow.contains(r#"SHIPYARD_VERSION: "v0.51.0""#));
         assert!(workflow.contains(r#"tags: ["v*"]"#));
         assert!(workflow.contains("curl -fsSL \"https://generouscorp.com/Shipyard/install.sh\""));
+        assert!(workflow.contains(r#"tag="${GITHUB_REF#refs/tags/}""#));
+        assert!(!workflow.contains(r#"tag="${{GITHUB_REF#refs/tags/}}""#));
     }
 
     #[cfg(unix)]
