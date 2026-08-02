@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0810"></a>
-## [0.81.1]
+<a id="v0811"></a>
+## [0.81.1] - 2026-08-01
 
+- fix(release): emit valid post-tag shell expansion ([#391](https://github.com/danielraffel/Shipyard/pull/391))
+
+<a id="v0810"></a>
 ## [0.81.0] - 2026-08-01
 
 - feat: surface fleet capacity health ([#390](https://github.com/danielraffel/Shipyard/pull/390))
@@ -744,6 +747,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.81.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.1
 [0.81.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.0
 [0.80.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.80.4
 [0.80.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.80.3
