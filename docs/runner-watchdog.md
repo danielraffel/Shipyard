@@ -182,6 +182,23 @@ monitor resolves the repository default branch automatically. Override it with
 `shipyard runner watch --fleet-base <branch>` or
 `runner.watchdog.fleet_base = "<branch>"`.
 
+Metal and planned machines that are not Tart host classes can be declared as
+expected fleet inventory. Each entry matches registered runners by a
+case-insensitive required-label subset and defaults to one required online
+runner:
+
+```toml
+[runner.fleet.expected_host.macmini]
+labels = ["self-hosted", "macOS", "X64", "pulp-host-macmini"]
+
+[runner.fleet.expected_host.future_host]
+active = false
+labels = ["self-hosted", "Linux", "ARM64", "pulp-host-future"]
+```
+
+An active missing/offline host makes fleet liveness unhealthy. An inactive
+entry is reported for planning visibility without alerting.
+
 #### `--reap-stale-runs` — repo-wide stale-run reaper
 
 `--kill-hung-workers` reaps hung *processes* on the runner host;

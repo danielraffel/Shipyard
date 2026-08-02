@@ -39,7 +39,9 @@ mod render;
 
 pub(in crate::app) use assessment::FleetAssessment;
 use assessment::{
-    DoctorProbe, HostFleetStatus, MergeQueueProbe, ObservationReason, QueuedSummary, ReleaseProbe,
+    DoctorProbe, ExpectedHostConfig, ExpectedHostStatus, HostFleetStatus, MergeQueueProbe,
+    ObservationReason, QueuedSummary, ReleaseProbe, RepositoryRunner, RoutingMismatch,
+    RunnerInventory, StorageProbe,
 };
 use observation::{
     classify_observation_error, fetch_observed_workflow_runs, inspect_merge_queue_liveness,
@@ -65,6 +67,7 @@ use release_observation::{
 pub(in crate::app) use render::{render_fleet_assessment, render_fleet_watch_event};
 
 const FLEET_LANE_TARGET: &str = "macos";
+const DEFAULT_DISK_FLOOR_KIBIBYTE: u64 = 25 * 1024 * 1024;
 
 pub(super) struct FleetStatusArgs {
     pub(super) repo: Option<String>,
@@ -121,6 +124,13 @@ pub(super) fn collect_fleet_assessment(
 
     let capacities =
         gather_configured_host_capacities(&config.data).map_err(|e| CliFailure::new(2, e))?;
+    // Observe repository runners once through the controller's authenticated
+    // GitHub client. Host-local doctor probes can share an unauthenticated IP
+    // rate limit, which must not make otherwise healthy capacity unroutable.
+    let runners = fetch_repository_runners(actions, &repo);
+    let expected_host_configs =
+        parse_expected_hosts(&config.data).map_err(|error| CliFailure::new(2, error))?;
+    let expected_hosts = assess_expected_hosts(&expected_host_configs, &runners);
     let mut hosts = Vec::new();
     for class in &classes {
         let capacity = capacities
@@ -135,15 +145,26 @@ pub(super) fn collect_fleet_assessment(
                 source: "capacity missing for host class".to_owned(),
             });
         let doctor = probe_doctor(class);
+        let storage = probe_storage(class);
         // `--target` is a GitHub job-name substring, not a TartCI routing
         // label. FleetStatus is the macOS VM fleet command, so host health is
         // always scoped to the macOS lane even for custom job names such as
         // `required-apple-tests`.
-        hosts.push(analyze_host(capacity, doctor, FLEET_LANE_TARGET));
+        hosts.push(analyze_host(
+            capacity,
+            doctor,
+            storage,
+            FLEET_LANE_TARGET,
+            runners.readable,
+        ));
     }
 
     let queue_run_limit = args.queue_run_limit.clamp(1, MAX_DETAILED_WORKFLOW_RUNS);
     let observed_runs = fetch_observed_workflow_runs(actions, &repo, queue_run_limit);
+    let routing_mismatches = observed_runs.as_ref().map_or_else(
+        |_| Vec::new(),
+        |observed| detect_routing_mismatches(&observed.runs, &runners),
+    );
     let queue = observed_runs.as_ref().map_or_else(
         |reason| QueuedSummary {
             readable: false,
@@ -227,6 +248,9 @@ pub(super) fn collect_fleet_assessment(
         || doctor_unreadable
         || supervisor_unhealthy
         || problem_hosts
+        || !runners.readable
+        || expected_hosts.iter().any(|host| host.problem.is_some())
+        || !routing_mismatches.is_empty()
         || !queue.readable
         || queued_age_with_capacity
         || !merge_queue.readable
@@ -260,10 +284,144 @@ pub(super) fn collect_fleet_assessment(
         release_stale_threshold_secs: args.release_stale_threshold_secs.max(0),
         release,
         hosts,
+        runners,
+        expected_hosts,
+        routing_mismatches,
         observation_reason_codes,
         observation_incomplete,
         should_fail,
     })
+}
+
+fn parse_expected_hosts(data: &toml::Table) -> Result<Vec<ExpectedHostConfig>, String> {
+    let Some(value) = data
+        .get("runner")
+        .and_then(toml::Value::as_table)
+        .and_then(|runner| runner.get("fleet"))
+        .and_then(toml::Value::as_table)
+        .and_then(|fleet| fleet.get("expected_host"))
+    else {
+        return Ok(Vec::new());
+    };
+    let hosts = value
+        .as_table()
+        .ok_or_else(|| "runner.fleet.expected_host must be a table".to_owned())?;
+    let mut parsed = Vec::with_capacity(hosts.len());
+    for (name, value) in hosts {
+        let host = value
+            .as_table()
+            .ok_or_else(|| format!("runner.fleet.expected_host.{name} must be a table"))?;
+        let active = match host.get("active") {
+            None => true,
+            Some(toml::Value::Boolean(value)) => *value,
+            Some(_) => {
+                return Err(format!(
+                    "runner.fleet.expected_host.{name}.active must be a boolean"
+                ));
+            }
+        };
+        let min_online = match host.get("min_online") {
+            None => 1,
+            Some(toml::Value::Integer(value)) if *value >= 0 => {
+                u32::try_from(*value).map_err(|_| {
+                    format!("runner.fleet.expected_host.{name}.min_online is too large")
+                })?
+            }
+            Some(_) => {
+                return Err(format!(
+                    "runner.fleet.expected_host.{name}.min_online must be a non-negative integer"
+                ));
+            }
+        };
+        let labels = match host.get("labels") {
+            Some(toml::Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        format!("runner.fleet.expected_host.{name}.labels must be strings")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(format!(
+                    "runner.fleet.expected_host.{name}.labels must be an array"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "runner.fleet.expected_host.{name}.labels is required"
+                ));
+            }
+        };
+        if labels.is_empty() {
+            return Err(format!(
+                "runner.fleet.expected_host.{name}.labels must not be empty"
+            ));
+        }
+        parsed.push(ExpectedHostConfig {
+            name: name.clone(),
+            active,
+            min_online,
+            labels,
+        });
+    }
+    Ok(parsed)
+}
+
+fn assess_expected_hosts(
+    expected: &[ExpectedHostConfig],
+    inventory: &RunnerInventory,
+) -> Vec<ExpectedHostStatus> {
+    expected
+        .iter()
+        .map(|host| {
+            let required_labels = host
+                .labels
+                .iter()
+                .map(|label| label.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>();
+            let matching = inventory
+                .runners
+                .iter()
+                .filter(|runner| {
+                    let actual = runner
+                        .labels
+                        .iter()
+                        .map(|label| label.to_ascii_lowercase())
+                        .collect::<BTreeSet<_>>();
+                    required_labels.is_subset(&actual)
+                })
+                .collect::<Vec<_>>();
+            let online = matching
+                .iter()
+                .filter(|runner| runner.status.eq_ignore_ascii_case("online"))
+                .count();
+            let idle = matching
+                .iter()
+                .filter(|runner| runner.status.eq_ignore_ascii_case("online") && !runner.busy)
+                .count();
+            let problem = if host.active && !inventory.readable {
+                Some("runner_inventory_unreadable".to_owned())
+            } else if host.active && online < host.min_online as usize {
+                Some(format!(
+                    "expected_host_unavailable:online={online} min_online={}",
+                    host.min_online
+                ))
+            } else {
+                None
+            };
+            ExpectedHostStatus {
+                name: host.name.clone(),
+                active: host.active,
+                min_online: host.min_online,
+                labels: host.labels.clone(),
+                matching_runners: matching.iter().map(|runner| runner.name.clone()).collect(),
+                online,
+                idle,
+                problem,
+            }
+        })
+        .collect()
 }
 
 fn probe_doctor(class: &HostClassConfig) -> DoctorProbe {
@@ -346,7 +504,13 @@ fn doctor_probe_from_output(output: &Output, base_source: &str) -> DoctorProbe {
     }
 }
 
-fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe, target: &str) -> HostFleetStatus {
+fn analyze_host(
+    capacity: HostCapacity,
+    doctor: DoctorProbe,
+    storage: StorageProbe,
+    target: &str,
+    central_runner_inventory_readable: bool,
+) -> HostFleetStatus {
     let digest = doctor.digest.as_ref();
     let all_supervisors = digest
         .and_then(|value| value.get("supervisors"))
@@ -374,9 +538,13 @@ fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe, target: &str) -> Ho
         .into_iter()
         .flatten()
         .filter(|problem| problem_matches_target(problem, &all_supervisors, target))
+        .filter(|problem| {
+            !(central_runner_inventory_readable && is_host_github_observation_problem(problem))
+        })
         .cloned()
         .collect::<Vec<_>>();
-    let problem_count = problems.len();
+    let storage_problems = storage_problems(&storage);
+    let problem_count = problems.len() + storage_problems.len();
     let github_runner_count = digest
         .and_then(|value| value.get("github_runners"))
         .and_then(Value::as_array)
@@ -400,6 +568,7 @@ fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe, target: &str) -> Ho
     let routable = capacity.readable()
         && capacity.free() > 0
         && doctor.readable
+        && storage.readable
         && problem_count == 0
         && fresh_supervisor_count > 0;
     HostFleetStatus {
@@ -414,7 +583,229 @@ fn analyze_host(capacity: HostCapacity, doctor: DoctorProbe, target: &str) -> Ho
         routable,
         problems,
         supervisors,
+        storage,
+        storage_problems,
     }
+}
+
+fn storage_problems(storage: &StorageProbe) -> Vec<String> {
+    if !storage.readable {
+        return vec![format!("storage_unreadable:{}", storage.source)];
+    }
+    let mut problems = Vec::new();
+    if storage
+        .disk_available_kibibyte
+        .is_some_and(|available| available < storage.disk_floor_kibibyte)
+    {
+        problems.push(format!(
+            "disk_floor_unmet:path={} available_kibibyte={} floor_kibibyte={}",
+            storage.disk_path,
+            storage.disk_available_kibibyte.unwrap_or_default(),
+            storage.disk_floor_kibibyte
+        ));
+    }
+    if storage
+        .ccache_size_kibibyte
+        .zip(storage.ccache_max_kibibyte)
+        .is_some_and(|(size, maximum)| size > maximum)
+    {
+        problems.push(format!(
+            "ccache_over_limit:size_kibibyte={} max_kibibyte={}",
+            storage.ccache_size_kibibyte.unwrap_or_default(),
+            storage.ccache_max_kibibyte.unwrap_or_default()
+        ));
+    }
+    problems
+}
+
+fn probe_storage(class: &HostClassConfig) -> StorageProbe {
+    let disk_path = class.tart_home.as_deref().unwrap_or(".");
+    let script = storage_probe_script(disk_path);
+    let output = if let Some(host) = &class.ssh {
+        Command::new("ssh")
+            .args(ssh_probe_options())
+            .arg(host)
+            .arg(format!(
+                "env PATH={REMOTE_PROBE_PATH} sh -c {}",
+                shlex_quote(&script)
+            ))
+            .output()
+    } else {
+        Command::new("sh").args(["-c", &script]).output()
+    };
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return StorageProbe {
+                source: format!("storage probe spawn failed: {error}"),
+                disk_path: disk_path.to_owned(),
+                disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
+                ..StorageProbe::default()
+            };
+        }
+    };
+    storage_probe_from_output(&output, disk_path)
+}
+
+fn is_host_github_observation_problem(problem: &Value) -> bool {
+    problem
+        .as_str()
+        .is_some_and(|problem| problem.starts_with("github_unreadable:"))
+        || problem
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id == "github_unreadable")
+}
+
+fn storage_probe_script(disk_path: &str) -> String {
+    format!(
+        "disk_path={}; printf 'disk_path\\t%s\\n' \"$disk_path\"; \
+         df -Pk \"$disk_path\" 2>/dev/null | awk 'END {{print \"disk_available_kibibyte\\t\" $4}}'; \
+         if command -v ccache >/dev/null 2>&1; then \
+           CCACHE_DIR=\"${{CCACHE_DIR:-$HOME/Library/Caches/ccache}}\" ccache --print-stats 2>/dev/null | \
+             awk -F '\\t' '$1 == \"cache_size_kibibyte\" || $1 == \"max_cache_size_kibibyte\" {{print}}'; \
+         fi",
+        shlex_quote(disk_path)
+    )
+}
+
+fn storage_probe_from_output(output: &Output, fallback_path: &str) -> StorageProbe {
+    let mut probe = StorageProbe {
+        source: if output.status.success() {
+            "host".to_owned()
+        } else {
+            format!("host exit {}", output.status.code().unwrap_or(-1))
+        },
+        disk_path: fallback_path.to_owned(),
+        disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
+        ..StorageProbe::default()
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((key, value)) = line.split_once('\t') else {
+            continue;
+        };
+        match key {
+            "disk_path" => value.clone_into(&mut probe.disk_path),
+            "disk_available_kibibyte" => {
+                probe.disk_available_kibibyte = value.trim().parse().ok();
+            }
+            "cache_size_kibibyte" => probe.ccache_size_kibibyte = value.trim().parse().ok(),
+            "max_cache_size_kibibyte" => {
+                probe.ccache_max_kibibyte = value.trim().parse().ok();
+            }
+            _ => {}
+        }
+    }
+    probe.readable = output.status.success() && probe.disk_available_kibibyte.is_some();
+    probe
+}
+
+fn fetch_repository_runners(actions: &GitHubActions, repo: &str) -> RunnerInventory {
+    let raw = actions.run_gh(&[
+        "api".to_owned(),
+        "--paginate".to_owned(),
+        format!("repos/{repo}/actions/runners?per_page=100"),
+        "--jq".to_owned(),
+        ".runners[]".to_owned(),
+    ]);
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(error) => {
+            return RunnerInventory {
+                source: format!("github runners unreadable: {error}"),
+                ..RunnerInventory::default()
+            };
+        }
+    };
+    let mut runners = Vec::new();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let value: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                return RunnerInventory {
+                    source: format!("github runner JSON malformed: {error}"),
+                    ..RunnerInventory::default()
+                };
+            }
+        };
+        runners.push(RepositoryRunner {
+            id: value.get("id").and_then(Value::as_u64).unwrap_or_default(),
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            status: value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            busy: value.get("busy").and_then(Value::as_bool).unwrap_or(false),
+            labels: value
+                .get("labels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|label| label.get("name").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect(),
+        });
+    }
+    RunnerInventory {
+        readable: true,
+        source: "github".to_owned(),
+        runners,
+    }
+}
+
+fn detect_routing_mismatches(
+    runs: &[ActiveRunObservation],
+    inventory: &RunnerInventory,
+) -> Vec<RoutingMismatch> {
+    if !inventory.readable {
+        return Vec::new();
+    }
+    let candidates = inventory
+        .runners
+        .iter()
+        .filter(|runner| runner.status.eq_ignore_ascii_case("online") && !runner.busy)
+        .filter(|runner| {
+            let labels = runner
+                .labels
+                .iter()
+                .map(|label| label.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>();
+            labels.contains("self-hosted") && labels.contains("linux") && labels.contains("x64")
+        })
+        .map(|runner| runner.name.clone())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    runs.iter()
+        .filter(|run| {
+            run.workflow == "Build and Test" && run.head_branch.starts_with("gh-readonly-queue/")
+        })
+        .flat_map(|run| {
+            let candidates = candidates.clone();
+            run.jobs.iter().filter_map(move |job| {
+                let active = matches!(job.status.as_str(), "queued" | "in_progress");
+                let hosted_linux = job
+                    .labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case("ubuntu-latest"));
+                (active && hosted_linux && job.name.to_ascii_lowercase().contains("linux"))
+                    .then(|| RoutingMismatch {
+                        run_id: run.run_id,
+                        workflow: run.workflow.clone(),
+                        job: job.name.clone(),
+                        requested_labels: job.labels.clone(),
+                        idle_candidates: candidates.clone(),
+                        reason: "merge-group Linux build uses ubuntu-latest while self-hosted Linux x64 runners are idle".to_owned(),
+                    })
+            })
+        })
+        .collect()
 }
 
 fn normalized_target(target: &str) -> String {

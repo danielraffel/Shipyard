@@ -581,9 +581,33 @@ gates on: drain a still-queued cloud macOS job to local only when `free > 0`.
 Use `shipyard runner fleet-status --repo <owner/repo> --target macos --json`
 for the operator view that answers "can queued jobs actually drain?" It combines
 capacity with host-local `tartci doctor --reap --json`, supervisor heartbeat
-freshness, per-host routability, and oldest queued macOS age. It is read-only
-and exits non-zero when a host is unreadable/unhealthy or when queued macOS work
-is older than `--queued-age-threshold-secs` while routable capacity exists. Use
+freshness, Tart storage admission headroom, ccache size versus its configured
+maximum, the repository's complete registered-runner inventory, per-host
+routability, and oldest queued macOS age. Registered-runner labels make metal
+pools such as MacPro Linux and Mac Mini Intel visible without adding them as
+Tart host classes. Declare machines that should exist even before registration
+under `[runner.fleet.expected_host.<name>]`; matching is an extensible,
+case-insensitive required-label subset rather than hard-coded machine names:
+
+```toml
+[runner.fleet.expected_host.macpro]
+labels = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
+min_online = 2
+
+[runner.fleet.expected_host.macmini]
+labels = ["self-hosted", "macOS", "X64", "pulp-host-macmini"]
+
+[runner.fleet.expected_host.macbook_air]
+active = false # planned inventory: visible, but does not alert yet
+labels = ["self-hosted", "Linux", "ARM64", "pulp-host-macbook-air"]
+```
+
+Active expected hosts default to `min_online = 1`; absent or offline matches are
+reported as `expected_host_unavailable`. Inactive hosts remain visible without
+making the command unhealthy. It is read-only and exits non-zero when a host is
+unreadable/unhealthy, a merge-group Linux build requests `ubuntu-latest` while
+an online idle self-hosted Linux x64 runner exists, or queued macOS work is older
+than `--queued-age-threshold-secs` while routable capacity exists. Use
 `--queue-run-limit N` to keep live debugging snappy on a large queued backlog.
 
 The report retains optional workflows, finds queued jobs inside `in_progress`
@@ -592,6 +616,9 @@ active-run list requests plus 50 per-run job requests; larger observations
 fail visibly with `OBSERVATION_TRUNCATED` instead of exhausting the monitor's
 own API budget. Its local snapshot detects cleared auto-merge enrollment with
 a separate 25-PR reconciliation cap and the same truncation signal.
+Release staleness uses the oldest releasable commit when available and
+conservatively falls back to the release publication age when a bounded commit
+scan proves releasable work exists but cannot recover that timestamp.
 Consume the stable reason codes rather than chat-turn counts. With host classes
 configured, `runner watch` invokes this observer by default. This path never
 uses Orchard and never mutates GitHub.

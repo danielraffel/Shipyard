@@ -498,6 +498,14 @@ liveness by default. Consume its stable reason codes: `NORMAL_SERIAL_WAIT`
 means a follower is not blocked; cleared enrollment and optional/superseded
 capacity theft require attention. Never infer a wedge solely from an unchanged
 follower queue position.
+Fleet liveness also reports every registered runner, Tart disk admission
+headroom, ccache actual versus configured maximum, and merge-group Linux jobs
+left on `ubuntu-latest` while compatible self-hosted capacity is idle. Declare
+metal or planned machines under `[runner.fleet.expected_host.<name>]` with a
+required `labels` array, optional `min_online` (default 1), and `active = false`
+for visible future inventory that should not alert yet. Active absent/offline
+machines fail visibly as `expected_host_unavailable`, including machines that
+have not completed runner registration.
 The watcher resolves the repository default branch. For a different merge
 target, pass `--fleet-base <branch>` or configure
 `runner.watchdog.fleet_base`.

@@ -35,6 +35,65 @@ pub(super) struct HostFleetStatus {
     pub(super) routable: bool,
     pub(super) problems: Vec<Value>,
     pub(super) supervisors: Vec<Value>,
+    pub(super) storage: StorageProbe,
+    pub(super) storage_problems: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(super) struct StorageProbe {
+    pub(super) readable: bool,
+    pub(super) source: String,
+    pub(super) disk_path: String,
+    pub(super) disk_available_kibibyte: Option<u64>,
+    pub(super) disk_floor_kibibyte: u64,
+    pub(super) ccache_size_kibibyte: Option<u64>,
+    pub(super) ccache_max_kibibyte: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(super) struct RepositoryRunner {
+    pub(super) id: u64,
+    pub(super) name: String,
+    pub(super) status: String,
+    pub(super) busy: bool,
+    pub(super) labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct RunnerInventory {
+    pub(super) readable: bool,
+    pub(super) source: String,
+    pub(super) runners: Vec<RepositoryRunner>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ExpectedHostConfig {
+    pub(super) name: String,
+    pub(super) active: bool,
+    pub(super) min_online: u32,
+    pub(super) labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct ExpectedHostStatus {
+    pub(super) name: String,
+    pub(super) active: bool,
+    pub(super) min_online: u32,
+    pub(super) labels: Vec<String>,
+    pub(super) matching_runners: Vec<String>,
+    pub(super) online: usize,
+    pub(super) idle: usize,
+    pub(super) problem: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct RoutingMismatch {
+    pub(super) run_id: u64,
+    pub(super) workflow: String,
+    pub(super) job: String,
+    pub(super) requested_labels: Vec<String>,
+    pub(super) idle_candidates: Vec<String>,
+    pub(super) reason: String,
 }
 
 #[derive(Debug)]
@@ -79,6 +138,9 @@ pub(in crate::app) struct FleetAssessment {
     pub(super) release_stale_threshold_secs: i64,
     pub(super) release: ReleaseProbe,
     pub(super) hosts: Vec<HostFleetStatus>,
+    pub(super) runners: RunnerInventory,
+    pub(super) expected_hosts: Vec<ExpectedHostStatus>,
+    pub(super) routing_mismatches: Vec<RoutingMismatch>,
     pub(super) observation_reason_codes: Vec<ObservationReason>,
     pub(super) observation_incomplete: bool,
     pub(super) should_fail: bool,

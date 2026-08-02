@@ -86,7 +86,7 @@ shipyard runner watch --fix               # auto-cancel stale queued runs each t
 shipyard runner watch --kill-hung-workers # also auto-kill hung Worker processes
 shipyard runner watch --reap-stale-runs   # also cancel stale workflow runs repo-wide
 shipyard runner watch --reap-stale-runs --dry-run   # preview reaper, cancel nothing
-shipyard runner fleet-status --repo OWNER/REPO      # read-only TartCI + queue liveness
+shipyard runner fleet-status --repo OWNER/REPO      # TartCI, registered runners, storage + queue liveness
 shipyard runner fleet-status --json                 # periodic-monitor JSON + nonzero alerts
 shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
 shipyard runner steward --apply                     # exact-head, green-gated mutations

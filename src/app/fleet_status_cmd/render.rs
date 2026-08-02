@@ -100,6 +100,26 @@ fn write_fleet_json<W: Write>(
         "hosts".to_owned(),
         Value::from(view.hosts.iter().map(host_to_json).collect::<Vec<_>>()),
     );
+    data.insert(
+        "runners".to_owned(),
+        serde_json::json!({
+            "readable": view.runners.readable,
+            "source": view.runners.source,
+            "total": view.runners.runners.len(),
+            "online": view.runners.runners.iter().filter(|runner| runner.status.eq_ignore_ascii_case("online")).count(),
+            "idle": view.runners.runners.iter().filter(|runner| runner.status.eq_ignore_ascii_case("online") && !runner.busy).count(),
+            "offline": view.runners.runners.iter().filter(|runner| runner.status.eq_ignore_ascii_case("offline")).count(),
+            "registrations": view.runners.runners,
+        }),
+    );
+    data.insert(
+        "routing_mismatches".to_owned(),
+        serde_json::to_value(&view.routing_mismatches).expect("routing mismatches serialize"),
+    );
+    data.insert(
+        "expected_hosts".to_owned(),
+        serde_json::to_value(&view.expected_hosts).expect("expected hosts serialize"),
+    );
     write_json_envelope(stdout, command, data)
         .map_err(|e| CliFailure::new(1, format!("failed to write JSON: {e}")))
 }
@@ -134,7 +154,46 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<
             host.doctor.source
         )
         .map_err(text_write_failure)?;
+        if !host.storage_problems.is_empty() {
+            for problem in &host.storage_problems {
+                writeln!(stdout, "    storage: {problem}").map_err(text_write_failure)?;
+            }
+        }
     }
+    writeln!(
+        stdout,
+        "  runners: total={} online={} idle={} offline={} readable={}",
+        view.runners.runners.len(),
+        view.runners
+            .runners
+            .iter()
+            .filter(|runner| runner.status.eq_ignore_ascii_case("online"))
+            .count(),
+        view.runners
+            .runners
+            .iter()
+            .filter(|runner| runner.status.eq_ignore_ascii_case("online") && !runner.busy)
+            .count(),
+        view.runners
+            .runners
+            .iter()
+            .filter(|runner| runner.status.eq_ignore_ascii_case("offline"))
+            .count(),
+        view.runners.readable
+    )
+    .map_err(text_write_failure)?;
+    for mismatch in &view.routing_mismatches {
+        writeln!(
+            stdout,
+            "    routing mismatch: run={} job={} candidates={} reason={}",
+            mismatch.run_id,
+            mismatch.job,
+            mismatch.idle_candidates.join(","),
+            mismatch.reason
+        )
+        .map_err(text_write_failure)?;
+    }
+    write_expected_hosts_text(stdout, view)?;
     writeln!(
         stdout,
         "  queued macOS: count={} oldest_age_secs={} threshold={} readable={}",
@@ -152,6 +211,27 @@ fn write_fleet_text<W: Write>(stdout: &mut W, view: &FleetAssessment) -> Result<
         writeln!(
             stdout,
             "fleet-status: attention required (see fields above)"
+        )
+        .map_err(text_write_failure)?;
+    }
+    Ok(())
+}
+
+fn write_expected_hosts_text<W: Write>(
+    stdout: &mut W,
+    view: &FleetAssessment,
+) -> Result<(), CliFailure> {
+    for host in &view.expected_hosts {
+        writeln!(
+            stdout,
+            "  expected host: name={} active={} online={}/{} idle={} runners={} problem={}",
+            host.name,
+            host.active,
+            host.online,
+            host.min_online,
+            host.idle,
+            host.matching_runners.join(","),
+            host.problem.as_deref().unwrap_or("-")
         )
         .map_err(text_write_failure)?;
     }
@@ -194,6 +274,14 @@ fn host_to_json(host: &HostFleetStatus) -> Value {
         Value::from(host.stale_supervisor_count),
     );
     m.insert("problem_count".to_owned(), Value::from(host.problem_count));
+    m.insert(
+        "storage".to_owned(),
+        serde_json::to_value(&host.storage).expect("storage probe serializes"),
+    );
+    m.insert(
+        "storage_problems".to_owned(),
+        Value::from(host.storage_problems.clone()),
+    );
     m.insert(
         "github_runner_count".to_owned(),
         Value::from(host.github_runner_count),
