@@ -69,6 +69,11 @@ not resume until the incident owner has restored the intended queue order.
 Queue writes are serialized process-wide and recorded in machine-global
 `merge_queue/mutations.jsonl`.
 
+After changing `mutation_machine` or upgrading the release bot, regenerate the
+post-tag workflow with `shipyard release-bot hook install`. Its tag extraction
+must remain literal Bash, `tag="${GITHUB_REF#refs/tags/}"`; the double-braced
+`${{GITHUB_REF#refs/tags/}}` form is not a valid GitHub expression.
+
 ## Local/SSH VM Watch
 
 Use `shipyard watch local` for long target-backed jobs that are not GitHub

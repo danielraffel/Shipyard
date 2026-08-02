@@ -36,6 +36,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Regenerate CHANGELOG.md from tags | `shipyard changelog regenerate` |
 | CI drift gate for CHANGELOG.md | `shipyard changelog check` |
 | Run the post-tag hook locally | `shipyard release-bot hook run --tag v0.9.0` |
+| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; `${{GITHUB_REF#refs/tags/}}` is invalid GitHub expression syntax. |
 | Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |

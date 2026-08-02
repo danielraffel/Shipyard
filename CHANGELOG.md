@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0810"></a>
+## [0.81.1]
+
 ## [0.81.0] - 2026-08-01
 
 - feat: surface fleet capacity health ([#390](https://github.com/danielraffel/Shipyard/pull/390))
