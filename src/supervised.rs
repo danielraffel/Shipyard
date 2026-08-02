@@ -29,6 +29,11 @@ pub const SUPERVISED_ENV_VAR: &str = "SHIPYARD_PR_RUNNING";
 /// Value set on every supervised subprocess.
 pub const SUPERVISED_ENV_VALUE: &str = "1";
 
+/// Default OpenSSH command for pushes whose local pre-push gate can run for
+/// much longer than GitHub's idle SSH timeout.
+pub const PUSH_SSH_KEEPALIVE_COMMAND: &str =
+    "ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3";
+
 /// Mark a `Command` as supervised. Returns the same command for
 /// fluent chaining.
 #[must_use]
@@ -50,6 +55,23 @@ pub fn gh_supervised(gh_command: Option<&Path>) -> Command {
 #[must_use]
 pub fn git_supervised() -> Command {
     supervised(Command::new("git"))
+}
+
+/// Build a supervised `git push` command with an SSH keepalive when the user
+/// has not supplied a custom SSH command. Git opens the transport before it
+/// invokes `pre-push`; without traffic, a long local gate can finish only to
+/// discover that the remote closed the idle connection.
+#[must_use]
+pub fn git_push_supervised() -> Command {
+    git_push_supervised_for(std::env::var_os("GIT_SSH_COMMAND").as_deref())
+}
+
+fn git_push_supervised_for(existing_ssh_command: Option<&std::ffi::OsStr>) -> Command {
+    let mut command = git_supervised();
+    if existing_ssh_command.is_none() {
+        command.env("GIT_SSH_COMMAND", PUSH_SSH_KEEPALIVE_COMMAND);
+    }
+    command
 }
 
 #[cfg(test)]
@@ -105,6 +127,27 @@ mod tests {
             env_value(&cmd, SUPERVISED_ENV_VAR).as_deref(),
             Some(OsString::from("1").as_os_str())
         );
+    }
+
+    #[test]
+    fn git_push_supervised_adds_idle_transport_keepalive() {
+        let cmd = git_push_supervised_for(None);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("git"));
+        assert_eq!(
+            env_value(&cmd, "GIT_SSH_COMMAND").as_deref(),
+            Some(OsString::from(PUSH_SSH_KEEPALIVE_COMMAND).as_os_str())
+        );
+        assert_eq!(
+            env_value(&cmd, SUPERVISED_ENV_VAR).as_deref(),
+            Some(OsString::from(SUPERVISED_ENV_VALUE).as_os_str())
+        );
+    }
+
+    #[test]
+    fn git_push_supervised_preserves_explicit_ssh_policy() {
+        let explicit = std::ffi::OsStr::new("ssh -i /tmp/operator-key");
+        let cmd = git_push_supervised_for(Some(explicit));
+        assert_eq!(env_value(&cmd, "GIT_SSH_COMMAND"), None);
     }
 
     // End-to-end: spawn a real subprocess and assert it sees the env.

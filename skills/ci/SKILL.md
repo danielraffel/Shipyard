@@ -230,6 +230,12 @@ every supervised spawn site. Diagnostic subcommands (`doctor`,
 `skills/shipyard/SKILL.md` → "Supervised Subprocess Marker" for the
 helper API.
 
+Supervised pushes also use an OpenSSH server-alive probe when the caller has
+not supplied `GIT_SSH_COMMAND`. Git opens its transport before invoking the
+consumer's pre-push hook; without keepalive traffic, an hour-long local gate can
+finish successfully only to find GitHub closed the idle connection. Preserve a
+caller's explicit SSH command rather than replacing its identity/proxy policy.
+
 ## Runner Provider Defaults
 
 Shipyard's own workflows default to GitHub-hosted runners for Linux, macOS, and
