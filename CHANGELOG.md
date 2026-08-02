@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0811"></a>
+## [0.81.2]
+
 ## [0.81.1] - 2026-08-01
 
 - fix(release): emit valid post-tag shell expansion ([#391](https://github.com/danielraffel/Shipyard/pull/391))
