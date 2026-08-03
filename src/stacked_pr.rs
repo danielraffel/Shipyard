@@ -68,12 +68,23 @@ pub fn unsupported_message(pr: u64, stack: &StackInfo) -> String {
 }
 
 fn parse_response(body: &Value) -> Result<Option<StackInfo>, String> {
-    if body
+    if let Some(errors) = body
         .get("errors")
         .and_then(Value::as_array)
-        .is_some_and(|errors| !errors.is_empty())
+        .filter(|errors| !errors.is_empty())
     {
-        return Err("pull request stack query returned GraphQL errors".to_owned());
+        let messages = errors
+            .iter()
+            .filter_map(|error| error.get("message").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let detail = if messages.is_empty() {
+            "unknown GraphQL error".to_owned()
+        } else {
+            messages.join("; ")
+        };
+        return Err(format!(
+            "pull request stack query returned GraphQL errors: {detail}"
+        ));
     }
     let pr = body
         .pointer("/data/repository/pullRequest")
@@ -156,6 +167,18 @@ mod tests {
         ] {
             assert!(parse_response(&body).is_err());
         }
+    }
+
+    #[test]
+    fn graphql_error_messages_survive_for_rate_limit_classification() {
+        let error = parse_response(&serde_json::json!({
+            "data": null,
+            "errors": [{"message": "API rate limit already exceeded for user ID 123"}]
+        }))
+        .expect_err("GraphQL error must fail closed");
+        assert!(error.contains("GraphQL"));
+        assert!(error.contains("rate limit already exceeded"));
+        assert!(crate::gh::is_graphql_rate_limited(&error));
     }
 
     #[test]

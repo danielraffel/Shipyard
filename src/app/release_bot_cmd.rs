@@ -349,6 +349,13 @@ fn hook_install<W: Write>(
     })?;
     let target = workflows_dir.join(POST_TAG_WORKFLOW);
     let overwrote = target.exists();
+    let hook_config = load_hook_config(config);
+    let signing_setup_script = hook_config
+        .ssh_signing_setup_script
+        .as_deref()
+        .map(validate_workflow_script_path)
+        .transpose()
+        .map_err(|error| CliFailure::new(1, error))?;
     let trusted_config = LoadedConfig::load_machine_global_from_dir(config.global_dir.clone())
         .map_err(|error| {
             CliFailure::new(
@@ -374,7 +381,7 @@ fn hook_install<W: Write>(
     };
     fs::write(
         &target,
-        render_workflow(tag_pattern, shipyard_version, &runner),
+        render_workflow(tag_pattern, shipyard_version, &runner, signing_setup_script),
     )
     .map_err(|error| {
         CliFailure::new(1, format!("failed to write {}: {error}", target.display()))
@@ -621,7 +628,42 @@ fn render_pat_creation_url(owner: &str, repo: &str, pat_name: &str) -> String {
     )
 }
 
-fn render_workflow(tag_pattern: &str, shipyard_version: &str, runner: &str) -> String {
+fn validate_workflow_script_path(path: &str) -> Result<&str, String> {
+    let valid = !path.is_empty()
+        && !path.starts_with('-')
+        && path.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && component
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        });
+    if !valid {
+        return Err(format!(
+            "release.post_tag_hook.ssh_signing_setup_script must be a safe repository-relative path, got {path:?}"
+        ));
+    }
+    Ok(path)
+}
+
+fn render_workflow(
+    tag_pattern: &str,
+    shipyard_version: &str,
+    runner: &str,
+    ssh_signing_setup_script: Option<&str>,
+) -> String {
+    let signing_setup = ssh_signing_setup_script.map_or_else(String::new, |script| {
+        format!(
+            r"      - name: Configure release bot SSH signing
+        shell: bash
+        env:
+          RELEASE_BOT_SSH_SIGNING_KEY: ${{{{ secrets.RELEASE_BOT_SSH_SIGNING_KEY }}}}
+        run: bash -- {script}
+
+"
+        )
+    });
     format!(
         r#"name: Post-tag docs sync
 
@@ -663,6 +705,7 @@ jobs:
           curl -fsSL "https://generouscorp.com/Shipyard/install.sh" | SHIPYARD_VERSION="$SHIPYARD_VERSION" bash
           shipyard --version
 
+{signing_setup}
       - name: Run post-tag docs sync
         shell: bash
         env:
@@ -686,6 +729,7 @@ struct HookConfig {
     bot_email: String,
     remote: String,
     branch: String,
+    ssh_signing_setup_script: Option<String>,
     // How the bot commit lands on `branch`:
     //   "direct" (default) — push --ff-only straight to `branch` (today's
     //     behavior). Incompatible with a GitHub "Require merge queue" rule,
@@ -711,6 +755,7 @@ impl Default for HookConfig {
             bot_email: String::from("shipyard-release-bot@users.noreply.github.com"),
             remote: String::from("origin"),
             branch: String::from("main"),
+            ssh_signing_setup_script: None,
             push_mode: String::from("direct"),
             pr_branch_prefix: String::from("release/post-tag-sync"),
         }
@@ -768,6 +813,10 @@ fn load_hook_config(config: &LoadedConfig) -> HookConfig {
             .and_then(toml::Value::as_str)
             .unwrap_or("main")
             .to_owned(),
+        ssh_signing_setup_script: section
+            .get("ssh_signing_setup_script")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned),
         push_mode: section
             .get("push_mode")
             .and_then(toml::Value::as_str)
@@ -1000,10 +1049,7 @@ fn push_via_pr(
         }
         (target, commit)
     } else {
-        run_git(
-            cwd,
-            &["push", &config.remote, &branch_push_refspec(&pr_branch)],
-        )?;
+        attach_and_push_release_bot_branch(cwd, &config.remote, &pr_branch)?;
         result.pushed = true;
         create_release_bot_pr(cwd, config, tag, &pr_branch)?;
         let target = run_gh_json(
@@ -1061,6 +1107,18 @@ fn push_via_pr(
         merge_result: None,
     };
     supervise_release_bot_admission(&store, cwd, &request)
+}
+
+fn attach_and_push_release_bot_branch(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<(), String> {
+    // Tag-triggered Actions checkouts are detached. Attach the deterministic
+    // PR branch before pushing so repository pre-push hooks can validate the
+    // branch state instead of rejecting an otherwise explicit refspec.
+    run_git(cwd, &["switch", "-C", branch])?;
+    run_git_supervised(cwd, &["push", remote, &branch_push_refspec(branch)])
 }
 
 fn ensure_release_commit_is_based_on_target(cwd: &Path, config: &HookConfig) -> Result<(), String> {
@@ -1596,6 +1654,23 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
+fn run_git_supervised(cwd: &Path, args: &[&str]) -> Result<(), String> {
+    let output = crate::supervised::git_push_supervised()
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("failed to run git {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 fn run_git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
@@ -1977,7 +2052,7 @@ esac
 
     #[test]
     fn render_workflow_uses_release_bot_token_fallback() {
-        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest");
+        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest", None);
 
         assert!(workflow.contains("secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN"));
         assert!(workflow.contains(r#"SHIPYARD_VERSION: "v0.51.0""#));
@@ -1985,6 +2060,33 @@ esac
         assert!(workflow.contains("curl -fsSL \"https://generouscorp.com/Shipyard/install.sh\""));
         assert!(workflow.contains(r#"tag="${GITHUB_REF#refs/tags/}""#));
         assert!(!workflow.contains(r#"tag="${{GITHUB_REF#refs/tags/}}""#));
+    }
+
+    #[test]
+    fn render_workflow_configures_repository_ssh_signing() {
+        let script =
+            validate_workflow_script_path("tools/scripts/configure_release_bot_ssh_signing.sh")
+                .expect("safe script path");
+        let workflow = render_workflow("v*", "v0.52.0", "ubuntu-latest", Some(script));
+
+        assert!(workflow.contains("name: Configure release bot SSH signing"));
+        assert!(
+            workflow.contains(
+                "RELEASE_BOT_SSH_SIGNING_KEY: ${{ secrets.RELEASE_BOT_SSH_SIGNING_KEY }}"
+            )
+        );
+        assert!(
+            workflow.contains("run: bash -- tools/scripts/configure_release_bot_ssh_signing.sh")
+        );
+        for unsafe_path in [
+            "../sign.sh",
+            "/tmp/sign.sh",
+            "-x",
+            "sign script.sh",
+            "sign.sh\nrun: bad",
+        ] {
+            assert!(validate_workflow_script_path(unsafe_path).is_err());
+        }
     }
 
     #[cfg(unix)]
@@ -2051,6 +2153,7 @@ only_for_tag_pattern = "shipyard-v*"
 max_push_attempts = 2
 remote = "upstream"
 branch = "stable"
+ssh_signing_setup_script = "tools/configure-signing.sh"
 
 [release.post_tag_hook.bot_identity]
 name = "release bot"
@@ -2077,6 +2180,10 @@ email = "bot@example.com"
         assert_eq!(parsed.max_push_attempts, 2);
         assert_eq!(parsed.remote, "upstream");
         assert_eq!(parsed.branch, "stable");
+        assert_eq!(
+            parsed.ssh_signing_setup_script.as_deref(),
+            Some("tools/configure-signing.sh")
+        );
         assert_eq!(parsed.bot_name, "release bot");
         assert_eq!(parsed.bot_email, "bot@example.com");
         // push_mode is unset in this section → defaults to the direct push.
@@ -2150,6 +2257,49 @@ pr_branch_prefix = "bot/changelog"
             release_bot_branch("release/post-tag-sync", "v1/foo"),
             release_bot_branch("release/post-tag-sync", "v1-foo")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_bot_pr_push_attaches_detached_head_and_marks_push_supervised() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        fs::create_dir(&repo).expect("repo");
+        git(
+            temp.path(),
+            &["init", "--bare", remote.to_str().expect("remote")],
+        );
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.name", "release bot"]);
+        git(&repo, &["config", "user.email", "release@example.com"]);
+        fs::write(repo.join("CHANGELOG.md"), "release\n").expect("changelog");
+        git(&repo, &["add", "CHANGELOG.md"]);
+        git(&repo, &["commit", "-m", "release docs"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().expect("remote")],
+        );
+        git(&repo, &["checkout", "--detach"]);
+
+        let hook = repo.join(".git/hooks/pre-push");
+        write_executable(
+            &hook,
+            r#"#!/bin/sh
+test "$SHIPYARD_PR_RUNNING" = 1 || exit 41
+test "$(git symbolic-ref --short HEAD)" = "release/post-tag-sync-v1.2.3-test" || exit 42
+"#,
+        );
+
+        let branch = "release/post-tag-sync-v1.2.3-test";
+        attach_and_push_release_bot_branch(&repo, "origin", branch).expect("push");
+        let attached =
+            run_git_capture(&repo, &["symbolic-ref", "--short", "HEAD"]).expect("attached branch");
+        assert_eq!(attached, branch);
+        let remote_head = run_git_capture(&remote, &["rev-parse", &format!("refs/heads/{branch}")])
+            .expect("remote branch");
+        let local_head = run_git_capture(&repo, &["rev-parse", "HEAD"]).expect("local head");
+        assert_eq!(remote_head, local_head);
     }
 
     #[test]

@@ -83,7 +83,14 @@ post-tag workflow with `shipyard release-bot hook install`. Its tag extraction
 must remain literal Bash, `tag="${GITHUB_REF#refs/tags/}"`; the double-braced
 `${{GITHUB_REF#refs/tags/}}` form is not a valid GitHub expression. Because the
 workflow checks out the release tag in detached-HEAD state, branch pushes must
-use the fully qualified `HEAD:refs/heads/<branch>` refspec.
+first attach the deterministic local PR branch and then use Shipyard's
+supervised push with the fully qualified `HEAD:refs/heads/<branch>` refspec.
+The full refspec alone is insufficient in repositories whose pre-push hook
+rejects detached HEAD or requires `SHIPYARD_PR_RUNNING=1`.
+Repositories that require signed bot commits should set
+`release.post_tag_hook.ssh_signing_setup_script` to a safe repository-relative
+helper path. Hook installation then regenerates the required secret-backed SSH
+signing step instead of relying on edits to the owned workflow.
 
 ## Local/SSH VM Watch
 
