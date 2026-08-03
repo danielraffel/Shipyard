@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0813"></a>
-## [0.81.4]
+<a id="v0814"></a>
+## [0.81.4] - 2026-08-02
 
+- fix(release): generate repository signing setup ([#395](https://github.com/danielraffel/Shipyard/pull/395))
+
+<a id="v0813"></a>
 ## [0.81.3] - 2026-08-02
 
 - docs(ci): record attached release-bot push contract ([#394](https://github.com/danielraffel/Shipyard/pull/394))
@@ -759,6 +762,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.81.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.4
 [0.81.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.3
 [0.81.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.2
 [0.81.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.1
