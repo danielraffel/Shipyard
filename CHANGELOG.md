@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0820"></a>
+## [0.82.0] - 2026-08-03
+
+- feat/stacked pr awareness ([#393](https://github.com/danielraffel/Shipyard/pull/393))
+
 <a id="v0814"></a>
 ## [0.81.4] - 2026-08-02
 
@@ -762,6 +767,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.82.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.82.0
 [0.81.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.4
 [0.81.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.3
 [0.81.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.2
