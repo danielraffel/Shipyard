@@ -349,6 +349,13 @@ fn hook_install<W: Write>(
     })?;
     let target = workflows_dir.join(POST_TAG_WORKFLOW);
     let overwrote = target.exists();
+    let hook_config = load_hook_config(config);
+    let signing_setup_script = hook_config
+        .ssh_signing_setup_script
+        .as_deref()
+        .map(validate_workflow_script_path)
+        .transpose()
+        .map_err(|error| CliFailure::new(1, error))?;
     let trusted_config = LoadedConfig::load_machine_global_from_dir(config.global_dir.clone())
         .map_err(|error| {
             CliFailure::new(
@@ -374,7 +381,7 @@ fn hook_install<W: Write>(
     };
     fs::write(
         &target,
-        render_workflow(tag_pattern, shipyard_version, &runner),
+        render_workflow(tag_pattern, shipyard_version, &runner, signing_setup_script),
     )
     .map_err(|error| {
         CliFailure::new(1, format!("failed to write {}: {error}", target.display()))
@@ -621,7 +628,42 @@ fn render_pat_creation_url(owner: &str, repo: &str, pat_name: &str) -> String {
     )
 }
 
-fn render_workflow(tag_pattern: &str, shipyard_version: &str, runner: &str) -> String {
+fn validate_workflow_script_path(path: &str) -> Result<&str, String> {
+    let valid = !path.is_empty()
+        && !path.starts_with('-')
+        && path.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && component
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        });
+    if !valid {
+        return Err(format!(
+            "release.post_tag_hook.ssh_signing_setup_script must be a safe repository-relative path, got {path:?}"
+        ));
+    }
+    Ok(path)
+}
+
+fn render_workflow(
+    tag_pattern: &str,
+    shipyard_version: &str,
+    runner: &str,
+    ssh_signing_setup_script: Option<&str>,
+) -> String {
+    let signing_setup = ssh_signing_setup_script.map_or_else(String::new, |script| {
+        format!(
+            r"      - name: Configure release bot SSH signing
+        shell: bash
+        env:
+          RELEASE_BOT_SSH_SIGNING_KEY: ${{{{ secrets.RELEASE_BOT_SSH_SIGNING_KEY }}}}
+        run: bash -- {script}
+
+"
+        )
+    });
     format!(
         r#"name: Post-tag docs sync
 
@@ -663,6 +705,7 @@ jobs:
           curl -fsSL "https://generouscorp.com/Shipyard/install.sh" | SHIPYARD_VERSION="$SHIPYARD_VERSION" bash
           shipyard --version
 
+{signing_setup}
       - name: Run post-tag docs sync
         shell: bash
         env:
@@ -686,6 +729,7 @@ struct HookConfig {
     bot_email: String,
     remote: String,
     branch: String,
+    ssh_signing_setup_script: Option<String>,
     // How the bot commit lands on `branch`:
     //   "direct" (default) — push --ff-only straight to `branch` (today's
     //     behavior). Incompatible with a GitHub "Require merge queue" rule,
@@ -711,6 +755,7 @@ impl Default for HookConfig {
             bot_email: String::from("shipyard-release-bot@users.noreply.github.com"),
             remote: String::from("origin"),
             branch: String::from("main"),
+            ssh_signing_setup_script: None,
             push_mode: String::from("direct"),
             pr_branch_prefix: String::from("release/post-tag-sync"),
         }
@@ -768,6 +813,10 @@ fn load_hook_config(config: &LoadedConfig) -> HookConfig {
             .and_then(toml::Value::as_str)
             .unwrap_or("main")
             .to_owned(),
+        ssh_signing_setup_script: section
+            .get("ssh_signing_setup_script")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned),
         push_mode: section
             .get("push_mode")
             .and_then(toml::Value::as_str)
@@ -2003,7 +2052,7 @@ esac
 
     #[test]
     fn render_workflow_uses_release_bot_token_fallback() {
-        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest");
+        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest", None);
 
         assert!(workflow.contains("secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN"));
         assert!(workflow.contains(r#"SHIPYARD_VERSION: "v0.51.0""#));
@@ -2011,6 +2060,33 @@ esac
         assert!(workflow.contains("curl -fsSL \"https://generouscorp.com/Shipyard/install.sh\""));
         assert!(workflow.contains(r#"tag="${GITHUB_REF#refs/tags/}""#));
         assert!(!workflow.contains(r#"tag="${{GITHUB_REF#refs/tags/}}""#));
+    }
+
+    #[test]
+    fn render_workflow_configures_repository_ssh_signing() {
+        let script =
+            validate_workflow_script_path("tools/scripts/configure_release_bot_ssh_signing.sh")
+                .expect("safe script path");
+        let workflow = render_workflow("v*", "v0.52.0", "ubuntu-latest", Some(script));
+
+        assert!(workflow.contains("name: Configure release bot SSH signing"));
+        assert!(
+            workflow.contains(
+                "RELEASE_BOT_SSH_SIGNING_KEY: ${{ secrets.RELEASE_BOT_SSH_SIGNING_KEY }}"
+            )
+        );
+        assert!(
+            workflow.contains("run: bash -- tools/scripts/configure_release_bot_ssh_signing.sh")
+        );
+        for unsafe_path in [
+            "../sign.sh",
+            "/tmp/sign.sh",
+            "-x",
+            "sign script.sh",
+            "sign.sh\nrun: bad",
+        ] {
+            assert!(validate_workflow_script_path(unsafe_path).is_err());
+        }
     }
 
     #[cfg(unix)]
@@ -2077,6 +2153,7 @@ only_for_tag_pattern = "shipyard-v*"
 max_push_attempts = 2
 remote = "upstream"
 branch = "stable"
+ssh_signing_setup_script = "tools/configure-signing.sh"
 
 [release.post_tag_hook.bot_identity]
 name = "release bot"
@@ -2103,6 +2180,10 @@ email = "bot@example.com"
         assert_eq!(parsed.max_push_attempts, 2);
         assert_eq!(parsed.remote, "upstream");
         assert_eq!(parsed.branch, "stable");
+        assert_eq!(
+            parsed.ssh_signing_setup_script.as_deref(),
+            Some("tools/configure-signing.sh")
+        );
         assert_eq!(parsed.bot_name, "release bot");
         assert_eq!(parsed.bot_email, "bot@example.com");
         // push_mode is unset in this section → defaults to the direct push.

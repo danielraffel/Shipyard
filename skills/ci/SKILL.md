@@ -36,7 +36,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Regenerate CHANGELOG.md from tags | `shipyard changelog regenerate` |
 | CI drift gate for CHANGELOG.md | `shipyard changelog check` |
 | Run the post-tag hook locally | `shipyard release-bot hook run --tag v0.9.0` |
-| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; `${{GITHUB_REF#refs/tags/}}` is invalid GitHub expression syntax. PR pushes from the detached tag checkout must first attach the deterministic local branch, then use Shipyard's supervised push and target `HEAD:refs/heads/<branch>` so repository hooks see both a branch and `SHIPYARD_PR_RUNNING=1`. |
+| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; `${{GITHUB_REF#refs/tags/}}` is invalid GitHub expression syntax. PR pushes from the detached tag checkout must first attach the deterministic local branch, then use Shipyard's supervised push and target `HEAD:refs/heads/<branch>` so repository hooks see both a branch and `SHIPYARD_PR_RUNNING=1`. Repositories requiring signed bot commits set `release.post_tag_hook.ssh_signing_setup_script`; never hand-edit the owned workflow. |
 | Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
