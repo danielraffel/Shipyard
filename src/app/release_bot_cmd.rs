@@ -1000,10 +1000,7 @@ fn push_via_pr(
         }
         (target, commit)
     } else {
-        run_git(
-            cwd,
-            &["push", &config.remote, &branch_push_refspec(&pr_branch)],
-        )?;
+        attach_and_push_release_bot_branch(cwd, &config.remote, &pr_branch)?;
         result.pushed = true;
         create_release_bot_pr(cwd, config, tag, &pr_branch)?;
         let target = run_gh_json(
@@ -1061,6 +1058,18 @@ fn push_via_pr(
         merge_result: None,
     };
     supervise_release_bot_admission(&store, cwd, &request)
+}
+
+fn attach_and_push_release_bot_branch(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<(), String> {
+    // Tag-triggered Actions checkouts are detached. Attach the deterministic
+    // PR branch before pushing so repository pre-push hooks can validate the
+    // branch state instead of rejecting an otherwise explicit refspec.
+    run_git(cwd, &["switch", "-C", branch])?;
+    run_git_supervised(cwd, &["push", remote, &branch_push_refspec(branch)])
 }
 
 fn ensure_release_commit_is_based_on_target(cwd: &Path, config: &HookConfig) -> Result<(), String> {
@@ -1581,6 +1590,23 @@ fn verify_token(repo_slug: &str, gh_command: Option<&Path>) -> Result<String, St
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
     let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("failed to run git {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn run_git_supervised(cwd: &Path, args: &[&str]) -> Result<(), String> {
+    let output = crate::supervised::git_push_supervised()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -2150,6 +2176,49 @@ pr_branch_prefix = "bot/changelog"
             release_bot_branch("release/post-tag-sync", "v1/foo"),
             release_bot_branch("release/post-tag-sync", "v1-foo")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_bot_pr_push_attaches_detached_head_and_marks_push_supervised() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        fs::create_dir(&repo).expect("repo");
+        git(
+            temp.path(),
+            &["init", "--bare", remote.to_str().expect("remote")],
+        );
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.name", "release bot"]);
+        git(&repo, &["config", "user.email", "release@example.com"]);
+        fs::write(repo.join("CHANGELOG.md"), "release\n").expect("changelog");
+        git(&repo, &["add", "CHANGELOG.md"]);
+        git(&repo, &["commit", "-m", "release docs"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().expect("remote")],
+        );
+        git(&repo, &["checkout", "--detach"]);
+
+        let hook = repo.join(".git/hooks/pre-push");
+        write_executable(
+            &hook,
+            r#"#!/bin/sh
+test "$SHIPYARD_PR_RUNNING" = 1 || exit 41
+test "$(git symbolic-ref --short HEAD)" = "release/post-tag-sync-v1.2.3-test" || exit 42
+"#,
+        );
+
+        let branch = "release/post-tag-sync-v1.2.3-test";
+        attach_and_push_release_bot_branch(&repo, "origin", branch).expect("push");
+        let attached =
+            run_git_capture(&repo, &["symbolic-ref", "--short", "HEAD"]).expect("attached branch");
+        assert_eq!(attached, branch);
+        let remote_head = run_git_capture(&remote, &["rev-parse", &format!("refs/heads/{branch}")])
+            .expect("remote branch");
+        let local_head = run_git_capture(&repo, &["rev-parse", "HEAD"]).expect("local head");
+        assert_eq!(remote_head, local_head);
     }
 
     #[test]
