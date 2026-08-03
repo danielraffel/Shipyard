@@ -655,13 +655,13 @@ fn render_workflow(
 ) -> String {
     let signing_setup = ssh_signing_setup_script.map_or_else(String::new, |script| {
         format!(
-            r#"      - name: Configure release bot SSH signing
+            r"      - name: Configure release bot SSH signing
         shell: bash
         env:
           RELEASE_BOT_SSH_SIGNING_KEY: ${{{{ secrets.RELEASE_BOT_SSH_SIGNING_KEY }}}}
         run: bash -- {script}
 
-"#
+"
         )
     });
     format!(
