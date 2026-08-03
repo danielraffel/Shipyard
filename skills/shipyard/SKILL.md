@@ -54,8 +54,9 @@ manual/unknown removal, head drift, malformed authority data, or a
 
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard
 inspects `PullRequest.stack` and `stackEntry` at each merge or enqueue mutation
-boundary and refuses its unstacked mutation path when either identifies a
-stack. Validate each layer, then use `gh stack merge <pr> --merge` until
+boundary, including `shipyard runner steward`, and refuses its unstacked
+mutation path when either identifies a stack. Validate each layer, then use
+`gh stack merge <pr> --merge` until
 Shipyard durably models the asynchronous request UUID and result polling. A
 classic-boundary GraphQL exhaustion retains the exact-head REST fallback because
 GitHub requires the asynchronous endpoint for formal stacks; queue admission

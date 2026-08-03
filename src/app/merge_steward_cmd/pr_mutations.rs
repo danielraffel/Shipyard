@@ -72,6 +72,28 @@ pub(super) fn enqueue_pull_request(
         Ok(guard) => guard,
         Err(error) => return (None, Some(error)),
     };
+    match inspect_pull_request_stack(context, pr) {
+        Ok(Some(stack)) => {
+            let message = crate::stacked_pr::unsupported_message(pr.fact.number, &stack);
+            let audit_error = guard.finish("rejected_stacked_pull_request").err();
+            return (
+                None,
+                Some(audit_error.map_or(message.clone(), |error| {
+                    format!("{message}; mutation audit also failed: {error}")
+                })),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let audit_error = guard.finish("stack_inspection_failed").err();
+            return (
+                None,
+                Some(audit_error.map_or(error.clone(), |audit_error| {
+                    format!("{error}; mutation audit also failed: {audit_error}")
+                })),
+            );
+        }
+    }
     let query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
     let result = context.actions.run_gh(&[
         "api".to_owned(),
@@ -139,6 +161,18 @@ pub(super) fn enqueue_pull_request(
             }
         }
     }
+}
+
+fn inspect_pull_request_stack(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+) -> Result<Option<crate::stacked_pr::StackInfo>, String> {
+    let args = crate::stacked_pr::query_args(&context.observation.repo, pr.fact.number)?;
+    let raw = context
+        .actions
+        .run_gh(&args)
+        .map_err(|error| format!("failed to inspect pull request stack: {error}"))?;
+    crate::stacked_pr::parse_json(&raw)
 }
 
 #[allow(clippy::too_many_lines)]
