@@ -664,6 +664,15 @@ On a base branch whose live queue object or evaluated rules require GitHub's
 merge queue, Shipyard does not issue a direct merge. It enqueues with GitHub's
 server-atomic `expectedHeadOid` set to the exact validated head SHA, then
 `shipyard ship` waits for the queue result.
+Formal GitHub stacked pull requests are detected at each merge or enqueue
+mutation boundary. The initial integration refuses them because GitHub requires
+its asynchronous merge API; Shipyard must not route one through the classic or
+GraphQL unstacked mutation. If that final classic-boundary read exhausts
+GraphQL, Shipyard preserves its exact-head REST fallback because GitHub's
+classic endpoint cannot merge a formal stack.
+For an observe-only pilot, validate every layer and use
+`gh stack merge <pr> --merge`. Do not add Shipyard mutation support until the
+asynchronous request UUID and completion lifecycle are modeled durably.
 On private repositories whose plan cannot expose evaluated rules, Shipyard
 continues to classic exact-head merge only when the authoritative live
 `mergeQueue` object is null and GitHub returns its exact private-free

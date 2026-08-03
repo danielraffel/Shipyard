@@ -109,6 +109,8 @@ pub mod ship_resume;
 pub mod ship_retry;
 /// Durable in-flight ship-state model and store.
 pub mod ship_state;
+/// GitHub stacked pull request discovery and initial fail-closed policy.
+pub mod stacked_pr;
 /// Subprocess helpers that mark supervised child processes with
 /// `SHIPYARD_PR_RUNNING=1` (issue #266). Used by every `git` / `gh`
 /// spawn site that participates in the supervised PR / ship / merge

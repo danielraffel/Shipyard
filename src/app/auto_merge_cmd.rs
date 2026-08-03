@@ -598,6 +598,13 @@ fn merge_pr(
                 return Ok(MergeDisposition::Enqueued);
             }
             QueueAdmission::Arm { pr_id } => {
+                ensure_unstacked(
+                    client
+                        .as_ref()
+                        .expect("built-in merge should have gh client"),
+                    cwd,
+                    state,
+                )?;
                 let guard = MergeQueueMutationGuard::acquire_in_mode(
                     store,
                     cwd,
@@ -681,6 +688,13 @@ fn merge_pr(
             state,
             "at classic merge mutation boundary",
         )?;
+        ensure_unstacked_for_classic_merge(
+            client
+                .as_ref()
+                .expect("built-in merge should have gh client"),
+            cwd,
+            state,
+        )?;
         command.args(classic_merge_args(
             state,
             merge_method,
@@ -725,6 +739,10 @@ fn merge_pr(
                 "shipyard: GraphQL PR merge is unavailable for this GitHub identity. Falling back to REST."
             );
         }
+        // Do not repeat stack discovery here: this path exists specifically
+        // because GraphQL became unavailable after the earlier mutation-boundary
+        // check. The REST merge still carries the exact validated head SHA, and
+        // another GraphQL dependency would make the fallback unreachable.
         merge_pr_rest(
             client,
             state.pr,
@@ -737,6 +755,37 @@ fn merge_pr(
         return classify_builtin_merge_success(client, cwd, state);
     }
     Err(message)
+}
+
+fn ensure_unstacked(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<(), String> {
+    if let Some(stack) = crate::stacked_pr::fetch(client, cwd, &state.repo, state.pr)? {
+        return Err(crate::stacked_pr::unsupported_message(state.pr, &stack));
+    }
+    Ok(())
+}
+
+fn ensure_unstacked_for_classic_merge(
+    client: &GhClient,
+    cwd: &Path,
+    state: &ShipState,
+) -> Result<(), String> {
+    allow_classic_rest_fallback(ensure_unstacked(client, cwd, state))
+}
+
+fn allow_classic_rest_fallback(result: Result<(), String>) -> Result<(), String> {
+    match result {
+        Err(error) if crate::pr::is_graphql_rate_limited(&error) => {
+            // The classic REST merge endpoint cannot merge a formal stack; the
+            // asynchronous endpoint is required for that. Preserve Shipyard's
+            // independent REST quota fallback when this last read exhausts
+            // GraphQL, while retaining the exact validated-head REST guard.
+            eprintln!(
+                "shipyard: stack inspection exhausted GraphQL at the classic merge boundary; continuing to the server-enforced exact-head merge path"
+            );
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn verify_live_merge_target(
@@ -1172,6 +1221,9 @@ pub(super) fn supervise_merge_queue(
                                 ),
                             };
                         }
+                        if let Err(error) = ensure_unstacked(&client, cwd, &state) {
+                            return AutoMergeOutcome::MergeFailed { error };
+                        }
                         let guard = match MergeQueueMutationGuard::acquire_in_mode(
                             store,
                             cwd,
@@ -1276,6 +1328,9 @@ pub(super) fn supervise_merge_queue(
                                     "PR #{pr} has an uncertain prior exact-head enqueue mutation; refusing to re-arm without queue observation"
                                 ),
                             };
+                        }
+                        if let Err(error) = ensure_unstacked(&client, cwd, &state) {
+                            return AutoMergeOutcome::MergeFailed { error };
                         }
                         let guard = match MergeQueueMutationGuard::acquire_in_mode(
                             store,
@@ -2537,6 +2592,20 @@ mod tests {
         assert!(is_graphql_malformed_query_error(
             "gh: Field 'id' doesn't exist on type 'AutoMergeRequest'"
         ));
+    }
+
+    #[test]
+    fn classic_stack_inspection_preserves_only_graphql_rate_limit_fallback() {
+        assert_eq!(
+            allow_classic_rest_fallback(Err(
+                "GraphQL: API rate limit already exceeded for user ID 123".to_owned()
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            allow_classic_rest_fallback(Err("stack metadata was malformed".to_owned())),
+            Err("stack metadata was malformed".to_owned())
+        );
     }
 
     #[test]
