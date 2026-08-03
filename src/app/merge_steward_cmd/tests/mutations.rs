@@ -12,9 +12,9 @@ use crate::app::merge_steward_cmd::cancellation_terminalization::force_cancel_no
 use crate::app::merge_steward_cmd::capacity_cancellation::{
     pending_cancellation_key, start_capacity_preemption,
 };
-use crate::app::merge_steward_cmd::pr_mutations::{
-    enqueue_pull_request, rollback_transient_attempt,
-};
+#[cfg(unix)]
+use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
+use crate::app::merge_steward_cmd::pr_mutations::rollback_transient_attempt;
 
 #[test]
 fn overlapping_apply_pass_fails_fast_on_ledger_lock() {
