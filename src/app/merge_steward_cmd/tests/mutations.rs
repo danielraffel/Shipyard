@@ -12,7 +12,9 @@ use crate::app::merge_steward_cmd::cancellation_terminalization::force_cancel_no
 use crate::app::merge_steward_cmd::capacity_cancellation::{
     pending_cancellation_key, start_capacity_preemption,
 };
-use crate::app::merge_steward_cmd::pr_mutations::rollback_transient_attempt;
+use crate::app::merge_steward_cmd::pr_mutations::{
+    enqueue_pull_request, rollback_transient_attempt,
+};
 
 #[test]
 fn overlapping_apply_pass_fails_fast_on_ledger_lock() {
@@ -89,6 +91,7 @@ case "$*" in
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
   "pr view "*)
     printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"stackEntry"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":null,"stackEntry":null}}}}}}}}' ;;
   *"enqueuePullRequest"*) printf '%s' '{{"data":{{"enqueuePullRequest":{{"mergeQueueEntry":{{"position":1}}}}}}}}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -118,6 +121,53 @@ esac
     assert!(calls.contains("mergeQueue"), "{calls}");
     assert!(calls.contains("pr view 42"), "{calls}");
     assert!(calls.contains("enqueuePullRequest"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn steward_refuses_formal_stack_before_enqueue_mutation() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"stackEntry"*)
+    printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":{{"number":7,"size":3,"baseRefName":"main"}},"stackEntry":{{"position":2}}}}}}}}}}' ;;
+  *"enqueuePullRequest"*) echo "mutation must not run" >&2; exit 90 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            log.display()
+        ),
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+    let (mutation, error) = enqueue_pull_request(&context, &pr, &mut ledger);
+
+    assert!(mutation.is_none());
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|message| message.contains("position 2/3 in GitHub stack #7")),
+        "{error:?}"
+    );
+    let calls = fs::read_to_string(log).expect("calls");
+    assert!(calls.contains("stackEntry"), "{calls}");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+    let state_root = mutation_control.store.path().parent().expect("state root");
+    assert!(
+        crate::merge_queue_control::uncertain_mutations(state_root)
+            .expect("uncertainty")
+            .is_empty()
+    );
 }
 
 #[cfg(unix)]
@@ -829,6 +879,7 @@ case "$*" in
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
   "pr view "*)
     printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"stackEntry"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":null,"stackEntry":null}}}}}}}}' ;;
   *"enqueuePullRequest"*) echo "connection reset after request body" >&2; exit 1 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -1038,6 +1089,7 @@ case "$*" in
     printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   "pr view "*)
     printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"BLOCKED","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}]}' ;;
+  *"stackEntry"*) printf '%s' '{"data":{"repository":{"pullRequest":{"stack":null,"stackEntry":null}}}}' ;;
   *"enqueuePullRequest"*)
     echo "Required approving review has not been submitted" >&2
     exit 1 ;;

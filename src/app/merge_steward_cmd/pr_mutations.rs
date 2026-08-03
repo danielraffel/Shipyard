@@ -72,6 +72,36 @@ pub(super) fn enqueue_pull_request(
         Ok(guard) => guard,
         Err(error) => return (None, Some(error)),
     };
+    let stack = crate::stacked_pr::query_args(&context.observation.repo, pr.fact.number)
+        .and_then(|args| {
+            context
+                .actions
+                .run_gh(&args)
+                .map_err(|error| format!("failed to inspect pull request stack: {error}"))
+        })
+        .and_then(|raw| crate::stacked_pr::parse_json(&raw));
+    match stack {
+        Ok(Some(stack)) => {
+            let message = crate::stacked_pr::unsupported_message(pr.fact.number, &stack);
+            let audit_error = guard.finish("rejected_stacked_pull_request").err();
+            return (
+                None,
+                Some(audit_error.map_or(message.clone(), |error| {
+                    format!("{message}; mutation audit also failed: {error}")
+                })),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let audit_error = guard.finish("stack_inspection_failed").err();
+            return (
+                None,
+                Some(audit_error.map_or(error.clone(), |audit_error| {
+                    format!("{error}; mutation audit also failed: {audit_error}")
+                })),
+            );
+        }
+    }
     let query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
     let result = context.actions.run_gh(&[
         "api".to_owned(),

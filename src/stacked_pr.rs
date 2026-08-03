@@ -26,25 +26,11 @@ pub fn fetch(
     repo: &str,
     pr: u64,
 ) -> Result<Option<StackInfo>, String> {
-    let (owner, name) = repo
-        .split_once('/')
-        .ok_or_else(|| format!("invalid repository slug {repo:?}"))?;
-    let query = "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){stack{number size baseRefName} stackEntry{position}}}}";
+    let args = query_args(repo, pr)?;
     let output = client
         .prepare_command(cwd, None, GhSupervision::Supervised, GhAuthPolicy::Default)
         .map_err(|error| format!("stack inspection command preparation failed: {error}"))?
-        .args([
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={query}"),
-            "-F",
-            &format!("owner={owner}"),
-            "-F",
-            &format!("name={name}"),
-            "-F",
-            &format!("pr={pr}"),
-        ])
+        .args(args)
         .output()
         .map_err(|error| format!("failed to inspect pull request stack: {error}"))?;
     if !output.status.success() {
@@ -53,7 +39,33 @@ pub fn fetch(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let body: Value = serde_json::from_slice(&output.stdout)
+    parse_json(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Build the shared stack-inspection query for every merge mutation boundary.
+pub(crate) fn query_args(repo: &str, pr: u64) -> Result<Vec<String>, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .filter(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'))
+        .ok_or_else(|| format!("invalid repository slug {repo:?}"))?;
+    let query = "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){stack{number size baseRefName} stackEntry{position}}}}";
+    Ok(vec![
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={query}"),
+        "-F".to_owned(),
+        format!("owner={owner}"),
+        "-F".to_owned(),
+        format!("name={name}"),
+        "-F".to_owned(),
+        format!("pr={pr}"),
+    ])
+}
+
+/// Parse stack-inspection JSON returned through either GitHub transport.
+pub(crate) fn parse_json(raw: &str) -> Result<Option<StackInfo>, String> {
+    let body: Value = serde_json::from_str(raw)
         .map_err(|error| format!("pull request stack query returned invalid JSON: {error}"))?;
     parse_response(&body)
 }
