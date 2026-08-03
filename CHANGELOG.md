@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0813"></a>
+## [0.81.4]
+
 ## [0.81.3] - 2026-08-02
 
 - docs(ci): record attached release-bot push contract ([#394](https://github.com/danielraffel/Shipyard/pull/394))
