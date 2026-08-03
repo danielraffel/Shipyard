@@ -72,15 +72,7 @@ pub(super) fn enqueue_pull_request(
         Ok(guard) => guard,
         Err(error) => return (None, Some(error)),
     };
-    let stack = crate::stacked_pr::query_args(&context.observation.repo, pr.fact.number)
-        .and_then(|args| {
-            context
-                .actions
-                .run_gh(&args)
-                .map_err(|error| format!("failed to inspect pull request stack: {error}"))
-        })
-        .and_then(|raw| crate::stacked_pr::parse_json(&raw));
-    match stack {
+    match inspect_pull_request_stack(context, pr) {
         Ok(Some(stack)) => {
             let message = crate::stacked_pr::unsupported_message(pr.fact.number, &stack);
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
@@ -169,6 +161,18 @@ pub(super) fn enqueue_pull_request(
             }
         }
     }
+}
+
+fn inspect_pull_request_stack(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+) -> Result<Option<crate::stacked_pr::StackInfo>, String> {
+    let args = crate::stacked_pr::query_args(&context.observation.repo, pr.fact.number)?;
+    let raw = context
+        .actions
+        .run_gh(&args)
+        .map_err(|error| format!("failed to inspect pull request stack: {error}"))?;
+    crate::stacked_pr::parse_json(&raw)
 }
 
 #[allow(clippy::too_many_lines)]
