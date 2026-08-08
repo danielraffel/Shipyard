@@ -58,6 +58,7 @@ pub(super) fn queue_observer_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let explicit_repo = args.repo.is_some();
     let repo = super::runner_cmd::resolve_repo_slug(args.repo, cwd)?;
     let configured_required = configured_required_checks(config);
     let path_base = args.replay.as_ref().map_or_else(
@@ -109,7 +110,7 @@ pub(super) fn queue_observer_command<W: Write>(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let actions = GitHubActions::from_loaded_config(cwd, config);
+    let actions = observer_actions(cwd, config, &repo, explicit_repo);
     let mut polls = 0;
     let mut failures = 0_usize;
     loop {
@@ -156,6 +157,20 @@ pub(super) fn queue_observer_command<W: Write>(
         thread::sleep(Duration::from_secs(delay));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn observer_actions(
+    cwd: &Path,
+    config: &LoadedConfig,
+    repo: &str,
+    explicit_repo: bool,
+) -> GitHubActions {
+    let actions = GitHubActions::from_loaded_config(cwd, config);
+    if explicit_repo {
+        actions.with_repo_override(repo)
+    } else {
+        actions
+    }
 }
 
 fn acquire_observer_lock(state_path: &Path) -> Result<fs::File, CliFailure> {

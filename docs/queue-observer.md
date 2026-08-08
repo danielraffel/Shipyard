@@ -52,6 +52,8 @@ or edits labels.
 There is no mutation flag or mutation query. A metadata/read-only GitHub token
 is sufficient; no write credential is required. Queue enqueue/dequeue, rerun,
 refresh, push, merge, and hold/resume operations are outside this command.
+When `--repo` is explicit, it also drives `{repo_slug}`-style configured token
+helpers instead of accidentally minting for the current checkout's origin.
 The snapshot keeps `hold_active=true` even when a present HOLD payload is
 malformed or lacks a reason, and reports that condition as a blocker.
 

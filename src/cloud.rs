@@ -265,6 +265,13 @@ impl GitHubActions {
         }
     }
 
+    /// Override repository placeholders used by configured token helpers.
+    #[must_use]
+    pub(crate) fn with_repo_override(mut self, repo: &str) -> Self {
+        self.gh = self.gh.map(|client| client.with_repo_override(repo));
+        self
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
         self.gh_binary_override = Some(gh_binary.into());

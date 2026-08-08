@@ -30,6 +30,8 @@ pub struct GhClient {
     /// `--repo` values but runs from a non-repo CWD, so without this a
     /// `token_command` using `{repo_slug}` could never mint a token.
     repo_hint: Option<RepoIdentity>,
+    /// Explicit command target; unlike a hint, this outranks the checkout.
+    repo_override: Option<RepoIdentity>,
 }
 
 impl Debug for GhClient {
@@ -65,6 +67,13 @@ impl GhClient {
     #[must_use]
     pub fn with_repo_hint(mut self, slug: &str) -> Self {
         self.repo_hint = RepoIdentity::from_slug(slug);
+        self
+    }
+
+    /// Force token-command repository placeholders to use an explicit target.
+    #[must_use]
+    pub fn with_repo_override(mut self, slug: &str) -> Self {
+        self.repo_override = RepoIdentity::from_slug(slug);
         self
     }
 
@@ -191,6 +200,7 @@ impl GhClient {
             auth,
             cache: Arc::new(Mutex::new(None)),
             repo_hint: None,
+            repo_override: None,
         }
     }
 
@@ -222,7 +232,12 @@ impl GhClient {
         cache_ttl_seconds: Option<u64>,
         timeout: Option<Duration>,
     ) -> Result<TokenResolution, GhPrepareError> {
-        let expanded = expand_token_command(token_command, cwd, self.repo_hint.as_ref())?;
+        let expanded = expand_token_command(
+            token_command,
+            cwd,
+            self.repo_hint.as_ref(),
+            self.repo_override.as_ref(),
+        )?;
         let now = Utc::now();
         if let Some(cached) = self.cached_token(&expanded, now)? {
             return Ok(cached);
@@ -785,6 +800,7 @@ fn expand_token_command(
     args: &[String],
     cwd: &Path,
     repo_hint: Option<&RepoIdentity>,
+    repo_override: Option<&RepoIdentity>,
 ) -> Result<Vec<String>, GhPrepareError> {
     if args.is_empty() {
         return Err(GhPrepareError::EmptyTokenCommand);
@@ -797,7 +813,7 @@ fn expand_token_command(
                 let identity = if let Some(identity) = &repo {
                     identity
                 } else {
-                    repo = Some(resolve_repo_placeholder(cwd, repo_hint)?);
+                    repo = Some(resolve_repo_placeholder(cwd, repo_hint, repo_override)?);
                     repo.as_ref().expect("repo identity should be set")
                 };
                 expanded = expanded
@@ -817,7 +833,11 @@ fn expand_token_command(
 fn resolve_repo_placeholder(
     cwd: &Path,
     repo_hint: Option<&RepoIdentity>,
+    repo_override: Option<&RepoIdentity>,
 ) -> Result<RepoIdentity, GhPrepareError> {
+    if let Some(repo_override) = repo_override {
+        return Ok(repo_override.clone());
+    }
     match resolve_repo_identity(cwd) {
         Ok(identity) => Ok(identity),
         Err(GhPrepareError::RepoSlugRequired) if repo_hint.is_some() => {
@@ -1224,11 +1244,19 @@ mod tests {
         // The CWD's GitHub remote wins even when a hint is present.
         let hint = RepoIdentity::from_slug("hintowner/hintrepo");
         let expanded =
-            expand_token_command(&command, repo.path(), hint.as_ref()).expect("expanded");
+            expand_token_command(&command, repo.path(), hint.as_ref(), None).expect("expanded");
         assert_eq!(expanded[2], "owner/repo");
         assert_eq!(expanded[4], "owner");
         assert_eq!(expanded[6], "repo");
         assert_eq!(expanded[8], repo.path().display().to_string());
+
+        let repo_override = RepoIdentity::from_slug("target/other").expect("override");
+        let overridden =
+            expand_token_command(&command, repo.path(), hint.as_ref(), Some(&repo_override))
+                .expect("overridden");
+        assert_eq!(overridden[2], "target/other");
+        assert_eq!(overridden[4], "target");
+        assert_eq!(overridden[6], "other");
     }
 
     #[test]
@@ -1243,11 +1271,11 @@ mod tests {
         ];
         let hint = RepoIdentity::from_slug("danielraffel/pulp").expect("valid slug");
         let expanded =
-            expand_token_command(&command, not_a_repo.path(), Some(&hint)).expect("expanded");
+            expand_token_command(&command, not_a_repo.path(), Some(&hint), None).expect("expanded");
         assert_eq!(expanded[2], "danielraffel/pulp");
 
         // Without a hint, it still errors (unchanged behavior).
-        let err = expand_token_command(&command, not_a_repo.path(), None);
+        let err = expand_token_command(&command, not_a_repo.path(), None, None);
         assert!(matches!(err, Err(GhPrepareError::RepoSlugRequired)));
     }
 
