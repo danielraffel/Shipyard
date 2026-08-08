@@ -29,6 +29,10 @@ pub struct CheckSnapshot {
     pub conclusion: Option<String>,
     /// Whether repository governance names this context as required.
     pub required: bool,
+    /// GitHub App database ID that produced this check run, when applicable.
+    pub app_id: Option<u64>,
+    /// App required by branch protection for this context, when app-bound.
+    pub required_app_id: Option<u64>,
     /// Details URL supplied by GitHub.
     pub url: Option<String>,
 }
@@ -114,12 +118,23 @@ pub struct QueueStateSnapshot {
     pub truncated: bool,
     /// Required check names from repository/configured governance.
     pub required_contexts: Vec<String>,
+    /// Required contexts and their optional GitHub App binding.
+    pub required_checks: Vec<RequiredCheckSnapshot>,
     /// Local mutation ownership and hold state.
     pub ownership: OwnershipSnapshot,
     /// Queue entries in queue order.
     pub queue: Vec<QueueEntrySnapshot>,
     /// Open pull requests ordered by number.
     pub pull_requests: Vec<PullRequestSnapshot>,
+}
+
+/// One required-check policy entry from configuration or branch protection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RequiredCheckSnapshot {
+    /// Check context name.
+    pub context: String,
+    /// Required producer app, or `None` when any producer may satisfy it.
+    pub app_id: Option<u64>,
 }
 
 /// Persisted observer cursor.
@@ -439,17 +454,7 @@ pub fn parse_snapshot(
         ownership.hold_active = true;
     }
 
-    let mut required = configured_required.iter().cloned().collect::<BTreeSet<_>>();
-    if let Some(rule) = repository.pointer("/baseRef/branchProtectionRule") {
-        required.extend(
-            rule.get("requiredStatusCheckContexts")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_owned),
-        );
-    }
+    let required = required_check_policy(repository, configured_required)?;
 
     let mut pull_requests = connection_nodes(repository.get("pullRequests"))
         .into_iter()
@@ -490,11 +495,49 @@ pub fn parse_snapshot(
         main_url: format!("{repository_url}/commit/{main_sha}"),
         main_sha,
         truncated,
-        required_contexts: required.into_iter().collect(),
+        required_contexts: required.keys().cloned().collect(),
+        required_checks: required
+            .into_iter()
+            .map(|(context, app_id)| RequiredCheckSnapshot { context, app_id })
+            .collect(),
         ownership,
         queue,
         pull_requests,
     })
+}
+
+fn required_check_policy(
+    repository: &Value,
+    configured_required: &[String],
+) -> Result<BTreeMap<String, Option<u64>>, String> {
+    let mut required = configured_required
+        .iter()
+        .cloned()
+        .map(|context| (context, None))
+        .collect::<BTreeMap<_, _>>();
+    let Some(rule) = repository.pointer("/baseRef/branchProtectionRule") else {
+        return Ok(required);
+    };
+    for context in rule
+        .get("requiredStatusCheckContexts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        required.entry(context.to_owned()).or_insert(None);
+    }
+    for check in rule
+        .get("requiredStatusChecks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let context = required_string(check, "context", "required status check")?;
+        let app_id = check.pointer("/app/databaseId").and_then(Value::as_u64);
+        required.insert(context, app_id);
+    }
+    Ok(required)
 }
 
 /// Render a transition as compact Markdown while retaining every repository,
@@ -583,7 +626,7 @@ pub fn render_markdown(transition: &Transition) -> String {
 
 fn parse_pull_request(
     node: &Value,
-    required: &BTreeSet<String>,
+    required: &BTreeMap<String, Option<u64>>,
 ) -> Result<PullRequestSnapshot, String> {
     let number = required_u64(node, "number", "pull request")?;
     let labels = connection_nodes(node.get("labels"))
@@ -613,13 +656,14 @@ fn parse_pull_request(
     blockers.sort();
     blockers.dedup();
 
-    let mut latest = BTreeMap::<String, (String, CheckSnapshot)>::new();
+    let mut latest = BTreeMap::<(String, Option<u64>), (String, CheckSnapshot)>::new();
     for check in connection_nodes(node.pointer("/statusCheckRollup/contexts")) {
         let (stamp, parsed) = parse_check(check, required)?;
-        match latest.get(&parsed.name) {
+        let key = (parsed.name.clone(), parsed.app_id);
+        match latest.get(&key) {
             Some((existing, _)) if existing >= &stamp => {}
             _ => {
-                latest.insert(parsed.name.clone(), (stamp, parsed));
+                latest.insert(key, (stamp, parsed));
             }
         }
     }
@@ -644,10 +688,10 @@ fn parse_pull_request(
 
 fn parse_check(
     node: &Value,
-    required: &BTreeSet<String>,
+    required: &BTreeMap<String, Option<u64>>,
 ) -> Result<(String, CheckSnapshot), String> {
     let typename = node.get("__typename").and_then(Value::as_str).unwrap_or("");
-    let (name, status, conclusion, url, stamp) = match typename {
+    let (name, status, conclusion, url, stamp, app_id) = match typename {
         "CheckRun" => {
             let name = required_string(node, "name", "check run")?;
             let status = node
@@ -677,6 +721,8 @@ fn parse_check(
                 conclusion,
                 optional_string(node, "detailsUrl"),
                 stamp,
+                node.pointer("/checkSuite/app/databaseId")
+                    .and_then(Value::as_u64),
             )
         }
         "StatusContext" => {
@@ -703,36 +749,44 @@ fn parse_check(
                 conclusion,
                 optional_string(node, "targetUrl"),
                 stamp,
+                None,
             )
         }
         _ => return Err(format!("unsupported status context type `{typename}`")),
     };
+    let required_app_id = required.get(&name).copied().flatten();
+    let is_required = required
+        .get(&name)
+        .is_some_and(|binding| binding.is_none_or(|required_app| app_id == Some(required_app)));
     Ok((
         stamp,
         CheckSnapshot {
-            required: required.contains(&name),
+            required: is_required,
             name,
             status,
             conclusion,
             url,
+            app_id,
+            required_app_id,
         },
     ))
 }
 
 fn parse_queue_entry(
     node: &Value,
-    required: &BTreeSet<String>,
+    required: &BTreeMap<String, Option<u64>>,
 ) -> Result<QueueEntrySnapshot, String> {
     let pr = node
         .get("pullRequest")
         .ok_or_else(|| "queue entry missing pull request".to_owned())?;
-    let mut latest = BTreeMap::<String, (String, CheckSnapshot)>::new();
+    let mut latest = BTreeMap::<(String, Option<u64>), (String, CheckSnapshot)>::new();
     for check in connection_nodes(node.pointer("/headCommit/statusCheckRollup/contexts")) {
         let (stamp, parsed) = parse_check(check, required)?;
-        match latest.get(&parsed.name) {
+        let key = (parsed.name.clone(), parsed.app_id);
+        match latest.get(&key) {
             Some((existing, _)) if existing >= &stamp => {}
             _ => {
-                latest.insert(parsed.name.clone(), (stamp, parsed));
+                latest.insert(key, (stamp, parsed));
             }
         }
     }
@@ -756,8 +810,14 @@ fn render_check(check: &CheckSnapshot) -> String {
         || format!("`{}`", check.name),
         |url| format!("[{}]({url})", check.name),
     );
+    let producer = check
+        .app_id
+        .map_or_else(String::new, |app| format!(" app={app}"));
+    let binding = check
+        .required_app_id
+        .map_or_else(String::new, |app| format!(" required_app={app}"));
     format!(
-        "{}{}={value}",
+        "{}{}={value}{producer}{binding}",
         if check.required { "required " } else { "" },
         rendered
     )
@@ -964,6 +1024,8 @@ mod tests {
                 conclusion: Some("failure".to_owned()),
                 required: true,
                 url: Some("https://github.test/check/1".to_owned()),
+                app_id: None,
+                required_app_id: None,
             }],
         });
         let transition = observe(None, snapshot)
@@ -990,7 +1052,7 @@ mod tests {
 
     #[test]
     fn newer_queued_check_run_supersedes_older_completed_run() {
-        let required = BTreeSet::from(["macos".to_owned()]);
+        let required = BTreeMap::from([("macos".to_owned(), None)]);
         let old = serde_json::json!({
             "__typename":"CheckRun", "databaseId":10, "name":"macos",
             "status":"COMPLETED", "conclusion":"SUCCESS",
@@ -1031,6 +1093,29 @@ mod tests {
         assert!(new_stamp > old_stamp);
     }
 
+    #[test]
+    fn app_bound_requirement_ignores_same_name_from_wrong_app() {
+        let required = BTreeMap::from([("macos".to_owned(), Some(10))]);
+        let required_run = serde_json::json!({
+            "__typename":"CheckRun", "databaseId":1, "name":"macos",
+            "status":"COMPLETED", "conclusion":"SUCCESS",
+            "detailsUrl":"https://github.test/run/1", "startedAt":"2026-01-01T00:00:00Z",
+            "checkSuite":{"createdAt":"2026-01-01T00:00:00Z","app":{"databaseId":10}}
+        });
+        let wrong_app = serde_json::json!({
+            "__typename":"CheckRun", "databaseId":2, "name":"macos",
+            "status":"COMPLETED", "conclusion":"FAILURE",
+            "detailsUrl":"https://github.test/run/2", "startedAt":"2026-01-02T00:00:00Z",
+            "checkSuite":{"createdAt":"2026-01-02T00:00:00Z","app":{"databaseId":11}}
+        });
+        let (_, required_run) = parse_check(&required_run, &required).expect("required app");
+        let (_, wrong_app) = parse_check(&wrong_app, &required).expect("wrong app");
+        assert!(required_run.required);
+        assert_eq!(required_run.required_app_id, Some(10));
+        assert!(!wrong_app.required);
+        assert_eq!(wrong_app.required_app_id, Some(10));
+    }
+
     fn minimal_snapshot(sha: &str) -> QueueStateSnapshot {
         QueueStateSnapshot {
             schema_version: QUEUE_OBSERVER_SCHEMA_VERSION,
@@ -1040,6 +1125,7 @@ mod tests {
             main_url: format!("https://github.test/o/r/commit/{sha}"),
             truncated: false,
             required_contexts: Vec::new(),
+            required_checks: Vec::new(),
             ownership: OwnershipSnapshot::default(),
             queue: Vec::new(),
             pull_requests: Vec::new(),

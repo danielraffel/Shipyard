@@ -28,7 +28,7 @@ Each live tick issues one GraphQL `query` containing:
 - up to 100 open PRs with exact heads, URLs, assignees/owner labels,
   blocker labels, auto-merge state, and latest check contexts;
 - the observed base ref's effective classic branch-protection required
-  contexts, unioned with
+  contexts and any required GitHub App producer binding, unioned with
   `governance.required_status_checks` from Shipyard configuration;
 - up to 100 server merge-queue entries in order, with PR heads, admission
   timestamps, speculative merge-group SHAs, and the merge-group commit's
@@ -39,6 +39,8 @@ completeness. Ruleset-required contexts that are not present in Shipyard config
 or classic branch protection remain visible as checks but cannot be marked
 `required`; configure `governance.required_status_checks` for authoritative
 classification.
+When classic protection binds a context to one GitHub App, same-name checks
+from other apps remain visible but cannot replace or satisfy the bound check.
 
 The command also reads Shipyard's existing machine-local mutation-authority and
 `HOLD` records. This records the owner and blocker boundary without acquiring a
