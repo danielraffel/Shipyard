@@ -83,6 +83,9 @@ pub struct OwnershipSnapshot {
     pub mutation_machine: Option<String>,
     /// Whether the current machine is the configured authority.
     pub authority_matches: bool,
+    /// Whether a durable HOLD record exists, even if its payload is unreadable.
+    #[serde(default)]
+    pub hold_active: bool,
     /// Durable hold reason, when queue mutation is paused.
     pub hold_reason: Option<String>,
     /// Machine that created the durable hold.
@@ -403,7 +406,7 @@ pub fn parse_snapshot(
     repo: &str,
     base: &str,
     configured_required: &[String],
-    ownership: OwnershipSnapshot,
+    mut ownership: OwnershipSnapshot,
 ) -> Result<QueueStateSnapshot, String> {
     if let Some(errors) = body
         .get("errors")
@@ -429,6 +432,12 @@ pub fn parse_snapshot(
         .get("url")
         .and_then(Value::as_str)
         .unwrap_or("https://github.com");
+    if ownership.hold_reason.is_some()
+        || ownership.hold_machine.is_some()
+        || ownership.held_at.is_some()
+    {
+        ownership.hold_active = true;
+    }
 
     let mut required = configured_required.iter().cloned().collect::<BTreeSet<_>>();
     if let Some(rule) = repository.pointer("/baseRef/branchProtectionRule") {
@@ -517,7 +526,12 @@ pub fn render_markdown(transition: &Transition) -> String {
         .as_deref()
         .unwrap_or("unconfigured");
     let mut authority = format!("- queue owner: `{owner}`");
-    if let Some(reason) = &snapshot.ownership.hold_reason {
+    if snapshot.ownership.hold_active {
+        let reason = snapshot
+            .ownership
+            .hold_reason
+            .as_deref()
+            .unwrap_or("active; reason unavailable");
         let _ = write!(authority, "; **HOLD:** {reason}");
     }
     if let Some(blocker) = &snapshot.ownership.blocker {
@@ -934,6 +948,7 @@ mod tests {
     fn markdown_preserves_sha_urls_owner_and_blocker() {
         let mut snapshot = minimal_snapshot("a");
         snapshot.ownership.mutation_machine = Some("M1".to_owned());
+        snapshot.ownership.hold_active = true;
         snapshot.ownership.hold_reason = Some("owned by queue monitor".to_owned());
         snapshot.pull_requests.push(PullRequestSnapshot {
             number: 7,

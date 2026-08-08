@@ -181,13 +181,95 @@ fn acquire_observer_lock(state_path: &Path) -> Result<fs::File, CliFailure> {
 }
 
 fn validate_distinct_paths(state_path: &Path, log_path: &Path) -> Result<(), CliFailure> {
-    if state_path == log_path {
+    let state_resolved = resolve_output_path(state_path)?;
+    let log_resolved = resolve_output_path(log_path)?;
+    if state_resolved == log_resolved || existing_files_match(state_path, log_path)? {
         return Err(CliFailure::new(
             2,
             "queue observer --state-file and --transition-log must be different paths",
         ));
     }
     Ok(())
+}
+
+fn resolve_output_path(path: &Path) -> Result<PathBuf, CliFailure> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::canonicalize(path).map_err(|error| {
+            CliFailure::new(
+                2,
+                format!("resolve queue observer output {}: {error}", path.display()),
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = path.file_name().ok_or_else(|| {
+                CliFailure::new(
+                    2,
+                    format!(
+                        "queue observer output path {} has no file name",
+                        path.display()
+                    ),
+                )
+            })?;
+            fs::create_dir_all(parent).map_err(|error| {
+                CliFailure::new(
+                    1,
+                    format!(
+                        "create queue observer output directory {}: {error}",
+                        parent.display()
+                    ),
+                )
+            })?;
+            fs::canonicalize(parent)
+                .map(|parent| parent.join(name))
+                .map_err(|error| {
+                    CliFailure::new(
+                        2,
+                        format!(
+                            "resolve queue observer output directory {}: {error}",
+                            parent.display()
+                        ),
+                    )
+                })
+        }
+        Err(error) => Err(CliFailure::new(
+            2,
+            format!("inspect queue observer output {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn existing_files_match(left: &Path, right: &Path) -> Result<bool, CliFailure> {
+    let (left, right) = match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => (left, right),
+        (Err(left), _) if left.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        (_, Err(right)) if right.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        (Err(error), _) | (_, Err(error)) => {
+            return Err(CliFailure::new(
+                2,
+                format!("inspect queue observer output identity: {error}"),
+            ));
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok(left.volume_serial_number() == right.volume_serial_number()
+            && left.file_index() == right.file_index())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (left, right);
+        Ok(false)
+    }
 }
 
 fn apply_and_emit<W: Write>(
@@ -277,23 +359,39 @@ fn collect_ownership(
         }
         Err(error) => snapshot.blocker = Some(format!("authority unreadable: {error}")),
     }
+    apply_hold_observation(&mut snapshot, hold);
+    snapshot
+}
+
+fn apply_hold_observation(snapshot: &mut OwnershipSnapshot, hold: Result<Option<Value>, String>) {
     match hold {
         Ok(Some(value)) => {
-            snapshot.hold_reason = optional_json_string(&value, "reason");
+            snapshot.hold_active = true;
+            snapshot.hold_reason =
+                optional_json_string(&value, "reason").filter(|reason| !reason.trim().is_empty());
             snapshot.hold_machine = optional_json_string(&value, "machine");
             snapshot.held_at = optional_json_string(&value, "held_at");
+            if snapshot.hold_reason.is_none() {
+                add_ownership_blocker(snapshot, "hold record has no valid reason");
+            }
         }
         Ok(None) => {}
         Err(error) => {
-            let message = format!("hold unreadable: {error}");
-            snapshot.blocker = Some(
-                snapshot
-                    .blocker
-                    .map_or(message.clone(), |current| format!("{current}; {message}")),
-            );
+            snapshot.hold_active = true;
+            add_ownership_blocker(snapshot, &format!("hold unreadable: {error}"));
         }
     }
-    snapshot
+}
+
+fn add_ownership_blocker(snapshot: &mut OwnershipSnapshot, message: &str) {
+    snapshot.blocker = Some(
+        snapshot
+            .blocker
+            .take()
+            .map_or(message.to_owned(), |current| {
+                format!("{current}; {message}")
+            }),
+    );
 }
 
 fn configured_required_checks(config: &LoadedConfig) -> Vec<String> {
@@ -370,6 +468,29 @@ mod tests {
     }
 
     #[test]
+    fn malformed_but_present_hold_remains_visible_and_blocking() {
+        let mut snapshot = OwnershipSnapshot::default();
+        apply_hold_observation(&mut snapshot, Ok(Some(serde_json::json!({}))));
+        assert!(snapshot.hold_active);
+        assert_eq!(snapshot.hold_reason, None);
+        assert_eq!(
+            snapshot.blocker.as_deref(),
+            Some("hold record has no valid reason")
+        );
+    }
+
+    #[test]
+    fn distinct_output_paths_reject_parent_aliases() {
+        let temp = tempfile::tempdir().expect("temp");
+        let nested = temp.path().join("nested");
+        fs::create_dir(&nested).expect("nested");
+        let state = nested.join("..").join("observer.json");
+        let log = temp.path().join("observer.json");
+        let error = validate_distinct_paths(&state, &log).expect_err("same resolved path");
+        assert_eq!(error.code, 2);
+    }
+
+    #[test]
     fn replay_fixtures_miss_no_delivery_transition() {
         let fixture_dir =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/queue-observer");
@@ -428,6 +549,7 @@ mod tests {
             transitions[5].snapshot.ownership.hold_reason.as_deref(),
             Some("queue monitor surface55 owns mutation")
         );
+        assert!(transitions[5].snapshot.ownership.hold_active);
         assert_eq!(
             transitions[6].snapshot.main_sha,
             "dddddddddddddddddddddddddddddddddddddddd"
