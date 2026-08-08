@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0830"></a>
+## [0.84.0]
+
 ## [0.83.0] - 2026-08-03
 
 - fix/stacked pr steward boundary ([#396](https://github.com/danielraffel/Shipyard/pull/396))
