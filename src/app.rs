@@ -36,6 +36,7 @@ mod pin_cmd;
 mod pr_cmd;
 mod quarantine_cmd;
 mod queue_cmd;
+mod queue_observer_cmd;
 mod release_bot_cmd;
 mod reroute_cmd;
 mod rescue_cmd;
@@ -79,6 +80,7 @@ use self::quarantine_cmd::quarantine_command;
 use self::queue_cmd::{
     bump_command, cancel_command, evidence_command, logs_command, queue_command, status_command,
 };
+use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
 use self::release_bot_cmd::release_bot_command;
 use self::rescue_cmd::rescue_command;
 use self::run_cmd::{
@@ -266,6 +268,35 @@ fn dispatch<W: Write, E: Write>(
                 stdout,
             );
         }
+        Command::QueueObserve {
+            repo,
+            base,
+            follow,
+            state_file,
+            transition_log,
+            replay,
+            max_polls,
+        } => {
+            let config = LoadedConfig::load_from_cwd(cli.mode.into(), &cwd)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            return queue_observer_command(
+                QueueObserverArgs {
+                    repo,
+                    base,
+                    follow,
+                    state_file,
+                    transition_log,
+                    replay,
+                    max_polls,
+                },
+                &config,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths,
+                cli.json,
+                stdout,
+            );
+        }
         Command::Wait { command } => {
             return handle_wait_command(
                 command,
@@ -349,6 +380,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Cancel { .. }
         | Command::Bump { .. }
         | Command::Queue
+        | Command::QueueObserve { .. }
         | Command::Cleanup { .. }
         | Command::Targets { .. }
         | Command::Quarantine { .. }

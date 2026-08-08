@@ -29,6 +29,8 @@ shipyard merge-queue resume
 
 # Monitor
 shipyard status                # dashboard: queue + targets + evidence
+shipyard queue-observe         # one read-only queue/PR snapshot; emit on change
+shipyard --json queue-observe --follow  # adaptive delta-only NDJSON monitor
 shipyard watch                 # live-tail an in-flight ship
 shipyard watch local --target linux-vm --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'
 shipyard queue                 # show all jobs with priorities

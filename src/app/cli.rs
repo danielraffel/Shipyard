@@ -131,6 +131,31 @@ pub(super) enum Command {
     },
     /// Show all jobs in the queue.
     Queue,
+    /// Observe GitHub pull requests and merge queue, emitting only transitions.
+    #[command(name = "queue-observe")]
+    QueueObserve {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Base branch whose pull requests and merge queue should be observed.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Continue with adaptive 15/30/60/120/300-second polling.
+        #[arg(long)]
+        follow: bool,
+        /// Override the durable canonical-state path.
+        #[arg(long = "state-file")]
+        state_file: Option<PathBuf>,
+        /// Override the append-only transition-log path.
+        #[arg(long = "transition-log")]
+        transition_log: Option<PathBuf>,
+        /// Replay a JSON fixture file or directory instead of querying GitHub.
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        /// Stop follow mode after this many polls. Test and supervised-run hook.
+        #[arg(long = "max-polls", hide = true)]
+        max_polls: Option<u64>,
+    },
     /// Clean up old logs, bundles, evidence, and optional ship-state.
     Cleanup {
         /// Show what would be cleaned up.

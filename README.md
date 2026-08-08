@@ -11,6 +11,7 @@ shipyard init              # detects your project, probes your machines
 shipyard run               # validates on every platform you configured
 shipyard ship              # validate, open PR, merge on green
 shipyard watch             # live-tail an in-flight ship
+shipyard queue-observe     # read-only GitHub queue deltas with adaptive backoff
 shipyard wait pr 151 --state green  # wait on release / PR / run conditions
 shipyard auto-merge <pr>   # cron-friendly one-shot merge-on-green
 shipyard merge-queue status  # inspect the local queue-mutation hold
@@ -153,6 +154,8 @@ It calls your build commands and cares about one thing: did they pass?
 
 ## Documentation
 
+- [Queue observer](docs/queue-observer.md) — one-query queue snapshots,
+  persisted state hashes, delta-only output, replay, and adaptive backoff.
 - [Examples & Scenarios](docs/examples.md) — real-world setups for Xcode,
   CMake, Swift, Tauri, etc.
 - [Targets & Fallback Chains](docs/targets.md) — how local/SSH/cloud
