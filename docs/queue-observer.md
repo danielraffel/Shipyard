@@ -84,8 +84,9 @@ Polling begins at 15 seconds, then backs off through 30, 60, 120, and 300
 seconds while unchanged. Any transition resets the next delay to 15 seconds.
 Follow mode also retries five consecutive read or parse failures with those
 same bounded delays while preserving the last durable state. Each GitHub read
-attempt has a 60-second timeout, so a stalled credential helper or network call
-cannot escape that retry budget.
+attempt has a 60-second end-to-end timeout, including configured token-helper
+resolution, so a stalled credential helper or network call cannot escape that
+retry budget.
 Over an unchanged hour this makes 16 queries versus 240 fixed 15-second polls:
 93.33% fewer queries. Fixture replay covers initial state, queue admission,
 merge-group materialization, required-check failure, refreshed PR head, local

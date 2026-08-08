@@ -3,13 +3,16 @@
 use std::env;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use wait_timeout::ChildExt;
 
 use crate::config::{ConfigLoadError, LoadedConfig};
 use crate::identity::RuntimeMode;
@@ -77,6 +80,35 @@ impl GhClient {
         supervision: GhSupervision,
         auth_policy: GhAuthPolicy,
     ) -> Result<Command, GhPrepareError> {
+        self.prepare_command_inner(cwd, binary_override, supervision, auth_policy, None)
+    }
+
+    /// Prepare a `gh` command while bounding configured token-helper execution.
+    pub fn prepare_command_with_auth_timeout(
+        &self,
+        cwd: &Path,
+        binary_override: Option<&Path>,
+        supervision: GhSupervision,
+        auth_policy: GhAuthPolicy,
+        auth_timeout: Duration,
+    ) -> Result<Command, GhPrepareError> {
+        self.prepare_command_inner(
+            cwd,
+            binary_override,
+            supervision,
+            auth_policy,
+            Some(auth_timeout),
+        )
+    }
+
+    fn prepare_command_inner(
+        &self,
+        cwd: &Path,
+        binary_override: Option<&Path>,
+        supervision: GhSupervision,
+        auth_policy: GhAuthPolicy,
+        auth_timeout: Option<Duration>,
+    ) -> Result<Command, GhPrepareError> {
         let mut command = match supervision {
             GhSupervision::Supervised => crate::supervised::gh_supervised(binary_override),
             GhSupervision::Unsupervised => {
@@ -85,7 +117,7 @@ impl GhClient {
         };
         command.current_dir(cwd);
         if auth_policy == GhAuthPolicy::Default
-            && let Some(token) = self.resolve_token(cwd)?
+            && let Some(token) = self.resolve_token_with_timeout(cwd, auth_timeout)?
         {
             command.env(GH_TOKEN_ENV, token.token);
         }
@@ -163,6 +195,14 @@ impl GhClient {
     }
 
     fn resolve_token(&self, cwd: &Path) -> Result<Option<TokenResolution>, GhPrepareError> {
+        self.resolve_token_with_timeout(cwd, None)
+    }
+
+    fn resolve_token_with_timeout(
+        &self,
+        cwd: &Path,
+        timeout: Option<Duration>,
+    ) -> Result<Option<TokenResolution>, GhPrepareError> {
         match &self.auth.source {
             GhAuthSource::GhCli => Ok(None),
             GhAuthSource::Env { token_env } => env_token(token_env).map(Some),
@@ -170,7 +210,7 @@ impl GhClient {
                 token_command,
                 cache_ttl_seconds,
             } => self
-                .resolve_command_token(cwd, token_command, *cache_ttl_seconds)
+                .resolve_command_token(cwd, token_command, *cache_ttl_seconds, timeout)
                 .map(Some),
         }
     }
@@ -180,6 +220,7 @@ impl GhClient {
         cwd: &Path,
         token_command: &[String],
         cache_ttl_seconds: Option<u64>,
+        timeout: Option<Duration>,
     ) -> Result<TokenResolution, GhPrepareError> {
         let expanded = expand_token_command(token_command, cwd, self.repo_hint.as_ref())?;
         let now = Utc::now();
@@ -190,14 +231,18 @@ impl GhClient {
         let (program, args) = expanded
             .split_first()
             .ok_or(GhPrepareError::EmptyTokenCommand)?;
-        let output = Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .map_err(|source| GhPrepareError::HelperStart {
-                program: program.clone(),
-                source,
-            })?;
+        let mut command = Command::new(program);
+        command.args(args).current_dir(cwd);
+        let output = if let Some(timeout) = timeout {
+            run_helper_with_timeout(&mut command, program, timeout)?
+        } else {
+            command
+                .output()
+                .map_err(|source| GhPrepareError::HelperStart {
+                    program: program.clone(),
+                    source,
+                })?
+        };
         if !output.status.success() {
             return Err(GhPrepareError::HelperFailed {
                 program: program.clone(),
@@ -255,6 +300,85 @@ impl GhClient {
         Ok(())
     }
 }
+
+fn run_helper_with_timeout(
+    command: &mut Command,
+    program: &str,
+    timeout: Duration,
+) -> Result<Output, GhPrepareError> {
+    let mut stdout = tempfile::tempfile().map_err(|source| GhPrepareError::HelperStart {
+        program: program.to_owned(),
+        source,
+    })?;
+    let mut stderr = tempfile::tempfile().map_err(|source| GhPrepareError::HelperStart {
+        program: program.to_owned(),
+        source,
+    })?;
+    command
+        .stdout(Stdio::from(stdout.try_clone().map_err(|source| {
+            GhPrepareError::HelperStart {
+                program: program.to_owned(),
+                source,
+            }
+        })?))
+        .stderr(Stdio::from(stderr.try_clone().map_err(|source| {
+            GhPrepareError::HelperStart {
+                program: program.to_owned(),
+                source,
+            }
+        })?));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|source| GhPrepareError::HelperStart {
+            program: program.to_owned(),
+            source,
+        })?;
+    let status = child
+        .wait_timeout(timeout)
+        .map_err(|source| GhPrepareError::HelperStart {
+            program: program.to_owned(),
+            source,
+        })?;
+    let Some(status) = status else {
+        terminate_helper_process_group(&mut child);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(GhPrepareError::HelperTimedOut {
+            program: program.to_owned(),
+            timeout_ms: timeout.as_millis(),
+        });
+    };
+    let read_output = |file: &mut std::fs::File| -> Result<Vec<u8>, GhPrepareError> {
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map(|_| bytes)
+            })
+            .map_err(|source| GhPrepareError::HelperStart {
+                program: program.to_owned(),
+                source,
+            })
+    };
+    Ok(Output {
+        status,
+        stdout: read_output(&mut stdout)?,
+        stderr: read_output(&mut stderr)?,
+    })
+}
+
+#[cfg(unix)]
+fn terminate_helper_process_group(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+}
+
+#[cfg(not(unix))]
+fn terminate_helper_process_group(_child: &mut std::process::Child) {}
 
 /// Which auth source to apply when preparing a `gh` command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -458,6 +582,13 @@ pub enum GhPrepareError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+    /// Command helper exceeded the caller's bounded auth budget.
+    HelperTimedOut {
+        /// Helper executable.
+        program: String,
+        /// Timeout in milliseconds.
+        timeout_ms: u128,
+    },
     /// Command helper exited non-zero.
     HelperFailed {
         /// Helper executable.
@@ -497,6 +628,10 @@ impl Display for GhPrepareError {
             Self::HelperStart { program, source } => {
                 write!(f, "failed to start token helper {program:?}: {source}")
             }
+            Self::HelperTimedOut {
+                program,
+                timeout_ms,
+            } => write!(f, "token helper {program:?} timed out after {timeout_ms}ms"),
             Self::HelperFailed {
                 program,
                 status,
@@ -860,6 +995,16 @@ mod tests {
     use super::*;
     use crate::config::LocalOverlaySource;
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).expect("write script");
+        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod script");
+    }
+
     fn config_from_toml(input: &str) -> LoadedConfig {
         LoadedConfig {
             data: input.parse::<toml::Table>().expect("parse toml"),
@@ -924,6 +1069,35 @@ mod tests {
         );
         let error = GhClient::from_loaded_config(&config).expect_err("invalid config");
         assert!(error.to_string().contains("token_command"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_preparation_times_out_token_helper() {
+        let temp = TempDir::new().expect("temp");
+        let helper = temp.path().join("token-helper");
+        write_executable(&helper, "#!/bin/sh\nsleep 5\nprintf token\n");
+        let config = config_from_toml(&format!(
+            r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}"]
+            "#,
+            helper.display()
+        ));
+        let client = GhClient::from_loaded_config(&config).expect("client");
+        let started = std::time::Instant::now();
+        let error = client
+            .prepare_command_with_auth_timeout(
+                temp.path(),
+                Some(Path::new("/tmp/fake-gh")),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+                Duration::from_millis(20),
+            )
+            .expect_err("helper timeout");
+        assert!(matches!(error, GhPrepareError::HelperTimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

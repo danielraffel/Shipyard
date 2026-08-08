@@ -692,7 +692,15 @@ impl GitHubActions {
         args: &[String],
         timeout: Duration,
     ) -> Result<String, GitHubError> {
-        let mut command = self.prepare_gh_command()?;
+        let started = Instant::now();
+        let mut command = self.prepare_gh_command_with_timeout(timeout)?;
+        if started.elapsed() >= timeout {
+            return Err(GitHubError::new(format!(
+                "gh {} timed out during credential preparation after {}ms",
+                args.join(" "),
+                timeout.as_millis()
+            )));
+        }
         command
             .args(args)
             .stdout(std::process::Stdio::piped())
@@ -721,7 +729,6 @@ impl GitHubActions {
             let mut bytes = Vec::new();
             stderr.read_to_end(&mut bytes).map(|_| bytes)
         });
-        let started = Instant::now();
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -795,6 +802,25 @@ impl GitHubActions {
                 self.gh_binary_override.as_deref(),
                 GhSupervision::Unsupervised,
                 GhAuthPolicy::Default,
+            )
+            .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
+    }
+
+    fn prepare_gh_command_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<std::process::Command, GitHubError> {
+        let client = self
+            .gh
+            .as_ref()
+            .map_err(|error| GitHubError::new(error.clone()))?;
+        client
+            .prepare_command_with_auth_timeout(
+                &self.cwd,
+                self.gh_binary_override.as_deref(),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+                timeout,
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
