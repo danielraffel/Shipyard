@@ -27,7 +27,8 @@ Each live tick issues one GraphQL `query` containing:
 - exact base-branch SHA and commit URL;
 - up to 100 open PRs with exact heads, URLs, assignees/owner labels,
   blocker labels, auto-merge state, and latest check contexts;
-- classic branch-protection required contexts, unioned with
+- the observed base ref's effective classic branch-protection required
+  contexts, unioned with
   `governance.required_status_checks` from Shipyard configuration;
 - up to 100 server merge-queue entries in order, with PR heads, admission
   timestamps, speculative merge-group SHAs, and the merge-group commit's
@@ -63,10 +64,13 @@ The first file is atomically replaced and contains the canonical snapshot,
 SHA-256 hash, and backoff cursor. Its hash is verified on load. The second is an
 append-only NDJSON transition log. Transition append precedes cursor advance,
 giving crash recovery at-least-once delivery rather than silently losing a
-transition. Consumers can deduplicate by `state_hash`. A new process resumes
+transition. Each record is encoded before append, serialized by a log-specific
+lock, and an incomplete crash tail is removed before the next append. Consumers
+can deduplicate by `state_hash`. A new process resumes
 from these files and does not reconstruct queue history from agent context.
 An exclusive per-state-path lock rejects a second collector before either
-process can interleave log writes or overwrite the other's cursor.
+process can overwrite the other's cursor. A separate log-path lock prevents
+collectors with distinct state files from interleaving a shared log.
 
 JSON transitions include the full snapshot plus semantic JSON-pointer changes.
 The Markdown renderer retains every commit, PR, and check URL; every observed
@@ -77,7 +81,9 @@ cursor advances.
 Polling begins at 15 seconds, then backs off through 30, 60, 120, and 300
 seconds while unchanged. Any transition resets the next delay to 15 seconds.
 Follow mode also retries five consecutive read or parse failures with those
-same bounded delays while preserving the last durable state.
+same bounded delays while preserving the last durable state. Each GitHub read
+attempt has a 60-second timeout, so a stalled credential helper or network call
+cannot escape that retry budget.
 Over an unchanged hour this makes 16 queries versus 240 fixed 15-second polls:
 93.33% fewer queries. Fixture replay covers initial state, queue admission,
 merge-group materialization, required-check failure, refreshed PR head, local

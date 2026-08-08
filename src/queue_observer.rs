@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -306,18 +307,82 @@ pub fn append_transition(path: &Path, transition: &Transition) -> Result<(), Str
         .ok_or_else(|| format!("transition log path {} has no parent", path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("create transition log directory: {error}"))?;
+    let lock_path = path.with_extension("append.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("open transition-log lock {}: {error}", lock_path.display()))?;
+    lock.lock_exclusive().map_err(|error| {
+        format!(
+            "acquire transition-log lock {}: {error}",
+            lock_path.display()
+        )
+    })?;
+    let mut payload = serde_json::to_vec(transition)
+        .map_err(|error| format!("encode transition log: {error}"))?;
+    payload.push(b'\n');
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|error| format!("open transition log {}: {error}", path.display()))?;
-    serde_json::to_writer(&mut file, transition)
-        .map_err(|error| format!("encode transition log: {error}"))?;
-    file.write_all(b"\n")
+    repair_incomplete_transition_tail(path, &mut file)?;
+    file.write_all(&payload)
         .map_err(|error| format!("append transition log: {error}"))?;
     file.sync_data()
         .map_err(|error| format!("sync transition log: {error}"))?;
     Ok(())
+}
+
+fn repair_incomplete_transition_tail(path: &Path, file: &mut fs::File) -> Result<(), String> {
+    let len = file
+        .metadata()
+        .map_err(|error| format!("inspect transition log {}: {error}", path.display()))?
+        .len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))
+        .and_then(|_| {
+            let mut last = [0_u8; 1];
+            file.read_exact(&mut last).map(|()| last)
+        })
+        .map_err(|error| format!("inspect transition log tail {}: {error}", path.display()))
+        .and_then(|last| {
+            if last == *b"\n" {
+                Ok(())
+            } else {
+                truncate_to_last_complete_line(path, file, len)
+            }
+        })
+}
+
+fn truncate_to_last_complete_line(
+    path: &Path,
+    file: &mut fs::File,
+    mut end: u64,
+) -> Result<(), String> {
+    let mut buffer = [0_u8; 8192];
+    let complete_len = loop {
+        if end == 0 {
+            break 0;
+        }
+        let chunk_len = usize::try_from(end.min(buffer.len() as u64)).expect("bounded chunk");
+        let start = end - chunk_len as u64;
+        file.seek(SeekFrom::Start(start))
+            .and_then(|_| file.read_exact(&mut buffer[..chunk_len]))
+            .map_err(|error| format!("scan transition log {}: {error}", path.display()))?;
+        if let Some(index) = buffer[..chunk_len].iter().rposition(|byte| *byte == b'\n') {
+            break start + index as u64 + 1;
+        }
+        end = start;
+    };
+    file.set_len(complete_len)
+        .map_err(|error| format!("repair transition log {}: {error}", path.display()))
 }
 
 /// Default state and transition-log paths for a repository/base pair.
@@ -366,10 +431,7 @@ pub fn parse_snapshot(
         .unwrap_or("https://github.com");
 
     let mut required = configured_required.iter().cloned().collect::<BTreeSet<_>>();
-    if let Some(rule) = effective_branch_rule(
-        &connection_nodes(repository.get("branchProtectionRules")),
-        base,
-    ) {
+    if let Some(rule) = repository.pointer("/baseRef/branchProtectionRule") {
         required.extend(
             rule.get("requiredStatusCheckContexts")
                 .and_then(Value::as_array)
@@ -398,7 +460,6 @@ pub fn parse_snapshot(
     queue.sort_by_key(|entry| (entry.position, entry.pr));
 
     let truncated = connection_has_next(repository.get("pullRequests"))
-        || connection_has_next(repository.get("branchProtectionRules"))
         || queue_value.is_some_and(|value| connection_has_next(value.get("entries")))
         || queue_value.is_some_and(|value| {
             connection_nodes(value.get("entries")).iter().any(|entry| {
@@ -742,37 +803,6 @@ fn connection_has_next(value: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
-fn effective_branch_rule<'a>(rules: &[&'a Value], branch: &str) -> Option<&'a Value> {
-    if let Some(exact) = rules
-        .iter()
-        .copied()
-        .find(|rule| rule.get("pattern").and_then(Value::as_str) == Some(branch))
-    {
-        return Some(exact);
-    }
-    let options = glob::MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: true,
-        require_literal_leading_dot: false,
-    };
-    rules
-        .iter()
-        .copied()
-        .filter(|rule| {
-            rule.get("pattern")
-                .and_then(Value::as_str)
-                .and_then(|pattern| glob::Pattern::new(pattern).ok())
-                .is_some_and(|pattern| pattern.matches_with(branch, options))
-        })
-        // GitHub does not expose rule creation timestamps; monotonically assigned
-        // database IDs preserve the creation order used for wildcard precedence.
-        .min_by_key(|rule| {
-            rule.get("databaseId")
-                .and_then(Value::as_u64)
-                .unwrap_or(u64::MAX)
-        })
-}
-
 fn required_string(value: &Value, field: &str, context: &str) -> Result<String, String> {
     value
         .get(field)
@@ -872,6 +902,35 @@ mod tests {
     }
 
     #[test]
+    fn transition_append_repairs_an_incomplete_tail() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("transitions.jsonl");
+        let first = observe(None, minimal_snapshot("a"))
+            .expect("first")
+            .transition
+            .expect("transition");
+        append_transition(&path, &first).expect("append first");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open partial")
+            .write_all(b"{\"partial\":")
+            .expect("write partial");
+        let second = observe(None, minimal_snapshot("b"))
+            .expect("second")
+            .transition
+            .expect("transition");
+        append_transition(&path, &second).expect("repair and append");
+        let lines = fs::read_to_string(&path).expect("read");
+        let records = lines
+            .lines()
+            .map(serde_json::from_str::<Transition>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid ndjson");
+        assert_eq!(records, [first, second]);
+    }
+
+    #[test]
     fn markdown_preserves_sha_urls_owner_and_blocker() {
         let mut snapshot = minimal_snapshot("a");
         snapshot.ownership.mutation_machine = Some("M1".to_owned());
@@ -912,20 +971,6 @@ mod tests {
                 "missing {expected}: {markdown}"
             );
         }
-    }
-
-    #[test]
-    fn effective_rule_prefers_exact_then_oldest_github_style_pattern() {
-        let exact = serde_json::json!({"pattern":"main","databaseId":3});
-        let wildcard = serde_json::json!({"pattern":"*","databaseId":1});
-        assert_eq!(
-            effective_branch_rule(&[&wildcard, &exact], "main"),
-            Some(&exact)
-        );
-        let old = serde_json::json!({"pattern":"qa/*","databaseId":1});
-        let new = serde_json::json!({"pattern":"qa/*","databaseId":2});
-        assert_eq!(effective_branch_rule(&[&new, &old], "qa/x"), Some(&old));
-        assert_eq!(effective_branch_rule(&[&new, &old], "qa/x/y"), None);
     }
 
     #[test]
@@ -989,8 +1034,7 @@ mod tests {
     fn fixture_repo(sha: &str) -> Value {
         serde_json::json!({
             "url":"https://github.test/o/r",
-            "baseRef":{"target":{"oid":sha}},
-            "branchProtectionRules":{"nodes":[{"pattern":"main","requiredStatusCheckContexts":["macos"]}],"pageInfo":{"hasNextPage":false}},
+            "baseRef":{"target":{"oid":sha},"branchProtectionRule":{"requiredStatusCheckContexts":["macos"]}},
             "pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}},
             "mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}
         })

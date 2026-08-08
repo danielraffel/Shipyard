@@ -52,6 +52,16 @@ been observed in the queue (durably recorded across restarts), and only an
 manual/unknown removal, head drift, malformed authority data, or a
 403/rate-limit response stop fail-closed.
 
+Use `shipyard --json queue-observe --repo <owner/repo> [--follow]` when an
+agent needs a durable, read-only feed of base SHA, open PR heads/checks,
+server-owned queue order and merge-group checks, mutation ownership, and
+`HOLD` state. Each live tick is one bounded GraphQL query; unchanged polls emit
+nothing and back off through 15/30/60/120/300 seconds. The observer writes an
+atomic canonical cursor plus an append-only transition log under the Shipyard
+state root and takes an exclusive per-cursor lock. It exposes no mutation flag,
+does not acquire a mutation lease, and needs no write credential. See
+[`docs/queue-observer.md`](../../docs/queue-observer.md).
+
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard
 inspects `PullRequest.stack` and `stackEntry` at each merge or enqueue mutation
 boundary, including `shipyard runner steward`, and refuses its unstacked

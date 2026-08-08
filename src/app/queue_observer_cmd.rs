@@ -26,8 +26,9 @@ use crate::queue_observer::{
 // classic required contexts, and server-owned merge-queue order/group heads.
 // This is intentionally a query literal; no mutation operation exists in this
 // module or in the command surface.
-const SNAPSHOT_QUERY: &str = r"query($owner:String!,$name:String!,$branch:String!,$qualified:String!){repository(owner:$owner,name:$name){url baseRef:ref(qualifiedName:$qualified){target{... on Commit{oid}}} branchProtectionRules(first:100){nodes{databaseId pattern requiredStatusCheckContexts} pageInfo{hasNextPage}} pullRequests(first:100,states:OPEN,baseRefName:$branch,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number url headRefOid mergeStateStatus autoMergeRequest{enabledAt} assignees(first:20){nodes{login} pageInfo{hasNextPage}} labels(first:40){nodes{name} pageInfo{hasNextPage}} statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{databaseId name status conclusion detailsUrl startedAt checkSuite{createdAt}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage}}}} pageInfo{hasNextPage}} mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{databaseId name status conclusion detailsUrl startedAt checkSuite{createdAt}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage}}}} pullRequest{number url headRefOid}} pageInfo{hasNextPage}}}}}";
+const SNAPSHOT_QUERY: &str = r"query($owner:String!,$name:String!,$branch:String!,$qualified:String!){repository(owner:$owner,name:$name){url baseRef:ref(qualifiedName:$qualified){target{... on Commit{oid}} branchProtectionRule{requiredStatusCheckContexts}} pullRequests(first:100,states:OPEN,baseRefName:$branch,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number url headRefOid mergeStateStatus autoMergeRequest{enabledAt} assignees(first:20){nodes{login} pageInfo{hasNextPage}} labels(first:40){nodes{name} pageInfo{hasNextPage}} statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{databaseId name status conclusion detailsUrl startedAt checkSuite{createdAt}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage}}}} pageInfo{hasNextPage}} mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{databaseId name status conclusion detailsUrl startedAt checkSuite{createdAt}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage}}}} pullRequest{number url headRefOid}} pageInfo{hasNextPage}}}}}";
 const FAILURE_BACKOFF: [u64; 5] = [15, 30, 60, 120, 300];
+const SNAPSHOT_ATTEMPT_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub(super) struct QueueObserverArgs {
     pub(super) repo: Option<String>,
@@ -250,7 +251,7 @@ fn fetch_snapshot(actions: &GitHubActions, repo: &str, base: &str) -> Result<Val
         format!("qualified=refs/heads/{base}"),
     ];
     let raw = actions
-        .run_gh(&args)
+        .run_gh_with_timeout(&args, SNAPSHOT_ATTEMPT_TIMEOUT)
         .map_err(|error| CliFailure::new(1, format!("read queue snapshot: {error}")))?;
     serde_json::from_str(&raw)
         .map_err(|error| CliFailure::new(1, format!("parse queue snapshot: {error}")))
@@ -362,7 +363,7 @@ mod tests {
             "pullrequests",
             "statuscheckrollup",
             "mergequeue",
-            "branchprotectionrules",
+            "branchprotectionrule",
         ] {
             assert!(lower.contains(field), "missing {field}");
         }
