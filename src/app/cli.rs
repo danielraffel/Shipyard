@@ -153,7 +153,11 @@ pub(super) enum Command {
         #[arg(long)]
         replay: Option<PathBuf>,
         /// Stop follow mode after this many polls. Test and supervised-run hook.
-        #[arg(long = "max-polls", hide = true)]
+        #[arg(
+            long = "max-polls",
+            hide = true,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
         max_polls: Option<u64>,
     },
     /// Clean up old logs, bundles, evidence, and optional ship-state.
@@ -1749,5 +1753,24 @@ impl From<PathMode> for RuntimeMode {
             PathMode::Isolated => Self::Isolated,
             PathMode::Shipyard => Self::Shipyard,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn queue_observer_rejects_zero_max_polls() {
+        assert!(
+            Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "0",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "1",])
+                .is_ok()
+        );
     }
 }

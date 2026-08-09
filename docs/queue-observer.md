@@ -75,8 +75,9 @@ lock, and an incomplete crash tail is removed before the next append. Consumers
 can deduplicate by `state_hash`. A new process resumes
 from these files and does not reconstruct queue history from agent context.
 An exclusive per-state-path lock rejects a second collector before either
-process can overwrite the other's cursor. A separate log-path lock prevents
-collectors with distinct state files from interleaving a shared log.
+process can overwrite the other's cursor. The transition log itself is locked,
+so collectors with distinct state files cannot interleave a shared log even
+when they reach it through symlink or hard-link aliases.
 
 JSON transitions include the full snapshot plus semantic JSON-pointer changes.
 The Markdown renderer retains every commit, PR, and check URL; every observed

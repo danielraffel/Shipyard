@@ -277,8 +277,12 @@ fn dispatch<W: Write, E: Write>(
             replay,
             max_polls,
         } => {
-            let config = LoadedConfig::load_from_cwd(cli.mode.into(), &cwd)
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            let config = LoadedConfig::load_from_cwd_with_global_dir(
+                cli.mode.into(),
+                &cwd,
+                runtime_paths.global_dir.clone(),
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
             return queue_observer_command(
                 QueueObserverArgs {
                     repo,

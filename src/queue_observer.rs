@@ -301,7 +301,8 @@ pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
 pub fn save_state(path: &Path, state: &ObserverState) -> Result<(), String> {
     let parent = path
         .parent()
-        .ok_or_else(|| format!("observer state path {} has no parent", path.display()))?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|error| format!("create observer state directory: {error}"))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
@@ -322,32 +323,23 @@ pub fn save_state(path: &Path, state: &ObserverState) -> Result<(), String> {
 pub fn append_transition(path: &Path, transition: &Transition) -> Result<(), String> {
     let parent = path
         .parent()
-        .ok_or_else(|| format!("transition log path {} has no parent", path.display()))?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|error| format!("create transition log directory: {error}"))?;
-    let lock_path = path.with_extension("append.lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| format!("open transition-log lock {}: {error}", lock_path.display()))?;
-    lock.lock_exclusive().map_err(|error| {
-        format!(
-            "acquire transition-log lock {}: {error}",
-            lock_path.display()
-        )
-    })?;
-    let mut payload = serde_json::to_vec(transition)
-        .map_err(|error| format!("encode transition log: {error}"))?;
-    payload.push(b'\n');
+    // Lock the log itself so symlink and hard-link aliases serialize against
+    // the same underlying file instead of acquiring unrelated sidecar locks.
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
         .open(path)
         .map_err(|error| format!("open transition log {}: {error}", path.display()))?;
+    FileExt::lock_exclusive(&file)
+        .map_err(|error| format!("acquire transition-log lock {}: {error}", path.display()))?;
+    let mut payload = serde_json::to_vec(transition)
+        .map_err(|error| format!("encode transition log: {error}"))?;
+    payload.push(b'\n');
     repair_incomplete_transition_tail(path, &mut file)?;
     file.write_all(&payload)
         .map_err(|error| format!("append transition log: {error}"))?;
@@ -428,10 +420,17 @@ pub fn parse_snapshot(
         .and_then(Value::as_array)
         .filter(|errors| !errors.is_empty())
     {
-        return Err(format!(
-            "queue snapshot GraphQL errors: {}",
-            Value::Array(errors.clone())
-        ));
+        let substantive = errors
+            .iter()
+            .filter(|error| !is_governance_graphql_error(error))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !substantive.is_empty() {
+            return Err(format!(
+                "queue snapshot GraphQL errors: {}",
+                Value::Array(substantive)
+            ));
+        }
     }
     let repository = body
         .pointer("/data/repository")
@@ -504,6 +503,38 @@ pub fn parse_snapshot(
         queue,
         pull_requests,
     })
+}
+
+/// Whether a GraphQL response contains errors exclusively on optional
+/// governance fields. GitHub can return usable repository, PR, head, and check
+/// data alongside permission errors for these fields.
+pub(crate) fn only_governance_graphql_errors(body: &Value) -> bool {
+    body.get("errors")
+        .and_then(Value::as_array)
+        .filter(|errors| !errors.is_empty())
+        .is_some_and(|errors| errors.iter().all(is_governance_graphql_error))
+}
+
+fn is_governance_graphql_error(error: &Value) -> bool {
+    let permission_denied = error.get("type").and_then(Value::as_str) == Some("FORBIDDEN")
+        || matches!(
+            error.pointer("/extensions/code").and_then(Value::as_str),
+            Some("FORBIDDEN" | "INSUFFICIENT_SCOPES")
+        );
+    permission_denied
+        && (graphql_error_path_equals(error, &["repository", "mergeQueue"])
+            || graphql_error_path_equals(error, &["repository", "baseRef", "branchProtectionRule"]))
+}
+
+fn graphql_error_path_equals(error: &Value, expected: &[&str]) -> bool {
+    let Some(path) = error.get("path").and_then(Value::as_array) else {
+        return false;
+    };
+    path.len() == expected.len()
+        && path
+            .iter()
+            .zip(expected)
+            .all(|(segment, expected)| segment.as_str() == Some(expected))
 }
 
 fn required_check_policy(
@@ -656,18 +687,7 @@ fn parse_pull_request(
     blockers.sort();
     blockers.dedup();
 
-    let mut latest = BTreeMap::<(String, Option<u64>), (String, CheckSnapshot)>::new();
-    for check in connection_nodes(node.pointer("/statusCheckRollup/contexts")) {
-        let (stamp, parsed) = parse_check(check, required)?;
-        let key = (parsed.name.clone(), parsed.app_id);
-        match latest.get(&key) {
-            Some((existing, _)) if existing >= &stamp => {}
-            _ => {
-                latest.insert(key, (stamp, parsed));
-            }
-        }
-    }
-    let checks = latest.into_values().map(|(_, check)| check).collect();
+    let checks = parse_latest_checks(node.pointer("/statusCheckRollup/contexts"), required)?;
     Ok(PullRequestSnapshot {
         number,
         url: required_string(node, "url", "pull request")?,
@@ -772,17 +792,22 @@ fn parse_check(
     ))
 }
 
-fn parse_queue_entry(
-    node: &Value,
+fn parse_latest_checks(
+    contexts: Option<&Value>,
     required: &BTreeMap<String, Option<u64>>,
-) -> Result<QueueEntrySnapshot, String> {
-    let pr = node
-        .get("pullRequest")
-        .ok_or_else(|| "queue entry missing pull request".to_owned())?;
+) -> Result<Vec<CheckSnapshot>, String> {
     let mut latest = BTreeMap::<(String, Option<u64>), (String, CheckSnapshot)>::new();
-    for check in connection_nodes(node.pointer("/headCommit/statusCheckRollup/contexts")) {
+    for check in connection_nodes(contexts) {
         let (stamp, parsed) = parse_check(check, required)?;
-        let key = (parsed.name.clone(), parsed.app_id);
+        // App identity is load-bearing only for an app-bound requirement. An
+        // unbound context can be satisfied by any producer, so retain its
+        // newest observation rather than showing conflicting duplicates.
+        let app_key = required
+            .get(&parsed.name)
+            .is_some_and(Option::is_some)
+            .then_some(parsed.app_id)
+            .flatten();
+        let key = (parsed.name.clone(), app_key);
         match latest.get(&key) {
             Some((existing, _)) if existing >= &stamp => {}
             _ => {
@@ -790,6 +815,20 @@ fn parse_queue_entry(
             }
         }
     }
+    Ok(latest.into_values().map(|(_, check)| check).collect())
+}
+
+fn parse_queue_entry(
+    node: &Value,
+    required: &BTreeMap<String, Option<u64>>,
+) -> Result<QueueEntrySnapshot, String> {
+    let pr = node
+        .get("pullRequest")
+        .ok_or_else(|| "queue entry missing pull request".to_owned())?;
+    let checks = parse_latest_checks(
+        node.pointer("/headCommit/statusCheckRollup/contexts"),
+        required,
+    )?;
     Ok(QueueEntrySnapshot {
         pr: required_u64(pr, "number", "queue pull request")?,
         position: required_u64(node, "position", "queue entry")?,
@@ -800,7 +839,7 @@ fn parse_queue_entry(
             .and_then(Value::as_str)
             .map(str::to_owned),
         enqueued_at: required_string(node, "enqueuedAt", "queue entry")?,
-        checks: latest.into_values().map(|(_, check)| check).collect(),
+        checks,
     })
 }
 
@@ -1005,6 +1044,29 @@ mod tests {
     }
 
     #[test]
+    fn transition_log_file_lock_covers_hard_link_aliases() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("transitions.jsonl");
+        let alias = temp.path().join("transitions-alias.jsonl");
+        fs::write(&path, "").expect("create log");
+        fs::hard_link(&path, &alias).expect("hard link");
+        let original = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .expect("open original");
+        let aliased = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&alias)
+            .expect("open alias");
+
+        FileExt::lock_exclusive(&original).expect("lock original");
+        assert!(FileExt::try_lock_exclusive(&aliased).is_err());
+        FileExt::unlock(&original).expect("unlock original");
+    }
+
+    #[test]
     fn markdown_preserves_sha_urls_owner_and_blocker() {
         let mut snapshot = minimal_snapshot("a");
         snapshot.ownership.mutation_machine = Some("M1".to_owned());
@@ -1116,6 +1178,48 @@ mod tests {
         assert_eq!(wrong_app.required_app_id, Some(10));
     }
 
+    #[test]
+    fn unbound_context_collapses_producers_but_app_bound_context_preserves_them() {
+        let contexts = serde_json::json!({
+            "nodes":[
+                {
+                    "__typename":"CheckRun", "databaseId":1, "name":"macos",
+                    "status":"COMPLETED", "conclusion":"FAILURE",
+                    "detailsUrl":"https://github.test/run/1",
+                    "checkSuite":{"createdAt":"2026-01-01T00:00:00Z","app":{"databaseId":10}}
+                },
+                {
+                    "__typename":"CheckRun", "databaseId":2, "name":"macos",
+                    "status":"COMPLETED", "conclusion":"SUCCESS",
+                    "detailsUrl":"https://github.test/run/2",
+                    "checkSuite":{"createdAt":"2026-01-02T00:00:00Z","app":{"databaseId":11}}
+                }
+            ],
+            "pageInfo":{"hasNextPage":false}
+        });
+
+        let unbound = BTreeMap::from([("macos".to_owned(), None)]);
+        let checks = parse_latest_checks(Some(&contexts), &unbound).expect("unbound checks");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].app_id, Some(11));
+        assert_eq!(checks[0].conclusion.as_deref(), Some("success"));
+        assert!(checks[0].required);
+
+        let app_bound = BTreeMap::from([("macos".to_owned(), Some(10))]);
+        let checks = parse_latest_checks(Some(&contexts), &app_bound).expect("app-bound checks");
+        assert_eq!(checks.len(), 2);
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.app_id == Some(10) && check.required)
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.app_id == Some(11) && !check.required)
+        );
+    }
+
     fn minimal_snapshot(sha: &str) -> QueueStateSnapshot {
         QueueStateSnapshot {
             schema_version: QUEUE_OBSERVER_SCHEMA_VERSION,
@@ -1139,5 +1243,47 @@ mod tests {
             "pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}},
             "mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}
         })
+    }
+
+    #[test]
+    fn non_governance_graphql_errors_remain_fatal() {
+        let body = serde_json::json!({
+            "data":{"repository":fixture_repo("abc")},
+            "errors":[{
+                "path":["repository","pullRequests"],
+                "message":"pull requests unavailable"
+            }]
+        });
+
+        assert!(!only_governance_graphql_errors(&body));
+        let error = parse_snapshot(&body, "o/r", "main", &[], OwnershipSnapshot::default())
+            .expect_err("PR errors must remain fatal");
+        assert!(error.contains("pull requests unavailable"));
+    }
+
+    #[test]
+    fn nested_or_nonpermission_merge_queue_errors_remain_fatal() {
+        for error in [
+            serde_json::json!({
+                "type":"FORBIDDEN",
+                "path":["repository","mergeQueue","entries"],
+                "message":"queue entries unavailable"
+            }),
+            serde_json::json!({
+                "type":"RATE_LIMITED",
+                "path":["repository","mergeQueue"],
+                "message":"rate limited"
+            }),
+        ] {
+            let body = serde_json::json!({
+                "data":{"repository":fixture_repo("abc")},
+                "errors":[error]
+            });
+
+            assert!(!only_governance_graphql_errors(&body));
+            assert!(
+                parse_snapshot(&body, "o/r", "main", &[], OwnershipSnapshot::default()).is_err()
+            );
+        }
     }
 }

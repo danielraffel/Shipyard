@@ -19,7 +19,8 @@ use crate::merge_queue_control::{authority_status, hold_status};
 use crate::paths::RuntimePaths;
 use crate::queue_observer::{
     ObserverState, OwnershipSnapshot, Transition, append_transition, default_paths, load_state,
-    next_poll_seconds, observe, parse_snapshot, render_markdown, save_state,
+    next_poll_seconds, observe, only_governance_graphql_errors, parse_snapshot, render_markdown,
+    save_state,
 };
 
 // One GraphQL request returns base SHA, bounded open PR heads/checks/labels,
@@ -174,7 +175,10 @@ fn observer_actions(
 }
 
 fn acquire_observer_lock(state_path: &Path) -> Result<fs::File, CliFailure> {
-    if let Some(parent) = state_path.parent() {
+    if let Some(parent) = state_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent).map_err(|error| {
             CliFailure::new(1, format!("create observer state directory: {error}"))
         })?;
@@ -184,7 +188,7 @@ fn acquire_observer_lock(state_path: &Path) -> Result<fs::File, CliFailure> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(state_path.with_extension("lock"))
+        .open(observer_lock_path(state_path))
         .map_err(|error| CliFailure::new(1, format!("open observer lock: {error}")))?;
     lock.try_lock_exclusive().map_err(|error| {
         CliFailure::new(
@@ -193,6 +197,12 @@ fn acquire_observer_lock(state_path: &Path) -> Result<fs::File, CliFailure> {
         )
     })?;
     Ok(lock)
+}
+
+fn observer_lock_path(state_path: &Path) -> PathBuf {
+    let mut lock_path = state_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
 }
 
 fn validate_distinct_paths(state_path: &Path, log_path: &Path) -> Result<(), CliFailure> {
@@ -258,32 +268,13 @@ fn resolve_output_path(path: &Path) -> Result<PathBuf, CliFailure> {
 }
 
 fn existing_files_match(left: &Path, right: &Path) -> Result<bool, CliFailure> {
-    let (left, right) = match (fs::metadata(left), fs::metadata(right)) {
-        (Ok(left), Ok(right)) => (left, right),
-        (Err(left), _) if left.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        (_, Err(right)) if right.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        (Err(error), _) | (_, Err(error)) => {
-            return Err(CliFailure::new(
-                2,
-                format!("inspect queue observer output identity: {error}"),
-            ));
-        }
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(left.dev() == right.dev() && left.ino() == right.ino())
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        Ok(left.volume_serial_number() == right.volume_serial_number()
-            && left.file_index() == right.file_index())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (left, right);
-        Ok(false)
+    match same_file::is_same_file(left, right) {
+        Ok(matches) => Ok(matches),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CliFailure::new(
+            2,
+            format!("inspect queue observer output identity: {error}"),
+        )),
     }
 }
 
@@ -301,8 +292,6 @@ fn apply_and_emit<W: Write>(
         // Append before advancing the cursor. A crash can therefore replay a
         // transition at least once, but can never durably skip it.
         append_transition(log_path, transition).map_err(|error| CliFailure::new(1, error))?;
-    }
-    if let Some(transition) = &result.transition {
         emit_transition(stdout, transition, json)?;
     }
     save_state(state_path, &result.state).map_err(|error| CliFailure::new(1, error))?;
@@ -347,11 +336,26 @@ fn fetch_snapshot(actions: &GitHubActions, repo: &str, base: &str) -> Result<Val
         "-F".to_owned(),
         format!("qualified=refs/heads/{base}"),
     ];
-    let raw = actions
-        .run_gh_with_timeout(&args, SNAPSHOT_ATTEMPT_TIMEOUT)
+    let output = actions
+        .run_gh_with_timeout_output(&args, SNAPSHOT_ATTEMPT_TIMEOUT)
         .map_err(|error| CliFailure::new(1, format!("read queue snapshot: {error}")))?;
-    serde_json::from_str(&raw)
-        .map_err(|error| CliFailure::new(1, format!("parse queue snapshot: {error}")))
+    let body = serde_json::from_slice(output.stdout()).map_err(|error| {
+        if output.success() {
+            CliFailure::new(1, format!("parse queue snapshot: {error}"))
+        } else {
+            CliFailure::new(
+                1,
+                format!("read queue snapshot: {}", output.command_error(&args)),
+            )
+        }
+    })?;
+    if !output.success() && !only_governance_graphql_errors(&body) {
+        return Err(CliFailure::new(
+            1,
+            format!("read queue snapshot: {}", output.command_error(&args)),
+        ));
+    }
+    Ok(body)
 }
 
 fn collect_ownership(
@@ -464,6 +468,18 @@ fn optional_json_string(value: &Value, field: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::config::LocalOverlaySource;
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, contents).expect("write script");
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod script");
+    }
 
     #[test]
     fn snapshot_transport_is_one_read_only_graphql_query() {
@@ -503,6 +519,30 @@ mod tests {
         let log = temp.path().join("observer.json");
         let error = validate_distinct_paths(&state, &log).expect_err("same resolved path");
         assert_eq!(error.code, 2);
+    }
+
+    #[test]
+    fn distinct_output_paths_reject_hard_link_aliases() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state = temp.path().join("observer-state.json");
+        let log = temp.path().join("observer-transitions.jsonl");
+        fs::write(&state, "seed").expect("state");
+        fs::hard_link(&state, &log).expect("hard link");
+
+        let error = validate_distinct_paths(&state, &log).expect_err("same underlying file");
+        assert_eq!(error.code, 2);
+    }
+
+    #[test]
+    fn observer_lock_suffix_preserves_the_complete_state_name() {
+        assert_eq!(
+            observer_lock_path(Path::new("observer.json")),
+            PathBuf::from("observer.json.lock")
+        );
+        assert_eq!(
+            observer_lock_path(Path::new("observer.lock")),
+            PathBuf::from("observer.lock.lock")
+        );
     }
 
     #[test]
@@ -570,5 +610,83 @@ mod tests {
             "dddddddddddddddddddddddddddddddddddddddd"
         );
         assert!(transitions[6].snapshot.pull_requests.is_empty());
+    }
+
+    #[test]
+    fn replay_without_merge_queue_or_branch_rule_keeps_pr_head_and_checks() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/queue-observer-no-governance.json");
+        let frame = load_replay_frames(&fixture)
+            .expect("fixture")
+            .pop()
+            .expect("one frame");
+        let snapshot = parse_snapshot(&frame.graphql, "acme/forge", "main", &[], frame.ownership)
+            .expect("snapshot");
+
+        assert_eq!(
+            snapshot.main_sha,
+            "2222222222222222222222222222222222222222"
+        );
+        assert!(snapshot.required_contexts.is_empty());
+        assert!(snapshot.queue.is_empty());
+        assert_eq!(snapshot.pull_requests.len(), 1);
+        assert_eq!(
+            snapshot.pull_requests[0].head_sha,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
+        assert_eq!(snapshot.pull_requests[0].checks.len(), 1);
+        assert_eq!(snapshot.pull_requests[0].checks[0].name, "build");
+        assert!(!snapshot.pull_requests[0].checks[0].required);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_graphql_with_only_governance_errors_preserves_partial_snapshot() {
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/queue-observer-no-governance.json");
+        let frame = load_replay_frames(&fixture)
+            .expect("fixture")
+            .pop()
+            .expect("one frame");
+        let body = temp.path().join("graphql.json");
+        fs::write(
+            &body,
+            serde_json::to_vec(&frame.graphql).expect("encode graphql"),
+        )
+        .expect("write graphql");
+        let gh = temp.path().join("gh");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\ncat '{}'\nprintf '%s\\n' 'governance fields unavailable' >&2\nexit 1\n",
+                body.display()
+            ),
+        );
+        let config = LoadedConfig {
+            data: toml::Table::new(),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        };
+        let actions =
+            GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(&gh);
+
+        let body = fetch_snapshot(&actions, "acme/forge", "main")
+            .expect("governance-only error should preserve partial data");
+        let snapshot = parse_snapshot(
+            &body,
+            "acme/forge",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect("snapshot");
+
+        assert!(snapshot.queue.is_empty());
+        assert!(snapshot.required_contexts.is_empty());
+        assert_eq!(snapshot.pull_requests[0].number, 24);
+        assert_eq!(snapshot.pull_requests[0].checks[0].name, "build");
     }
 }
