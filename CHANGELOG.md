@@ -777,6 +777,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.84.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.84.0
 [0.83.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.83.0
 [0.82.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.82.0
 [0.81.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.81.4

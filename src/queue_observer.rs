@@ -114,7 +114,8 @@ pub struct QueueStateSnapshot {
     pub main_sha: String,
     /// Browser URL for the exact base commit.
     pub main_url: String,
-    /// Whether any bounded GraphQL connection was truncated.
+    /// Whether any bounded GraphQL connection or optional governance field was
+    /// unavailable, so the snapshot is intentionally conservative.
     pub truncated: bool,
     /// Required check names from repository/configured governance.
     pub required_contexts: Vec<String>,
@@ -418,8 +419,24 @@ pub fn parse_snapshot(
     repo: &str,
     base: &str,
     configured_required: &[String],
-    mut ownership: OwnershipSnapshot,
+    ownership: OwnershipSnapshot,
 ) -> Result<QueueStateSnapshot, String> {
+    parse_snapshot_with_previous(body, repo, base, configured_required, ownership, None)
+}
+
+/// Parse a snapshot while conservatively retaining governance facts that a
+/// previous observation could read but the current credential cannot.
+pub(crate) fn parse_snapshot_with_previous(
+    body: &Value,
+    repo: &str,
+    base: &str,
+    configured_required: &[String],
+    mut ownership: OwnershipSnapshot,
+    previous: Option<&QueueStateSnapshot>,
+) -> Result<QueueStateSnapshot, String> {
+    let merge_queue_denied = governance_field_denied(body, &["repository", "mergeQueue"]);
+    let branch_rule_denied =
+        governance_field_denied(body, &["repository", "baseRef", "branchProtectionRule"]);
     if let Some(errors) = body
         .get("errors")
         .and_then(Value::as_array)
@@ -457,8 +474,13 @@ pub fn parse_snapshot(
     {
         ownership.hold_active = true;
     }
+    let previous = previous.filter(|snapshot| snapshot.repo == repo && snapshot.base == base);
 
-    let required = required_check_policy(repository, configured_required)?;
+    let required = required_check_policy(
+        repository,
+        configured_required,
+        branch_rule_denied.then_some(previous).flatten(),
+    )?;
 
     let mut pull_requests = connection_nodes(repository.get("pullRequests"))
         .into_iter()
@@ -469,15 +491,21 @@ pub fn parse_snapshot(
     let queue_value = repository
         .get("mergeQueue")
         .filter(|value| !value.is_null());
-    let mut queue = queue_value
-        .map(|value| connection_nodes(value.get("entries")))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|node| parse_queue_entry(node, &required))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut queue = if merge_queue_denied {
+        previous.map_or_else(Vec::new, |snapshot| snapshot.queue.clone())
+    } else {
+        queue_value
+            .map(|value| connection_nodes(value.get("entries")))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|node| parse_queue_entry(node, &required))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     queue.sort_by_key(|entry| (entry.position, entry.pr));
 
-    let truncated = connection_has_next(repository.get("pullRequests"))
+    let truncated = merge_queue_denied
+        || branch_rule_denied
+        || connection_has_next(repository.get("pullRequests"))
         || queue_value.is_some_and(|value| connection_has_next(value.get("entries")))
         || queue_value.is_some_and(|value| {
             connection_nodes(value.get("entries")).iter().any(|entry| {
@@ -521,14 +549,27 @@ pub(crate) fn only_governance_graphql_errors(body: &Value) -> bool {
 }
 
 fn is_governance_graphql_error(error: &Value) -> bool {
-    let permission_denied = error.get("type").and_then(Value::as_str) == Some("FORBIDDEN")
+    is_permission_denied_graphql_error(error)
+        && (graphql_error_path_equals(error, &["repository", "mergeQueue"])
+            || graphql_error_path_equals(error, &["repository", "baseRef", "branchProtectionRule"]))
+}
+
+fn governance_field_denied(body: &Value, path: &[&str]) -> bool {
+    body.get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                is_permission_denied_graphql_error(error) && graphql_error_path_equals(error, path)
+            })
+        })
+}
+
+fn is_permission_denied_graphql_error(error: &Value) -> bool {
+    error.get("type").and_then(Value::as_str) == Some("FORBIDDEN")
         || matches!(
             error.pointer("/extensions/code").and_then(Value::as_str),
             Some("FORBIDDEN" | "INSUFFICIENT_SCOPES")
-        );
-    permission_denied
-        && (graphql_error_path_equals(error, &["repository", "mergeQueue"])
-            || graphql_error_path_equals(error, &["repository", "baseRef", "branchProtectionRule"]))
+        )
 }
 
 fn graphql_error_path_equals(error: &Value, expected: &[&str]) -> bool {
@@ -545,12 +586,22 @@ fn graphql_error_path_equals(error: &Value, expected: &[&str]) -> bool {
 fn required_check_policy(
     repository: &Value,
     configured_required: &[String],
+    previous: Option<&QueueStateSnapshot>,
 ) -> Result<BTreeMap<String, Option<u64>>, String> {
     let mut required = configured_required
         .iter()
         .cloned()
         .map(|context| (context, None))
         .collect::<BTreeMap<_, _>>();
+    if let Some(previous) = previous {
+        for context in &previous.required_contexts {
+            required.entry(context.clone()).or_insert(None);
+        }
+        for check in &previous.required_checks {
+            required.insert(check.context.clone(), check.app_id);
+        }
+        return Ok(required);
+    }
     let Some(rule) = repository.pointer("/baseRef/branchProtectionRule") else {
         return Ok(required);
     };
@@ -1248,6 +1299,72 @@ mod tests {
             "pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}},
             "mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}
         })
+    }
+
+    #[test]
+    fn governance_permission_loss_preserves_last_known_queue_and_policy() {
+        let mut initial_repository = fixture_repo("abc");
+        initial_repository["mergeQueue"]["entries"]["nodes"] = serde_json::json!([{
+            "position":1,
+            "enqueuedAt":"2026-08-08T00:00:00Z",
+            "headCommit":{
+                "oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "statusCheckRollup":{"contexts":{"nodes":[],"pageInfo":{"hasNextPage":false}}}
+            },
+            "pullRequest":{
+                "number":7,
+                "url":"https://github.test/o/r/pull/7",
+                "headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }]);
+        let initial = parse_snapshot(
+            &serde_json::json!({"data":{"repository":initial_repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect("initial governance snapshot");
+        assert_eq!(initial.required_contexts, ["macos"]);
+        assert_eq!(initial.queue.len(), 1);
+
+        let denied = serde_json::json!({
+            "data":{"repository":{
+                "url":"https://github.test/o/r",
+                "baseRef":{"target":{"oid":"abc"},"branchProtectionRule":null},
+                "pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}},
+                "mergeQueue":null
+            }},
+            "errors":[
+                {"type":"FORBIDDEN","path":["repository","baseRef","branchProtectionRule"]},
+                {"type":"FORBIDDEN","path":["repository","mergeQueue"]}
+            ]
+        });
+        let conservative = parse_snapshot_with_previous(
+            &denied,
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+            Some(&initial),
+        )
+        .expect("partial snapshot");
+
+        assert!(conservative.truncated);
+        assert_eq!(conservative.required_checks, initial.required_checks);
+        assert_eq!(conservative.required_contexts, initial.required_contexts);
+        assert_eq!(conservative.queue, initial.queue);
+
+        let previous = observe(None, initial).expect("previous state").state;
+        let result = observe(Some(&previous), conservative).expect("permission-loss observation");
+        let changes = result.transition.expect("uncertainty transition").changes;
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/truncated"]
+        );
     }
 
     #[test]

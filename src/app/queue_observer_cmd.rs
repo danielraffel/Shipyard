@@ -19,8 +19,8 @@ use crate::merge_queue_control::{authority_status, hold_status};
 use crate::paths::RuntimePaths;
 use crate::queue_observer::{
     ObserverState, OwnershipSnapshot, Transition, append_transition, default_paths, load_state,
-    next_poll_seconds, observe, only_governance_graphql_errors, parse_snapshot, render_markdown,
-    save_state,
+    next_poll_seconds, observe, only_governance_graphql_errors, parse_snapshot_with_previous,
+    render_markdown, save_state,
 };
 
 // One GraphQL request returns base SHA, bounded open PR heads/checks/labels,
@@ -91,12 +91,13 @@ pub(super) fn queue_observer_command<W: Write>(
             ));
         }
         for frame in frames {
-            let snapshot = parse_snapshot(
+            let snapshot = parse_snapshot_with_previous(
                 &frame.graphql,
                 &repo,
                 &args.base,
                 &configured_required,
                 frame.ownership,
+                state.as_ref().map(|state| &state.snapshot),
             )
             .map_err(|error| CliFailure::new(1, error))?;
             state = apply_and_emit(
@@ -116,14 +117,16 @@ pub(super) fn queue_observer_command<W: Write>(
     let mut failures = 0_usize;
     loop {
         let snapshot = fetch_snapshot(&actions, &repo, &args.base).and_then(|body| {
-            let ownership = collect_ownership(
-                &runtime_paths.state_dir,
-                &runtime_paths.global_dir,
-                cwd,
-                mode,
-            );
-            parse_snapshot(&body, &repo, &args.base, &configured_required, ownership)
-                .map_err(|error| CliFailure::new(1, error))
+            let ownership = collect_runtime_ownership(runtime_paths, cwd, mode);
+            parse_snapshot_with_previous(
+                &body,
+                &repo,
+                &args.base,
+                &configured_required,
+                ownership,
+                state.as_ref().map(|state| &state.snapshot),
+            )
+            .map_err(|error| CliFailure::new(1, error))
         });
         let snapshot = match snapshot {
             Ok(snapshot) => {
@@ -158,6 +161,19 @@ pub(super) fn queue_observer_command<W: Write>(
         thread::sleep(Duration::from_secs(delay));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn collect_runtime_ownership(
+    runtime_paths: &RuntimePaths,
+    cwd: &Path,
+    mode: RuntimeMode,
+) -> OwnershipSnapshot {
+    collect_ownership(
+        &runtime_paths.state_dir,
+        &runtime_paths.global_dir,
+        cwd,
+        mode,
+    )
 }
 
 fn observer_actions(
@@ -470,6 +486,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::config::LocalOverlaySource;
+    use crate::queue_observer::parse_snapshot;
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
@@ -627,6 +644,7 @@ mod tests {
             snapshot.main_sha,
             "2222222222222222222222222222222222222222"
         );
+        assert!(snapshot.truncated);
         assert!(snapshot.required_contexts.is_empty());
         assert!(snapshot.queue.is_empty());
         assert_eq!(snapshot.pull_requests.len(), 1);

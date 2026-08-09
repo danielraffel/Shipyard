@@ -24,6 +24,7 @@ pub(crate) struct ProcessTree {
     child: Box<dyn process_wrap::std::ChildWrapper>,
     #[cfg(not(windows))]
     child: Child,
+    terminated: bool,
 }
 
 impl ProcessTree {
@@ -39,7 +40,10 @@ impl ProcessTree {
             let command = std::mem::replace(command, Command::new(""));
             let mut wrapped = CommandWrap::from(command);
             wrapped.wrap(JobObject);
-            wrapped.spawn().map(|child| Self { child })
+            wrapped.spawn().map(|child| Self {
+                child,
+                terminated: false,
+            })
         }
         #[cfg(not(windows))]
         {
@@ -48,7 +52,10 @@ impl ProcessTree {
                 use std::os::unix::process::CommandExt;
                 command.process_group(0);
             }
-            command.spawn().map(|child| Self { child })
+            command.spawn().map(|child| Self {
+                child,
+                terminated: false,
+            })
         }
     }
 
@@ -98,6 +105,9 @@ impl ProcessTree {
 
     /// Best-effort termination and reaping of the complete supervised tree.
     pub(crate) fn terminate(&mut self) {
+        if std::mem::replace(&mut self.terminated, true) {
+            return;
+        }
         #[cfg(windows)]
         {
             // The wrapper retains the Job Object even if `try_wait` reaped the
@@ -133,7 +143,18 @@ impl ProcessTree {
 impl Drop for ProcessTree {
     fn drop(&mut self) {
         // Fail closed on early returns between spawn and explicit cleanup.
-        let _ = self.child.start_kill();
+        if !self.terminated {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        // Match the Windows Job boundary when a caller returns before its
+        // normal explicit cleanup path.
+        self.terminate();
     }
 }
 
@@ -166,6 +187,51 @@ mod tests {
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["-KILL", "--", "-42"].map(OsStr::new)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_drop_terminates_the_child_process_group() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 30 & echo $! > \"$SHIPYARD_DROP_TEST_PID\"; wait",
+            ])
+            .env("SHIPYARD_DROP_TEST_PID", &pid_path);
+        let tree = super::ProcessTree::spawn(&mut command).expect("spawn process tree");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pid_path.exists(), "descendant pid was not recorded");
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("descendant pid")
+            .trim()
+            .to_owned();
+
+        drop(tree);
+
+        let process_is_running = || {
+            Command::new("kill")
+                .args(["-0", "--", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_is_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_is_running(),
+            "process-tree descendant {pid} survived drop"
         );
     }
 
