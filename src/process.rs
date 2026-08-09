@@ -132,8 +132,6 @@ impl ProcessTree {
 #[cfg(windows)]
 impl Drop for ProcessTree {
     fn drop(&mut self) {
-        use process_wrap::std::ChildWrapper;
-
         // Fail closed on early returns between spawn and explicit cleanup.
         let _ = self.child.start_kill();
     }
@@ -234,6 +232,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "subprocess helper for windows_job_remains_usable_after_tree_leader_exits"]
+    #[allow(clippy::zombie_processes)]
     fn windows_process_tree_root_helper() {
         use std::process::Command;
         use std::time::{Duration, Instant};
@@ -246,6 +245,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(release.exists(), "parent did not release root helper");
+        // Deliberately leave the leaf running when this root exits: the parent
+        // test proves the retained Job Object can still terminate that leaf.
         Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
