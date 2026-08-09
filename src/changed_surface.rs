@@ -416,13 +416,19 @@ fn secondary_contract_digests(
                 .iter()
                 .find(|target| target.name == name)
                 .ok_or_else(|| format!("required secondary target {name:?} did not resolve"))?;
-            if !matches!(
-                target.validation,
-                crate::executor::dispatch::ResolvedValidation::Local(_)
-            ) {
-                return Err(format!(
-                    "required secondary target {name:?} must use a concrete local validation contract"
-                ));
+            match &target.validation {
+                crate::executor::dispatch::ResolvedValidation::Local(validation)
+                    if !validation.prepared_state_enabled => {}
+                crate::executor::dispatch::ResolvedValidation::Local(_) => {
+                    return Err(format!(
+                        "required secondary target {name:?} must disable prepared-state reuse"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "required secondary target {name:?} must use a concrete local validation contract"
+                    ));
+                }
             }
             let digest =
                 crate::queue_request::validation_contract_digest(target).ok_or_else(|| {
@@ -1602,5 +1608,11 @@ mod tests {
             "[targets.release-sdk]\n            backend = \"cloud\"\n            workflow = \"release.yml\"\n            platform",
         );
         assert!(policy_from_toml(&cloud, "debug").is_err());
+
+        let prepared = required.replace(
+            "[project]\n            profile = \"mac-only\"",
+            "[project]\n            profile = \"mac-only\"\n\n            [validation.prepared_state]\n            enabled = true",
+        );
+        assert!(policy_from_toml(&prepared, "debug").is_err());
     }
 }

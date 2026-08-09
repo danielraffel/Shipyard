@@ -95,6 +95,8 @@ checkout whose pre-execution HEAD and tree exactly match the authenticated PR
 head and tree. Secondary targets must currently use a concrete local validation
 contract; remote, cloud, host-pool, and fallback targets are rejected because
 this phase does not yet capture their pre-execution source-tree provenance.
+Prepared-state reuse must be disabled so a fresh completion timestamp always
+represents a concrete validation execution.
 
 ## Planning an exact PR head
 
