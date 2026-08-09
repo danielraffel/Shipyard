@@ -15,6 +15,7 @@ mod auth_cmd;
 mod auto_merge_cmd;
 mod branch_cmd;
 mod capacity_cmd;
+mod changed_surface_cmd;
 mod changelog_cmd;
 mod ci_cmd;
 mod cleanup_cmd;
@@ -55,6 +56,7 @@ mod watch_local_cmd;
 use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
 use self::branch_cmd::branch_command;
+use self::changed_surface_cmd::{ChangedSurfacePlanArgs, changed_surface_plan_command};
 use self::changelog_cmd::changelog_command;
 use self::ci_cmd::ci_command;
 use self::cleanup_cmd::{
@@ -301,6 +303,22 @@ fn dispatch<W: Write, E: Write>(
                 stdout,
             );
         }
+        Command::ChangedSurfacePlan { target, pr, repo } => {
+            let config = LoadedConfig::load_from_cwd_with_global_dir(
+                cli.mode.into(),
+                &cwd,
+                runtime_paths.global_dir.clone(),
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            return changed_surface_plan_command(
+                ChangedSurfacePlanArgs { target, pr, repo },
+                &config,
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
+        }
         Command::Wait { command } => {
             return handle_wait_command(
                 command,
@@ -385,6 +403,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Bump { .. }
         | Command::Queue
         | Command::QueueObserve { .. }
+        | Command::ChangedSurfacePlan { .. }
         | Command::Cleanup { .. }
         | Command::Targets { .. }
         | Command::Quarantine { .. }

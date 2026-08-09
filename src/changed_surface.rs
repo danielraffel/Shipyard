@@ -62,8 +62,8 @@ pub struct ExactHeadInput {
     pub pr_base_sha: String,
     /// Current SHA resolved from the protected base ref.
     pub protected_ref_sha: String,
-    /// Whether GitHub reports the base ref as protected.
-    pub base_ref_protected: bool,
+    /// Protection/resolution status from GitHub's branch API.
+    pub protected_ref_status: ProtectedRefStatus,
     /// Head SHA reported by the pull request.
     pub pr_head_sha: String,
     /// Head tree SHA reported by GitHub's commit API.
@@ -82,8 +82,32 @@ pub struct ExactHeadInput {
     pub checkout_clean: bool,
     /// Paths returned by the authenticated PR-files API.
     pub remote_changed_paths: Vec<String>,
+    /// Completeness of the authenticated PR-files query.
+    pub remote_changed_paths_status: ObservationStatus,
     /// Paths computed locally for `merge-base..HEAD`.
     pub local_changed_paths: Vec<String>,
+    /// Completeness of local changed-path computation.
+    pub local_changed_paths_status: ObservationStatus,
+}
+
+/// Authenticated protected-ref query state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtectedRefStatus {
+    /// GitHub resolved the base branch and reports it protected.
+    Protected,
+    /// GitHub resolved the base branch and reports it unprotected.
+    Unprotected,
+    /// The protected-ref query was unavailable or malformed.
+    Unresolved,
+}
+
+/// Whether an observed input is complete enough for selector policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationStatus {
+    /// The observation completed without truncation.
+    Complete,
+    /// The observation failed or was truncated.
+    Incomplete,
 }
 
 /// A hard identity failure. No successful or reusable receipt may be emitted.
@@ -137,6 +161,8 @@ impl std::error::Error for IdentityError {}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackReason {
+    /// The protected-ref query was missing or malformed.
+    BaseRefUnresolved,
     /// GitHub did not report the PR base as a protected ref.
     BaseRefNotProtected,
     /// The protected ref advanced away from the PR base used for provenance.
@@ -262,62 +288,30 @@ pub fn plan_selection(
 ) -> Result<SelectionReceipt, IdentityError> {
     validate_identity(input)?;
     let changed_paths = normalized_paths(&input.remote_changed_paths);
-    let mut receipt = base_receipt(input, changed_paths.clone());
+    let receipt = base_receipt(input, changed_paths.clone());
+    if let Some(reason) = provenance_fallback(input, &changed_paths) {
+        return Ok(fallback(receipt, None, reason, None));
+    }
+    plan_with_policy(receipt, policy, &changed_paths)
+}
 
-    if !input.base_ref_protected {
-        return Ok(fallback(
-            receipt,
-            None,
-            FallbackReason::BaseRefNotProtected,
-            None,
-        ));
-    }
-    if input.pr_base_sha != input.protected_ref_sha {
-        return Ok(fallback(receipt, None, FallbackReason::StaleBase, None));
-    }
-    if input.pr_base_sha == input.pr_head_sha {
-        return Ok(fallback(
-            receipt,
-            None,
-            FallbackReason::BaseEqualsHead,
-            None,
-        ));
-    }
-    if !input.merge_base_is_ancestor {
-        return Ok(fallback(
-            receipt,
-            None,
-            FallbackReason::AncestryMismatch,
-            None,
-        ));
-    }
-    if input.local_merge_base_sha != input.remote_merge_base_sha {
-        return Ok(fallback(
-            receipt,
-            None,
-            FallbackReason::MergeBaseMismatch,
-            None,
-        ));
-    }
-    if input.local_merge_base_sha != input.pr_base_sha {
-        return Ok(fallback(
-            receipt,
-            None,
-            FallbackReason::BasePolicyMismatch,
-            None,
-        ));
-    }
-    if changed_paths != normalized_paths(&input.local_changed_paths) {
-        return Ok(fallback(
-            receipt,
-            None,
-            FallbackReason::ChangedPathsMismatch,
-            None,
-        ));
-    }
-
+fn plan_with_policy(
+    mut receipt: SelectionReceipt,
+    policy: Result<ChangedSurfacePolicy, String>,
+    changed_paths: &[String],
+) -> Result<SelectionReceipt, IdentityError> {
     let policy = match policy {
-        Ok(policy) => policy,
+        Ok(policy) => {
+            if let Err(detail) = validate_policy(&policy) {
+                return Ok(fallback(
+                    receipt,
+                    None,
+                    FallbackReason::InvalidPolicy,
+                    Some(detail),
+                ));
+            }
+            policy
+        }
         Err(detail) => {
             return Ok(fallback(
                 receipt,
@@ -334,7 +328,7 @@ pub fn plan_selection(
     let policy_patterns = std::iter::once(".shipyard/config.toml".to_owned())
         .chain(policy.policy_paths.iter().cloned())
         .collect::<Vec<_>>();
-    if paths_match_any(&changed_paths, &policy_patterns)? {
+    if paths_match_any(changed_paths, &policy_patterns)? {
         return Ok(fallback(
             receipt,
             Some(&policy),
@@ -342,7 +336,7 @@ pub fn plan_selection(
             None,
         ));
     }
-    if paths_match_any(&changed_paths, &policy.test_topology_paths)? {
+    if paths_match_any(changed_paths, &policy.test_topology_paths)? {
         return Ok(fallback(
             receipt,
             Some(&policy),
@@ -360,7 +354,7 @@ pub fn plan_selection(
     let mut family_coverage = BTreeMap::new();
     let mut mapped_paths = BTreeSet::new();
     for family in &policy.families {
-        let affected = matching_paths(&changed_paths, &family.paths)?;
+        let affected = matching_paths(changed_paths, &family.paths)?;
         if affected.is_empty() {
             continue;
         }
@@ -370,7 +364,7 @@ pub fn plan_selection(
         family_coverage.insert(family.name.clone(), tests.len());
         selected_tests.extend(tests);
     }
-    let baseline_only = matching_paths(&changed_paths, &policy.baseline_only_paths)?;
+    let baseline_only = matching_paths(changed_paths, &policy.baseline_only_paths)?;
     mapped_paths.extend(baseline_only);
     let unmapped = changed_paths
         .iter()
@@ -392,6 +386,42 @@ pub fn plan_selection(
     receipt.selected_count = Some(receipt.selected_tests.len());
     receipt.planned_suite = PlannedSuite::Bounded;
     Ok(receipt)
+}
+
+fn provenance_fallback(input: &ExactHeadInput, changed_paths: &[String]) -> Option<FallbackReason> {
+    if input.protected_ref_status == ProtectedRefStatus::Unresolved
+        || !valid_sha(&input.protected_ref_sha)
+    {
+        return Some(FallbackReason::BaseRefUnresolved);
+    }
+    if input.protected_ref_status == ProtectedRefStatus::Unprotected {
+        return Some(FallbackReason::BaseRefNotProtected);
+    }
+    if input.pr_base_sha != input.protected_ref_sha {
+        return Some(FallbackReason::StaleBase);
+    }
+    if input.pr_base_sha == input.pr_head_sha {
+        return Some(FallbackReason::BaseEqualsHead);
+    }
+    if !input.merge_base_is_ancestor {
+        return Some(FallbackReason::AncestryMismatch);
+    }
+    if !valid_sha(&input.local_merge_base_sha)
+        || !valid_sha(&input.remote_merge_base_sha)
+        || input.local_merge_base_sha != input.remote_merge_base_sha
+    {
+        return Some(FallbackReason::MergeBaseMismatch);
+    }
+    if input.local_merge_base_sha != input.pr_base_sha {
+        return Some(FallbackReason::BasePolicyMismatch);
+    }
+    if input.remote_changed_paths_status == ObservationStatus::Incomplete
+        || input.local_changed_paths_status == ObservationStatus::Incomplete
+    {
+        return Some(FallbackReason::AmbiguousDiff);
+    }
+    (changed_paths != normalized_paths(&input.local_changed_paths))
+        .then_some(FallbackReason::ChangedPathsMismatch)
 }
 
 /// Reject a receipt whose exact identity no longer matches the validation input.
@@ -460,13 +490,10 @@ fn validate_identity(input: &ExactHeadInput) -> Result<(), IdentityError> {
     }
     for (name, sha) in [
         ("PR base", &input.pr_base_sha),
-        ("protected ref", &input.protected_ref_sha),
         ("PR head", &input.pr_head_sha),
         ("remote tree", &input.remote_tree_sha),
         ("local HEAD", &input.local_head_sha),
         ("local tree", &input.local_tree_sha),
-        ("local merge base", &input.local_merge_base_sha),
-        ("remote merge base", &input.remote_merge_base_sha),
     ] {
         if !valid_sha(sha) {
             return Err(IdentityError::Unresolved(format!(
@@ -732,7 +759,7 @@ mod tests {
             base_ref: "main".to_owned(),
             pr_base_sha: A.to_owned(),
             protected_ref_sha: A.to_owned(),
-            base_ref_protected: true,
+            protected_ref_status: ProtectedRefStatus::Protected,
             pr_head_sha: B.to_owned(),
             remote_tree_sha: C.to_owned(),
             local_head_sha: B.to_owned(),
@@ -742,7 +769,9 @@ mod tests {
             merge_base_is_ancestor: true,
             checkout_clean: true,
             remote_changed_paths: paths.iter().map(ToString::to_string).collect(),
+            remote_changed_paths_status: ObservationStatus::Complete,
             local_changed_paths: paths.iter().map(ToString::to_string).collect(),
+            local_changed_paths_status: ObservationStatus::Complete,
         }
     }
 
@@ -807,7 +836,7 @@ mod tests {
         for (case, reason) in cases {
             let mut value = input(&["src/audio/a.rs"]);
             match case {
-                "unprotected" => value.base_ref_protected = false,
+                "unprotected" => value.protected_ref_status = ProtectedRefStatus::Unprotected,
                 "stale" => value.protected_ref_sha = C.to_owned(),
                 "equal" => value.pr_head_sha = A.to_owned(),
                 "ancestry" => value.merge_base_is_ancestor = false,
@@ -865,6 +894,12 @@ mod tests {
         let mut invalid = policy();
         invalid.families[0].tests.clear();
         assert!(validate_policy(&invalid).is_err());
+        let malformed = plan_selection(&input(&["src/audio/a.rs"]), Ok(invalid))
+            .expect("invalid policy falls back");
+        assert_eq!(
+            malformed.fallback_reason,
+            Some(FallbackReason::InvalidPolicy)
+        );
         let encoded = toml::to_string(&toml::toml! {
             [targets.mac.changed_surface_selection]
             schema_version = 1
@@ -899,5 +934,22 @@ mod tests {
         let mut bypass = policy();
         bypass.baseline_only_paths = vec!["**".to_owned()];
         assert!(validate_policy(&bypass).is_err());
+    }
+
+    #[test]
+    fn incomplete_diff_and_unresolved_protected_ref_fall_back() {
+        let mut incomplete = input(&["src/audio/a.rs"]);
+        incomplete.remote_changed_paths_status = ObservationStatus::Incomplete;
+        let receipt = plan_selection(&incomplete, Ok(policy())).expect("fallback");
+        assert_eq!(receipt.fallback_reason, Some(FallbackReason::AmbiguousDiff));
+
+        let mut unresolved = input(&["src/audio/a.rs"]);
+        unresolved.protected_ref_sha.clear();
+        unresolved.protected_ref_status = ProtectedRefStatus::Unresolved;
+        let receipt = plan_selection(&unresolved, Ok(policy())).expect("fallback");
+        assert_eq!(
+            receipt.fallback_reason,
+            Some(FallbackReason::BaseRefUnresolved)
+        );
     }
 }
