@@ -943,7 +943,8 @@ do not qualify. The evidence must bind a clean pre-execution checkout at the
 authenticated head and tree. Required secondary targets must currently be
 concrete local validation contracts, not remote, cloud, or composite wrappers.
 Prepared-state reuse must be disabled on the secondary target. Never substitute
-full Debug for a Release-only installed-SDK
+resumed or warm-reused stage execution for the full required contract. Never
+substitute full Debug for a Release-only installed-SDK
 family or treat historical Release evidence as sufficient. See
 [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 

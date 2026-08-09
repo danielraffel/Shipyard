@@ -285,12 +285,14 @@ fn collect_secondary_proofs(
                         && evidence.contract_digest.as_ref() == Some(expected_contract)
                         && evidence.source_head_sha.as_deref() == Some(head_sha)
                         && evidence.source_tree_sha.as_deref() == Some(tree_sha)
-                        && evidence.source_checkout_clean == Some(true))
+                        && evidence.source_checkout_clean == Some(true)
+                        && evidence.full_execution == Some(true))
                     .then_some(SecondaryProof {
                         target: target.clone(),
                         build_type,
                         head_sha: evidence.sha,
                         tree_sha: evidence.source_tree_sha.expect("matched tree identity"),
+                        full_execution: true,
                         passed,
                         reused,
                         completed_at: evidence.completed_at,
@@ -589,6 +591,7 @@ mod tests {
             source_head_sha: Some(head.clone()),
             source_tree_sha: Some(tree.clone()),
             source_checkout_clean: Some(true),
+            full_execution: Some(true),
             completed_at: Utc::now(),
             duration_secs: None,
             host: None,
@@ -608,6 +611,10 @@ mod tests {
         );
 
         evidence.source_checkout_clean = Some(false);
+        store.record(&evidence).expect("replace record");
+        assert!(collect_secondary_proofs(Some(&policy), temp.path(), &head, &tree).is_empty());
+        evidence.source_checkout_clean = Some(true);
+        evidence.full_execution = Some(false);
         store.record(&evidence).expect("replace record");
         assert!(collect_secondary_proofs(Some(&policy), temp.path(), &head, &tree).is_empty());
         policy.secondary_contract_digests.clear();

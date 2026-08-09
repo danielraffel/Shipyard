@@ -239,6 +239,8 @@ impl LocalExecutor {
         let started_at = Utc::now();
         let start_time = Instant::now();
         let progress_callback = request.progress_callback.take();
+        let full_execution =
+            request.resume_from.is_none() && !request.validation.prepared_state_enabled;
         let plan = plan_validation(
             request.validation.command.as_deref(),
             &request.validation.stages,
@@ -285,6 +287,7 @@ impl LocalExecutor {
             result.source_tree_sha = Some(tree);
             result.source_checkout_clean = Some(clean);
         }
+        result.full_execution = Some(full_execution);
         result
     }
 
@@ -931,6 +934,26 @@ mod tests {
         request.branch = "test-branch".to_owned();
         request.target = target();
         request
+    }
+
+    #[test]
+    fn full_execution_marker_rejects_any_resume_request() {
+        let repo = tempfile::tempdir().expect("repo");
+        init_git_repo(repo.path());
+        let validation = LocalValidationConfig {
+            command: Some("true".to_owned()),
+            ..LocalValidationConfig::default()
+        };
+        let mut full = request(repo.path().join("full.log"), validation.clone());
+        full.target.cwd = Some(repo.path().to_path_buf());
+        let full = LocalExecutor::default().validate(full);
+        assert_eq!(full.full_execution, Some(true));
+
+        let mut resumed = request(repo.path().join("resumed.log"), validation);
+        resumed.target.cwd = Some(repo.path().to_path_buf());
+        resumed.resume_from = Some("test".to_owned());
+        let resumed = LocalExecutor::default().validate(resumed);
+        assert_eq!(resumed.full_execution, Some(false));
     }
 
     fn contract(markers: &[&str]) -> ContractConfig {

@@ -145,6 +145,8 @@ pub struct SecondaryProof {
     pub head_sha: String,
     /// Exact git tree observed by the target before execution.
     pub tree_sha: String,
+    /// Whether the concrete target ran without stage resume or reuse.
+    pub full_execution: bool,
     /// Evidence status.
     pub passed: bool,
     /// Reused ancestor evidence is never accepted for a required secondary leg.
@@ -277,6 +279,8 @@ pub struct SecondaryProofReceipt {
     pub head_sha: String,
     /// Exact git tree observed by the target before execution.
     pub tree_sha: String,
+    /// Whether the concrete target ran without stage resume or reuse.
+    pub full_execution: bool,
     /// Completion time of the accepted fresh execution.
     pub completed_at: DateTime<Utc>,
     /// Contract digest recorded by the execution, when present.
@@ -667,6 +671,7 @@ fn select_policy_families(
                     build_type: proof.build_type,
                     head_sha: proof.head_sha.clone(),
                     tree_sha: proof.tree_sha.clone(),
+                    full_execution: proof.full_execution,
                     completed_at: proof.completed_at,
                     contract_digest: proof.contract_digest.clone(),
                     families: Vec::new(),
@@ -714,6 +719,7 @@ fn required_secondary_proof<'a>(
         proof.target == target
             && proof.head_sha == input.pr_head_sha
             && proof.tree_sha == input.remote_tree_sha
+            && proof.full_execution
             && proof.build_type == build_type
             && proof.passed
             && !proof.reused
@@ -890,6 +896,7 @@ pub fn verify_receipt_identity(
                 && proof.build_type == required.build_type
                 && proof.head_sha == required.head_sha
                 && proof.tree_sha == required.tree_sha
+                && proof.full_execution == required.full_execution
                 && proof.passed
                 && !proof.reused
                 && proof.completed_at == required.completed_at
@@ -1526,6 +1533,7 @@ mod tests {
             build_type: BuildType::Release,
             head_sha: B.to_owned(),
             tree_sha: C.to_owned(),
+            full_execution: true,
             passed: true,
             reused: false,
             completed_at: debug.observed_at,

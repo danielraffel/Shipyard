@@ -2091,6 +2091,7 @@ fn evidence_record(
         source_head_sha: result.source_head_sha.clone(),
         source_tree_sha: result.source_tree_sha.clone(),
         source_checkout_clean: result.source_checkout_clean,
+        full_execution: result.full_execution,
         completed_at: result.completed_at.unwrap_or_else(Utc::now),
         duration_secs: result.duration_secs,
         host: target.and_then(|target| target.host.clone()),

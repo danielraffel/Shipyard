@@ -77,8 +77,8 @@ qualify. The evidence must bind a clean pre-execution checkout at the
 authenticated head and tree. Use a concrete local secondary target; remote,
 cloud, host-pool, and fallback targets are rejected until their source-tree
 provenance is captured, and prepared-state reuse must be disabled. Without a
-fresh concrete execution the plan is policy-blocked, not redirected into a
-known-incompatible full Debug run.
+fresh, non-resumed execution of the full contract the plan is policy-blocked,
+not redirected into a known-incompatible full Debug run.
 See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard

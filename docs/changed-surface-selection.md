@@ -96,7 +96,9 @@ head and tree. Secondary targets must currently use a concrete local validation
 contract; remote, cloud, host-pool, and fallback targets are rejected because
 this phase does not yet capture their pre-execution source-tree provenance.
 Prepared-state reuse must be disabled so a fresh completion timestamp always
-represents a concrete validation execution.
+represents a concrete validation execution. Evidence from an explicit or
+warm-pool stage resume is also rejected; the required target must run its full
+declared validation contract.
 
 ## Planning an exact PR head
 

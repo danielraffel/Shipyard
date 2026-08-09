@@ -35,6 +35,9 @@ pub struct EvidenceRecord {
     /// Whether the execution checkout was clean before validation began.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_checkout_clean: Option<bool>,
+    /// Whether validation began without resume or prepared-state stage reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_execution: Option<bool>,
     /// Completion timestamp.
     pub completed_at: DateTime<Utc>,
     /// Optional duration in seconds.
@@ -503,6 +506,7 @@ mod tests {
             source_head_sha: None,
             source_tree_sha: None,
             source_checkout_clean: None,
+            full_execution: None,
             completed_at: Utc::now(),
             duration_secs: None,
             host: None,
@@ -530,6 +534,7 @@ mod tests {
             source_head_sha: Some("new".to_owned()),
             source_tree_sha: Some("tree".to_owned()),
             source_checkout_clean: Some(true),
+            full_execution: Some(true),
             completed_at: Utc::now(),
             duration_secs: None,
             host: None,

@@ -801,6 +801,7 @@ mod tests {
                 source_head_sha: None,
                 source_tree_sha: None,
                 source_checkout_clean: None,
+                full_execution: None,
                 completed_at: Utc::now(),
                 duration_secs: None,
                 host: None,
