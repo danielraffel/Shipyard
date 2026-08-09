@@ -6,7 +6,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 <a id="v0840"></a>
 ## [0.84.0] - 2026-08-08
 
-- feat: add durable read-only GitHub queue observation with explicit-repository credential scoping ([#397](https://github.com/danielraffel/Shipyard/pull/397))
+- fix: scope observer auth to explicit repo ([#397](https://github.com/danielraffel/Shipyard/pull/397))
 
 <a id="v0830"></a>
 ## [0.83.0] - 2026-08-03
