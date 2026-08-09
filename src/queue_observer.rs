@@ -331,8 +331,9 @@ pub fn append_transition(path: &Path, transition: &Transition) -> Result<(), Str
     // the same underlying file instead of acquiring unrelated sidecar locks.
     let mut file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
-        .append(true)
+        .write(true)
         .open(path)
         .map_err(|error| format!("open transition log {}: {error}", path.display()))?;
     FileExt::lock_exclusive(&file)
@@ -341,7 +342,11 @@ pub fn append_transition(path: &Path, transition: &Transition) -> Result<(), Str
         .map_err(|error| format!("encode transition log: {error}"))?;
     payload.push(b'\n');
     repair_incomplete_transition_tail(path, &mut file)?;
-    file.write_all(&payload)
+    // The exclusive file lock serializes all collector writers, including
+    // hard-link aliases, so a final seek preserves append semantics while
+    // retaining the write access Windows requires for tail repair.
+    file.seek(SeekFrom::End(0))
+        .and_then(|_| file.write_all(&payload))
         .map_err(|error| format!("append transition log: {error}"))?;
     file.sync_data()
         .map_err(|error| format!("sync transition log: {error}"))?;
