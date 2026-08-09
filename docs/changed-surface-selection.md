@@ -13,6 +13,11 @@ sha>:.shipyard/config.toml`; the head checkout and machine-local overlays cannot
 change policy for their own validation.
 
 ```toml
+[targets.mac]
+backend = "local"
+platform = "macos-arm64"
+validation_build_type = "debug"
+
 [targets.mac.changed_surface_selection]
 schema_version = 1
 full_test_count = 20091
@@ -63,6 +68,10 @@ required_secondary_build_type = "release"
 backend = "local"
 platform = "macos-arm64"
 advisory = false
+validation_build_type = "release"
+
+[targets.release-installed-sdk.validation]
+command = "cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release && ctest --test-dir build-release --output-on-failure"
 ```
 
 `tests` are literal reviewed test identities, not regexes. Every family must
@@ -77,8 +86,11 @@ target's `build_type` must name a different, non-advisory secondary target and
 its supported build type. For example, a Release-only installed-SDK test is
 never selected in a Debug bound. The plan remains blocked until Shipyard's
 evidence store contains a passing, non-reused record from the required Release
-target for the same exact head. Historical, ancestor-reused, advisory, or
-wrong-head evidence does not satisfy the requirement.
+target for the same exact head. The execution record must itself carry the
+matching `validation_build_type`, must be no more than 24 hours old, and its
+completion time and contract digest are bound into the receipt. Historical,
+ancestor-reused, direct- or profile-advisory, wrong-build, or wrong-head evidence
+does not satisfy the requirement.
 
 ## Planning an exact PR head
 

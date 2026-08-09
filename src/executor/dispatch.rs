@@ -44,6 +44,8 @@ const STAGE_ORDER: [&str; 4] = ["setup", "configure", "build", "test"];
 pub struct ResolvedTarget {
     /// Logical target name.
     pub name: String,
+    /// Typed build configuration whose execution this target evidences.
+    pub validation_build_type: Option<String>,
     /// Platform label.
     pub platform: String,
     /// Normalized backend label.
@@ -821,6 +823,7 @@ fn resolved_local(
     };
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: "local".to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -855,6 +858,7 @@ fn resolved_ssh(
     };
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: backend_name.to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -899,6 +903,7 @@ fn resolved_windows(
     };
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: backend_name.to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -950,6 +955,7 @@ fn resolved_cloud(
 
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: "cloud".to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -990,6 +996,7 @@ fn resolved_host_pool(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: "host-pool".to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -1115,6 +1122,7 @@ fn resolved_fallback(
         .as_ref();
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: primary_target.backend_name.clone(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -2451,6 +2459,31 @@ mod tests {
 
         assert_eq!(implicit.workdir().as_deref(), Some("/submitted"));
         assert_eq!(explicit.workdir().as_deref(), Some("/configured"));
+    }
+
+    #[test]
+    fn resolved_target_carries_declared_validation_build_type() {
+        let mut target = resolve_targets_from_table(
+            &table(
+                r#"
+                [targets.release]
+                backend = "local"
+                platform = "macos-arm64"
+                validation_build_type = "release"
+                "#,
+            ),
+            ValidationMode::Full,
+        )
+        .expect("target")
+        .remove(0);
+
+        assert_eq!(target.validation_build_type.as_deref(), Some("release"));
+        let release_digest = crate::queue_request::validation_contract_digest(&target)
+            .expect("typed validation digest");
+        target.validation_build_type = Some("debug".to_owned());
+        let debug_digest = crate::queue_request::validation_contract_digest(&target)
+            .expect("typed validation digest");
+        assert_ne!(release_digest, debug_digest);
     }
 
     fn resolved_local_target(name: &str) -> super::ResolvedTarget {

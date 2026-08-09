@@ -7,12 +7,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Changed-surface declaration schema understood by this Shipyard release.
 pub const CHANGED_SURFACE_SCHEMA_VERSION: u32 = 1;
+/// Maximum age accepted for a required secondary execution proof.
+pub const SECONDARY_PROOF_MAX_AGE_HOURS: i64 = 24;
 
 /// A complete reviewed test family and the changed paths that affect it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -75,6 +78,9 @@ pub struct ChangedSurfacePolicy {
     pub test_topology_paths: Vec<String>,
     /// Complete reviewed family declarations.
     pub families: Vec<TestFamily>,
+    /// Expected target-validation digests computed from the authenticated base.
+    #[serde(skip)]
+    pub secondary_contract_digests: BTreeMap<String, String>,
 }
 
 /// Authenticated GitHub provenance plus independently observed local git facts.
@@ -84,6 +90,10 @@ pub struct ExactHeadInput {
     pub repository: String,
     /// Pull request number.
     pub pull_request: u64,
+    /// Exact target whose base-owned policy produced the plan.
+    pub target: String,
+    /// Time at which this planning observation began.
+    pub observed_at: DateTime<Utc>,
     /// Base ref reported by the pull request.
     pub base_ref: String,
     /// Base SHA reported by the pull request.
@@ -137,6 +147,10 @@ pub struct SecondaryProof {
     pub passed: bool,
     /// Reused ancestor evidence is never accepted for a required secondary leg.
     pub reused: bool,
+    /// Completion time of the concrete target execution.
+    pub completed_at: DateTime<Utc>,
+    /// Contract digest recorded by the concrete target execution, when present.
+    pub contract_digest: Option<String>,
 }
 
 /// Authenticated protected-ref query state.
@@ -259,6 +273,11 @@ pub struct SecondaryProofReceipt {
     pub build_type: BuildType,
     /// Exact head proven by the target.
     pub head_sha: String,
+    /// Completion time of the accepted fresh execution.
+    pub completed_at: DateTime<Utc>,
+    /// Contract digest recorded by the execution, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_digest: Option<String>,
     /// Families covered by this proof.
     pub families: Vec<String>,
     /// Complete literal tests covered by this proof.
@@ -287,6 +306,8 @@ pub struct SelectionReceipt {
     pub repository: String,
     /// Pull request identity.
     pub pull_request: u64,
+    /// Exact target whose base-owned policy produced this receipt.
+    pub target: String,
     /// Authenticated protected target ref.
     pub protected_ref: String,
     /// Base SHA reported by PR metadata.
@@ -358,12 +379,46 @@ pub fn policy_from_toml(contents: &str, target: &str) -> Result<ChangedSurfacePo
                 "authenticated base has no [targets.{target}.changed_surface_selection] declaration"
             )
         })?;
-    let policy: ChangedSurfacePolicy = value
+    let mut policy: ChangedSurfacePolicy = value
         .try_into()
         .map_err(|error| format!("invalid selector declaration: {error}"))?;
     validate_policy(&policy)?;
     validate_secondary_targets(&root, target, &policy)?;
+    policy.secondary_contract_digests = secondary_contract_digests(&root, &policy)?;
     Ok(policy)
+}
+
+fn secondary_contract_digests(
+    root: &toml::Table,
+    policy: &ChangedSurfacePolicy,
+) -> Result<BTreeMap<String, String>, String> {
+    let required = policy
+        .families
+        .iter()
+        .filter_map(|family| family.required_secondary_target.as_deref())
+        .collect::<BTreeSet<_>>();
+    if required.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let resolved = crate::executor::dispatch::resolve_targets_from_table(
+        root,
+        crate::job::ValidationMode::Full,
+    )
+    .map_err(|error| format!("resolve authenticated-base target contracts: {error}"))?;
+    required
+        .into_iter()
+        .map(|name| {
+            let target = resolved
+                .iter()
+                .find(|target| target.name == name)
+                .ok_or_else(|| format!("required secondary target {name:?} did not resolve"))?;
+            let digest =
+                crate::queue_request::validation_contract_digest(target).ok_or_else(|| {
+                    format!("required secondary target {name:?} has no typed validation contract")
+                })?;
+            Ok((name.to_owned(), digest))
+        })
+        .collect()
 }
 
 fn validate_secondary_targets(
@@ -394,18 +449,56 @@ fn validate_secondary_targets(
                     family.name
                 )
             })?;
-        if table
-            .get("advisory")
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(false)
-        {
+        if crate::lane_policy::resolve_lane_policy_from_table(root, None).is_advisory(required) {
             return Err(format!(
                 "family {} required secondary target {required:?} must not be advisory",
                 family.name
             ));
         }
+        let declared_build_type = table
+            .get("validation_build_type")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "family {} required secondary target {required:?} has no validation_build_type",
+                    family.name
+                )
+            })?;
+        let required_build_type = family.required_secondary_build_type.ok_or_else(|| {
+            format!(
+                "family {} has no typed secondary build requirement",
+                family.name
+            )
+        })?;
+        if declared_build_type != build_type_name(required_build_type) {
+            return Err(format!(
+                "family {} required secondary target {required:?} declares validation_build_type {declared_build_type:?}, expected {:?}",
+                family.name, required_build_type
+            ));
+        }
+    }
+    let current_build_type = targets
+        .get(current_target)
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("validation_build_type"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| format!("target {current_target:?} has no validation_build_type"))?;
+    if current_build_type != build_type_name(policy.build_type) {
+        return Err(format!(
+            "target {current_target:?} declares validation_build_type {current_build_type:?}, expected {:?}",
+            policy.build_type
+        ));
     }
     Ok(())
+}
+
+fn build_type_name(build_type: BuildType) -> &'static str {
+    match build_type {
+        BuildType::Debug => "debug",
+        BuildType::Release => "release",
+        BuildType::RelWithDebInfo => "rel_with_deb_info",
+        BuildType::MinSizeRel => "min_size_rel",
+    }
 }
 
 /// Validate an exact-head input and compute a shadow-only selection receipt.
@@ -532,13 +625,9 @@ fn select_policy_families(
                     ),
                 ));
             };
-            let Some(proof) = input.secondary_proofs.iter().find(|proof| {
-                proof.target == *required_target
-                    && proof.head_sha == input.pr_head_sha
-                    && proof.build_type == required_build_type
-                    && proof.passed
-                    && !proof.reused
-            }) else {
+            let Some(proof) =
+                required_secondary_proof(input, policy, required_target, required_build_type)
+            else {
                 return Ok(blocked(
                     receipt,
                     policy,
@@ -559,6 +648,8 @@ fn select_policy_families(
                     target: required_target.clone(),
                     build_type: proof.build_type,
                     head_sha: proof.head_sha.clone(),
+                    completed_at: proof.completed_at,
+                    contract_digest: proof.contract_digest.clone(),
                     families: Vec::new(),
                     tests: Vec::new(),
                 });
@@ -591,6 +682,26 @@ fn select_policy_families(
         family_coverage,
         secondary,
     ))
+}
+
+fn required_secondary_proof<'a>(
+    input: &'a ExactHeadInput,
+    policy: &ChangedSurfacePolicy,
+    target: &str,
+    build_type: BuildType,
+) -> Option<&'a SecondaryProof> {
+    let expected_contract = policy.secondary_contract_digests.get(target)?;
+    input.secondary_proofs.iter().find(|proof| {
+        proof.target == target
+            && proof.head_sha == input.pr_head_sha
+            && proof.build_type == build_type
+            && proof.passed
+            && !proof.reused
+            && proof.contract_digest.as_ref() == Some(expected_contract)
+            && proof.completed_at <= input.observed_at
+            && proof.completed_at
+                >= input.observed_at - chrono::Duration::hours(SECONDARY_PROOF_MAX_AGE_HOURS)
+    })
 }
 
 fn finalize_bounded_receipt(
@@ -700,6 +811,7 @@ pub fn verify_receipt_identity(
             receipt.repository.as_str(),
             input.repository.as_str(),
         ),
+        ("target", receipt.target.as_str(), input.target.as_str()),
         (
             "base_ref",
             receipt.protected_ref.as_str(),
@@ -759,6 +871,11 @@ pub fn verify_receipt_identity(
                 && proof.head_sha == required.head_sha
                 && proof.passed
                 && !proof.reused
+                && proof.completed_at == required.completed_at
+                && proof.contract_digest == required.contract_digest
+                && proof.completed_at <= input.observed_at
+                && proof.completed_at
+                    >= input.observed_at - chrono::Duration::hours(SECONDARY_PROOF_MAX_AGE_HOURS)
         })
     }) {
         return Err(IdentityError::Unresolved(
@@ -769,7 +886,10 @@ pub fn verify_receipt_identity(
 }
 
 fn validate_identity(input: &ExactHeadInput) -> Result<(), IdentityError> {
-    if input.pull_request == 0 || !valid_repo(&input.repository) || input.base_ref.trim().is_empty()
+    if input.pull_request == 0
+        || !valid_repo(&input.repository)
+        || input.target.is_empty()
+        || input.base_ref.trim().is_empty()
     {
         return Err(IdentityError::Unresolved(
             "repository, PR number, or base ref is missing".to_owned(),
@@ -921,6 +1041,7 @@ fn base_receipt(input: &ExactHeadInput, changed_paths: Vec<String>) -> Selection
         shadow_only: true,
         repository: input.repository.clone(),
         pull_request: input.pull_request,
+        target: input.target.clone(),
         protected_ref: input.base_ref.clone(),
         pr_base_sha: input.pr_base_sha.clone(),
         protected_ref_sha: input.protected_ref_sha.clone(),
@@ -1083,6 +1204,7 @@ mod tests {
                     required_secondary_build_type: None,
                 },
             ],
+            secondary_contract_digests: BTreeMap::new(),
         }
     }
 
@@ -1090,6 +1212,8 @@ mod tests {
         ExactHeadInput {
             repository: "owner/repo".to_owned(),
             pull_request: 42,
+            target: "mac-debug".to_owned(),
+            observed_at: Utc::now(),
             base_ref: "main".to_owned(),
             pr_base_sha: A.to_owned(),
             protected_ref_sha: A.to_owned(),
@@ -1271,6 +1395,10 @@ mod tests {
         let mut changed_merge_base = input(&["src/audio/a.rs"]);
         changed_merge_base.local_merge_base_sha = C.to_owned();
         assert!(verify_receipt_identity(&receipt, &changed_merge_base).is_err());
+
+        let mut changed_target = input(&["src/audio/a.rs"]);
+        changed_target.target = "other-target".to_owned();
+        assert!(verify_receipt_identity(&receipt, &changed_target).is_err());
     }
 
     #[test]
@@ -1354,6 +1482,10 @@ mod tests {
             required_secondary_target: Some("release-installed-sdk".to_owned()),
             required_secondary_build_type: Some(BuildType::Release),
         });
+        release_policy.secondary_contract_digests.insert(
+            "release-installed-sdk".to_owned(),
+            "release-contract".to_owned(),
+        );
         let mut debug = input(&["sdk/agent-capability.cpp"]);
         debug
             .base_tracked_paths
@@ -1374,6 +1506,8 @@ mod tests {
             head_sha: B.to_owned(),
             passed: true,
             reused: false,
+            completed_at: debug.observed_at,
+            contract_digest: Some("release-contract".to_owned()),
         });
         let eligible = plan_selection(&debug, Ok(release_policy.clone())).expect("bounded plan");
         assert_eq!(eligible.planned_suite, PlannedSuite::Bounded);
@@ -1389,7 +1523,62 @@ mod tests {
         );
 
         debug.secondary_proofs[0].reused = true;
-        let reused = plan_selection(&debug, Ok(release_policy)).expect("blocked plan");
+        let reused = plan_selection(&debug, Ok(release_policy.clone())).expect("blocked plan");
         assert_eq!(reused.planned_suite, PlannedSuite::Blocked);
+
+        debug.secondary_proofs[0].reused = false;
+        debug.secondary_proofs[0].completed_at =
+            debug.observed_at - chrono::Duration::hours(SECONDARY_PROOF_MAX_AGE_HOURS + 1);
+        let stale = plan_selection(&debug, Ok(release_policy.clone())).expect("blocked plan");
+        assert_eq!(stale.planned_suite, PlannedSuite::Blocked);
+
+        debug.secondary_proofs[0].completed_at = debug.observed_at;
+        debug.secondary_proofs[0].build_type = BuildType::Debug;
+        let wrong_build = plan_selection(&debug, Ok(release_policy)).expect("blocked plan");
+        assert_eq!(wrong_build.planned_suite, PlannedSuite::Blocked);
+    }
+
+    #[test]
+    fn base_config_authenticates_secondary_build_type_and_profile_requirement() {
+        let config = r#"
+            [project]
+            profile = "mac-only"
+
+            [profiles.mac-only]
+            focus_platforms = ["macos"]
+
+            [targets.debug]
+            platform = "macos-arm64"
+            validation_build_type = "debug"
+
+            [targets.debug.changed_surface_selection]
+            schema_version = 1
+            full_test_count = 2
+            build_type = "debug"
+            baseline_tests = ["smoke"]
+            test_topology_paths = ["tests/**"]
+
+            [[targets.debug.changed_surface_selection.families]]
+            name = "sdk"
+            paths = ["sdk/**"]
+            tests = ["installed SDK"]
+            supported_build_types = ["release"]
+            required_secondary_target = "release-sdk"
+            required_secondary_build_type = "release"
+
+            [targets.release-sdk]
+            platform = "linux-x64"
+            validation_build_type = "release"
+        "#;
+        assert!(policy_from_toml(config, "debug").is_err());
+
+        let required = config.replace("platform = \"linux-x64\"", "platform = \"macos-arm64\"");
+        assert!(policy_from_toml(&required, "debug").is_ok());
+
+        let wrong_build = required.replace(
+            "[targets.release-sdk]\n            platform = \"macos-arm64\"\n            validation_build_type = \"release\"",
+            "[targets.release-sdk]\n            platform = \"macos-arm64\"\n            validation_build_type = \"debug\"",
+        );
+        assert!(policy_from_toml(&wrong_build, "debug").is_err());
     }
 }

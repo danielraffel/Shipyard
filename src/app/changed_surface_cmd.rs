@@ -7,14 +7,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
+use chrono::Utc;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::CliFailure;
 use crate::changed_surface::{
-    ChangedSurfacePolicy, ExactHeadInput, ObservationStatus, PlannedSuite, ProtectedRefStatus,
-    SecondaryProof, SelectionReceipt, plan_selection, policy_from_toml,
+    BuildType, ChangedSurfacePolicy, ExactHeadInput, ObservationStatus, PlannedSuite,
+    ProtectedRefStatus, SecondaryProof, SelectionReceipt, plan_selection, policy_from_toml,
 };
 use crate::config::LoadedConfig;
 use crate::evidence::EvidenceStore;
@@ -95,6 +96,7 @@ pub(super) fn changed_surface_plan_command<W: Write>(
         return Err(CliFailure::new(2, "--pr and --target must be nonempty"));
     }
     let started = Instant::now();
+    let observed_at = Utc::now();
     let repo = super::runner_cmd::resolve_repo_slug(args.repo, cwd)?;
     let client = GhClient::from_loaded_config(config)
         .map_err(|error| CliFailure::new(1, format!("load GitHub auth: {error}")))?
@@ -175,6 +177,8 @@ pub(super) fn changed_surface_plan_command<W: Write>(
     let input = ExactHeadInput {
         repository: repo.clone(),
         pull_request: pull.number,
+        target: args.target.clone(),
+        observed_at,
         base_ref: pull.base.name,
         pr_base_sha: pull.base.sha,
         protected_ref_sha: branch
@@ -263,16 +267,22 @@ fn collect_secondary_proofs(
         .filter_map(|(target, build_type)| {
             store
                 .query_passing_for_target(target, &[head_sha.to_owned()])
-                .map(|evidence| {
+                .and_then(|evidence| {
                     let passed = evidence.passed();
                     let reused = evidence.reused();
-                    SecondaryProof {
+                    let observed_build_type = evidence
+                        .validation_build_type
+                        .as_deref()
+                        .and_then(parse_build_type);
+                    (observed_build_type == Some(build_type)).then_some(SecondaryProof {
                         target: target.clone(),
                         build_type,
                         head_sha: evidence.sha,
                         passed,
                         reused,
-                    }
+                        completed_at: evidence.completed_at,
+                        contract_digest: evidence.contract_digest,
+                    })
                 })
         })
         .collect()
@@ -432,10 +442,10 @@ fn pull_file_paths(files: Vec<PullFile>) -> Vec<String> {
 fn receipt_path(state_dir: &Path, repo: &str, pr: u64, head: &str, target: &str) -> PathBuf {
     state_dir
         .join("changed-surface")
-        .join(repo.replace('/', "__"))
+        .join(percent_encode_component(repo))
         .join(pr.to_string())
         .join(head)
-        .join(format!("{}.json", safe_component(target)))
+        .join(format!("{}.json", percent_encode_component(target)))
 }
 
 fn store_receipt(
@@ -471,17 +481,14 @@ fn percent_encode_component(value: &str) -> String {
         .collect()
 }
 
-fn safe_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
+fn parse_build_type(value: &str) -> Option<BuildType> {
+    match value {
+        "debug" => Some(BuildType::Debug),
+        "release" => Some(BuildType::Release),
+        "rel_with_deb_info" => Some(BuildType::RelWithDebInfo),
+        "min_size_rel" => Some(BuildType::MinSizeRel),
+        _ => None,
+    }
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -511,7 +518,11 @@ mod tests {
         );
         assert_eq!(
             path,
-            Path::new("/state/changed-surface/owner__repo/42/abc/______mac_target.json")
+            Path::new("/state/changed-surface/owner%2Frepo/42/abc/..%2F..%2Fmac%20target.json")
+        );
+        assert_ne!(
+            receipt_path(Path::new("/state"), "owner/repo", 42, "abc", "mac/release"),
+            receipt_path(Path::new("/state"), "owner/repo", 42, "abc", "mac_release")
         );
     }
 

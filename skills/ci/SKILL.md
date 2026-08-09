@@ -936,8 +936,10 @@ target evidence, and the configured full validation command must still run.
 Every eligible bounded candidate includes the nonempty mandatory baseline and
 the complete literal test list of every affected compatible family. A
 build-incompatible family must name a typed, non-advisory secondary target; the
-plan stays blocked until fresh non-reused evidence from that target proves the
-same exact head. Never substitute full Debug for a Release-only installed-SDK
+plan stays blocked until evidence from that target proves its own declared
+`validation_build_type`, the same exact head, and completion within 24 hours.
+Direct and active-profile advisory targets, reused evidence, and older records
+do not qualify. Never substitute full Debug for a Release-only installed-SDK
 family or treat historical Release evidence as sufficient. See
 [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 

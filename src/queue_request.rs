@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::executor::cloud::CloudTargetConfig;
 use crate::executor::contract::ContractConfig;
@@ -563,6 +564,9 @@ pub struct VmSlotDemand {
 pub struct QueuedResolvedTarget {
     /// Logical target name.
     pub name: String,
+    /// Typed build configuration whose execution this target evidences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_build_type: Option<String>,
     /// Platform label.
     pub platform: String,
     /// Normalized backend label.
@@ -583,6 +587,7 @@ impl From<&ResolvedTarget> for QueuedResolvedTarget {
     fn from(target: &ResolvedTarget) -> Self {
         Self {
             name: target.name.clone(),
+            validation_build_type: target.validation_build_type.clone(),
             platform: target.platform.clone(),
             backend_name: target.backend_name.clone(),
             warm_keepalive_seconds: target.warm_keepalive_seconds,
@@ -943,6 +948,15 @@ impl From<&ResolvedValidation> for QueuedValidationSnapshot {
     }
 }
 
+/// Digest the executed target's typed build and complete validation command contract.
+#[must_use]
+pub fn validation_contract_digest(target: &ResolvedTarget) -> Option<String> {
+    let build_type = target.validation_build_type.as_deref()?;
+    let validation = QueuedValidationSnapshot::from(&target.validation);
+    let payload = serde_json::to_vec(&(build_type, validation)).ok()?;
+    Some(format!("{:x}", Sha256::digest(payload)))
+}
+
 /// Local validation snapshot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueuedLocalValidation {
@@ -1115,6 +1129,7 @@ fn restore_targets(targets: &[QueuedResolvedTarget]) -> QueueRequestResult<Vec<R
 fn restore_target(target: &QueuedResolvedTarget) -> QueueRequestResult<ResolvedTarget> {
     Ok(ResolvedTarget {
         name: target.name.clone(),
+        validation_build_type: target.validation_build_type.clone(),
         platform: target.platform.clone(),
         backend_name: target.backend_name.clone(),
         warm_keepalive_seconds: target.warm_keepalive_seconds,
@@ -1528,6 +1543,7 @@ mod tests {
         stages.insert("test".to_owned(), "cargo test".to_owned());
         ResolvedTarget {
             name: name.to_owned(),
+            validation_build_type: None,
             platform: "macos".to_owned(),
             backend_name: "local".to_owned(),
             warm_keepalive_seconds: 60,
@@ -1552,6 +1568,7 @@ mod tests {
     fn ssh_target(name: &str, host: &str, repo_path: &str) -> ResolvedTarget {
         ResolvedTarget {
             name: name.to_owned(),
+            validation_build_type: None,
             platform: "linux".to_owned(),
             backend_name: "ssh".to_owned(),
             warm_keepalive_seconds: 60,
@@ -1580,6 +1597,7 @@ mod tests {
     fn windows_target(name: &str, host: &str, repo_path: &str) -> ResolvedTarget {
         ResolvedTarget {
             name: name.to_owned(),
+            validation_build_type: None,
             platform: "windows-x64".to_owned(),
             backend_name: "ssh-windows".to_owned(),
             warm_keepalive_seconds: 60,
@@ -1615,6 +1633,7 @@ mod tests {
     fn cloud_target_with_platform(name: &str, platform: &str) -> ResolvedTarget {
         ResolvedTarget {
             name: name.to_owned(),
+            validation_build_type: None,
             platform: platform.to_owned(),
             backend_name: "cloud".to_owned(),
             warm_keepalive_seconds: 0,
@@ -1812,6 +1831,7 @@ mod tests {
         };
         let host_pool = ResolvedTarget {
             name: "pool-mac".to_owned(),
+            validation_build_type: None,
             platform: "macos".to_owned(),
             backend_name: "host_pool".to_owned(),
             warm_keepalive_seconds: 30,
@@ -1829,6 +1849,7 @@ mod tests {
         };
         let fallback = ResolvedTarget {
             name: "fallback".to_owned(),
+            validation_build_type: None,
             platform: "linux".to_owned(),
             backend_name: "fallback".to_owned(),
             warm_keepalive_seconds: 0,
@@ -2035,6 +2056,7 @@ mod tests {
         let mut request = run_request();
         let target = ResolvedTarget {
             name: "mac-pool".to_owned(),
+            validation_build_type: None,
             platform: "macos".to_owned(),
             backend_name: "host-pool".to_owned(),
             warm_keepalive_seconds: 0,
@@ -2090,6 +2112,7 @@ mod tests {
         let mut request = run_request();
         request.targets = vec![ResolvedTarget {
             name: "fallback".to_owned(),
+            validation_build_type: None,
             platform: "macos".to_owned(),
             backend_name: "fallback".to_owned(),
             warm_keepalive_seconds: 0,

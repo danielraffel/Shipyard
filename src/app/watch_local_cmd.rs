@@ -537,6 +537,7 @@ mod tests {
         ssh.ssh_options = vec!["-p".to_owned(), "2222".to_owned()];
         let target = ResolvedTarget {
             name: "linux".to_owned(),
+            validation_build_type: None,
             platform: "linux-arm64".to_owned(),
             backend_name: "ssh".to_owned(),
             warm_keepalive_seconds: 0,

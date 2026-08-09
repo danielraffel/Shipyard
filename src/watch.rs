@@ -794,6 +794,7 @@ mod tests {
                 sha: state.head_sha.clone(),
                 branch: state.branch.clone(),
                 target_name: "macos".to_owned(),
+                validation_build_type: None,
                 platform: "macos-arm64".to_owned(),
                 status: "pass".to_owned(),
                 backend: "reused".to_owned(),

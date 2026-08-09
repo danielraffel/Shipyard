@@ -17,6 +17,9 @@ pub struct EvidenceRecord {
     /// Logical target name.
     #[serde(rename = "target")]
     pub target_name: String,
+    /// Typed validation build configuration declared by the executed target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_build_type: Option<String>,
     /// Concrete platform label.
     pub platform: String,
     /// Validation result status.
@@ -341,7 +344,10 @@ impl EvidenceStore {
                 let Some(rank) = candidate_ranks.get(record.sha.as_str()).copied() else {
                     continue;
                 };
-                if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+                if best.as_ref().is_none_or(|(best_rank, current)| {
+                    rank < *best_rank
+                        || (rank == *best_rank && record.completed_at > current.completed_at)
+                }) {
                     best = Some((rank, record.clone()));
                 }
             }
@@ -448,6 +454,7 @@ mod tests {
             sha: sha.to_owned(),
             branch: branch.to_owned(),
             target_name: target.to_owned(),
+            validation_build_type: None,
             platform: format!("{target}-platform"),
             status: "pass".to_owned(),
             backend: "local".to_owned(),
@@ -471,6 +478,7 @@ mod tests {
             sha: "new".to_owned(),
             branch: "feat/x".to_owned(),
             target_name: "mac".to_owned(),
+            validation_build_type: Some("release".to_owned()),
             platform: "macos-arm64".to_owned(),
             status: "pass".to_owned(),
             backend: "reused".to_owned(),
@@ -492,6 +500,7 @@ mod tests {
 
         let value = serde_json::to_value(&record).expect("serialize");
         assert_eq!(value["target"], "mac");
+        assert_eq!(value["validation_build_type"], "release");
         assert_eq!(value["reused_from"], "old");
         assert_eq!(value["contract_digest"], "abc123");
         assert_eq!(value["stages_signature"], "build|test");
@@ -662,6 +671,18 @@ mod tests {
             .query_passing_for_target("mac", &candidates)
             .expect("record");
         assert_eq!(match_record.sha, "b".repeat(40));
+
+        let same_sha = "d".repeat(40);
+        let mut older = record("old", "mac", &same_sha);
+        older.completed_at = Utc::now() - chrono::Duration::hours(2);
+        store.record(&older).expect("older record");
+        let mut newer = record("new", "mac", &same_sha);
+        newer.completed_at = Utc::now() - chrono::Duration::hours(1);
+        store.record(&newer).expect("newer record");
+        let newest = store
+            .query_passing_for_target("mac", std::slice::from_ref(&same_sha))
+            .expect("newest exact-sha record");
+        assert_eq!(newest.branch, "new");
         assert!(
             store
                 .query_passing_for_target("linux", &["abc".to_owned()])
