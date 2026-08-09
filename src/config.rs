@@ -56,8 +56,16 @@ impl LoadedConfig {
 
     /// Load and merge config layers for a given mode and directory.
     pub fn load_from_cwd(mode: RuntimeMode, cwd: &Path) -> ConfigResult<Self> {
+        Self::load_from_cwd_with_global_dir(mode, cwd, RuntimePaths::current(mode).global_dir)
+    }
+
+    /// Load config layers while honoring an explicitly resolved global directory.
+    pub fn load_from_cwd_with_global_dir(
+        mode: RuntimeMode,
+        cwd: &Path,
+        global_dir: PathBuf,
+    ) -> ConfigResult<Self> {
         let identity = ProductIdentity::for_mode(mode);
-        let runtime_paths = RuntimePaths::current(mode);
         let project_dir = cwd.join(identity.tracked_project_dir_name);
         let direct_local_dir = cwd.join(identity.local_overlay_dir_name);
 
@@ -71,7 +79,7 @@ impl LoadedConfig {
         };
 
         Self::load(
-            Some(runtime_paths.global_dir),
+            Some(global_dir),
             project_dir.exists().then_some(project_dir),
             local_dir,
             local_overlay_source,
@@ -300,6 +308,55 @@ mod tests {
         assert_eq!(config.get_str("defaults.priority"), Some("normal"));
         assert_eq!(config.get_str("project.name"), Some("my-project"));
         assert_eq!(config.get_str("targets.ubuntu.host"), Some("vm.local"));
+    }
+
+    #[test]
+    fn cwd_loader_honors_explicit_global_dir_and_keeps_project_layers() {
+        let sandbox = TempDir::new().expect("tempdir");
+        let global_dir = sandbox.path().join("explicit-global");
+        let repo = sandbox.path().join("repo");
+        let project_dir = repo.join(".shipyard");
+        let local_dir = repo.join(".shipyard.local");
+        std::fs::create_dir_all(&global_dir).expect("global dir");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::create_dir_all(&local_dir).expect("local dir");
+        std::fs::write(
+            global_dir.join("config.toml"),
+            "[github.auth]\nsource = \"env\"\ntoken_env = \"EXPLICIT_TOKEN\"\n",
+        )
+        .expect("global config");
+        std::fs::write(
+            project_dir.join("config.toml"),
+            "[governance]\nrequired_status_checks = [\"windows\"]\n",
+        )
+        .expect("project config");
+        std::fs::write(
+            local_dir.join("config.toml"),
+            "[project]\nname = \"observer-test\"\n",
+        )
+        .expect("local config");
+
+        let config = LoadedConfig::load_from_cwd_with_global_dir(
+            RuntimeMode::Shipyard,
+            &repo,
+            global_dir.clone(),
+        )
+        .expect("load config");
+
+        assert_eq!(config.global_dir, global_dir);
+        assert_eq!(
+            config.get_str("github.auth.token_env"),
+            Some("EXPLICIT_TOKEN")
+        );
+        assert_eq!(
+            config
+                .get("governance.required_status_checks")
+                .and_then(toml::Value::as_array)
+                .and_then(|checks| checks.first())
+                .and_then(toml::Value::as_str),
+            Some("windows")
+        );
+        assert_eq!(config.get_str("project.name"), Some("observer-test"));
     }
 
     #[test]

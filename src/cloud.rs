@@ -216,6 +216,28 @@ impl Display for GitHubError {
 
 impl Error for GitHubError {}
 
+/// Captured result of a bounded `gh` command, including non-zero GraphQL
+/// responses whose stdout can still contain usable partial data.
+pub(crate) struct GitHubCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl GitHubCommandOutput {
+    pub(crate) fn success(&self) -> bool {
+        self.status.success()
+    }
+
+    pub(crate) fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    pub(crate) fn command_error(&self, args: &[String]) -> GitHubError {
+        GitHubError::command_failed(args, self.status.code(), &self.stderr)
+    }
+}
+
 /// Shell-backed GitHub Actions client.
 #[derive(Clone, Debug)]
 pub struct GitHubActions {
@@ -263,6 +285,17 @@ impl GitHubActions {
             gh,
             gh_binary_override: None,
         }
+    }
+
+    /// Override repository placeholders used by configured token helpers.
+    #[must_use]
+    pub(crate) fn with_repo_override(mut self, repo: &str) -> Self {
+        self.gh = self.gh.and_then(|client| {
+            client
+                .with_repo_override(repo)
+                .map_err(|error| format!("failed to scope GitHub auth to explicit repo: {error}"))
+        });
+        self
     }
 
     #[cfg(all(test, unix))]
@@ -692,26 +725,40 @@ impl GitHubActions {
         args: &[String],
         timeout: Duration,
     ) -> Result<String, GitHubError> {
-        let mut command = self.prepare_gh_command()?;
+        let output = self.run_gh_with_timeout_output(args, timeout)?;
+        if !output.success() {
+            return Err(output.command_error(args));
+        }
+        Ok(String::from_utf8_lossy(output.stdout()).to_string())
+    }
+
+    pub(crate) fn run_gh_with_timeout_output(
+        &self,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<GitHubCommandOutput, GitHubError> {
+        let started = Instant::now();
+        let mut command = self.prepare_gh_command_with_timeout(timeout)?;
+        if started.elapsed() >= timeout {
+            return Err(GitHubError::new(format!(
+                "gh {} timed out during credential preparation after {}ms",
+                args.join(" "),
+                timeout.as_millis()
+            )));
+        }
         command
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let mut child = command.spawn().map_err(|error| {
-            GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
-        })?;
-        let mut stdout = child
-            .stdout
-            .take()
+        let mut process_tree =
+            crate::process::ProcessTree::spawn(&mut command).map_err(|error| {
+                GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
+            })?;
+        let mut stdout = process_tree
+            .take_stdout()
             .ok_or_else(|| GitHubError::new("failed to capture gh stdout".to_owned()))?;
-        let mut stderr = child
-            .stderr
-            .take()
+        let mut stderr = process_tree
+            .take_stderr()
             .ok_or_else(|| GitHubError::new("failed to capture gh stderr".to_owned()))?;
         let stdout_reader = std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -721,17 +768,14 @@ impl GitHubActions {
             let mut bytes = Vec::new();
             stderr.read_to_end(&mut bytes).map(|_| bytes)
         });
-        let started = Instant::now();
         let status = loop {
-            match child.try_wait() {
+            match process_tree.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if started.elapsed() < timeout => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Ok(None) => {
-                    terminate_process_group(&mut child);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    process_tree.terminate();
                     return Err(GitHubError::new(format!(
                         "gh {} timed out after {}ms",
                         args.join(" "),
@@ -739,9 +783,7 @@ impl GitHubActions {
                     )));
                 }
                 Err(error) => {
-                    terminate_process_group(&mut child);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    process_tree.terminate();
                     return Err(GitHubError::new(format!(
                         "failed waiting for gh {}: {error}",
                         args.join(" ")
@@ -755,7 +797,7 @@ impl GitHubActions {
             std::thread::sleep(Duration::from_millis(10));
         }
         if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
-            terminate_process_group(&mut child);
+            process_tree.terminate();
             let drain_deadline = Instant::now() + Duration::from_millis(500);
             while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
                 && Instant::now() < drain_deadline
@@ -770,6 +812,9 @@ impl GitHubActions {
                 timeout.as_millis()
             )));
         }
+        // The command is complete and its captured pipes are closed, but a
+        // detached descendant may have redirected stdio. Reap that tree too.
+        process_tree.terminate();
         let stdout = stdout_reader
             .join()
             .map_err(|_| GitHubError::new("gh stdout reader panicked".to_owned()))?
@@ -778,10 +823,11 @@ impl GitHubActions {
             .join()
             .map_err(|_| GitHubError::new("gh stderr reader panicked".to_owned()))?
             .map_err(|error| GitHubError::new(format!("failed reading gh stderr: {error}")))?;
-        if !status.success() {
-            return Err(GitHubError::command_failed(args, status.code(), &stderr));
-        }
-        Ok(String::from_utf8_lossy(&stdout).to_string())
+        Ok(GitHubCommandOutput {
+            status,
+            stdout,
+            stderr,
+        })
     }
 
     fn prepare_gh_command(&self) -> Result<std::process::Command, GitHubError> {
@@ -798,18 +844,26 @@ impl GitHubActions {
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
-}
 
-#[cfg(unix)]
-fn terminate_process_group(child: &mut std::process::Child) {
-    let group = format!("-{}", child.id());
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", "--", &group])
-        .status();
+    fn prepare_gh_command_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<std::process::Command, GitHubError> {
+        let client = self
+            .gh
+            .as_ref()
+            .map_err(|error| GitHubError::new(error.clone()))?;
+        client
+            .prepare_command_with_auth_timeout(
+                &self.cwd,
+                self.gh_binary_override.as_deref(),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+                timeout,
+            )
+            .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
+    }
 }
-
-#[cfg(not(unix))]
-fn terminate_process_group(_child: &mut std::process::Child) {}
 
 /// Discover workflow-dispatchable GitHub Actions workflows below `repo_root`.
 #[must_use]

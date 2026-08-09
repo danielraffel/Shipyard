@@ -83,8 +83,11 @@ pub mod pr_text;
 pub mod preflight;
 /// Prepared-state cache for warm stage reruns.
 pub mod prepared_state;
+mod process;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
+/// Stable read-only GitHub queue snapshots, state hashing, and delta tracking.
+pub mod queue_observer;
 /// Durable queued execution request and outcome stores.
 pub mod queue_request;
 /// Cooperative queue scheduler planning primitives.

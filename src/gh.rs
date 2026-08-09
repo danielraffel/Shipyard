@@ -3,9 +3,11 @@
 use std::env;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -27,6 +29,8 @@ pub struct GhClient {
     /// `--repo` values but runs from a non-repo CWD, so without this a
     /// `token_command` using `{repo_slug}` could never mint a token.
     repo_hint: Option<RepoIdentity>,
+    /// Explicit command target; unlike a hint, this outranks the checkout.
+    repo_override: Option<RepoIdentity>,
 }
 
 impl Debug for GhClient {
@@ -65,6 +69,17 @@ impl GhClient {
         self
     }
 
+    /// Force token-command repository placeholders to use an explicit target.
+    pub fn with_repo_override(mut self, slug: &str) -> Result<Self, GhPrepareError> {
+        self.repo_override =
+            Some(
+                RepoIdentity::from_slug(slug).ok_or_else(|| GhPrepareError::InvalidRepoSlug {
+                    slug: slug.to_owned(),
+                })?,
+            );
+        Ok(self)
+    }
+
     /// Prepare a `gh` command with the requested supervision and auth policy.
     ///
     /// The returned command has its program, current directory, supervised
@@ -77,6 +92,35 @@ impl GhClient {
         supervision: GhSupervision,
         auth_policy: GhAuthPolicy,
     ) -> Result<Command, GhPrepareError> {
+        self.prepare_command_inner(cwd, binary_override, supervision, auth_policy, None)
+    }
+
+    /// Prepare a `gh` command while bounding configured token-helper execution.
+    pub fn prepare_command_with_auth_timeout(
+        &self,
+        cwd: &Path,
+        binary_override: Option<&Path>,
+        supervision: GhSupervision,
+        auth_policy: GhAuthPolicy,
+        auth_timeout: Duration,
+    ) -> Result<Command, GhPrepareError> {
+        self.prepare_command_inner(
+            cwd,
+            binary_override,
+            supervision,
+            auth_policy,
+            Some(auth_timeout),
+        )
+    }
+
+    fn prepare_command_inner(
+        &self,
+        cwd: &Path,
+        binary_override: Option<&Path>,
+        supervision: GhSupervision,
+        auth_policy: GhAuthPolicy,
+        auth_timeout: Option<Duration>,
+    ) -> Result<Command, GhPrepareError> {
         let mut command = match supervision {
             GhSupervision::Supervised => crate::supervised::gh_supervised(binary_override),
             GhSupervision::Unsupervised => {
@@ -85,7 +129,7 @@ impl GhClient {
         };
         command.current_dir(cwd);
         if auth_policy == GhAuthPolicy::Default
-            && let Some(token) = self.resolve_token(cwd)?
+            && let Some(token) = self.resolve_token_with_timeout(cwd, auth_timeout)?
         {
             command.env(GH_TOKEN_ENV, token.token);
         }
@@ -159,10 +203,19 @@ impl GhClient {
             auth,
             cache: Arc::new(Mutex::new(None)),
             repo_hint: None,
+            repo_override: None,
         }
     }
 
     fn resolve_token(&self, cwd: &Path) -> Result<Option<TokenResolution>, GhPrepareError> {
+        self.resolve_token_with_timeout(cwd, None)
+    }
+
+    fn resolve_token_with_timeout(
+        &self,
+        cwd: &Path,
+        timeout: Option<Duration>,
+    ) -> Result<Option<TokenResolution>, GhPrepareError> {
         match &self.auth.source {
             GhAuthSource::GhCli => Ok(None),
             GhAuthSource::Env { token_env } => env_token(token_env).map(Some),
@@ -170,7 +223,7 @@ impl GhClient {
                 token_command,
                 cache_ttl_seconds,
             } => self
-                .resolve_command_token(cwd, token_command, *cache_ttl_seconds)
+                .resolve_command_token(cwd, token_command, *cache_ttl_seconds, timeout)
                 .map(Some),
         }
     }
@@ -180,8 +233,14 @@ impl GhClient {
         cwd: &Path,
         token_command: &[String],
         cache_ttl_seconds: Option<u64>,
+        timeout: Option<Duration>,
     ) -> Result<TokenResolution, GhPrepareError> {
-        let expanded = expand_token_command(token_command, cwd, self.repo_hint.as_ref())?;
+        let expanded = expand_token_command(
+            token_command,
+            cwd,
+            self.repo_hint.as_ref(),
+            self.repo_override.as_ref(),
+        )?;
         let now = Utc::now();
         if let Some(cached) = self.cached_token(&expanded, now)? {
             return Ok(cached);
@@ -190,14 +249,18 @@ impl GhClient {
         let (program, args) = expanded
             .split_first()
             .ok_or(GhPrepareError::EmptyTokenCommand)?;
-        let output = Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .map_err(|source| GhPrepareError::HelperStart {
-                program: program.clone(),
-                source,
-            })?;
+        let mut command = Command::new(program);
+        command.args(args).current_dir(cwd);
+        let output = if let Some(timeout) = timeout {
+            run_helper_with_timeout(&mut command, program, timeout)?
+        } else {
+            command
+                .output()
+                .map_err(|source| GhPrepareError::HelperStart {
+                    program: program.clone(),
+                    source,
+                })?
+        };
         if !output.status.success() {
             return Err(GhPrepareError::HelperFailed {
                 program: program.clone(),
@@ -254,6 +317,77 @@ impl GhClient {
         });
         Ok(())
     }
+}
+
+fn run_helper_with_timeout(
+    command: &mut Command,
+    program: &str,
+    timeout: Duration,
+) -> Result<Output, GhPrepareError> {
+    let mut stdout = tempfile::tempfile().map_err(|source| GhPrepareError::HelperStart {
+        program: program.to_owned(),
+        source,
+    })?;
+    let mut stderr = tempfile::tempfile().map_err(|source| GhPrepareError::HelperStart {
+        program: program.to_owned(),
+        source,
+    })?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.try_clone().map_err(|source| {
+            GhPrepareError::HelperStart {
+                program: program.to_owned(),
+                source,
+            }
+        })?))
+        .stderr(Stdio::from(stderr.try_clone().map_err(|source| {
+            GhPrepareError::HelperStart {
+                program: program.to_owned(),
+                source,
+            }
+        })?));
+    let mut process_tree = crate::process::ProcessTree::spawn(command).map_err(|source| {
+        GhPrepareError::HelperStart {
+            program: program.to_owned(),
+            source,
+        }
+    })?;
+    let status = match process_tree.wait_timeout(timeout) {
+        Ok(status) => status,
+        Err(source) => {
+            process_tree.terminate();
+            return Err(GhPrepareError::HelperStart {
+                program: program.to_owned(),
+                source,
+            });
+        }
+    };
+    let Some(status) = status else {
+        process_tree.terminate();
+        return Err(GhPrepareError::HelperTimedOut {
+            program: program.to_owned(),
+            timeout_ms: timeout.as_millis(),
+        });
+    };
+    // A successful helper is a bounded operation, not a daemon launcher.
+    // Reap descendants that detached their stdio before the leader exited.
+    process_tree.terminate();
+    let read_output = |file: &mut std::fs::File| -> Result<Vec<u8>, GhPrepareError> {
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map(|_| bytes)
+            })
+            .map_err(|source| GhPrepareError::HelperStart {
+                program: program.to_owned(),
+                source,
+            })
+    };
+    Ok(Output {
+        status,
+        stdout: read_output(&mut stdout)?,
+        stderr: read_output(&mut stderr)?,
+    })
 }
 
 /// Which auth source to apply when preparing a `gh` command.
@@ -458,6 +592,13 @@ pub enum GhPrepareError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+    /// Command helper exceeded the caller's bounded auth budget.
+    HelperTimedOut {
+        /// Helper executable.
+        program: String,
+        /// Timeout in milliseconds.
+        timeout_ms: u128,
+    },
     /// Command helper exited non-zero.
     HelperFailed {
         /// Helper executable.
@@ -475,6 +616,11 @@ pub enum GhPrepareError {
     TokenExpired,
     /// Repo placeholder expansion needed a GitHub remote.
     RepoSlugRequired,
+    /// An explicit repository override was not an exact `OWNER/REPO` slug.
+    InvalidRepoSlug {
+        /// Rejected repository slug.
+        slug: String,
+    },
     /// Git remote probing failed.
     RepoProbeFailed {
         /// Underlying I/O error.
@@ -497,6 +643,10 @@ impl Display for GhPrepareError {
             Self::HelperStart { program, source } => {
                 write!(f, "failed to start token helper {program:?}: {source}")
             }
+            Self::HelperTimedOut {
+                program,
+                timeout_ms,
+            } => write!(f, "token helper {program:?} timed out after {timeout_ms}ms"),
             Self::HelperFailed {
                 program,
                 status,
@@ -519,6 +669,10 @@ impl Display for GhPrepareError {
             Self::RepoSlugRequired => write!(
                 f,
                 "token_command placeholder requires remote.origin.url to be a GitHub remote"
+            ),
+            Self::InvalidRepoSlug { slug } => write!(
+                f,
+                "invalid explicit GitHub repository slug {slug:?}; expected OWNER/REPO"
             ),
             Self::RepoProbeFailed { source } => write!(f, "git remote probe failed: {source}"),
             Self::TokenCachePoisoned => write!(f, "token cache lock was poisoned"),
@@ -650,6 +804,7 @@ fn expand_token_command(
     args: &[String],
     cwd: &Path,
     repo_hint: Option<&RepoIdentity>,
+    repo_override: Option<&RepoIdentity>,
 ) -> Result<Vec<String>, GhPrepareError> {
     if args.is_empty() {
         return Err(GhPrepareError::EmptyTokenCommand);
@@ -662,7 +817,7 @@ fn expand_token_command(
                 let identity = if let Some(identity) = &repo {
                     identity
                 } else {
-                    repo = Some(resolve_repo_placeholder(cwd, repo_hint)?);
+                    repo = Some(resolve_repo_placeholder(cwd, repo_hint, repo_override)?);
                     repo.as_ref().expect("repo identity should be set")
                 };
                 expanded = expanded
@@ -682,7 +837,11 @@ fn expand_token_command(
 fn resolve_repo_placeholder(
     cwd: &Path,
     repo_hint: Option<&RepoIdentity>,
+    repo_override: Option<&RepoIdentity>,
 ) -> Result<RepoIdentity, GhPrepareError> {
+    if let Some(repo_override) = repo_override {
+        return Ok(repo_override.clone());
+    }
     match resolve_repo_identity(cwd) {
         Ok(identity) => Ok(identity),
         Err(GhPrepareError::RepoSlugRequired) if repo_hint.is_some() => {
@@ -860,6 +1019,16 @@ mod tests {
     use super::*;
     use crate::config::LocalOverlaySource;
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).expect("write script");
+        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod script");
+    }
+
     fn config_from_toml(input: &str) -> LoadedConfig {
         LoadedConfig {
             data: input.parse::<toml::Table>().expect("parse toml"),
@@ -924,6 +1093,98 @@ mod tests {
         );
         let error = GhClient::from_loaded_config(&config).expect_err("invalid config");
         assert!(error.to_string().contains("token_command"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_preparation_times_out_token_helper() {
+        let temp = TempDir::new().expect("temp");
+        let helper = temp.path().join("token-helper");
+        write_executable(&helper, "#!/bin/sh\nsleep 5\nprintf token\n");
+        let config = config_from_toml(&format!(
+            r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}"]
+            "#,
+            helper.display()
+        ));
+        let client = GhClient::from_loaded_config(&config).expect("client");
+        let started = std::time::Instant::now();
+        let error = client
+            .prepare_command_with_auth_timeout(
+                temp.path(),
+                Some(Path::new("/tmp/fake-gh")),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+                Duration::from_millis(20),
+            )
+            .expect_err("helper timeout");
+        assert!(matches!(error, GhPrepareError::HelperTimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_helper_receives_eof_instead_of_inheriting_caller_stdin() {
+        let temp = TempDir::new().expect("temp");
+        let helper = temp.path().join("token-helper");
+        write_executable(&helper, "#!/bin/sh\nread ignored || true\nprintf token\n");
+        let mut command = Command::new(&helper);
+        // A caller-provided pipe would remain open in the parent and make the
+        // helper block on `read` unless the bounded boundary replaces stdin.
+        command.stdin(Stdio::piped());
+
+        // Keep the assertion about EOF, not scheduler latency in the highly
+        // parallel full suite. The helper returns immediately on the good path.
+        let output = run_helper_with_timeout(&mut command, "token-helper", Duration::from_secs(30))
+            .expect("helper should see EOF");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_bounded_helper_does_not_leave_detached_descendants() {
+        let temp = TempDir::new().expect("temp");
+        let helper = temp.path().join("token-helper");
+        let descendant_pid = temp.path().join("descendant.pid");
+        write_executable(
+            &helper,
+            &format!(
+                "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > '{}'\nprintf token\n",
+                descendant_pid.display()
+            ),
+        );
+        let mut command = Command::new(&helper);
+
+        let output = run_helper_with_timeout(&mut command, "token-helper", Duration::from_secs(10))
+            .expect("helper succeeds");
+        let pid = std::fs::read_to_string(&descendant_pid).expect("descendant pid");
+        let pid = pid.trim();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut running = true;
+        while running && std::time::Instant::now() < deadline {
+            running = Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if running {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if running {
+            let _ = Command::new("kill")
+                .args(["-KILL", pid])
+                .stderr(Stdio::null())
+                .status();
+        }
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"token");
+        assert!(!running, "helper descendant {pid} survived success");
     }
 
     #[test]
@@ -1050,11 +1311,19 @@ mod tests {
         // The CWD's GitHub remote wins even when a hint is present.
         let hint = RepoIdentity::from_slug("hintowner/hintrepo");
         let expanded =
-            expand_token_command(&command, repo.path(), hint.as_ref()).expect("expanded");
+            expand_token_command(&command, repo.path(), hint.as_ref(), None).expect("expanded");
         assert_eq!(expanded[2], "owner/repo");
         assert_eq!(expanded[4], "owner");
         assert_eq!(expanded[6], "repo");
         assert_eq!(expanded[8], repo.path().display().to_string());
+
+        let repo_override = RepoIdentity::from_slug("target/other").expect("override");
+        let overridden =
+            expand_token_command(&command, repo.path(), hint.as_ref(), Some(&repo_override))
+                .expect("overridden");
+        assert_eq!(overridden[2], "target/other");
+        assert_eq!(overridden[4], "target");
+        assert_eq!(overridden[6], "other");
     }
 
     #[test]
@@ -1069,11 +1338,11 @@ mod tests {
         ];
         let hint = RepoIdentity::from_slug("danielraffel/pulp").expect("valid slug");
         let expanded =
-            expand_token_command(&command, not_a_repo.path(), Some(&hint)).expect("expanded");
+            expand_token_command(&command, not_a_repo.path(), Some(&hint), None).expect("expanded");
         assert_eq!(expanded[2], "danielraffel/pulp");
 
         // Without a hint, it still errors (unchanged behavior).
-        let err = expand_token_command(&command, not_a_repo.path(), None);
+        let err = expand_token_command(&command, not_a_repo.path(), None, None);
         assert!(matches!(err, Err(GhPrepareError::RepoSlugRequired)));
     }
 
@@ -1084,6 +1353,18 @@ mod tests {
         assert!(RepoIdentity::from_slug("owner/").is_none());
         assert!(RepoIdentity::from_slug("/name").is_none());
         assert!(RepoIdentity::from_slug("a/b/c").is_none());
+    }
+
+    #[test]
+    fn explicit_repo_override_rejects_malformed_instead_of_falling_back() {
+        let error = GhClient::ambient()
+            .with_repo_override("owner/repo/extra")
+            .expect_err("invalid explicit slug");
+
+        assert!(matches!(
+            error,
+            GhPrepareError::InvalidRepoSlug { slug } if slug == "owner/repo/extra"
+        ));
     }
 
     #[test]

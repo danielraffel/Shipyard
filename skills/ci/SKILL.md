@@ -40,6 +40,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
+| Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
 | Show run logs | `shipyard logs <job_id> --json` |
 | **Runner watchdog: health check** | `shipyard runner status --repo <r> --runner-id <id>` |
 | **Runner watchdog: list stale queued runs (dry-run)** | `shipyard runner cleanup --dry-run` |
@@ -816,6 +817,15 @@ When multiple jobs are queued (common with parallel worktrees):
 - `shipyard bump <id> high` — make a job run next
 - `shipyard bump <id> low` — deprioritize a job
 - `shipyard cancel <id>` — cancel a pending or running job
+
+For cross-process, read-only observation of GitHub's server merge queue and
+open PR heads, use `shipyard queue-observe`. It persists a canonical snapshot,
+emits only initial state or semantic deltas, and backs unchanged polling off
+through 15/30/60/120/300 seconds. The command also reports local mutation
+authority and `HOLD` state, but it never acquires a mutation lease or calls a
+GitHub mutation. Its state file, append-only transition log, and exclusive lock
+provide a durable handoff boundary for queue-monitor agents. See
+[`docs/queue-observer.md`](../../docs/queue-observer.md).
 
 ## Target configuration
 
