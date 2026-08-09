@@ -6,7 +6,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 <a id="v0850"></a>
 ## [0.85.0] - 2026-08-08
 
-- feat: add fail-closed exact-head changed-surface shadow planning with protected-base policy, mandatory smoke, complete-family selection, typed fresh secondary proof, and target-bound queryable receipts
+- Add exact-head changed-surface shadow planner ([#398](https://github.com/danielraffel/Shipyard/pull/398))
 
 <a id="v0840"></a>
 ## [0.84.0] - 2026-08-08
