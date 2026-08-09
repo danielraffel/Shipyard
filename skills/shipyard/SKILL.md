@@ -69,6 +69,10 @@ literal baseline/family tests. Never substitute caller regexes, caller-selected
 base/head SHAs, `skip-target`, `resume-from`, or diff-cover selectors. A local
 head/tree mismatch hard-fails with no receipt; every later ambiguity selects the
 full suite. The receipt is telemetry and cannot replace full target evidence.
+Release-only families under a Debug target require fresh, non-reused,
+same-exact-head evidence from their base-declared non-advisory Release target;
+without it the plan is policy-blocked, not redirected into a known-incompatible
+full Debug run.
 See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard

@@ -16,6 +16,8 @@ change policy for their own validation.
 [targets.mac.changed_surface_selection]
 schema_version = 1
 full_test_count = 20091
+build_type = "debug"
+build_flags = ["-DCMAKE_BUILD_TYPE=Debug"]
 baseline_tests = [
   "smoke: CLI starts",
   "smoke: plugin registry loads",
@@ -38,6 +40,7 @@ tests = [
   "capability registry exact contract",
   "capability registry no-exceptions contract",
 ]
+supported_build_types = ["debug", "release"]
 
 [[targets.mac.changed_surface_selection.families]]
 name = "audio-runtime"
@@ -46,6 +49,20 @@ tests = [
   "audio runtime smoke",
   "audio runtime RT safety",
 ]
+supported_build_types = ["debug", "release"]
+
+[[targets.mac.changed_surface_selection.families]]
+name = "installed-sdk"
+paths = ["tools/cli/**", "include/pulp/capability/**"]
+tests = ["agent capability installed SDK"]
+supported_build_types = ["release"]
+required_secondary_target = "release-installed-sdk"
+required_secondary_build_type = "release"
+
+[targets.release-installed-sdk]
+backend = "local"
+platform = "macos-arm64"
+advisory = false
 ```
 
 `tests` are literal reviewed test identities, not regexes. Every family must
@@ -54,6 +71,14 @@ must be unique, and the union of declared literal tests cannot exceed
 `full_test_count`. `baseline_only_paths` cannot match the entire repository.
 Unknown fields are rejected, so the schema has no caller regex or test-free
 success representation.
+
+Build compatibility is typed. A family that does not support the current
+target's `build_type` must name a different, non-advisory secondary target and
+its supported build type. For example, a Release-only installed-SDK test is
+never selected in a Debug bound. The plan remains blocked until Shipyard's
+evidence store contains a passing, non-reused record from the required Release
+target for the same exact head. Historical, ancestor-reused, advisory, or
+wrong-head evidence does not satisfy the requirement.
 
 ## Planning an exact PR head
 
@@ -82,6 +107,12 @@ explicitly says `shadow_only: true`, `authoritative_suite: full`, and
 `authoritative_execution: not_observed_by_shadow_planner`; it is not target
 evidence and cannot satisfy a merge gate.
 
+When a release-only family is affected under Debug, the receipt either binds
+the required exact-head Release target evidence under `secondary_proofs`, or it
+reports `planned_suite: blocked` and exits nonzero. It does not fall back to a
+known-incompatible full Debug suite. This preserves the independent Release
+installed-SDK proof instead of weakening or treating it as advisory history.
+
 ## Failure and fallback boundary
 
 These conditions hard-fail and write no receipt:
@@ -99,6 +130,7 @@ the stable reason when:
 - ancestry or local/GitHub merge-base provenance disagrees;
 - either changed-path observation is incomplete or the path sets disagree;
 - policy is missing, malformed, unknown-version, or test-free;
+- baseline-only patterns collectively cover the authenticated base tree;
 - a path is unmapped;
 - the head modifies `.shipyard/config.toml`, another declared policy/schema
   path, or declared test-topology path.

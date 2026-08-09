@@ -13,10 +13,11 @@ use serde_json::Value;
 
 use super::CliFailure;
 use crate::changed_surface::{
-    ExactHeadInput, ObservationStatus, PlannedSuite, ProtectedRefStatus, SelectionReceipt,
-    plan_selection, policy_from_toml,
+    ChangedSurfacePolicy, ExactHeadInput, ObservationStatus, PlannedSuite, ProtectedRefStatus,
+    SecondaryProof, SelectionReceipt, plan_selection, policy_from_toml,
 };
 use crate::config::LoadedConfig;
+use crate::evidence::EvidenceStore;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::output::write_json_envelope;
 
@@ -165,6 +166,11 @@ pub(super) fn changed_surface_plan_command<W: Write>(
     )
     .map_err(|error| error.message)
     .and_then(|contents| policy_from_toml(&contents, &args.target));
+    let (base_tracked_paths, base_tracked_paths_complete) =
+        git_nul_paths(cwd, &["ls-tree", "-r", "--name-only", "-z", &pull.base.sha])
+            .map_or((Vec::new(), false), |paths| (paths, true));
+    let secondary_proofs =
+        collect_secondary_proofs(policy.as_ref().ok(), state_dir, &pull.head.sha);
 
     let input = ExactHeadInput {
         repository: repo.clone(),
@@ -204,6 +210,13 @@ pub(super) fn changed_surface_plan_command<W: Write>(
         } else {
             ObservationStatus::Incomplete
         },
+        base_tracked_paths,
+        base_tracked_paths_status: if base_tracked_paths_complete {
+            ObservationStatus::Complete
+        } else {
+            ObservationStatus::Incomplete
+        },
+        secondary_proofs,
     };
     let mut receipt =
         plan_selection(&input, policy).map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -218,7 +231,51 @@ pub(super) fn changed_surface_plan_command<W: Write>(
     store_receipt(&receipt_path, &receipt)?;
 
     emit_receipt(&receipt, &receipt_path, json, stdout)?;
-    Ok(ExitCode::SUCCESS)
+    if receipt.planned_suite == PlannedSuite::Blocked {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn collect_secondary_proofs(
+    policy: Option<&ChangedSurfacePolicy>,
+    state_dir: &Path,
+    head_sha: &str,
+) -> Vec<SecondaryProof> {
+    let Some(policy) = policy else {
+        return Vec::new();
+    };
+    let Ok(store) = EvidenceStore::new(state_dir.join("evidence")) else {
+        return Vec::new();
+    };
+    policy
+        .families
+        .iter()
+        .filter_map(|family| {
+            Some((
+                family.required_secondary_target.as_ref()?,
+                family.required_secondary_build_type?,
+            ))
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|(target, build_type)| {
+            store
+                .query_passing_for_target(target, &[head_sha.to_owned()])
+                .map(|evidence| {
+                    let passed = evidence.passed();
+                    let reused = evidence.reused();
+                    SecondaryProof {
+                        target: target.clone(),
+                        build_type,
+                        head_sha: evidence.sha,
+                        passed,
+                        reused,
+                    }
+                })
+        })
+        .collect()
 }
 
 fn emit_receipt<W: Write>(
@@ -248,6 +305,7 @@ fn emit_receipt<W: Write>(
         let planned = match receipt.planned_suite {
             PlannedSuite::Bounded => "bounded (shadow only)",
             PlannedSuite::Full => "full suite",
+            PlannedSuite::Blocked => "blocked pending required secondary proof",
         };
         writeln!(
             stdout,

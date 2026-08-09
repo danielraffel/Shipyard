@@ -934,7 +934,11 @@ policy/schema/test-topology changes force a full-suite receipt.
 The command is shadow-only. Its receipt is queryable telemetry, not passing
 target evidence, and the configured full validation command must still run.
 Every eligible bounded candidate includes the nonempty mandatory baseline and
-the complete literal test list of every affected family. See
+the complete literal test list of every affected compatible family. A
+build-incompatible family must name a typed, non-advisory secondary target; the
+plan stays blocked until fresh non-reused evidence from that target proves the
+same exact head. Never substitute full Debug for a Release-only installed-SDK
+family or treat historical Release evidence as sufficient. See
 [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
 ## Cross-PR evidence reuse

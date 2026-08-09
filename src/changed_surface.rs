@@ -24,6 +24,29 @@ pub struct TestFamily {
     pub paths: Vec<String>,
     /// Complete literal test names for this family. These are not regexes.
     pub tests: Vec<String>,
+    /// Build types on which these literal tests are valid.
+    pub supported_build_types: Vec<BuildType>,
+    /// Required non-advisory target that proves this family when the current
+    /// target's build type is unsupported.
+    #[serde(default)]
+    pub required_secondary_target: Option<String>,
+    /// Build type produced by the required secondary target.
+    #[serde(default)]
+    pub required_secondary_build_type: Option<BuildType>,
+}
+
+/// Typed build configuration used by selector compatibility policy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildType {
+    /// Unoptimized/debug validation.
+    Debug,
+    /// Optimized production validation.
+    Release,
+    /// Optimized validation retaining debug information.
+    RelWithDebInfo,
+    /// Size-optimized validation.
+    MinSizeRel,
 }
 
 /// Base-owned selector policy declared under
@@ -35,6 +58,11 @@ pub struct ChangedSurfacePolicy {
     pub schema_version: u32,
     /// Number of tests in the authoritative full suite.
     pub full_test_count: usize,
+    /// Build type of this target's test stage.
+    pub build_type: BuildType,
+    /// Reviewed build flags bound into the receipt.
+    #[serde(default)]
+    pub build_flags: Vec<String>,
     /// Literal tests that run for every eligible bounded selection.
     pub baseline_tests: Vec<String>,
     /// Paths reviewed as safe to require baseline smoke only (for example docs).
@@ -88,6 +116,27 @@ pub struct ExactHeadInput {
     pub local_changed_paths: Vec<String>,
     /// Completeness of local changed-path computation.
     pub local_changed_paths_status: ObservationStatus,
+    /// Tracked paths read from the authenticated base tree.
+    pub base_tracked_paths: Vec<String>,
+    /// Completeness of the authenticated base-tree observation.
+    pub base_tracked_paths_status: ObservationStatus,
+    /// Exact-head target evidence available to satisfy typed secondary legs.
+    pub secondary_proofs: Vec<SecondaryProof>,
+}
+
+/// Exact-head target evidence offered for a typed secondary validation leg.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecondaryProof {
+    /// Required target name from base-owned policy.
+    pub target: String,
+    /// Build type this target proves.
+    pub build_type: BuildType,
+    /// Exact validated head SHA.
+    pub head_sha: String,
+    /// Evidence status.
+    pub passed: bool,
+    /// Reused ancestor evidence is never accepted for a required secondary leg.
+    pub reused: bool,
 }
 
 /// Authenticated protected-ref query state.
@@ -197,6 +246,23 @@ pub enum PlannedSuite {
     Bounded,
     /// Safety policy selected the full authoritative suite.
     Full,
+    /// A known incompatible family requires an exact-head secondary proof.
+    Blocked,
+}
+
+/// Secondary proof bound into a completed selection receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SecondaryProofReceipt {
+    /// Required target.
+    pub target: String,
+    /// Typed build configuration.
+    pub build_type: BuildType,
+    /// Exact head proven by the target.
+    pub head_sha: String,
+    /// Families covered by this proof.
+    pub families: Vec<String>,
+    /// Complete literal tests covered by this proof.
+    pub tests: Vec<String>,
 }
 
 /// Outcomes carried by a shadow receipt. This phase never claims target proof.
@@ -238,6 +304,11 @@ pub struct SelectionReceipt {
     /// Digest of the selector policy loaded from the authenticated base.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_digest: Option<String>,
+    /// Current target build type from base-owned policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_type: Option<BuildType>,
+    /// Reviewed target build flags from base-owned policy.
+    pub build_flags: Vec<String>,
     /// Authenticated changed paths.
     pub changed_paths: Vec<String>,
     /// Selected affected family names.
@@ -248,6 +319,8 @@ pub struct SelectionReceipt {
     pub baseline_tests: Vec<String>,
     /// Test counts by affected family.
     pub family_coverage: BTreeMap<String, usize>,
+    /// Required exact-head secondary legs satisfying incompatible families.
+    pub secondary_proofs: Vec<SecondaryProofReceipt>,
     /// Planned suite for comparison; execution remains full during shadow mode.
     pub planned_suite: PlannedSuite,
     /// Authoritative suite executed in this phase.
@@ -289,7 +362,50 @@ pub fn policy_from_toml(contents: &str, target: &str) -> Result<ChangedSurfacePo
         .try_into()
         .map_err(|error| format!("invalid selector declaration: {error}"))?;
     validate_policy(&policy)?;
+    validate_secondary_targets(&root, target, &policy)?;
     Ok(policy)
+}
+
+fn validate_secondary_targets(
+    root: &toml::Table,
+    current_target: &str,
+    policy: &ChangedSurfacePolicy,
+) -> Result<(), String> {
+    let targets = root
+        .get("targets")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "base config has no targets table".to_owned())?;
+    for family in &policy.families {
+        let Some(required) = family.required_secondary_target.as_deref() else {
+            continue;
+        };
+        if required == current_target {
+            return Err(format!(
+                "family {} secondary target must differ from the current target",
+                family.name
+            ));
+        }
+        let table = targets
+            .get(required)
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| {
+                format!(
+                    "family {} required secondary target {required:?} is not declared",
+                    family.name
+                )
+            })?;
+        if table
+            .get("advisory")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "family {} required secondary target {required:?} must not be advisory",
+                family.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validate an exact-head input and compute a shadow-only selection receipt.
@@ -303,26 +419,17 @@ pub fn plan_selection(
     if let Some(reason) = provenance_fallback(input, &changed_paths) {
         return Ok(fallback(receipt, None, reason, None));
     }
-    plan_with_policy(receipt, policy, &changed_paths)
+    plan_with_policy(receipt, policy, &changed_paths, input)
 }
 
 fn plan_with_policy(
     mut receipt: SelectionReceipt,
     policy: Result<ChangedSurfacePolicy, String>,
     changed_paths: &[String],
+    input: &ExactHeadInput,
 ) -> Result<SelectionReceipt, IdentityError> {
-    let policy = match policy {
-        Ok(policy) => {
-            if let Err(detail) = validate_policy(&policy) {
-                return Ok(fallback(
-                    receipt,
-                    None,
-                    FallbackReason::InvalidPolicy,
-                    Some(detail),
-                ));
-            }
-            policy
-        }
+    let policy = match validated_policy(policy) {
+        Ok(policy) => policy,
         Err(detail) => {
             return Ok(fallback(
                 receipt,
@@ -334,7 +441,28 @@ fn plan_with_policy(
     };
     receipt.policy_digest = Some(policy_digest(&policy));
     receipt.full_count = Some(policy.full_test_count);
+    receipt.build_type = Some(policy.build_type);
+    receipt.build_flags.clone_from(&policy.build_flags);
     receipt.baseline_tests = sorted_unique(&policy.baseline_tests);
+
+    if input.base_tracked_paths_status == ObservationStatus::Incomplete
+        || input.base_tracked_paths.is_empty()
+    {
+        return Ok(fallback(
+            receipt,
+            Some(&policy),
+            FallbackReason::AmbiguousDiff,
+            Some("authenticated base-tree inventory is incomplete".to_owned()),
+        ));
+    }
+    if baseline_only_covers_base(&policy, &input.base_tracked_paths)? {
+        return Ok(fallback(
+            receipt,
+            Some(&policy),
+            FallbackReason::InvalidPolicy,
+            Some("baseline_only_paths collectively cover the authenticated base tree".to_owned()),
+        ));
+    }
 
     let policy_patterns = std::iter::once(".shipyard/config.toml".to_owned())
         .chain(policy.policy_paths.iter().cloned())
@@ -356,6 +484,15 @@ fn plan_with_policy(
         ));
     }
 
+    select_policy_families(receipt, &policy, changed_paths, input)
+}
+
+fn select_policy_families(
+    receipt: SelectionReceipt,
+    policy: &ChangedSurfacePolicy,
+    changed_paths: &[String],
+    input: &ExactHeadInput,
+) -> Result<SelectionReceipt, IdentityError> {
     let mut selected_tests = receipt
         .baseline_tests
         .iter()
@@ -363,6 +500,7 @@ fn plan_with_policy(
         .collect::<BTreeSet<_>>();
     let mut selected_families = Vec::new();
     let mut family_coverage = BTreeMap::new();
+    let mut secondary = BTreeMap::<(String, BuildType, String), SecondaryProofReceipt>::new();
     let mut mapped_paths = BTreeSet::new();
     for family in &policy.families {
         let affected = matching_paths(changed_paths, &family.paths)?;
@@ -373,6 +511,61 @@ fn plan_with_policy(
         selected_families.push(family.name.clone());
         let tests = sorted_unique(&family.tests);
         family_coverage.insert(family.name.clone(), tests.len());
+        if !family.supported_build_types.contains(&policy.build_type) {
+            let Some(required_target) = &family.required_secondary_target else {
+                return Ok(blocked(
+                    receipt,
+                    policy,
+                    format!(
+                        "family {:?} is incompatible with {:?} and has no required secondary target",
+                        family.name, policy.build_type
+                    ),
+                ));
+            };
+            let Some(required_build_type) = family.required_secondary_build_type else {
+                return Ok(blocked(
+                    receipt,
+                    policy,
+                    format!(
+                        "family {:?} has no typed secondary build requirement",
+                        family.name
+                    ),
+                ));
+            };
+            let Some(proof) = input.secondary_proofs.iter().find(|proof| {
+                proof.target == *required_target
+                    && proof.head_sha == input.pr_head_sha
+                    && proof.build_type == required_build_type
+                    && proof.passed
+                    && !proof.reused
+            }) else {
+                return Ok(blocked(
+                    receipt,
+                    policy,
+                    format!(
+                        "family {:?} requires fresh exact-head evidence from target {:?} at {:?}",
+                        family.name, required_target, required_build_type
+                    ),
+                ));
+            };
+            let key = (
+                required_target.clone(),
+                proof.build_type,
+                proof.head_sha.clone(),
+            );
+            let entry = secondary
+                .entry(key)
+                .or_insert_with(|| SecondaryProofReceipt {
+                    target: required_target.clone(),
+                    build_type: proof.build_type,
+                    head_sha: proof.head_sha.clone(),
+                    families: Vec::new(),
+                    tests: Vec::new(),
+                });
+            entry.families.push(family.name.clone());
+            entry.tests.extend(tests);
+            continue;
+        }
         selected_tests.extend(tests);
     }
     let baseline_only = matching_paths(changed_paths, &policy.baseline_only_paths)?;
@@ -385,18 +578,78 @@ fn plan_with_policy(
     if !unmapped.is_empty() {
         return Ok(fallback(
             receipt,
-            Some(&policy),
+            Some(policy),
             FallbackReason::UnmappedChangedPath,
             Some(format!("unmapped paths: {}", unmapped.join(", "))),
         ));
     }
 
+    Ok(finalize_bounded_receipt(
+        receipt,
+        selected_tests,
+        selected_families,
+        family_coverage,
+        secondary,
+    ))
+}
+
+fn finalize_bounded_receipt(
+    mut receipt: SelectionReceipt,
+    selected_tests: BTreeSet<String>,
+    selected_families: Vec<String>,
+    family_coverage: BTreeMap<String, usize>,
+    secondary: BTreeMap<(String, BuildType, String), SecondaryProofReceipt>,
+) -> SelectionReceipt {
     receipt.selected_families = selected_families;
     receipt.selected_tests = selected_tests.into_iter().collect();
     receipt.family_coverage = family_coverage;
+    receipt.secondary_proofs = secondary
+        .into_values()
+        .map(|mut proof| {
+            proof.families.sort();
+            proof.families.dedup();
+            proof.tests.sort();
+            proof.tests.dedup();
+            proof
+        })
+        .collect();
     receipt.selected_count = Some(receipt.selected_tests.len());
     receipt.planned_suite = PlannedSuite::Bounded;
-    Ok(receipt)
+    receipt
+}
+
+fn validated_policy(
+    policy: Result<ChangedSurfacePolicy, String>,
+) -> Result<ChangedSurfacePolicy, String> {
+    let policy = policy?;
+    validate_policy(&policy)?;
+    Ok(policy)
+}
+
+fn blocked(
+    mut receipt: SelectionReceipt,
+    policy: &ChangedSurfacePolicy,
+    detail: String,
+) -> SelectionReceipt {
+    receipt.policy_digest = Some(policy_digest(policy));
+    receipt.full_count = Some(policy.full_test_count);
+    receipt.build_type = Some(policy.build_type);
+    receipt.build_flags.clone_from(&policy.build_flags);
+    receipt.baseline_tests = sorted_unique(&policy.baseline_tests);
+    receipt.planned_suite = PlannedSuite::Blocked;
+    receipt.selected_count = None;
+    receipt.fallback_reason = None;
+    receipt.fallback_detail = Some(detail);
+    "blocked_required_secondary_proof".clone_into(&mut receipt.outcomes.planner);
+    receipt
+}
+
+fn baseline_only_covers_base(
+    policy: &ChangedSurfacePolicy,
+    base_paths: &[String],
+) -> Result<bool, IdentityError> {
+    let matched = matching_paths(base_paths, &policy.baseline_only_paths)?;
+    Ok(!base_paths.is_empty() && matched.len() == normalized_paths(base_paths).len())
 }
 
 fn provenance_fallback(input: &ExactHeadInput, changed_paths: &[String]) -> Option<FallbackReason> {
@@ -499,6 +752,19 @@ pub fn verify_receipt_identity(
             "receipt changed-path digest mismatch".to_owned(),
         ));
     }
+    if receipt.secondary_proofs.iter().any(|required| {
+        !input.secondary_proofs.iter().any(|proof| {
+            proof.target == required.target
+                && proof.build_type == required.build_type
+                && proof.head_sha == required.head_sha
+                && proof.passed
+                && !proof.reused
+        })
+    }) {
+        return Err(IdentityError::Unresolved(
+            "receipt required-secondary-proof identity mismatch".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -564,6 +830,32 @@ fn validate_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
         }
         validate_patterns(&family.paths)?;
         validate_literal_tests(&format!("family {} tests", family.name), &family.tests)?;
+        if family.supported_build_types.is_empty() {
+            return Err(format!(
+                "family {} supported_build_types must be nonempty",
+                family.name
+            ));
+        }
+        if !family.supported_build_types.contains(&policy.build_type)
+            && (family
+                .required_secondary_target
+                .as_deref()
+                .is_none_or(str::is_empty)
+                || family.required_secondary_build_type.is_none())
+        {
+            return Err(format!(
+                "family {} is incompatible with the target build type and requires required_secondary_target",
+                family.name
+            ));
+        }
+        if let Some(build_type) = family.required_secondary_build_type
+            && !family.supported_build_types.contains(&build_type)
+        {
+            return Err(format!(
+                "family {} secondary build type must be supported by the family",
+                family.name
+            ));
+        }
     }
     validate_patterns(&policy.baseline_only_paths)?;
     validate_patterns(&policy.policy_paths)?;
@@ -637,11 +929,14 @@ fn base_receipt(input: &ExactHeadInput, changed_paths: Vec<String>) -> Selection
         tree_sha: input.remote_tree_sha.clone(),
         changed_paths_digest: digest_lines(&changed_paths),
         policy_digest: None,
+        build_type: None,
+        build_flags: Vec::new(),
         changed_paths,
         selected_families: Vec::new(),
         selected_tests: Vec::new(),
         baseline_tests: Vec::new(),
         family_coverage: BTreeMap::new(),
+        secondary_proofs: Vec::new(),
         planned_suite: PlannedSuite::Full,
         authoritative_suite: PlannedSuite::Full,
         outcomes: SelectionOutcomes {
@@ -665,6 +960,8 @@ fn fallback(
     if let Some(policy) = policy {
         receipt.full_count = Some(policy.full_test_count);
         receipt.selected_count = Some(policy.full_test_count);
+        receipt.build_type = Some(policy.build_type);
+        receipt.build_flags.clone_from(&policy.build_flags);
         receipt.baseline_tests = sorted_unique(&policy.baseline_tests);
         receipt
             .policy_digest
@@ -756,6 +1053,8 @@ mod tests {
         ChangedSurfacePolicy {
             schema_version: 1,
             full_test_count: 100,
+            build_type: BuildType::Debug,
+            build_flags: vec!["-DCMAKE_BUILD_TYPE=Debug".to_owned()],
             baseline_tests: vec!["smoke boots".to_owned(), "smoke config".to_owned()],
             baseline_only_paths: vec!["docs/**".to_owned()],
             policy_paths: vec!["schema/changed-surface.json".to_owned()],
@@ -768,6 +1067,9 @@ mod tests {
                     name: "audio".to_owned(),
                     paths: vec!["src/audio/**".to_owned()],
                     tests: vec!["audio alpha".to_owned(), "audio beta".to_owned()],
+                    supported_build_types: vec![BuildType::Debug, BuildType::Release],
+                    required_secondary_target: None,
+                    required_secondary_build_type: None,
                 },
                 TestFamily {
                     name: "registry".to_owned(),
@@ -776,6 +1078,9 @@ mod tests {
                         "include/registry/**".to_owned(),
                     ],
                     tests: vec!["registry one".to_owned(), "registry two".to_owned()],
+                    supported_build_types: vec![BuildType::Debug, BuildType::Release],
+                    required_secondary_target: None,
+                    required_secondary_build_type: None,
                 },
             ],
         }
@@ -801,6 +1106,14 @@ mod tests {
             remote_changed_paths_status: ObservationStatus::Complete,
             local_changed_paths: paths.iter().map(ToString::to_string).collect(),
             local_changed_paths_status: ObservationStatus::Complete,
+            base_tracked_paths: vec![
+                "src/audio/processor.rs".to_owned(),
+                "src/registry/index.rs".to_owned(),
+                "docs/guide.md".to_owned(),
+                ".shipyard/config.toml".to_owned(),
+            ],
+            base_tracked_paths_status: ObservationStatus::Complete,
+            secondary_proofs: Vec::new(),
         }
     }
 
@@ -1014,5 +1327,69 @@ mod tests {
             receipt.fallback_reason,
             Some(FallbackReason::SelectorPolicyChanged)
         );
+    }
+
+    #[test]
+    fn baseline_only_union_cannot_cover_the_authenticated_base_tree() {
+        let mut bypass = policy();
+        bypass.baseline_only_paths = vec![
+            "src/**".to_owned(),
+            "docs/**".to_owned(),
+            ".shipyard/**".to_owned(),
+        ];
+        let receipt =
+            plan_selection(&input(&["src/audio/processor.rs"]), Ok(bypass)).expect("full fallback");
+        assert_eq!(receipt.planned_suite, PlannedSuite::Full);
+        assert_eq!(receipt.fallback_reason, Some(FallbackReason::InvalidPolicy));
+    }
+
+    #[test]
+    fn debug_excludes_release_only_family_and_requires_fresh_exact_head_release_proof() {
+        let mut release_policy = policy();
+        release_policy.families.push(TestFamily {
+            name: "installed-sdk".to_owned(),
+            paths: vec!["sdk/**".to_owned()],
+            tests: vec!["agent capability installed SDK".to_owned()],
+            supported_build_types: vec![BuildType::Release],
+            required_secondary_target: Some("release-installed-sdk".to_owned()),
+            required_secondary_build_type: Some(BuildType::Release),
+        });
+        let mut debug = input(&["sdk/agent-capability.cpp"]);
+        debug
+            .base_tracked_paths
+            .push("sdk/agent-capability.cpp".to_owned());
+
+        let blocked = plan_selection(&debug, Ok(release_policy.clone())).expect("blocked plan");
+        assert_eq!(blocked.planned_suite, PlannedSuite::Blocked);
+        assert!(
+            !blocked
+                .selected_tests
+                .contains(&"agent capability installed SDK".to_owned())
+        );
+        assert!(blocked.secondary_proofs.is_empty());
+
+        debug.secondary_proofs.push(SecondaryProof {
+            target: "release-installed-sdk".to_owned(),
+            build_type: BuildType::Release,
+            head_sha: B.to_owned(),
+            passed: true,
+            reused: false,
+        });
+        let eligible = plan_selection(&debug, Ok(release_policy.clone())).expect("bounded plan");
+        assert_eq!(eligible.planned_suite, PlannedSuite::Bounded);
+        assert!(
+            !eligible
+                .selected_tests
+                .contains(&"agent capability installed SDK".to_owned())
+        );
+        assert_eq!(eligible.secondary_proofs.len(), 1);
+        assert_eq!(
+            eligible.secondary_proofs[0].tests,
+            ["agent capability installed SDK"]
+        );
+
+        debug.secondary_proofs[0].reused = true;
+        let reused = plan_selection(&debug, Ok(release_policy)).expect("blocked plan");
+        assert_eq!(reused.planned_suite, PlannedSuite::Blocked);
     }
 }
