@@ -2084,9 +2084,14 @@ fn evidence_record(
         sha: request.sha.clone(),
         branch: request.branch.clone(),
         target_name: result.target_name.clone(),
+        validation_build_type: target.and_then(|target| target.validation_build_type.clone()),
         platform: result.platform.clone(),
         status: evidence_status(result).to_owned(),
         backend: result.backend.clone(),
+        source_head_sha: result.source_head_sha.clone(),
+        source_tree_sha: result.source_tree_sha.clone(),
+        source_checkout_clean: result.source_checkout_clean,
+        full_execution: result.full_execution,
         completed_at: result.completed_at.unwrap_or_else(Utc::now),
         duration_secs: result.duration_secs,
         host: target.and_then(|target| target.host.clone()),
@@ -2096,7 +2101,7 @@ fn evidence_record(
         runner_profile: result.runner_profile.clone(),
         failure_class: result.failure_class.clone(),
         reused_from: result.reused_from.clone(),
-        contract_digest: None,
+        contract_digest: target.and_then(crate::queue_request::validation_contract_digest),
         stages_signature: None,
     }
 }

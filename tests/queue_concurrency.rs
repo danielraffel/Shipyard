@@ -28,6 +28,7 @@ fn local_target(name: &str, cwd: impl Into<PathBuf>) -> ResolvedTarget {
     stages.insert("test".to_owned(), "true".to_owned());
     ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: None,
         platform: "macos".to_owned(),
         backend_name: "local".to_owned(),
         warm_keepalive_seconds: 0,

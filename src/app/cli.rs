@@ -160,6 +160,19 @@ pub(super) enum Command {
         )]
         max_polls: Option<u64>,
     },
+    /// Plan a fail-closed exact-head changed-surface test selection in shadow mode.
+    #[command(name = "changed-surface-plan")]
+    ChangedSurfacePlan {
+        /// Target whose base-owned selector declaration should be evaluated.
+        #[arg(long)]
+        target: String,
+        /// Pull request whose authenticated exact head is checked against this checkout.
+        #[arg(long)]
+        pr: u64,
+        /// Owner/repo slug. Defaults to the current checkout's repository.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Clean up old logs, bundles, evidence, and optional ship-state.
     Cleanup {
         /// Show what would be cleaned up.

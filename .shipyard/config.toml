@@ -16,6 +16,7 @@ command = "_sy_find_cargo_bin() { for c in cargo \"$HOME/.cargo/bin/cargo\"; do 
 [targets.mac]
 backend = "local"
 platform = "macos-arm64"
+validation_build_type = "debug"
 
 [release.changelog]
 enabled    = true

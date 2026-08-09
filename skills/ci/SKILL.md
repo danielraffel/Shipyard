@@ -41,6 +41,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
+| Shadow-plan changed-surface tests for an exact PR head | `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n> --target <name>` (base-owned literal tests only; full suite remains authoritative; identity mismatch hard-fails, ambiguity falls back full) |
 | Show run logs | `shipyard logs <job_id> --json` |
 | **Runner watchdog: health check** | `shipyard runner status --repo <r> --runner-id <id>` |
 | **Runner watchdog: list stale queued runs (dry-run)** | `shipyard runner cleanup --dry-run` |
@@ -919,6 +920,33 @@ Full docs: [`docs/targets.md`](../../docs/targets.md) and
 ## SSH delivery: incremental bundles
 
 SSH-backed targets deliver code via `git bundle`. On the first run the bundle is full (every object reachable from the target SHA, ~443 MB for Pulp-sized repos). On every subsequent run Shipyard probes the remote for its current HEAD over SSH (`git rev-parse HEAD`), verifies that the local clone has that commit as an ancestor, and emits `git bundle create <bundle> <target> ^<remote_head>` — a delta bundle that is typically kilobytes instead of megabytes. Any failure in the probe, ancestry check, or delta create silently falls back to the full-bundle path so the behavior on cold/corrupt remotes is unchanged. Each run logs a `bundle_mode=delta|full bundle_bytes=<N>` line to the per-target log so operators can confirm the optimisation is active.
+
+## Exact-head changed-surface shadow planning
+
+Use `changed-surface-plan` only for a target that declares
+`[targets.<name>.changed_surface_selection]` on the authenticated protected
+base. The command has no caller-controlled base, head, regex, or test list. It
+hard-fails before writing a receipt when local HEAD/tree does not match the PR;
+after that boundary, missing/malformed policy, stale or mismatched base
+provenance, incomplete/mismatched diffs, unmapped paths, and head-side
+policy/schema/test-topology changes force a full-suite receipt.
+
+The command is shadow-only. Its receipt is queryable telemetry, not passing
+target evidence, and the configured full validation command must still run.
+Every eligible bounded candidate includes the nonempty mandatory baseline and
+the complete literal test list of every affected compatible family. A
+build-incompatible family must name a typed, non-advisory secondary target; the
+plan stays blocked until evidence from that target proves its own declared
+`validation_build_type`, the same exact head, and completion within 24 hours.
+Direct and active-profile advisory targets, reused evidence, and older records
+do not qualify. The evidence must bind a clean pre-execution checkout at the
+authenticated head and tree. Required secondary targets must currently be
+concrete local validation contracts, not remote, cloud, or composite wrappers.
+Prepared-state reuse must be disabled on the secondary target. Never substitute
+resumed or warm-reused stage execution for the full required contract. Never
+substitute full Debug for a Release-only installed-SDK
+family or treat historical Release evidence as sufficient. See
+[`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
 ## Cross-PR evidence reuse
 

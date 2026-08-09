@@ -62,6 +62,25 @@ state root and takes an exclusive per-cursor lock. It exposes no mutation flag,
 does not acquire a mutation lease, and needs no write credential. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
 
+Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
+--target <name>` for the shadow-only exact-head selector. Policy must come from
+the authenticated protected base and may contain only reviewed path globs plus
+literal baseline/family tests. Never substitute caller regexes, caller-selected
+base/head SHAs, `skip-target`, `resume-from`, or diff-cover selectors. A local
+head/tree mismatch hard-fails with no receipt; every later ambiguity selects the
+full suite. The receipt is telemetry and cannot replace full target evidence.
+Release-only families under a Debug target require fresh, non-reused,
+same-exact-head evidence no more than 24 hours old from their base-declared
+Release target. The evidence must carry that target's own
+`validation_build_type`, and neither direct nor active-profile advisory targets
+qualify. The evidence must bind a clean pre-execution checkout at the
+authenticated head and tree. Use a concrete local secondary target; remote,
+cloud, host-pool, and fallback targets are rejected until their source-tree
+provenance is captured, and prepared-state reuse must be disabled. Without a
+fresh, non-resumed execution of the full contract the plan is policy-blocked,
+not redirected into a known-incompatible full Debug run.
+See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
+
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard
 inspects `PullRequest.stack` and `stackEntry` at each merge or enqueue mutation
 boundary, including `shipyard runner steward`, and refuses its unstacked

@@ -103,6 +103,7 @@ mod tests {
     fn local_target() -> ResolvedTarget {
         ResolvedTarget {
             name: "mac".to_owned(),
+            validation_build_type: None,
             platform: "macos-arm64".to_owned(),
             backend_name: "local".to_owned(),
             warm_keepalive_seconds: 0,

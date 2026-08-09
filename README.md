@@ -12,6 +12,7 @@ shipyard run               # validates on every platform you configured
 shipyard ship              # validate, open PR, merge on green
 shipyard watch             # live-tail an in-flight ship
 shipyard queue-observe     # read-only GitHub queue deltas with adaptive backoff
+shipyard changed-surface-plan --pr 123 --target mac  # fail-closed shadow test plan
 shipyard wait pr 151 --state green  # wait on release / PR / run conditions
 shipyard auto-merge <pr>   # cron-friendly one-shot merge-on-green
 shipyard merge-queue status  # inspect the local queue-mutation hold
@@ -33,6 +34,10 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
 - **Evidence-based merge gate.** `shipyard ship` refuses to merge unless
   every required platform has passing evidence **for the exact HEAD SHA** —
   not the most-recent run, not the branch tip, the SHA.
+- **Fail-closed test-selection shadowing.** A target can declare mandatory
+  baseline smoke plus complete changed-surface families. Shipyard authenticates
+  PR/protected-base provenance and emits an exact-head receipt while the full
+  suite remains authoritative; ambiguity always falls back to full.
 - **Parallel-agent-aware queue.** Multiple agents in multiple worktrees
   share one machine-global queue with priorities, FIFO scheduling, and
   automatic deduplication.
@@ -78,6 +83,9 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   exports into a small SQLite store. Agents can ask for summaries, drift
   findings, and placement advice without requiring tartci or any observability
   service.
+
+See [exact-head changed-surface selection](docs/changed-surface-selection.md)
+for the base-owned schema, receipt fields, and hard-fail/fallback boundary.
 
 ## Installation
 

@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0850"></a>
+## [0.85.0] - 2026-08-08
+
+- feat: add fail-closed exact-head changed-surface shadow planning with protected-base policy, mandatory smoke, complete-family selection, typed fresh secondary proof, and target-bound queryable receipts
+
 <a id="v0840"></a>
 ## [0.84.0] - 2026-08-08
 
@@ -777,6 +782,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.85.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.85.0
 [0.84.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.84.0
 [0.83.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.83.0
 [0.82.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.82.0

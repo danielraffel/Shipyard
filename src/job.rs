@@ -115,6 +115,18 @@ pub struct TargetResult {
     pub status: TargetStatus,
     /// Backend label.
     pub backend: String,
+    /// Git HEAD observed in the execution checkout before validation began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_head_sha: Option<String>,
+    /// Git tree observed in the execution checkout before validation began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tree_sha: Option<String>,
+    /// Whether the execution checkout was clean before validation began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_checkout_clean: Option<bool>,
+    /// Whether validation began without resume or prepared-state stage reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_execution: Option<bool>,
     /// Duration in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<f64>,
@@ -210,6 +222,10 @@ impl TargetResult {
             platform: platform.into(),
             status,
             backend: backend.into(),
+            source_head_sha: None,
+            source_tree_sha: None,
+            source_checkout_clean: None,
+            full_execution: None,
             duration_secs: None,
             started_at: None,
             completed_at: None,
