@@ -568,12 +568,16 @@ fn validate_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
     validate_patterns(&policy.baseline_only_paths)?;
     validate_patterns(&policy.policy_paths)?;
     validate_patterns(&policy.test_topology_paths)?;
-    if policy
-        .baseline_only_paths
-        .iter()
-        .any(|pattern| matches!(pattern.as_str(), "*" | "**" | "**/*"))
-    {
-        return Err("baseline_only_paths may not match the whole repository".to_owned());
+    if policy.baseline_only_paths.iter().any(|pattern| {
+        pattern.split('/').next().is_none_or(|first| {
+            first
+                .chars()
+                .any(|character| matches!(character, '*' | '?' | '['))
+        })
+    }) {
+        return Err(
+            "baseline_only_paths must start with a literal top-level path component".to_owned(),
+        );
     }
     let declared = policy
         .baseline_tests
@@ -699,8 +703,8 @@ fn paths_match_any(paths: &[String], patterns: &[String]) -> Result<bool, Identi
 fn normalized_paths(paths: &[String]) -> Vec<String> {
     paths
         .iter()
-        .map(|path| path.trim().replace('\\', "/"))
         .filter(|path| !path.is_empty())
+        .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -967,6 +971,10 @@ mod tests {
         let mut bypass = policy();
         bypass.baseline_only_paths = vec!["**".to_owned()];
         assert!(validate_policy(&bypass).is_err());
+        bypass.baseline_only_paths = vec!["?*".to_owned()];
+        assert!(validate_policy(&bypass).is_err());
+        bypass.baseline_only_paths = vec!["d*/**".to_owned()];
+        assert!(validate_policy(&bypass).is_err());
     }
 
     #[test]
@@ -983,6 +991,28 @@ mod tests {
         assert_eq!(
             receipt.fallback_reason,
             Some(FallbackReason::BaseRefUnresolved)
+        );
+    }
+
+    #[test]
+    fn authenticated_path_identity_is_not_rewritten() {
+        let paths = vec!["docs\\literal ".to_owned(), "docs/literal".to_owned()];
+        let normalized = normalized_paths(&paths);
+        assert_eq!(normalized, ["docs/literal", "docs\\literal "]);
+        assert_ne!(normalized[0], normalized[1]);
+        assert!(normalized.iter().any(|path| path.ends_with(' ')));
+    }
+
+    #[test]
+    fn rename_source_path_can_force_policy_fallback() {
+        let receipt = plan_selection(
+            &input(&["schema/changed-surface.json", "docs/moved.json"]),
+            Ok(policy()),
+        )
+        .expect("fallback");
+        assert_eq!(
+            receipt.fallback_reason,
+            Some(FallbackReason::SelectorPolicyChanged)
         );
     }
 }

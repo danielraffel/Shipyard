@@ -77,6 +77,8 @@ struct CompareMetadata {
 #[derive(Debug, Deserialize)]
 struct PullFile {
     filename: String,
+    #[serde(default)]
+    previous_filename: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -148,6 +150,7 @@ pub(super) fn changed_surface_plan_command<W: Write>(
                     &[
                         "diff",
                         "--name-only",
+                        "--no-renames",
                         "-z",
                         &format!("{merge_base}..{}", pull.head.sha),
                     ],
@@ -299,7 +302,7 @@ fn fetch_changed_paths(
             format!("repos/{repo}/pulls/{pr}/files?per_page={FILES_PER_PAGE}&page={page}");
         let files: Vec<PullFile> = gh_api_json(client, cwd, &endpoint)?;
         let count = files.len();
-        paths.extend(files.into_iter().map(|file| file.filename));
+        paths.extend(pull_file_paths(files));
         if count < FILES_PER_PAGE {
             return Ok((paths, true));
         }
@@ -346,12 +349,26 @@ fn git_nul_paths(cwd: &Path, args: &[&str]) -> Result<Vec<String>, CliFailure> {
     if !output.status.success() {
         return Err(CliFailure::new(1, "compute local changed paths failed"));
     }
-    Ok(output
+    output
         .stdout
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .map(|path| String::from_utf8_lossy(path).into_owned())
-        .collect())
+        .map(|path| {
+            String::from_utf8(path.to_vec()).map_err(|_| {
+                CliFailure::new(
+                    1,
+                    "local changed path is not valid UTF-8; selector diff is ambiguous",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn pull_file_paths(files: Vec<PullFile>) -> Vec<String> {
+    files
+        .into_iter()
+        .flat_map(|file| file.previous_filename.into_iter().chain([file.filename]))
+        .collect()
 }
 
 fn receipt_path(state_dir: &Path, repo: &str, pr: u64, head: &str, target: &str) -> PathBuf {
@@ -438,5 +455,14 @@ mod tests {
             path,
             Path::new("/state/changed-surface/owner__repo/42/abc/______mac_target.json")
         );
+    }
+
+    #[test]
+    fn renamed_pull_files_include_source_and_destination_paths() {
+        let paths = pull_file_paths(vec![PullFile {
+            filename: "docs/new.md".to_owned(),
+            previous_filename: Some("schema/selector.json".to_owned()),
+        }]);
+        assert_eq!(paths, ["schema/selector.json", "docs/new.md"]);
     }
 }
