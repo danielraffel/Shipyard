@@ -13,6 +13,8 @@ pub mod branch;
 pub mod bundle;
 /// VM-slot-aware macOS capacity accounting across host-class members.
 pub mod capacity;
+/// Exact-head changed-surface test planning and shadow receipts.
+pub mod changed_surface;
 /// Changelog tag graph extraction and markdown rendering.
 pub mod changelog;
 /// Coarse failure classification shared by executors.
