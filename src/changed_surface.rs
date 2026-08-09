@@ -458,6 +458,16 @@ pub fn verify_receipt_identity(
             input.pr_base_sha.as_str(),
         ),
         (
+            "protected_ref_sha",
+            receipt.protected_ref_sha.as_str(),
+            input.protected_ref_sha.as_str(),
+        ),
+        (
+            "merge_base_sha",
+            receipt.merge_base_sha.as_str(),
+            input.local_merge_base_sha.as_str(),
+        ),
+        (
             "head_sha",
             receipt.head_sha.as_str(),
             input.pr_head_sha.as_str(),
@@ -936,6 +946,14 @@ mod tests {
         changed.pr_head_sha = C.to_owned();
         changed.local_head_sha = C.to_owned();
         assert!(verify_receipt_identity(&receipt, &changed).is_err());
+
+        let mut changed_base = input(&["src/audio/a.rs"]);
+        changed_base.protected_ref_sha = C.to_owned();
+        assert!(verify_receipt_identity(&receipt, &changed_base).is_err());
+
+        let mut changed_merge_base = input(&["src/audio/a.rs"]);
+        changed_merge_base.local_merge_base_sha = C.to_owned();
+        assert!(verify_receipt_identity(&receipt, &changed_merge_base).is_err());
     }
 
     #[test]
