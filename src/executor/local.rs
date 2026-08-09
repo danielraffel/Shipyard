@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -249,8 +250,14 @@ impl LocalExecutor {
             started_at,
             start_time,
         };
+        let source_cwd = request
+            .target
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
+        let source = source_cwd.as_deref().and_then(source_provenance);
 
-        match plan {
+        let mut result = match plan {
             LocalValidationPlan::SingleCommand(command) => Self::run_single(
                 &command,
                 &context,
@@ -272,7 +279,13 @@ impl LocalExecutor {
                 started_at,
                 Some(start_time.elapsed().as_secs_f64()),
             ),
+        };
+        if let Some((head, tree, clean)) = source {
+            result.source_head_sha = Some(head);
+            result.source_tree_sha = Some(tree);
+            result.source_checkout_clean = Some(clean);
         }
+        result
     }
 
     fn run_single(
@@ -479,6 +492,24 @@ impl LocalExecutor {
             filter_stages_by_prepared_state(stage_pairs, record.as_ref(), config_hash);
         (stages_to_run, skipped, record)
     }
+}
+
+fn source_provenance(cwd: &Path) -> Option<(String, String, bool)> {
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let head = git(&["rev-parse", "HEAD"])?;
+    let tree = git(&["rev-parse", "HEAD^{tree}"])?;
+    let status = git(&["status", "--porcelain", "--untracked-files=normal"])?;
+    Some((head, tree, status.is_empty()))
 }
 
 #[derive(Clone, Copy)]
@@ -741,7 +772,7 @@ mod tests {
     use super::{
         ContractConfig, LocalExecutor, LocalTargetConfig, LocalValidationConfig,
         LocalValidationPlan, LocalValidationRequest, StageCommand, TargetStatus, configured_stages,
-        plan_validation, prepared_state_enabled, read_log_tail,
+        plan_validation, prepared_state_enabled, read_log_tail, source_provenance,
     };
     use crate::prepared_state::PreparedStateStore;
 
@@ -750,6 +781,35 @@ mod tests {
             .iter()
             .map(|(stage, command)| ((*stage).to_owned(), (*command).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn source_provenance_binds_clean_head_and_tree_before_execution() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("git");
+            assert!(status.success());
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.path().join("source.txt"), "clean\n").expect("source");
+        git(&["add", "source.txt"]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        let (head, tree, clean) = source_provenance(repo.path()).expect("provenance");
+        assert_eq!(head.len(), 40);
+        assert_eq!(tree.len(), 40);
+        assert!(clean);
+
+        std::fs::write(repo.path().join("source.txt"), "dirty\n").expect("edit");
+        let (_, same_tree, clean) = source_provenance(repo.path()).expect("provenance");
+        assert_eq!(tree, same_tree);
+        assert!(!clean);
     }
 
     #[test]

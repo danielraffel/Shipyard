@@ -143,6 +143,8 @@ pub struct SecondaryProof {
     pub build_type: BuildType,
     /// Exact validated head SHA.
     pub head_sha: String,
+    /// Exact git tree observed by the target before execution.
+    pub tree_sha: String,
     /// Evidence status.
     pub passed: bool,
     /// Reused ancestor evidence is never accepted for a required secondary leg.
@@ -273,6 +275,8 @@ pub struct SecondaryProofReceipt {
     pub build_type: BuildType,
     /// Exact head proven by the target.
     pub head_sha: String,
+    /// Exact git tree observed by the target before execution.
+    pub tree_sha: String,
     /// Completion time of the accepted fresh execution.
     pub completed_at: DateTime<Utc>,
     /// Contract digest recorded by the execution, when present.
@@ -415,11 +419,9 @@ fn secondary_contract_digests(
             if !matches!(
                 target.validation,
                 crate::executor::dispatch::ResolvedValidation::Local(_)
-                    | crate::executor::dispatch::ResolvedValidation::Ssh { .. }
-                    | crate::executor::dispatch::ResolvedValidation::Windows { .. }
             ) {
                 return Err(format!(
-                    "required secondary target {name:?} must use a concrete local, ssh, or ssh-windows validation contract"
+                    "required secondary target {name:?} must use a concrete local validation contract"
                 ));
             }
             let digest =
@@ -658,6 +660,7 @@ fn select_policy_families(
                     target: required_target.clone(),
                     build_type: proof.build_type,
                     head_sha: proof.head_sha.clone(),
+                    tree_sha: proof.tree_sha.clone(),
                     completed_at: proof.completed_at,
                     contract_digest: proof.contract_digest.clone(),
                     families: Vec::new(),
@@ -704,6 +707,7 @@ fn required_secondary_proof<'a>(
     input.secondary_proofs.iter().find(|proof| {
         proof.target == target
             && proof.head_sha == input.pr_head_sha
+            && proof.tree_sha == input.remote_tree_sha
             && proof.build_type == build_type
             && proof.passed
             && !proof.reused
@@ -879,6 +883,7 @@ pub fn verify_receipt_identity(
             proof.target == required.target
                 && proof.build_type == required.build_type
                 && proof.head_sha == required.head_sha
+                && proof.tree_sha == required.tree_sha
                 && proof.passed
                 && !proof.reused
                 && proof.completed_at == required.completed_at
@@ -1514,6 +1519,7 @@ mod tests {
             target: "release-installed-sdk".to_owned(),
             build_type: BuildType::Release,
             head_sha: B.to_owned(),
+            tree_sha: C.to_owned(),
             passed: true,
             reused: false,
             completed_at: debug.observed_at,

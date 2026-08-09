@@ -26,6 +26,15 @@ pub struct EvidenceRecord {
     pub status: String,
     /// Backend that produced this evidence.
     pub backend: String,
+    /// Git HEAD observed in the execution checkout before validation began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_head_sha: Option<String>,
+    /// Git tree observed in the execution checkout before validation began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tree_sha: Option<String>,
+    /// Whether the execution checkout was clean before validation began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_checkout_clean: Option<bool>,
     /// Completion timestamp.
     pub completed_at: DateTime<Utc>,
     /// Optional duration in seconds.
@@ -491,6 +500,9 @@ mod tests {
             platform: format!("{target}-platform"),
             status: "pass".to_owned(),
             backend: "local".to_owned(),
+            source_head_sha: None,
+            source_tree_sha: None,
+            source_checkout_clean: None,
             completed_at: Utc::now(),
             duration_secs: None,
             host: None,
@@ -515,6 +527,9 @@ mod tests {
             platform: "macos-arm64".to_owned(),
             status: "pass".to_owned(),
             backend: "reused".to_owned(),
+            source_head_sha: Some("new".to_owned()),
+            source_tree_sha: Some("tree".to_owned()),
+            source_checkout_clean: Some(true),
             completed_at: Utc::now(),
             duration_secs: None,
             host: None,

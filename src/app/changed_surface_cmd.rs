@@ -171,8 +171,12 @@ pub(super) fn changed_surface_plan_command<W: Write>(
     let (base_tracked_paths, base_tracked_paths_complete) =
         git_nul_paths(cwd, &["ls-tree", "-r", "--name-only", "-z", &pull.base.sha])
             .map_or((Vec::new(), false), |paths| (paths, true));
-    let secondary_proofs =
-        collect_secondary_proofs(policy.as_ref().ok(), state_dir, &pull.head.sha);
+    let secondary_proofs = collect_secondary_proofs(
+        policy.as_ref().ok(),
+        state_dir,
+        &pull.head.sha,
+        &remote_commit.tree.sha,
+    );
 
     let input = ExactHeadInput {
         repository: repo.clone(),
@@ -246,6 +250,7 @@ fn collect_secondary_proofs(
     policy: Option<&ChangedSurfacePolicy>,
     state_dir: &Path,
     head_sha: &str,
+    tree_sha: &str,
 ) -> Vec<SecondaryProof> {
     let Some(policy) = policy else {
         return Vec::new();
@@ -277,11 +282,15 @@ fn collect_secondary_proofs(
                         .as_deref()
                         .and_then(parse_build_type);
                     (observed_build_type == Some(build_type)
-                        && evidence.contract_digest.as_ref() == Some(expected_contract))
+                        && evidence.contract_digest.as_ref() == Some(expected_contract)
+                        && evidence.source_head_sha.as_deref() == Some(head_sha)
+                        && evidence.source_tree_sha.as_deref() == Some(tree_sha)
+                        && evidence.source_checkout_clean == Some(true))
                     .then_some(SecondaryProof {
                         target: target.clone(),
                         build_type,
                         head_sha: evidence.sha,
+                        tree_sha: evidence.source_tree_sha.expect("matched tree identity"),
                         passed,
                         reused,
                         completed_at: evidence.completed_at,
@@ -502,6 +511,8 @@ fn short_sha(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changed_surface::TestFamily;
+    use crate::evidence::EvidenceRecord;
 
     #[test]
     fn branch_ref_is_encoded_as_one_api_path_component() {
@@ -537,5 +548,69 @@ mod tests {
             previous_filename: Some("schema/selector.json".to_owned()),
         }]);
         assert_eq!(paths, ["schema/selector.json", "docs/new.md"]);
+    }
+
+    #[test]
+    fn secondary_collector_requires_clean_executed_head_and_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let mut policy = ChangedSurfacePolicy {
+            schema_version: 1,
+            full_test_count: 2,
+            build_type: BuildType::Debug,
+            build_flags: Vec::new(),
+            baseline_tests: vec!["smoke".to_owned()],
+            baseline_only_paths: Vec::new(),
+            policy_paths: Vec::new(),
+            test_topology_paths: vec!["tests/**".to_owned()],
+            families: vec![TestFamily {
+                name: "sdk".to_owned(),
+                paths: vec!["sdk/**".to_owned()],
+                tests: vec!["installed SDK".to_owned()],
+                supported_build_types: vec![BuildType::Release],
+                required_secondary_target: Some("release-sdk".to_owned()),
+                required_secondary_build_type: Some(BuildType::Release),
+            }],
+            secondary_contract_digests: BTreeMap::from([(
+                "release-sdk".to_owned(),
+                "contract".to_owned(),
+            )]),
+        };
+        let store = EvidenceStore::new(temp.path().join("evidence")).expect("store");
+        let mut evidence = EvidenceRecord {
+            sha: head.clone(),
+            branch: "feature".to_owned(),
+            target_name: "release-sdk".to_owned(),
+            validation_build_type: Some("release".to_owned()),
+            platform: "macos-arm64".to_owned(),
+            status: "pass".to_owned(),
+            backend: "local".to_owned(),
+            source_head_sha: Some(head.clone()),
+            source_tree_sha: Some(tree.clone()),
+            source_checkout_clean: Some(true),
+            completed_at: Utc::now(),
+            duration_secs: None,
+            host: None,
+            primary_backend: None,
+            failover_reason: None,
+            provider: None,
+            runner_profile: None,
+            failure_class: None,
+            reused_from: None,
+            contract_digest: Some("contract".to_owned()),
+            stages_signature: None,
+        };
+        store.record(&evidence).expect("record");
+        assert_eq!(
+            collect_secondary_proofs(Some(&policy), temp.path(), &head, &tree).len(),
+            1
+        );
+
+        evidence.source_checkout_clean = Some(false);
+        store.record(&evidence).expect("replace record");
+        assert!(collect_secondary_proofs(Some(&policy), temp.path(), &head, &tree).is_empty());
+        policy.secondary_contract_digests.clear();
+        assert!(collect_secondary_proofs(Some(&policy), temp.path(), &head, &tree).is_empty());
     }
 }
