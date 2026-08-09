@@ -90,7 +90,9 @@ target for the same exact head. The execution record must itself carry the
 matching `validation_build_type`, must be no more than 24 hours old, and its
 completion time and contract digest are bound into the receipt. Historical,
 ancestor-reused, direct- or profile-advisory, wrong-build, or wrong-head evidence
-does not satisfy the requirement.
+does not satisfy the requirement. Secondary targets must use a concrete local,
+SSH, or SSH-Windows validation contract; cloud, host-pool, and fallback targets
+are rejected because their wrapper identity is not a concrete executed command.
 
 ## Planning an exact PR head
 

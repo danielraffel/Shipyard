@@ -412,6 +412,16 @@ fn secondary_contract_digests(
                 .iter()
                 .find(|target| target.name == name)
                 .ok_or_else(|| format!("required secondary target {name:?} did not resolve"))?;
+            if !matches!(
+                target.validation,
+                crate::executor::dispatch::ResolvedValidation::Local(_)
+                    | crate::executor::dispatch::ResolvedValidation::Ssh { .. }
+                    | crate::executor::dispatch::ResolvedValidation::Windows { .. }
+            ) {
+                return Err(format!(
+                    "required secondary target {name:?} must use a concrete local, ssh, or ssh-windows validation contract"
+                ));
+            }
             let digest =
                 crate::queue_request::validation_contract_digest(target).ok_or_else(|| {
                     format!("required secondary target {name:?} has no typed validation contract")
@@ -1580,5 +1590,11 @@ mod tests {
             "[targets.release-sdk]\n            platform = \"macos-arm64\"\n            validation_build_type = \"debug\"",
         );
         assert!(policy_from_toml(&wrong_build, "debug").is_err());
+
+        let cloud = required.replace(
+            "[targets.release-sdk]\n            platform",
+            "[targets.release-sdk]\n            backend = \"cloud\"\n            workflow = \"release.yml\"\n            platform",
+        );
+        assert!(policy_from_toml(&cloud, "debug").is_err());
     }
 }

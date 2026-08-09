@@ -73,8 +73,9 @@ Release-only families under a Debug target require fresh, non-reused,
 same-exact-head evidence no more than 24 hours old from their base-declared
 Release target. The evidence must carry that target's own
 `validation_build_type`, and neither direct nor active-profile advisory targets
-qualify; without it the plan is policy-blocked, not redirected into a
-known-incompatible full Debug run.
+qualify. Use a concrete local, SSH, or SSH-Windows secondary target, not a cloud,
+host-pool, or fallback wrapper; without it the plan is policy-blocked, not
+redirected into a known-incompatible full Debug run.
 See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard

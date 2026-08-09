@@ -356,6 +356,39 @@ impl EvidenceStore {
         best.map(|(_, record)| record)
     }
 
+    /// Return every non-reused passing record for one target and exact SHA,
+    /// newest first, so callers can apply their complete contract predicate.
+    #[must_use]
+    pub fn passing_records_for_target_sha(
+        &self,
+        target_name: &str,
+        sha: &str,
+    ) -> Vec<EvidenceRecord> {
+        let Ok(entries) = fs::read_dir(&self.path) else {
+            return Vec::new();
+        };
+        let mut records = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")).then_some(path)
+            })
+            .filter_map(|path| {
+                let branch_key = path.file_stem()?.to_str()?;
+                self.load_branch(branch_key).ok()
+            })
+            .flat_map(std::collections::BTreeMap::into_values)
+            .filter(|record| {
+                record.target_name == target_name
+                    && record.sha == sha
+                    && record.passed()
+                    && !record.reused()
+            })
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| std::cmp::Reverse(record.completed_at));
+        records
+    }
+
     fn branch_file(&self, branch_key: &str) -> PathBuf {
         self.path.join(format!("{branch_key}.json"))
     }
@@ -683,6 +716,14 @@ mod tests {
             .query_passing_for_target("mac", std::slice::from_ref(&same_sha))
             .expect("newest exact-sha record");
         assert_eq!(newest.branch, "new");
+        let all_exact = store.passing_records_for_target_sha("mac", &same_sha);
+        assert_eq!(
+            all_exact
+                .iter()
+                .map(|record| record.branch.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "old"]
+        );
         assert!(
             store
                 .query_passing_for_target("linux", &["abc".to_owned()])

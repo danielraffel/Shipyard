@@ -939,7 +939,9 @@ build-incompatible family must name a typed, non-advisory secondary target; the
 plan stays blocked until evidence from that target proves its own declared
 `validation_build_type`, the same exact head, and completion within 24 hours.
 Direct and active-profile advisory targets, reused evidence, and older records
-do not qualify. Never substitute full Debug for a Release-only installed-SDK
+do not qualify. Required secondary targets must be concrete local, SSH, or
+SSH-Windows validation contracts, not cloud or composite wrappers. Never
+substitute full Debug for a Release-only installed-SDK
 family or treat historical Release evidence as sufficient. See
 [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 

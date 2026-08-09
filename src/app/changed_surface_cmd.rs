@@ -265,16 +265,20 @@ fn collect_secondary_proofs(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .filter_map(|(target, build_type)| {
+            let expected_contract = policy.secondary_contract_digests.get(target)?;
             store
-                .query_passing_for_target(target, &[head_sha.to_owned()])
-                .and_then(|evidence| {
+                .passing_records_for_target_sha(target, head_sha)
+                .into_iter()
+                .find_map(|evidence| {
                     let passed = evidence.passed();
                     let reused = evidence.reused();
                     let observed_build_type = evidence
                         .validation_build_type
                         .as_deref()
                         .and_then(parse_build_type);
-                    (observed_build_type == Some(build_type)).then_some(SecondaryProof {
+                    (observed_build_type == Some(build_type)
+                        && evidence.contract_digest.as_ref() == Some(expected_contract))
+                    .then_some(SecondaryProof {
                         target: target.clone(),
                         build_type,
                         head_sha: evidence.sha,
