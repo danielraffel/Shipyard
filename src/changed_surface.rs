@@ -199,6 +199,15 @@ pub enum PlannedSuite {
     Full,
 }
 
+/// Outcomes carried by a shadow receipt. This phase never claims target proof.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SelectionOutcomes {
+    /// Planner result after exact-head verification.
+    pub planner: String,
+    /// Full-suite result is owned by the existing target execution path.
+    pub authoritative_execution: String,
+}
+
 /// Exact-head shadow-planning receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SelectionReceipt {
@@ -243,6 +252,8 @@ pub struct SelectionReceipt {
     pub planned_suite: PlannedSuite,
     /// Authoritative suite executed in this phase.
     pub authoritative_suite: PlannedSuite,
+    /// Explicit planner/authoritative-execution outcomes.
+    pub outcomes: SelectionOutcomes,
     /// Selected bounded count, or the full count on fallback when known.
     pub selected_count: Option<usize>,
     /// Declared full-suite count when policy parsing succeeded.
@@ -619,6 +630,10 @@ fn base_receipt(input: &ExactHeadInput, changed_paths: Vec<String>) -> Selection
         family_coverage: BTreeMap::new(),
         planned_suite: PlannedSuite::Full,
         authoritative_suite: PlannedSuite::Full,
+        outcomes: SelectionOutcomes {
+            planner: "planned".to_owned(),
+            authoritative_execution: "not_observed_by_shadow_planner".to_owned(),
+        },
         selected_count: None,
         full_count: None,
         fallback_reason: None,

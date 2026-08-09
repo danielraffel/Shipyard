@@ -62,6 +62,15 @@ state root and takes an exclusive per-cursor lock. It exposes no mutation flag,
 does not acquire a mutation lease, and needs no write credential. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
 
+Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
+--target <name>` for the shadow-only exact-head selector. Policy must come from
+the authenticated protected base and may contain only reviewed path globs plus
+literal baseline/family tests. Never substitute caller regexes, caller-selected
+base/head SHAs, `skip-target`, `resume-from`, or diff-cover selectors. A local
+head/tree mismatch hard-fails with no receipt; every later ambiguity selects the
+full suite. The receipt is telemetry and cannot replace full target evidence.
+See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
+
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard
 inspects `PullRequest.stack` and `stackEntry` at each merge or enqueue mutation
 boundary, including `shipyard runner steward`, and refuses its unstacked
