@@ -121,5 +121,57 @@ Stops the LaunchAgent, fetches a removal token, and runs `config.sh remove`.
 3. `shipyard runner register --repo <owner/repo> --count <N> --ci-root <dir>`
 4. `shipyard runner list --repo <owner/repo>` to confirm `<repo>-m5-NN` online.
 
+## GitHub TLS/DNS diagnostic on Mac hosts
+
+If `ghapp` or Shipyard reports a TLS handshake timeout while GitHub Status is
+operational, first test the host rather than treating the event as a GitHub
+outage. Run the same read-only probe in both resolver modes:
+
+```bash
+python3 - <<'PY'
+import os, subprocess
+
+for label, extra in (("default", {}), ("go", {"GODEBUG": "netdns=go"})):
+    env = os.environ.copy()
+    env.update(extra)
+    try:
+        result = subprocess.run(
+            ["ghapp", "api", "repos/OWNER/REPO/git/ref/heads/main", "--jq", ".object.sha"],
+            env=env, text=True, capture_output=True, timeout=8,
+        )
+        print(label, result.returncode, (result.stdout or result.stderr).strip())
+    except subprocess.TimeoutExpired:
+        print(label, "timeout")
+PY
+```
+
+Record the host, macOS build, resolver mode, elapsed time, and SHA/error. A
+`default` timeout with a successful `GODEBUG=netdns=go` probe identifies a
+host-local Go/cgo DNS/TLS path problem. Do not apply that workaround fleet-wide
+without reproducing it: the M1 and M5 probes on 2026-08-12 succeeded in both
+modes, while the controller Mac Studio reproduced the difference.
+
+For Git transport failures, test SSH over GitHub's HTTPS port and verify the
+published GitHub Ed25519 fingerprint before accepting the host key:
+
+```bash
+ssh-keyscan -p 443 -t ed25519 ssh.github.com | ssh-keygen -lf -
+ssh -T -p 443 -o HostName=ssh.github.com git@ssh.github.com
+```
+
+If the 1Password SSH agent stalls during signing, bypass only that agent for
+the operation and select an authorized local key explicitly:
+
+```bash
+GIT_SSH_COMMAND='ssh -o HostName=ssh.github.com -p 443 \
+  -o IdentityAgent=none -o IdentitiesOnly=yes -i ~/.ssh/id_rsa' \
+  git fetch origin
+```
+
+Keep `GODEBUG=netdns=go` and the SSH-over-443 setting host-local (bootstrap,
+LaunchAgent environment, or the local `ghapp`/Shipyard wrapper). Do not put
+machine-network workarounds in a repository's `CLAUDE.md`, source, or public
+skills. Re-test after OS, Go, Shipyard, DNS, or 1Password-agent updates.
+
 The index continues from any existing runners on other machines, so the M5's
 runners never collide with the Studio's or the laptop's.
