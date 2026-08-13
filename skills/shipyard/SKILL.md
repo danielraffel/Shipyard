@@ -704,6 +704,8 @@ have enough unreserved online idle `pulp-ci-ephemeral-*` runners after matching
 queued jobs reserve their slots; otherwise it deletes the variable.
 `--apply --watch --interval-secs 60` is the durable controller form.
 The profile TTL must be 60–900 seconds, so a dead controller expires safely.
+The accepted event scope is exactly `merge_group`, and the first target must
+include `pulp-auto-linux-x64`; pull-request routing is rejected.
 
 This is a routing lease, not merge or runner mutation authority. It never
 changes the selector variable, dispatches or cancels a workflow, or touches the

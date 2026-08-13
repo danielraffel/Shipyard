@@ -25,16 +25,20 @@ targets = ["macpro.linux-x64-vm", "github.linux-x64"]
 github_variable = "PULP_LOCAL_LINUX_RUNS_ON_JSON"
 health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
-health_lease_events = ["pull_request", "merge_group"]
+health_lease_events = ["merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
 health_lease_min_idle = 1
+
+[targets."macpro.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-auto-linux-x64"]
 ```
 
 Required runner labels come from the first target's `runs_on_json`; they are
 not duplicated in the lease declaration. Shipyard rejects TTLs outside
-60–900 seconds, any event scope other than the exact unprivileged
-`pull_request`/`merge_group` pair, a non-ephemeral runner prefix, a zero idle
-minimum, or a first target missing `self-hosted`, `Linux`, or `X64`.
+60–900 seconds, any event scope other than exactly `merge_group`, a
+non-ephemeral runner prefix, a zero idle minimum, or a first target missing
+`self-hosted`, `Linux`, `X64`, or the protected automatic opt-in label
+`pulp-auto-linux-x64`.
 
 ## Operation
 

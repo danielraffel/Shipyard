@@ -549,6 +549,7 @@ mod tests {
             "X64",
             "pulp-build-linux-x64",
             "pulp-host-macpro",
+            "pulp-auto-linux-x64",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -568,6 +569,7 @@ mod tests {
                 "X64",
                 "pulp-build-linux-x64",
                 "pulp-host-macpro",
+                "pulp-auto-linux-x64",
             ],
         )];
         let decision = decide_lease(&runners, "pulp-ci-ephemeral-", &labels(), 0, 1, 300, now);
@@ -591,6 +593,7 @@ mod tests {
                 "X64",
                 "pulp-build-linux-x64",
                 "pulp-host-macpro",
+                "pulp-auto-linux-x64",
             ],
         )];
         let decision = decide_lease(&runners, "pulp-ci-ephemeral-", &labels(), 0, 1, 300, now);
@@ -612,6 +615,7 @@ mod tests {
                     "X64",
                     "pulp-build-linux-x64",
                     "pulp-host-macpro",
+                    "pulp-auto-linux-x64",
                 ],
             ),
             runner(
@@ -624,6 +628,7 @@ mod tests {
                     "X64",
                     "pulp-build-linux-x64",
                     "pulp-host-macpro",
+                    "pulp-auto-linux-x64",
                 ],
             ),
         ];

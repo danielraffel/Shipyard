@@ -353,7 +353,7 @@ pub(super) fn load_local_linux_lease_profile(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for required in ["self-hosted", "Linux", "X64"] {
+    for required in ["self-hosted", "Linux", "X64", "pulp-auto-linux-x64"] {
         if !required_labels
             .iter()
             .any(|label| label.eq_ignore_ascii_case(required))
@@ -426,10 +426,10 @@ fn strict_health_lease_plan(table: &Table) -> Result<HealthLeasePlan, CliFailure
             "health_lease_ttl_seconds must be between 60 and 900",
         ));
     }
-    if lease.events != ["pull_request", "merge_group"] {
+    if lease.events != ["merge_group"] {
         return Err(CliFailure::new(
             2,
-            "health_lease_events must be exactly [\"pull_request\", \"merge_group\"]",
+            "health_lease_events must be exactly [\"merge_group\"]",
         ));
     }
     if lease.runner_name_prefix.trim().is_empty() || !lease.runner_name_prefix.contains("ephemeral")
@@ -702,12 +702,12 @@ targets = ["macpro.linux-x64-vm", "github.linux-x64"]
 github_variable = "PULP_LOCAL_LINUX_RUNS_ON_JSON"
 health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
-health_lease_events = ["pull_request", "merge_group"]
+health_lease_events = ["merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
 health_lease_min_idle = 1
 
 [targets."macpro.linux-x64-vm"]
-runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-auto-linux-x64"]
 
 [targets."github.linux-x64"]
 runs_on_json = "ubuntu-latest"
@@ -727,10 +727,78 @@ runs_on_json = "ubuntu-latest"
 
         assert_eq!(lease.variable, "PULP_LOCAL_LINUX_LEASE_UNTIL");
         assert_eq!(lease.ttl_seconds, 300);
-        assert_eq!(lease.events, ["pull_request", "merge_group"]);
+        assert_eq!(lease.events, ["merge_group"]);
         assert_eq!(lease.runner_name_prefix, "pulp-ci-ephemeral-");
         assert_eq!(lease.min_idle, 1);
         assert!(lease.required_labels.iter().any(|label| label == "X64"));
+        assert!(
+            lease
+                .required_labels
+                .iter()
+                .any(|label| label == "pulp-auto-linux-x64")
+        );
+    }
+
+    #[test]
+    fn rejects_pull_request_health_lease_scope() {
+        let profile = r#"
+name = "normal-local-fast"
+
+[repo."owner/repo".pr.linux]
+targets = ["macpro.linux-x64-vm"]
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["pull_request", "merge_group"]
+health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+
+[targets."macpro.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro", "pulp-auto-linux-x64"]
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        fs::write(&path, profile).expect("write profile");
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "normal-local-fast",
+            Some(&path),
+            "owner/repo",
+            "pr",
+            "linux",
+        )
+        .expect_err("pull-request scope must fail");
+        assert!(error.message.contains("exactly [\"merge_group\"]"));
+    }
+
+    #[test]
+    fn rejects_target_without_protected_automatic_label() {
+        let profile = r#"
+name = "normal-local-fast"
+
+[repo."owner/repo".pr.linux]
+targets = ["macpro.linux-x64-vm"]
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+
+[targets."macpro.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        fs::write(&path, profile).expect("write profile");
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "normal-local-fast",
+            Some(&path),
+            "owner/repo",
+            "pr",
+            "linux",
+        )
+        .expect_err("unprotected automatic target must fail");
+        assert!(error.message.contains("pulp-auto-linux-x64"));
     }
 
     #[test]
@@ -742,7 +810,7 @@ name = "normal-local-fast"
 targets = ["macpro.linux-x64-vm"]
 health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 901
-health_lease_events = ["pull_request", "merge_group"]
+health_lease_events = ["merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
 
 [targets."macpro.linux-x64-vm"]
@@ -773,7 +841,7 @@ name = "normal-local-fast"
 targets = ["macpro.linux-x64-vm"]
 health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
-health_lease_events = ["pull_request", "merge_group"]
+health_lease_events = ["merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
 health_lease_min_idle = "2"
 
