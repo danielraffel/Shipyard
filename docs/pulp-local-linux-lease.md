@@ -1,9 +1,9 @@
 # Pulp local Linux health lease
 
 `shipyard runner local-linux-lease` is the external health authority for Pulp's
-two disposable Mac Pro Linux CI routes. It does not dispatch workflows or mutate the
-merge queue. It only maintains the short repository variable consumed before a
-workflow creates its matrix:
+disposable Mac Pro Linux CI routes. It does not dispatch workflows or mutate
+the merge queue. It only maintains a short repository variable consumed before
+a workflow creates its matrix:
 
 ```text
 PULP_LOCAL_LINUX_LEASE_UNTIL=2026-08-13T18:50:00Z
@@ -13,6 +13,10 @@ PULP_PR_SAFE_LINUX_LEASE_UNTIL=2026-08-13T18:50:00Z
 The value is an RFC3339 UTC expiry. Pulp uses the local selector only while the
 value is in the future; an absent, malformed, or expired value selects
 `ubuntu-latest`.
+
+The merge-group lane is the currently checked-in Pulp contract. PR-safe support
+is dormant until Pulp separately provisions the named ephemeral pool and adds
+the PR profile lane, lease variable, and advisory workflow consumer shown below.
 
 ## Checked-in policy
 
@@ -49,11 +53,13 @@ runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-hos
 
 Required runner labels come from the first target's `runs_on_json`; they are
 not duplicated in the lease declaration. Shipyard accepts only two complete
-namespaces: trusted `merge_group` with `PULP_LOCAL_LINUX_LEASE_UNTIL`,
+namespaces: context `merge_group` with `PULP_LOCAL_LINUX_LEASE_UNTIL`,
 `pulp-ci-ephemeral-`, and `pulp-auto-linux-x64`; or PR-safe `pull_request` with
-`PULP_PR_SAFE_LINUX_LEASE_UNTIL`, `pulp-pr-safe-ephemeral-`, and
-`pulp-pr-safe-linux-x64`. Mixed namespaces fail closed. TTLs must be 60–900
-seconds, the branch must be `main`, and admission burst must be positive.
+profile context `pr`, `PULP_PR_SAFE_LINUX_LEASE_UNTIL`,
+`pulp-pr-safe-ephemeral-`, and
+`pulp-pr-safe-linux-x64`. Mixed control tuples or target selectors carrying both
+capability labels fail closed. TTLs must be 60–900 seconds, the branch must be
+`main`, and admission burst must be positive.
 
 ## Operation
 
@@ -85,14 +91,20 @@ shipyard runner local-linux-lease \
 Each tick lists all registered runners through Shipyard's configured GitHub
 authentication. A runner authorizes renewal only when its name has the exact
 lane-specific prefix, it carries every label from the first local target,
-it is online, and it is idle. Shipyard also reads the live rules applying to `main`
+it is online, and it is idle. Renewal also fails closed if any registered runner
+eligible for the selector sits outside that prefix or carries the opposite
+trusted/PR-safe capability label; GitHub schedules by labels, not runner names.
+Shipyard also reads the live rules applying to `main`
 and extracts the merge queue's `max_entries_to_build` for the merge-group lane.
-The PR-safe lane uses its own declared burst because it does not consume merge
-queue admission. The declared admission
-burst must be at least that live value, and that many matching runners must
+The PR-safe lane uses its own declared capacity budget because it does not
+consume merge-queue admission and GitHub exposes no equivalent repository-wide
+PR materialization cap. It must remain advisory: the TTL snapshot is not atomic
+admission control and cannot guarantee hosted fallback after a job is assigned.
+For the merge-group lane, the declared admission burst must be at least the live
+value. For either lane, that many matching runners must
 remain idle after already-queued jobs reserve their slots. This covers the
-largest group of workflows GitHub can materialize from one shared lease
-snapshot; a TTL is not treated as atomic admission control.
+reviewed admission budget for one shared lease snapshot; a TTL is not treated as
+atomic admission control.
 
 The renewal expiry is computed only after the runner, job, and branch-rule
 observations finish, then written as `observation_completed_at +

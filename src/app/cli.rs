@@ -977,7 +977,7 @@ pub(super) enum RunnerCommand {
         #[arg(long = "profile-file")]
         profile_file: Option<PathBuf>,
         /// Profile context containing the lease declaration.
-        #[arg(long, default_value = "pr")]
+        #[arg(long, default_value = "merge_group")]
         context: String,
         /// Profile lane containing the lease declaration.
         #[arg(long, default_value = "linux")]
@@ -1805,7 +1805,7 @@ impl From<PathMode> for RuntimeMode {
 mod tests {
     use clap::Parser;
 
-    use super::Cli;
+    use super::{Cli, Command, RunnerCommand};
 
     #[test]
     fn queue_observer_rejects_zero_max_polls() {
@@ -1817,5 +1817,19 @@ mod tests {
             Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "1",])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn local_linux_lease_defaults_to_trusted_merge_group_context() {
+        let cli = Cli::try_parse_from(["shipyard", "runner", "local-linux-lease"])
+            .expect("default local Linux lease command");
+        let Command::Runner {
+            command: RunnerCommand::LocalLinuxLease { context, lane, .. },
+        } = cli.command
+        else {
+            panic!("expected local Linux lease command");
+        };
+        assert_eq!(context, "merge_group");
+        assert_eq!(lane, "linux");
     }
 }

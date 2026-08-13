@@ -708,8 +708,20 @@ burst; otherwise it deletes the variable. With Pulp's five-entry queue and
 two-runner fleet, automatic routing intentionally remains disarmed.
 `--apply --watch --interval-secs 60` is the durable controller form.
 The profile TTL must be 60–900 seconds, so a dead controller expires safely.
-The accepted event scope is exactly `merge_group`, and the first target must
-include `pulp-auto-linux-x64`; pull-request routing is rejected.
+The default accepted namespace is exactly `merge_group`, and the first target
+must include `pulp-auto-linux-x64`.
+
+An independently provisioned PR-safe pool is selected explicitly with
+`--context pr --lane linux`. It must use the complete tuple
+`PULP_PR_SAFE_LINUX_LEASE_UNTIL`, `pull_request`,
+`pulp-pr-safe-ephemeral-`, and target label `pulp-pr-safe-linux-x64`.
+The trusted and PR-safe capability labels are mutually exclusive in a target;
+mixed tuples or selectors fail closed. The live inventory must also show that
+every selector-eligible registration uses the approved prefix and lacks the
+opposite capability. The PR-safe admission burst is a
+reviewed capacity budget because GitHub exposes no repository-wide PR
+materialization cap, so this lane must remain advisory and cannot promise
+hosted fallback after assignment.
 
 This is a routing lease, not merge or runner mutation authority. It never
 changes the selector variable, dispatches or cancels a workflow, or touches the
