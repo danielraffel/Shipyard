@@ -964,6 +964,38 @@ pub(super) enum RunnerCommand {
         #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
         release_stale_threshold_secs: i64,
     },
+    /// Maintain an expiring repository-variable lease for an approved local
+    /// Linux CI lane. Dry-run unless `--apply` is supplied.
+    LocalLinuxLease {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Checked-in CI routing profile name.
+        #[arg(long, default_value = "normal-local-fast")]
+        profile: String,
+        /// Explicit profile path. Defaults to Shipyard's normal profile search.
+        #[arg(long = "profile-file")]
+        profile_file: Option<PathBuf>,
+        /// Profile context containing the lease declaration.
+        #[arg(long, default_value = "pr")]
+        context: String,
+        /// Profile lane containing the lease declaration.
+        #[arg(long, default_value = "linux")]
+        lane: String,
+        /// Renew or clear the repository variable. Without this flag, print
+        /// the decision without changing GitHub.
+        #[arg(long)]
+        apply: bool,
+        /// Continue probing and renewing until interrupted.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between watch ticks. Must be shorter than the lease TTL.
+        #[arg(long = "interval-secs", default_value_t = 60)]
+        interval_secs: u64,
+        /// Stop after N ticks. Test hook.
+        #[arg(long = "max-ticks", hide = true)]
+        max_ticks: Option<u32>,
+    },
     /// Audit and conservatively advance merge-on-green across repositories.
     ///
     /// Dry-run is the default. `--apply` may enqueue an exact green head,
