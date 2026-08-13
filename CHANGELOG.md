@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0871"></a>
+## [0.87.1] - 2026-08-13
+
+- fix(release): preserve macOS user keychain state ([#405](https://github.com/danielraffel/Shipyard/pull/405))
+
 <a id="v0870"></a>
 ## [0.87.0] - 2026-08-13
 
@@ -794,6 +799,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.87.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.1
 [0.87.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.0
 [0.86.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.86.0
 [0.85.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.85.0
