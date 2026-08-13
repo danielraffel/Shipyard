@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0850"></a>
-## [0.86.0]
+<a id="v0860"></a>
+## [0.86.0] - 2026-08-13
 
+- fix(runner): protect release workflows from bulk cancellation ([#399](https://github.com/danielraffel/Shipyard/pull/399))
+
+<a id="v0850"></a>
 ## [0.85.0] - 2026-08-08
 
 - Add exact-head changed-surface shadow planner ([#398](https://github.com/danielraffel/Shipyard/pull/398))
@@ -784,6 +787,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.86.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.86.0
 [0.85.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.85.0
 [0.84.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.84.0
 [0.83.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.83.0
