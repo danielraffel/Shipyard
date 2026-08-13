@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0850"></a>
+## [0.86.0]
+
 ## [0.85.0] - 2026-08-08
 
 - Add exact-head changed-surface shadow planner ([#398](https://github.com/danielraffel/Shipyard/pull/398))
