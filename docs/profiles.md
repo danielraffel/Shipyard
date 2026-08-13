@@ -206,3 +206,27 @@ on GitHub-hosted x64 runners. Coverage targets must use dedicated ephemeral
 labels; do not route coverage to a warm bare-metal build pool. Pulp's current
 repo-specific variables and labels live in Pulp's own docs and
 `.shipyard/ci-profiles/` files so Shipyard docs do not stale on Pulp operations.
+
+### Fleet identity and drift guard
+
+The shared profile contract uses stable target IDs plus stable `host/lane/slot`
+identity for operations. It does not use static GitHub registration names:
+disposable workers register with a unique per-boot name, and the supervisor may
+reclaim only an offline registration from the same slot. This preserves audit
+continuity while preventing zombie-name collisions after a reboot.
+
+Each repository profile must explicitly cover `pr`, `debug`, `release` build,
+`coverage`, and `scheduled` classes. Signing, deployment, privileged, and
+secret-bearing jobs remain hosted-only unless separately security-reviewed.
+Missing repository policy, missing target, label mismatch, stale lease, or
+unhealthy local capacity resolves to the hosted target before dispatch. It must
+never create an empty selector or leave GitHub with a local selector that no
+runner can satisfy.
+
+For a new Pulp/Forge repository, copy the profile vocabulary, add a repository
+stanza, run both `tartci profile validate` and `shipyard ci profile plan`, then
+prove one real dispatch and its fallback before enabling merge-queue routing.
+The profile and exact selectors are version-controlled in TartCI plus the
+consumer repository; secrets, registration tokens, and host state are never
+committed. This makes the repositories the durable, reviewable backup for
+policy while keeping credentials private to the host/provider.
