@@ -355,7 +355,12 @@ pub(super) fn load_local_linux_lease_profile(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for required in ["self-hosted", "Linux", "X64", "pulp-auto-linux-x64"] {
+    let capability = if lease.events == ["pull_request"] {
+        "pulp-pr-safe-linux-x64"
+    } else {
+        "pulp-auto-linux-x64"
+    };
+    for required in ["self-hosted", "Linux", "X64", capability] {
         if !required_labels
             .iter()
             .any(|label| label.eq_ignore_ascii_case(required))
@@ -416,31 +421,22 @@ fn strict_health_lease_plan(table: &Table) -> Result<HealthLeasePlan, CliFailure
             "profile lane needs health_lease_variable, health_lease_ttl_seconds, health_lease_events, health_lease_runner_name_prefix, health_lease_merge_queue_branch, and health_lease_admission_burst",
         )
     })?;
-    if lease.variable != "PULP_LOCAL_LINUX_LEASE_UNTIL" {
-        return Err(CliFailure::new(
-            2,
-            format!(
-                "local Linux lease variable must be PULP_LOCAL_LINUX_LEASE_UNTIL, got {}",
-                lease.variable
-            ),
-        ));
-    }
     if !(60..=900).contains(&lease.ttl_seconds) {
         return Err(CliFailure::new(
             2,
             "health_lease_ttl_seconds must be between 60 and 900",
         ));
     }
-    if lease.events != ["merge_group"] {
+    let trusted_merge_group = lease.variable == "PULP_LOCAL_LINUX_LEASE_UNTIL"
+        && lease.events == ["merge_group"]
+        && lease.runner_name_prefix == "pulp-ci-ephemeral-";
+    let pr_safe = lease.variable == "PULP_PR_SAFE_LINUX_LEASE_UNTIL"
+        && lease.events == ["pull_request"]
+        && lease.runner_name_prefix == "pulp-pr-safe-ephemeral-";
+    if !trusted_merge_group && !pr_safe {
         return Err(CliFailure::new(
             2,
-            "health_lease_events must be exactly [\"merge_group\"]",
-        ));
-    }
-    if lease.runner_name_prefix != "pulp-ci-ephemeral-" {
-        return Err(CliFailure::new(
-            2,
-            "health_lease_runner_name_prefix must be exactly pulp-ci-ephemeral- for the Pulp automatic route",
+            "health lease namespace must be either trusted merge_group (PULP_LOCAL_LINUX_LEASE_UNTIL, pulp-ci-ephemeral-) or PR-safe pull_request (PULP_PR_SAFE_LINUX_LEASE_UNTIL, pulp-pr-safe-ephemeral-)",
         ));
     }
     if lease.merge_queue_branch != "main" {
@@ -783,7 +779,7 @@ health_lease_admission_burst = 5
                 panic!("unapproved prefix must fail closed: {prefix}");
             };
             assert!(
-                error.message.contains("exactly pulp-ci-ephemeral-"),
+                error.message.contains("health lease namespace"),
                 "prefix={prefix} error={}",
                 error.message
             );
@@ -791,27 +787,27 @@ health_lease_admission_burst = 5
     }
 
     #[test]
-    fn rejects_pull_request_health_lease_scope() {
+    fn accepts_distinct_pull_request_health_lease_scope() {
         let profile = r#"
 name = "normal-local-fast"
 
 [repo."owner/repo".pr.linux]
-targets = ["macpro.linux-x64-vm"]
-health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+targets = ["macpro.linux-x64-pr-safe-vm"]
+health_lease_variable = "PULP_PR_SAFE_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
-health_lease_events = ["pull_request", "merge_group"]
-health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_events = ["pull_request"]
+health_lease_runner_name_prefix = "pulp-pr-safe-ephemeral-"
 health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = 5
+health_lease_admission_burst = 2
 
-[targets."macpro.linux-x64-vm"]
-runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro", "pulp-auto-linux-x64"]
+[targets."macpro.linux-x64-pr-safe-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro", "pulp-pr-safe-linux-x64"]
 "#;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("profile.toml");
         fs::write(&path, profile).expect("write profile");
 
-        let error = load_local_linux_lease_profile(
+        let lease = load_local_linux_lease_profile(
             dir.path(),
             "normal-local-fast",
             Some(&path),
@@ -819,8 +815,34 @@ runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro", "pulp-auto-li
             "pr",
             "linux",
         )
-        .expect_err("pull-request scope must fail");
-        assert!(error.message.contains("exactly [\"merge_group\"]"));
+        .expect("separate PR-safe namespace");
+        assert_eq!(lease.variable, "PULP_PR_SAFE_LINUX_LEASE_UNTIL");
+        assert_eq!(lease.events, ["pull_request"]);
+        assert_eq!(lease.runner_name_prefix, "pulp-pr-safe-ephemeral-");
+        assert!(
+            lease
+                .required_labels
+                .iter()
+                .any(|label| label == "pulp-pr-safe-linux-x64")
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_trusted_and_pr_safe_lease_namespaces() {
+        let lane: Table = r#"
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["pull_request"]
+health_lease_runner_name_prefix = "pulp-pr-safe-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 2
+"#
+        .parse()
+        .expect("lease lane");
+        let Err(error) = strict_health_lease_plan(&lane) else {
+            panic!("mixed namespace must fail closed");
+        };
+        assert!(error.message.contains("health lease namespace"));
     }
 
     #[test]
