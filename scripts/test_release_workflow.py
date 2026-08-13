@@ -38,6 +38,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('/Developer ID Application/ && index($0, team)', text)
         self.assertIn("no Developer ID Application identity for Team ID", text)
 
+    def test_release_workflow_always_restores_keychain_state(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("ci_macos_signing_keychain.py prepare", text)
+        self.assertIn("ci_macos_signing_keychain.py restore", text)
+        self.assertIn("Restore user keychains and delete ephemeral signing keychain", text)
+        self.assertIn("if: always()", text)
+        self.assertIn("SHIPYARD_SIGNING_KEYCHAIN_STATE", text)
+        self.assertNotIn("existing_keychains", text)
+        self.assertNotIn('security default-keychain -s "$KEYCHAIN"', text)
+
     def test_release_workflow_covers_release_platform_set(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("linux_arm64_runner_selector_json", text)

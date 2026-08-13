@@ -297,6 +297,13 @@ queue — the Studio's keychain already holds the Developer ID signing identity.
 Use `local` only on private repos / the owner's own machine, never a public repo
 with untrusted PRs.
 
+The tag release's CI signing step may temporarily add an imported Developer ID
+keychain. It must snapshot and verify the user-domain default keychain and
+complete search list without mutating either; pass the ephemeral keychain
+directly to `codesign`. Its `always()` cleanup deletes the ephemeral keychain.
+Never parse `security list-keychains` with line-based quote stripping or make a
+CI signing keychain the persistent runner user's default.
+
 ### External contribution execution
 
 Never route contributor-controlled revisions through Shipyard's normal local,
