@@ -3,6 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0870"></a>
+## [0.87.0] - 2026-08-13
+
+- feat(runner): harden PR-safe Linux lease release ([#404](https://github.com/danielraffel/Shipyard/pull/404))
+- feat/pr safe local linux lease 20260813 ([#403](https://github.com/danielraffel/Shipyard/pull/403))
+- feat: add fail-closed Pulp local Linux health lease ([#402](https://github.com/danielraffel/Shipyard/pull/402))
+
 <a id="v0860"></a>
 ## [0.86.0] - 2026-08-13
 
@@ -787,6 +794,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.87.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.0
 [0.86.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.86.0
 [0.85.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.85.0
 [0.84.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.84.0
