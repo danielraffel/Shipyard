@@ -191,6 +191,14 @@ ordered fallback chain into a Pulp workflow and expect GitHub to handle it.
 Fallback must be resolved before repo variables or `workflow_dispatch` inputs are
 set.
 
+Routing migrations use per-PR admission holds. Add the configured Shipyard
+opt-out label (for Pulp, `shipyard:no-auto-merge`) only to the routing PRs while
+their external runner-group or reporter proofs are incomplete. Never use
+`shipyard merge-queue hold` for this purpose: a repository-wide hold suppresses
+eligible unrelated PRs and turns a local routing issue into queue-wide
+serialization. Once the proof is complete, remove the label and let the normal
+steward arm protected auto-merge for that PR.
+
 For Pulp, the normal fast profile is expected to route PR macOS/Linux/Windows to
 local ARM64 VMs first where those lanes are enabled, then fall back to GitHub
 where configured, while scheduled nightly Intel Linux/Windows validation stays
