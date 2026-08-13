@@ -33,6 +33,28 @@ struct LanePlan {
     github_variable: Option<String>,
     issue_on_failure: bool,
     ephemeral_required: bool,
+    health_lease: Option<HealthLeasePlan>,
+}
+
+#[derive(Clone, Serialize)]
+struct HealthLeasePlan {
+    variable: String,
+    ttl_seconds: u64,
+    events: Vec<String>,
+    runner_name_prefix: String,
+    merge_queue_branch: String,
+    admission_burst: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct LocalLinuxLeaseProfile {
+    pub(super) variable: String,
+    pub(super) ttl_seconds: u64,
+    pub(super) events: Vec<String>,
+    pub(super) runner_name_prefix: String,
+    pub(super) merge_queue_branch: String,
+    pub(super) admission_burst: usize,
+    pub(super) required_labels: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -269,6 +291,7 @@ fn plan_lane(spec: &LaneSpec<'_>, targets: &Table) -> LaneOutcome {
         github_variable: github_variable.map(str::to_owned),
         issue_on_failure: optional_bool(spec.table, "issue_on_failure"),
         ephemeral_required,
+        health_lease: health_lease_plan(spec.table),
     };
     let change = variable_change(
         spec,
@@ -282,6 +305,160 @@ fn plan_lane(spec: &LaneSpec<'_>, targets: &Table) -> LaneOutcome {
         change,
         warnings,
     }
+}
+
+pub(super) fn load_local_linux_lease_profile(
+    cwd: &Path,
+    name: &str,
+    explicit: Option<&Path>,
+    repo: &str,
+    context: &str,
+    lane: &str,
+) -> Result<LocalLinuxLeaseProfile, CliFailure> {
+    let (_, profile) = load_profile(cwd, name, explicit)?;
+    let repo_table = repo_profile_table(&profile, repo)?;
+    let lane_table = repo_table
+        .get(context)
+        .and_then(Value::as_table)
+        .and_then(|table| table.get(lane))
+        .and_then(Value::as_table)
+        .ok_or_else(|| {
+            CliFailure::new(
+                2,
+                format!("profile has no lane repo.{repo}.{context}.{lane}"),
+            )
+        })?;
+    let lease = strict_health_lease_plan(lane_table)?;
+    let first_target = target_ids(lane_table).into_iter().next().ok_or_else(|| {
+        CliFailure::new(2, format!("profile lane {context}.{lane} has no targets"))
+    })?;
+    let target = required_table(&profile, "targets")?
+        .get(&first_target)
+        .and_then(Value::as_table)
+        .ok_or_else(|| CliFailure::new(2, format!("profile target {first_target} is missing")))?;
+    let required_labels = target
+        .get("runs_on_json")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliFailure::new(
+                2,
+                format!("profile target {first_target} must use an array runs_on_json selector"),
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                CliFailure::new(
+                    2,
+                    format!("profile target {first_target} has a non-string label"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for required in ["self-hosted", "Linux", "X64", "pulp-auto-linux-x64"] {
+        if !required_labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case(required))
+        {
+            return Err(CliFailure::new(
+                2,
+                format!("profile target {first_target} is missing required label {required}"),
+            ));
+        }
+    }
+    Ok(LocalLinuxLeaseProfile {
+        variable: lease.variable,
+        ttl_seconds: lease.ttl_seconds,
+        events: lease.events,
+        runner_name_prefix: lease.runner_name_prefix,
+        merge_queue_branch: lease.merge_queue_branch,
+        admission_burst: lease.admission_burst,
+        required_labels,
+    })
+}
+
+fn health_lease_plan(table: &Table) -> Option<HealthLeasePlan> {
+    let variable = optional_str(table, "health_lease_variable")?.to_owned();
+    let ttl_seconds = table
+        .get("health_lease_ttl_seconds")?
+        .as_integer()
+        .and_then(|value| u64::try_from(value).ok())?;
+    let events = string_array(table, "health_lease_events")?;
+    let runner_name_prefix = optional_str(table, "health_lease_runner_name_prefix")?.to_owned();
+    let merge_queue_branch = optional_str(table, "health_lease_merge_queue_branch")?.to_owned();
+    let admission_burst = health_lease_admission_burst(table).ok()?;
+    Some(HealthLeasePlan {
+        variable,
+        ttl_seconds,
+        events,
+        runner_name_prefix,
+        merge_queue_branch,
+        admission_burst,
+    })
+}
+
+fn health_lease_admission_burst(table: &Table) -> Result<usize, &'static str> {
+    match table.get("health_lease_admission_burst") {
+        None => Err("health_lease_admission_burst is required"),
+        Some(value) => value
+            .as_integer()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value >= 1)
+            .ok_or("health_lease_admission_burst must be a positive integer"),
+    }
+}
+
+fn strict_health_lease_plan(table: &Table) -> Result<HealthLeasePlan, CliFailure> {
+    health_lease_admission_burst(table).map_err(|message| CliFailure::new(2, message))?;
+    let lease = health_lease_plan(table).ok_or_else(|| {
+        CliFailure::new(
+            2,
+            "profile lane needs health_lease_variable, health_lease_ttl_seconds, health_lease_events, health_lease_runner_name_prefix, health_lease_merge_queue_branch, and health_lease_admission_burst",
+        )
+    })?;
+    if lease.variable != "PULP_LOCAL_LINUX_LEASE_UNTIL" {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "local Linux lease variable must be PULP_LOCAL_LINUX_LEASE_UNTIL, got {}",
+                lease.variable
+            ),
+        ));
+    }
+    if !(60..=900).contains(&lease.ttl_seconds) {
+        return Err(CliFailure::new(
+            2,
+            "health_lease_ttl_seconds must be between 60 and 900",
+        ));
+    }
+    if lease.events != ["merge_group"] {
+        return Err(CliFailure::new(
+            2,
+            "health_lease_events must be exactly [\"merge_group\"]",
+        ));
+    }
+    if lease.runner_name_prefix != "pulp-ci-ephemeral-" {
+        return Err(CliFailure::new(
+            2,
+            "health_lease_runner_name_prefix must be exactly pulp-ci-ephemeral- for the Pulp automatic route",
+        ));
+    }
+    if lease.merge_queue_branch != "main" {
+        return Err(CliFailure::new(
+            2,
+            "health_lease_merge_queue_branch must be main for the Pulp automatic route",
+        ));
+    }
+    Ok(lease)
+}
+
+fn string_array(table: &Table, key: &str) -> Option<Vec<String>> {
+    table.get(key).and_then(Value::as_array).and_then(|values| {
+        values
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect()
+    })
 }
 
 fn target_ids(lane_table: &Table) -> Vec<String> {
@@ -431,6 +608,18 @@ fn print_plan<W: Write>(stdout: &mut W, plan: &ProfilePlan) -> std::io::Result<(
         {
             writeln!(stdout, "  {variable}={value}")?;
         }
+        if let Some(lease) = &lane.health_lease {
+            writeln!(
+                stdout,
+                "  health lease: {} ttl={}s events={} prefix={} branch={} admission_burst={}",
+                lease.variable,
+                lease.ttl_seconds,
+                lease.events.join(","),
+                lease.runner_name_prefix,
+                lease.merge_queue_branch,
+                lease.admission_burst
+            )?;
+        }
     }
     if !plan.warnings.is_empty() {
         writeln!(stdout, "warnings:")?;
@@ -444,7 +633,11 @@ fn print_plan<W: Write>(stdout: &mut W, plan: &ProfilePlan) -> std::io::Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::build_plan;
+    use std::fs;
+
+    use toml::Table;
+
+    use super::{build_plan, load_local_linux_lease_profile, strict_health_lease_plan};
 
     #[test]
     fn builds_provider_neutral_profile_plan() {
@@ -499,5 +692,233 @@ runs_on_json = "windows-latest"
 
         assert!(plan.warnings.is_empty());
         assert_eq!(plan.changes[0].value, "\"windows-latest\"");
+    }
+
+    #[test]
+    fn loads_bounded_local_linux_health_lease_from_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        fs::write(
+            &path,
+            r#"
+name = "normal-local-fast"
+
+[repo."owner/repo".pr.linux]
+strategy = "ordered-fallback"
+targets = ["macpro.linux-x64-vm", "github.linux-x64"]
+github_variable = "PULP_LOCAL_LINUX_RUNS_ON_JSON"
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
+
+[targets."macpro.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-auto-linux-x64"]
+
+[targets."github.linux-x64"]
+runs_on_json = "ubuntu-latest"
+"#,
+        )
+        .expect("write profile");
+
+        let lease = load_local_linux_lease_profile(
+            dir.path(),
+            "normal-local-fast",
+            Some(&path),
+            "owner/repo",
+            "pr",
+            "linux",
+        )
+        .expect("lease profile");
+
+        assert_eq!(lease.variable, "PULP_LOCAL_LINUX_LEASE_UNTIL");
+        assert_eq!(lease.ttl_seconds, 300);
+        assert_eq!(lease.events, ["merge_group"]);
+        assert_eq!(lease.runner_name_prefix, "pulp-ci-ephemeral-");
+        assert_eq!(lease.merge_queue_branch, "main");
+        assert_eq!(lease.admission_burst, 5);
+        assert!(lease.required_labels.iter().any(|label| label == "X64"));
+        assert!(
+            lease
+                .required_labels
+                .iter()
+                .any(|label| label == "pulp-auto-linux-x64")
+        );
+    }
+
+    fn lease_lane_with_runner_prefix(prefix: &str) -> Table {
+        format!(
+            r#"
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "{prefix}"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
+"#
+        )
+        .parse()
+        .expect("lease lane")
+    }
+
+    #[test]
+    fn accepts_exact_controller_owned_health_lease_runner_prefix() {
+        let lease = strict_health_lease_plan(&lease_lane_with_runner_prefix("pulp-ci-ephemeral-"))
+            .expect("exact approved prefix");
+        assert_eq!(lease.runner_name_prefix, "pulp-ci-ephemeral-");
+    }
+
+    #[test]
+    fn rejects_broad_deceptive_and_near_miss_health_lease_runner_prefixes() {
+        for prefix in [
+            "ephemeral",
+            "not-ephemeral-",
+            "pulp-ci-ephemeral",
+            "pulp-ci-ephemeral-prod-",
+        ] {
+            let Err(error) = strict_health_lease_plan(&lease_lane_with_runner_prefix(prefix))
+            else {
+                panic!("unapproved prefix must fail closed: {prefix}");
+            };
+            assert!(
+                error.message.contains("exactly pulp-ci-ephemeral-"),
+                "prefix={prefix} error={}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_pull_request_health_lease_scope() {
+        let profile = r#"
+name = "normal-local-fast"
+
+[repo."owner/repo".pr.linux]
+targets = ["macpro.linux-x64-vm"]
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["pull_request", "merge_group"]
+health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
+
+[targets."macpro.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro", "pulp-auto-linux-x64"]
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        fs::write(&path, profile).expect("write profile");
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "normal-local-fast",
+            Some(&path),
+            "owner/repo",
+            "pr",
+            "linux",
+        )
+        .expect_err("pull-request scope must fail");
+        assert!(error.message.contains("exactly [\"merge_group\"]"));
+    }
+
+    #[test]
+    fn rejects_target_without_protected_automatic_label() {
+        let profile = r#"
+name = "normal-local-fast"
+
+[repo."owner/repo".pr.linux]
+targets = ["macpro.linux-x64-vm"]
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
+
+[targets."macpro.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        fs::write(&path, profile).expect("write profile");
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "normal-local-fast",
+            Some(&path),
+            "owner/repo",
+            "pr",
+            "linux",
+        )
+        .expect_err("unprotected automatic target must fail");
+        assert!(error.message.contains("pulp-auto-linux-x64"));
+    }
+
+    #[test]
+    fn rejects_health_lease_longer_than_fifteen_minutes() {
+        let profile = r#"
+name = "normal-local-fast"
+
+[repo."owner/repo".pr.linux]
+targets = ["macpro.linux-x64-vm"]
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 901
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
+
+[targets."macpro.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        fs::write(&path, profile).expect("write profile");
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "normal-local-fast",
+            Some(&path),
+            "owner/repo",
+            "pr",
+            "linux",
+        )
+        .expect_err("oversized lease must fail");
+        assert!(error.message.contains("between 60 and 900"));
+    }
+
+    #[test]
+    fn rejects_malformed_health_lease_admission_burst_instead_of_defaulting() {
+        let profile = r#"
+name = "normal-local-fast"
+
+[repo."owner/repo".pr.linux]
+targets = ["macpro.linux-x64-vm"]
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = "5"
+
+[targets."macpro.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        fs::write(&path, profile).expect("write profile");
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "normal-local-fast",
+            Some(&path),
+            "owner/repo",
+            "pr",
+            "linux",
+        )
+        .expect_err("malformed minimum must fail");
+        assert!(error.message.contains("positive integer"));
     }
 }

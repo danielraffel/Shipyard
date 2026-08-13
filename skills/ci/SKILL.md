@@ -55,6 +55,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Runner provisioning: audit host-class naming/label drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels and fatally rejects any runner combining `<repo>-advisory-*` with `<repo>-build*` / `<repo>-preamble*`; exit 1 on drift) |
 | **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` + `tart get` per `[host_class.*]`, using configured `tart_home` as `TART_HOME`; counts only running macOS/darwin VMs; `free = Σ max(0, cap − running_macos)`; fail-closed, exit 1 if any host/VM OS unreadable) |
 | **Runner fleet visibility: exact-head queue/release liveness** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (bounded pagination; stable auth/rate/truncation reasons; detects optional/superseded capacity owners and cleared enrollment) |
+| **Maintain Pulp's expiring disposable-Linux route** | `shipyard runner local-linux-lease --repo Generous-Corp/pulp [--apply] [--watch --interval-secs 60] [--json]` (dry-run by default; profile-derived exact labels; queued matching jobs reserve idle slots; renews only for unreserved online idle ephemeral capacity; unhealthy/unreadable clears; 15-minute maximum TTL; no workflow or MQ mutation) |
 | **Cross-repo merge-on-green stewardship** | `shipyard runner steward --repo <owner/pulp> --repo <owner/forge> --repo <owner/vellum> [--json]` (dry-run by default; `--apply` requires the trusted machine-global mutation authority, obeys central `HOLD`, serializes and write-ahead audits every GitHub mutation, resumes durable exact-run pending cancellations before planning, re-enrolls only the current exact green head, preserves native queue order, refuses mutation without authoritative required-check governance and refuses client-side direct merge when GitHub cannot atomically bind the validated base revision, bounds transient reruns, cancels only queued runs whose immutable PR/merge-group head is provably superseded, and may preempt one exact allow-listed advisory Pulp workflow holding `pulp-preamble` after a 15-minute exact-front pool wait; same-head duplicates, required workflows, pushes, and unknown work are never cancelled; opt out with `shipyard:no-auto-merge` or disable preemption with `--no-preempt-capacity`) |
 | **Drain cloud-queued macOS jobs to local when a slot frees** | `shipyard runner reroute-watch [--apply] [--once] [--interval N] [--flap-window N]` (observe-only without `--apply`; logs per-host capacity + candidate list; flap-guard, one-reroute-per-tick, slot/fail-closed) |
 | **Runner provisioning: deregister a runner** | `shipyard runner remove --name <repo>-<tag>-NN --yes [--purge-dir]` |
@@ -135,6 +136,18 @@ GitHub-hosted nightly Intel Linux/Windows lanes are compatibility surveillance.
 Windows QEMU on Apple Silicon is Windows ARM64; x64 MSVC/Prism execution is
 smoke/debug until proven and should not replace `windows-latest` authority.
 Coverage must use dedicated ephemeral labels, not warm bare-metal build pools.
+
+For the local x64 Linux PR/merge-group lane, keep selector policy in the
+checked-in `normal-local-fast` profile and run the external Shipyard health
+operator documented in `docs/pulp-local-linux-lease.md`. The operator renews
+`PULP_LOCAL_LINUX_LEASE_UNTIL` only while the exact disposable Mac Pro selector
+has idle capacity for the full live merge-queue admission burst after queued
+reservations; all other observations clear the variable and new
+jobs fall back hosted. The lease scope is exactly `merge_group`, and the first
+target must carry the protected `pulp-auto-linux-x64` opt-in label. The runner
+name prefix must be exactly the controller-owned `pulp-ci-ephemeral-` namespace;
+broad or substring-matching prefixes are rejected. Pull requests remain hosted.
+Never reuse it for secret-bearing or `pull_request_target` jobs.
 
 ## Runner Metrics For Agents
 

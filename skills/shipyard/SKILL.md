@@ -694,6 +694,29 @@ snapshot.
 Read [references/merge-steward.md](references/merge-steward.md) before operating
 the steward, changing its policy, or recovering a pending cancellation.
 
+### Pulp disposable Linux health lease
+
+Use `shipyard runner local-linux-lease --repo Generous-Corp/pulp` to inspect the
+checked-in `normal-local-fast` Linux lane and decide whether its disposable Mac
+Pro pool may serve new unprivileged jobs. Dry-run is the default. `--apply`
+renews `PULP_LOCAL_LINUX_LEASE_UNTIL` only when the exact profile-derived labels
+have enough unreserved online idle runners in the exact controller-owned
+`pulp-ci-ephemeral-` name namespace after matching queued jobs reserve their
+slots. It reads `main`'s live merge-queue rule and
+requires idle capacity for the full declared `max_entries_to_build` admission
+burst; otherwise it deletes the variable. With Pulp's five-entry queue and
+two-runner fleet, automatic routing intentionally remains disarmed.
+`--apply --watch --interval-secs 60` is the durable controller form.
+The profile TTL must be 60–900 seconds, so a dead controller expires safely.
+The accepted event scope is exactly `merge_group`, and the first target must
+include `pulp-auto-linux-x64`; pull-request routing is rejected.
+
+This is a routing lease, not merge or runner mutation authority. It never
+changes the selector variable, dispatches or cancels a workflow, or touches the
+protected queue. Never use the generic lease for `pull_request_target`, Vellum
+trusted, WebCLAP/deploy, signing, release, or other secret-bearing work. See
+[`docs/pulp-local-linux-lease.md`](../../docs/pulp-local-linux-lease.md).
+
 ### Reroute watcher (cloud→local drain)
 
 ```bash
