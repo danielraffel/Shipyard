@@ -93,6 +93,51 @@ fn dry_run_overridden_only_respects_fix_flag() {
 }
 
 #[test]
+fn cleanup_report_distinguishes_cancellable_and_protected_stale_runs() {
+    let settings = WatchdogSettings {
+        repo_slug: "owner/repo".to_owned(),
+        runner_id: None,
+        runner_dir: std::path::PathBuf::from("/tmp/runner"),
+        thresholds: WatchdogThresholds::default(),
+    };
+    let stale = vec![
+        StaleQueuedRun {
+            run_id: 1,
+            workflow: "CI".to_owned(),
+            branch: "feature/x".to_owned(),
+            queued_for_secs: 10_000,
+            url: None,
+            cancellation_safe: true,
+        },
+        StaleQueuedRun {
+            run_id: 2,
+            workflow: "Release CLI".to_owned(),
+            branch: "main".to_owned(),
+            queued_for_secs: 10_000,
+            url: None,
+            cancellation_safe: false,
+        },
+    ];
+
+    let mut human = Vec::new();
+    emit_cleanup_report(&mut human, &settings, &stale, &[], &[], false, false)
+        .expect("human report");
+    let human = String::from_utf8(human).expect("UTF-8");
+    assert!(human.contains("run 1"));
+    assert!(human.contains("[cancellable]"));
+    assert!(human.contains("run 2"));
+    assert!(human.contains("[protected: not cancellable]"));
+    assert!(human.contains("cancel the eligible runs"));
+    assert!(human.contains("Protected run ids (not cancellable): [2]"));
+
+    let mut json = Vec::new();
+    emit_cleanup_report(&mut json, &settings, &stale, &[], &[], true, true).expect("JSON report");
+    let value: serde_json::Value = serde_json::from_slice(&json).expect("parse JSON");
+    assert_eq!(value["protected_run_ids"], serde_json::json!([2]));
+    assert_eq!(value["stale_queued_runs"][1]["cancellation_safe"], false);
+}
+
+#[test]
 fn fleet_liveness_is_default_on_for_configured_pool_and_has_cadence() {
     let config = config_with(
         "[host_class.m5]\ncap = 2\n[runner.watchdog]\nfleet_liveness_every_ticks = 3\n",
@@ -202,12 +247,15 @@ printf '%s\n' "$*" >> '{calls}'
 case "$*" in
   *"status=in_progress"*)
     printf '%s' '{{"workflow_runs":[
-      {{"id":101,"name":"first","head_branch":"a","created_at":"2020-01-01T00:00:00Z","run_started_at":"2020-01-01T00:00:00Z","status":"in_progress"}},
-      {{"id":102,"name":"second","head_branch":"b","created_at":"2020-01-01T00:00:00Z","run_started_at":"2020-01-01T00:00:00Z","status":"in_progress"}}
+      {{"id":101,"name":"first","head_branch":"a","event":"pull_request","created_at":"2020-01-01T00:00:00Z","run_started_at":"2020-01-01T00:00:00Z","status":"in_progress"}},
+      {{"id":102,"name":"second","head_branch":"b","event":"merge_group","created_at":"2020-01-01T00:00:00Z","run_started_at":"2020-01-01T00:00:00Z","status":"in_progress"}},
+      {{"id":103,"name":"Release CLI","head_branch":"main","event":"workflow_dispatch","path":".github/workflows/release-cli.yml","created_at":"2020-01-01T00:00:00Z","run_started_at":"2020-01-01T00:00:00Z","status":"in_progress"}},
+      {{"id":104,"name":"ordinary dispatch","head_branch":"main","event":"workflow_dispatch","path":".github/workflows/ci.yml","created_at":"2020-01-01T00:00:00Z","run_started_at":"2020-01-01T00:00:00Z","status":"in_progress"}}
     ]}}' ;;
   *"status=queued"*) printf '%s' '{{"workflow_runs":[]}}' ;;
   *"runs/101/cancel"*) echo "first cancellation rejected" >&2; exit 1 ;;
   *"runs/102/cancel"*) printf '%s' '{{}}' ;;
+  *"runs/103/cancel"*|*"runs/104/cancel"*) echo "protected run cancellation attempted" >&2; exit 3 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
@@ -246,7 +294,15 @@ esac
     let calls = std::fs::read_to_string(calls).expect("calls");
     assert!(calls.contains("runs/101/cancel"), "{calls}");
     assert!(calls.contains("runs/102/cancel"), "{calls}");
+    assert!(!calls.contains("runs/103/cancel"), "{calls}");
+    assert!(!calls.contains("runs/104/cancel"), "{calls}");
     let output = String::from_utf8(output).expect("UTF-8");
     assert!(output.contains("failed run=101"), "{output}");
     assert!(output.contains("cancelled run=102"), "{output}");
+    assert!(output.contains("skipped run=103"), "{output}");
+    assert!(output.contains("skipped run=104"), "{output}");
+    assert!(
+        output.contains("protected event or release workflow"),
+        "{output}"
+    );
 }

@@ -150,6 +150,8 @@ pub struct QueuedRun {
     pub name: String,
     /// Branch associated with the run.
     pub head_branch: String,
+    /// GitHub event that created the run (`pull_request`, `merge_group`, etc.).
+    pub event: String,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
     /// ISO-8601 execution-start timestamp, when GitHub reported one. Absent
@@ -1168,6 +1170,11 @@ pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let event = run
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let created_at = run
             .get("created_at")
             .and_then(Value::as_str)
@@ -1198,6 +1205,7 @@ pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
             workflow_name: name.clone(),
             name,
             head_branch,
+            event,
             created_at,
             run_started_at,
             url: run
@@ -1739,13 +1747,14 @@ runner_selector = "config-selector"
     #[test]
     fn queued_runs_parse_github_api_shape() {
         let parsed = super::parse_queued_runs(
-            r#"{"workflow_runs":[{"id":555,"name":"CI","head_branch":"feat/x","created_at":"2026-04-23T12:00:00Z","run_started_at":"2026-04-23T12:05:00Z","html_url":"https://example/run/555","path":".github/workflows/ci.yml"}]}"#,
+            r#"{"workflow_runs":[{"id":555,"name":"CI","head_branch":"feat/x","event":"pull_request","created_at":"2026-04-23T12:00:00Z","run_started_at":"2026-04-23T12:05:00Z","html_url":"https://example/run/555","path":".github/workflows/ci.yml"}]}"#,
         )
         .expect("parse");
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].database_id, 555);
         assert_eq!(parsed[0].path, ".github/workflows/ci.yml");
+        assert_eq!(parsed[0].event, "pull_request");
         // P1: `run_started_at` is captured so the reaper can age in_progress
         // runs from execution start, not creation time.
         assert_eq!(

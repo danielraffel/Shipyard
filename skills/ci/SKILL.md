@@ -471,6 +471,12 @@ shipyard rescue --all-stuck
 shipyard rescue 286 --rerun-failed --to local
 ```
 
+Rescue is fail-closed to `pull_request` and `merge_group` runs, including the
+PR-targeted form: branch equality alone is not cancellation authority.
+`Release CLI` and `Sign and Release` are protected by workflow name and
+filename in both repo-wide and PR-targeted rescue. Use an exact-run release
+operation for push, schedule, tag, or `workflow_dispatch` runs.
+
 What it does:
 1. Resolves the PR's head branch (skipped under `--all-stuck`).
 2. Lists queued workflow runs and filters to (a) the PR's branch and (b) ones older than `--threshold` (default `30m`).
@@ -551,6 +557,16 @@ masks wedges as required-check failures.
 lists the repo's GitHub Actions runs and cancels genuinely-stale ones
 repo-wide — including runs on **GitHub-hosted** runners, which the
 process-level reaper cannot see.
+
+Its cancellation authority is limited to `pull_request` and `merge_group`
+runs. `Release CLI` and `Sign and Release` are never reaper candidates; push,
+schedule, tag, and `workflow_dispatch` runs require an exact-run operation.
+They are still emitted as protected `skipped` observations by the stale-run
+reaper, including outside dry-run mode.
+Protected stale runs remain visible in status/dry-run output even though the
+mutating command skips them.
+Human output labels their policy state; JSON exposes `cancellation_safe` and
+`protected_run_ids` for automation.
 
 ```sh
 # Auto-cancel stale workflow runs on every tick:

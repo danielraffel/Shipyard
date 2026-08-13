@@ -432,7 +432,17 @@ pub(super) fn cancel_stale_inline<W: Write>(
 ) -> Result<(), CliFailure> {
     let mut cancelled = Vec::new();
     let mut failed = Vec::new();
-    for run in &report.stale_queued_runs {
+    let protected = report
+        .stale_queued_runs
+        .iter()
+        .filter(|run| !run.cancellation_safe)
+        .map(|run| run.run_id)
+        .collect::<Vec<_>>();
+    for run in report
+        .stale_queued_runs
+        .iter()
+        .filter(|run| run.cancellation_safe)
+    {
         match actions.cancel_workflow_run(&settings.repo_slug, run.run_id) {
             Ok(()) => cancelled.push(run.run_id),
             Err(err) => failed.push((run.run_id, err.to_string())),
@@ -461,6 +471,10 @@ pub(super) fn cancel_stale_inline<W: Write>(
             )
             .expect("failed serialization"),
         );
+        data.insert(
+            "protected_run_ids".to_owned(),
+            serde_json::to_value(&protected).expect("protected serialization"),
+        );
         return write_json_envelope(stdout, "runner.watch", data)
             .map_err(|error| CliFailure::new(1, error.to_string()));
     }
@@ -473,6 +487,10 @@ pub(super) fn cancel_stale_inline<W: Write>(
             writeln!(stdout, "  auto-fix FAILED for run {id}: {msg}")
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
+    }
+    if !protected.is_empty() {
+        writeln!(stdout, "  auto-fix: protected, not cancelled {protected:?}")
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(())
 }
@@ -560,6 +578,17 @@ pub(super) fn reap_stale_runs_tick<W: Write>(
             run,
             Some(&detail),
         )?;
+        if !run.cancellation_safe {
+            emit_reap_event(
+                stdout,
+                &settings.repo_slug,
+                json,
+                "skipped",
+                run,
+                Some("protected event or release workflow: not cancelling"),
+            )?;
+            continue;
+        }
         if dry_run {
             emit_reap_event(
                 stdout,
@@ -621,6 +650,10 @@ pub(super) fn emit_reap_event<W: Write>(
         data.insert("workflow".to_owned(), Value::from(run.workflow.clone()));
         data.insert("branch".to_owned(), Value::from(run.branch.clone()));
         data.insert("age_secs".to_owned(), Value::from(run.age_secs));
+        data.insert(
+            "cancellation_safe".to_owned(),
+            Value::Bool(run.cancellation_safe),
+        );
         if let Some(url) = &run.url {
             data.insert("url".to_owned(), Value::from(url.clone()));
         }

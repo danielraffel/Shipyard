@@ -309,7 +309,8 @@ hours.
 
 ### Mutating commands (require explicit flags)
 
-- `shipyard runner cleanup --fix` — cancel stale queued runs (1s gap between cancels)
+- `shipyard runner cleanup --fix` — cancel stale queued PR/merge-group runs;
+  release, push, schedule, tag, and dispatch runs are protected
 - `shipyard runner watch --fix` — auto-recovery loop (cron-friendly)
 - `shipyard runner kill --pid X --reason "..."` — kill a specific Worker; requires typed `KILL` confirmation
 

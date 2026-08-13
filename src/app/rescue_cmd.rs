@@ -12,6 +12,7 @@ use super::{CliFailure, cli::RescueArgs, wait_cmd::parse_github_repo_slug};
 use crate::cloud::{GitHubActions, QueuedRun, discover_workflows, resolve_cloud_dispatch_plan};
 use crate::config::LoadedConfig;
 use crate::output::write_json_envelope;
+use crate::workflow_cancellation::is_bulk_run_cancellation_safe;
 
 /// Cap on the number of paginated `gh api` calls per rescue invocation.
 /// Each page is 100 items, so the worst case is 500 queued + 500 completed
@@ -153,7 +154,10 @@ fn collect_candidates(
     let queued = actions
         .list_queued_runs_paginated(repo_slug, RESCUE_LIST_MAX_PAGES)
         .map_err(|error| CliFailure::new(1, format!("Could not list queued runs: {error}")))?;
-    let stuck = filter_stuck_queued(&queued, branch, threshold_secs, now);
+    let stuck = filter_stuck_queued(&queued, branch, threshold_secs, now)
+        .into_iter()
+        .filter(rescue_run_cancellation_safe)
+        .collect::<Vec<_>>();
     let mut candidates: Vec<Candidate> = stuck
         .into_iter()
         .map(|run| Candidate {
@@ -169,6 +173,9 @@ fn collect_candidates(
         .map_err(|error| CliFailure::new(1, format!("Could not list completed runs: {error}")))?;
     for run in completed {
         if !matches_branch(&run, branch) {
+            continue;
+        }
+        if !rescue_run_cancellation_safe(&run) {
             continue;
         }
         // A watchdog sweep marks a wedged run `cancelled`; a flaky or
@@ -188,6 +195,10 @@ fn collect_candidates(
         }
     }
     Ok(candidates)
+}
+
+fn rescue_run_cancellation_safe(run: &QueuedRun) -> bool {
+    is_bulk_run_cancellation_safe(run)
 }
 
 fn rescue_envelope_data(
@@ -552,6 +563,7 @@ mod tests {
             database_id: id,
             name: format!("CI #{id}"),
             head_branch: branch.to_owned(),
+            event: "pull_request".to_owned(),
             created_at: created_at.to_owned(),
             run_started_at: None,
             workflow_name: "CI".to_owned(),
@@ -704,6 +716,21 @@ mod tests {
             rescue_provider_override(None, CandidateKind::CompletedRerunnable),
             None
         );
+    }
+
+    #[test]
+    fn bulk_rescue_is_review_only_and_release_workflows_are_always_protected() {
+        let review = queued_run(1, "feature/x", "2026-05-13T10:00:00Z", "queued", None);
+        assert!(rescue_run_cancellation_safe(&review));
+
+        let mut dispatch = review.clone();
+        dispatch.event = "workflow_dispatch".to_owned();
+        assert!(!rescue_run_cancellation_safe(&dispatch));
+
+        let mut release = review;
+        release.workflow_name = "Release CLI".to_owned();
+        release.path = ".github/workflows/release-cli.yml".to_owned();
+        assert!(!rescue_run_cancellation_safe(&release));
     }
 
     #[test]
