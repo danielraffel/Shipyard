@@ -41,6 +41,14 @@ struct LeaseJob {
 struct FleetObservation {
     runners: Vec<LeaseRunner>,
     queued_matching_jobs: usize,
+    merge_queue_build_concurrency: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdmissionPolicy {
+    declared_burst: usize,
+    live_burst: usize,
+    ttl_seconds: u64,
 }
 
 impl LeaseRunner {
@@ -128,28 +136,44 @@ pub(super) fn local_linux_lease_command<W: Write>(
     let mut tick = 0u32;
     loop {
         tick += 1;
-        let observed_at = Utc::now();
-        let decision = match observe_fleet(&actions, &repo, &profile.required_labels) {
-            Ok(observation) => decide_lease(
-                &observation.runners,
-                &profile.runner_name_prefix,
-                &profile.required_labels,
-                observation.queued_matching_jobs,
-                profile.min_idle,
-                profile.ttl_seconds,
-                observed_at,
-            ),
-            Err(error) => LeaseDecision {
-                action: LeaseAction::Clear,
-                observed_at,
-                expires_at: None,
-                matching: 0,
-                online: 0,
-                idle: 0,
-                queued: 0,
-                available: 0,
-                reason: format!("fleet_unreadable: {error}"),
-            },
+        let decision = match observe_fleet(
+            &actions,
+            &repo,
+            &profile.required_labels,
+            &profile.merge_queue_branch,
+        ) {
+            Ok(observation) => {
+                // Lease time begins only after every fleet and ruleset read is
+                // complete. A slow observation can delay or expire the previous
+                // lease, but it can never publish an already-aged renewal.
+                let observed_at = Utc::now();
+                decide_lease(
+                    &observation.runners,
+                    &profile.runner_name_prefix,
+                    &profile.required_labels,
+                    observation.queued_matching_jobs,
+                    AdmissionPolicy {
+                        declared_burst: profile.admission_burst,
+                        live_burst: observation.merge_queue_build_concurrency,
+                        ttl_seconds: profile.ttl_seconds,
+                    },
+                    observed_at,
+                )
+            }
+            Err(error) => {
+                let observed_at = Utc::now();
+                LeaseDecision {
+                    action: LeaseAction::Clear,
+                    observed_at,
+                    expires_at: None,
+                    matching: 0,
+                    online: 0,
+                    idle: 0,
+                    queued: 0,
+                    available: 0,
+                    reason: format!("fleet_unreadable: {error}"),
+                }
+            }
         };
         let (mutation, mutation_failed) = if args.apply {
             mutation_for_tick(
@@ -198,11 +222,66 @@ fn observe_fleet(
     actions: &GitHubActions,
     repo: &str,
     required_labels: &[String],
+    merge_queue_branch: &str,
 ) -> Result<FleetObservation, String> {
     let queued_matching_jobs = fetch_queued_matching_jobs(actions, repo, required_labels)?;
     Ok(FleetObservation {
         runners: fetch_runners(actions, repo)?,
         queued_matching_jobs,
+        merge_queue_build_concurrency: fetch_merge_queue_build_concurrency(
+            actions,
+            repo,
+            merge_queue_branch,
+        )?,
+    })
+}
+
+fn fetch_merge_queue_build_concurrency(
+    actions: &GitHubActions,
+    repo: &str,
+    branch: &str,
+) -> Result<usize, String> {
+    let raw = actions
+        .run_gh(&merge_queue_rules_args(repo, branch))
+        .map_err(|error| format!("failed to read rules for branch {branch}: {error}"))?;
+    parse_merge_queue_build_concurrency(&raw, branch)
+}
+
+fn merge_queue_rules_args(repo: &str, branch: &str) -> Vec<String> {
+    vec![
+        "api".to_owned(),
+        "--paginate".to_owned(),
+        "--slurp".to_owned(),
+        format!("repos/{repo}/rules/branches/{branch}?per_page=100"),
+    ]
+}
+
+fn parse_merge_queue_build_concurrency(raw: &str, branch: &str) -> Result<usize, String> {
+    let pages = serde_json::from_str::<Vec<Value>>(raw)
+        .map_err(|error| format!("branch rules JSON parse failed: {error}"))?;
+    let mut rules = Vec::new();
+    for (index, page) in pages.into_iter().enumerate() {
+        let Value::Array(page_rules) = page else {
+            return Err(format!(
+                "branch rules page {} is not a JSON array",
+                index + 1
+            ));
+        };
+        rules.extend(page_rules);
+    }
+    let bursts = rules
+        .into_iter()
+        .filter(|rule| rule.get("type").and_then(Value::as_str) == Some("merge_queue"))
+        .filter_map(|rule| {
+            rule.get("parameters")?
+                .get("max_entries_to_build")?
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+        })
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    bursts.into_iter().max().ok_or_else(|| {
+        format!("no positive merge_queue max_entries_to_build applies to branch {branch}")
     })
 }
 
@@ -286,8 +365,7 @@ fn decide_lease(
     name_prefix: &str,
     required_labels: &[String],
     queued: usize,
-    min_idle: usize,
-    ttl_seconds: u64,
+    policy: AdmissionPolicy,
     observed_at: DateTime<Utc>,
 ) -> LeaseDecision {
     let required = required_labels
@@ -312,14 +390,30 @@ fn decide_lease(
         .filter(|runner| runner.status.eq_ignore_ascii_case("online") && !runner.busy)
         .count();
     let available = idle.saturating_sub(queued);
-    if available >= min_idle {
+    if policy.declared_burst < policy.live_burst {
+        return LeaseDecision {
+            action: LeaseAction::Clear,
+            observed_at,
+            expires_at: None,
+            matching: matching.len(),
+            online,
+            idle,
+            queued,
+            available,
+            reason: format!(
+                "profile_admission_burst_below_live_merge_queue: declared={} live={}",
+                policy.declared_burst, policy.live_burst
+            ),
+        };
+    }
+    if available >= policy.declared_burst {
         LeaseDecision {
             action: LeaseAction::Renew,
             observed_at,
             expires_at: Some(
                 observed_at
                     + Duration::seconds(
-                        i64::try_from(ttl_seconds).expect("profile TTL is bounded"),
+                        i64::try_from(policy.ttl_seconds).expect("profile TTL is bounded"),
                     ),
             ),
             matching: matching.len(),
@@ -327,7 +421,10 @@ fn decide_lease(
             idle,
             queued,
             available,
-            reason: "healthy_unreserved_idle_capacity".to_owned(),
+            reason: format!(
+                "healthy_for_admission_burst: declared={} live={}",
+                policy.declared_burst, policy.live_burst
+            ),
         }
     } else {
         LeaseDecision {
@@ -340,7 +437,8 @@ fn decide_lease(
             queued,
             available,
             reason: format!(
-                "insufficient_unreserved_idle_capacity: required={min_idle} idle={idle} queued={queued} available={available}"
+                "insufficient_unreserved_idle_capacity_for_admission_burst: required={} live={} idle={idle} queued={queued} available={available}",
+                policy.declared_burst, policy.live_burst
             ),
         }
     }
@@ -556,6 +654,14 @@ mod tests {
         .collect()
     }
 
+    fn policy(declared_burst: usize, live_burst: usize) -> AdmissionPolicy {
+        AdmissionPolicy {
+            declared_burst,
+            live_burst,
+            ttl_seconds: 300,
+        }
+    }
+
     #[test]
     fn renews_only_for_online_idle_exact_pool_capacity() {
         let now = Utc.with_ymd_and_hms(2026, 8, 13, 18, 45, 0).unwrap();
@@ -572,7 +678,14 @@ mod tests {
                 "pulp-auto-linux-x64",
             ],
         )];
-        let decision = decide_lease(&runners, "pulp-ci-ephemeral-", &labels(), 0, 1, 300, now);
+        let decision = decide_lease(
+            &runners,
+            "pulp-ci-ephemeral-",
+            &labels(),
+            0,
+            policy(1, 1),
+            now,
+        );
         assert_eq!(decision.action, LeaseAction::Renew);
         assert_eq!(
             decision.expires_at,
@@ -596,7 +709,14 @@ mod tests {
                 "pulp-auto-linux-x64",
             ],
         )];
-        let decision = decide_lease(&runners, "pulp-ci-ephemeral-", &labels(), 0, 1, 300, now);
+        let decision = decide_lease(
+            &runners,
+            "pulp-ci-ephemeral-",
+            &labels(),
+            0,
+            policy(1, 1),
+            now,
+        );
         assert_eq!(decision.action, LeaseAction::Clear);
         assert!(decision.expires_at.is_none());
     }
@@ -632,10 +752,159 @@ mod tests {
                 ],
             ),
         ];
-        let decision = decide_lease(&runners, "pulp-ci-ephemeral-", &labels(), 2, 1, 300, now);
+        let decision = decide_lease(
+            &runners,
+            "pulp-ci-ephemeral-",
+            &labels(),
+            2,
+            policy(1, 1),
+            now,
+        );
         assert_eq!(decision.action, LeaseAction::Clear);
         assert_eq!(decision.available, 0);
         assert_eq!(decision.queued, 2);
+    }
+
+    #[test]
+    fn live_merge_queue_burst_larger_than_profile_fails_closed() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 13, 18, 45, 0).unwrap();
+        let runners = (1..=5)
+            .map(|index| {
+                runner(
+                    &format!("pulp-ci-ephemeral-{index}"),
+                    "online",
+                    false,
+                    &[
+                        "self-hosted",
+                        "Linux",
+                        "X64",
+                        "pulp-build-linux-x64",
+                        "pulp-host-macpro",
+                        "pulp-auto-linux-x64",
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let decision = decide_lease(
+            &runners,
+            "pulp-ci-ephemeral-",
+            &labels(),
+            0,
+            policy(2, 5),
+            now,
+        );
+        assert_eq!(decision.action, LeaseAction::Clear);
+        assert!(decision.reason.contains("declared=2 live=5"));
+    }
+
+    #[test]
+    fn full_declared_admission_burst_must_be_idle_before_renewal() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 13, 18, 45, 0).unwrap();
+        let runners = (1..=5)
+            .map(|index| {
+                runner(
+                    &format!("pulp-ci-ephemeral-{index}"),
+                    "online",
+                    false,
+                    &[
+                        "self-hosted",
+                        "Linux",
+                        "X64",
+                        "pulp-build-linux-x64",
+                        "pulp-host-macpro",
+                        "pulp-auto-linux-x64",
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let decision = decide_lease(
+            &runners,
+            "pulp-ci-ephemeral-",
+            &labels(),
+            0,
+            policy(5, 5),
+            now,
+        );
+        assert_eq!(decision.action, LeaseAction::Renew);
+        assert_eq!(decision.available, 5);
+    }
+
+    #[test]
+    fn two_runner_fleet_cannot_arm_a_five_entry_merge_queue() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 13, 18, 45, 0).unwrap();
+        let runners = (1..=2)
+            .map(|index| {
+                runner(
+                    &format!("pulp-ci-ephemeral-{index}"),
+                    "online",
+                    false,
+                    &[
+                        "self-hosted",
+                        "Linux",
+                        "X64",
+                        "pulp-build-linux-x64",
+                        "pulp-host-macpro",
+                        "pulp-auto-linux-x64",
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let decision = decide_lease(
+            &runners,
+            "pulp-ci-ephemeral-",
+            &labels(),
+            0,
+            policy(5, 5),
+            now,
+        );
+        assert_eq!(decision.action, LeaseAction::Clear);
+        assert_eq!(decision.available, 2);
+        assert!(decision.reason.contains("required=5 live=5"));
+    }
+
+    #[test]
+    fn branch_rules_require_a_positive_merge_queue_concurrency() {
+        let valid = r#"[[{"type":"required_status_checks","parameters":{}},{"type":"merge_queue","parameters":{"max_entries_to_build":5}}]]"#;
+        assert_eq!(
+            parse_merge_queue_build_concurrency(valid, "main").expect("merge queue rule"),
+            5
+        );
+        let missing = r#"[[{"type":"required_status_checks","parameters":{}}]]"#;
+        assert!(parse_merge_queue_build_concurrency(missing, "main").is_err());
+        let malformed = r#"[[{"type":"merge_queue","parameters":{"max_entries_to_build":0}}]]"#;
+        assert!(parse_merge_queue_build_concurrency(malformed, "main").is_err());
+    }
+
+    #[test]
+    fn branch_rules_query_requests_and_slurps_all_full_pages() {
+        assert_eq!(
+            merge_queue_rules_args("owner/repo", "main"),
+            [
+                "api",
+                "--paginate",
+                "--slurp",
+                "repos/owner/repo/rules/branches/main?per_page=100",
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_rules_find_merge_queue_on_a_later_page() {
+        let pages = r#"[[{"type":"required_status_checks","parameters":{}}],[{"type":"merge_queue","parameters":{"max_entries_to_build":5}}]]"#;
+        assert_eq!(
+            parse_merge_queue_build_concurrency(pages, "main").expect("later page"),
+            5
+        );
+    }
+
+    #[test]
+    fn malformed_branch_rules_page_fails_closed() {
+        let malformed_page = r#"[[{"type":"required_status_checks","parameters":{}}],{"type":"merge_queue","parameters":{"max_entries_to_build":5}}]"#;
+        let error = parse_merge_queue_build_concurrency(malformed_page, "main")
+            .expect_err("non-array page must not be skipped");
+        assert!(error.contains("page 2 is not a JSON array"));
+
+        assert!(parse_merge_queue_build_concurrency("[[]", "main").is_err());
     }
 
     #[test]
@@ -655,7 +924,14 @@ mod tests {
                 &["self-hosted", "Linux", "X64"],
             ),
         ];
-        let decision = decide_lease(&runners, "pulp-ci-ephemeral-", &labels(), 0, 1, 300, now);
+        let decision = decide_lease(
+            &runners,
+            "pulp-ci-ephemeral-",
+            &labels(),
+            0,
+            policy(1, 1),
+            now,
+        );
         assert_eq!(decision.action, LeaseAction::Clear);
         assert_eq!(decision.matching, 0);
     }

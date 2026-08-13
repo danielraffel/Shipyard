@@ -42,7 +42,8 @@ struct HealthLeasePlan {
     ttl_seconds: u64,
     events: Vec<String>,
     runner_name_prefix: String,
-    min_idle: usize,
+    merge_queue_branch: String,
+    admission_burst: usize,
 }
 
 #[derive(Debug)]
@@ -51,7 +52,8 @@ pub(super) struct LocalLinuxLeaseProfile {
     pub(super) ttl_seconds: u64,
     pub(super) events: Vec<String>,
     pub(super) runner_name_prefix: String,
-    pub(super) min_idle: usize,
+    pub(super) merge_queue_branch: String,
+    pub(super) admission_burst: usize,
     pub(super) required_labels: Vec<String>,
 }
 
@@ -369,7 +371,8 @@ pub(super) fn load_local_linux_lease_profile(
         ttl_seconds: lease.ttl_seconds,
         events: lease.events,
         runner_name_prefix: lease.runner_name_prefix,
-        min_idle: lease.min_idle,
+        merge_queue_branch: lease.merge_queue_branch,
+        admission_burst: lease.admission_burst,
         required_labels,
     })
 }
@@ -382,33 +385,35 @@ fn health_lease_plan(table: &Table) -> Option<HealthLeasePlan> {
         .and_then(|value| u64::try_from(value).ok())?;
     let events = string_array(table, "health_lease_events")?;
     let runner_name_prefix = optional_str(table, "health_lease_runner_name_prefix")?.to_owned();
-    let min_idle = health_lease_min_idle(table).ok()?;
+    let merge_queue_branch = optional_str(table, "health_lease_merge_queue_branch")?.to_owned();
+    let admission_burst = health_lease_admission_burst(table).ok()?;
     Some(HealthLeasePlan {
         variable,
         ttl_seconds,
         events,
         runner_name_prefix,
-        min_idle,
+        merge_queue_branch,
+        admission_burst,
     })
 }
 
-fn health_lease_min_idle(table: &Table) -> Result<usize, &'static str> {
-    match table.get("health_lease_min_idle") {
-        None => Ok(1),
+fn health_lease_admission_burst(table: &Table) -> Result<usize, &'static str> {
+    match table.get("health_lease_admission_burst") {
+        None => Err("health_lease_admission_burst is required"),
         Some(value) => value
             .as_integer()
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value >= 1)
-            .ok_or("health_lease_min_idle must be a positive integer"),
+            .ok_or("health_lease_admission_burst must be a positive integer"),
     }
 }
 
 fn strict_health_lease_plan(table: &Table) -> Result<HealthLeasePlan, CliFailure> {
-    health_lease_min_idle(table).map_err(|message| CliFailure::new(2, message))?;
+    health_lease_admission_burst(table).map_err(|message| CliFailure::new(2, message))?;
     let lease = health_lease_plan(table).ok_or_else(|| {
         CliFailure::new(
             2,
-            "profile lane needs health_lease_variable, health_lease_ttl_seconds, health_lease_events, and health_lease_runner_name_prefix",
+            "profile lane needs health_lease_variable, health_lease_ttl_seconds, health_lease_events, health_lease_runner_name_prefix, health_lease_merge_queue_branch, and health_lease_admission_burst",
         )
     })?;
     if lease.variable != "PULP_LOCAL_LINUX_LEASE_UNTIL" {
@@ -432,17 +437,16 @@ fn strict_health_lease_plan(table: &Table) -> Result<HealthLeasePlan, CliFailure
             "health_lease_events must be exactly [\"merge_group\"]",
         ));
     }
-    if lease.runner_name_prefix.trim().is_empty() || !lease.runner_name_prefix.contains("ephemeral")
-    {
+    if lease.runner_name_prefix != "pulp-ci-ephemeral-" {
         return Err(CliFailure::new(
             2,
-            "health_lease_runner_name_prefix must identify an ephemeral pool",
+            "health_lease_runner_name_prefix must be exactly pulp-ci-ephemeral- for the Pulp automatic route",
         ));
     }
-    if lease.min_idle == 0 {
+    if lease.merge_queue_branch != "main" {
         return Err(CliFailure::new(
             2,
-            "health_lease_min_idle must be at least 1",
+            "health_lease_merge_queue_branch must be main for the Pulp automatic route",
         ));
     }
     Ok(lease)
@@ -607,12 +611,13 @@ fn print_plan<W: Write>(stdout: &mut W, plan: &ProfilePlan) -> std::io::Result<(
         if let Some(lease) = &lane.health_lease {
             writeln!(
                 stdout,
-                "  health lease: {} ttl={}s events={} prefix={} min_idle={}",
+                "  health lease: {} ttl={}s events={} prefix={} branch={} admission_burst={}",
                 lease.variable,
                 lease.ttl_seconds,
                 lease.events.join(","),
                 lease.runner_name_prefix,
-                lease.min_idle
+                lease.merge_queue_branch,
+                lease.admission_burst
             )?;
         }
     }
@@ -630,7 +635,9 @@ fn print_plan<W: Write>(stdout: &mut W, plan: &ProfilePlan) -> std::io::Result<(
 mod tests {
     use std::fs;
 
-    use super::{build_plan, load_local_linux_lease_profile};
+    use toml::Table;
+
+    use super::{build_plan, load_local_linux_lease_profile, strict_health_lease_plan};
 
     #[test]
     fn builds_provider_neutral_profile_plan() {
@@ -704,7 +711,8 @@ health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
 health_lease_events = ["merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
-health_lease_min_idle = 1
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
 
 [targets."macpro.linux-x64-vm"]
 runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-auto-linux-x64"]
@@ -729,7 +737,8 @@ runs_on_json = "ubuntu-latest"
         assert_eq!(lease.ttl_seconds, 300);
         assert_eq!(lease.events, ["merge_group"]);
         assert_eq!(lease.runner_name_prefix, "pulp-ci-ephemeral-");
-        assert_eq!(lease.min_idle, 1);
+        assert_eq!(lease.merge_queue_branch, "main");
+        assert_eq!(lease.admission_burst, 5);
         assert!(lease.required_labels.iter().any(|label| label == "X64"));
         assert!(
             lease
@@ -737,6 +746,48 @@ runs_on_json = "ubuntu-latest"
                 .iter()
                 .any(|label| label == "pulp-auto-linux-x64")
         );
+    }
+
+    fn lease_lane_with_runner_prefix(prefix: &str) -> Table {
+        format!(
+            r#"
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "{prefix}"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
+"#
+        )
+        .parse()
+        .expect("lease lane")
+    }
+
+    #[test]
+    fn accepts_exact_controller_owned_health_lease_runner_prefix() {
+        let lease = strict_health_lease_plan(&lease_lane_with_runner_prefix("pulp-ci-ephemeral-"))
+            .expect("exact approved prefix");
+        assert_eq!(lease.runner_name_prefix, "pulp-ci-ephemeral-");
+    }
+
+    #[test]
+    fn rejects_broad_deceptive_and_near_miss_health_lease_runner_prefixes() {
+        for prefix in [
+            "ephemeral",
+            "not-ephemeral-",
+            "pulp-ci-ephemeral",
+            "pulp-ci-ephemeral-prod-",
+        ] {
+            let Err(error) = strict_health_lease_plan(&lease_lane_with_runner_prefix(prefix))
+            else {
+                panic!("unapproved prefix must fail closed: {prefix}");
+            };
+            assert!(
+                error.message.contains("exactly pulp-ci-ephemeral-"),
+                "prefix={prefix} error={}",
+                error.message
+            );
+        }
     }
 
     #[test]
@@ -750,6 +801,8 @@ health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
 health_lease_events = ["pull_request", "merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
 
 [targets."macpro.linux-x64-vm"]
 runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro", "pulp-auto-linux-x64"]
@@ -781,6 +834,8 @@ health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
 health_lease_events = ["merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
 
 [targets."macpro.linux-x64-vm"]
 runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
@@ -812,6 +867,8 @@ health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 901
 health_lease_events = ["merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
 
 [targets."macpro.linux-x64-vm"]
 runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
@@ -833,7 +890,7 @@ runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
     }
 
     #[test]
-    fn rejects_malformed_health_lease_min_idle_instead_of_defaulting() {
+    fn rejects_malformed_health_lease_admission_burst_instead_of_defaulting() {
         let profile = r#"
 name = "normal-local-fast"
 
@@ -843,7 +900,8 @@ health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
 health_lease_events = ["merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
-health_lease_min_idle = "2"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = "5"
 
 [targets."macpro.linux-x64-vm"]
 runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]

@@ -700,8 +700,12 @@ Use `shipyard runner local-linux-lease --repo Generous-Corp/pulp` to inspect the
 checked-in `normal-local-fast` Linux lane and decide whether its disposable Mac
 Pro pool may serve new unprivileged jobs. Dry-run is the default. `--apply`
 renews `PULP_LOCAL_LINUX_LEASE_UNTIL` only when the exact profile-derived labels
-have enough unreserved online idle `pulp-ci-ephemeral-*` runners after matching
-queued jobs reserve their slots; otherwise it deletes the variable.
+have enough unreserved online idle runners in the exact controller-owned
+`pulp-ci-ephemeral-` name namespace after matching queued jobs reserve their
+slots. It reads `main`'s live merge-queue rule and
+requires idle capacity for the full declared `max_entries_to_build` admission
+burst; otherwise it deletes the variable. With Pulp's five-entry queue and
+two-runner fleet, automatic routing intentionally remains disarmed.
 `--apply --watch --interval-secs 60` is the durable controller form.
 The profile TTL must be 60–900 seconds, so a dead controller expires safely.
 The accepted event scope is exactly `merge_group`, and the first target must

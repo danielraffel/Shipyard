@@ -141,10 +141,13 @@ For the local x64 Linux PR/merge-group lane, keep selector policy in the
 checked-in `normal-local-fast` profile and run the external Shipyard health
 operator documented in `docs/pulp-local-linux-lease.md`. The operator renews
 `PULP_LOCAL_LINUX_LEASE_UNTIL` only while the exact disposable Mac Pro selector
-has online idle capacity; all other observations clear the variable and new
+has idle capacity for the full live merge-queue admission burst after queued
+reservations; all other observations clear the variable and new
 jobs fall back hosted. The lease scope is exactly `merge_group`, and the first
-target must carry the protected `pulp-auto-linux-x64` opt-in label. Pull requests
-remain hosted. Never reuse it for secret-bearing or `pull_request_target` jobs.
+target must carry the protected `pulp-auto-linux-x64` opt-in label. The runner
+name prefix must be exactly the controller-owned `pulp-ci-ephemeral-` namespace;
+broad or substring-matching prefixes are rejected. Pull requests remain hosted.
+Never reuse it for secret-bearing or `pull_request_target` jobs.
 
 ## Runner Metrics For Agents
 
