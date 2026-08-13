@@ -328,11 +328,25 @@ fn emit_status_report<W: Write>(
                     for run in &report.stale_queued_runs {
                         writeln!(
                             stdout,
-                            "  - run {} ({}, branch={}) queued for {}s",
-                            run.run_id, run.workflow, run.branch, run.queued_for_secs,
+                            "  - run {} ({}, branch={}) queued for {}s [{}]",
+                            run.run_id,
+                            run.workflow,
+                            run.branch,
+                            run.queued_for_secs,
+                            if run.cancellation_safe {
+                                "cancellable"
+                            } else {
+                                "protected: not cancellable"
+                            },
                         )?;
                     }
-                    writeln!(stdout, "fix with: shipyard runner cleanup --fix")?;
+                    if report
+                        .stale_queued_runs
+                        .iter()
+                        .any(|run| run.cancellation_safe)
+                    {
+                        writeln!(stdout, "fix with: shipyard runner cleanup --fix")?;
+                    }
                 }
             }
         }
@@ -397,7 +411,7 @@ fn cleanup_command<W: Write>(
     let mut cancelled = Vec::new();
     let mut failed = Vec::new();
     if apply {
-        for run in &stale {
+        for run in stale.iter().filter(|run| run.cancellation_safe) {
             match actions.cancel_workflow_run(&settings.repo_slug, run.run_id) {
                 Ok(()) => cancelled.push(run.run_id),
                 Err(err) => failed.push((run.run_id, err.to_string())),
@@ -503,42 +517,22 @@ fn emit_cleanup_report<W: Write>(
     apply: bool,
     json: bool,
 ) -> Result<(), CliFailure> {
+    let protected_run_ids = stale
+        .iter()
+        .filter(|run| !run.cancellation_safe)
+        .map(|run| run.run_id)
+        .collect::<Vec<_>>();
+    let eligible_count = stale.len().saturating_sub(protected_run_ids.len());
     if json {
-        let mut data = BTreeMap::new();
-        data.insert("repo".to_owned(), Value::from(settings.repo_slug.clone()));
-        data.insert(
-            "stale_hours".to_owned(),
-            Value::from(settings.thresholds.max_queue_age_hours),
+        return emit_cleanup_json(
+            stdout,
+            settings,
+            stale,
+            cancelled,
+            failed,
+            &protected_run_ids,
+            apply,
         );
-        data.insert("apply".to_owned(), Value::Bool(apply));
-        data.insert(
-            "stale_queued_runs".to_owned(),
-            serde_json::to_value(stale).expect("stale serialization"),
-        );
-        data.insert(
-            "cancelled_run_ids".to_owned(),
-            serde_json::to_value(cancelled).expect("cancelled serialization"),
-        );
-        data.insert(
-            "failed".to_owned(),
-            Value::Array(
-                failed
-                    .iter()
-                    .map(|(id, msg)| {
-                        Value::Object(
-                            [
-                                ("run_id".to_owned(), Value::from(*id)),
-                                ("error".to_owned(), Value::from(msg.clone())),
-                            ]
-                            .into_iter()
-                            .collect(),
-                        )
-                    })
-                    .collect(),
-            ),
-        );
-        return write_json_envelope(stdout, "runner.cleanup", data)
-            .map_err(|error| CliFailure::new(1, error.to_string()));
     }
 
     let result: std::io::Result<()> = (|| {
@@ -560,13 +554,21 @@ fn emit_cleanup_report<W: Write>(
         for run in stale {
             writeln!(
                 stdout,
-                "  - run {} ({}, branch={}) queued for {}s",
-                run.run_id, run.workflow, run.branch, run.queued_for_secs,
+                "  - run {} ({}, branch={}) queued for {}s [{}]",
+                run.run_id,
+                run.workflow,
+                run.branch,
+                run.queued_for_secs,
+                if run.cancellation_safe {
+                    "cancellable"
+                } else {
+                    "protected: not cancellable"
+                },
             )?;
         }
         if apply {
             if cancelled.is_empty() && failed.is_empty() {
-                writeln!(stdout, "No runs cancelled.")?;
+                writeln!(stdout, "No eligible runs cancelled.")?;
             } else {
                 writeln!(stdout, "Cancelled run ids: {cancelled:?}")?;
             }
@@ -576,12 +578,70 @@ fn emit_cleanup_report<W: Write>(
                     writeln!(stdout, "  - run {id}: {msg}")?;
                 }
             }
+        } else if eligible_count > 0 {
+            writeln!(stdout, "Re-run with --fix to cancel the eligible runs.")?;
         } else {
-            writeln!(stdout, "Re-run with --fix to cancel these.")?;
+            writeln!(stdout, "No stale runs are eligible for broad cancellation.")?;
+        }
+        if !protected_run_ids.is_empty() {
+            writeln!(
+                stdout,
+                "Protected run ids (not cancellable): {protected_run_ids:?}"
+            )?;
         }
         Ok(())
     })();
     result.map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
+fn emit_cleanup_json<W: Write>(
+    stdout: &mut W,
+    settings: &WatchdogSettings,
+    stale: &[StaleQueuedRun],
+    cancelled: &[u64],
+    failed: &[(u64, String)],
+    protected_run_ids: &[u64],
+    apply: bool,
+) -> Result<(), CliFailure> {
+    let mut data = BTreeMap::new();
+    data.insert("repo".to_owned(), Value::from(settings.repo_slug.clone()));
+    data.insert(
+        "stale_hours".to_owned(),
+        Value::from(settings.thresholds.max_queue_age_hours),
+    );
+    data.insert("apply".to_owned(), Value::Bool(apply));
+    data.insert(
+        "stale_queued_runs".to_owned(),
+        serde_json::to_value(stale).expect("stale serialization"),
+    );
+    data.insert(
+        "cancelled_run_ids".to_owned(),
+        serde_json::to_value(cancelled).expect("cancelled serialization"),
+    );
+    data.insert(
+        "protected_run_ids".to_owned(),
+        serde_json::to_value(protected_run_ids).expect("protected serialization"),
+    );
+    data.insert(
+        "failed".to_owned(),
+        Value::Array(
+            failed
+                .iter()
+                .map(|(id, msg)| {
+                    Value::Object(
+                        [
+                            ("run_id".to_owned(), Value::from(*id)),
+                            ("error".to_owned(), Value::from(msg.clone())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )
+                })
+                .collect(),
+        ),
+    );
+    write_json_envelope(stdout, "runner.cleanup", data)
+        .map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 // ---------- settings / config wiring ----------

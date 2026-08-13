@@ -45,6 +45,16 @@ cancel them via `POST /actions/runs/<id>/cancel`. Exits non-zero when
 stale runs are found in dry-run mode (matches the prototype script's
 contract, so cron consumers see drift).
 
+Repository-wide cleanup is fail-closed to `pull_request` and `merge_group`
+runs. `Release CLI` and `Sign and Release` are never candidates, matched by
+both workflow name and filename. Push, schedule, tag, and `workflow_dispatch`
+runs require an exact-run operation instead of broad age-based cleanup.
+Protected stale runs remain visible in status and dry-run reports; protection
+limits mutation authority, not observability.
+Human output labels each run `cancellable` or `protected: not cancellable`;
+JSON includes `cancellation_safe` per run and `protected_run_ids` in cleanup
+results.
+
 ```bash
 shipyard runner cleanup                             # dry-run, prints stale ids
 shipyard runner cleanup --fix                       # cancel them
@@ -216,6 +226,10 @@ Both thresholds are deliberately well past any healthy run, so an
 in-flight validation run is never cancelled. Unlike host-process reaping,
 this also covers runs on **GitHub-hosted** runners.
 
+The reaper only considers `pull_request` and `merge_group` runs and always
+protects `Release CLI` and `Sign and Release`; other event types are outside
+the authority of repository-wide age-based cleanup.
+
 ```bash
 # Auto-cancel stale runs on every tick:
 shipyard runner watch --reap-stale-runs
@@ -230,7 +244,7 @@ shipyard runner watch --reap-stale-runs \
 
 With `--json`, each candidate emits a `runner.watch` envelope with
 `event=reap_stale_run` and `phase ∈ {attempt, cancelled, failed,
-skipped}` (`skipped` only under `--dry-run`) — mirroring the
+skipped}` (`skipped` means dry-run or protected by cancellation policy) — mirroring the
 `event=auto_kill_worker` envelopes from `--kill-hung-workers`.
 
 Cancellation goes through the GitHub REST API
