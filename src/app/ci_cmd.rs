@@ -336,6 +336,15 @@ fn lane_warnings(
                 spec.context, spec.lane, target.id
             ));
         }
+        if target.arch.as_deref() == Some("x64")
+            && !target.is_github()
+            && !target_bool(targets, &target.id, "proven")
+        {
+            warnings.push(format!(
+                "{}.{}: local x64 target {} is not marked proven",
+                spec.context, spec.lane, target.id
+            ));
+        }
     }
     warnings
 }
