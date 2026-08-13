@@ -41,7 +41,7 @@ struct LeaseJob {
 struct FleetObservation {
     runners: Vec<LeaseRunner>,
     queued_matching_jobs: usize,
-    merge_queue_build_concurrency: usize,
+    observed_admission_burst: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -153,10 +153,15 @@ pub(super) fn local_linux_lease_command<W: Write>(
                     &observation.runners,
                     &profile.runner_name_prefix,
                     &profile.required_labels,
+                    if profile.events == ["pull_request"] {
+                        "pulp-auto-linux-x64"
+                    } else {
+                        "pulp-pr-safe-linux-x64"
+                    },
                     observation.queued_matching_jobs,
                     AdmissionPolicy {
                         declared_burst: profile.admission_burst,
-                        live_burst: observation.merge_queue_build_concurrency,
+                        live_burst: observation.observed_admission_burst,
                         ttl_seconds: profile.ttl_seconds,
                     },
                     observed_at,
@@ -237,7 +242,7 @@ fn observe_fleet(
     Ok(FleetObservation {
         runners: fetch_runners(actions, repo)?,
         queued_matching_jobs,
-        merge_queue_build_concurrency: live_burst,
+        observed_admission_burst: live_burst,
     })
 }
 
@@ -369,6 +374,7 @@ fn decide_lease(
     runners: &[LeaseRunner],
     name_prefix: &str,
     required_labels: &[String],
+    forbidden_capability: &str,
     queued: usize,
     policy: AdmissionPolicy,
     observed_at: DateTime<Utc>,
@@ -377,14 +383,22 @@ fn decide_lease(
         .iter()
         .map(|label| label.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
-    let matching = runners
+    let scheduler_eligible = runners
+        .iter()
+        .filter(|runner| required.is_subset(&runner.label_names()))
+        .collect::<Vec<_>>();
+    let forbidden_capability = forbidden_capability.to_ascii_lowercase();
+    let contaminated = scheduler_eligible
         .iter()
         .filter(|runner| {
-            // GitHub's repository-runner API does not expose registration
-            // ephemerality. The profile prefix is therefore a dedicated,
-            // controller-owned namespace in addition to the exact pool labels.
-            runner.name.starts_with(name_prefix) && required.is_subset(&runner.label_names())
+            let labels = runner.label_names();
+            !runner.name.starts_with(name_prefix) || labels.contains(&forbidden_capability)
         })
+        .count();
+    let matching = scheduler_eligible
+        .iter()
+        .copied()
+        .filter(|runner| runner.name.starts_with(name_prefix))
         .collect::<Vec<_>>();
     let online = matching
         .iter()
@@ -395,6 +409,21 @@ fn decide_lease(
         .filter(|runner| runner.status.eq_ignore_ascii_case("online") && !runner.busy)
         .count();
     let available = idle.saturating_sub(queued);
+    if contaminated > 0 {
+        return LeaseDecision {
+            action: LeaseAction::Clear,
+            observed_at,
+            expires_at: None,
+            matching: matching.len(),
+            online,
+            idle,
+            queued,
+            available,
+            reason: format!(
+                "scheduler_eligible_runner_outside_approved_namespace: contaminated={contaminated} prefix={name_prefix} forbidden_capability={forbidden_capability}"
+            ),
+        };
+    }
     if policy.declared_burst < policy.live_burst {
         return LeaseDecision {
             action: LeaseAction::Clear,
@@ -687,6 +716,7 @@ mod tests {
             &runners,
             "pulp-ci-ephemeral-",
             &labels(),
+            "pulp-pr-safe-linux-x64",
             0,
             policy(1, 1),
             now,
@@ -718,6 +748,7 @@ mod tests {
             &runners,
             "pulp-ci-ephemeral-",
             &labels(),
+            "pulp-pr-safe-linux-x64",
             0,
             policy(1, 1),
             now,
@@ -761,6 +792,7 @@ mod tests {
             &runners,
             "pulp-ci-ephemeral-",
             &labels(),
+            "pulp-pr-safe-linux-x64",
             2,
             policy(1, 1),
             now,
@@ -794,6 +826,7 @@ mod tests {
             &runners,
             "pulp-ci-ephemeral-",
             &labels(),
+            "pulp-pr-safe-linux-x64",
             0,
             policy(2, 5),
             now,
@@ -826,6 +859,7 @@ mod tests {
             &runners,
             "pulp-ci-ephemeral-",
             &labels(),
+            "pulp-pr-safe-linux-x64",
             0,
             policy(5, 5),
             now,
@@ -858,6 +892,7 @@ mod tests {
             &runners,
             "pulp-ci-ephemeral-",
             &labels(),
+            "pulp-pr-safe-linux-x64",
             0,
             policy(5, 5),
             now,
@@ -933,12 +968,56 @@ mod tests {
             &runners,
             "pulp-ci-ephemeral-",
             &labels(),
+            "pulp-pr-safe-linux-x64",
             0,
             policy(1, 1),
             now,
         );
         assert_eq!(decision.action, LeaseAction::Clear);
         assert_eq!(decision.matching, 0);
+    }
+
+    #[test]
+    fn scheduler_eligible_runner_outside_namespace_clears_lease() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 13, 18, 45, 0).unwrap();
+        let required = [
+            "self-hosted",
+            "Linux",
+            "X64",
+            "pulp-host-macpro",
+            "pulp-pr-safe-linux-x64",
+        ];
+        let mut dual_capability = required.to_vec();
+        dual_capability.push("pulp-auto-linux-x64");
+        for contaminated in [
+            runner("persistent-macpro", "offline", false, &required),
+            runner(
+                "pulp-pr-safe-ephemeral-202",
+                "online",
+                false,
+                &dual_capability,
+            ),
+        ] {
+            let runners = vec![
+                runner("pulp-pr-safe-ephemeral-201", "online", false, &required),
+                contaminated,
+            ];
+            let required_labels = required
+                .iter()
+                .map(|label| (*label).to_owned())
+                .collect::<Vec<_>>();
+            let decision = decide_lease(
+                &runners,
+                "pulp-pr-safe-ephemeral-",
+                &required_labels,
+                "pulp-auto-linux-x64",
+                0,
+                policy(1, 1),
+                now,
+            );
+            assert_eq!(decision.action, LeaseAction::Clear);
+            assert!(decision.reason.contains("outside_approved_namespace"));
+        }
     }
 
     #[test]

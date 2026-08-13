@@ -137,17 +137,25 @@ Windows QEMU on Apple Silicon is Windows ARM64; x64 MSVC/Prism execution is
 smoke/debug until proven and should not replace `windows-latest` authority.
 Coverage must use dedicated ephemeral labels, not warm bare-metal build pools.
 
-For the local x64 Linux PR/merge-group lane, keep selector policy in the
-checked-in `normal-local-fast` profile and run the external Shipyard health
-operator documented in `docs/pulp-local-linux-lease.md`. The operator renews
+For local x64 Linux, keep selector policy in the checked-in `normal-local-fast`
+profile and run the external Shipyard health operator documented in
+`docs/pulp-local-linux-lease.md`. The trusted merge-group namespace renews
 `PULP_LOCAL_LINUX_LEASE_UNTIL` only while the exact disposable Mac Pro selector
 has idle capacity for the full live merge-queue admission burst after queued
-reservations; all other observations clear the variable and new
-jobs fall back hosted. The lease scope is exactly `merge_group`, and the first
-target must carry the protected `pulp-auto-linux-x64` opt-in label. The runner
-name prefix must be exactly the controller-owned `pulp-ci-ephemeral-` namespace;
-broad or substring-matching prefixes are rejected. Pull requests remain hosted.
-Never reuse it for secret-bearing or `pull_request_target` jobs.
+reservations; all other observations clear the variable and new jobs fall back
+hosted. Its first target must carry `pulp-auto-linux-x64` and its runner prefix
+must be exactly `pulp-ci-ephemeral-`.
+
+A future PR route must use the fully separate PR-safe tuple selected with
+`--context pr`: `PULP_PR_SAFE_LINUX_LEASE_UNTIL`,
+`pulp-pr-safe-ephemeral-`, and `pulp-pr-safe-linux-x64`. Shipyard rejects target
+selectors that carry both capability labels. The PR-safe lane must remain
+advisory because its declared burst is a reviewed capacity budget, not an
+atomic or GitHub-enforced PR admission cap. Broad/near-miss prefixes and mixed
+control tuples fail closed. Renewal also refuses any inventory where a
+selector-eligible runner sits outside its approved prefix or carries the
+opposite capability. Never reuse either lease for secret-bearing or
+`pull_request_target` jobs.
 
 ## Runner Metrics For Agents
 
