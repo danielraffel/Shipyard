@@ -1,12 +1,13 @@
 # Pulp local Linux health lease
 
 `shipyard runner local-linux-lease` is the external health authority for Pulp's
-disposable Mac Pro Linux CI route. It does not dispatch workflows or mutate the
+two disposable Mac Pro Linux CI routes. It does not dispatch workflows or mutate the
 merge queue. It only maintains the short repository variable consumed before a
 workflow creates its matrix:
 
 ```text
 PULP_LOCAL_LINUX_LEASE_UNTIL=2026-08-13T18:50:00Z
+PULP_PR_SAFE_LINUX_LEASE_UNTIL=2026-08-13T18:50:00Z
 ```
 
 The value is an RFC3339 UTC expiry. Pulp uses the local selector only while the
@@ -19,7 +20,7 @@ The operator reads the lane declaration from Pulp's checked-in
 `.shipyard/ci-profiles/normal-local-fast.toml`. The Linux lane has this shape:
 
 ```toml
-[repo."Generous-Corp/pulp".pr.linux]
+[repo."Generous-Corp/pulp".merge_group.linux]
 strategy = "ordered-fallback"
 targets = ["macpro.linux-x64-vm", "github.linux-x64"]
 github_variable = "PULP_LOCAL_LINUX_RUNS_ON_JSON"
@@ -32,15 +33,27 @@ health_lease_admission_burst = 5
 
 [targets."macpro.linux-x64-vm"]
 runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-auto-linux-x64"]
+
+[repo."Generous-Corp/pulp".pr.linux]
+targets = ["macpro.linux-x64-pr-safe-vm", "github.linux-x64"]
+health_lease_variable = "PULP_PR_SAFE_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["pull_request"]
+health_lease_runner_name_prefix = "pulp-pr-safe-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 2
+
+[targets."macpro.linux-x64-pr-safe-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-pr-safe-linux-x64"]
 ```
 
 Required runner labels come from the first target's `runs_on_json`; they are
-not duplicated in the lease declaration. Shipyard rejects TTLs outside
-60–900 seconds, any event scope other than exactly `merge_group`, a branch
-other than `main`, a missing/non-positive admission burst, any runner prefix
-other than the controller-owned exact `pulp-ci-ephemeral-` namespace, or a
-first target missing `self-hosted`, `Linux`, `X64`, or the protected automatic opt-in label
-`pulp-auto-linux-x64`.
+not duplicated in the lease declaration. Shipyard accepts only two complete
+namespaces: trusted `merge_group` with `PULP_LOCAL_LINUX_LEASE_UNTIL`,
+`pulp-ci-ephemeral-`, and `pulp-auto-linux-x64`; or PR-safe `pull_request` with
+`PULP_PR_SAFE_LINUX_LEASE_UNTIL`, `pulp-pr-safe-ephemeral-`, and
+`pulp-pr-safe-linux-x64`. Mixed namespaces fail closed. TTLs must be 60–900
+seconds, the branch must be `main`, and admission burst must be positive.
 
 ## Operation
 
@@ -49,6 +62,10 @@ the default:
 
 ```sh
 shipyard runner local-linux-lease --repo Generous-Corp/pulp --json
+
+# Separate same-repository PR-safe lane
+shipyard runner local-linux-lease --repo Generous-Corp/pulp \
+  --context pr --lane linux --json
 ```
 
 One applied health tick:
@@ -67,9 +84,11 @@ shipyard runner local-linux-lease \
 
 Each tick lists all registered runners through Shipyard's configured GitHub
 authentication. A runner authorizes renewal only when its name has the exact
-`pulp-ci-ephemeral-` prefix, it carries every label from the first local target,
+lane-specific prefix, it carries every label from the first local target,
 it is online, and it is idle. Shipyard also reads the live rules applying to `main`
-and extracts the merge queue's `max_entries_to_build`. The declared admission
+and extracts the merge queue's `max_entries_to_build` for the merge-group lane.
+The PR-safe lane uses its own declared burst because it does not consume merge
+queue admission. The declared admission
 burst must be at least that live value, and that many matching runners must
 remain idle after already-queued jobs reserve their slots. This covers the
 largest group of workflows GitHub can materialize from one shared lease

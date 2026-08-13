@@ -141,6 +141,8 @@ pub(super) fn local_linux_lease_command<W: Write>(
             &repo,
             &profile.required_labels,
             &profile.merge_queue_branch,
+            &profile.events,
+            profile.admission_burst,
         ) {
             Ok(observation) => {
                 // Lease time begins only after every fleet and ruleset read is
@@ -223,16 +225,19 @@ fn observe_fleet(
     repo: &str,
     required_labels: &[String],
     merge_queue_branch: &str,
+    events: &[String],
+    declared_burst: usize,
 ) -> Result<FleetObservation, String> {
     let queued_matching_jobs = fetch_queued_matching_jobs(actions, repo, required_labels)?;
+    let live_burst = if events == ["merge_group"] {
+        fetch_merge_queue_build_concurrency(actions, repo, merge_queue_branch)?
+    } else {
+        declared_burst
+    };
     Ok(FleetObservation {
         runners: fetch_runners(actions, repo)?,
         queued_matching_jobs,
-        merge_queue_build_concurrency: fetch_merge_queue_build_concurrency(
-            actions,
-            repo,
-            merge_queue_branch,
-        )?,
+        merge_queue_build_concurrency: live_burst,
     })
 }
 
