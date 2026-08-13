@@ -166,6 +166,8 @@ def smoke_binary(binary: Path) -> str:
 
 def sign_binary(path: Path) -> None:
     identity = os.environ["SHIPYARD_SIGNING_IDENTITY"]
+    keychain = os.environ.get("SHIPYARD_SIGNING_KEYCHAIN")
+    keychain_args = ["--keychain", keychain] if keychain else []
     run(
         [
             "codesign",
@@ -175,6 +177,7 @@ def sign_binary(path: Path) -> None:
             "--timestamp",
             "--sign",
             identity,
+            *keychain_args,
             str(path),
         ]
     )
@@ -200,7 +203,9 @@ def create_dmg(stage_dir: Path, output_dmg: Path, *, volume_name: str) -> None:
 
 def sign_dmg(path: Path) -> None:
     identity = os.environ["SHIPYARD_SIGNING_IDENTITY"]
-    run(["codesign", "--force", "--sign", identity, str(path)])
+    keychain = os.environ.get("SHIPYARD_SIGNING_KEYCHAIN")
+    keychain_args = ["--keychain", keychain] if keychain else []
+    run(["codesign", "--force", "--sign", identity, *keychain_args, str(path)])
 
 
 def create_notary_keychain(temp_dir: Path) -> tuple[Path, str]:

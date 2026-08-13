@@ -794,6 +794,12 @@ lives in the Studio keychain, so the signed/notarized dmg build skips
 GitHub's hosted-macOS queue. Full provider semantics:
 `skills/ci/SKILL.md` → "Runner Provider Defaults" → "The `local` provider".
 
+When the release workflow imports an ephemeral signing identity, preserve the
+runner owner's exact user keychain default and search-list order by never
+mutating either: pass the ephemeral keychain explicitly to `codesign`.
+Cleanup must run under `always()`, verify both settings stayed unchanged, and
+delete the ephemeral keychain even when signing setup fails.
+
 ### CI routing profiles
 
 Use `shipyard ci profile show <name>` and
