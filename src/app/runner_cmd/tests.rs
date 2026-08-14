@@ -93,6 +93,26 @@ fn dry_run_overridden_only_respects_fix_flag() {
 }
 
 #[test]
+fn offline_busy_human_status_includes_reconciliation_symptom() {
+    let report = RunnerReport {
+        health: RunnerHealth::Offline,
+        symptoms: vec![Symptom::OfflineBusy],
+        stale_queued_runs: Vec::new(),
+        worker_count: 0,
+        busy: true,
+        status: "offline".to_owned(),
+    };
+    let mut output = Vec::new();
+
+    emit_status_report(&mut output, &report, false).expect("render human status");
+    let rendered = String::from_utf8(output).expect("utf-8 output");
+
+    assert!(rendered.contains("ERR: runner is not online"));
+    assert!(rendered.contains("offline_busy:"));
+    assert!(rendered.contains("reconcile local VM/lease/job ownership"));
+}
+
+#[test]
 fn cleanup_report_distinguishes_cancellable_and_protected_stale_runs() {
     let settings = WatchdogSettings {
         repo_slug: "owner/repo".to_owned(),
