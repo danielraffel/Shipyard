@@ -119,7 +119,10 @@ The subscription-open / snapshot / fallback order is fixed:
    and record `transport: "polling"`.
 2. **Authoritative snapshot.** One `gh` call to evaluate the truth
    condition. Always runs, regardless of daemon state or
-   `--no-fallback`.
+   `--no-fallback`. A transient token-helper/network preparation failure is
+   retried inside the same process with bounded backoff and the same overall
+   `--timeout`; permanent configuration or credential errors still fail
+   immediately.
 3. **Matched?** Exit 0 with the observed snapshot. Drain and discard
    the event queue; close the subscription cleanly.
 4. **Not matched + daemon available:** process buffered events in
@@ -159,6 +162,7 @@ catches the transition. No cursor semantics required.
   "transport": "daemon",
   "fallback_used": false,
   "events_received": 3,
+  "transient_errors": 1,
   "elapsed_seconds": 12.4
 }
 ```
@@ -175,6 +179,9 @@ Fields:
   fell through to polling mid-wait (e.g. daemon exited).
 - `events_received` — count of events that triggered a re-evaluation.
   Zero on pure-polling transport.
+- `transient_errors` — count of recoverable snapshot/auth failures retried
+  without dropping the waiter. Permanent auth/configuration failures are not
+  counted because they terminate immediately.
 - `elapsed_seconds` — wall-clock since the CLI was invoked.
 
 ## MVP tradeoffs

@@ -653,6 +653,12 @@ in `[runner.watchdog]` (`reap_in_progress_max_min` /
 
 Whenever you'd otherwise write a polling loop around `gh` — wait for a release to upload, wait for a PR's required checks to go green, wait for a dispatched workflow run to finish — reach for `shipyard wait` instead. It opens a daemon subscription first (if one's running), takes one authoritative `gh` snapshot, and either exits 0 immediately or keeps re-evaluating on real webhook events (no extra REST budget). When the daemon isn't running, it falls back to polling transparently — safe to use on headless CI too.
 
+The waiter does not drop ownership on a brief token-helper or network
+preparation failure. It retries only classified transient failures with bounded
+backoff inside the existing `--timeout` and reports the count as
+`transient_errors`; permanent credential/configuration failures still exit
+immediately.
+
 For `--state green`, Shipyard separately resolves GitHub's required-check set and
 annotates the rollup before evaluating it. Never infer requiredness from the raw
 `gh pr view --json statusCheckRollup` payload: that payload omits `isRequired`.
@@ -702,6 +708,7 @@ If either check fails, fall back to `gh run watch` / `gh pr checks --watch`.
   "transport": "daemon",
   "fallback_used": false,
   "events_received": 3,
+  "transient_errors": 1,
   "elapsed_seconds": 12.4
 }
 ```
