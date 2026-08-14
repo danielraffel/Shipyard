@@ -466,6 +466,14 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   mutation path. A stale state must not disable or dequeue the newer head;
   pending required, advisory, or self-hosted checks do not create revocation
   authority, regardless of their age.
+- **Closure authority:** an open PR may be described as already integrated only
+  from a `current-base...PR-head` GitHub comparison. `behind` or `identical`
+  with `ahead_by == 0` proves commit containment. `ahead` and `diverged` do not;
+  they require exact changed-path blob containment before closure. The ghapp
+  close guard fails closed on missing, contradictory, or truncated evidence and
+  requires `GHAPP_ALLOW_UNINTEGRATED_PR_CLOSE=1` for an explicit abandonment or
+  temporary sequence lock. Reversing the compare operands reverses the meaning
+  of `ahead_by` and is never valid closure evidence.
 - **Fleet authority:** `[merge_queue].mutation_machine` is required in the
   trusted machine-global `config.toml` reported by `shipyard paths`; tracked
   project and checkout-local overlays are ignored. The machine-global runner
