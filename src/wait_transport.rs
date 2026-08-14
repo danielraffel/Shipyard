@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::{Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +16,8 @@ use serde_json::Value;
 use crate::gh::{GhAuthPolicy, GhClient, GhPrepareError, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::wait::TruthResult;
+
+const SNAPSHOT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Common result type for wait snapshot fetches and evaluator calls.
 pub type WaitResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -91,22 +95,29 @@ fn fetch_snapshot_resilient<F>(
     transient_errors: &mut u64,
 ) -> WaitResult<SnapshotFetch>
 where
-    F: FnMut() -> WaitResult<Option<Value>>,
+    F: FnMut(Duration) -> WaitResult<Option<Value>>,
 {
     let retry_interval = poll_interval
         .max(Duration::from_millis(250))
         .min(Duration::from_secs(5));
     loop {
-        match fetch_snapshot() {
-            Ok(snapshot) => return Ok(SnapshotFetch::Snapshot(snapshot)),
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Ok(SnapshotFetch::TimedOut);
+        }
+        let fetched = fetch_snapshot(remaining);
+        let timed_out = timeout.saturating_sub(start.elapsed()).is_zero();
+        match fetched {
             Err(error) if is_transient_snapshot_error(error.as_ref()) => {
                 *transient_errors += 1;
-                let remaining = timeout.saturating_sub(start.elapsed());
-                if remaining.is_zero() {
+                if timed_out {
                     return Ok(SnapshotFetch::TimedOut);
                 }
+                let remaining = timeout.saturating_sub(start.elapsed());
                 thread::sleep(retry_interval.min(remaining));
             }
+            _ if timed_out => return Ok(SnapshotFetch::TimedOut),
+            Ok(snapshot) => return Ok(SnapshotFetch::Snapshot(snapshot)),
             Err(error) => return Err(error),
         }
     }
@@ -116,6 +127,7 @@ fn is_transient_snapshot_error(error: &(dyn std::error::Error + 'static)) -> boo
     error
         .downcast_ref::<GhPrepareError>()
         .is_some_and(GhPrepareError::is_transient)
+        || error.downcast_ref::<SnapshotCommandTimeout>().is_some()
 }
 
 fn fetch_and_evaluate<F, E>(
@@ -127,7 +139,7 @@ fn fetch_and_evaluate<F, E>(
     transient_errors: &mut u64,
 ) -> WaitResult<Option<TruthResult>>
 where
-    F: FnMut() -> WaitResult<Option<Value>>,
+    F: FnMut(Duration) -> WaitResult<Option<Value>>,
     E: FnMut(Option<&Value>) -> WaitResult<TruthResult>,
 {
     match fetch_snapshot_resilient(
@@ -226,7 +238,7 @@ impl DaemonConnection {
 /// 3. daemon-driven re-evaluation when available
 /// 4. polling fallback only when the daemon is unavailable or disconnects
 pub fn wait_for_condition<F, E, P>(
-    mut evaluator: E,
+    evaluator: E,
     mut fetch_snapshot: F,
     event_filter: P,
     timeout_seconds: f64,
@@ -236,6 +248,31 @@ pub fn wait_for_condition<F, E, P>(
 ) -> WaitResult<WaitOutcome>
 where
     F: FnMut() -> WaitResult<Option<Value>>,
+    E: FnMut(Option<&Value>) -> WaitResult<TruthResult>,
+    P: Fn(&Value) -> bool,
+{
+    wait_for_condition_with_timeout(
+        evaluator,
+        move |_| fetch_snapshot(),
+        event_filter,
+        timeout_seconds,
+        poll_interval_seconds,
+        no_fallback,
+        socket_path,
+    )
+}
+
+pub(crate) fn wait_for_condition_with_timeout<F, E, P>(
+    mut evaluator: E,
+    mut fetch_snapshot: F,
+    event_filter: P,
+    timeout_seconds: f64,
+    poll_interval_seconds: f64,
+    no_fallback: bool,
+    socket_path: &Path,
+) -> WaitResult<WaitOutcome>
+where
+    F: FnMut(Duration) -> WaitResult<Option<Value>>,
     E: FnMut(Option<&Value>) -> WaitResult<TruthResult>,
     P: Fn(&Value) -> bool,
 {
@@ -358,6 +395,15 @@ pub fn read_snapshot_file(path: &Path) -> WaitResult<Option<Value>> {
 
 /// Fetch a GitHub release snapshot.
 pub fn fetch_release_snapshot(repo: &str, tag: &str, cwd: &Path) -> WaitResult<Option<Value>> {
+    fetch_release_snapshot_with_timeout(repo, tag, cwd, Duration::from_secs(15))
+}
+
+pub(crate) fn fetch_release_snapshot_with_timeout(
+    repo: &str,
+    tag: &str,
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Option<Value>> {
     let client = gh_client(cwd)?;
     run_gh_json(
         &client,
@@ -368,7 +414,7 @@ pub fn fetch_release_snapshot(repo: &str, tag: &str, cwd: &Path) -> WaitResult<O
             "Accept: application/vnd.github+json".to_owned(),
         ],
         cwd,
-        15.0,
+        timeout,
     )
 }
 
@@ -380,7 +426,17 @@ pub fn fetch_release_snapshot(repo: &str, tag: &str, cwd: &Path) -> WaitResult<O
 /// `gh api repos/:r/commits/:sha/check-runs` for the check rollup. Matches
 /// the same fallback pattern `src/pr.rs` and `src/app/auto_merge_cmd.rs` use.
 pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<Option<Value>> {
+    fetch_pr_snapshot_with_timeout(repo, pr_number, cwd, Duration::from_secs(15))
+}
+
+pub(crate) fn fetch_pr_snapshot_with_timeout(
+    repo: &str,
+    pr_number: u64,
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Option<Value>> {
     let client = gh_client(cwd)?;
+    let started = Instant::now();
     match run_gh_capturing(
         &client,
         &[
@@ -393,13 +449,15 @@ pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<O
             PR_VIEW_JSON_FIELDS.to_owned(),
         ],
         cwd,
+        timeout,
     )? {
         GhOutcome::Success(stdout) => {
             let mut value = serde_json::from_slice::<Value>(&stdout)?;
             if !value.is_object() {
                 return Ok(None);
             }
-            match fetch_required_pr_checks(&client, repo, pr_number, cwd)? {
+            let remaining = remaining_snapshot_timeout(timeout, started.elapsed());
+            match fetch_required_pr_checks(&client, repo, pr_number, cwd, remaining)? {
                 Some(required) => annotate_required_checks(&mut value, &required),
                 None => {
                     value["_required_checks_known"] = Value::Bool(false);
@@ -408,8 +466,12 @@ pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<O
             Ok(Some(value))
         }
         GhOutcome::GraphqlRateLimited => {
-            crate::pr::report_rate_limit_fallback_with_client(&client, "gh pr snapshot", cwd);
-            fetch_pr_snapshot_rest_with_client(&client, repo, pr_number, cwd)
+            // The shared reporter performs a best-effort reset-time probe. A
+            // waiter cannot make that extra unbounded call without violating
+            // its overall deadline, so retain the notice and skip the probe.
+            eprintln!("shipyard: GraphQL rate limit hit for gh pr snapshot. Falling back to REST.");
+            let remaining = timeout.saturating_sub(started.elapsed());
+            fetch_pr_snapshot_rest_with_client(&client, repo, pr_number, cwd, remaining)
         }
         GhOutcome::OtherFailure => Ok(None),
     }
@@ -427,11 +489,12 @@ fn fetch_required_pr_checks(
     repo: &str,
     pr_number: u64,
     cwd: &Path,
+    timeout: Duration,
 ) -> WaitResult<Option<Vec<Value>>> {
     let pr_number = pr_number.to_string();
-    let output = client
-        .prepare_command(cwd, None, GhSupervision::Supervised, GhAuthPolicy::Default)?
-        .args([
+    let output = run_gh_output(
+        client,
+        &[
             "pr",
             "checks",
             pr_number.as_str(),
@@ -440,8 +503,10 @@ fn fetch_required_pr_checks(
             "--required",
             "--json",
             PR_CHECKS_JSON_FIELDS,
-        ])
-        .output()?;
+        ],
+        cwd,
+        timeout,
+    )?;
 
     if let Ok(value) = serde_json::from_slice::<Value>(&output.stdout)
         && let Some(required) = value.as_array()
@@ -521,8 +586,17 @@ fn annotate_required_checks(snapshot: &mut Value, required: &[Value]) {
 /// safe: a green REST evaluation cannot incorrectly report green when
 /// non-required checks fail.
 pub fn fetch_pr_snapshot_rest(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<Option<Value>> {
+    fetch_pr_snapshot_rest_with_timeout(repo, pr_number, cwd, Duration::from_secs(15))
+}
+
+pub(crate) fn fetch_pr_snapshot_rest_with_timeout(
+    repo: &str,
+    pr_number: u64,
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Option<Value>> {
     let client = gh_client(cwd)?;
-    fetch_pr_snapshot_rest_with_client(&client, repo, pr_number, cwd)
+    fetch_pr_snapshot_rest_with_client(&client, repo, pr_number, cwd, timeout)
 }
 
 fn fetch_pr_snapshot_rest_with_client(
@@ -530,7 +604,9 @@ fn fetch_pr_snapshot_rest_with_client(
     repo: &str,
     pr_number: u64,
     cwd: &Path,
+    timeout: Duration,
 ) -> WaitResult<Option<Value>> {
+    let started = Instant::now();
     let pr_value = match run_gh_capturing(
         client,
         &[
@@ -540,6 +616,7 @@ fn fetch_pr_snapshot_rest_with_client(
             "Accept: application/vnd.github+json".to_owned(),
         ],
         cwd,
+        timeout,
     )? {
         GhOutcome::Success(stdout) => serde_json::from_slice::<Value>(&stdout)?,
         GhOutcome::GraphqlRateLimited | GhOutcome::OtherFailure => return Ok(None),
@@ -563,6 +640,7 @@ fn fetch_pr_snapshot_rest_with_client(
                 "Accept: application/vnd.github+json".to_owned(),
             ],
             cwd,
+            remaining_snapshot_timeout(timeout, started.elapsed()),
         )? {
             GhOutcome::Success(stdout) => serde_json::from_slice::<Value>(&stdout)?,
             GhOutcome::GraphqlRateLimited | GhOutcome::OtherFailure => {
@@ -629,6 +707,15 @@ pub fn synthesize_pr_snapshot_from_rest(pr_number: u64, pr: &Value, check_runs: 
 
 /// Fetch a GitHub Actions workflow-run snapshot.
 pub fn fetch_run_snapshot(repo: &str, run_id: &str, cwd: &Path) -> WaitResult<Option<Value>> {
+    fetch_run_snapshot_with_timeout(repo, run_id, cwd, Duration::from_secs(15))
+}
+
+pub(crate) fn fetch_run_snapshot_with_timeout(
+    repo: &str,
+    run_id: &str,
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Option<Value>> {
     let client = gh_client(cwd)?;
     run_gh_json(
         &client,
@@ -642,7 +729,7 @@ pub fn fetch_run_snapshot(repo: &str, run_id: &str, cwd: &Path) -> WaitResult<Op
             "databaseId,status,conclusion,headSha,workflowName,url".to_owned(),
         ],
         cwd,
-        15.0,
+        timeout,
     )
 }
 
@@ -726,14 +813,10 @@ fn run_gh_json(
     client: &GhClient,
     args: &[String],
     cwd: &Path,
-    timeout_seconds: f64,
+    timeout: Duration,
 ) -> WaitResult<Option<Value>> {
-    let output = client
-        .prepare_command(cwd, None, GhSupervision::Supervised, GhAuthPolicy::Default)?
-        .args(args)
-        .output()?;
-
-    let _ = timeout_seconds;
+    let string_args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_gh_output(client, &string_args, cwd, timeout)?;
 
     if !output.status.success() {
         return Ok(None);
@@ -751,11 +834,14 @@ enum GhOutcome {
     OtherFailure,
 }
 
-fn run_gh_capturing(client: &GhClient, args: &[String], cwd: &Path) -> WaitResult<GhOutcome> {
-    let output = client
-        .prepare_command(cwd, None, GhSupervision::Supervised, GhAuthPolicy::Default)?
-        .args(args)
-        .output()?;
+fn run_gh_capturing(
+    client: &GhClient,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<GhOutcome> {
+    let string_args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_gh_output(client, &string_args, cwd, timeout)?;
     if output.status.success() {
         return Ok(GhOutcome::Success(output.stdout));
     }
@@ -764,6 +850,82 @@ fn run_gh_capturing(client: &GhClient, args: &[String], cwd: &Path) -> WaitResul
         return Ok(GhOutcome::GraphqlRateLimited);
     }
     Ok(GhOutcome::OtherFailure)
+}
+
+fn snapshot_command_timeout(remaining: Duration) -> Duration {
+    remaining.min(SNAPSHOT_COMMAND_TIMEOUT)
+}
+
+fn remaining_snapshot_timeout(timeout: Duration, elapsed: Duration) -> Duration {
+    timeout.saturating_sub(elapsed)
+}
+
+#[derive(Debug)]
+struct SnapshotCommandTimeout {
+    timeout: Duration,
+}
+
+impl std::fmt::Display for SnapshotCommandTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "GitHub snapshot command timed out after {}ms",
+            self.timeout.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for SnapshotCommandTimeout {}
+
+fn run_gh_output(
+    client: &GhClient,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Output> {
+    let timeout = snapshot_command_timeout(timeout);
+    if timeout.is_zero() {
+        return Err(Box::new(SnapshotCommandTimeout { timeout }));
+    }
+
+    let started = Instant::now();
+    let mut command = client.prepare_command_with_auth_timeout(
+        cwd,
+        None,
+        GhSupervision::Supervised,
+        GhAuthPolicy::Default,
+        timeout,
+    )?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(Box::new(SnapshotCommandTimeout { timeout }));
+    }
+
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?));
+    let mut process = crate::process::ProcessTree::spawn(&mut command)?;
+    let Some(status) = process.wait_timeout(remaining)? else {
+        process.terminate();
+        return Err(Box::new(SnapshotCommandTimeout { timeout }));
+    };
+    process.terminate();
+
+    let read_output = |file: &mut std::fs::File| -> std::io::Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    Ok(Output {
+        status,
+        stdout: read_output(&mut stdout)?,
+        stderr: read_output(&mut stderr)?,
+    })
 }
 
 #[cfg(unix)]
@@ -811,8 +973,9 @@ fn value_matches_text(value: Option<&Value>, expected: &str) -> bool {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     #[cfg(unix)]
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use serde_json::Value;
     #[cfg(unix)]
@@ -820,8 +983,9 @@ mod tests {
 
     use super::{
         PR_CHECKS_JSON_FIELDS, PR_VIEW_JSON_FIELDS, WaitOutcome, annotate_required_checks,
-        pr_event_filter, read_snapshot_file, release_event_filter, run_event_filter,
-        synthesize_pr_snapshot_from_rest, wait_for_condition,
+        pr_event_filter, read_snapshot_file, release_event_filter, remaining_snapshot_timeout,
+        run_event_filter, snapshot_command_timeout, synthesize_pr_snapshot_from_rest,
+        wait_for_condition_with_timeout,
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{IpcServer, IpcState};
@@ -848,7 +1012,7 @@ mod tests {
         let socket_path = temp.path().join("daemon.sock");
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
-        let outcome = wait_for_condition(
+        let outcome = wait_for_condition_with_timeout(
             |snapshot| {
                 Ok(TruthResult {
                     matched: snapshot
@@ -866,7 +1030,7 @@ mod tests {
                     .collect(),
                 })
             },
-            move || {
+            move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(serde_json::json!({"status": "completed"})))
             },
@@ -885,10 +1049,44 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_command_timeout_is_capped_at_fifteen_seconds() {
+        assert_eq!(
+            snapshot_command_timeout(Duration::from_secs(30)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            snapshot_command_timeout(Duration::from_secs(7)),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn multi_step_snapshot_timeout_uses_remaining_overall_budget() {
+        let overall = Duration::from_secs(40);
+
+        assert_eq!(
+            remaining_snapshot_timeout(overall, Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            snapshot_command_timeout(remaining_snapshot_timeout(overall, Duration::from_secs(10))),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            remaining_snapshot_timeout(overall, Duration::from_secs(32)),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            remaining_snapshot_timeout(overall, Duration::from_secs(41)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
     fn no_fallback_snapshot_miss_returns_early() {
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("daemon.sock");
-        let outcome = wait_for_condition(
+        let outcome = wait_for_condition_with_timeout(
             |snapshot| {
                 Ok(TruthResult {
                     matched: snapshot
@@ -898,7 +1096,7 @@ mod tests {
                     observed: std::collections::BTreeMap::new(),
                 })
             },
-            || Ok(Some(serde_json::json!({"status": "pending"}))),
+            |_| Ok(Some(serde_json::json!({"status": "pending"}))),
             |_| true,
             5.0,
             0.05,
@@ -918,7 +1116,7 @@ mod tests {
         let socket_path = temp.path().join("daemon.sock");
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
-        let outcome = wait_for_condition(
+        let outcome = wait_for_condition_with_timeout(
             |snapshot| {
                 Ok(TruthResult {
                     matched: snapshot
@@ -928,7 +1126,7 @@ mod tests {
                     observed: std::collections::BTreeMap::new(),
                 })
             },
-            move || {
+            move |_| {
                 let count = counter.fetch_add(1, Ordering::SeqCst);
                 let status = if count >= 2 { "completed" } else { "pending" };
                 Ok(Some(serde_json::json!({"status": status})))
@@ -951,7 +1149,7 @@ mod tests {
         let socket_path = temp.path().join("daemon.sock");
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
-        let outcome = wait_for_condition(
+        let outcome = wait_for_condition_with_timeout(
             |snapshot| {
                 Ok(TruthResult {
                     matched: snapshot
@@ -961,7 +1159,7 @@ mod tests {
                     observed: std::collections::BTreeMap::new(),
                 })
             },
-            move || {
+            move |_| {
                 if counter.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(Box::new(GhPrepareError::HelperFailed {
                         program: "helper".to_owned(),
@@ -988,14 +1186,14 @@ mod tests {
     fn repeated_transient_token_helper_failures_consume_only_overall_timeout() {
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("daemon.sock");
-        let outcome = wait_for_condition(
+        let outcome = wait_for_condition_with_timeout(
             |_| {
                 Ok(TruthResult {
                     matched: false,
                     observed: std::collections::BTreeMap::new(),
                 })
             },
-            || {
+            |_| {
                 Err(Box::new(GhPrepareError::HelperFailed {
                     program: "helper".to_owned(),
                     status: Some(1),
@@ -1016,17 +1214,86 @@ mod tests {
     }
 
     #[test]
-    fn permanent_token_helper_failure_is_not_hidden_until_timeout() {
+    fn retry_does_not_start_another_snapshot_after_the_deadline() {
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("daemon.sock");
-        let result = wait_for_condition(
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let outcome = wait_for_condition_with_timeout(
             |_| {
                 Ok(TruthResult {
                     matched: false,
                     observed: std::collections::BTreeMap::new(),
                 })
             },
-            || {
+            move |remaining| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                Err(Box::new(GhPrepareError::HelperFailed {
+                    program: "helper".to_owned(),
+                    status: Some(1),
+                    stderr: "service unavailable".to_owned(),
+                }) as Box<dyn std::error::Error>)
+            },
+            |_| true,
+            0.01,
+            0.01,
+            false,
+            &socket_path,
+        )
+        .expect("transient failure should consume the deadline");
+
+        assert!(outcome.timed_out);
+        assert_eq!(outcome.transient_errors, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn snapshot_returned_after_its_budget_times_out_without_evaluation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let evaluation_count = Arc::clone(&evaluations);
+        let outcome = wait_for_condition_with_timeout(
+            move |snapshot| {
+                evaluation_count.fetch_add(1, Ordering::SeqCst);
+                Ok(TruthResult {
+                    matched: snapshot
+                        .and_then(|snapshot| snapshot.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("completed"),
+                    observed: std::collections::BTreeMap::new(),
+                })
+            },
+            |remaining| {
+                std::thread::sleep(remaining + Duration::from_millis(10));
+                Ok(Some(serde_json::json!({"status": "completed"})))
+            },
+            |_| true,
+            0.01,
+            0.01,
+            false,
+            &socket_path,
+        )
+        .expect("late snapshot should become an overall timeout");
+
+        assert!(outcome.timed_out);
+        assert!(!outcome.matched);
+        assert_eq!(evaluations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn permanent_token_helper_failure_is_not_hidden_until_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let result = wait_for_condition_with_timeout(
+            |_| {
+                Ok(TruthResult {
+                    matched: false,
+                    observed: std::collections::BTreeMap::new(),
+                })
+            },
+            |_| {
                 Err(Box::new(GhPrepareError::HelperFailed {
                     program: "helper".to_owned(),
                     status: Some(1),
@@ -1048,14 +1315,14 @@ mod tests {
     fn timeout_is_reported_when_condition_never_matches() {
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("daemon.sock");
-        let outcome = wait_for_condition(
+        let outcome = wait_for_condition_with_timeout(
             |_| {
                 Ok(TruthResult {
                     matched: false,
                     observed: std::collections::BTreeMap::new(),
                 })
             },
-            || Ok(Some(serde_json::json!({"status": "pending"}))),
+            |_| Ok(Some(serde_json::json!({"status": "pending"}))),
             |_| true,
             0.03,
             0.01,
@@ -1087,7 +1354,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
         let waiter = std::thread::spawn(move || {
-            wait_for_condition(
+            wait_for_condition_with_timeout(
                 |snapshot| {
                     Ok(TruthResult {
                         matched: snapshot
@@ -1105,7 +1372,7 @@ mod tests {
                             .unwrap_or_default(),
                     })
                 },
-                move || {
+                move |_| {
                     let count = counter.fetch_add(1, Ordering::SeqCst);
                     Ok(Some(json!({
                         "status": if count == 0 { "pending" } else { "completed" }
@@ -1149,7 +1416,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
         let waiter = std::thread::spawn(move || {
-            wait_for_condition(
+            wait_for_condition_with_timeout(
                 |snapshot| {
                     Ok(TruthResult {
                         matched: snapshot
@@ -1159,7 +1426,7 @@ mod tests {
                         observed: std::collections::BTreeMap::new(),
                     })
                 },
-                move || {
+                move |_| {
                     let count = counter.fetch_add(1, Ordering::SeqCst);
                     let status = if count >= 2 { "completed" } else { "pending" };
                     Ok(Some(json!({"status": status})))

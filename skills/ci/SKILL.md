@@ -693,6 +693,11 @@ If either check fails, fall back to `gh run watch` / `gh pr checks --watch`.
 | 7 | unsupported scope — rulesets / merge-queue governance detected; switch lanes or do it manually |
 | 130 | SIGINT / SIGTERM |
 
+Transient snapshot retries do not extend `--timeout`: credential preparation
+and the `gh` subprocess are bounded by the remaining overall budget, and no new
+attempt starts after the deadline. JSON `transient_errors` remains accurate
+when `wait run --success` stops early with exit 4 on a terminal failed run.
+
 ### JSON shape
 
 ```json

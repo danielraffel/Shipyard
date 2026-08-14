@@ -927,6 +927,11 @@ overall timeout, and reports the retry count as `transient_errors`. Permanent
 credential, helper-output, and configuration failures still fail immediately;
 do not paper them over with an outer unbounded polling loop.
 
+The overall timeout also bounds credential preparation and each `gh` snapshot
+subprocess; no retry begins after the deadline. `wait run --success` preserves
+the accumulated retry count and transport metadata when a recovered snapshot
+ends in a terminal non-success conclusion (exit 4).
+
 GitHub App installation tokens can also be rejected by GitHub's GraphQL
 `createPullRequest` / `mergePullRequest` mutations even when the App token is
 otherwise the right auth source for inspection. PR creation first tries the
