@@ -6,7 +6,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 <a id="v0883"></a>
 ## [0.88.3] - 2026-08-14
 
-- fix(queue): terminate active validation process trees after durable cancellation
+- fix: stop active validation after cancellation ([#414](https://github.com/danielraffel/Shipyard/pull/414))
 
 <a id="v0882"></a>
 ## [0.88.2] - 2026-08-14
@@ -835,6 +835,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.88.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.3
 [0.88.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.2
 [0.88.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.1
 [0.88.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.0
