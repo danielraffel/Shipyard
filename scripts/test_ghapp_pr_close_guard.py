@@ -252,6 +252,7 @@ class PrCloseGuardTests(unittest.TestCase):
             return {
                 "truncated": False,
                 "tree": [
+                    {"path": "   ", "mode": "100644", "type": "blob", "sha": "d" * 40},
                     {"path": "a", "mode": "100644", "type": "blob", "sha": "a" * 40},
                     {"path": "b", "mode": "100644", "type": "blob", "sha": "c" * 40},
                 ],

@@ -485,7 +485,9 @@ def tree_entry_for_path(
             for item in items:
                 if not isinstance(item, dict):
                     raise GuardError("Git tree contains a non-object entry")
-                name = required_string(item.get("path"), "tree.path")
+                name = item.get("path")
+                if not isinstance(name, str) or name == "":
+                    raise GuardError("Git tree entry is missing path")
                 entries[name] = (
                     required_string(item.get("mode"), f"tree.mode for {name}"),
                     required_string(item.get("type"), f"tree.type for {name}"),
