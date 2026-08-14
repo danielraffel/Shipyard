@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0910"></a>
+## [0.91.1]
+
 ## [0.91.0] - 2026-08-14
 
 - test(queue): preserve admission for unrelated pull requests ([#401](https://github.com/danielraffel/Shipyard/pull/401))
