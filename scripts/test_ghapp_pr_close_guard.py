@@ -165,16 +165,28 @@ class PrCloseGuardTests(unittest.TestCase):
                     {"status": "modified", "filename": "src/lib.rs", "sha": blob}
                 ],
             },
-            f"repos/o/r/git/trees/{base}?recursive=1": {
+            f"repos/o/r/git/trees/{base}": {
                 "truncated": False,
                 "tree": [
-                    {"path": "src/lib.rs", "mode": "100644", "type": "blob", "sha": blob}
+                    {"path": "src", "mode": "040000", "type": "tree", "sha": "d" * 40}
                 ],
             },
-            f"repos/o/r/git/trees/{head}?recursive=1": {
+            f"repos/o/r/git/trees/{'d' * 40}": {
                 "truncated": False,
                 "tree": [
-                    {"path": "src/lib.rs", "mode": "100644", "type": "blob", "sha": blob}
+                    {"path": "lib.rs", "mode": "100644", "type": "blob", "sha": blob}
+                ],
+            },
+            f"repos/o/r/git/trees/{head}": {
+                "truncated": False,
+                "tree": [
+                    {"path": "src", "mode": "040000", "type": "tree", "sha": "e" * 40}
+                ],
+            },
+            f"repos/o/r/git/trees/{'e' * 40}": {
+                "truncated": False,
+                "tree": [
+                    {"path": "lib.rs", "mode": "100644", "type": "blob", "sha": blob}
                 ],
             },
         }
@@ -182,7 +194,7 @@ class PrCloseGuardTests(unittest.TestCase):
             self.run_guard(["pr", "close", "7", "-R", "o/r"], responses)[0],
             0,
         )
-        responses[f"repos/o/r/git/trees/{base}?recursive=1"]["tree"][0]["sha"] = "d" * 40
+        responses[f"repos/o/r/git/trees/{'d' * 40}"]["tree"][0]["sha"] = "f" * 40
         self.assertEqual(
             self.run_guard(["pr", "close", "7", "-R", "o/r"], responses)[0],
             1,
@@ -208,13 +220,13 @@ class PrCloseGuardTests(unittest.TestCase):
         head = "h" * 40
         blob = "c" * 40
         responses = {
-            f"repos/o/r/git/trees/{base}?recursive=1": {
+            f"repos/o/r/git/trees/{base}": {
                 "truncated": False,
                 "tree": [
                     {"path": "tool", "mode": "100644", "type": "blob", "sha": blob}
                 ],
             },
-            f"repos/o/r/git/trees/{head}?recursive=1": {
+            f"repos/o/r/git/trees/{head}": {
                 "truncated": False,
                 "tree": [
                     {"path": "tool", "mode": "100755", "type": "blob", "sha": blob}

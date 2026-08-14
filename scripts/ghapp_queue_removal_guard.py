@@ -139,20 +139,24 @@ def current_repo_identity() -> tuple[str, str]:
     repo_parts = os.environ.get("GH_REPO", "").split("/")
     if len(repo_parts) >= 2 and repo_parts[-2] and repo_parts[-1]:
         return repo_parts[-2], repo_parts[-1]
+    real_gh = os.environ.get("GHAPP_REAL_GH", "/opt/homebrew/bin/gh")
     try:
-        remote = subprocess.run(
-            ["git", "config", "--get", "remote.origin.url"],
+        output = subprocess.run(
+            [real_gh, "repo", "view", "--json", "nameWithOwner"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as error:
         raise GuardError(f"cannot resolve current repository identity: {error}") from error
-    normalized = remote.removesuffix(".git").rstrip("/").replace(":", "/")
-    parts = normalized.split("/")
-    if len(parts) < 2 or not parts[-2] or not parts[-1]:
+    try:
+        repo = json.loads(output).get("nameWithOwner")
+    except (json.JSONDecodeError, AttributeError) as error:
+        raise GuardError("cannot resolve current repository identity") from error
+    parts = repo.split("/") if isinstance(repo, str) else []
+    if len(parts) != 2 or not parts[0] or not parts[1]:
         raise GuardError("cannot resolve current repository identity")
-    return parts[-2], parts[-1]
+    return parts[0], parts[1]
 
 
 def is_queue_removal(args: list[str]) -> bool:

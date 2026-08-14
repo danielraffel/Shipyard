@@ -126,9 +126,9 @@ class QueueRemovalGuardTests(unittest.TestCase):
 
     def test_repository_placeholders_fall_back_to_git_remote(self) -> None:
         completed = subprocess.CompletedProcess(
-            ["git", "config", "--get", "remote.origin.url"],
+            ["/opt/homebrew/bin/gh", "repo", "view", "--json", "nameWithOwner"],
             0,
-            stdout="git@github.com:o/r.git\n",
+            stdout='{"nameWithOwner":"o/r"}\n',
             stderr="",
         )
         with mock.patch.object(guard.subprocess, "run", return_value=completed):

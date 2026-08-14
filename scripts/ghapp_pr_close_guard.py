@@ -463,26 +463,37 @@ def head_is_contained(comparison: dict[str, Any]) -> bool:
     return ahead_by == 0 and status in {"behind", "identical"}
 
 
-def tree_entries(
-    repo: str, commit_sha: str, query: ApiJson
-) -> dict[str, tuple[str, str, str]]:
-    value = query(f"repos/{repo}/git/trees/{commit_sha}?recursive=1")
-    if value.get("truncated") is not False:
-        raise GuardError("recursive Git tree evidence is truncated or ambiguous")
-    items = value.get("tree")
-    if not isinstance(items, list):
-        raise GuardError("Git tree response is missing entries")
-    entries: dict[str, tuple[str, str, str]] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            raise GuardError("Git tree contains a non-object entry")
-        path = required_string(item.get("path"), "tree.path")
-        entries[path] = (
-            required_string(item.get("mode"), f"tree.mode for {path}"),
-            required_string(item.get("type"), f"tree.type for {path}"),
-            required_string(item.get("sha"), f"tree.sha for {path}"),
+def tree_entry_for_path(
+    repo: str, commit_sha: str, path: str, query: ApiJson
+) -> tuple[str, str, str] | None:
+    tree_sha = commit_sha
+    components = path.split("/")
+    for index, component in enumerate(components):
+        value = query(f"repos/{repo}/git/trees/{tree_sha}")
+        if value.get("truncated") is not False:
+            raise GuardError("Git tree evidence is truncated or ambiguous")
+        items = value.get("tree")
+        if not isinstance(items, list):
+            raise GuardError("Git tree response is missing entries")
+        entry = next(
+            (
+                item
+                for item in items
+                if isinstance(item, dict) and item.get("path") == component
+            ),
+            None,
         )
-    return entries
+        if entry is None:
+            return None
+        mode = required_string(entry.get("mode"), f"tree.mode for {path}")
+        kind = required_string(entry.get("type"), f"tree.type for {path}")
+        sha = required_string(entry.get("sha"), f"tree.sha for {path}")
+        if index == len(components) - 1:
+            return mode, kind, sha
+        if kind != "tree":
+            return None
+        tree_sha = sha
+    return None
 
 
 def changed_content_is_contained(
@@ -501,22 +512,22 @@ def changed_content_is_contained(
     # ambiguous and cannot prove the complete patch is contained.
     if len(files) >= 300:
         return False
-    base_entries = tree_entries(repo, base_sha, query)
-    head_entries = tree_entries(repo, head_sha, query)
     for item in files:
         if not isinstance(item, dict):
             raise GuardError("comparison files contains a non-object entry")
         status = required_string(item.get("status"), "files.status").lower()
         filename = required_string(item.get("filename"), "files.filename")
-        base_entry = base_entries.get(filename)
-        head_entry = head_entries.get(filename)
+        base_entry = tree_entry_for_path(repo, base_sha, filename, query)
+        head_entry = tree_entry_for_path(repo, head_sha, filename, query)
         if status == "removed":
             if base_entry is not None or head_entry is not None:
                 return False
             continue
         if status == "renamed":
             previous = required_string(item.get("previous_filename"), "files.previous_filename")
-            if previous != filename and base_entries.get(previous) is not None:
+            if previous != filename and tree_entry_for_path(
+                repo, base_sha, previous, query
+            ) is not None:
                 return False
         elif status not in {"added", "modified", "changed", "copied", "unchanged"}:
             raise GuardError(f"unsupported comparison file status: {status}")
