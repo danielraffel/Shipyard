@@ -80,6 +80,13 @@ pub struct StewardPolicy {
     pub required_checks: Vec<RequiredCheck>,
     /// Label that opts a PR out of stewardship.
     pub opt_out_label: String,
+    /// Label that explicitly hands a PR to the steward. `None` preserves the
+    /// legacy classify-all behavior for library callers; the CLI always sets
+    /// this to a concrete label.
+    pub managed_label: Option<String>,
+    /// Successful commit-status context required on the current immutable
+    /// head when `managed_label` is configured.
+    pub handoff_context: String,
     /// Maximum transient reruns allowed per immutable head and run.
     pub max_transient_reruns: u32,
 }
@@ -193,6 +200,11 @@ impl CapacityPreemptionPolicy {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum StewardDecision {
+    /// PR has not been explicitly handed to the steward.
+    Unmanaged,
+    /// PR carries the management label but the current immutable head has no
+    /// successful handoff receipt.
+    HandoffMissing,
     /// PR is already in the merge queue. Queue order is preserved.
     Queued {
         /// Current zero-based queue position.
@@ -251,6 +263,9 @@ pub fn classify_pr(
     policy: &StewardPolicy,
     transient_attempts: &BTreeMap<u64, u32>,
 ) -> StewardDecision {
+    if let Some(decision) = classify_management(pr, policy) {
+        return decision;
+    }
     if pr
         .labels
         .iter()
@@ -351,6 +366,31 @@ pub fn classify_pr(
             reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
         }
     }
+}
+
+fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Option<StewardDecision> {
+    let managed_label = policy.managed_label.as_deref()?;
+    let labelled = pr
+        .labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(managed_label));
+    if !labelled {
+        return Some(StewardDecision::Unmanaged);
+    }
+    (!has_successful_status(pr, &policy.handoff_context)).then_some(StewardDecision::HandoffMissing)
+}
+
+/// Whether the current immutable head carries a successful status context.
+#[must_use]
+pub fn has_successful_status(pr: &StewardPullRequest, context: &str) -> bool {
+    pr.checks.iter().any(|check| {
+        check.name.eq_ignore_ascii_case(context)
+            && check.status.eq_ignore_ascii_case("COMPLETED")
+            && check
+                .conclusion
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("SUCCESS"))
+    })
 }
 
 fn selected_checks<'a>(

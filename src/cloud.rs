@@ -722,6 +722,39 @@ impl GitHubActions {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// Run one low-volume GitHub mutation with ambient `gh` credentials.
+    /// Callers must first attempt configured auth and restrict fallback to an
+    /// explicit integration-permission rejection.
+    pub(crate) fn run_gh_ambient(&self, args: &[String]) -> Result<String, GitHubError> {
+        let client = GhClient::ambient();
+        let output = client
+            .prepare_command(
+                &self.cwd,
+                self.gh_binary_override.as_deref(),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::AmbientOnly,
+            )
+            .map_err(|error| GitHubError::new(format!("failed to prepare ambient gh: {error}")))?
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(args)
+            .output()
+            .map_err(|error| {
+                GitHubError::new(format!(
+                    "failed to run ambient gh {}: {error}",
+                    args.join(" ")
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(GitHubError::command_failed(
+                args,
+                output.status.code(),
+                &output.stderr,
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
     pub(crate) fn run_gh_with_timeout(
         &self,
         args: &[String],

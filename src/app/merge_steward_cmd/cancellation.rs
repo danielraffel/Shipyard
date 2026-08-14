@@ -6,7 +6,8 @@ use super::{
     acquire_run_mutation_guard, apply_capacity_preemption, attempts_for,
     authoritative_head_still_superseded, classify_pr, coalescing_reason_authorizes,
     current_pull_request_heads, exact_run_still_queued, merge_group_pr_number, mutate_pr,
-    opted_out_pull_requests, plan_capacity_preemptions, plan_run_coalescing, record_audit,
+    opted_out_pull_requests, plan_capacity_preemptions, plan_run_coalescing,
+    pull_request_is_managed, reconcile_recovery_signal, record_audit,
     revalidate_coalescing_cancellation,
 };
 
@@ -24,6 +25,8 @@ pub(super) fn apply_repo_plan(
         native_auto_merge: observation.allow_auto_merge,
         required_checks: observation.required_checks.clone(),
         opt_out_label: args.opt_out_label.clone(),
+        managed_label: Some(args.managed_label.clone()),
+        handoff_context: args.handoff_context.clone(),
         max_transient_reruns: args.max_transient_reruns,
     };
     let (reports, pr_mutation_failed) = apply_pr_plans(
@@ -40,7 +43,7 @@ pub(super) fn apply_repo_plan(
     let mut planned_cancellations = Vec::new();
     if args.coalesce {
         let current_heads = current_pull_request_heads(&observation.prs);
-        let opted_out = opted_out_pull_requests(&observation.prs, &args.opt_out_label);
+        let opted_out = excluded_pull_requests(observation, &args.opt_out_label);
         planned_cancellations.extend(plan_run_coalescing(
             &observation.runs,
             &current_heads,
@@ -140,7 +143,7 @@ pub(super) fn apply_pr_plans(
         .map(|pr| {
             let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
             let decision = classify_pr(&pr.fact, policy, &attempts);
-            let (mutation, error) = if args.apply {
+            let (mut mutation, mut error) = if args.apply {
                 mutate_pr(
                     mutation_context
                         .as_ref()
@@ -153,6 +156,23 @@ pub(super) fn apply_pr_plans(
             } else {
                 (None, None)
             };
+            if args.apply && error.is_none() {
+                let (recovery_mutation, recovery_error) = reconcile_recovery_signal(
+                    mutation_context
+                        .as_ref()
+                        .expect("apply mode requires mutation control"),
+                    pr,
+                    policy,
+                    &decision,
+                    ledger,
+                );
+                if let Some(recovery_mutation) = recovery_mutation {
+                    mutation = Some(mutation.map_or(recovery_mutation.clone(), |prior| {
+                        format!("{prior},{recovery_mutation}")
+                    }));
+                }
+                error = recovery_error;
+            }
             unhealthy |= error.is_some();
             PrReport {
                 number: pr.fact.number,
@@ -188,7 +208,7 @@ pub(super) fn plan_repo_capacity_preemptions(
         .filter(|(_, count)| **count >= args.max_preemptions_per_head)
         .filter_map(|(key, _)| key.strip_prefix(&prefix).map(str::to_owned))
         .collect();
-    let opted_out = opted_out_pull_requests(&observation.prs, &args.opt_out_label);
+    let opted_out = excluded_pull_requests(observation, &args.opt_out_label);
     plan_capacity_preemptions(
         &observation.runs,
         &opted_out,
@@ -197,6 +217,21 @@ pub(super) fn plan_repo_capacity_preemptions(
         &attempted,
         remaining_preemptions,
     )
+}
+
+fn excluded_pull_requests(
+    observation: &RepoObservation,
+    opt_out_label: &str,
+) -> std::collections::BTreeSet<u64> {
+    let mut excluded = opted_out_pull_requests(&observation.prs, opt_out_label);
+    excluded.extend(
+        observation
+            .prs
+            .iter()
+            .filter(|pr| !pull_request_is_managed(pr))
+            .map(|pr| pr.fact.number),
+    );
+    excluded
 }
 
 pub(super) fn cancellation_reason_label(reason: RunCancellationReason) -> String {

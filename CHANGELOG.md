@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0874"></a>
+## [0.88.0]
+
 ## [0.87.4] - 2026-08-13
 
 - fix(queue): guard exact-head removal authority ([#408](https://github.com/danielraffel/Shipyard/pull/408))
