@@ -221,6 +221,9 @@ def compact_graphql(document: str) -> str:
             while index < len(document) and document[index] not in "\r\n":
                 index += 1
             continue
+        if char == ",":
+            index += 1
+            continue
         without_comments.append(char)
         index += 1
     return "".join("".join(without_comments).split()).lower()
@@ -257,10 +260,30 @@ def repo_from_url(value: str) -> str | None:
     return match.group(1) if match else None
 
 
-def pr_close_target(args: list[str]) -> str:
+def close_subcommand_index(args: list[str]) -> int | None:
+    value_options = {"-R", "--repo"}
+    skip_next = False
+    for index, arg in enumerate(args[1:], start=1):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in value_options:
+            skip_next = True
+            continue
+        if any(arg.startswith(f"{name}=") for name in value_options):
+            continue
+        if arg == "close":
+            return index
+        if arg.startswith("-"):
+            continue
+        return None
+    return None
+
+
+def pr_close_target(args: list[str], close_index: int) -> str:
     value_options = {"-c", "--comment", "-R", "--repo"}
     skip_next = False
-    for arg in args[2:]:
+    for arg in args[close_index + 1 :]:
         if skip_next:
             skip_next = False
             continue
@@ -275,13 +298,21 @@ def pr_close_target(args: list[str]) -> str:
     raise GuardError("PR close target is missing")
 
 
-def normalize_repo(value: str) -> str:
+def repo_identity(value: str) -> tuple[str, str | None]:
     parts = value.removeprefix("https://github.com/").removesuffix(".git").strip("/").split("/")
+    hostname = None
     if len(parts) == 3 and "." in parts[0]:
+        hostname = parts[0].lower()
         parts = parts[1:]
     if len(parts) != 2 or not all(parts):
         raise GuardError(f"invalid repository identity: {value}")
-    return "/".join(parts)
+    if hostname in {"github.com", "api.github.com"}:
+        hostname = None
+    return "/".join(parts), hostname
+
+
+def normalize_repo(value: str) -> str:
+    return repo_identity(value)[0]
 
 
 def input_closes_pr(args: list[str]) -> bool:
@@ -298,18 +329,21 @@ def input_closes_pr(args: list[str]) -> bool:
 
 
 def close_request(args: list[str]) -> CloseRequest | None:
-    if len(args) >= 2 and args[:2] in (["pr", "close"], ["issue", "close"]):
-        target = pr_close_target(args)
+    close_index = close_subcommand_index(args) if args and args[0] in {"pr", "issue"} else None
+    if close_index is not None:
+        target = pr_close_target(args, close_index)
         pr = parse_pr_number(target)
         if pr is None:
             raise GuardError("PR close target must be a number or GitHub pull-request URL")
         repo = option_value(args, {"-R", "--repo"}) or repo_from_url(target)
         if repo is None:
             repo = live_repo()
+        repo, hostname = repo_identity(repo)
         return CloseRequest(
-            repo=normalize_repo(repo),
+            repo=repo,
             pr=pr,
             allow_non_pr=args[0] == "issue",
+            hostname=hostname,
         )
 
     if len(args) >= 2 and args[0] == "api":

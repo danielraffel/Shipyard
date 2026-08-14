@@ -378,6 +378,18 @@ class PrCloseGuardTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("closePullRequest", message)
 
+    def test_graphql_ignored_comma_cannot_hide_close_mutation(self) -> None:
+        code, message, _ = self.run_guard(
+            [
+                "api",
+                "graphql",
+                "-f",
+                "query=mutation { closePullRequest,(input:{pullRequestId:\"x\"}) { clientMutationId } }",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("closePullRequest", message)
+
     def test_hash_inside_graphql_string_is_not_treated_as_a_comment(self) -> None:
         compact = guard.compact_graphql(
             'mutation { closePullRequest(reason: "# retained") { clientMutationId } }'
@@ -487,6 +499,25 @@ class PrCloseGuardTests(unittest.TestCase):
         self.assertEqual(
             guard.close_request(["issue", "close", "7", "-R", "o/r"]),
             guard.CloseRequest(repo="o/r", pr=7, allow_non_pr=True),
+        )
+
+    def test_high_level_close_accepts_inherited_repo_flag_before_subcommand(self) -> None:
+        self.assertEqual(
+            guard.close_request(["pr", "-R", "o/r", "close", "7"]),
+            guard.CloseRequest(repo="o/r", pr=7),
+        )
+
+    def test_high_level_enterprise_repo_binds_evidence_hostname(self) -> None:
+        self.assertEqual(
+            guard.close_request(
+                ["issue", "--repo", "ghe.example.com/o/r", "close", "7"]
+            ),
+            guard.CloseRequest(
+                repo="o/r",
+                pr=7,
+                allow_non_pr=True,
+                hostname="ghe.example.com",
+            ),
         )
 
     def test_malformed_or_unreadable_evidence_fails_closed(self) -> None:
