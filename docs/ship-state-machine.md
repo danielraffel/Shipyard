@@ -452,6 +452,12 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **Idempotency:** a later one-shot first polls the queue. An already queued PR
   is not armed again; a terminal removal newer than the current ship-state is
   not rearmed. A new validated head creates newer ship-state and may be armed.
+- **Revocation authority:** an active ship-state owns native auto-merge and
+  queue authority only while its validated `head_sha` still equals the live PR
+  head. A same-head base retarget may revoke that authority through the audited
+  mutation path. A stale state must not disable or dequeue the newer head;
+  pending required, advisory, or self-hosted checks do not create revocation
+  authority, regardless of their age.
 - **Fleet authority:** `[merge_queue].mutation_machine` is required in the
   trusted machine-global `config.toml` reported by `shipyard paths`; tracked
   project and checkout-local overlays are ignored. The machine-global runner

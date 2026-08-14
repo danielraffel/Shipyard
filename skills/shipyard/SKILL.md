@@ -850,6 +850,16 @@ everything.
 
 ## GraphQL And GitHub App Fallback Behaviour
 
+Raw queue removal is not a queue-steward operation. Install
+`scripts/ghapp_queue_removal_guard.py` at the App-authenticated `ghapp`
+chokepoint and run it against the wrapper argv before invoking the real `gh`.
+It refuses `pr merge --disable-auto`, `dequeuePullRequest`, and
+`disablePullRequestAutoMerge` unless the call comes from Shipyard's
+machine-authorized, exact-head, write-ahead-audited mutation path. A deliberate
+manual authority action requires the loud `GHAPP_ALLOW_QUEUE_REMOVAL=1`
+override. Long-running or pending advisory/self-hosted checks are never queue
+removal authority.
+
 Five operations detect `is_graphql_rate_limited` in `gh` stderr and
 fall through to a REST equivalent: PR list, PR create, PR view, PR
 snapshot (in `wait_transport`), and PR merge (in
