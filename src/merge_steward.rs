@@ -14,6 +14,8 @@ use serde::Serialize;
 pub struct StewardCheck {
     /// Check/status context.
     pub name: String,
+    /// GitHub surface that produced the observation.
+    pub source: StewardCheckSource,
     /// GitHub App database ID that produced this check run. Legacy commit
     /// statuses and observations whose producer is unavailable have no ID.
     pub app_id: Option<u64>,
@@ -25,6 +27,15 @@ pub struct StewardCheck {
     pub run_id: Option<u64>,
     /// GitHub observation timestamp used to disambiguate duplicate contexts.
     pub observed_at: Option<String>,
+}
+
+/// GitHub check-rollup surface that produced a check observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StewardCheckSource {
+    /// A GitHub Actions/App check run.
+    CheckRun,
+    /// A commit status context.
+    StatusContext,
 }
 
 /// One required status-check rule from repository governance.
@@ -263,15 +274,15 @@ pub fn classify_pr(
     policy: &StewardPolicy,
     transient_attempts: &BTreeMap<u64, u32>,
 ) -> StewardDecision {
-    if let Some(decision) = classify_management(pr, policy) {
-        return decision;
-    }
     if pr
         .labels
         .iter()
         .any(|label| label.eq_ignore_ascii_case(&policy.opt_out_label))
     {
         return StewardDecision::OptedOut;
+    }
+    if let Some(decision) = classify_management(pr, policy) {
+        return decision;
     }
     if let Some(position) = pr.queue_position {
         return StewardDecision::Queued { position };
@@ -385,6 +396,7 @@ fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Optio
 pub fn has_successful_status(pr: &StewardPullRequest, context: &str) -> bool {
     pr.checks.iter().any(|check| {
         check.name.eq_ignore_ascii_case(context)
+            && check.source == StewardCheckSource::StatusContext
             && check.status.eq_ignore_ascii_case("COMPLETED")
             && check
                 .conclusion

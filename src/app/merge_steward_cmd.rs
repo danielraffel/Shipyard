@@ -132,6 +132,18 @@ struct PendingCancellation {
     mutation_kind: PendingMutationKind,
     reason: String,
     opt_out_label: String,
+    #[serde(default = "default_managed_label")]
+    managed_label: String,
+    #[serde(default = "default_handoff_context")]
+    handoff_context: String,
+}
+
+fn default_managed_label() -> String {
+    MANAGED_LABEL.to_owned()
+}
+
+fn default_handoff_context() -> String {
+    HANDOFF_CONTEXT.to_owned()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -194,6 +206,8 @@ struct CapacityApplyContext<'a> {
     cancellation: &'a RunCancellation,
     ledger_path: &'a Path,
     mutation_control: &'a MutationControl,
+    managed_label: &'a str,
+    handoff_context: &'a str,
 }
 
 const CANCEL_TERMINAL_WAIT: Duration = Duration::from_secs(15);

@@ -140,6 +140,8 @@ fn pending_cancellation_record() -> PendingCancellation {
         mutation_kind: PendingMutationKind::NormalCancel,
         reason: "advisory_preamble_capacity_theft".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
     }
 }
 

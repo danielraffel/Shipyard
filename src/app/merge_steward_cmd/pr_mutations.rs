@@ -185,6 +185,7 @@ pub(super) fn mutate_transient_reruns(
 ) -> (Option<String>, Option<String>) {
     let mut errors = Vec::new();
     let mut rerun = Vec::new();
+    let mut exhausted = Vec::new();
     for run_id in run_ids {
         let guard = match acquire_pr_mutation_guard(
             context.mutation_control,
@@ -232,7 +233,7 @@ pub(super) fn mutate_transient_reruns(
             *run_id,
             ledger,
         ) {
-            Ok(false) => {
+            Ok(TransientRerunRevalidation::Stale) => {
                 if let Err(error) = guard.finish("skipped_after_live_revalidation") {
                     errors.push(format!("rerun skip mutation audit failed: {error}"));
                     continue;
@@ -248,6 +249,27 @@ pub(super) fn mutate_transient_reruns(
                 ) {
                     errors.push(error);
                 }
+                continue;
+            }
+            Ok(TransientRerunRevalidation::Exhausted { accepted_attempts }) => {
+                let synchronized = accepted_attempts.max(policy.max_transient_reruns);
+                ledger.transient_attempts.insert(key.clone(), synchronized);
+                record_audit(
+                    ledger,
+                    &context.observation.repo,
+                    &format!("run:{run_id}:{}", pr.fact.head_sha),
+                    "rerun_transient_exhausted_from_github_attempt",
+                );
+                if let Err(error) = save_ledger(context.ledger_path, ledger) {
+                    errors.push(format!(
+                        "could not persist exhausted GitHub rerun attempt: {}",
+                        error.message
+                    ));
+                }
+                if let Err(error) = guard.finish("exhausted_github_run_attempt") {
+                    errors.push(format!("rerun exhaustion audit failed: {error}"));
+                }
+                exhausted.push(*run_id);
                 continue;
             }
             Err(error) => {
@@ -275,7 +297,7 @@ pub(super) fn mutate_transient_reruns(
                 ));
                 continue;
             }
-            Ok(true) => {}
+            Ok(TransientRerunRevalidation::Eligible) => {}
         }
         match context
             .actions
@@ -300,7 +322,15 @@ pub(super) fn mutate_transient_reruns(
         }
     }
     if errors.is_empty() {
-        (Some(format!("reran {rerun:?}")), None)
+        let mutation = match (rerun.is_empty(), exhausted.is_empty()) {
+            (false, true) => format!("reran {rerun:?}"),
+            (true, false) => format!("transient rerun budget exhausted for {exhausted:?}"),
+            (false, false) => {
+                format!("reran {rerun:?}; transient rerun budget exhausted for {exhausted:?}")
+            }
+            (true, true) => "no transient reruns remained eligible".to_owned(),
+        };
+        (Some(mutation), None)
     } else {
         (None, Some(errors.join("; ")))
     }
@@ -334,6 +364,13 @@ pub(super) fn rollback_transient_attempt(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TransientRerunRevalidation {
+    Eligible,
+    Exhausted { accepted_attempts: u32 },
+    Stale,
+}
+
 pub(super) fn revalidate_transient_rerun(
     actions: &GitHubActions,
     observation: &RepoObservation,
@@ -341,7 +378,7 @@ pub(super) fn revalidate_transient_rerun(
     policy: &StewardPolicy,
     run_id: u64,
     ledger: &StewardLedger,
-) -> Result<bool, String> {
+) -> Result<TransientRerunRevalidation, String> {
     let (_, queue_positions, _, _) =
         merge_queue_snapshot(actions, &observation.repo, &observation.base)?;
     let Some(live_pr) = pull_request_with_required_checks(
@@ -353,14 +390,14 @@ pub(super) fn revalidate_transient_rerun(
         &policy.required_checks,
     )?
     else {
-        return Ok(false);
+        return Ok(TransientRerunRevalidation::Stale);
     };
     if !live_pr
         .fact
         .head_sha
         .eq_ignore_ascii_case(&observed_pr.fact.head_sha)
     {
-        return Ok(false);
+        return Ok(TransientRerunRevalidation::Stale);
     }
     let mut attempts = attempts_for(ledger, &observation.repo, &live_pr.fact);
     if let Some(count) = attempts.get_mut(&run_id) {
@@ -371,7 +408,7 @@ pub(super) fn revalidate_transient_rerun(
         StewardDecision::RerunTransient { run_ids } if run_ids.contains(&run_id)
     );
     if !eligible {
-        return Ok(false);
+        return Ok(TransientRerunRevalidation::Stale);
     }
     let value = gh_json(
         actions,
@@ -382,21 +419,30 @@ pub(super) fn revalidate_transient_rerun(
         "transient exact-run revalidation",
     )?;
     let Some(run) = parse_run(&value) else {
-        return Ok(false);
+        return Ok(TransientRerunRevalidation::Stale);
     };
     let conclusion = value
         .get("conclusion")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_uppercase();
-    Ok(run.status.eq_ignore_ascii_case("completed")
-        && run.head_sha.eq_ignore_ascii_case(&live_pr.fact.head_sha)
-        && run.pull_request_number == Some(live_pr.fact.number)
-        && run_attempt_allows_transient_rerun(run.run_attempt, policy.max_transient_reruns)
-        && matches!(
+    if !run.status.eq_ignore_ascii_case("completed")
+        || !run.head_sha.eq_ignore_ascii_case(&live_pr.fact.head_sha)
+        || run.pull_request_number != Some(live_pr.fact.number)
+        || !matches!(
             conclusion.as_str(),
             "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "STALE"
-        ))
+        )
+    {
+        return Ok(TransientRerunRevalidation::Stale);
+    }
+    if run_attempt_allows_transient_rerun(run.run_attempt, policy.max_transient_reruns) {
+        Ok(TransientRerunRevalidation::Eligible)
+    } else {
+        Ok(TransientRerunRevalidation::Exhausted {
+            accepted_attempts: u32::try_from(run.run_attempt.saturating_sub(1)).unwrap_or(u32::MAX),
+        })
+    }
 }
 
 /// Fence the bounded retry budget with GitHub's durable workflow-attempt

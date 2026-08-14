@@ -191,12 +191,14 @@ pub struct RunMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitHubError {
     message: String,
+    command_failed: bool,
 }
 
 impl GitHubError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            command_failed: false,
         }
     }
 
@@ -207,10 +209,20 @@ impl GitHubError {
     fn command_failed(args: &[String], status: Option<i32>, stderr: &[u8]) -> Self {
         let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
         let status = status.map_or_else(|| "signal".to_owned(), |code| code.to_string());
-        Self::new(format!(
-            "gh {} failed with status {status}: {stderr}",
-            args.join(" ")
-        ))
+        Self {
+            message: format!(
+                "gh {} failed with status {status}: {stderr}",
+                args.join(" ")
+            ),
+            command_failed: true,
+        }
+    }
+
+    pub(crate) fn is_integration_permission_denial(&self) -> bool {
+        self.command_failed
+            && self
+                .message
+                .contains("Resource not accessible by integration")
     }
 }
 

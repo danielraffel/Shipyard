@@ -19,6 +19,8 @@ fn required_workflow_capacity_reason_is_rejected_before_github_reads_or_writes()
             &observed,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "steward:skip",
+            MANAGED_LABEL,
+            HANDOFF_CONTEXT,
         ),
         Ok(None)
     ));
@@ -102,6 +104,8 @@ esac
         cancellation: &cancellation,
         ledger_path: &ledger_path,
         mutation_control: &control,
+        managed_label: MANAGED_LABEL,
+        handoff_context: HANDOFF_CONTEXT,
     };
     let mut ledger = StewardLedger::default();
 
@@ -197,6 +201,8 @@ esac
         cancellation: &cancellation,
         ledger_path: &ledger_path,
         mutation_control: &control,
+        managed_label: MANAGED_LABEL,
+        handoff_context: HANDOFF_CONTEXT,
     };
     let mut ledger = StewardLedger::default();
 

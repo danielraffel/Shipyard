@@ -114,6 +114,10 @@ impl CliFailure {
             message: message.into(),
         }
     }
+
+    pub(super) fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 /// `shipyard ship` validated every target green but could not merge because the

@@ -1,12 +1,11 @@
 use super::{
     BTreeMap, BTreeSet, CapacityPreemptionPolicy, CapacityRevalidation, GitHubActions,
-    HANDOFF_CONTEXT, MANAGED_LABEL, MergeQueueMutationGuard, MutationControl, ObservedPr,
-    RepoObservation, RequiredCheck, RunCancellation, RunCancellationReason, ShipState, StewardJob,
-    StewardLedger, StewardPullRequest, StewardRun, Value, active_runs, attempt_key,
-    coalescing_reason_authorizes, fetch_run_jobs, gh_json, has_successful_status,
-    hydrate_required_check_identities, is_full_sha, is_safe_capacity_preemption,
-    merge_queue_snapshot, parse_pr, parse_run, plan_run_coalescing, pull_requests,
-    queue_front_waits_for_pool, timestamp_old_enough,
+    MergeQueueMutationGuard, MutationControl, ObservedPr, RepoObservation, RequiredCheck,
+    RunCancellation, RunCancellationReason, ShipState, StewardJob, StewardLedger,
+    StewardPullRequest, StewardRun, Value, active_runs, attempt_key, coalescing_reason_authorizes,
+    fetch_run_jobs, gh_json, has_successful_status, hydrate_required_check_identities, is_full_sha,
+    is_safe_capacity_preemption, merge_queue_snapshot, parse_pr, parse_run, plan_run_coalescing,
+    pull_requests, queue_front_waits_for_pool, timestamp_old_enough,
 };
 
 pub(super) fn revalidate_capacity_preemption(
@@ -16,6 +15,8 @@ pub(super) fn revalidate_capacity_preemption(
     observed: &StewardRun,
     expected_front: &str,
     opt_out_label: &str,
+    managed_label: &str,
+    handoff_context: &str,
 ) -> Result<Option<CapacityRevalidation>, String> {
     let front_enqueued_at = match live_queue_front(actions, &observation.repo, &observation.base)? {
         Some((live_front, enqueued_at))
@@ -73,7 +74,12 @@ pub(super) fn revalidate_capacity_preemption(
     )?;
     all_current_heads.insert(candidate_pr.fact.number, candidate_pr.fact.head_sha.clone());
     if pull_request_opted_out(&candidate_pr, opt_out_label)
-        || !managed_ownership_still_valid(observation, &candidate_pr)
+        || !managed_ownership_still_valid(
+            observation,
+            &candidate_pr,
+            managed_label,
+            handoff_context,
+        )
     {
         opted_out.insert(candidate_pr.fact.number);
     }
@@ -184,26 +190,43 @@ pub(super) fn pull_request_opted_out(pr: &ObservedPr, opt_out_label: &str) -> bo
         .any(|label| label.eq_ignore_ascii_case(opt_out_label))
 }
 
-pub(super) fn pull_request_is_managed(pr: &ObservedPr) -> bool {
+pub(super) fn pull_request_is_managed(
+    pr: &ObservedPr,
+    managed_label: &str,
+    handoff_context: &str,
+) -> bool {
     let explicitly_managed = pr
         .fact
         .labels
         .iter()
-        .any(|label| label.eq_ignore_ascii_case(MANAGED_LABEL));
-    let exact_head_handoff = has_successful_status(&pr.fact, HANDOFF_CONTEXT);
+        .any(|label| label.eq_ignore_ascii_case(managed_label));
+    let exact_head_handoff = has_successful_status(&pr.fact, handoff_context);
     explicitly_managed && exact_head_handoff
 }
 
-fn managed_ownership_still_valid(observation: &RepoObservation, live: &ObservedPr) -> bool {
+fn managed_ownership_still_valid(
+    observation: &RepoObservation,
+    live: &ObservedPr,
+    managed_label: &str,
+    handoff_context: &str,
+) -> bool {
     let initial = observation
         .prs
         .iter()
         .find(|pr| pr.fact.number == live.fact.number);
-    initial.is_none_or(|initial| management_transition_valid(initial, live))
+    initial.is_some_and(|initial| {
+        management_transition_valid(initial, live, managed_label, handoff_context)
+    })
 }
 
-fn management_transition_valid(initial: &ObservedPr, live: &ObservedPr) -> bool {
-    !pull_request_is_managed(initial) || pull_request_is_managed(live)
+fn management_transition_valid(
+    initial: &ObservedPr,
+    live: &ObservedPr,
+    managed_label: &str,
+    handoff_context: &str,
+) -> bool {
+    !pull_request_is_managed(initial, managed_label, handoff_context)
+        || pull_request_is_managed(live, managed_label, handoff_context)
 }
 
 pub(super) fn live_queue_front_pool_jobs(
@@ -252,6 +275,8 @@ pub(super) fn revalidate_coalescing_cancellation(
     observed: &StewardRun,
     cancellation: &RunCancellation,
     opt_out_label: &str,
+    managed_label: &str,
+    handoff_context: &str,
 ) -> Result<bool, String> {
     if !coalescing_reason_authorizes(cancellation.reason) || !is_full_sha(&observed.head_sha) {
         return Ok(false);
@@ -273,7 +298,12 @@ pub(super) fn revalidate_coalescing_cancellation(
         return Ok(false);
     };
     if pull_request_opted_out(&candidate_pr, opt_out_label)
-        || !managed_ownership_still_valid(observation, &candidate_pr)
+        || !managed_ownership_still_valid(
+            observation,
+            &candidate_pr,
+            managed_label,
+            handoff_context,
+        )
     {
         return Ok(false);
     }
@@ -333,6 +363,8 @@ pub(super) fn authoritative_head_still_superseded(
     observed: &StewardRun,
     cancellation: &RunCancellation,
     opt_out_label: &str,
+    managed_label: &str,
+    handoff_context: &str,
 ) -> Result<bool, String> {
     let Some(pr_number) = observed
         .pull_request_number
@@ -351,7 +383,12 @@ pub(super) fn authoritative_head_still_superseded(
         return Ok(false);
     };
     if pull_request_opted_out(&candidate_pr, opt_out_label)
-        || !managed_ownership_still_valid(observation, &candidate_pr)
+        || !managed_ownership_still_valid(
+            observation,
+            &candidate_pr,
+            managed_label,
+            handoff_context,
+        )
     {
         return Ok(false);
     }

@@ -16,6 +16,7 @@ fn green_pr() -> StewardPullRequest {
         labels: Vec::new(),
         checks: vec![StewardCheck {
             name: "required".to_owned(),
+            source: StewardCheckSource::CheckRun,
             app_id: None,
             status: "COMPLETED".to_owned(),
             conclusion: Some("SUCCESS".to_owned()),
@@ -58,6 +59,7 @@ fn explicit_management_requires_label_and_current_head_receipt() {
 
     pr.checks.push(StewardCheck {
         name: "shipyard/steward-handoff".to_owned(),
+        source: StewardCheckSource::StatusContext,
         app_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("SUCCESS".to_owned()),
@@ -67,6 +69,27 @@ fn explicit_management_requires_label_and_current_head_receipt() {
     assert_eq!(
         classify_pr(&pr, &policy, &BTreeMap::new()),
         StewardDecision::ArmMergeQueue
+    );
+}
+
+#[test]
+fn check_run_cannot_impersonate_handoff_status_context() {
+    let mut policy = queue_policy();
+    policy.managed_label = Some("shipyard:managed".to_owned());
+    let mut pr = green_pr();
+    pr.labels.push("shipyard:managed".to_owned());
+    pr.checks.push(StewardCheck {
+        name: "shipyard/steward-handoff".to_owned(),
+        source: StewardCheckSource::CheckRun,
+        app_id: Some(1),
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: Some(99),
+        observed_at: Some("2026-08-13T00:00:00Z".to_owned()),
+    });
+    assert_eq!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::HandoffMissing
     );
 }
 
@@ -85,6 +108,7 @@ fn ignores_advisory_failure_when_required_context_is_green() {
     let mut pr = green_pr();
     pr.checks.push(StewardCheck {
         name: "advisory".to_owned(),
+        source: StewardCheckSource::CheckRun,
         app_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("FAILURE".to_owned()),
@@ -104,6 +128,7 @@ fn newest_duplicate_required_context_is_authoritative() {
     pr.checks[0].observed_at = Some("2026-07-25T00:00:00Z".to_owned());
     pr.checks.push(StewardCheck {
         name: "required".to_owned(),
+        source: StewardCheckSource::CheckRun,
         app_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("SUCCESS".to_owned()),
@@ -122,6 +147,7 @@ fn undated_pending_duplicate_blocks_older_success() {
     pr.checks[0].observed_at = Some("2026-07-26T00:00:00Z".to_owned());
     pr.checks.push(StewardCheck {
         name: "required".to_owned(),
+        source: StewardCheckSource::CheckRun,
         app_id: None,
         status: "QUEUED".to_owned(),
         conclusion: None,
@@ -223,6 +249,7 @@ fn direct_merge_refuses_unvalidated_base_advance_even_with_authoritative_checks(
     pr.checks[0].observed_at = Some("2026-07-25T00:00:00Z".to_owned());
     pr.checks.push(StewardCheck {
         name: "required".to_owned(),
+        source: StewardCheckSource::CheckRun,
         app_id: None,
         status: "COMPLETED".to_owned(),
         conclusion: Some("SUCCESS".to_owned()),

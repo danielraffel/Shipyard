@@ -16,6 +16,7 @@ use crate::app::merge_steward_cmd::capacity_cancellation::{
 use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
 use crate::app::merge_steward_cmd::pr_mutations::rollback_transient_attempt;
 use crate::app::merge_steward_cmd::pr_mutations::run_attempt_allows_transient_rerun;
+use crate::merge_steward::StewardCheckSource;
 
 #[test]
 fn github_run_attempt_fences_lost_transient_retry_ledger() {
@@ -24,6 +25,32 @@ fn github_run_attempt_fences_lost_transient_retry_ledger() {
     assert!(!run_attempt_allows_transient_rerun(2, 1));
     assert!(run_attempt_allows_transient_rerun(2, 2));
     assert!(!run_attempt_allows_transient_rerun(3, 2));
+}
+
+#[test]
+fn managed_ownership_uses_the_configured_label_and_handoff_context() {
+    let mut pr = ready_pr();
+    pr.fact.labels.push("custom:managed".to_owned());
+    pr.fact.checks.push(StewardCheck {
+        name: "custom/handoff".to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-07-26T00:00:00Z".to_owned()),
+    });
+
+    assert!(pull_request_is_managed(
+        &pr,
+        "custom:managed",
+        "custom/handoff"
+    ));
+    assert!(!pull_request_is_managed(
+        &pr,
+        MANAGED_LABEL,
+        HANDOFF_CONTEXT
+    ));
 }
 
 #[test]
@@ -335,6 +362,8 @@ fn unauthorized_steward_does_not_consume_capacity_preemption_budget() {
         cancellation: &cancellation,
         ledger_path: &ledger_path,
         mutation_control: &mutation_control,
+        managed_label: MANAGED_LABEL,
+        handoff_context: HANDOFF_CONTEXT,
     };
 
     let (mutation, error) = apply_capacity_preemption(&context, "steward:skip", &mut ledger);
@@ -385,6 +414,8 @@ fn initial_force_cancel_revalidation_failure_is_durably_rejected_before_post() {
         cancellation: &cancellation,
         ledger_path: &ledger_path,
         mutation_control: &control,
+        managed_label: MANAGED_LABEL,
+        handoff_context: HANDOFF_CONTEXT,
     };
     let active = NonTerminalRun {
         status: "in_progress".to_owned(),
@@ -534,6 +565,8 @@ fn initial_capacity_guard_correlation_is_durable_before_started_audit_can_be_orp
         cancellation: &cancellation,
         ledger_path: &ledger_path,
         mutation_control: &control,
+        managed_label: MANAGED_LABEL,
+        handoff_context: HANDOFF_CONTEXT,
     };
     let mut ledger = StewardLedger::default();
 
@@ -584,6 +617,8 @@ fn skipped_capacity_intent_recovers_without_sending_a_cancellation() {
         cancellation: &cancellation,
         ledger_path: &ledger_path,
         mutation_control: &control,
+        managed_label: MANAGED_LABEL,
+        handoff_context: HANDOFF_CONTEXT,
     };
     let mut ledger = StewardLedger::default();
     let (guard, pending) = start_capacity_preemption(
@@ -952,7 +987,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         repos: vec!["owner/repo".to_owned()],
         base: "main".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
-        managed_label: "steward:managed".to_owned(),
+        managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
         coalesce: true,
@@ -997,7 +1032,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         repos: vec!["owner/repo".to_owned()],
         base: "main".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
-        managed_label: "steward:managed".to_owned(),
+        managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
         coalesce: true,
@@ -1036,7 +1071,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         repos: vec!["owner/repo".to_owned()],
         base: "main".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
-        managed_label: "steward:managed".to_owned(),
+        managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
         coalesce: false,
@@ -1209,6 +1244,8 @@ fn legacy_same_head_duplicate_reason_is_rejected_before_github_reads() {
         &observation,
         &cancellation,
         "steward:skip",
+        MANAGED_LABEL,
+        HANDOFF_CONTEXT,
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,
@@ -1265,6 +1302,8 @@ esac
         &observation,
         &cancellation,
         "steward:skip",
+        MANAGED_LABEL,
+        HANDOFF_CONTEXT,
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,
@@ -1332,6 +1371,8 @@ esac
         &observation,
         &cancellation,
         "steward:skip",
+        MANAGED_LABEL,
+        HANDOFF_CONTEXT,
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,
@@ -1396,6 +1437,8 @@ esac
         &observation,
         &cancellation,
         "steward:skip",
+        MANAGED_LABEL,
+        HANDOFF_CONTEXT,
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,
@@ -1455,6 +1498,8 @@ esac
         &observation,
         &cancellation,
         "steward:skip",
+        MANAGED_LABEL,
+        HANDOFF_CONTEXT,
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,
