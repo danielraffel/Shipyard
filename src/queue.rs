@@ -114,10 +114,16 @@ impl Queue {
         &self.state_dir
     }
 
+    /// Durable queue file path for an application state directory.
+    #[must_use]
+    pub fn queue_file_at(state_dir: &Path) -> PathBuf {
+        state_dir.join("queue.json")
+    }
+
     /// Durable queue file path.
     #[must_use]
     pub fn queue_file(&self) -> PathBuf {
-        self.state_dir.join("queue.json")
+        Self::queue_file_at(&self.state_dir)
     }
 
     /// Drain lock file path.

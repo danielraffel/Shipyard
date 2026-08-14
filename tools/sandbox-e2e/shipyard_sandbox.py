@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from typing import Mapping, Sequence
 
 BINARY_NAME = "shipyard.exe" if sys.platform == "win32" else "shipyard"
 PYTHON_BINARY_NAME = "shipyard-py"
+QUEUE_TEMP_RE = re.compile(r"^\.queue-(\d+)-\d+-\d+\.json\.tmp$")
 
 PROTECTED_PATHS: tuple[Path, ...] = (
     Path.home() / "Library" / "Application Support" / "shipyard",
@@ -112,7 +114,148 @@ def _snapshot_paths(root: Path) -> set[Path]:
         return set()
 
 
-def _find_newer(root: Path, sentinel_mtime: float, pre_existing: set[Path]) -> list[Path]:
+def _queued_job_ids(root: Path) -> set[str]:
+    try:
+        payload = json.loads((root / "queue.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, list):
+        return set()
+    return {
+        job_id
+        for job in jobs
+        if isinstance(job, dict)
+        and isinstance((job_id := job.get("id")), str)
+        and job_id
+    }
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _darwin_process_start_identity(pid: int) -> str | None:
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+    info = _DarwinProcBsdInfo()
+    size = ctypes.sizeof(info)
+    written = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+    if written != size:
+        return None
+    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+
+
+def _linux_process_start_identity(pid: int) -> str | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # The executable name is parenthesized and may contain spaces. Fields after
+    # the final ')' begin at field 3; starttime is field 22 (index 19 here).
+    fields = stat[stat.rfind(")") + 2 :].split()
+    if len(fields) <= 19 or not fields[19].isdigit():
+        return None
+    return f"linux:{fields[19]}"
+
+
+def _process_start_identity(pid: int) -> str | None:
+    if sys.platform == "darwin":
+        return _darwin_process_start_identity(pid)
+    if sys.platform.startswith("linux"):
+        return _linux_process_start_identity(pid)
+    return None
+
+
+def _active_process_identities() -> dict[int, str]:
+    if os.name != "posix":
+        return {}
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    identities: dict[int, str] = {}
+    for field in result.stdout.split():
+        if not field.isdigit():
+            continue
+        pid = int(field)
+        identity = _process_start_identity(pid)
+        if identity is not None:
+            identities[pid] = identity
+    return identities
+
+
+def _is_queue_temp_from_pre_existing_process(
+    path: Path, pre_existing_process_identities: Mapping[int, str]
+) -> bool:
+    match = QUEUE_TEMP_RE.fullmatch(path.name)
+    if match is None:
+        return False
+    pid = int(match.group(1))
+    prior_identity = pre_existing_process_identities.get(pid)
+    return (
+        prior_identity is not None
+        and _process_start_identity(pid) == prior_identity
+    )
+
+
+def _is_outcome_for_pre_existing_job(
+    path: Path, pre_existing_queue_job_ids: set[str]
+) -> bool:
+    return (
+        path.suffix == ".json"
+        and path.parent.name == "outcomes"
+        and path.parent.parent.name == "queue"
+        and path.stem in pre_existing_queue_job_ids
+    )
+
+
+def _find_newer(
+    root: Path,
+    sentinel_mtime: float,
+    pre_existing: set[Path],
+    pre_existing_process_identities: Mapping[int, str] | None = None,
+    pre_existing_queue_job_ids: set[str] | None = None,
+) -> list[Path]:
     if not root.exists():
         return []
     offenders: list[Path] = []
@@ -128,6 +271,23 @@ def _find_newer(root: Path, sentinel_mtime: float, pre_existing: set[Path]) -> l
         except OSError:
             continue
         if stat.st_mtime > sentinel_mtime:
+            # A pooled macOS runner can host another legitimate Shipyard process
+            # while this sandbox runs. Its atomic queue temp file is not evidence
+            # that the isolated child escaped. Only exempt writers that already
+            # existed when the sandbox started; a child created by this sandbox
+            # remains attributable and must still fail the contamination check.
+            if _is_queue_temp_from_pre_existing_process(
+                path, pre_existing_process_identities or {}
+            ):
+                continue
+            # A queued job that predates the sandbox may finish while the test
+            # runs. The drain can be a child spawned after our process snapshot,
+            # so the durable job id is the stable ownership boundary for its new
+            # outcome file. Jobs created by the sandbox are absent from this set.
+            if _is_outcome_for_pre_existing_job(
+                path, pre_existing_queue_job_ids or set()
+            ):
+                continue
             offenders.append(path)
     return offenders
 
@@ -228,6 +388,8 @@ class Sandbox:
         self.root: Path | None = None
         self._sentinel_mtime: float | None = None
         self._pre_existing: dict[Path, set[Path]] = {}
+        self._pre_existing_process_identities: dict[int, str] = {}
+        self._pre_existing_queue_job_ids: dict[Path, set[str]] = {}
 
     @property
     def bin_dir(self) -> Path:
@@ -253,6 +415,10 @@ class Sandbox:
         self.home_dir.mkdir(parents=True)
         self.work_dir.mkdir(parents=True)
         self._pre_existing = {path: _snapshot_paths(path) for path in PROTECTED_PATHS}
+        self._pre_existing_process_identities = _active_process_identities()
+        self._pre_existing_queue_job_ids = {
+            path: _queued_job_ids(path) for path in PROTECTED_PATHS
+        }
         sentinel = self.root / ".sentinel"
         sentinel.write_text("sandbox-start\n", encoding="utf-8")
         now = time.time()
@@ -338,7 +504,13 @@ class Sandbox:
         offenders: list[Path] = []
         for path in PROTECTED_PATHS:
             offenders.extend(
-                _find_newer(path, self._sentinel_mtime, self._pre_existing.get(path, set()))
+                _find_newer(
+                    path,
+                    self._sentinel_mtime,
+                    self._pre_existing.get(path, set()),
+                    self._pre_existing_process_identities,
+                    self._pre_existing_queue_job_ids.get(path, set()),
+                )
             )
         report = ContaminationReport(tuple(sorted(offenders)), self._sentinel_mtime)
         if not report.clean:

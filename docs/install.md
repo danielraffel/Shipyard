@@ -73,7 +73,15 @@ a bot like `pulp-release-bot`), the scope lives on the **App's
 permissions**, not the invoking user's token. github.com →
 organizations/<org> → Settings → GitHub Apps → your app →
 **Permissions & events** → **Actions: Read and write**. Accept the
-install prompt on each repo after saving.
+installation permission update after saving.
+
+If the Shipyard deployment includes an external organization runner-group
+verifier, also grant
+**Organization permissions → Self-hosted runners: Read-only**. Repository
+`Actions` access does not cover the organization runner-group API. Use Read &
+write only when Shipyard must configure runner groups or remove registrations.
+After any App permission change, approve the installation update and mint a
+fresh installation token; an existing cached token retains its old permissions.
 
 ## Optional Shipyard GitHub auth override
 
@@ -148,12 +156,22 @@ Minimal GitHub App registration for a local Shipyard quota/auth helper:
 | Setup URL / Redirect on update | blank / disabled |
 | Webhook Active | disabled |
 | Repository permissions | `Contents: Read-only`; add `Actions`, `Checks`, `Commit statuses`, and `Pull requests` as read-only for fuller Shipyard inspection |
+| Organization permissions | `Self-hosted runners: Read-only` when inspecting or verifying organization runner groups; Read & write only for configuration/removal |
 | Subscribe to events | none for quota testing |
 | Installable by | Only on this account |
 
 After creating the app, install it on the account and choose `All repositories`
 when validating the scaled installation bucket. Save the App ID, installation
 ID, and private-key path locally; never put the private key in tracked config.
+
+Runner-group access is valuable when Shipyard coordinates multiple local
+providers because an App-backed policy verifier can compare selected
+repositories, selected workflows, and live group membership before the
+deployment treats capacity as trusted. This verifier is an operator integration,
+not currently a built-in `shipyard runner` check. It keeps fleet
+coordination separate from execution—TartCI can own disposable Apple-Silicon
+macOS VMs, Proxmox can own x64 Linux VMs, and native Intel hardware can run
+macOS/Metal checks—without broadening any one runner's authorization.
 
 `scripts/shipyard-github-app-token` is a zero-Python-dependency helper for this
 flow. It uses `openssl` to sign the app JWT, asks GitHub for an installation

@@ -32,6 +32,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::cloud::QueuedRun;
+use crate::workflow_cancellation::is_bulk_run_cancellation_safe;
 
 /// Defaults for the watchdog, mirroring `[runner.watchdog]` in
 /// `.shipyard/config.toml`.
@@ -155,6 +156,8 @@ pub struct StaleQueuedRun {
     pub queued_for_secs: i64,
     /// Browser URL, when GitHub returned one.
     pub url: Option<String>,
+    /// Whether broad cleanup has authority to cancel this run.
+    pub cancellation_safe: bool,
 }
 
 /// Summary returned by [`assess_runner`].
@@ -282,6 +285,7 @@ pub fn compute_stale_queued_runs(
             branch: run.head_branch.clone(),
             queued_for_secs: age_secs,
             url: run.url.clone(),
+            cancellation_safe: is_bulk_run_cancellation_safe(run),
         });
     }
     out
@@ -325,6 +329,8 @@ pub struct StaleRun {
     pub age_secs: i64,
     /// Browser URL, when GitHub returned one.
     pub url: Option<String>,
+    /// Whether broad cleanup has authority to cancel this run.
+    pub cancellation_safe: bool,
 }
 
 /// Thresholds for the stale-run reaper, in minutes.
@@ -429,6 +435,7 @@ fn collect_stale(
             kind,
             age_secs,
             url: run.url.clone(),
+            cancellation_safe: is_bulk_run_cancellation_safe(run),
         });
     }
 }
@@ -463,6 +470,7 @@ mod tests {
             database_id: id,
             name: workflow.to_owned(),
             head_branch: branch.to_owned(),
+            event: "pull_request".to_owned(),
             created_at: created_at.to_owned(),
             run_started_at: None,
             workflow_name: workflow.to_owned(),
@@ -576,6 +584,31 @@ mod tests {
     }
 
     #[test]
+    fn stale_queue_reports_all_runs_but_marks_only_review_runs_cancellable() {
+        let now = Utc::now();
+        let old = (now - ChronoDuration::hours(12)).to_rfc3339();
+        let mut release = queued_run(1, "Release CLI", "main", &old);
+        release.path = ".github/workflows/release-cli.yml".to_owned();
+        let mut dispatch = queued_run(2, "CI", "main", &old);
+        dispatch.event = "workflow_dispatch".to_owned();
+        let review = queued_run(3, "CI", "feature/safe", &old);
+
+        let stale = compute_stale_queued_runs(&[release, dispatch, review], 60, now);
+        assert_eq!(
+            stale.iter().map(|run| run.run_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            stale
+                .iter()
+                .filter(|run| run.cancellation_safe)
+                .map(|run| run.run_id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
     fn stale_queue_drives_stuck_verdict() {
         let now = Utc::now();
         let snapshot = RunnerSnapshot {
@@ -610,6 +643,7 @@ mod tests {
             database_id: id,
             name: workflow.to_owned(),
             head_branch: branch.to_owned(),
+            event: "pull_request".to_owned(),
             created_at: created_at.to_owned(),
             run_started_at: None,
             workflow_name: workflow.to_owned(),
@@ -733,6 +767,23 @@ mod tests {
         assert_eq!(stale.len(), 2);
         assert_eq!(stale[0].kind, StaleRunKind::HungInProgress);
         assert_eq!(stale[1].kind, StaleRunKind::OrphanedQueued);
+    }
+
+    #[test]
+    fn stale_run_reaper_reports_sign_and_release_as_protected() {
+        let now = Utc::now();
+        let mut release = run_with_status(
+            99,
+            "Sign and Release",
+            "main",
+            "in_progress",
+            &(now - ChronoDuration::days(2)).to_rfc3339(),
+        );
+        release.path = ".github/workflows/sign-and-release.yml".to_owned();
+
+        let stale = compute_stale_runs(&[release], &[], ReaperThresholds::default(), now);
+        assert_eq!(stale.len(), 1);
+        assert!(!stale[0].cancellation_safe);
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod auth_cmd;
 mod auto_merge_cmd;
 mod branch_cmd;
 mod capacity_cmd;
+mod changed_surface_cmd;
 mod changelog_cmd;
 mod ci_cmd;
 mod cleanup_cmd;
@@ -28,12 +29,16 @@ mod doctor_cmd;
 mod fleet_status_cmd;
 mod governance_cmd;
 mod init_cmd;
+mod local_linux_lease_cmd;
+mod merge_queue_control_cmd;
+mod merge_steward_cmd;
 mod metrics_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
 mod quarantine_cmd;
 mod queue_cmd;
+mod queue_observer_cmd;
 mod release_bot_cmd;
 mod reroute_cmd;
 mod rescue_cmd;
@@ -52,6 +57,7 @@ mod watch_local_cmd;
 use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
 use self::branch_cmd::branch_command;
+use self::changed_surface_cmd::{ChangedSurfacePlanArgs, changed_surface_plan_command};
 use self::changelog_cmd::changelog_command;
 use self::ci_cmd::ci_command;
 use self::cleanup_cmd::{
@@ -68,14 +74,16 @@ use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
 use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
+use self::merge_queue_control_cmd::merge_queue_control_command;
 use self::metrics_cmd::metrics_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
-use self::pr_cmd::{PrCommandArgs, pr_command};
+use self::pr_cmd::{PrCommandArgs, StewardHandoffPreference, pr_command};
 use self::quarantine_cmd::quarantine_command;
 use self::queue_cmd::{
     bump_command, cancel_command, evidence_command, logs_command, queue_command, status_command,
 };
+use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
 use self::release_bot_cmd::release_bot_command;
 use self::rescue_cmd::rescue_command;
 use self::run_cmd::{
@@ -107,6 +115,13 @@ impl CliFailure {
         }
     }
 }
+
+/// `shipyard ship` validated every target green but could not merge because the
+/// request Shipyard sent GitHub was malformed — a Shipyard defect, not a PR
+/// problem. Distinct from `1` (validation genuinely failed) and from `0` (merged,
+/// or blocked by something on the PR) so automation can tell a stalled-green PR
+/// from a red one.
+pub(super) const SHIP_EXIT_MERGE_CLIENT_DEFECT: u8 = 8;
 
 pub(super) const WAIT_EXIT_TIMEOUT: u8 = 1;
 pub(super) const WAIT_EXIT_RUN_TERMINAL_WRONG: u8 = 4;
@@ -180,7 +195,14 @@ fn dispatch<W: Write, E: Write>(
         | Command::Branch { .. }
         | Command::Governance { .. }
         | Command::ReleaseBot { .. }) => {
-            return handle_setup_command(command, cli.mode.into(), &cwd, cli.json, stdout);
+            return handle_setup_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
         }
         command @ (Command::Status
         | Command::Evidence { .. }
@@ -234,6 +256,66 @@ fn dispatch<W: Write, E: Write>(
                 cli.global_dir.clone(),
                 cli.state_dir.clone(),
                 &runtime_paths,
+                cli.json,
+                stdout,
+            );
+        }
+        Command::MergeQueue { command } => {
+            return merge_queue_control_command(
+                command,
+                &runtime_paths.state_dir,
+                &runtime_paths.global_dir,
+                &cwd,
+                cli.mode.into(),
+                cli.json,
+                stdout,
+            );
+        }
+        Command::QueueObserve {
+            repo,
+            base,
+            follow,
+            state_file,
+            transition_log,
+            replay,
+            max_polls,
+        } => {
+            let config = LoadedConfig::load_from_cwd_with_global_dir(
+                cli.mode.into(),
+                &cwd,
+                runtime_paths.global_dir.clone(),
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            return queue_observer_command(
+                QueueObserverArgs {
+                    repo,
+                    base,
+                    follow,
+                    state_file,
+                    transition_log,
+                    replay,
+                    max_polls,
+                },
+                &config,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths,
+                cli.json,
+                stdout,
+            );
+        }
+        Command::ChangedSurfacePlan { target, pr, repo } => {
+            let config = LoadedConfig::load_from_cwd_with_global_dir(
+                cli.mode.into(),
+                &cwd,
+                runtime_paths.global_dir.clone(),
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            return changed_surface_plan_command(
+                ChangedSurfacePlanArgs { target, pr, repo },
+                &config,
+                &cwd,
+                &runtime_paths.state_dir,
                 cli.json,
                 stdout,
             );
@@ -292,7 +374,7 @@ fn handle_operational_variant<W: Write>(
         }
         command @ Command::Rescue(_) => handle_rescue_variant(command, mode, cwd, json, stdout),
         command @ Command::AutoMerge { .. } => {
-            handle_auto_merge_variant(command, &runtime_paths.state_dir, cwd, json, stdout)
+            handle_auto_merge_variant(command, mode, runtime_paths, cwd, json, stdout)
         }
         command @ Command::Watch { .. } => {
             handle_watch_variant(command, mode, &runtime_paths.state_dir, cwd, json, stdout)
@@ -301,7 +383,9 @@ fn handle_operational_variant<W: Write>(
             handle_ship_state_variant(&command, mode, cwd, &runtime_paths.state_dir, json, stdout)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Runner { command } => handle_runner_command(command, mode, cwd, json, stdout),
+        Command::Runner { command } => {
+            handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
+        }
         Command::Paths
         | Command::Pin { .. }
         | Command::Config { .. }
@@ -319,11 +403,14 @@ fn handle_operational_variant<W: Write>(
         | Command::Cancel { .. }
         | Command::Bump { .. }
         | Command::Queue
+        | Command::QueueObserve { .. }
+        | Command::ChangedSurfacePlan { .. }
         | Command::Cleanup { .. }
         | Command::Targets { .. }
         | Command::Quarantine { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }
+        | Command::MergeQueue { .. }
         | Command::Wait { .. }
         | Command::Update(_) => unreachable!("command handled by top-level dispatch"),
     }
@@ -348,6 +435,7 @@ fn handle_setup_command<W: Write>(
     command: Command,
     mode: RuntimeMode,
     cwd: &Path,
+    state_dir: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -356,7 +444,9 @@ fn handle_setup_command<W: Write>(
         Command::Changelog { command } => changelog_command(command, mode, cwd, json, stdout),
         Command::Branch { command } => branch_command(command, mode, cwd, json, stdout),
         Command::Governance { command } => governance_command(command, mode, cwd, json, stdout),
-        Command::ReleaseBot { command } => release_bot_command(command, mode, cwd, json, stdout),
+        Command::ReleaseBot { command } => {
+            release_bot_command(command, mode, cwd, state_dir, json, stdout)
+        }
         _ => unreachable!("setup command helper only receives setup commands"),
     }
 }
@@ -389,7 +479,9 @@ fn handle_state_command<W: Write>(
             None => evidence_command(branch, cwd, state_dir, json, stdout),
         },
         Command::Logs { job_id, target } => logs_command(&job_id, target, state_dir, stdout),
-        Command::Cancel { job_id } => cancel_command(&job_id, state_dir, json, stdout),
+        Command::Cancel { job_id, reason } => {
+            cancel_command(&job_id, reason.as_deref(), state_dir, json, stdout)
+        }
         Command::Bump { job_id, priority } => {
             bump_command(&job_id, priority, state_dir, json, stdout)
         }
@@ -485,12 +577,13 @@ fn handle_runner_command<W: Write>(
     command: self::cli::RunnerCommand,
     mode: RuntimeMode,
     cwd: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let config = crate::config::LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    runner_command(command, mode, &config, cwd, json, stdout)
+    runner_command(command, &config, mode, cwd, runtime_paths, json, stdout)
 }
 
 struct AutoMergeInvocation {
@@ -543,6 +636,7 @@ fn handle_ship_variant<W: Write>(
             allow_unreachable_targets,
             skip_targets,
             adopt_head,
+            steward_handoff: None,
         },
         mode,
         cwd,
@@ -571,6 +665,9 @@ fn handle_pr_variant<W: Write>(
         skip_skill_update,
         skill_reason,
         adopt_head,
+        workstream_id,
+        context_url,
+        no_steward_handoff,
     } = command
     else {
         unreachable!("pr variant required")
@@ -588,6 +685,13 @@ fn handle_pr_variant<W: Write>(
             skip_skill_update,
             skill_reason,
             adopt_head,
+            workstream_id,
+            context_url,
+            steward_handoff_preference: if no_steward_handoff {
+                StewardHandoffPreference::Disabled
+            } else {
+                StewardHandoffPreference::ProjectDefault
+            },
             python_command: None,
         },
         &config,
@@ -666,7 +770,8 @@ fn handle_cloud_variant<W: Write>(
 
 fn handle_auto_merge_variant<W: Write>(
     command: Command,
-    state_dir: &Path,
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
@@ -694,7 +799,9 @@ fn handle_auto_merge_variant<W: Write>(
             merge_command,
             merge_result,
         },
-        state_dir,
+        mode,
+        &runtime_paths.state_dir,
+        &runtime_paths.global_dir,
         cwd,
         json,
         stdout,
@@ -807,7 +914,9 @@ fn handle_cloud_command<W: Write>(
 
 fn handle_auto_merge<W: Write>(
     invocation: AutoMergeInvocation,
+    mode: RuntimeMode,
     state_dir: &Path,
+    global_dir: &Path,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
@@ -817,6 +926,8 @@ fn handle_auto_merge<W: Write>(
     auto_merge(
         &store,
         cwd,
+        mode,
+        global_dir,
         invocation.pr,
         invocation.merge_method,
         invocation.delete_branch,
@@ -1516,7 +1627,7 @@ mod tests {
     #[test]
     fn queue_json_reports_multiple_active_runs_additively() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let first = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1571,7 +1682,7 @@ mod tests {
     #[test]
     fn status_json_reports_multiple_active_runs_additively() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         for (sha, branch, target) in [
             ("abc123456789", "feature/first", "linux"),
             ("def987654321", "feature/second", "mac"),
@@ -1649,9 +1760,14 @@ mod tests {
                 sha: "abc123456789".to_owned(),
                 branch: "feature/evidence".to_owned(),
                 target_name: "linux".to_owned(),
+                validation_build_type: None,
                 platform: "linux".to_owned(),
                 status: "pass".to_owned(),
                 backend: "local".to_owned(),
+                source_head_sha: None,
+                source_tree_sha: None,
+                source_checkout_clean: None,
+                full_execution: None,
                 completed_at: Utc::now(),
                 duration_secs: Some(1.5),
                 host: None,
@@ -1691,7 +1807,7 @@ mod tests {
     #[test]
     fn bump_json_updates_pending_job_priority() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1724,7 +1840,7 @@ mod tests {
     #[test]
     fn cancel_json_marks_pending_job_cancelled() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1751,12 +1867,17 @@ mod tests {
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "cancel");
         assert_eq!(value["job"]["status"], "cancelled");
+        assert!(
+            value["job"]["cancellation_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("shipyard cancel"))
+        );
     }
 
     #[test]
     fn cancel_json_marks_running_job_cancelled() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1778,6 +1899,8 @@ mod tests {
             temp.path().to_str().expect("temp path"),
             "cancel",
             &job.id,
+            "--reason",
+            "controller epoch 7 replaced exact head",
         ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1789,6 +1912,10 @@ mod tests {
         assert_eq!(value["command"], "cancel");
         assert_eq!(value["job"]["status"], "cancelled");
         assert_eq!(
+            value["job"]["cancellation_reason"],
+            "controller epoch 7 replaced exact head"
+        );
+        assert_eq!(
             queue.get(&job.id).expect("get").expect("job").status,
             crate::job::JobStatus::Cancelled
         );
@@ -1799,7 +1926,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let log_path = temp.path().join("linux.log");
         std::fs::write(&log_path, "target log\n").expect("write log");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -1834,7 +1961,7 @@ mod tests {
     #[test]
     fn queue_human_reports_pending_and_recent_jobs() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut queue = Queue::new(temp.path().join("queue")).expect("queue");
+        let mut queue = Queue::new(temp.path()).expect("queue");
         let pending = queue
             .enqueue(Job::create(
                 "abc123456789",
@@ -2122,9 +2249,8 @@ mod tests {
         std::fs::create_dir_all(&active_log).expect("active log dir");
         std::fs::write(orphan_log.join("out.log"), "orphan\n").expect("orphan log");
         std::fs::write(active_log.join("out.log"), "active\n").expect("active log");
-        std::fs::create_dir_all(temp.path().join("queue")).expect("queue dir");
         std::fs::write(
-            temp.path().join("queue").join("queue.json"),
+            temp.path().join("queue.json"),
             r#"{"jobs":[{"id":"active"}]}"#,
         )
         .expect("queue file");
@@ -2591,6 +2717,55 @@ mod tests {
         // State must stay active (not archived) so the new head can be
         // re-validated.
         assert!(store.get(42).is_some());
+        assert_eq!(store.list_archived().len(), 0);
+    }
+
+    #[test]
+    fn auto_merge_green_refuses_when_pr_is_retargeted_after_validation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        store
+            .save(&auto_merge_state(
+                43,
+                &[("macos", "pass"), ("linux", "pass")],
+            ))
+            .expect("save");
+        let snapshot = temp.path().join("pr.json");
+        std::fs::write(
+            &snapshot,
+            format!(
+                r#"{{"headRefOid":"{}","baseRefName":"release"}}"#,
+                "a".repeat(40)
+            ),
+        )
+        .expect("write snapshot");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "auto-merge",
+            "43",
+            "--merge-result",
+            "success",
+            "--pr-snapshot-file",
+            snapshot.to_str().expect("snapshot path"),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["event"], "merge-failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("retargeted from validated base main to release")
+        );
+        assert!(store.get(43).is_some());
         assert_eq!(store.list_archived().len(), 0);
     }
 
@@ -3605,9 +3780,14 @@ mod tests {
                 sha: state.head_sha.clone(),
                 branch: state.branch.clone(),
                 target_name: "macos".to_owned(),
+                validation_build_type: None,
                 platform: "macos-arm64".to_owned(),
                 status: "pass".to_owned(),
                 backend: "reused".to_owned(),
+                source_head_sha: None,
+                source_tree_sha: None,
+                source_checkout_clean: None,
+                full_execution: None,
                 completed_at: Utc::now(),
                 duration_secs: None,
                 host: None,
@@ -3675,9 +3855,14 @@ mod tests {
                 sha: state.head_sha.clone(),
                 branch: state.branch.clone(),
                 target_name: "macos".to_owned(),
+                validation_build_type: None,
                 platform: "macos-arm64".to_owned(),
                 status: "pass".to_owned(),
                 backend: "reused".to_owned(),
+                source_head_sha: None,
+                source_tree_sha: None,
+                source_checkout_clean: None,
+                full_execution: None,
                 completed_at: Utc::now(),
                 duration_secs: None,
                 host: None,

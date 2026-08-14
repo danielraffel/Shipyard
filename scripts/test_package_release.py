@@ -15,6 +15,23 @@ import package_release
 
 
 class PackageReleaseTests(unittest.TestCase):
+    def test_codesign_uses_explicit_ephemeral_keychain_when_configured(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SHIPYARD_SIGNING_IDENTITY": "identity",
+                "SHIPYARD_SIGNING_KEYCHAIN": "/tmp/signing keychain.keychain-db",
+                "SHIPYARD_SIGNING_HOME": "/tmp/isolated signing home",
+            },
+            clear=True,
+        ), mock.patch.object(package_release, "run") as run:
+            package_release.sign_binary(Path("/tmp/shipyard"))
+            package_release.sign_dmg(Path("/tmp/shipyard.dmg"))
+        for call in run.call_args_list:
+            self.assertIn("--keychain", call.args[0])
+            self.assertIn("/tmp/signing keychain.keychain-db", call.args[0])
+            self.assertEqual(call.kwargs["env"]["HOME"], "/tmp/isolated signing home")
+
     def test_artifact_filename_keeps_dev_safe_prefix(self) -> None:
         self.assertEqual(
             package_release.artifact_filename(

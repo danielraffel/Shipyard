@@ -36,9 +36,13 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Regenerate CHANGELOG.md from tags | `shipyard changelog regenerate` |
 | CI drift gate for CHANGELOG.md | `shipyard changelog check` |
 | Run the post-tag hook locally | `shipyard release-bot hook run --tag v0.9.0` |
+| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; `${{GITHUB_REF#refs/tags/}}` is invalid GitHub expression syntax. PR pushes from the detached tag checkout must first attach the deterministic local branch, then use Shipyard's supervised push and target `HEAD:refs/heads/<branch>` so repository hooks see both a branch and `SHIPYARD_PR_RUNNING=1`. Repositories requiring signed bot commits set `release.post_tag_hook.ssh_signing_setup_script`; never hand-edit the owned workflow. |
 | Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
+| Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
+| Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |
+| Shadow-plan changed-surface tests for an exact PR head | `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n> --target <name>` (base-owned literal tests only; full suite remains authoritative; identity mismatch hard-fails, ambiguity falls back full) |
 | Show run logs | `shipyard logs <job_id> --json` |
 | **Runner watchdog: health check** | `shipyard runner status --repo <r> --runner-id <id>` |
 | **Runner watchdog: list stale queued runs (dry-run)** | `shipyard runner cleanup --dry-run` |
@@ -49,9 +53,11 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Runner provisioning: register N runners for a repo** | `shipyard runner register --repo <owner/repo> --count <N> [--ci-root <dir>]` (names `<repo>-<tag>-NN`, continues the index) |
 | **Runner provisioning: dry-run the registration plan** | `shipyard runner register --repo <owner/repo> --count <N> --dry-run` |
 | **Runner provisioning: live cross-repo pool view** | `shipyard runner list [--repo <owner/repo>]` (groups by machine; flags orphaned local dirs) |
-| **Runner provisioning: audit host-class naming/label drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels; exit 1 on drift) |
+| **Runner provisioning: audit host-class naming/label drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels and fatally rejects any runner combining `<repo>-advisory-*` with `<repo>-build*` / `<repo>-preamble*`; exit 1 on drift) |
 | **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` + `tart get` per `[host_class.*]`, using configured `tart_home` as `TART_HOME`; counts only running macOS/darwin VMs; `free = Σ max(0, cap − running_macos)`; fail-closed, exit 1 if any host/VM OS unreadable) |
-| **Runner fleet visibility: capacity + tartci health + queue age** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (runs host-local `tartci doctor --reap --json` via configured `tartci_bin`, checks supervisor freshness, per-host routability, and oldest queued macOS age; exits 1 on unreadable/problem hosts or queued-age-with-capacity) |
+| **Runner fleet visibility: exact-head queue/release liveness** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (bounded pagination; stable auth/rate/truncation reasons; detects optional/superseded capacity owners and cleared enrollment) |
+| **Maintain Pulp's expiring disposable-Linux route** | `shipyard runner local-linux-lease --repo Generous-Corp/pulp [--apply] [--watch --interval-secs 60] [--json]` (dry-run by default; profile-derived exact labels; queued matching jobs reserve idle slots; renews only for unreserved online idle ephemeral capacity; unhealthy/unreadable clears; 15-minute maximum TTL; no workflow or MQ mutation) |
+| **Cross-repo merge-on-green stewardship** | Prefer atomic submission: configure `[merge_steward].auto_handoff = true` on the protected base branch and use `shipyard pr [--workstream-id <id>] [--context-url <url>]` (a PR branch cannot opt itself in); otherwise hand off one immutable head with `shipyard runner steward-handoff --repo <owner/repo> --pr <n> --head <sha> --workstream-id <id> [--context-url <url>] --apply`, then reconcile with `shipyard runner steward --repo <owner/pulp> --repo <owner/forge> --repo <owner/vellum> [--json]` (dry-run by default; only PRs carrying both the `shipyard:managed` label and a successful `shipyard/steward-handoff` status on their current head may be mutated, so apply mode explicitly labels old backlog `shipyard:unmanaged` without adopting it and exact handoff removes that explanatory label; `--apply` requires the trusted machine-global mutation authority, obeys central `HOLD`, serializes and write-ahead audits every GitHub mutation, emits one deduplicated `shipyard:needs-agent` plus `shipyard/steward-recovery` failure signal for semantic blockers, resumes durable exact-run pending cancellations before planning, re-enrolls only the current exact green head, preserves native queue order, refuses mutation without authoritative required-check governance and refuses client-side direct merge when GitHub cannot atomically bind the validated base revision, bounds transient reruns with both write-ahead intent and GitHub's durable `run_attempt`, cancels only queued runs whose immutable PR/merge-group head is provably superseded, and may preempt one exact allow-listed advisory Pulp workflow holding `pulp-preamble` after a 15-minute exact-front pool wait; same-head duplicates, required workflows, pushes, unknown work, and unmanaged PRs are never cancelled; opt out with `shipyard:no-auto-merge` or disable preemption with `--no-preempt-capacity`) |
 | **Drain cloud-queued macOS jobs to local when a slot frees** | `shipyard runner reroute-watch [--apply] [--once] [--interval N] [--flap-window N]` (observe-only without `--apply`; logs per-host capacity + candidate list; flap-guard, one-reroute-per-tick, slot/fail-closed) |
 | **Runner provisioning: deregister a runner** | `shipyard runner remove --name <repo>-<tag>-NN --yes [--purge-dir]` |
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
@@ -83,7 +89,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Global warm-pool kill switch | `SHIPYARD_NO_WARM_POOL=1` in the environment |
 | Retarget one lane on an in-flight PR | `shipyard cloud retarget --pr <n> --target macos --provider github-hosted` (dry-run; add `--apply`) |
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider github-hosted]` (dry-run; add `--apply`) |
-| Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (cancels + redispatches; add `--dry-run` to preview, `--rerun-failed` for completed cancelled/failed/timed-out runs; omit `--to` to re-resolve a failed leg local-first, or pass `--to <provider>` to force) |
+| Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (preflights + dispatches a replacement before cancelling the old run; add `--dry-run` to preview, `--rerun-failed` for completed cancelled/failed/timed-out runs; omit `--to` to re-resolve a failed leg local-first, or pass `--to <provider>` to force) |
 | Rescue every stuck run repo-wide | `shipyard rescue --all-stuck` |
 | Same-PR ship refused by a killed worker (`SamePrShipRunning`) | v0.68.0+ auto-reaps the stale `running` queue job after ~180s — just retry `shipyard pr`. See the `shipyard` skill's "Durable Queue: killed-worker recovery". Don't run two `shipyard pr`s for one PR concurrently. |
 | PR stuck in-flight forever (never auto-merges after a host reboot / daemon crash) | `shipyard ship-state list` or `shipyard status` flags it `ORPHANED? [<evidence>]` — cross-referencing the queue: `queue_stale` (dead worker heartbeat) / `queue_terminal` (worker ended without finalizing) surface in ~3m; `queue_absent` / `time_fallback` are time-gated (default 45m, `[ship_state] orphan_stale_minutes`). A live or pending worker is never flagged. Re-run `shipyard ship <pr>` to re-validate (this clears any `abandoned` marker), or `shipyard ship-state discard <pr>` if truly dead. Detection is report-only; the daemon can optionally abandon a `queue_stale` orphan (so auto-merge stops waiting) via `[ship_state] auto_resume = true` (default off, fail-closed, never re-dispatches, re-reads the queue live under the per-PR lock so a concurrent re-ship is spared). See the `shipyard` skill's "Orphaned ship-state reporting". |
@@ -131,6 +137,26 @@ GitHub-hosted nightly Intel Linux/Windows lanes are compatibility surveillance.
 Windows QEMU on Apple Silicon is Windows ARM64; x64 MSVC/Prism execution is
 smoke/debug until proven and should not replace `windows-latest` authority.
 Coverage must use dedicated ephemeral labels, not warm bare-metal build pools.
+
+For local x64 Linux, keep selector policy in the checked-in `normal-local-fast`
+profile and run the external Shipyard health operator documented in
+`docs/pulp-local-linux-lease.md`. The trusted merge-group namespace renews
+`PULP_LOCAL_LINUX_LEASE_UNTIL` only while the exact disposable Mac Pro selector
+has idle capacity for the full live merge-queue admission burst after queued
+reservations; all other observations clear the variable and new jobs fall back
+hosted. Its first target must carry `pulp-auto-linux-x64` and its runner prefix
+must be exactly `pulp-ci-ephemeral-`.
+
+A future PR route must use the fully separate PR-safe tuple selected with
+`--context pr`: `PULP_PR_SAFE_LINUX_LEASE_UNTIL`,
+`pulp-pr-safe-ephemeral-`, and `pulp-pr-safe-linux-x64`. Shipyard rejects target
+selectors that carry both capability labels. The PR-safe lane must remain
+advisory because its declared burst is a reviewed capacity budget, not an
+atomic or GitHub-enforced PR admission cap. Broad/near-miss prefixes and mixed
+control tuples fail closed. Renewal also refuses any inventory where a
+selector-eligible runner sits outside its approved prefix or carries the
+opposite capability. Never reuse either lease for secret-bearing or
+`pull_request_target` jobs.
 
 ## Runner Metrics For Agents
 
@@ -229,6 +255,12 @@ every supervised spawn site. Diagnostic subcommands (`doctor`,
 `skills/shipyard/SKILL.md` → "Supervised Subprocess Marker" for the
 helper API.
 
+Supervised pushes also use an OpenSSH server-alive probe when the caller has
+not supplied `GIT_SSH_COMMAND`. Git opens its transport before invoking the
+consumer's pre-push hook; without keepalive traffic, an hour-long local gate can
+finish successfully only to find GitHub closed the idle connection. Preserve a
+caller's explicit SSH command rather than replacing its identity/proxy policy.
+
 ## Runner Provider Defaults
 
 Shipyard's own workflows default to GitHub-hosted runners for Linux, macOS, and
@@ -265,6 +297,18 @@ macOS **release** builds to the Mac Studio so they skip GitHub's hosted-macOS
 queue — the Studio's keychain already holds the Developer ID signing identity.
 Use `local` only on private repos / the owner's own machine, never a public repo
 with untrusted PRs.
+
+The tag release's CI signing step may temporarily add an imported Developer ID
+keychain. It must snapshot and verify the user-domain default keychain and
+complete search list without mutating either; pass the ephemeral keychain
+directly to `codesign`. Its `always()` cleanup deletes the ephemeral keychain.
+Never parse `security list-keychains` with line-based quote stripping or make a
+CI signing keychain the persistent runner user's default.
+
+`codesign --keychain` still requires that identity keychain to appear in the
+calling process's user search list. Configure that list under the release
+step's isolated temporary `HOME` and pass the same `HOME` only to `codesign`;
+never add the ephemeral keychain to the persistent runner user's search list.
 
 ### External contribution execution
 
@@ -326,7 +370,7 @@ think the build takes:
 |---|---|---|
 | You can hold the session open until merge | `shipyard watch --follow --json` | Blocks; exits `0` pass, `1` fail, `130` SIGINT. Zero polling logic needed. |
 | You want to release the session, re-check later | `shipyard watch --no-follow --json` + `ScheduleWakeup` | One-shot snapshot is cheap. Re-check on wakeup; exits `3` while in-flight. |
-| The agent is stepping away entirely | `shipyard auto-merge <pr>` on cron / GitHub schedule | Idempotent one-shot. Exits `0` merged, `1` fail, `2` not-found, `3` in-flight. |
+| The agent is stepping away entirely | `shipyard auto-merge <pr>` on cron / GitHub schedule | Idempotent one-shot. Exits `0` merged, `1` fail, `2` not-found, `3` in-flight or natively enqueued. |
 | You just want a status peek right now | `shipyard watch --no-follow --json` | Same as a `ship-state show` but uses the live event schema. |
 
 **Rules of thumb for agents:**
@@ -350,11 +394,13 @@ think the build takes:
   + `GET /repos/:r/commits/:sha/check-runs` (wait pr) directly. REST
   has its own 5000/hr bucket, separate from GraphQL. Agents do not
   need to hand-roll `gh api` calls anymore. Check both buckets with
-  `shipyard doctor --rate-limit --json`. The REST `wait pr` fallback
-  is conservative — all check runs are treated as required, so a
-  green verdict cannot incorrectly fire when non-required checks
-  fail. Snapshot output carries `_rest_fallback: true` when the
-  fallback path served the value.
+  `shipyard doctor --rate-limit --json`. A green verdict additionally
+  requires a successful `gh pr checks --required --json` classification;
+  `statusCheckRollup` alone does not expose requiredness. If that
+  classification is unavailable, including on the REST snapshot path,
+  `wait pr --state green` fails closed with exit 7 rather than guessing.
+  Snapshot output carries `_rest_fallback: true` when the fallback path
+  served the value.
 
 Example — agent blocks until merge in-session:
 
@@ -461,19 +507,28 @@ shipyard rescue --all-stuck
 shipyard rescue 286 --rerun-failed --to local
 ```
 
+Rescue is fail-closed to `pull_request` and `merge_group` runs, including the
+PR-targeted form: branch equality alone is not cancellation authority.
+`Release CLI` and `Sign and Release` are protected by workflow name and
+filename in both repo-wide and PR-targeted rescue. Use an exact-run release
+operation for push, schedule, tag, or `workflow_dispatch` runs.
+
 What it does:
 1. Resolves the PR's head branch (skipped under `--all-stuck`).
 2. Lists queued workflow runs and filters to (a) the PR's branch and (b) ones older than `--threshold` (default `30m`).
-3. With `--rerun-failed`, additionally pulls `status=completed` runs whose conclusion is `cancelled`, `failure`, or `timed_out` on that branch (#345 — previously cancelled-only, so a plain failed leg was never a candidate) — these get `gh run rerun --failed` first, then the same cancel+redispatch handoff.
-4. For each candidate, cancels the existing run and dispatches a fresh one. **Provider resolution is kind-aware when `--to` is omitted (#345):** a wedged *stuck-queued* run falls back to `github-hosted` (move off the stuck local runner), while a re-run *failed* run RE-RESOLVES the provider (config/default — local-first with overflow) so a leg that overflowed to a GPU-less hosted runner can return to a real local runner. An explicit `--to <provider>` forces the destination for any candidate.
-5. Emits a per-run summary (`applied`, `rerun+applied`, `planned`, `skipped-completed`, `skipped-no-plan`, `failed`) with a top-level `event=cloud.rescue` JSON envelope under `--json`.
+3. With `--rerun-failed`, additionally pulls `status=completed` runs whose conclusion is `cancelled`, `failure`, or `timed_out` on that branch (#345 — previously cancelled-only, so a plain failed leg was never a candidate). Once a replacement dispatch is accepted, the terminal original remains untouched. Never re-arm a terminal run merely to cancel it: GitHub can accept the rerun before it becomes cancellable, producing HTTP 409 and duplicate work.
+4. For each candidate, proves that its workflow declares `workflow_dispatch`, resolves every required dispatch input, and submits the replacement **before** cancelling a still-queued old run. Terminal originals are not mutated. Known PR-number inputs (`pr`, `pr_number`, and `pull_request_number`) are filled from the PR argument. A workflow with no dispatch trigger, an unknown required input, or a rejected dispatch is reported as `skipped-no-plan`/`failed` and its original run is preserved. **Provider resolution is kind-aware when `--to` is omitted (#345):** a wedged *stuck-queued* run falls back to `github-hosted` (move off the stuck local runner), while a re-run *failed* run RE-RESOLVES the provider (config/default — local-first with overflow) so a leg that overflowed to a GPU-less hosted runner can return to a real local runner. An explicit `--to <provider>` forces the destination for any candidate.
+5. Emits a per-run summary (`applied`, `replacement-applied`, `planned`, `skipped-completed`, `skipped-no-plan`, `failed`) with a top-level `event=cloud.rescue` JSON envelope under `--json`.
 
 **Do not reach for `runner-watchdog.sh --fix` instead of `shipyard rescue`.**
 The watchdog's cancellation registers as required-check `failure` on the PR
 without redispatching — it makes the wedge look terminal to branch
-protection. `shipyard rescue` is the safe primitive because it cancels +
-redispatches atomically under one transaction; no orphaned `failure`
-contexts, no destructive ops on the runner host itself.
+protection. `shipyard rescue` is the safe primitive because it fail-closes
+before cancellation and uses a replacement-first transaction. A rejected or
+unconstructable dispatch leaves the original run untouched; a queued-run
+cancellation failure after an accepted replacement can create duplicate work,
+but never zero work. Terminal originals are never re-armed. There are no
+destructive ops on the runner host itself.
 
 `shipyard rescue` is the discoverable surface for what was previously a
 5-step recipe (`gh api` + `cloud handoff list-stuck` + per-run
@@ -485,6 +540,23 @@ on a specific run ID outside the PR-scoped flow.
 
 `shipyard rescue` recovers from a wedge after the fact. The companion
 preventive surface is the auto-kill mode of `runner watch`:
+
+With `[host_class.*]` configured, `runner watch` also runs read-only fleet
+liveness by default. Consume its stable reason codes: `NORMAL_SERIAL_WAIT`
+means a follower is not blocked; cleared enrollment and optional/superseded
+capacity theft require attention. Never infer a wedge solely from an unchanged
+follower queue position.
+Fleet liveness also reports every registered runner, Tart disk admission
+headroom, ccache actual versus configured maximum, and merge-group Linux jobs
+left on `ubuntu-latest` while compatible self-hosted capacity is idle. Declare
+metal or planned machines under `[runner.fleet.expected_host.<name>]` with a
+required `labels` array, optional `min_online` (default 1), and `active = false`
+for visible future inventory that should not alert yet. Active absent/offline
+machines fail visibly as `expected_host_unavailable`, including machines that
+have not completed runner registration.
+The watcher resolves the repository default branch. For a different merge
+target, pass `--fleet-base <branch>` or configure
+`runner.watchdog.fleet_base`.
 
 ```sh
 # Daemon mode that auto-cancels stale queued runs AND auto-kills hung Workers
@@ -525,6 +597,16 @@ lists the repo's GitHub Actions runs and cancels genuinely-stale ones
 repo-wide — including runs on **GitHub-hosted** runners, which the
 process-level reaper cannot see.
 
+Its cancellation authority is limited to `pull_request` and `merge_group`
+runs. `Release CLI` and `Sign and Release` are never reaper candidates; push,
+schedule, tag, and `workflow_dispatch` runs require an exact-run operation.
+They are still emitted as protected `skipped` observations by the stale-run
+reaper, including outside dry-run mode.
+Protected stale runs remain visible in status/dry-run output even though the
+mutating command skips them.
+Human output labels their policy state; JSON exposes `cancellation_safe` and
+`protected_run_ids` for automation.
+
 ```sh
 # Auto-cancel stale workflow runs on every tick:
 shipyard runner watch --reap-stale-runs
@@ -564,6 +646,11 @@ in `[runner.watchdog]` (`reap_in_progress_max_min` /
 ## Waiting on conditions (`shipyard wait`)
 
 Whenever you'd otherwise write a polling loop around `gh` — wait for a release to upload, wait for a PR's required checks to go green, wait for a dispatched workflow run to finish — reach for `shipyard wait` instead. It opens a daemon subscription first (if one's running), takes one authoritative `gh` snapshot, and either exits 0 immediately or keeps re-evaluating on real webhook events (no extra REST budget). When the daemon isn't running, it falls back to polling transparently — safe to use on headless CI too.
+
+For `--state green`, Shipyard separately resolves GitHub's required-check set and
+annotates the rollup before evaluating it. Never infer requiredness from the raw
+`gh pr view --json statusCheckRollup` payload: that payload omits `isRequired`.
+If requiredness cannot be resolved, Shipyard exits 7 and does not report green.
 
 ### Before/after
 
@@ -634,6 +721,81 @@ See `docs/waiting.md` for the full reference: subcommand semantics, event source
 
 Shipyard refuses to merge unless every required platform has passing evidence
 for the exact HEAD SHA.
+
+On a base branch whose live queue object or evaluated rules require GitHub's
+merge queue, Shipyard does not issue a direct merge. It enqueues with GitHub's
+server-atomic `expectedHeadOid` set to the exact validated head SHA, then
+`shipyard ship` waits for the queue result.
+Formal GitHub stacked pull requests are detected at each merge or enqueue
+mutation boundary, including the runner steward. The initial integration
+refuses them because GitHub requires
+its asynchronous merge API; Shipyard must not route one through the classic or
+GraphQL unstacked mutation. If that final classic-boundary read exhausts
+GraphQL, Shipyard preserves its exact-head REST fallback because GitHub's
+classic endpoint cannot merge a formal stack.
+For an observe-only pilot, validate every layer and use
+`gh stack merge <pr> --merge`. Do not add Shipyard mutation support until the
+asynchronous request UUID and completion lifecycle are modeled durably.
+On private repositories whose plan cannot expose evaluated rules, Shipyard
+continues to classic exact-head merge only when the authoritative live
+`mergeQueue` object is null and GitHub returns its exact private-free
+plan-entitlement 403. Other authorization failures and malformed responses
+remain fail-closed.
+`shipyard auto-merge` remains a cron-safe one-shot: it returns exit 3 after
+arming or observing the queue and leaves ship-state active. A queue supervisor
+re-enqueues only after it previously observed the PR (persisted across process
+restarts) and GitHub reports `invalid_merge_commit`; `failed_checks`,
+manual/unknown removal, head drift, and HTTP 403/rate-limit responses stop
+fail-closed.
+
+### "Validated green but not merged" — read the status before blaming the PR
+
+`shipyard ship` can validate every target green and still not merge. The
+reason is not always on the PR, so do not start by inspecting branch
+protection. Read the `status` field in `--json` (or the headline of the human
+render) first:
+
+| `status` | Exit | What it means | What to do |
+|---|---|---|---|
+| `merged` | 0 | Landed. | Nothing. |
+| `validation_failed` | 1 | A target genuinely failed. | Read `shipyard logs`. |
+| `green_not_merged` | 0 | GitHub rejected the merge — usually a required check Shipyard does not supervise still in flight. | Re-run `shipyard ship --pr <n>` once the remaining checks finish. |
+| `green_not_merged_flaky_required` | 0 | A required check is RED on the exact SHA Shipyard validated green. | `shipyard rescue` — see [Rescuing wedged runners](#rescuing-wedged-runners-shipyard-rescue). |
+| `green_not_merged_head_superseded` | 0 | The head moved after validation; Shipyard refused rather than land an unvalidated commit. GitHub rejected nothing. | `shipyard ship --pr <n> --adopt-head`. If you did not expect the head to move, look for an unpushed local commit first. |
+| `green_not_merged_client_defect` | 8 | **Shipyard sent GitHub a malformed request.** Nothing is wrong with the PR. | Report it with the `merge_error` verbatim. The PR is almost certainly mergeable now; `gh pr merge <n> --auto` lands it without bypassing any gate. |
+
+`merge_error` carries the underlying failure verbatim for every non-merged
+state, so automation never has to scrape prose out of the human render.
+
+Two things worth knowing about that last row. It is exit **8**, deliberately
+distinct from `1`, so a script can tell a *stalled-green* PR from a *red* one —
+the pre-existing states keep their historical exit codes. And when you arm the
+merge by hand on a merge-queue-governed branch, pass **no strategy flag**: the
+queue owns the merge method and `--squash` is refused with `! The merge strategy
+for main is set by the merge queue`.
+
+The known instance of this class: Shipyard ≤0.80.1 selected
+`autoMergeRequest{id}` in the merge-queue poll query. GitHub's
+`AutoMergeRequest` is a plain OBJECT implementing no interfaces — not a `Node`,
+so it has no `id` — and GitHub rejected the whole document with `Field 'id'
+doesn't exist on type 'AutoMergeRequest'`. Because that query runs at queue
+*admission*, before any mutation, merge-queue admission failed outright on every
+queue-governed repo. When adding or editing a GraphQL selection set, verify it
+against the live schema rather than assuming a field exists:
+
+```sh
+gh api graphql -f query='{__type(name:"AutoMergeRequest"){fields{name}}}'
+```
+
+On a multi-host fleet, set `[merge_queue].mutation_machine` to one stored
+runner tag in every host's trusted machine-global `config.toml` reported by
+`shipyard paths`. Project and checkout-local config cannot select authority.
+All other hosts may validate but must fail before a queue write.
+Use `shipyard merge-queue hold --reason "<incident>"` / `status` / `resume`
+on the configured mutation machine for the authority stop; propagate the hold
+when consistent fleet status matters. Shipyard serializes mutations
+process-wide and records their correlation id, machine, PID, exact head/base,
+action, and outcome under machine-global `merge_queue/mutations.jsonl`.
 
 ### Iterating on a single-platform failure
 
@@ -716,6 +878,15 @@ When multiple jobs are queued (common with parallel worktrees):
 - `shipyard bump <id> high` — make a job run next
 - `shipyard bump <id> low` — deprioritize a job
 - `shipyard cancel <id>` — cancel a pending or running job
+
+For cross-process, read-only observation of GitHub's server merge queue and
+open PR heads, use `shipyard queue-observe`. It persists a canonical snapshot,
+emits only initial state or semantic deltas, and backs unchanged polling off
+through 15/30/60/120/300 seconds. The command also reports local mutation
+authority and `HOLD` state, but it never acquires a mutation lease or calls a
+GitHub mutation. Its state file, append-only transition log, and exclusive lock
+provide a durable handoff boundary for queue-monitor agents. See
+[`docs/queue-observer.md`](../../docs/queue-observer.md).
 
 ## Target configuration
 
@@ -809,6 +980,33 @@ Full docs: [`docs/targets.md`](../../docs/targets.md) and
 ## SSH delivery: incremental bundles
 
 SSH-backed targets deliver code via `git bundle`. On the first run the bundle is full (every object reachable from the target SHA, ~443 MB for Pulp-sized repos). On every subsequent run Shipyard probes the remote for its current HEAD over SSH (`git rev-parse HEAD`), verifies that the local clone has that commit as an ancestor, and emits `git bundle create <bundle> <target> ^<remote_head>` — a delta bundle that is typically kilobytes instead of megabytes. Any failure in the probe, ancestry check, or delta create silently falls back to the full-bundle path so the behavior on cold/corrupt remotes is unchanged. Each run logs a `bundle_mode=delta|full bundle_bytes=<N>` line to the per-target log so operators can confirm the optimisation is active.
+
+## Exact-head changed-surface shadow planning
+
+Use `changed-surface-plan` only for a target that declares
+`[targets.<name>.changed_surface_selection]` on the authenticated protected
+base. The command has no caller-controlled base, head, regex, or test list. It
+hard-fails before writing a receipt when local HEAD/tree does not match the PR;
+after that boundary, missing/malformed policy, stale or mismatched base
+provenance, incomplete/mismatched diffs, unmapped paths, and head-side
+policy/schema/test-topology changes force a full-suite receipt.
+
+The command is shadow-only. Its receipt is queryable telemetry, not passing
+target evidence, and the configured full validation command must still run.
+Every eligible bounded candidate includes the nonempty mandatory baseline and
+the complete literal test list of every affected compatible family. A
+build-incompatible family must name a typed, non-advisory secondary target; the
+plan stays blocked until evidence from that target proves its own declared
+`validation_build_type`, the same exact head, and completion within 24 hours.
+Direct and active-profile advisory targets, reused evidence, and older records
+do not qualify. The evidence must bind a clean pre-execution checkout at the
+authenticated head and tree. Required secondary targets must currently be
+concrete local validation contracts, not remote, cloud, or composite wrappers.
+Prepared-state reuse must be disabled on the secondary target. Never substitute
+resumed or warm-reused stage execution for the full required contract. Never
+substitute full Debug for a Release-only installed-SDK
+family or treat historical Release evidence as sufficient. See
+[`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
 ## Cross-PR evidence reuse
 
@@ -987,6 +1185,13 @@ advisory = true
 
 A red advisory lane surfaces in `shipyard watch` and the PR body but does **not** block `shipyard ship` / `shipyard auto-merge`. Required lanes (the default — `advisory = false` or unset) still must be green.
 
+Queue capacity is replenished per completed worker. A fast job finishing beside
+a slow job should admit the next eligible queued job immediately instead of
+leaving that slot idle until the whole batch ends. Scheduler deferrals retain
+their backoff timestamp, and an admission error must not strand another active
+worker's durable job in `running`; the coordinator drains and records active
+completions before returning the original error.
+
 ### Overriding per PR — the `Lane-Policy:` trailer
 
 Sometimes a release candidate needs to treat a normally-advisory lane as must-green (or vice versa). Put a trailer on the **tip commit** (never in the PR body):
@@ -1054,9 +1259,17 @@ The orchestration, in order:
 1. `skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without a `SKILL.md` update or a `Skill-Update:` trailer on the tip commit.
 2. `version_bump_check.py --mode=apply` — rewrites `Cargo.toml` for CLI-surface bumps and `.claude-plugin/plugin.json` for plugin-surface bumps. The two version streams are independent per `RELEASING.md`.
 3. `git commit` + `gh pr create` + `shipyard ship`.
-4. On merge, `.github/workflows/auto-release.yml` tags the CLI bump as `v<x.y.z>`. The existing tag-triggered `release.yml` builds the 5-platform binaries and publishes the GitHub Release.
+4. With `[merge_steward].auto_handoff = true` on the protected base branch or explicit `--workstream-id`, write the exact-head server receipt and managed label immediately after PR creation, before validation begins. The PR branch cannot enable the project default. The fallback workstream is `OWNER/REPO#PR` and the fallback context is the PR URL; `--no-steward-handoff` is an explicit override.
+5. On merge, `.github/workflows/auto-release.yml` tags the CLI bump as `v<x.y.z>`. The existing tag-triggered `release.yml` builds the 5-platform binaries and publishes the GitHub Release.
 
 Never run `gh pr create` + release separately. Never run the gate scripts by hand.
+
+`shipyard cancel <job> --reason <why>` is an execution boundary, not only a
+ledger mutation. A running local or SSH validation observes the durable
+cancellation through its progress callback and terminates the supervised
+process tree, including descendants. The returned job remains `cancelled` with
+the exact durable reason; it must not consume a runner until the current build
+stage exits naturally.
 
 ### Gate-script path resolution
 
@@ -1103,5 +1316,11 @@ A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever the ma
 **Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `scripts/ci_matrix.py`, release packaging scripts, or `src/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.
 
 **Manual release fallback:** `./scripts/release.sh` still exists for emergencies but is no longer the happy path. Normal releases flow through `shipyard pr` → merge → auto-release workflow.
+
+**Local Linux lease liveness:** one `runner local-linux-lease` fleet
+observation has a single 20-second budget across auth plus all paginated GitHub
+reads. Timeout is a reportable `fleet_unreadable` clear decision, including in
+`--json` mode; applied variable mutation has a separate 10-second budget. Do
+not wrap this operator in an unbounded `gh` polling loop.
 
 **`RELEASE_BOT_TOKEN` is required for the auto-release chain to fire.** Without it, auto-release silently degrades — tags get created via `GITHUB_TOKEN` but GitHub doesn't trigger workflows on `GITHUB_TOKEN`-pushed tags, so `release.yml` never runs and no binaries ship. Run `shipyard doctor` to check; if the secret is missing, follow the "One-time setup" section in `RELEASING.md`. `shipyard pr` will also print a heads-up before pushing the PR if the secret isn't present.

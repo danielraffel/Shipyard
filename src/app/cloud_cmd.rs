@@ -2210,6 +2210,7 @@ mod tests {
             database_id: id,
             name: format!("{workflow} run"),
             head_branch: branch.to_owned(),
+            event: "pull_request".to_owned(),
             created_at: created_at.to_owned(),
             run_started_at: None,
             workflow_name: workflow.to_owned(),
@@ -2226,7 +2227,9 @@ mod tests {
             file: file.to_owned(),
             name: key.to_owned(),
             description: String::new(),
+            dispatchable: true,
             inputs: Vec::new(),
+            required_inputs: Vec::new(),
         }
     }
 

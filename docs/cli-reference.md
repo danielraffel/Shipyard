@@ -19,13 +19,19 @@ shipyard run --targets mac         # single target
 shipyard run --resume-from test    # skip setup/configure/build (where supported)
 shipyard run --continue            # don't stop at first failure
 shipyard run command --target linux-vm --artifact 'build/linux-x64/lib/libv8.so' -- bash -lc './build-v8.py --target linux-x64'
+shipyard --json changed-surface-plan --repo OWNER/REPO --pr 123 --target mac  # shadow-only exact-head test plan
 
 # Ship
 shipyard ship                  # PR → validate → merge on green
 shipyard ship --base develop   # target a different branch
+shipyard merge-queue status    # local mutation authority hold
+shipyard merge-queue hold --reason "incident"
+shipyard merge-queue resume
 
 # Monitor
 shipyard status                # dashboard: queue + targets + evidence
+shipyard queue-observe         # one read-only queue/PR snapshot; emit on change
+shipyard --json queue-observe --follow  # adaptive delta-only NDJSON monitor
 shipyard watch                 # live-tail an in-flight ship
 shipyard watch local --target linux-vm --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'
 shipyard queue                 # show all jobs with priorities
@@ -83,6 +89,44 @@ shipyard runner watch --fix               # auto-cancel stale queued runs each t
 shipyard runner watch --kill-hung-workers # also auto-kill hung Worker processes
 shipyard runner watch --reap-stale-runs   # also cancel stale workflow runs repo-wide
 shipyard runner watch --reap-stale-runs --dry-run   # preview reaper, cancel nothing
+shipyard runner fleet-status --repo OWNER/REPO      # TartCI, registered runners, storage + queue liveness
+shipyard runner fleet-status --json                 # periodic-monitor JSON + nonzero alerts
+shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
+shipyard runner steward --apply                     # exact-head, green-gated mutations
+shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
+shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
+
+# On the protected base branch, make every `shipyard pr` submission durable
+# immediately after PR creation. A PR branch cannot opt itself in.
+# Optional CLI --workstream-id/--context-url values override the fallbacks.
+# In .shipyard/config.toml:
+# [merge_steward]
+# auto_handoff = true
+
+`runner steward-handoff` is also dry-run by default. Apply writes a durable
+successful `shipyard/steward-handoff` commit status on the expected immutable
+head, revalidates that the PR still has that head, and then adds
+`shipyard:managed` and removes `shipyard:unmanaged`. Apply-mode `runner steward`
+adds that explanatory label to unhanded PRs, but only heads carrying both
+management signals may be queued, rerun, cancelled, or recovery-signalled.
+Semantic blockers receive one deduplicated `shipyard:needs-agent` label and
+failed `shipyard/steward-recovery` status, which are cleared after recovery.
+
+`runner steward` is read-only unless `--apply` is present. Same-head duplicate
+runs are never cancelled; cancellation authority requires an immutable PR or
+merge-group head that differs from GitHub's current head. Apply mode requires
+the trusted machine-global `[merge_queue].mutation_machine`, rejects the
+central merge-queue `HOLD`, and serializes plus write-ahead audits every
+enqueue, rerun, and cancellation through the shared mutation guard. A
+repository without a GitHub-native merge queue receives a typed
+`direct_merge_refused` decision; Shipyard does not issue a client-side REST
+merge because that endpoint cannot atomically enforce complete check
+materialization and the validated base revision.
+Accepted capacity cancellations remain in the handoff ledger until an exact
+run/job read proves terminal; each apply pass resumes those records with an
+exact-run force-cancel before planning new work. Read failures keep the record
+pending and make the pass unhealthy. Dry-run does not require mutation
+authority.
 
 # Self-hosted runner provisioning (register / list / remove on this machine)
 shipyard runner tag --set studio          # set this box's machine tag (m1, m5, …)
@@ -118,6 +162,27 @@ shipyard ci profile plan normal-local-fast --repo OWNER/REPO --json
 
 The envelope always carries `schema_version: 1` and the command name, so
 agents can pin to a stable contract.
+
+## Merge Queue Control
+
+`shipyard merge-queue hold` writes a durable machine-global sentinel and every
+Shipyard enqueue/dequeue path checks it before invoking GitHub. `resume`
+removes only that sentinel. It does not bypass
+`[merge_queue].mutation_machine` from the trusted machine-global `config.toml`
+reported by `shipyard paths`, which binds queue writes to the host whose stored
+runner tag matches the configured authority. Tracked project config and local
+checkout overlays cannot grant or redirect mutation authority.
+
+Every attempted write is serialized process-wide and recorded in
+`$SHIPYARD_STATE_DIR/merge_queue/mutations.jsonl`. A `started` record without a
+definitive `finished` result is classified under `uncertain_mutations` by
+`merge-queue status --json`, preserving the fail-closed retry boundary after a
+hard crash or transport ambiguity.
+
+An unresolved row blocks another mutation for the same repository, base, and
+PR. After checking GitHub's authoritative queue/timeline state, resolve it with
+`shipyard merge-queue resolve <correlation-id> --outcome accepted|rejected
+--reason "<evidence>"`.
 
 `shipyard ci profile plan` is provider-neutral and read-only. It parses a
 repo-owned TOML profile from `.tartci/`, `.shipyard/ci-profiles/`, or

@@ -17,9 +17,7 @@ use serde_json::Value;
 use super::CliFailure;
 use super::runner_cmd::{parse_github_repo_slug, resolve_repo_slug};
 use crate::cloud::GitHubActions;
-use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
-use crate::paths::RuntimePaths;
 use crate::runner_provision::{
     ApiRunner, AuditFinding, PoolRow, audit_runners, default_labels, format_audit_table,
     format_pool_table, next_index, orphan_local_runners, pool_rows, runner_name, short_repo,
@@ -59,13 +57,13 @@ const RUNNER_ASSET_JQ: &str =
 
 // ---------- tag ----------
 
-fn machine_tag_path(mode: RuntimeMode) -> PathBuf {
-    RuntimePaths::current(mode).state_dir.join("machine-tag")
+fn machine_tag_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("machine-tag")
 }
 
 /// Read this box's stored machine tag, if any.
-fn read_stored_tag(mode: RuntimeMode) -> Option<String> {
-    let raw = fs::read_to_string(machine_tag_path(mode)).ok()?;
+fn read_stored_tag(state_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(machine_tag_path(state_dir)).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         None
@@ -76,7 +74,7 @@ fn read_stored_tag(mode: RuntimeMode) -> Option<String> {
 
 /// `shipyard runner tag [--set <tag>]`.
 pub(super) fn tag_command<W: Write>(
-    mode: RuntimeMode,
+    state_dir: &Path,
     set: Option<String>,
     json: bool,
     stdout: &mut W,
@@ -84,7 +82,7 @@ pub(super) fn tag_command<W: Write>(
     if let Some(tag) = set {
         let tag = tag.trim().to_owned();
         validate_machine_tag(&tag).map_err(|reason| CliFailure::new(2, reason))?;
-        let path = machine_tag_path(mode);
+        let path = machine_tag_path(state_dir);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| CliFailure::new(1, format!("failed to create state dir: {e}")))?;
@@ -102,7 +100,7 @@ pub(super) fn tag_command<W: Write>(
         return Ok(ExitCode::SUCCESS);
     }
 
-    match read_stored_tag(mode) {
+    match read_stored_tag(state_dir) {
         Some(tag) => {
             if json {
                 let mut data = BTreeMap::new();
@@ -124,8 +122,8 @@ pub(super) fn tag_command<W: Write>(
 
 /// Inputs for [`register_command`].
 pub(super) struct RegisterArgs<'a> {
-    pub mode: RuntimeMode,
     pub cwd: &'a Path,
+    pub state_dir: &'a Path,
     pub actions: &'a GitHubActions,
     pub repo: Option<String>,
     pub count: u32,
@@ -205,7 +203,7 @@ pub(super) fn register_command<W: Write>(
             validate_machine_tag(&tag).map_err(|reason| CliFailure::new(2, reason))?;
             tag
         }
-        None => read_stored_tag(args.mode).ok_or_else(|| {
+        None => read_stored_tag(args.state_dir).ok_or_else(|| {
             CliFailure::new(
                 1,
                 "No machine tag set. Pass --machine-tag or run `shipyard runner tag --set <tag>`.",
@@ -810,6 +808,18 @@ mod tests {
     fn parse_dot_runner_rejects_missing_fields() {
         assert!(parse_dot_runner("{}").is_none());
         assert!(parse_dot_runner("not json").is_none());
+    }
+
+    #[test]
+    fn tag_command_uses_resolved_state_directory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_dir = temp.path().join("override-state");
+        let mut output = Vec::new();
+        tag_command(&state_dir, Some("studio".to_owned()), false, &mut output).expect("set tag");
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("machine-tag")).expect("tag"),
+            "studio\n"
+        );
     }
 
     // Runner provisioning targets self-hosted macOS runners and the env file's

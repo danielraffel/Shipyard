@@ -44,6 +44,8 @@ const STAGE_ORDER: [&str; 4] = ["setup", "configure", "build", "test"];
 pub struct ResolvedTarget {
     /// Logical target name.
     pub name: String,
+    /// Typed build configuration whose execution this target evidences.
+    pub validation_build_type: Option<String>,
     /// Platform label.
     pub platform: String,
     /// Normalized backend label.
@@ -114,6 +116,42 @@ impl ResolvedTarget {
                     *primary.target = updated;
                 }
             }
+        }
+        self
+    }
+
+    /// Return a copy whose local backends use `cwd` when they do not declare
+    /// an explicit working directory.
+    ///
+    /// Queue workers use the submitting job's durable cwd rather than the cwd
+    /// of whichever cooperative drainer happened to acquire the queue lock.
+    #[must_use]
+    pub fn with_default_local_workdir(mut self, cwd: &std::path::Path) -> Self {
+        match &mut self.backend {
+            ResolvedBackend::Local(target) => {
+                if target.cwd.is_none() {
+                    target.cwd = Some(cwd.to_path_buf());
+                }
+            }
+            ResolvedBackend::HostPool(pool) => {
+                for member in &mut pool.members {
+                    *member.target = member
+                        .target
+                        .as_ref()
+                        .clone()
+                        .with_default_local_workdir(cwd);
+                }
+            }
+            ResolvedBackend::Fallback(chain) => {
+                for backend in &mut chain.backends {
+                    *backend.target = backend
+                        .target
+                        .as_ref()
+                        .clone()
+                        .with_default_local_workdir(cwd);
+                }
+            }
+            ResolvedBackend::Ssh(_) | ResolvedBackend::Windows(_) | ResolvedBackend::Cloud(_) => {}
         }
         self
     }
@@ -295,7 +333,9 @@ pub struct DispatchValidationRequest<'target, 'callback> {
     /// Validation mode.
     pub mode: ValidationMode,
     /// Optional progress callback.
-    pub progress_callback: Option<&'callback mut dyn FnMut(ProgressEvent)>,
+    pub progress_callback: Option<
+        &'callback mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction,
+    >,
 }
 
 /// Backend reachability diagnosis used by submission preflight.
@@ -515,10 +555,13 @@ impl ExecutorDispatcher {
                 log_path: attempt_log,
                 resume_from: request.resume_from.clone(),
                 mode: request.mode,
-                progress_callback: request
-                    .progress_callback
-                    .as_mut()
-                    .map(|callback| &mut **callback as &mut dyn FnMut(ProgressEvent)),
+                progress_callback: request.progress_callback.as_mut().map(|callback| {
+                    &mut **callback
+                        as &mut dyn FnMut(
+                            ProgressEvent,
+                        )
+                            -> crate::executor::streaming::ProgressAction
+                }),
             });
             let result = demote_stale_result(result, chain.heartbeat_stale_secs);
 
@@ -626,10 +669,13 @@ impl ExecutorDispatcher {
                 log_path: attempt_log,
                 resume_from: request.resume_from.clone(),
                 mode: request.mode,
-                progress_callback: request
-                    .progress_callback
-                    .as_mut()
-                    .map(|callback| &mut **callback as &mut dyn FnMut(ProgressEvent)),
+                progress_callback: request.progress_callback.as_mut().map(|callback| {
+                    &mut **callback
+                        as &mut dyn FnMut(
+                            ProgressEvent,
+                        )
+                            -> crate::executor::streaming::ProgressAction
+                }),
             });
 
             if result.status == crate::job::TargetStatus::Fail {
@@ -785,6 +831,7 @@ fn resolved_local(
     };
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: "local".to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -819,6 +866,7 @@ fn resolved_ssh(
     };
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: backend_name.to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -863,6 +911,7 @@ fn resolved_windows(
     };
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: backend_name.to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -914,6 +963,7 @@ fn resolved_cloud(
 
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: "cloud".to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -954,6 +1004,7 @@ fn resolved_host_pool(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: "host-pool".to_owned(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -1079,6 +1130,7 @@ fn resolved_fallback(
         .as_ref();
     Ok(ResolvedTarget {
         name: name.to_owned(),
+        validation_build_type: optional_string(table, "validation_build_type"),
         platform: platform.to_owned(),
         backend_name: primary_target.backend_name.clone(),
         warm_keepalive_seconds: extract_warm_keepalive_seconds(table.get("warm_keepalive_seconds")),
@@ -2090,6 +2142,7 @@ mod tests {
                 if let Some(phase) = event.phase {
                     phases.push(phase);
                 }
+                crate::executor::streaming::ProgressAction::Continue
             };
             super::ExecutorDispatcher::new(None)
                 .validate(super::DispatchValidationRequest {
@@ -2149,6 +2202,7 @@ mod tests {
                 assert_eq!(leases[0].job_id.as_deref(), Some("job-host-pool"));
                 observed_job_id.set(true);
             }
+            crate::executor::streaming::ProgressAction::Continue
         };
 
         let result = dispatcher.validate(super::DispatchValidationRequest {
@@ -2392,6 +2446,54 @@ mod tests {
             .with_workdir(r"D:\warm");
 
         assert_eq!(target.workdir(), Some(r"D:\warm".to_owned()));
+    }
+
+    #[test]
+    fn default_local_workdir_fills_only_an_implicit_path() {
+        let implicit = resolved_local_target("implicit")
+            .with_default_local_workdir(std::path::Path::new("/submitted"));
+        let explicit = resolve_targets_from_table(
+            &table(
+                r#"
+                [targets.explicit]
+                backend = "local"
+                platform = "linux-x64"
+                cwd = "/configured"
+                "#,
+            ),
+            ValidationMode::Full,
+        )
+        .expect("target")
+        .remove(0)
+        .with_default_local_workdir(std::path::Path::new("/submitted"));
+
+        assert_eq!(implicit.workdir().as_deref(), Some("/submitted"));
+        assert_eq!(explicit.workdir().as_deref(), Some("/configured"));
+    }
+
+    #[test]
+    fn resolved_target_carries_declared_validation_build_type() {
+        let mut target = resolve_targets_from_table(
+            &table(
+                r#"
+                [targets.release]
+                backend = "local"
+                platform = "macos-arm64"
+                validation_build_type = "release"
+                "#,
+            ),
+            ValidationMode::Full,
+        )
+        .expect("target")
+        .remove(0);
+
+        assert_eq!(target.validation_build_type.as_deref(), Some("release"));
+        let release_digest = crate::queue_request::validation_contract_digest(&target)
+            .expect("typed validation digest");
+        target.validation_build_type = Some("debug".to_owned());
+        let debug_digest = crate::queue_request::validation_contract_digest(&target)
+            .expect("typed validation digest");
+        assert_ne!(release_digest, debug_digest);
     }
 
     fn resolved_local_target(name: &str) -> super::ResolvedTarget {

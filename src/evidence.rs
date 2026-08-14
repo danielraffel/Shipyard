@@ -17,12 +17,27 @@ pub struct EvidenceRecord {
     /// Logical target name.
     #[serde(rename = "target")]
     pub target_name: String,
+    /// Typed validation build configuration declared by the executed target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_build_type: Option<String>,
     /// Concrete platform label.
     pub platform: String,
     /// Validation result status.
     pub status: String,
     /// Backend that produced this evidence.
     pub backend: String,
+    /// Git HEAD observed in the execution checkout before validation began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_head_sha: Option<String>,
+    /// Git tree observed in the execution checkout before validation began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tree_sha: Option<String>,
+    /// Whether the execution checkout was clean before validation began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_checkout_clean: Option<bool>,
+    /// Whether validation began without resume or prepared-state stage reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_execution: Option<bool>,
     /// Completion timestamp.
     pub completed_at: DateTime<Utc>,
     /// Optional duration in seconds.
@@ -341,13 +356,49 @@ impl EvidenceStore {
                 let Some(rank) = candidate_ranks.get(record.sha.as_str()).copied() else {
                     continue;
                 };
-                if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+                if best.as_ref().is_none_or(|(best_rank, current)| {
+                    rank < *best_rank
+                        || (rank == *best_rank && record.completed_at > current.completed_at)
+                }) {
                     best = Some((rank, record.clone()));
                 }
             }
         }
 
         best.map(|(_, record)| record)
+    }
+
+    /// Return every non-reused passing record for one target and exact SHA,
+    /// newest first, so callers can apply their complete contract predicate.
+    #[must_use]
+    pub fn passing_records_for_target_sha(
+        &self,
+        target_name: &str,
+        sha: &str,
+    ) -> Vec<EvidenceRecord> {
+        let Ok(entries) = fs::read_dir(&self.path) else {
+            return Vec::new();
+        };
+        let mut records = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")).then_some(path)
+            })
+            .filter_map(|path| {
+                let branch_key = path.file_stem()?.to_str()?;
+                self.load_branch(branch_key).ok()
+            })
+            .flat_map(std::collections::BTreeMap::into_values)
+            .filter(|record| {
+                record.target_name == target_name
+                    && record.sha == sha
+                    && record.passed()
+                    && !record.reused()
+            })
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| std::cmp::Reverse(record.completed_at));
+        records
     }
 
     fn branch_file(&self, branch_key: &str) -> PathBuf {
@@ -448,9 +499,14 @@ mod tests {
             sha: sha.to_owned(),
             branch: branch.to_owned(),
             target_name: target.to_owned(),
+            validation_build_type: None,
             platform: format!("{target}-platform"),
             status: "pass".to_owned(),
             backend: "local".to_owned(),
+            source_head_sha: None,
+            source_tree_sha: None,
+            source_checkout_clean: None,
+            full_execution: None,
             completed_at: Utc::now(),
             duration_secs: None,
             host: None,
@@ -471,9 +527,14 @@ mod tests {
             sha: "new".to_owned(),
             branch: "feat/x".to_owned(),
             target_name: "mac".to_owned(),
+            validation_build_type: Some("release".to_owned()),
             platform: "macos-arm64".to_owned(),
             status: "pass".to_owned(),
             backend: "reused".to_owned(),
+            source_head_sha: Some("new".to_owned()),
+            source_tree_sha: Some("tree".to_owned()),
+            source_checkout_clean: Some(true),
+            full_execution: Some(true),
             completed_at: Utc::now(),
             duration_secs: None,
             host: None,
@@ -492,6 +553,7 @@ mod tests {
 
         let value = serde_json::to_value(&record).expect("serialize");
         assert_eq!(value["target"], "mac");
+        assert_eq!(value["validation_build_type"], "release");
         assert_eq!(value["reused_from"], "old");
         assert_eq!(value["contract_digest"], "abc123");
         assert_eq!(value["stages_signature"], "build|test");
@@ -662,6 +724,26 @@ mod tests {
             .query_passing_for_target("mac", &candidates)
             .expect("record");
         assert_eq!(match_record.sha, "b".repeat(40));
+
+        let same_sha = "d".repeat(40);
+        let mut older = record("old", "mac", &same_sha);
+        older.completed_at = Utc::now() - chrono::Duration::hours(2);
+        store.record(&older).expect("older record");
+        let mut newer = record("new", "mac", &same_sha);
+        newer.completed_at = Utc::now() - chrono::Duration::hours(1);
+        store.record(&newer).expect("newer record");
+        let newest = store
+            .query_passing_for_target("mac", std::slice::from_ref(&same_sha))
+            .expect("newest exact-sha record");
+        assert_eq!(newest.branch, "new");
+        let all_exact = store.passing_records_for_target_sha("mac", &same_sha);
+        assert_eq!(
+            all_exact
+                .iter()
+                .map(|record| record.branch.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "old"]
+        );
         assert!(
             store
                 .query_passing_for_target("linux", &["abc".to_owned()])

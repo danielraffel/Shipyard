@@ -12,6 +12,7 @@ use super::{CliFailure, cli::RescueArgs, wait_cmd::parse_github_repo_slug};
 use crate::cloud::{GitHubActions, QueuedRun, discover_workflows, resolve_cloud_dispatch_plan};
 use crate::config::LoadedConfig;
 use crate::output::write_json_envelope;
+use crate::workflow_cancellation::is_bulk_run_cancellation_safe;
 
 /// Cap on the number of paginated `gh api` calls per rescue invocation.
 /// Each page is 100 items, so the worst case is 500 queued + 500 completed
@@ -27,8 +28,8 @@ enum RunOutcome {
     Planned,
     /// Cancelled + redispatched on the new provider.
     Applied,
-    /// Re-armed via `gh run rerun --failed`, then handed off.
-    RerunAndApplied,
+    /// A fresh replacement was accepted for a terminal failed/cancelled run.
+    ReplacementApplied,
     /// Skipped: completed/cancelled run encountered without `--rerun-failed`.
     SkippedCompleted,
     /// Skipped: rescue could not plan a dispatch (e.g. workflow not found locally).
@@ -42,7 +43,7 @@ impl RunOutcome {
         match self {
             Self::Planned => "planned",
             Self::Applied => "applied",
-            Self::RerunAndApplied => "rerun+applied",
+            Self::ReplacementApplied => "replacement-applied",
             Self::SkippedCompleted => "skipped-completed",
             Self::SkippedNoPlan(_) => "skipped-no-plan",
             Self::Failed(_) => "failed",
@@ -153,7 +154,10 @@ fn collect_candidates(
     let queued = actions
         .list_queued_runs_paginated(repo_slug, RESCUE_LIST_MAX_PAGES)
         .map_err(|error| CliFailure::new(1, format!("Could not list queued runs: {error}")))?;
-    let stuck = filter_stuck_queued(&queued, branch, threshold_secs, now);
+    let stuck = filter_stuck_queued(&queued, branch, threshold_secs, now)
+        .into_iter()
+        .filter(rescue_run_cancellation_safe)
+        .collect::<Vec<_>>();
     let mut candidates: Vec<Candidate> = stuck
         .into_iter()
         .map(|run| Candidate {
@@ -169,6 +173,9 @@ fn collect_candidates(
         .map_err(|error| CliFailure::new(1, format!("Could not list completed runs: {error}")))?;
     for run in completed {
         if !matches_branch(&run, branch) {
+            continue;
+        }
+        if !rescue_run_cancellation_safe(&run) {
             continue;
         }
         // A watchdog sweep marks a wedged run `cancelled`; a flaky or
@@ -188,6 +195,10 @@ fn collect_candidates(
         }
     }
     Ok(candidates)
+}
+
+fn rescue_run_cancellation_safe(run: &QueuedRun) -> bool {
+    is_bulk_run_cancellation_safe(run)
 }
 
 fn rescue_envelope_data(
@@ -291,46 +302,80 @@ fn process_candidate(
             ));
         }
     };
+    let mut dispatch_fields = plan.dispatch_fields.clone();
+    if let Err(error) =
+        complete_required_dispatch_fields(&plan.workflow, args.pr, &mut dispatch_fields)
+    {
+        return RunOutcome::SkippedNoPlan(error);
+    }
 
     match candidate.kind {
         CandidateKind::CompletedRerunnable => {
             if args.dry_run {
                 return RunOutcome::Planned;
             }
-            if let Err(error) = actions.rerun_failed_run(repo_slug, run.database_id) {
-                return RunOutcome::Failed(format!("rerun --failed failed: {error}"));
-            }
-            if let Err(error) = actions.cancel_workflow_run(repo_slug, run.database_id) {
-                return RunOutcome::Failed(format!("cancel failed: {error}"));
-            }
             if let Err(error) = actions.workflow_dispatch(
                 Some(repo_slug),
                 &plan.workflow.file,
                 &plan.ref_name,
-                &plan.dispatch_fields,
+                &dispatch_fields,
             ) {
-                return RunOutcome::Failed(format!("workflow_dispatch failed: {error}"));
+                return RunOutcome::Failed(format!(
+                    "replacement workflow_dispatch failed; original run preserved: {error}"
+                ));
             }
-            RunOutcome::RerunAndApplied
+            // The candidate is already terminal. Re-arming it solely so it can
+            // be cancelled creates a race: GitHub accepts rerun-failed before
+            // the rerun reaches queued state, so an immediate cancel returns
+            // HTTP 409 and leaves duplicate work. The accepted replacement is
+            // the entire recovery transaction; leave terminal history alone.
+            RunOutcome::ReplacementApplied
         }
         CandidateKind::QueuedStuck => {
             if args.dry_run {
                 return RunOutcome::Planned;
             }
-            if let Err(error) = actions.cancel_workflow_run(repo_slug, run.database_id) {
-                return RunOutcome::Failed(format!("cancel failed: {error}"));
-            }
             if let Err(error) = actions.workflow_dispatch(
                 Some(repo_slug),
                 &plan.workflow.file,
                 &plan.ref_name,
-                &plan.dispatch_fields,
+                &dispatch_fields,
             ) {
-                return RunOutcome::Failed(format!("workflow_dispatch failed: {error}"));
+                return RunOutcome::Failed(format!(
+                    "replacement workflow_dispatch failed; original run preserved: {error}"
+                ));
+            }
+            if let Err(error) = actions.cancel_workflow_run(repo_slug, run.database_id) {
+                return RunOutcome::Failed(format!(
+                    "replacement accepted but original run could not be cancelled: {error}"
+                ));
             }
             RunOutcome::Applied
         }
     }
+}
+
+fn complete_required_dispatch_fields(
+    workflow: &crate::cloud::WorkflowDefinition,
+    pr: Option<u64>,
+    fields: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    for input in &workflow.required_inputs {
+        if fields.contains_key(input) {
+            continue;
+        }
+        if matches!(input.as_str(), "pr" | "pr_number" | "pull_request_number")
+            && let Some(pr) = pr
+        {
+            fields.insert(input.clone(), pr.to_string());
+            continue;
+        }
+        return Err(format!(
+            "workflow {} requires unsupported workflow_dispatch input {input}; original run preserved",
+            workflow.file
+        ));
+    }
+    Ok(())
 }
 
 fn candidate_row(candidate: &Candidate, outcome: &RunOutcome) -> BTreeMap<String, Value> {
@@ -530,6 +575,8 @@ mod tests {
     use super::*;
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use chrono::TimeZone;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn config(root: &Path) -> LoadedConfig {
         LoadedConfig {
@@ -552,6 +599,7 @@ mod tests {
             database_id: id,
             name: format!("CI #{id}"),
             head_branch: branch.to_owned(),
+            event: "pull_request".to_owned(),
             created_at: created_at.to_owned(),
             run_started_at: None,
             workflow_name: "CI".to_owned(),
@@ -560,6 +608,77 @@ mod tests {
             status: status.to_owned(),
             conclusion: conclusion.map(ToOwned::to_owned),
         }
+    }
+
+    fn workflow(
+        file: &str,
+        dispatchable: bool,
+        required_inputs: &[&str],
+    ) -> crate::cloud::WorkflowDefinition {
+        crate::cloud::WorkflowDefinition {
+            key: file.trim_end_matches(".yml").to_owned(),
+            file: file.to_owned(),
+            name: file.to_owned(),
+            description: String::new(),
+            dispatchable,
+            inputs: required_inputs
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            required_inputs: required_inputs
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).expect("write executable");
+        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod executable");
+    }
+
+    #[cfg(unix)]
+    fn scripted_actions(
+        temp: &tempfile::TempDir,
+        gh_body: &str,
+    ) -> (LoadedConfig, GitHubActions, std::path::PathBuf) {
+        let helper = temp.path().join("token-helper");
+        write_executable(
+            &helper,
+            "#!/bin/sh\nprintf '{\"token\":\"ghs_test\",\"kind\":\"github-app-installation\",\"expires_at\":\"2099-01-01T00:00:00Z\"}'\n",
+        );
+        let config_text = format!(
+            r#"
+[github.auth]
+source = "command"
+token_command = ["{}"]
+cache_ttl_seconds = 300
+"#,
+            helper.display()
+        );
+        let config = LoadedConfig {
+            data: config_text.parse().expect("parse config"),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        };
+        let log = temp.path().join("gh.log");
+        let gh = temp.path().join("gh");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{}\n",
+                log.display(),
+                gh_body
+            ),
+        );
+        let actions =
+            GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(&gh);
+        (config, actions, log)
     }
 
     #[test]
@@ -683,6 +802,186 @@ mod tests {
     }
 
     #[test]
+    fn required_pr_input_is_synthesized_but_unknown_input_is_rejected() {
+        let mut fields = BTreeMap::new();
+        complete_required_dispatch_fields(
+            &workflow("freeze.yml", true, &["pr_number"]),
+            Some(7507),
+            &mut fields,
+        )
+        .expect("known PR input");
+        assert_eq!(fields.get("pr_number").map(String::as_str), Some("7507"));
+
+        let error = complete_required_dispatch_fields(
+            &workflow("deploy.yml", true, &["environment"]),
+            Some(7507),
+            &mut BTreeMap::new(),
+        )
+        .expect_err("unknown required input must fail closed");
+        assert!(error.contains("unsupported workflow_dispatch input environment"));
+        assert!(error.contains("original run preserved"));
+    }
+
+    #[test]
+    fn workflow_without_dispatch_trigger_is_not_a_rescue_plan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut workflows = BTreeMap::new();
+        workflows.insert("lint".to_owned(), workflow("lint.yml", false, &[]));
+        let cfg = config(temp.path());
+        let mut run = queued_run(42, "feat/x", "2026-05-13T10:00:00Z", "queued", None);
+        run.path = ".github/workflows/lint.yml".to_owned();
+        let candidate = Candidate {
+            kind: CandidateKind::QueuedStuck,
+            run,
+        };
+        let args = RescueArgs {
+            pr: Some(7),
+            all_stuck: false,
+            provider: None,
+            rerun_failed: false,
+            dry_run: true,
+            threshold: "30m".to_owned(),
+            repo: Some("owner/repo".to_owned()),
+        };
+        let outcome = process_candidate(
+            &candidate,
+            &args,
+            &workflows,
+            &cfg,
+            &GitHubActions::new(temp.path()),
+            "owner/repo",
+        );
+        assert!(
+            matches!(outcome, RunOutcome::SkippedNoPlan(message) if message.contains("does not declare workflow_dispatch"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_failure_preserves_original_run_without_cancelling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cfg, actions, log) = scripted_actions(
+            &temp,
+            "case \"$1 $2\" in\n  \"workflow run\") printf 'dispatch rejected\\n' >&2; exit 1 ;;\n  \"api -X\") exit 0 ;;\nesac\nexit 2",
+        );
+        let mut workflows = BTreeMap::new();
+        workflows.insert("ci".to_owned(), workflow("ci.yml", true, &[]));
+        let candidate = Candidate {
+            kind: CandidateKind::QueuedStuck,
+            run: queued_run(42, "feat/x", "2026-05-13T10:00:00Z", "queued", None),
+        };
+        let args = RescueArgs {
+            pr: Some(7),
+            all_stuck: false,
+            provider: None,
+            rerun_failed: false,
+            dry_run: false,
+            threshold: "30m".to_owned(),
+            repo: Some("owner/repo".to_owned()),
+        };
+
+        let outcome =
+            process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
+
+        assert!(
+            matches!(outcome, RunOutcome::Failed(message) if message.contains("original run preserved"))
+        );
+        let calls = std::fs::read_to_string(log).expect("gh log");
+        assert!(calls.contains("workflow run ci.yml"));
+        assert!(
+            !calls.contains("/cancel"),
+            "must not cancel after failed dispatch: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_replacement_precedes_cancel_and_carries_pr_input() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cfg, actions, log) = scripted_actions(
+            &temp,
+            "case \"$1 $2\" in\n  \"workflow run\"|\"api -X\") exit 0 ;;\nesac\nexit 2",
+        );
+        let mut workflows = BTreeMap::new();
+        workflows.insert(
+            "freeze".to_owned(),
+            workflow("freeze.yml", true, &["pr_number"]),
+        );
+        let mut run = queued_run(42, "feat/x", "2026-05-13T10:00:00Z", "queued", None);
+        run.path = ".github/workflows/freeze.yml".to_owned();
+        let candidate = Candidate {
+            kind: CandidateKind::QueuedStuck,
+            run,
+        };
+        let args = RescueArgs {
+            pr: Some(7507),
+            all_stuck: false,
+            provider: None,
+            rerun_failed: false,
+            dry_run: false,
+            threshold: "30m".to_owned(),
+            repo: Some("owner/repo".to_owned()),
+        };
+
+        let outcome =
+            process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
+
+        assert_eq!(outcome, RunOutcome::Applied);
+        let calls = std::fs::read_to_string(log).expect("gh log");
+        let lines = calls.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "unexpected calls: {calls}");
+        assert!(lines[0].starts_with("workflow run freeze.yml"));
+        assert!(lines[0].contains("-f pr_number=7507"));
+        assert!(lines[1].contains("repos/owner/repo/actions/runs/42/cancel"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_run_dispatches_one_replacement_without_rearming_original() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cfg, actions, log) = scripted_actions(
+            &temp,
+            "case \"$1 $2\" in\n  \"workflow run\") exit 0 ;;\n  \"run rerun\"|\"api -X\") printf 'unexpected original mutation\\n' >&2; exit 9 ;;\nesac\nexit 2",
+        );
+        let mut workflows = BTreeMap::new();
+        workflows.insert("version".to_owned(), workflow("version.yml", true, &[]));
+        let mut run = queued_run(
+            42,
+            "feat/x",
+            "2026-05-13T10:00:00Z",
+            "completed",
+            Some("cancelled"),
+        );
+        run.path = ".github/workflows/version.yml".to_owned();
+        let candidate = Candidate {
+            kind: CandidateKind::CompletedRerunnable,
+            run,
+        };
+        let args = RescueArgs {
+            pr: Some(7507),
+            all_stuck: false,
+            provider: None,
+            rerun_failed: true,
+            dry_run: false,
+            threshold: "30m".to_owned(),
+            repo: Some("owner/repo".to_owned()),
+        };
+
+        let outcome =
+            process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
+
+        assert_eq!(outcome, RunOutcome::ReplacementApplied);
+        let calls = std::fs::read_to_string(log).expect("gh log");
+        let lines = calls.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            1,
+            "terminal original must remain untouched: {calls}"
+        );
+        assert!(lines[0].starts_with("workflow run version.yml"));
+    }
+
+    #[test]
     fn rescue_provider_override_is_kind_aware_without_explicit_to() {
         // #345: explicit --to forces the provider for any candidate kind.
         assert_eq!(
@@ -704,6 +1003,21 @@ mod tests {
             rescue_provider_override(None, CandidateKind::CompletedRerunnable),
             None
         );
+    }
+
+    #[test]
+    fn bulk_rescue_is_review_only_and_release_workflows_are_always_protected() {
+        let review = queued_run(1, "feature/x", "2026-05-13T10:00:00Z", "queued", None);
+        assert!(rescue_run_cancellation_safe(&review));
+
+        let mut dispatch = review.clone();
+        dispatch.event = "workflow_dispatch".to_owned();
+        assert!(!rescue_run_cancellation_safe(&dispatch));
+
+        let mut release = review;
+        release.workflow_name = "Release CLI".to_owned();
+        release.path = ".github/workflows/release-cli.yml".to_owned();
+        assert!(!rescue_run_cancellation_safe(&release));
     }
 
     #[test]

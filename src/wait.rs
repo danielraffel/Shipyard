@@ -186,9 +186,15 @@ pub fn evaluate_pr_green(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_ascii_uppercase();
-    if merge_state.contains("RULESET") || merge_state == "MERGE_QUEUED" {
+    if merge_state.contains("RULESET") || merge_queue_required(snapshot) {
         return Err(Box::new(UnsupportedScopeError(
             "Rulesets / merge-queue governance isn't supported by `shipyard wait pr --state green` yet — see governance/profiles.py.".to_owned(),
+        )));
+    }
+    if snapshot.get("_required_checks_known") == Some(&serde_json::Value::Bool(false)) {
+        return Err(Box::new(UnsupportedScopeError(
+            "GitHub required-check classification is unavailable; refusing to report the PR green"
+                .to_owned(),
         )));
     }
 
@@ -205,13 +211,33 @@ pub fn evaluate_pr_green(
             .get("mergeable")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
-            .eq_ignore_ascii_case("MERGEABLE");
+            .eq_ignore_ascii_case("MERGEABLE")
+            && merge_state == "CLEAN";
     }
 
     Ok(TruthResult {
         matched: checks.all_required_pass && !checks.any_still_waiting,
         observed: pr_green_observed(snapshot, merge_state, checks),
     })
+}
+
+/// Whether the PR is governed by a merge queue, derived from the
+/// `mergeStateStatus` field.
+///
+/// This is the ONLY merge-queue accessor that works against a `gh pr view
+/// --json` snapshot. `mergeStateStatus == "MERGE_QUEUED"` is a scalar the
+/// `gh` JSON surface can fetch. The GraphQL `mergeQueueEntry` connection —
+/// which would name the queue and the PR's position — is NOT a field `gh pr
+/// view --json` can request, so any accessor reading `snapshot["mergeQueueEntry"]`
+/// returns null/false permanently. Such accessors are worse than absent: an
+/// eviction watcher built on them would read "not in queue" forever and strand
+/// a queued PR. Do not add them; ride on `mergeStateStatus` alone.
+pub fn merge_queue_required(snapshot: &serde_json::Value) -> bool {
+    snapshot
+        .get("mergeStateStatus")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .eq_ignore_ascii_case("MERGE_QUEUED")
 }
 
 struct PrGreenChecks {
@@ -268,10 +294,11 @@ fn observed_pr_check(entry: &serde_json::Map<String, serde_json::Value>) -> Obse
     let required = entry
         .get("isRequired")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(true);
     let waiting = STILL_WAITING_STATES.contains(&state.as_str())
         && !PASSING_CONCLUSIONS.contains(&conclusion.as_str());
-    let passing = PASSING_CONCLUSIONS.contains(&conclusion.as_str());
+    let passing = PASSING_CONCLUSIONS.contains(&conclusion.as_str())
+        || PASSING_CONCLUSIONS.contains(&state.as_str());
 
     ObservedPrCheck {
         value: serde_json::json!({
@@ -351,7 +378,7 @@ pub fn evaluate_pr_state(
     let merged = snapshot
         .get("merged")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(state == "MERGED");
     let matched = match target_state {
         "merged" => merged,
         "closed" => state == "CLOSED" || state == "MERGED",
@@ -438,7 +465,7 @@ pub fn evaluate_run(
 mod tests {
     use super::{
         InvalidInputError, RunFailedFastError, UnsupportedScopeError, evaluate_pr_green,
-        evaluate_pr_state, evaluate_release, evaluate_run,
+        evaluate_pr_state, evaluate_release, evaluate_run, merge_queue_required,
     };
 
     fn rollup_entry(
@@ -535,6 +562,68 @@ mod tests {
     }
 
     #[test]
+    fn pr_green_fails_closed_when_required_check_classification_is_unknown() {
+        let snapshot = serde_json::json!({
+            "number": 1,
+            "headRefOid": "x",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [],
+            "_required_checks_known": false
+        });
+        let error = evaluate_pr_green(Some(&snapshot)).expect_err("unknown required checks");
+        assert!(error.downcast_ref::<UnsupportedScopeError>().is_some());
+    }
+
+    #[test]
+    fn pr_green_treats_unclassified_rollup_entries_as_required() {
+        let snapshot = serde_json::json!({
+            "number": 1,
+            "headRefOid": "x",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [{
+                "name": "required but unannotated",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE"
+            }]
+        });
+        let result = evaluate_pr_green(Some(&snapshot)).expect("green evaluation");
+        assert!(!result.matched);
+        assert_eq!(result.observed["checks"][0]["required"], true);
+    }
+
+    #[test]
+    fn pr_green_accepts_passing_required_commit_status_state() {
+        let snapshot = serde_json::json!({
+            "number": 1,
+            "headRefOid": "x",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [{
+                "context": "required-status",
+                "state": "SUCCESS",
+                "isRequired": true
+            }],
+            "_required_checks_known": true
+        });
+        assert!(evaluate_pr_green(Some(&snapshot)).expect("green").matched);
+    }
+
+    #[test]
+    fn pr_green_with_no_required_checks_still_requires_clean_merge_state() {
+        let snapshot = serde_json::json!({
+            "number": 1,
+            "headRefOid": "x",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [],
+            "_required_checks_known": true
+        });
+        assert!(!evaluate_pr_green(Some(&snapshot)).expect("green").matched);
+    }
+
+    #[test]
     fn pr_green_rulesets_raise_unsupported_scope() {
         let snapshot = serde_json::json!({
             "number": 1,
@@ -545,6 +634,94 @@ mod tests {
         });
         let error = evaluate_pr_green(Some(&snapshot)).expect_err("unsupported");
         assert!(error.downcast_ref::<UnsupportedScopeError>().is_some());
+    }
+
+    #[test]
+    fn merge_queue_required_rides_on_merge_state_status() {
+        // MERGE_QUEUED is reported through the fetchable `mergeStateStatus`
+        // scalar — note there is NO `mergeQueueEntry` field here, mirroring a
+        // real `gh pr view --json` snapshot.
+        let queued = serde_json::json!({
+            "number": 7,
+            "mergeStateStatus": "MERGE_QUEUED"
+        });
+        assert!(merge_queue_required(&queued));
+
+        // Case-insensitive, matching evaluate_pr_green's uppercasing.
+        let queued_lower = serde_json::json!({ "mergeStateStatus": "merge_queued" });
+        assert!(merge_queue_required(&queued_lower));
+
+        let clean = serde_json::json!({ "mergeStateStatus": "CLEAN" });
+        assert!(!merge_queue_required(&clean));
+
+        // Missing field must be treated as not-queued, never panic.
+        let empty = serde_json::json!({ "number": 7 });
+        assert!(!merge_queue_required(&empty));
+    }
+
+    #[test]
+    fn merge_queue_required_ignores_unfetchable_merge_queue_entry() {
+        // Negative control for the deleted dead accessors: `mergeQueueEntry`
+        // is a GraphQL-only connection `gh pr view --json` cannot fetch, so it
+        // must NOT drive the verdict. A snapshot that (impossibly) carries a
+        // populated `mergeQueueEntry` while `mergeStateStatus` is CLEAN must
+        // still report not-queued. An accessor reading `mergeQueueEntry`
+        // (round 1's in_merge_queue / merge_queue_state) would return true here.
+        let bogus = serde_json::json!({
+            "mergeStateStatus": "CLEAN",
+            "mergeQueueEntry": { "position": 3, "mergeQueue": { "id": "MQ_x" } }
+        });
+        assert!(!merge_queue_required(&bogus));
+    }
+
+    #[test]
+    fn pr_green_merge_queued_is_not_terminal_success() {
+        // A green-but-queued PR must stay a loud, non-terminal signal — never
+        // matched:true (which the CLI maps to exit 0 and a `wait pr --state
+        // green && treat-as-landed` script reads as "landed"). Round 1's
+        // regression turned this into terminal success; this pins it back to
+        // the UnsupportedScope error (exit 7).
+        let snapshot = serde_json::json!({
+            "number": 42,
+            "headRefOid": "deadbeef",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "MERGE_QUEUED",
+            "statusCheckRollup": [
+                rollup_entry("Linux", "SUCCESS", "COMPLETED", true),
+                rollup_entry("macOS", "SUCCESS", "COMPLETED", true)
+            ]
+        });
+        let result = evaluate_pr_green(Some(&snapshot));
+        let error = result.expect_err("green-but-queued must not report terminal success");
+        assert!(
+            error.downcast_ref::<UnsupportedScopeError>().is_some(),
+            "queued PR must surface UnsupportedScope, not a silent matched:true"
+        );
+    }
+
+    #[test]
+    fn pr_green_non_merge_queue_evaluates_unchanged() {
+        // Regression guard: a repo not under merge-queue governance must
+        // evaluate byte-identically to before — all required green -> matched,
+        // and merge_queue_required is false so no code path diverges.
+        let snapshot = serde_json::json!({
+            "number": 99,
+            "headRefOid": "cafe",
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [
+                rollup_entry("Linux", "SUCCESS", "COMPLETED", true),
+                rollup_entry("macOS", "SUCCESS", "COMPLETED", true)
+            ]
+        });
+        assert!(!merge_queue_required(&snapshot));
+        let result = evaluate_pr_green(Some(&snapshot)).expect("green");
+        assert!(result.matched);
+        assert_eq!(
+            result.observed["checks"].as_array().expect("checks").len(),
+            2
+        );
     }
 
     #[test]
@@ -560,6 +737,13 @@ mod tests {
                 .expect("closed")
                 .matched
         );
+
+        // `gh pr view --json` has no `merged` field; its GraphQL-shaped
+        // snapshot reports the terminal state directly.
+        let graphql_merged = serde_json::json!({"number": 2, "state": "MERGED"});
+        let result = evaluate_pr_state(Some(&graphql_merged), "merged").expect("merged state");
+        assert!(result.matched);
+        assert_eq!(result.observed["merged"], true);
     }
 
     #[test]

@@ -13,6 +13,8 @@ pub mod branch;
 pub mod bundle;
 /// VM-slot-aware macOS capacity accounting across host-class members.
 pub mod capacity;
+/// Exact-head changed-surface test planning and shadow receipts.
+pub mod changed_surface;
 /// Changelog tag graph extraction and markdown rendering.
 pub mod changelog;
 /// Coarse failure classification shared by executors.
@@ -57,6 +59,14 @@ pub mod init_config;
 pub mod job;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
+/// Merge-queue enqueue / poll / eviction supervision engine.
+pub mod merge_queue;
+/// Fleet authority, serialization, hold, and audit controls for queue writes.
+pub mod merge_queue_control;
+/// Read-only merge-queue front/check/fleet liveness correlation.
+pub mod merge_queue_liveness;
+/// Conservative cross-repository merge and queued-run stewardship.
+pub mod merge_steward;
 /// Runner and CI timing metrics store and analysis helpers.
 pub mod metrics;
 /// Structured JSON output helpers.
@@ -75,8 +85,11 @@ pub mod pr_text;
 pub mod preflight;
 /// Prepared-state cache for warm stage reruns.
 pub mod prepared_state;
+mod process;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
+/// Stable read-only GitHub queue snapshots, state hashing, and delta tracking.
+pub mod queue_observer;
 /// Durable queued execution request and outcome stores.
 pub mod queue_request;
 /// Cooperative queue scheduler planning primitives.
@@ -101,6 +114,8 @@ pub mod ship_resume;
 pub mod ship_retry;
 /// Durable in-flight ship-state model and store.
 pub mod ship_state;
+/// GitHub stacked pull request discovery and initial fail-closed policy.
+pub mod stacked_pr;
 /// Subprocess helpers that mark supervised child processes with
 /// `SHIPYARD_PR_RUNNING=1` (issue #266). Used by every `git` / `gh`
 /// spawn site that participates in the supervised PR / ship / merge
@@ -122,3 +137,5 @@ pub mod warm_pool;
 pub mod watch;
 /// GitHub webhook signature validation and event decoding.
 pub mod webhook;
+/// Fail-closed policy for automated workflow-run cancellation.
+pub mod workflow_cancellation;

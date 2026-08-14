@@ -121,6 +121,9 @@ pub(super) enum Command {
     Cancel {
         /// Job identifier.
         job_id: String,
+        /// Durable operator/controller reason recorded on the cancelled job.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Change the priority of a pending job.
     Bump {
@@ -131,6 +134,48 @@ pub(super) enum Command {
     },
     /// Show all jobs in the queue.
     Queue,
+    /// Observe GitHub pull requests and merge queue, emitting only transitions.
+    #[command(name = "queue-observe")]
+    QueueObserve {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Base branch whose pull requests and merge queue should be observed.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Continue with adaptive 15/30/60/120/300-second polling.
+        #[arg(long)]
+        follow: bool,
+        /// Override the durable canonical-state path.
+        #[arg(long = "state-file")]
+        state_file: Option<PathBuf>,
+        /// Override the append-only transition-log path.
+        #[arg(long = "transition-log")]
+        transition_log: Option<PathBuf>,
+        /// Replay a JSON fixture file or directory instead of querying GitHub.
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        /// Stop follow mode after this many polls. Test and supervised-run hook.
+        #[arg(
+            long = "max-polls",
+            hide = true,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        max_polls: Option<u64>,
+    },
+    /// Plan a fail-closed exact-head changed-surface test selection in shadow mode.
+    #[command(name = "changed-surface-plan")]
+    ChangedSurfacePlan {
+        /// Target whose base-owned selector declaration should be evaluated.
+        #[arg(long)]
+        target: String,
+        /// Pull request whose authenticated exact head is checked against this checkout.
+        #[arg(long)]
+        pr: u64,
+        /// Owner/repo slug. Defaults to the current checkout's repository.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Clean up old logs, bundles, evidence, and optional ship-state.
     Cleanup {
         /// Show what would be cleaned up.
@@ -272,6 +317,16 @@ pub(super) enum Command {
         /// SHA drift (Shipyard #346).
         #[arg(long = "adopt-head")]
         adopt_head: bool,
+        /// Durable workstream identifier for an atomic merge-steward handoff.
+        /// Also enables handoff when the project default is disabled.
+        #[arg(long = "workstream-id", conflicts_with = "no_steward_handoff")]
+        workstream_id: Option<String>,
+        /// Durable context URL for the steward receipt. Defaults to the PR URL.
+        #[arg(long = "context-url", conflicts_with = "no_steward_handoff")]
+        context_url: Option<String>,
+        /// Disable a project-configured automatic steward handoff.
+        #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
+        no_steward_handoff: bool,
     },
     /// Cloud runner operations.
     Cloud {
@@ -316,6 +371,13 @@ pub(super) enum Command {
         /// Daemon subcommand.
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Inspect or change this machine's merge-queue mutation hold.
+    #[command(name = "merge-queue")]
+    MergeQueue {
+        /// Merge-queue control subcommand.
+        #[command(subcommand)]
+        command: MergeQueueCommand,
     },
     /// Wait for a GitHub condition to match.
     Wait {
@@ -365,6 +427,31 @@ pub(super) enum EvidenceCommand {
         /// Show all command-evidence bundle summaries.
         #[arg(long)]
         list: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum MergeQueueCommand {
+    /// Show whether queue mutations are centrally held on this machine.
+    Status,
+    /// Block every Shipyard merge-queue mutation before GitHub is contacted.
+    Hold {
+        /// Human-readable incident or maintenance reason.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Remove the local hold. Machine-authority checks still apply.
+    Resume,
+    /// Resolve an uncertain mutation after authoritative GitHub reconciliation.
+    Resolve {
+        /// Correlation id shown by `merge-queue status --json`.
+        correlation_id: String,
+        /// Authoritative result: accepted or rejected.
+        #[arg(long)]
+        outcome: String,
+        /// Human-readable reconciliation evidence.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -722,6 +809,10 @@ pub(super) enum RunnerCommand {
         /// Polling cadence in seconds.
         #[arg(long)]
         interval: Option<u64>,
+        /// Base branch monitored by the durable fleet-liveness tick. Defaults
+        /// to `runner.watchdog.fleet_base`, then the repository default branch.
+        #[arg(long = "fleet-base")]
+        fleet_base: Option<String>,
         /// Auto-cancel stale queued runs.
         #[arg(long = "fix")]
         fix: bool,
@@ -865,15 +956,119 @@ pub(super) enum RunnerCommand {
         /// Owner/repo slug. Defaults to the current checkout's repo.
         #[arg(long)]
         repo: Option<String>,
+        /// Base branch whose merge queue should be monitored.
+        #[arg(long, default_value = "main")]
+        base: String,
         /// Job-name substring used to identify macOS queued work.
         #[arg(long, default_value = "macos")]
         target: String,
         /// Alert when queued macOS work is older than this and a routable slot exists.
         #[arg(long = "queued-age-threshold-secs", default_value_t = 900)]
         queued_age_threshold_secs: i64,
-        /// Maximum queued workflow runs to inspect for matching macOS jobs.
+        /// Maximum queued and in-progress workflow runs to inspect in total
+        /// (bounded to 50) for queue and capacity-owner attribution.
         #[arg(long = "queue-run-limit", default_value_t = 100)]
         queue_run_limit: u32,
+        /// Alert when the queue front has no required-check progress after this
+        /// age while routable fleet capacity is idle.
+        #[arg(long = "merge-queue-stall-threshold-secs", default_value_t = 900)]
+        merge_queue_stall_threshold_secs: i64,
+        /// Alert when releasable work, measured no earlier than publication, exceeds this age.
+        #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
+        release_stale_threshold_secs: i64,
+    },
+    /// Maintain an expiring repository-variable lease for an approved local
+    /// Linux CI lane. Dry-run unless `--apply` is supplied.
+    LocalLinuxLease {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Checked-in CI routing profile name.
+        #[arg(long, default_value = "normal-local-fast")]
+        profile: String,
+        /// Explicit profile path. Defaults to Shipyard's normal profile search.
+        #[arg(long = "profile-file")]
+        profile_file: Option<PathBuf>,
+        /// Profile context containing the lease declaration.
+        #[arg(long, default_value = "merge_group")]
+        context: String,
+        /// Profile lane containing the lease declaration.
+        #[arg(long, default_value = "linux")]
+        lane: String,
+        /// Renew or clear the repository variable. Without this flag, print
+        /// the decision without changing GitHub.
+        #[arg(long)]
+        apply: bool,
+        /// Continue probing and renewing until interrupted.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between watch ticks. Must be shorter than the lease TTL.
+        #[arg(long = "interval-secs", default_value_t = 60)]
+        interval_secs: u64,
+        /// Stop after N ticks. Test hook.
+        #[arg(long = "max-ticks", hide = true)]
+        max_ticks: Option<u32>,
+    },
+    /// Hand an exact pull-request head to the merge steward.
+    ///
+    /// Dry-run is the default. Apply mode writes a successful commit-status
+    /// receipt on the expected head, then labels the PR as managed only after
+    /// re-reading that the head is still exact.
+    StewardHandoff {
+        /// Owner/repo slug. Defaults to the current repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull-request number.
+        #[arg(long)]
+        pr: u64,
+        /// Full immutable head SHA expected by the submitting agent.
+        #[arg(long)]
+        head: String,
+        /// Durable work item identifier, such as GEN-7.
+        #[arg(long = "workstream-id")]
+        workstream_id: String,
+        /// Durable context URL, such as a Linear issue or planning document.
+        #[arg(long = "context-url")]
+        context_url: Option<String>,
+        /// Write the receipt and managed label. Without this flag, only audit.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Audit and conservatively advance merge-on-green across repositories.
+    ///
+    /// Dry-run is the default. `--apply` may enqueue an exact green head,
+    /// rerun a bounded transient failure, or cancel only queued runs with a
+    /// provably superseded PR/merge-group head. Same-head duplicates are never
+    /// cancelled. Repositories without a server-owned
+    /// merge queue are reported as direct-merge refusals.
+    Steward {
+        /// Owner/repo slug. Repeatable; defaults to the current repository.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Target branch.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Label that opts a PR out of stewardship.
+        #[arg(long = "opt-out-label", default_value = "shipyard:no-auto-merge")]
+        opt_out_label: String,
+        /// Maximum reruns of the same transiently-failed run on one exact head.
+        #[arg(long = "max-transient-reruns", default_value_t = 1)]
+        max_transient_reruns: u32,
+        /// Disable queued-run superseded-head cleanup.
+        #[arg(long = "no-coalesce")]
+        no_coalesce: bool,
+        /// Disable bounded preemption of safe preamble-only capacity thieves.
+        #[arg(long = "no-preempt-capacity")]
+        no_preempt_capacity: bool,
+        /// Maximum preemptions of one workflow on one immutable PR head.
+        #[arg(long = "max-preemptions-per-head", default_value_t = 1)]
+        max_preemptions_per_head: u32,
+        /// Perform the planned mutations. Without this flag, only audit.
+        #[arg(long)]
+        apply: bool,
+        /// Override the durable retry/audit ledger path. Test hook.
+        #[arg(long = "ledger", hide = true)]
+        ledger: Option<PathBuf>,
     },
     /// Watch for cloud-queued macOS jobs and drain them to a local runner when
     /// a VM slot frees up. Observe-only unless `--apply`.
@@ -1641,5 +1836,38 @@ impl From<PathMode> for RuntimeMode {
             PathMode::Isolated => Self::Isolated,
             PathMode::Shipyard => Self::Shipyard,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command, RunnerCommand};
+
+    #[test]
+    fn queue_observer_rejects_zero_max_polls() {
+        assert!(
+            Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "0",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "1",])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn local_linux_lease_defaults_to_trusted_merge_group_context() {
+        let cli = Cli::try_parse_from(["shipyard", "runner", "local-linux-lease"])
+            .expect("default local Linux lease command");
+        let Command::Runner {
+            command: RunnerCommand::LocalLinuxLease { context, lane, .. },
+        } = cli.command
+        else {
+            panic!("expected local Linux lease command");
+        };
+        assert_eq!(context, "merge_group");
+        assert_eq!(lane, "linux");
     }
 }

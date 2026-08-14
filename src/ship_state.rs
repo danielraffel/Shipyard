@@ -110,6 +110,28 @@ pub struct ShipState {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// When Shipyard most recently observed this PR in GitHub's merge queue.
+    ///
+    /// Persisting this across process restarts is the authority required to
+    /// distinguish a recoverable eviction from a PR that was never queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_observed_at: Option<DateTime<Utc>>,
+    /// Start of the current native queue admission attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_attempt_started_at: Option<DateTime<Utc>>,
+    /// When GitHub accepted the current exact-head enqueue mutation.
+    ///
+    /// An absent PR after this point but before observed membership is
+    /// terminal: Shipyard must not undo a manual dequeue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_enqueue_succeeded_at: Option<DateTime<Utc>>,
+    /// Durable marker written before issuing an enqueue mutation.
+    ///
+    /// A process exit after GitHub accepts the mutation but before the success
+    /// marker is saved leaves this set, preventing a later invocation from
+    /// treating queue absence as proof that no admission was attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_enqueue_started_at: Option<DateTime<Utc>>,
     /// Terminal abandonment marker set by the daemon's opt-in orphan resume
     /// sweep. `None` for a normal in-flight or evidence-terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +166,10 @@ impl ShipState {
             attempt: default_attempt(),
             created_at: now,
             updated_at: now,
+            merge_queue_observed_at: None,
+            merge_queue_attempt_started_at: None,
+            merge_queue_enqueue_succeeded_at: None,
+            merge_queue_enqueue_started_at: None,
             abandoned: None,
         }
     }
@@ -427,6 +453,10 @@ impl ShipStateStore {
             evidence_snapshot: BTreeMap::new(),
             created_at: now,
             updated_at: now,
+            merge_queue_observed_at: None,
+            merge_queue_attempt_started_at: None,
+            merge_queue_enqueue_succeeded_at: None,
+            merge_queue_enqueue_started_at: None,
             // A fresh attempt must not inherit the prior attempt's terminal
             // abandonment marker, or the re-ship would be dead on arrival.
             abandoned: None,
@@ -665,6 +695,10 @@ mod tests {
         state.attempt = 1;
         state.upsert_run(sample_run("cloud", "999"));
         state.update_evidence("macos", "pass");
+        state.merge_queue_observed_at = Some(Utc::now());
+        state.merge_queue_attempt_started_at = Some(Utc::now());
+        state.merge_queue_enqueue_succeeded_at = Some(Utc::now());
+        state.merge_queue_enqueue_started_at = Some(Utc::now());
         store.save(&state).expect("save");
 
         let fresh = store
@@ -673,6 +707,10 @@ mod tests {
         assert_eq!(fresh.attempt, 2);
         assert!(fresh.dispatched_runs.is_empty());
         assert!(fresh.evidence_snapshot.is_empty());
+        assert!(fresh.merge_queue_observed_at.is_none());
+        assert!(fresh.merge_queue_attempt_started_at.is_none());
+        assert!(fresh.merge_queue_enqueue_succeeded_at.is_none());
+        assert!(fresh.merge_queue_enqueue_started_at.is_none());
         assert_eq!(store.list_archived().len(), 1);
     }
 

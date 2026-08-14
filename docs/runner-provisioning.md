@@ -27,6 +27,34 @@ which recovers stuck runners. Pure naming/index/label/table logic lives in
   ordinary `backend = "local"` targets whose validation command shells to
   `tartci up <os> [--target-arch x86_64]` — see
   [targets.md](./targets.md#emulated-x86_64-smoke-local-via-tartci).
+- **Coordination does not imply one provider.** Shipyard can supervise TartCI
+  VMs on Apple Silicon, an independently managed Proxmox x64 Linux pool, and a
+  native Intel Mac in one validation plan. The provider keeps responsibility
+  for boot, isolation, and teardown; Shipyard supplies queue, exact-head, and
+  policy visibility across them.
+
+### Why runner-group read access matters
+
+For organization runner groups, an external policy verifier using Shipyard's
+GitHub App identity requires the App's **Self-hosted runners: Read-only**
+organization permission. Repository `Actions` permission is insufficient. With
+runner-group access, that verifier can check not
+only whether a runner is online, but whether the group is still limited to the
+intended repositories and workflows and contains the expected runners. This is
+an operator integration, not currently a built-in `shipyard runner` check.
+
+Runner-group policy is only one authorization control; it is not a sandbox. A
+permitted workflow can still execute attacker-controlled PR code. Untrusted work
+requires disposable guests with no host credentials or writable host mounts,
+plus the repository's fork/approval policy. Persistent or secret-bearing hosts
+should accept only protected, main-owned workflows that do not execute untrusted
+changes.
+
+Grant Read & write only when Shipyard must configure groups or remove
+registrations. After changing the App permission, approve the installation
+update and mint a new token; cached tokens keep their prior permissions. Full
+setup and 403 diagnosis are in
+[`github-app-quota.md`](./github-app-quota.md#register-the-github-app).
 
 ## Machine tag
 

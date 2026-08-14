@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -59,8 +60,12 @@ pub struct WorkflowDefinition {
     pub name: String,
     /// Human-readable summary for CLI rendering.
     pub description: String,
+    /// Whether the workflow declares a `workflow_dispatch` trigger.
+    pub dispatchable: bool,
     /// Declared `workflow_dispatch` input names.
     pub inputs: Vec<String>,
+    /// Required inputs that do not declare a default value.
+    pub required_inputs: Vec<String>,
 }
 
 /// Resolved GitHub Actions dispatch settings.
@@ -149,6 +154,8 @@ pub struct QueuedRun {
     pub name: String,
     /// Branch associated with the run.
     pub head_branch: String,
+    /// GitHub event that created the run (`pull_request`, `merge_group`, etc.).
+    pub event: String,
     /// ISO-8601 creation timestamp.
     pub created_at: String,
     /// ISO-8601 execution-start timestamp, when GitHub reported one. Absent
@@ -215,6 +222,28 @@ impl Display for GitHubError {
 
 impl Error for GitHubError {}
 
+/// Captured result of a bounded `gh` command, including non-zero GraphQL
+/// responses whose stdout can still contain usable partial data.
+pub(crate) struct GitHubCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl GitHubCommandOutput {
+    pub(crate) fn success(&self) -> bool {
+        self.status.success()
+    }
+
+    pub(crate) fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    pub(crate) fn command_error(&self, args: &[String]) -> GitHubError {
+        GitHubError::command_failed(args, self.status.code(), &self.stderr)
+    }
+}
+
 /// Shell-backed GitHub Actions client.
 #[derive(Clone, Debug)]
 pub struct GitHubActions {
@@ -264,8 +293,19 @@ impl GitHubActions {
         }
     }
 
+    /// Override repository placeholders used by configured token helpers.
+    #[must_use]
+    pub(crate) fn with_repo_override(mut self, repo: &str) -> Self {
+        self.gh = self.gh.and_then(|client| {
+            client
+                .with_repo_override(repo)
+                .map_err(|error| format!("failed to scope GitHub auth to explicit repo: {error}"))
+        });
+        self
+    }
+
     #[cfg(all(test, unix))]
-    fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
         self.gh_binary_override = Some(gh_binary.into());
         self
     }
@@ -474,6 +514,21 @@ impl GitHubActions {
         self.run_gh(&args).map(|_| ())
     }
 
+    /// Force-cancel an exact workflow run after normal cancellation failed to terminalize it.
+    pub fn force_cancel_workflow_run(
+        &self,
+        repository: &str,
+        run_id: u64,
+    ) -> Result<(), GitHubError> {
+        let args = vec![
+            "api".to_owned(),
+            "-X".to_owned(),
+            "POST".to_owned(),
+            format!("repos/{repository}/actions/runs/{run_id}/force-cancel"),
+        ];
+        self.run_gh(&args).map(|_| ())
+    }
+
     /// Re-trigger only the failed jobs in a workflow run. Used by the runner
     /// kill recovery path to immediately re-queue a PR whose Worker we just
     /// terminated.
@@ -671,6 +726,149 @@ impl GitHubActions {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// Run one low-volume GitHub mutation with ambient `gh` credentials.
+    /// Callers must first attempt configured auth and restrict fallback to an
+    /// explicit integration-permission rejection.
+    pub(crate) fn run_gh_ambient(&self, args: &[String]) -> Result<String, GitHubError> {
+        let client = GhClient::ambient();
+        let output = client
+            .prepare_command(
+                &self.cwd,
+                self.gh_binary_override.as_deref(),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::AmbientOnly,
+            )
+            .map_err(|error| GitHubError::new(format!("failed to prepare ambient gh: {error}")))?
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(args)
+            .output()
+            .map_err(|error| {
+                GitHubError::new(format!(
+                    "failed to run ambient gh {}: {error}",
+                    args.join(" ")
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(GitHubError::command_failed(
+                args,
+                output.status.code(),
+                &output.stderr,
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    pub(crate) fn run_gh_with_timeout(
+        &self,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<String, GitHubError> {
+        let output = self.run_gh_with_timeout_output(args, timeout)?;
+        if !output.success() {
+            return Err(output.command_error(args));
+        }
+        Ok(String::from_utf8_lossy(output.stdout()).to_string())
+    }
+
+    pub(crate) fn run_gh_with_timeout_output(
+        &self,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<GitHubCommandOutput, GitHubError> {
+        let started = Instant::now();
+        let mut command = self.prepare_gh_command_with_timeout(timeout)?;
+        if started.elapsed() >= timeout {
+            return Err(GitHubError::new(format!(
+                "gh {} timed out during credential preparation after {}ms",
+                args.join(" "),
+                timeout.as_millis()
+            )));
+        }
+        command
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut process_tree =
+            crate::process::ProcessTree::spawn(&mut command).map_err(|error| {
+                GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
+            })?;
+        let mut stdout = process_tree
+            .take_stdout()
+            .ok_or_else(|| GitHubError::new("failed to capture gh stdout".to_owned()))?;
+        let mut stderr = process_tree
+            .take_stderr()
+            .ok_or_else(|| GitHubError::new("failed to capture gh stderr".to_owned()))?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let status = loop {
+            match process_tree.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < timeout => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    process_tree.terminate();
+                    return Err(GitHubError::new(format!(
+                        "gh {} timed out after {}ms",
+                        args.join(" "),
+                        timeout.as_millis()
+                    )));
+                }
+                Err(error) => {
+                    process_tree.terminate();
+                    return Err(GitHubError::new(format!(
+                        "failed waiting for gh {}: {error}",
+                        args.join(" ")
+                    )));
+                }
+            }
+        };
+        while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
+            && started.elapsed() < timeout
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            process_tree.terminate();
+            let drain_deadline = Instant::now() + Duration::from_millis(500);
+            while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
+                && Instant::now() < drain_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            return Err(GitHubError::new(format!(
+                "gh {} left output pipes open after {}ms",
+                args.join(" "),
+                timeout.as_millis()
+            )));
+        }
+        // The command is complete and its captured pipes are closed, but a
+        // detached descendant may have redirected stdio. Reap that tree too.
+        process_tree.terminate();
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| GitHubError::new("gh stdout reader panicked".to_owned()))?
+            .map_err(|error| GitHubError::new(format!("failed reading gh stdout: {error}")))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| GitHubError::new("gh stderr reader panicked".to_owned()))?
+            .map_err(|error| GitHubError::new(format!("failed reading gh stderr: {error}")))?;
+        Ok(GitHubCommandOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
     fn prepare_gh_command(&self) -> Result<std::process::Command, GitHubError> {
         let client = self
             .gh
@@ -682,6 +880,25 @@ impl GitHubActions {
                 self.gh_binary_override.as_deref(),
                 GhSupervision::Unsupervised,
                 GhAuthPolicy::Default,
+            )
+            .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
+    }
+
+    fn prepare_gh_command_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<std::process::Command, GitHubError> {
+        let client = self
+            .gh
+            .as_ref()
+            .map_err(|error| GitHubError::new(error.clone()))?;
+        client
+            .prepare_command_with_auth_timeout(
+                &self.cwd,
+                self.gh_binary_override.as_deref(),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+                timeout,
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
@@ -715,7 +932,7 @@ pub fn discover_workflows(repo_root: &Path) -> BTreeMap<String, WorkflowDefiniti
             continue;
         };
         let contents = fs::read_to_string(&path).unwrap_or_default();
-        let inputs = discover_workflow_inputs(&contents);
+        let (dispatchable, inputs, required_inputs) = discover_workflow_dispatch(&contents);
         let key = stem.to_owned();
         let name = discover_workflow_name(&contents).unwrap_or_else(|| titleize(stem));
         let definition = WorkflowDefinition {
@@ -723,7 +940,9 @@ pub fn discover_workflows(repo_root: &Path) -> BTreeMap<String, WorkflowDefiniti
             file: filename.to_owned(),
             description: format!("{name} ({filename})"),
             name,
+            dispatchable,
             inputs,
+            required_inputs,
         };
         discovered.insert(key.clone(), definition.clone());
         if key == "ci" && !discovered.contains_key("build") {
@@ -746,14 +965,22 @@ pub fn default_workflow_key(
     workflows: &BTreeMap<String, WorkflowDefinition>,
 ) -> Option<String> {
     if let Some(configured) = config.get_str("cloud.default_workflow")
-        && workflows.contains_key(configured)
+        && workflows
+            .get(configured)
+            .is_some_and(|workflow| workflow.dispatchable)
     {
         return Some(configured.to_owned());
     }
-    if workflows.contains_key("build") {
+    if workflows
+        .get("build")
+        .is_some_and(|workflow| workflow.dispatchable)
+    {
         return Some("build".to_owned());
     }
-    workflows.keys().next().cloned()
+    workflows
+        .iter()
+        .find(|(_, workflow)| workflow.dispatchable)
+        .map(|(key, _)| key.clone())
 }
 
 /// Resolve provider and dispatch fields for a workflow.
@@ -785,6 +1012,12 @@ pub fn resolve_cloud_dispatch_plan_with_overrides(
         .get(workflow_key)
         .cloned()
         .ok_or_else(|| format!("Unknown workflow '{workflow_key}'"))?;
+    if !workflow.dispatchable {
+        return Err(format!(
+            "Workflow '{}' does not declare workflow_dispatch",
+            workflow.file
+        ));
+    }
     let repository = config.get_str("cloud.repository").map(ToOwned::to_owned);
     let workflow_config_key = format!("cloud.workflows.{workflow_key}");
     let workflow_config = table_at(config, &workflow_config_key);
@@ -990,6 +1223,11 @@ pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let event = run
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let created_at = run
             .get("created_at")
             .and_then(Value::as_str)
@@ -1020,6 +1258,7 @@ pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
             workflow_name: name.clone(),
             name,
             head_branch,
+            event,
             created_at,
             run_started_at,
             url: run
@@ -1116,12 +1355,25 @@ fn discover_workflow_name(contents: &str) -> Option<String> {
     })
 }
 
-fn discover_workflow_inputs(contents: &str) -> Vec<String> {
+fn discover_workflow_dispatch(contents: &str) -> (bool, Vec<String>, Vec<String>) {
     let mut inputs = Vec::new();
-    let mut in_workflow_dispatch = false;
-    let mut in_inputs = false;
+    let mut required_inputs = Vec::new();
+    let mut dispatchable = false;
+    let mut on_indent = None;
     let mut workflow_indent = None;
+    let mut in_inputs = false;
     let mut inputs_indent = None;
+    let mut current_input: Option<(String, usize, bool, bool)> = None;
+
+    let finish_input = |current: &mut Option<(String, usize, bool, bool)>,
+                        required: &mut Vec<String>| {
+        if let Some((name, _indent, is_required, has_default)) = current.take()
+            && is_required
+            && !has_default
+        {
+            required.push(name);
+        }
+    };
 
     for raw_line in contents.lines() {
         if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
@@ -1129,36 +1381,79 @@ fn discover_workflow_inputs(contents: &str) -> Vec<String> {
         }
         let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
         let stripped = raw_line.trim();
+        let normalized = stripped.trim_start_matches(['\'', '"']);
 
-        if stripped.starts_with("workflow_dispatch:") {
-            in_workflow_dispatch = true;
+        if let Some(rest) = normalized.strip_prefix("on:") {
+            on_indent = Some(indent);
+            if rest.contains("workflow_dispatch") {
+                dispatchable = true;
+            }
+            continue;
+        }
+
+        if on_indent.is_some_and(|on_indent| indent <= on_indent) {
+            finish_input(&mut current_input, &mut required_inputs);
+            on_indent = None;
+            workflow_indent = None;
+            in_inputs = false;
+        }
+
+        if on_indent.is_some()
+            && normalized
+                .trim_start_matches('"')
+                .starts_with("workflow_dispatch:")
+        {
+            dispatchable = true;
             in_inputs = false;
             workflow_indent = Some(indent);
             continue;
         }
-        if in_workflow_dispatch
+        if workflow_indent.is_some()
             && workflow_indent.is_some_and(|workflow_indent| indent <= workflow_indent)
             && stripped.contains(':')
         {
-            in_workflow_dispatch = false;
+            finish_input(&mut current_input, &mut required_inputs);
+            workflow_indent = None;
             in_inputs = false;
         }
-        if in_workflow_dispatch && stripped.starts_with("inputs:") {
+        if workflow_indent.is_some() && stripped.starts_with("inputs:") {
             in_inputs = true;
             inputs_indent = Some(indent);
             continue;
         }
         if in_inputs && inputs_indent.is_some_and(|inputs_indent| indent <= inputs_indent) {
+            finish_input(&mut current_input, &mut required_inputs);
             in_inputs = false;
         }
         if in_inputs
             && inputs_indent.is_some_and(|inputs_indent| indent == inputs_indent + 2)
             && stripped.ends_with(':')
         {
-            inputs.push(stripped.trim_end_matches(':').to_owned());
+            finish_input(&mut current_input, &mut required_inputs);
+            let name = stripped
+                .trim_end_matches(':')
+                .trim_matches(['\'', '"'])
+                .to_owned();
+            inputs.push(name.clone());
+            current_input = Some((name, indent, false, false));
+            continue;
+        }
+        if let Some((_name, input_indent, is_required, has_default)) = current_input.as_mut()
+            && indent > *input_indent
+        {
+            if stripped
+                .strip_prefix("required:")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+            {
+                *is_required = true;
+            }
+            if stripped.starts_with("default:") {
+                *has_default = true;
+            }
         }
     }
-    inputs
+    finish_input(&mut current_input, &mut required_inputs);
+    (dispatchable, inputs, required_inputs)
 }
 
 fn titleize(key: &str) -> String {
@@ -1384,10 +1679,72 @@ on:
         let discovered = discover_workflows(temp.path());
 
         assert!(discovered.contains_key("ci"));
+        assert!(discovered["build"].dispatchable);
         assert_eq!(discovered["build"].file, "ci.yml");
         assert_eq!(
             discovered["build"].inputs,
             vec!["runner_provider", "macos_runner_selector"]
+        );
+        assert!(discovered["build"].required_inputs.is_empty());
+    }
+
+    #[test]
+    fn discovers_required_dispatch_inputs_without_defaults() {
+        let temp = TempDir::new().expect("tempdir");
+        let workflows = temp.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows dir");
+        std::fs::write(
+            workflows.join("freeze.yml"),
+            r"
+name: Freeze
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: true
+      mode:
+        required: true
+        default: safe
+",
+        )
+        .expect("workflow");
+
+        let discovered = discover_workflows(temp.path());
+
+        assert!(discovered["freeze"].dispatchable);
+        assert_eq!(discovered["freeze"].inputs, vec!["pr_number", "mode"]);
+        assert_eq!(discovered["freeze"].required_inputs, vec!["pr_number"]);
+    }
+
+    #[test]
+    fn distinguishes_workflows_without_manual_dispatch() {
+        let temp = TempDir::new().expect("tempdir");
+        let workflows = temp.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows dir");
+        std::fs::write(
+            workflows.join("lint.yml"),
+            "name: Lint\non:\n  pull_request:\njobs: {}\n",
+        )
+        .expect("workflow");
+
+        let discovered = discover_workflows(temp.path());
+
+        assert!(!discovered["lint"].dispatchable);
+        assert!(discovered["lint"].inputs.is_empty());
+        assert!(discovered["lint"].required_inputs.is_empty());
+        assert_eq!(
+            default_workflow_key(
+                &LoadedConfig {
+                    data: toml::Table::new(),
+                    global_dir: temp.path().join("global"),
+                    project_dir: None,
+                    local_dir: None,
+                    local_overlay_source: LocalOverlaySource::None,
+                },
+                &discovered
+            ),
+            None
         );
     }
 
@@ -1417,10 +1774,12 @@ macos-arm64 = "generouscorp-macos"
                 file: "ci.yml".to_owned(),
                 name: "CI".to_owned(),
                 description: "CI".to_owned(),
+                dispatchable: true,
                 inputs: vec![
                     "runner_provider".to_owned(),
                     "macos_runner_selector".to_owned(),
                 ],
+                required_inputs: Vec::new(),
             },
         );
 
@@ -1465,11 +1824,13 @@ runner_selector = "config-selector"
                 file: "ci.yml".to_owned(),
                 name: "CI".to_owned(),
                 description: "CI".to_owned(),
+                dispatchable: true,
                 inputs: vec![
                     "runner_provider".to_owned(),
                     "runner_selector".to_owned(),
                     "runner_overrides".to_owned(),
                 ],
+                required_inputs: Vec::new(),
             },
         );
 
@@ -1561,13 +1922,14 @@ runner_selector = "config-selector"
     #[test]
     fn queued_runs_parse_github_api_shape() {
         let parsed = super::parse_queued_runs(
-            r#"{"workflow_runs":[{"id":555,"name":"CI","head_branch":"feat/x","created_at":"2026-04-23T12:00:00Z","run_started_at":"2026-04-23T12:05:00Z","html_url":"https://example/run/555","path":".github/workflows/ci.yml"}]}"#,
+            r#"{"workflow_runs":[{"id":555,"name":"CI","head_branch":"feat/x","event":"pull_request","created_at":"2026-04-23T12:00:00Z","run_started_at":"2026-04-23T12:05:00Z","html_url":"https://example/run/555","path":".github/workflows/ci.yml"}]}"#,
         )
         .expect("parse");
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].database_id, 555);
         assert_eq!(parsed[0].path, ".github/workflows/ci.yml");
+        assert_eq!(parsed[0].event, "pull_request");
         // P1: `run_started_at` is captured so the reaper can age in_progress
         // runs from execution start, not creation time.
         assert_eq!(

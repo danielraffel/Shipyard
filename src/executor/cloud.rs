@@ -139,7 +139,8 @@ pub struct CloudValidationRequest<'a> {
     /// Local log path used for result parity.
     pub log_path: PathBuf,
     /// Optional progress callback.
-    pub progress_callback: Option<&'a mut dyn FnMut(ProgressEvent)>,
+    pub progress_callback:
+        Option<&'a mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction>,
 }
 
 impl CloudValidationRequest<'_> {
@@ -436,7 +437,9 @@ fn terminal_result(
 }
 
 fn emit_progress(
-    progress_callback: &mut Option<&mut dyn FnMut(ProgressEvent)>,
+    progress_callback: &mut Option<
+        &mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction,
+    >,
     phase: impl Into<String>,
 ) {
     if let Some(callback) = progress_callback.as_deref_mut() {
@@ -569,6 +572,7 @@ mod tests {
         let mut phases = Vec::new();
         let mut progress = |event: crate::executor::streaming::ProgressEvent| {
             phases.push(event.phase.expect("phase"));
+            crate::executor::streaming::ProgressAction::Continue
         };
         request.progress_callback = Some(&mut progress);
 

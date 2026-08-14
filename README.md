@@ -11,8 +11,11 @@ shipyard init              # detects your project, probes your machines
 shipyard run               # validates on every platform you configured
 shipyard ship              # validate, open PR, merge on green
 shipyard watch             # live-tail an in-flight ship
+shipyard queue-observe     # read-only GitHub queue deltas with adaptive backoff
+shipyard changed-surface-plan --pr 123 --target mac  # fail-closed shadow test plan
 shipyard wait pr 151 --state green  # wait on release / PR / run conditions
 shipyard auto-merge <pr>   # cron-friendly one-shot merge-on-green
+shipyard merge-queue status  # inspect the local queue-mutation hold
 shipyard rescue <pr>       # cancel + redispatch every stuck queued run on a PR
 shipyard runner watch --kill-hung-workers  # daemon-mode prevent + auto-kill hung Workers
 shipyard update            # self-update the CLI (or `--check` to peek)
@@ -31,17 +34,23 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
 - **Evidence-based merge gate.** `shipyard ship` refuses to merge unless
   every required platform has passing evidence **for the exact HEAD SHA** —
   not the most-recent run, not the branch tip, the SHA.
+- **Fail-closed test-selection shadowing.** A target can declare mandatory
+  baseline smoke plus complete changed-surface families. Shipyard authenticates
+  PR/protected-base provenance and emits an exact-head receipt while the full
+  suite remains authoritative; ambiguity always falls back to full.
 - **Parallel-agent-aware queue.** Multiple agents in multiple worktrees
   share one machine-global queue with priorities, FIFO scheduling, and
   automatic deduplication.
 - **Declarative security & governance.** One TOML line picks a profile
   (`solo` or `multi`); one CLI command makes GitHub branch protection,
   tag protection, and workflow token permissions match.
-- **Merge-queue compatible.** Release-bot commits (e.g. the post-tag
-  CHANGELOG sync) can land through a PR instead of a direct push — set
-  `push_mode = "pr"` under `[release.post_tag_hook]` and shipyard opens +
-  auto-merges the bot commit, so it works on a branch that enforces a
-  GitHub merge queue (which rejects all direct pushes).
+- **Native merge-queue handoff.** On queue-governed branches Shipyard
+  validates the exact head, admits that exact SHA, and lets GitHub own the
+  merge. Configure one fleet authority with
+  `merge_queue.mutation_machine`, pause it instantly with
+  `shipyard merge-queue hold --reason "..."`, and audit every attempted
+  queue write in machine-global state. Other machines fail before GitHub is
+  contacted.
 - **22 ecosystem detectors.** `shipyard init` recognises CMake, Swift,
   Xcode, Rust, Go, Node (pnpm/bun/yarn/npm), Python (uv/poetry/pip),
   Gradle, Maven, .NET, Flutter, Dart, Deno, Ruby, Elixir, PHP.
@@ -53,9 +62,13 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
 - **One-shot PR rescue.** `shipyard rescue <pr>` cancels and
   redispatches every stuck queued workflow run on a PR onto
   `github-hosted` (or any provider via `--to`). `--rerun-failed`
-  also re-arms watchdog-cancelled runs; `--all-stuck` is the
+  dispatches fresh replacements for terminal failed/cancelled runs without
+  re-arming the originals; `--all-stuck` is the
   repo-wide variant. Pairs with the watchdog to form a complete
   prevent → recover toolkit.
+- **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
+  operator reason and terminates an active local or SSH validation process tree
+  on its next progress event, including descendant build processes.
 - **In-tool self-update.** `shipyard update` is the discoverable
   upgrade path (no more curl-pipe to remember); `--check` reports
   installed-vs-available, `--to v0.55.0` pins a specific tag for
@@ -74,6 +87,9 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   exports into a small SQLite store. Agents can ask for summaries, drift
   findings, and placement advice without requiring tartci or any observability
   service.
+
+See [exact-head changed-surface selection](docs/changed-surface-selection.md)
+for the base-owned schema, receipt fields, and hard-fail/fallback boundary.
 
 ## Installation
 
@@ -126,6 +142,23 @@ Downloads a standalone binary for your platform. No runtime needed. See
 and test commands, and reports what passed. `shipyard ship` does the same,
 then opens a PR and merges when every required platform is green.
 
+For a multi-Mac fleet, store a stable tag on each host with
+`shipyard runner tag --set <studio|m1|m5>` and select exactly one queue
+writer in the trusted machine-global `config.toml` reported by
+`shipyard paths`:
+
+```toml
+[merge_queue]
+mutation_machine = "studio"
+```
+
+Validation may run anywhere. Only the selected machine can enqueue, disable
+auto-merge, or dequeue through Shipyard, and queue writes for one repo/base
+are serialized across local processes. During an incident,
+`shipyard merge-queue hold --reason "incident"` blocks before GitHub contact;
+`shipyard merge-queue resume` removes the hold while retaining the machine
+authority check.
+
 Shipyard is not a [CI service](https://en.wikipedia.org/wiki/Continuous_integration),
 not a [build system](https://en.wikipedia.org/wiki/Build_automation),
 not a [workflow engine](https://en.wikipedia.org/wiki/Workflow_engine).
@@ -133,6 +166,8 @@ It calls your build commands and cares about one thing: did they pass?
 
 ## Documentation
 
+- [Queue observer](docs/queue-observer.md) — one-query queue snapshots,
+  persisted state hashes, delta-only output, replay, and adaptive backoff.
 - [Examples & Scenarios](docs/examples.md) — real-world setups for Xcode,
   CMake, Swift, Tauri, etc.
 - [Targets & Fallback Chains](docs/targets.md) — how local/SSH/cloud
@@ -312,6 +347,15 @@ not the important factor; using an installation access token is.
 
 See [`docs/github-app-quota.md`](docs/github-app-quota.md) for the setup fields,
 permissions, Shipyard config, and quota validation commands.
+
+The App can also give a Shipyard deployment's external policy verifier read-only
+visibility into organization runner groups. That permission is separate from
+repository `Actions` access and lets the integration verify repository, workflow,
+and runner-membership boundaries while Shipyard coordinates heterogeneous local
+capacity. This is not currently a built-in `shipyard runner` check. TartCI VMs, a separate Proxmox pool,
+and native machines remain distinct execution providers; Shipyard supplies the
+shared policy and exact-head view. Approve the installation update and refresh
+cached tokens after adding the permission.
 
 ## Learn more
 

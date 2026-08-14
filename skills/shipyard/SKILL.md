@@ -31,6 +31,97 @@ go/no-go for that operation.
    execution. Its untrusted job VM has no virtual NIC; only the trusted
    controller talks to GitHub. Timer activation remains an operator decision.
 
+## Merge-queue ownership
+
+When GitHub's live branch queue or evaluated rules require a merge queue,
+Shipyard is a validator and queue supervisor, not a second merge authority. A
+passing `shipyard ship` calls GitHub's queue mutation with
+`expectedHeadOid=<validated SHA>` and waits for GitHub to merge it. The
+one-shot `shipyard auto-merge` returns exit 3 while queued and retains
+ship-state for later ticks.
+
+For private-free repositories, GitHub may return an explicit null live queue
+and its exact plan-entitlement 403 from evaluated rules. That one combination
+selects classic merge while retaining the validated-head preflight,
+`--match-head-commit`, and REST `sha=` guard. Generic 401/403 responses,
+malformed authority, and a non-null queue still stop or select the queue path.
+
+Never treat queue absence alone as permission to rearm. The PR must first have
+been observed in the queue (durably recorded across restarts), and only an
+`invalid_merge_commit` removal may be re-enqueued automatically. Failed checks,
+manual/unknown removal, head drift, malformed authority data, or a
+403/rate-limit response stop fail-closed.
+
+Use `shipyard --json queue-observe --repo <owner/repo> [--follow]` when an
+agent needs a durable, read-only feed of base SHA, open PR heads/checks,
+server-owned queue order and merge-group checks, mutation ownership, and
+`HOLD` state. Each live tick is one bounded GraphQL query; unchanged polls emit
+nothing and back off through 15/30/60/120/300 seconds. The observer writes an
+atomic canonical cursor plus an append-only transition log under the Shipyard
+state root and takes an exclusive per-cursor lock. It exposes no mutation flag,
+does not acquire a mutation lease, and needs no write credential. See
+[`docs/queue-observer.md`](../../docs/queue-observer.md).
+
+Use `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n>
+--target <name>` for the shadow-only exact-head selector. Policy must come from
+the authenticated protected base and may contain only reviewed path globs plus
+literal baseline/family tests. Never substitute caller regexes, caller-selected
+base/head SHAs, `skip-target`, `resume-from`, or diff-cover selectors. A local
+head/tree mismatch hard-fails with no receipt; every later ambiguity selects the
+full suite. The receipt is telemetry and cannot replace full target evidence.
+Release-only families under a Debug target require fresh, non-reused,
+same-exact-head evidence no more than 24 hours old from their base-declared
+Release target. The evidence must carry that target's own
+`validation_build_type`, and neither direct nor active-profile advisory targets
+qualify. The evidence must bind a clean pre-execution checkout at the
+authenticated head and tree. Use a concrete local secondary target; remote,
+cloud, host-pool, and fallback targets are rejected until their source-tree
+provenance is captured, and prepared-state reuse must be disabled. Without a
+fresh, non-resumed execution of the full contract the plan is policy-blocked,
+not redirected into a known-incompatible full Debug run.
+See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
+
+Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard
+inspects `PullRequest.stack` and `stackEntry` at each merge or enqueue mutation
+boundary, including `shipyard runner steward`, and refuses its unstacked
+mutation path when either identifies a stack. Validate each layer, then use
+`gh stack merge <pr> --merge` until
+Shipyard durably models the asynchronous request UUID and result polling. A
+classic-boundary GraphQL exhaustion retains the exact-head REST fallback because
+GitHub requires the asynchronous endpoint for formal stacks; queue admission
+and re-enqueue inspections remain fail-closed.
+
+For fleets, configure exactly one mutation host in the trusted machine-global
+`config.toml` reported by `shipyard paths` (never in tracked project config):
+
+```toml
+[merge_queue]
+mutation_machine = "studio"
+```
+
+Each box must have its stable `shipyard runner tag`. Validation can execute on
+any host, but a non-authority host must fail before queue mutation. Use
+`shipyard merge-queue hold --reason "<incident>"` on the configured mutation
+machine as the authority stop and `shipyard merge-queue status` there to verify
+it. Propagate the hold to other hosts when consistent fleet status matters. Do
+not resume until the incident owner has restored the intended queue order.
+Queue writes are serialized process-wide and recorded in machine-global
+`merge_queue/mutations.jsonl`.
+
+After changing `mutation_machine` or upgrading the release bot, regenerate the
+post-tag workflow with `shipyard release-bot hook install`. Its tag extraction
+must remain literal Bash, `tag="${GITHUB_REF#refs/tags/}"`; the double-braced
+`${{GITHUB_REF#refs/tags/}}` form is not a valid GitHub expression. Because the
+workflow checks out the release tag in detached-HEAD state, branch pushes must
+first attach the deterministic local PR branch and then use Shipyard's
+supervised push with the fully qualified `HEAD:refs/heads/<branch>` refspec.
+The full refspec alone is insufficient in repositories whose pre-push hook
+rejects detached HEAD or requires `SHIPYARD_PR_RUNNING=1`.
+Repositories that require signed bot commits should set
+`release.post_tag_hook.ssh_signing_setup_script` to a safe repository-relative
+helper path. Hook installation then regenerates the required secret-backed SSH
+signing step instead of relying on edits to the owned workflow.
+
 ## Local/SSH VM Watch
 
 Use `shipyard watch local` for long target-backed jobs that are not GitHub
@@ -218,7 +309,8 @@ hours.
 
 ### Mutating commands (require explicit flags)
 
-- `shipyard runner cleanup --fix` — cancel stale queued runs (1s gap between cancels)
+- `shipyard runner cleanup --fix` — cancel stale queued PR/merge-group runs;
+  release, push, schedule, tag, and dispatch runs are protected
 - `shipyard runner watch --fix` — auto-recovery loop (cron-friendly)
 - `shipyard runner kill --pid X --reason "..."` — kill a specific Worker; requires typed `KILL` confirmation
 
@@ -543,10 +635,129 @@ gates on: drain a still-queued cloud macOS job to local only when `free > 0`.
 Use `shipyard runner fleet-status --repo <owner/repo> --target macos --json`
 for the operator view that answers "can queued jobs actually drain?" It combines
 capacity with host-local `tartci doctor --reap --json`, supervisor heartbeat
-freshness, per-host routability, and oldest queued macOS age. It is read-only
-and exits non-zero when a host is unreadable/unhealthy or when queued macOS work
-is older than `--queued-age-threshold-secs` while routable capacity exists. Use
+freshness, Tart storage admission headroom, ccache size versus its configured
+maximum, the repository's complete registered-runner inventory, per-host
+routability, and oldest queued macOS age. Registered-runner labels make metal
+pools such as MacPro Linux and Mac Mini Intel visible without adding them as
+Tart host classes. Declare machines that should exist even before registration
+under `[runner.fleet.expected_host.<name>]`; matching is an extensible,
+case-insensitive required-label subset rather than hard-coded machine names:
+
+```toml
+[runner.fleet.expected_host.macpro]
+labels = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
+min_online = 2
+
+[runner.fleet.expected_host.macmini]
+labels = ["self-hosted", "macOS", "X64", "pulp-host-macmini"]
+
+[runner.fleet.expected_host.macbook_air]
+active = false # planned inventory: visible, but does not alert yet
+labels = ["self-hosted", "Linux", "ARM64", "pulp-host-macbook-air"]
+```
+
+Active expected hosts default to `min_online = 1`; absent or offline matches are
+reported as `expected_host_unavailable`. Inactive hosts remain visible without
+making the command unhealthy. It is read-only and exits non-zero when a host is
+unreadable/unhealthy, a merge-group Linux build requests `ubuntu-latest` while
+an online idle self-hosted Linux x64 runner exists, or queued macOS work is older
+than `--queued-age-threshold-secs` while routable capacity exists. Use
 `--queue-run-limit N` to keep live debugging snappy on a large queued backlog.
+
+The report retains optional workflows, finds queued jobs inside `in_progress`
+workflows, and compares exact merge-group SHAs. A tick spends at most two
+active-run list requests plus 50 per-run job requests; larger observations
+fail visibly with `OBSERVATION_TRUNCATED` instead of exhausting the monitor's
+own API budget. Its local snapshot detects cleared auto-merge enrollment with
+a separate 25-PR reconciliation cap and the same truncation signal.
+Release staleness uses the oldest releasable commit when available and
+conservatively falls back to the release publication age when a bounded commit
+scan proves releasable work exists but cannot recover that timestamp.
+Consume the stable reason codes rather than chat-turn counts. With host classes
+configured, `runner watch` invokes this observer by default. This path never
+uses Orchard and never mutates GitHub.
+The watcher resolves the repository default branch; use `--fleet-base` or
+`runner.watchdog.fleet_base` for a different merge target.
+
+Use `shipyard runner steward` for agent-neutral merge-on-green reconciliation.
+It observes by default; `--apply` enables exact-head guarded queue admission,
+reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
+REST direct merge is refused because GitHub cannot atomically bind both complete
+check materialization and the validated base revision; use a server-owned merge
+queue or manual merge instead. Apply mode is restricted by central mutation
+authority, durable write-ahead intent, and live revalidation immediately before
+every GitHub write. Transient retry limits are also fenced against GitHub's
+durable `run_attempt`, so losing a controller cache after an accepted rerun
+cannot reset the budget. The built-in capacity preemption preset applies only to
+explicitly advisory Pulp workflows; required workflows and unknown repositories
+are disabled because GitHub cannot bind a cancellation to an atomic job-state
+snapshot.
+
+Stewardship is opt-in per immutable head. Prefer making the receipt atomic with
+PR creation: set `[merge_steward].auto_handoff = true` on the protected base
+branch and run `shipyard pr`, optionally adding `--workstream-id ID
+--context-url URL`. Shipyard never trusts the PR branch to enable that default.
+Immediately after the PR exists and before validation starts, Shipyard writes
+the receipt; without explicit values it uses `OWNER/REPO#PR` and the PR URL.
+Use `--no-steward-handoff` only as an explicit project-default override.
+
+For an already-created PR, the submitting agent must run
+`shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
+--workstream-id ID [--context-url URL] --apply`. That command writes a
+successful `shipyard/steward-handoff` status on the expected head, re-reads the
+PR, and only then adds `shipyard:managed` and removes `shipyard:unmanaged`.
+The apply-mode steward inventories all other open PRs as `unmanaged`, adds the
+explanatory `shipyard:unmanaged` label, but never enqueues, reruns, cancels, or
+signals recovery for them. A managed semantic blocker receives one deduplicated
+`shipyard:needs-agent` label plus failed `shipyard/steward-recovery` status;
+healthy deterministic progress clears the signal. This lets a cheap recovery
+agent handle exceptions without spending model tokens on polling.
+The preferred unattended credential has Commit statuses and Issues read/write.
+A local read-oriented GitHub App that receives the exact integration-permission
+403 falls back, with a visible warning, to ambient `gh` for these low-volume
+steward status/label writes only; normal observation remains on configured auth.
+
+Read [references/merge-steward.md](references/merge-steward.md) before operating
+the steward, changing its policy, or recovering a pending cancellation.
+
+### Pulp disposable Linux health lease
+
+Use `shipyard runner local-linux-lease --repo Generous-Corp/pulp` to inspect the
+checked-in `normal-local-fast` Linux lane and decide whether its disposable Mac
+Pro pool may serve new unprivileged jobs. Dry-run is the default. `--apply`
+renews `PULP_LOCAL_LINUX_LEASE_UNTIL` only when the exact profile-derived labels
+have enough unreserved online idle runners in the exact controller-owned
+`pulp-ci-ephemeral-` name namespace after matching queued jobs reserve their
+slots. It reads `main`'s live merge-queue rule and
+requires idle capacity for the full declared `max_entries_to_build` admission
+burst; otherwise it deletes the variable. With Pulp's five-entry queue and
+two-runner fleet, automatic routing intentionally remains disarmed.
+`--apply --watch --interval-secs 60` is the durable controller form.
+The profile TTL must be 60–900 seconds, so a dead controller expires safely.
+The default accepted namespace is exactly `merge_group`, and the first target
+must include `pulp-auto-linux-x64`.
+
+An independently provisioned PR-safe pool is selected explicitly with
+`--context pr --lane linux`. It must use the complete tuple
+`PULP_PR_SAFE_LINUX_LEASE_UNTIL`, `pull_request`,
+`pulp-pr-safe-ephemeral-`, and target label `pulp-pr-safe-linux-x64`.
+The trusted and PR-safe capability labels are mutually exclusive in a target;
+mixed tuples or selectors fail closed. The live inventory must also show that
+every selector-eligible registration uses the approved prefix and lacks the
+opposite capability. The PR-safe admission burst is a
+reviewed capacity budget because GitHub exposes no repository-wide PR
+materialization cap, so this lane must remain advisory and cannot promise
+hosted fallback after assignment.
+
+This is a routing lease, not merge or runner mutation authority. It never
+changes the selector variable, dispatches or cancels a workflow, or touches the
+protected queue. Never use the generic lease for `pull_request_target`, Vellum
+trusted, WebCLAP/deploy, signing, release, or other secret-bearing work. See
+[`docs/pulp-local-linux-lease.md`](../../docs/pulp-local-linux-lease.md).
+Each fleet observation has one 20-second total budget across credential
+resolution and all GitHub pages. A slow read must emit a fail-closed
+`fleet_unreadable` decision instead of leaving the invoking controller silent;
+applied lease mutation has a separate 10-second total budget.
 
 ### Reroute watcher (cloud→local drain)
 
@@ -613,6 +824,15 @@ lives in the Studio keychain, so the signed/notarized dmg build skips
 GitHub's hosted-macOS queue. Full provider semantics:
 `skills/ci/SKILL.md` → "Runner Provider Defaults" → "The `local` provider".
 
+When the release workflow imports an ephemeral signing identity, preserve the
+runner owner's exact user keychain default and search-list order by never
+mutating either: pass the ephemeral keychain explicitly to `codesign`.
+Cleanup must run under `always()`, verify both settings stayed unchanged, and
+delete the ephemeral keychain even when signing setup fails.
+Because `codesign --keychain` does not bypass its search-list eligibility
+requirement, the workflow gives signing an isolated temporary `HOME` whose
+search list contains only the ephemeral keychain.
+
 ### CI routing profiles
 
 Use `shipyard ci profile show <name>` and
@@ -639,6 +859,10 @@ route through the helpers in `src/supervised.rs`:
   helper in `src/pr.rs`).
 - `crate::supervised::git_supervised()` instead of
   `Command::new("git")`.
+- `crate::supervised::git_push_supervised()` for a supervised push. It adds
+  OpenSSH server-alive probes when `GIT_SSH_COMMAND` is unset, preventing a
+  long pre-push gate from losing an otherwise idle GitHub SSH connection while
+  preserving caller-supplied SSH identity/proxy commands.
 - `crate::supervised::supervised(cmd)` when wrapping an
   injection-style `git_command.map_or_else(..., Command::new)`
   pattern (see `src/branch.rs` for the precedent).
@@ -652,6 +876,16 @@ everything.
 
 ## GraphQL And GitHub App Fallback Behaviour
 
+Raw queue removal is not a queue-steward operation. Install
+`scripts/ghapp_queue_removal_guard.py` at the App-authenticated `ghapp`
+chokepoint and run it against the wrapper argv before invoking the real `gh`.
+It refuses `pr merge --disable-auto`, `dequeuePullRequest`, and
+`disablePullRequestAutoMerge` unless the call comes from Shipyard's
+machine-authorized, exact-head, write-ahead-audited mutation path. A deliberate
+manual authority action requires the loud `GHAPP_ALLOW_QUEUE_REMOVAL=1`
+override. Long-running or pending advisory/self-hosted checks are never queue
+removal authority.
+
 Five operations detect `is_graphql_rate_limited` in `gh` stderr and
 fall through to a REST equivalent: PR list, PR create, PR view, PR
 snapshot (in `wait_transport`), and PR merge (in
@@ -660,6 +894,13 @@ prints a one-line user-visible notice on stderr, including the
 GraphQL reset time when a best-effort `gh api rate_limit` probe
 succeeds. Add this call to any new REST-fallback dispatch site so
 the operator-visible signal stays consistent.
+
+The PR snapshot's raw `statusCheckRollup` does not carry `isRequired`.
+`wait pr --state green` must therefore hydrate requiredness from
+`gh pr checks --required --json` before evaluating the rollup. A failed
+requiredness lookup is not permission to use `mergeable` as a green proxy:
+mark the snapshot unknown and make the evaluator fail closed. State-only waits
+such as `--state merged` remain usable from the same snapshot.
 
 GitHub App installation tokens can also be rejected by GitHub's GraphQL
 `createPullRequest` / `mergePullRequest` mutations even when the App token is
@@ -699,6 +940,46 @@ guard above, because GraphQL auto-merge can otherwise land a commit
 pushed *after* validation completed (the bug that merged pulp #3128 at a
 pre-fix SHA).
 
+### GraphQL selection sets are unverified until something runs them
+
+`gh api graphql` failures arrive as prose on stderr with no machine-readable
+code, and a malformed *document* is indistinguishable at the call site from a
+legitimate rejection. Two rules follow.
+
+**Verify a new or edited selection set against the live schema.** Nothing in
+`cargo build` checks that a field exists; a wrong guess fails only when the
+query runs, in front of an operator. Shipyard ≤0.80.1 selected
+`autoMergeRequest{id}` in the merge-queue poll query — `AutoMergeRequest` is a
+plain OBJECT implementing no interfaces, so it is not a `Node` and has never had
+an `id`. GitHub rejected the entire document. Since `queue_admission` issues that
+query *before* any mutation, merge-queue admission failed outright for every
+queue-governed repository: PRs validated green and were never enqueued.
+
+```sh
+gh api graphql -f query='{__type(name:"AutoMergeRequest"){fields{name}}}'
+```
+
+The poll query is now built by `queue_poll_query()` from a named probe constant,
+with the type's real field list pinned in `AUTO_MERGE_REQUEST_FIELDS` and
+asserted by tests — so a stale selection fails in `cargo test`, not at merge
+time. Follow that shape for any query whose selection set could drift: build it
+from constants and assert the shape, rather than inlining a string literal. Note
+that GraphQL forbids an empty selection set, so a mere presence probe still has
+to name one real field.
+
+**Never let a client defect render as a PR problem.**
+`is_graphql_malformed_query_error` classifies malformed-document stderr, and
+`post_run_merge_state` routes it to `ShipRenderState::GreenNotMergedClientDefect`
+*before* any PR-inspecting classification runs. That state renders a diagnostic
+naming Shipyard as the fault, reports `status:"green_not_merged_client_defect"`
+in `--json`, and exits `8` — distinct from `1` (validation genuinely failed) and
+from the `0` the other green-but-unmerged states keep. The classifier fails
+closed: unrecognized stderr stays an ordinary merge rejection, so genuine blocks
+never lose their branch-protection guidance. Extend
+`GRAPHQL_MALFORMED_QUERY_SIGNATURES` when GitHub adds a phrasing, and keep the
+"must NOT match" test cases — a false positive would tell an operator to report a
+Shipyard bug when their PR really was blocked.
+
 ### Flaky-required-leg wedge → rescue hand-off (`auto_rescue`)
 
 When Shipyard validated every target green but `gh pr merge` is *rejected*
@@ -736,6 +1017,32 @@ The destructive counterpart (actually invoking `rescue --rerun-failed` + arming
 auto-merge automatically, behind a default-off flag) is a planned follow-up; the
 current behavior is diagnostic-only.
 
+The standalone `shipyard rescue` operator is replacement-first. Before it can
+cancel a queued PR/merge-group run, local workflow discovery must prove that the
+workflow declares `workflow_dispatch` and that every required input is either
+resolved by the dispatch plan or safely synthesized from the PR number
+(`pr`, `pr_number`, or `pull_request_number`). Shipyard submits the replacement
+first and cancels only after GitHub accepts that dispatch. A workflow without a
+dispatch trigger, an unknown required input, or a rejected dispatch leaves the
+original run untouched. If the later cancellation fails, report the duplicate
+work as an error; never roll back by cancelling the accepted replacement.
+For a completed cancelled/failed/timed-out candidate selected by
+`--rerun-failed`, the accepted replacement is the entire transaction: leave the
+terminal original untouched. Re-arming it merely to cancel it races GitHub's
+queued transition, can return HTTP 409, and can create duplicate work.
+
+Manual `shipyard cancel <job> --reason <why>` records the supplied reason on
+the durable job. If omitted, Shipyard still records command source, host, agent,
+and PID; a reasonless terminal cancellation is never valid evidence.
+When an active local or SSH validation observes that durable cancellation, its
+progress callback returns a termination action and Shipyard kills the supervised
+process tree, including descendants. Preserve the process-tree and integration
+regressions; changing the ledger without stopping active work is not cancellation.
+
+Dry-run must use the same static dispatchability/input checks as apply. Preserve
+the negative control that a rejected dispatch produces no cancel call and the
+positive control that the Vellum-style PR input is sent before cancellation.
+
 ## Validation Gates
 
 **Before `shipyard pr` / `shipyard ship`, run the *exact* chain the `mac`
@@ -750,11 +1057,29 @@ cargo fmt --all --check \
   && cargo test --all-targets --locked
 ```
 
-**`Cargo.lock` gotcha after a version bump:** `shipyard pr` rewrites
-`Cargo.toml` / `.claude-plugin/plugin.json` but does NOT touch `Cargo.lock`,
-so the `--locked` steps then fail with a lock-vs-manifest mismatch. After any
-bump, refresh the lock (`cargo build`/`cargo check`) and commit `Cargo.lock`
-in the same PR. (`cargo fmt --all` on new modules is the other easy miss.)
+**`Cargo.lock` after a version bump — now automatic.**
+`version_bump_check.py --mode=apply` used to rewrite `Cargo.toml` and leave
+`Cargo.lock` on the old version, so the `--locked` steps above failed with
+
+```
+error: cannot update the lock file … because --locked was passed
+```
+
+before compiling anything. Every self-ship that bumped the version hit it. The
+apply step now rewrites the lockfile's workspace-member entry and stages it with
+the bump (`refresh_cargo_lock`), so no manual step is needed.
+
+It is deliberately narrow, and stays silent when it cannot be sure: it rewrites
+only the `[[package]]` block whose `name` matches and which has **no** `source`
+key, because a registry crate sharing the name does have one. Zero matches or
+more than one means it writes nothing and the `--locked` failure returns — that
+is the intended behaviour, not a regression to patch over. If you see that error
+after a bump, check `Cargo.lock` actually contains a source-less entry for the
+crate rather than reaching for `cargo update`. The rewrite is textual, so it
+works in the Python-only version-skill-check job where no `cargo` exists, and it
+is idempotent across a re-applied bump.
+
+(`cargo fmt --all` on new modules is the other easy miss.)
 
 **Ship-state SHA drift recovery (`--adopt-head`, #346):** if you amend or
 force-push a PR's tip after Shipyard recorded ship-state (e.g. adding a
@@ -871,6 +1196,14 @@ owner, but they still do not interrupt running GitHub-hosted macOS jobs. Jobs
 serialize when they claim the same checkout, PR state, evidence lane, or
 exhausted pool capacity. See `docs/local-mac-pool.md` before claiming
 multi-Mac throughput.
+
+The durable drain refills capacity per worker completion, not per admitted
+batch: when one worker finishes, Shipyard replans immediately and may start the
+next eligible job while slower siblings continue. A scheduler-deferred job must
+respect `scheduler_defer_until` and wait for a later paced pass; it must never
+hot-loop back into the slot it just released. If refill admission itself fails,
+Shipyard preserves that error but still drains active worker completions and
+durably requeues any deferred jobs before returning.
 
 For Pulp/tartci macOS VM work, prefer local queueing over hosted overflow: a
 full local fleet should leave jobs queued on the self-hosted VM labels until a

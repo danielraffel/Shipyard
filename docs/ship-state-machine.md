@@ -175,6 +175,7 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 
 | CLI command                 | Reads                                               | Writes                                                  |
 |-----------------------------|-----------------------------------------------------|---------------------------------------------------------|
+| `shipyard pr` with steward handoff | Protected `origin/<base>:.shipyard/config.toml`, or explicit `--workstream-id` / `--context-url` | After the exact PR and head are resolved but before validation is enqueued, writes the `shipyard/steward-handoff` commit status, revalidates the open PR and exact head, then adds `shipyard:managed`. This is server-owned ownership state, separate from the local `ShipState`. |
 | `shipyard ship` (fresh)     | `ShipStateStore.get(pr)` (auto-resume decision; returns None) | Saves fresh state BEFORE preflight (cli.py:2675). Calls `_update_ship_state_from_job` once after `_execute_job` ends. `archive(pr)` on MERGED. |
 | `shipyard ship --no-resume` | Same                                                | `ShipStateStore.archive_and_replace(state)` archives prior attempt; then a new `ShipState(...)` is constructed with `attempt=1` (see Bug B2). |
 | `shipyard ship --resume`    | Refuses on SHA/policy drift via `_detect_ship_state_drift` | Refreshes `pr_url` / `pr_title` / `commit_subject` on the existing state and saves (cli.py:2679–2689). |
@@ -197,6 +198,7 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **Writes:** `ShipStateStore.save(ShipState(..., dispatched_runs=[], evidence_snapshot={}))` at cli.py:2675 — **before** preflight runs at cli.py:2679
 - **Externals:** `git push -u origin <branch>` at cli.py:2602 (return code ignored — see "External matrix" below), `gh pr list` / `gh pr create` for PR number. The Rust implementation falls back to REST `gh api repos/<owner>/<repo>/pulls` when GitHub GraphQL is rate-limited, so PR creation can still produce a tracked ship-state record.
 - **Failure modes**
+  - Requested steward handoff fails (invalid workstream/context, GitHub write denial, closed PR, or exact-head mismatch) → `shipyard pr` exits before queue or validation state is created. The status is written before the label and the head is re-read between them; therefore a concurrent head move can leave only a harmless stale-head status, never a managed label authorized by that stale receipt. *Recovery: resolve the failure and resubmit the current exact head.*
   - `git push` fails silently → `find_pr_for_branch` may still find an existing PR; the local SHA may not match the remote. A fresh state is saved for a branch whose tip may not be pushed. *Recovery: none automatic — the drift check on the next resume will catch it, but between the stale push and the next resume the state claims a SHA that doesn't exist on the remote.*
   - `gh pr create` fails after the REST fallback also fails → `create_pr` raises `GhError`; `ship` exits without saving state because the save at cli.py:2675 runs only after the PR has been found or created. *Recovery: retry or create the PR through REST and run `shipyard ship --pr <n>` to track it.*
   - `save` fails (disk, permission) → `save` raises; tmp file is cleaned up by the `except` branch in `core/ship_state.py`. *Recovery: resolve disk issue, retry.*
@@ -215,7 +217,31 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   drain owner and execute it, instead of trying to start it again. If the
   scheduler starts a job only to defer it for host-pool capacity or an
   unavailable local lease, the drain owner requeues that transient `Running`
-  job so a later local macOS slot can pick it up.
+  job with a retry timestamp; admission ignores it until that timestamp expires.
+  A durable `shipyard cancel` observed by a running worker is also an execution
+  transition, not merely a queue-state update. The worker's progress callback
+  returns `ProgressAction::Terminate`; local and SSH streaming validation then
+  terminates its supervised process tree (including descendants) and preserves
+  the durable cancellation reason. A cancellation that lands during a silent
+  command is observed by the next idle heartbeat.
+  The drain owner starts a replacement as each worker completes instead of
+  waiting for the whole admitted batch, so an independent idle slot is refilled
+  while slower siblings continue. If refill admission itself fails, the owner
+  retains that first error but still consumes every active worker completion and
+  durably applies any scheduler deferral before returning the error. Completed
+  worker threads are joined as each completion arrives, keeping retained thread
+  resources bounded by active concurrency. Once the
+  job awaited by the invoking command becomes terminal, the owner stops admitting
+  replacements but drains workers it already started, allowing the command to
+  return without consuming an unbounded stream of unrelated queued work. If the
+  admission pass itself cancels the awaited job, its cancellation is applied but
+  planned replacement starts are suppressed. Refill
+  host-pool accounting counts an active worker once only when its lease member
+  is eligible for that `Running` job's matching pool reservation; fallback
+  leases outside the reserved capability set remain visible. macOS VM admission remains
+  conservative because the live Tart probe cannot identify which VMs correspond
+  to queue reservations; treating every reservation as already live can exceed
+  the fleet cap while a mixed-target job has not reached its macOS target.
 - **Externals:** `workflow_dispatch` (cloud), `find_dispatched_run` (best-effort run id discovery), `ExecutorDispatcher.{probe,diagnose,validate}`.
 - **Failure modes**
   - `workflow_dispatch` fails in add-lane → `sys.exit(1)` at cli.py:2328 before any DispatchedRun is appended. *Recovery: retry.*
@@ -253,9 +279,12 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   - `shipyard ship` treats merge-command failure as "green but not merged" and leaves the state file active for retry.
   - `shipyard auto-merge` returns `merge-failed` only when the PR is still unmerged. If `gh pr merge --delete-branch` exits nonzero after GitHub has already merged the PR (for example, local branch deletion failed because another worktree has it checked out), Shipyard archives state and exits 0 with a `cleanup_warning`.
 - **GraphQL/App-token fallback:** if `gh pr merge` fails because GraphQL is rate-limited or because the App installation token cannot access `mergePullRequest`, Shipyard falls through to `merge_pr_rest` with the same configured `GhClient`. This preserves App-token quota and avoids silently switching to ambient user auth. If GitHub rejects the REST merge endpoint too, the merge remains a normal T5 failure for retry or manual/user-auth merge.
-- **Superseded-SHA preflight (#321).** Before `merge_pr` runs, `execute_auto_merge` reads the live PR head via `fetch_live_head_sha` (snapshot or fresh `gh`/REST; accepts `headRefOid` or `head.sha`) and compares it with `shas_match` against `state.head_sha` (the SHA Shipyard actually validated). If they differ, it returns `AutoMergeOutcome::SupersededSha { validated, current }` and does **not** merge — `ship_cmd`'s `post_run_merge_state` records this as `GreenNotMerged` (state file stays active for a re-validated retry, not `STATE_MERGED`). Fail-closed: an unreadable live head does not assume safety. This client-side guard sits in front of the server-side `--match-head-commit` / `-f sha=<oid>` race-guard on the PUT, because GraphQL auto-merge can otherwise land a commit pushed *after* validation completed (the regression that merged pulp #3128 at a pre-fix SHA).
+- **Private-free rules entitlement:** merge-governance discovery first requires an authoritative `repository.mergeQueue(branch:)` response. When that response is explicitly `null` and the evaluated-rules endpoint returns GitHub's exact `Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)` plan-entitlement error, Shipyard continues through the classic exact-head merge path. Generic 401/403 responses, malformed payloads, command failures, and non-null queue authority remain fail-closed.
+- **Superseded-SHA preflight (#321).** Before `merge_pr` runs, `execute_auto_merge` reads the live PR head via `fetch_live_head_sha` (snapshot or fresh `gh`/REST; accepts `headRefOid` or `head.sha`) and compares it with `shas_match` against `state.head_sha` (the SHA Shipyard actually validated). If they differ, it returns `AutoMergeOutcome::SupersededSha { validated, current }` and does **not** merge — `ship_cmd`'s `post_run_merge_state` records this as `GreenNotMergedHeadSuperseded { validated, current }` (state file stays active for a re-validated retry, not `STATE_MERGED`). Fail-closed: an unreadable live head does not assume safety. This client-side guard sits in front of the server-side `--match-head-commit` / `-f sha=<oid>` race-guard on the PUT, because GraphQL auto-merge can otherwise land a commit pushed *after* validation completed (the regression that merged pulp #3128 at a pre-fix SHA).
+- **Malformed-GraphQL-query classification of a `MergeFailed`.** Before any PR-inspecting classification, `classify_merge_failure` runs `is_graphql_malformed_query_error` over the error. GitHub rejects an invalid GraphQL *document* with prose on `gh`'s stderr and no machine-readable code, so the phrases in `GRAPHQL_MALFORMED_QUERY_SIGNATURES` are the only signal. A match records `GreenNotMergedClientDefect` (still not `STATE_MERGED`; state stays active), which renders a hand-back naming Shipyard as the fault rather than branch protection, and is the one non-merged state with a distinct nonzero exit code (`SHIP_EXIT_MERGE_CLIENT_DEFECT` = 8). Fail-closed: unrecognized stderr stays plain `GreenNotMerged`, so a genuine block never loses its branch-protection guidance. Diagnostic only — it changes the hand-back, exit code, and `status`/`merge_error` JSON fields, never the merge action. The known instance: the merge-queue poll query selected `autoMergeRequest{id}`, which GitHub's schema does not expose, so queue *admission* (T15) failed before any mutation on every queue-governed repo.
+- **Every non-merged terminal render reports `status` + `merge_error`.** `merged:false` alone cannot distinguish a failed validation from a passed validation whose merge call broke, so the `--json` envelope carries a stable `status` tag (`validation_failed`, `green_not_merged`, `green_not_merged_flaky_required`, `green_not_merged_head_superseded`, `green_not_merged_client_defect`, `merged`) plus the reason verbatim. Exit codes are unchanged except for the client-defect state: `validation_failed` stays `1`, the other green-but-unmerged states stay `0`.
 - **Archive failure remains a store error.** If `archive(pr)` itself fails after GitHub merge succeeds, the active state file remains and the command exits nonzero. A later retry can still recover if `gh pr merge` reports "already merged" or PR-state lookup confirms `MERGED`.
-- **Flaky-required-leg classification of a `MergeFailed` (`auto_rescue`).** When `execute_auto_merge` returns `AutoMergeOutcome::MergeFailed`, `ship_cmd`'s `classify_merge_failure` inspects whether the block is a *flaky required leg*: it fetches the live `headRefOid` + `statusCheckRollup` in one `gh pr view`, and only if the head still matches `state.head_sha` runs the pure `auto_rescue::classify_wedge`. If a required check is RED and **every** red required check maps (exactly, or via `[targets.<t>].required_check_context`) to a target Shipyard validated green, `post_run_merge_state` records `GreenNotMergedFlakyRequired` (still not `STATE_MERGED`; state stays active) and the hand-back prints the `shipyard rescue <pr> --rerun-failed` recovery. Fail-closed to plain `GreenNotMerged` on any ambiguity — a red/pending check with absent `isRequired`, an unmapped red required check, an unreadable ship-state, a failed rollup fetch, or a head that advanced past the validated SHA. This is diagnostic only: it changes the hand-back text and adds a `flaky_required_recovery` JSON field, never the merge action.
+- **Flaky-required-leg classification of a `MergeFailed` (`auto_rescue`).** When `execute_auto_merge` returns `AutoMergeOutcome::MergeFailed`, `ship_cmd`'s `classify_merge_failure` inspects whether the block is a *flaky required leg*: it fetches the live `headRefOid` + `statusCheckRollup` in one `gh pr view`, and only if the head still matches `state.head_sha` runs the pure `auto_rescue::classify_wedge`. If a required check is RED and **every** red required check maps (exactly, or via `[targets.<t>].required_check_context`) to a target Shipyard validated green, `post_run_merge_state` records `GreenNotMergedFlakyRequired` (still not `STATE_MERGED`; state stays active) and the hand-back prints the `shipyard rescue <pr> --rerun-failed` recovery. Fail-closed to plain `GreenNotMerged` on any ambiguity — a red/pending check with absent `isRequired`, an unmapped red required check, an unreadable ship-state, a failed rollup fetch, or a head that advanced past the validated SHA. Runs only after the malformed-query check below, since a malformed document says nothing about mergeability. This is diagnostic only: it changes the hand-back text and adds a `flaky_required_recovery` JSON field, never the merge action.
 
 ### T6 — Refuse to merge on FAIL
 
@@ -396,6 +425,60 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
     under-lock **fresh** queue read sees the owner live, so the live re-ship is
     never abandoned (counted as `raced`).
   - Config load fails in the daemon worker → the sweep no-ops for that pass.
+
+### T15 — Native merge-queue handoff
+
+- **From:** terminal passing ship-state for an OPEN PR on a base branch whose
+  live merge-queue object or evaluated repository rules require `merge_queue`
+- **To:** active ship-state plus a GitHub-native merge-queue entry; ultimately
+  archived ship-state only after GitHub reports the PR merged
+- **Trigger:** `shipyard ship` or the one-shot `shipyard auto-merge <pr>`
+- **Stack boundary:** at each merge or enqueue mutation boundary, Shipyard
+  queries formal `PullRequest.stack` and `stackEntry` metadata. The initial
+  integration refuses a stacked PR before mutation because GitHub requires the
+  asynchronous merge API and exposes a separate durable request UUID/lifecycle.
+  If the classic boundary inspection itself exhausts GraphQL, Shipyard preserves
+  its exact-head REST fallback; GitHub's classic REST endpoint cannot merge a
+  formal stack. Observe-only pilots validate each layer and merge with
+  `gh stack merge <pr> --merge`; T15 remains the unstacked merge-queue state
+  machine until that lifecycle is modeled.
+- **Externals:** the configured `GhClient` reads the live branch merge-queue
+  object plus evaluated rules, then performs sparse GraphQL queue/PR polls and
+  calls `enqueuePullRequest(expectedHeadOid: <validated-sha>)`.
+- **Rules:** classic branches retain the direct merge path. Queue branches
+  never use the REST direct-merge fallback. The exact live head must equal the
+  validated SHA atomically on GitHub. `auto-merge` returns exit 3 while queued
+  and keeps state active; `ship` supervises until merge or a terminal queue
+  outcome.
+- **Eviction safety:** absence is actionable only after the PR was observed in
+  the queue and the enqueue settle window elapsed. Re-enqueue is allowed only
+  for `invalid_merge_commit`. `failed_checks`, manual/unknown removal, a
+  never-observed arm, malformed/truncated authority data, and head drift are
+  terminal without mutation. Observed membership and attempt timestamps are
+  durable across process restarts. HTTP 403/rate-limit responses are never
+  retried.
+- **Idempotency:** a later one-shot first polls the queue. An already queued PR
+  is not armed again; a terminal removal newer than the current ship-state is
+  not rearmed. A new validated head creates newer ship-state and may be armed.
+- **Revocation authority:** an active ship-state owns native auto-merge and
+  queue authority only while its validated `head_sha` still equals the live PR
+  head. A same-head base retarget may revoke that authority through the audited
+  mutation path. A stale state must not disable or dequeue the newer head;
+  pending required, advisory, or self-hosted checks do not create revocation
+  authority, regardless of their age.
+- **Fleet authority:** `[merge_queue].mutation_machine` is required in the
+  trusted machine-global `config.toml` reported by `shipyard paths`; tracked
+  project and checkout-local overlays are ignored. The machine-global runner
+  tag must match before any GraphQL mutation is started.
+  Queue writes are serialized with a machine-global lock shared by hold/resume,
+  so a successful hold waits out any admitted writer and no later writer can
+  pass the sentinel. Resume removes only the hold, not the authority policy.
+- **Provenance:** every mutation writes `started` and `finished` JSONL records
+  under `merge_queue/mutations.jsonl`, including correlation id, machine tag,
+  PID, repo, base, PR, validated head, action, and outcome. A normal unwind or
+  ambiguous transport result records `outcome=uncertain`; after hard
+  termination, `merge-queue status` classifies an unmatched `started` row as
+  uncertain. It is never silently converted into permission to retry.
 
 ## Diagnostic: orphan reporting (no transition)
 

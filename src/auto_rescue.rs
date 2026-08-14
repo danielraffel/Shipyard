@@ -464,6 +464,10 @@ mod tests {
             attempt: 1,
             created_at: now,
             updated_at: now,
+            merge_queue_observed_at: None,
+            merge_queue_attempt_started_at: None,
+            merge_queue_enqueue_succeeded_at: None,
+            merge_queue_enqueue_started_at: None,
             abandoned: None,
         };
         state

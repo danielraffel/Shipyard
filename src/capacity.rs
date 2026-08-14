@@ -51,6 +51,11 @@ pub struct HostClassConfig {
     /// The `tartci` binary/wrapper to invoke for host-local doctor/fleet
     /// probes. Defaults to `tartci`; override for non-interactive SSH.
     pub tartci_bin: String,
+    /// Optional GitHub CLI command exposed to tartci as `TARTCI_GH_CLI`.
+    /// When absent, Shipyard preserves the local environment and tartci's
+    /// default; set this to an App-authenticated wrapper such as `ghapp` when
+    /// the ambient user token is unavailable or intentionally not used.
+    pub github_cli: Option<String>,
     /// Optional Tart store to expose as `TART_HOME` while reading this host.
     /// Use an absolute path; shell expansion is intentionally not performed.
     pub tart_home: Option<String>,
@@ -64,12 +69,15 @@ pub struct HostClassConfig {
 ///
 /// # Errors
 /// Returns a human-readable message when a class entry is malformed (not a
-/// table, non-string `ssh`/`tart_bin`/`tartci_bin`/`tart_home`,
+/// table, non-string `ssh`/`tart_bin`/`tartci_bin`/`github_cli`/`tart_home`,
 /// non-integer/negative `cap`, or a `labels` that is not an array of strings).
 pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> {
-    let Some(classes) = data.get("host_class").and_then(TomlValue::as_table) else {
+    let Some(value) = data.get("host_class") else {
         return Ok(Vec::new());
     };
+    let classes = value
+        .as_table()
+        .ok_or_else(|| "host_class must be a table".to_owned())?;
     let mut out = Vec::with_capacity(classes.len());
     for (class, value) in classes {
         let table = value
@@ -101,6 +109,11 @@ pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> 
             Some(TomlValue::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
             Some(_) => return Err(format!("host_class.{class}.tartci_bin must be a string")),
         };
+        let github_cli = match table.get("github_cli") {
+            None => None,
+            Some(TomlValue::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+            Some(_) => return Err(format!("host_class.{class}.github_cli must be a string")),
+        };
         let tart_home = match table.get("tart_home") {
             Some(TomlValue::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
             None | Some(TomlValue::String(_)) => None,
@@ -124,6 +137,7 @@ pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> 
             cap,
             tart_bin,
             tartci_bin,
+            github_cli,
             tart_home,
             labels,
         });
@@ -406,6 +420,7 @@ mod tests {
         assert_eq!(classes[0].cap, DEFAULT_CAP);
         assert_eq!(classes[0].tart_bin, "tart");
         assert_eq!(classes[0].tartci_bin, "tartci");
+        assert_eq!(classes[0].github_cli, None);
         assert_eq!(classes[1].class, "studio");
         assert_eq!(classes[1].cap, 4);
         assert_eq!(classes[1].ssh.as_deref(), Some("studio-ci.local"));
@@ -423,6 +438,11 @@ mod tests {
                 .expect("parse")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn parse_host_classes_rejects_non_table_section() {
+        assert!(parse_host_classes(&table("host_class = \"disabled\"\n")).is_err());
     }
 
     #[test]
@@ -450,6 +470,13 @@ mod tests {
     fn parse_host_classes_rejects_bad_tartci_bin() {
         let cfg = table("[host_class.studio]\ntartci_bin = []\n");
         assert!(parse_host_classes(&cfg).is_err());
+    }
+
+    #[test]
+    fn parse_host_classes_reads_github_cli() {
+        let cfg = table("[host_class.studio]\ngithub_cli = \"ghapp\"\n");
+        let classes = parse_host_classes(&cfg).expect("parse");
+        assert_eq!(classes[0].github_cli.as_deref(), Some("ghapp"));
     }
 
     #[test]
@@ -594,6 +621,7 @@ mod tests {
             cap: 2,
             tart_bin: "/opt/homebrew/bin/tart".to_owned(),
             tartci_bin: "/Users/ci/.local/bin/tartci".to_owned(),
+            github_cli: None,
             tart_home: Some("/Users/ci user/VMs".to_owned()),
             labels: Vec::new(),
         };

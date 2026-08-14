@@ -185,6 +185,7 @@ pub(super) fn logs_command<W: Write>(
 
 pub(super) fn cancel_command<W: Write>(
     job_id: &str,
+    reason: Option<&str>,
     state_dir: &Path,
     json_mode: bool,
     stdout: &mut W,
@@ -193,8 +194,21 @@ pub(super) fn cancel_command<W: Write>(
     let job = queue
         .get(job_id)?
         .ok_or_else(|| CliFailure::new(1, format!("Job {job_id} not found")))?;
+    let host = std::env::var("WHENCE_HOST")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_owned());
+    let agent = std::env::var("WHENCE_AGENT").unwrap_or_else(|_| "unknown-agent".to_owned());
+    let reason = reason.map_or_else(
+        || {
+            format!(
+                "Manual cancellation via shipyard cancel (host={host}, agent={agent}, pid={})",
+                std::process::id()
+            )
+        },
+        str::to_owned,
+    );
     let cancelled = job
-        .cancel()
+        .cancel_with_reason(Some(reason))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     queue.update(&cancelled)?;
     if json_mode {
@@ -389,7 +403,7 @@ fn write_queue_human<W: Write>(
 }
 
 fn open_queue(state_dir: &Path) -> Result<Queue, CliFailure> {
-    Queue::new(state_dir.join("queue")).map_err(|error| CliFailure::new(1, error.to_string()))
+    Queue::new(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
 fn queue_value(job: Option<Job>) -> Result<Value, CliFailure> {
