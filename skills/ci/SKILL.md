@@ -1342,3 +1342,11 @@ reads. Timeout is a reportable `fleet_unreadable` clear decision, including in
 not wrap this operator in an unbounded `gh` polling loop.
 
 **`RELEASE_BOT_TOKEN` is required for the auto-release chain to fire.** Without it, auto-release silently degrades — tags get created via `GITHUB_TOKEN` but GitHub doesn't trigger workflows on `GITHUB_TOKEN`-pushed tags, so `release.yml` never runs and no binaries ship. Run `shipyard doctor` to check; if the secret is missing, follow the "One-time setup" section in `RELEASING.md`. `shipyard pr` will also print a heads-up before pushing the PR if the secret isn't present.
+
+**Vellum local-runner ownership mismatch:** GitHub `offline + busy` is a
+reconciliation signal, not ordinary capacity and not permission to cancel a
+job. Correlate `shipyard runner status` with `tartci doctor --reap --json`
+twice across a bounded interval; record the exact runner, VM, lease,
+supervisor, and job IDs. Preserve protected-queue work while ownership is
+live or uncertain. Only an exact `offline_busy_orphaned_no_local_owner`
+finding permits the documented, job-specific recovery and replacement proof.

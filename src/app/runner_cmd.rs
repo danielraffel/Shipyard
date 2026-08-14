@@ -367,6 +367,9 @@ fn emit_status_report<W: Write>(
                     stdout,
                     "ERR: runner is not online; investigate before trusting CI."
                 )?;
+                for symptom in &report.symptoms {
+                    writeln!(stdout, "  - {}", format_symptom_human(symptom))?;
+                }
             }
             RunnerHealth::Stuck => {
                 writeln!(stdout, "WARN: stuck-state symptoms detected:")?;
@@ -407,6 +410,9 @@ fn emit_status_report<W: Write>(
 
 fn format_symptom_human(symptom: &Symptom) -> String {
     match symptom {
+        Symptom::OfflineBusy => {
+            "offline_busy: GitHub reports busy while the runner is offline; reconcile local VM/lease/job ownership before recovery".to_owned()
+        }
         Symptom::OrphanedBusy => {
             "orphaned_busy: runner.busy=true but no Runner.Worker process visible (usually clears in 1-5 min)".to_owned()
         }

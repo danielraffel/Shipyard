@@ -115,6 +115,10 @@ impl RunnerHealth {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Symptom {
+    /// GitHub reports a runner busy while the runner is offline. This is a
+    /// reconciliation condition; it is not proof that the associated job is
+    /// safe to cancel.
+    OfflineBusy,
     /// API reports busy but no `Runner.Worker` process is visible.
     OrphanedBusy,
     /// A `Runner.Worker` has been running longer than `max_job_min` minutes.
@@ -136,6 +140,7 @@ impl Symptom {
     #[must_use]
     pub fn tag(&self) -> &'static str {
         match self {
+            Self::OfflineBusy => "offline_busy",
             Self::OrphanedBusy => "orphaned_busy",
             Self::HungWorker { .. } => "hung_worker",
             Self::StaleQueuedRuns { .. } => "stale_queued_runs",
@@ -212,9 +217,14 @@ pub fn assess_runner(
     now: DateTime<Utc>,
 ) -> RunnerReport {
     if snapshot.status != "online" {
+        let symptoms = if snapshot.busy {
+            vec![Symptom::OfflineBusy]
+        } else {
+            Vec::new()
+        };
         return RunnerReport {
             health: RunnerHealth::Offline,
-            symptoms: Vec::new(),
+            symptoms,
             stale_queued_runs: Vec::new(),
             worker_count: snapshot.worker_count,
             busy: snapshot.busy,
@@ -493,6 +503,20 @@ mod tests {
         assert_eq!(report.health, RunnerHealth::Offline);
         assert_eq!(report.health.exit_code(), 2);
         assert!(report.symptoms.is_empty());
+    }
+
+    #[test]
+    fn offline_busy_runner_is_reported_as_reconciliation_condition() {
+        let snapshot = RunnerSnapshot {
+            status: "offline".to_owned(),
+            busy: true,
+            worker_count: 0,
+            oldest_worker_age_min: None,
+        };
+        let report = assess_runner(&snapshot, &[], WatchdogThresholds::default(), Utc::now());
+        assert_eq!(report.health, RunnerHealth::Offline);
+        assert!(matches!(report.symptoms.as_slice(), [Symptom::OfflineBusy]));
+        assert_eq!(report.health.exit_code(), 2);
     }
 
     #[test]
