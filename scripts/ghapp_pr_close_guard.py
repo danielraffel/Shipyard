@@ -6,12 +6,13 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
 import sys
 from collections.abc import Callable
 from typing import Any, NamedTuple
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 
 class GuardError(RuntimeError):
@@ -56,7 +57,7 @@ def option_values(args: list[str], names: set[str]) -> list[str]:
 
 def option_value(args: list[str], names: set[str]) -> str | None:
     values = option_values(args, names)
-    return values[0] if values else None
+    return values[-1] if values else None
 
 
 def field_values(args: list[str]) -> list[str]:
@@ -151,7 +152,10 @@ def api_target(args: list[str]) -> ApiTarget:
                 or parts.password is not None
             ):
                 raise GuardError("cannot inspect absolute API endpoint")
-        path = resolve_api_placeholders(path.lstrip("/"))
+        if re.search(r"%(?![0-9A-Fa-f]{2})", path):
+            raise GuardError("cannot inspect malformed encoded API endpoint")
+        path = posixpath.normpath(unquote(path)).lstrip("/")
+        path = resolve_api_placeholders(path)
         return ApiTarget(path, parse_qs(parts.query, keep_blank_values=True), hostname)
     return ApiTarget("", {}, hostname)
 

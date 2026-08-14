@@ -310,6 +310,37 @@ class PrCloseGuardTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("closePullRequest", message)
 
+    def test_last_repeated_method_flag_controls_close_classification(self) -> None:
+        self.assertEqual(
+            guard.close_request(
+                [
+                    "api",
+                    "-XGET",
+                    "-XPATCH",
+                    "repos/o/r/pulls/7",
+                    "-fstate=closed",
+                ]
+            ),
+            guard.CloseRequest(repo="o/r", pr=7),
+        )
+
+    def test_encoded_close_endpoints_are_canonicalized(self) -> None:
+        self.assertEqual(
+            guard.close_request(
+                ["api", "-XPATCH", "repos/o/r/%70ulls/7", "-fstate=closed"]
+            ),
+            guard.CloseRequest(repo="o/r", pr=7),
+        )
+        code, message, _ = self.run_guard(
+            [
+                "api",
+                "%67raphql",
+                "-fquery=mutation { closePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("closePullRequest", message)
+
     def test_rest_endpoint_placeholders_are_resolved_before_close_classification(self) -> None:
         with mock.patch.dict(os.environ, {"GH_REPO": "o/r"}, clear=True):
             self.assertEqual(
