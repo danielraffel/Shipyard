@@ -153,8 +153,8 @@ tartci exposes read-only profile and host status commands:
 
 ```bash
 tartci profile list
-tartci profile explain normal-local-fast --repo danielraffel/pulp --json
-tartci profile plan normal-local-fast --repo danielraffel/pulp --json
+tartci profile explain normal-local-fast --repo Generous-Corp/pulp --json
+tartci profile plan normal-local-fast --repo Generous-Corp/pulp --json
 tartci status --json
 ```
 
@@ -163,7 +163,7 @@ without requiring tartci:
 
 ```bash
 shipyard ci profile show normal-local-fast
-shipyard ci profile plan normal-local-fast --repo danielraffel/pulp --json
+shipyard ci profile plan normal-local-fast --repo Generous-Corp/pulp --json
 ```
 
 The Shipyard command searches `.tartci/<name>.toml`,

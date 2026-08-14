@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "repository": "danielraffel/pulp",
+  "repository": "Generous-Corp/pulp",
   "recipe": "pulp-linux.json",
   "policy": {
     "controller_fetch": "forbidden",

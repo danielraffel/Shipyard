@@ -9,6 +9,6 @@
     "danielraffel": 25807
   },
   "repositories": {
-    "danielraffel/pulp": "/etc/shipyard-review/recipes/pulp-linux.json"
+    "Generous-Corp/pulp": "/etc/shipyard-review/recipes/pulp-linux.json"
   }
 }
