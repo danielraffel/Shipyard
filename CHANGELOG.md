@@ -3,6 +3,79 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0902"></a>
+## [0.90.2] - 2026-08-14
+
+- fix(wait): resolve required PR checks safely ([#419](https://github.com/danielraffel/Shipyard/pull/419))
+
+<a id="v0901"></a>
+## [0.90.1] - 2026-08-14
+
+- fix(wait): query supported PR fields ([#418](https://github.com/danielraffel/Shipyard/pull/418))
+
+<a id="v0900"></a>
+## [0.90.0] - 2026-08-14
+
+- feat(pr): atomically hand off steward ownership ([#417](https://github.com/danielraffel/Shipyard/pull/417))
+
+<a id="v0890"></a>
+## [0.89.0] - 2026-08-14
+
+- fix/steward unmanaged label 20260814 ([#416](https://github.com/danielraffel/Shipyard/pull/416))
+
+<a id="v0884"></a>
+## [0.88.4] - 2026-08-14
+
+- fix/steward run attempt fence 20260814 ([#415](https://github.com/danielraffel/Shipyard/pull/415))
+
+<a id="v0883"></a>
+## [0.88.3] - 2026-08-14
+
+- fix: stop active validation after cancellation ([#414](https://github.com/danielraffel/Shipyard/pull/414))
+
+<a id="v0882"></a>
+## [0.88.2] - 2026-08-14
+
+- fix: make rescue replacement terminal-safe ([#413](https://github.com/danielraffel/Shipyard/pull/413))
+
+<a id="v0881"></a>
+## [0.88.1] - 2026-08-14
+
+- fix(rescue): preserve runs until replacement accepted ([#412](https://github.com/danielraffel/Shipyard/pull/412))
+- docs: explain runner group app access ([#411](https://github.com/danielraffel/Shipyard/pull/411))
+
+<a id="v0880"></a>
+## [0.88.0] - 2026-08-14
+
+- feat: add durable exact-head steward handoff ([#410](https://github.com/danielraffel/Shipyard/pull/410))
+
+<a id="v0874"></a>
+## [0.87.4] - 2026-08-13
+
+- fix(queue): guard exact-head removal authority ([#408](https://github.com/danielraffel/Shipyard/pull/408))
+
+<a id="v0873"></a>
+## [0.87.3] - 2026-08-13
+
+- fix/local linux lease process group 20260813 ([#407](https://github.com/danielraffel/Shipyard/pull/407))
+
+<a id="v0872"></a>
+## [0.87.2] - 2026-08-13
+
+- fix/release codesign keychain 20260813 ([#406](https://github.com/danielraffel/Shipyard/pull/406))
+
+<a id="v0871"></a>
+## [0.87.1] - 2026-08-13
+
+- fix(release): preserve macOS user keychain state ([#405](https://github.com/danielraffel/Shipyard/pull/405))
+
+<a id="v0870"></a>
+## [0.87.0] - 2026-08-13
+
+- feat(runner): harden PR-safe Linux lease release ([#404](https://github.com/danielraffel/Shipyard/pull/404))
+- feat/pr safe local linux lease 20260813 ([#403](https://github.com/danielraffel/Shipyard/pull/403))
+- feat: add fail-closed Pulp local Linux health lease ([#402](https://github.com/danielraffel/Shipyard/pull/402))
+
 <a id="v0860"></a>
 ## [0.86.0] - 2026-08-13
 
@@ -787,6 +860,20 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.90.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.2
+[0.90.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.1
+[0.90.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.0
+[0.89.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.89.0
+[0.88.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.4
+[0.88.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.3
+[0.88.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.2
+[0.88.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.1
+[0.88.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.0
+[0.87.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.4
+[0.87.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.3
+[0.87.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.2
+[0.87.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.1
+[0.87.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.0
 [0.86.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.86.0
 [0.85.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.85.0
 [0.84.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.84.0

@@ -158,7 +158,8 @@ pub struct WindowsValidationRequest<'a> {
     /// Validation mode label.
     pub mode: String,
     /// Optional progress callback.
-    pub progress_callback: Option<&'a mut dyn FnMut(ProgressEvent)>,
+    pub progress_callback:
+        Option<&'a mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction>,
 }
 
 /// Result of checking the uploaded bundle on the remote Windows host.
@@ -478,7 +479,9 @@ impl<O: WindowsOperations> WindowsExecutor<O> {
     fn validate_once(
         &self,
         request: &WindowsValidationRequest<'_>,
-        progress_callback: Option<&mut dyn FnMut(ProgressEvent)>,
+        progress_callback: Option<
+            &mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction,
+        >,
     ) -> TargetResult {
         let started_at = Utc::now();
         let start_time = Instant::now();

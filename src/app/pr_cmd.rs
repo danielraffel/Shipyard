@@ -26,7 +26,16 @@ pub(super) struct PrCommandArgs {
     /// Forwarded to `ship`: adopt the current head SHA on recorded-state drift
     /// (amend / force-push) instead of failing. See Shipyard #346.
     pub(super) adopt_head: bool,
+    pub(super) workstream_id: Option<String>,
+    pub(super) context_url: Option<String>,
+    pub(super) steward_handoff_preference: StewardHandoffPreference,
     pub(super) python_command: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StewardHandoffPreference {
+    ProjectDefault,
+    Disabled,
 }
 
 struct PrGates {
@@ -72,6 +81,14 @@ pub(super) fn pr_command<W: Write>(
             "--skip-skill-update requires --skill-reason \"...\".",
         ));
     }
+    if args.steward_handoff_preference == StewardHandoffPreference::Disabled
+        && (args.workstream_id.is_some() || args.context_url.is_some())
+    {
+        return Err(CliFailure::new(
+            2,
+            "--no-steward-handoff conflicts with --workstream-id/--context-url.",
+        ));
+    }
 
     let trailers = shortcut_trailers(&args);
     if !trailers.is_empty() {
@@ -106,6 +123,8 @@ pub(super) fn pr_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error))?;
     }
 
+    let steward_handoff =
+        resolve_steward_handoff(&args, protected_base_auto_handoff(cwd, &args.base));
     writeln!(stdout, "▸ Handing off to `shipyard ship`")
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     ship_command(
@@ -122,6 +141,7 @@ pub(super) fn pr_command<W: Write>(
             allow_unreachable_targets: args.allow_unreachable_targets,
             skip_targets: args.skip_targets,
             adopt_head: args.adopt_head,
+            steward_handoff,
         },
         config,
         cwd,
@@ -129,6 +149,29 @@ pub(super) fn pr_command<W: Write>(
         json_mode,
         stdout,
     )
+}
+
+fn resolve_steward_handoff(
+    args: &PrCommandArgs,
+    protected_default: bool,
+) -> Option<super::ship_cmd::ShipStewardHandoff> {
+    (args.steward_handoff_preference != StewardHandoffPreference::Disabled
+        && (protected_default || args.workstream_id.is_some() || args.context_url.is_some()))
+    .then(|| super::ship_cmd::ShipStewardHandoff {
+        workstream_id: args.workstream_id.clone(),
+        context_url: args.context_url.clone(),
+    })
+}
+
+fn protected_base_auto_handoff(cwd: &Path, base: &str) -> bool {
+    // Security policy must come from the protected base, never the PR branch:
+    // otherwise an untrusted contribution could opt its own head into mutation.
+    let spec = format!("origin/{base}:.shipyard/config.toml");
+    git_output(cwd, &["show", &spec])
+        .ok()
+        .and_then(|contents| contents.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("merge_steward")?.get("auto_handoff")?.as_bool())
+        .unwrap_or(false)
 }
 
 fn resolve_pr_gates(repo_root: &Path, config: &LoadedConfig) -> Result<PrGates, CliFailure> {
@@ -537,6 +580,9 @@ mod tests {
             skip_skill_update: Vec::new(),
             skill_reason: None,
             adopt_head: false,
+            workstream_id: None,
+            context_url: None,
+            steward_handoff_preference: StewardHandoffPreference::ProjectDefault,
             python_command: None,
         }
     }
@@ -632,6 +678,92 @@ mod tests {
                 String::from("Skill-Update: skip skill=ci reason=\"docs-only\"")
             ]
         );
+    }
+
+    #[test]
+    fn steward_handoff_is_project_default_or_cli_opt_in_with_opt_out() {
+        let automatic = resolve_steward_handoff(&pr_args(), true).expect("default");
+        assert!(automatic.workstream_id.is_none());
+
+        let explicit = PrCommandArgs {
+            workstream_id: Some(String::from("GEN-7")),
+            context_url: Some(String::from("https://linear.example/GEN-7")),
+            ..pr_args()
+        };
+        let resolved = resolve_steward_handoff(&explicit, false).expect("explicit");
+        assert_eq!(resolved.workstream_id.as_deref(), Some("GEN-7"));
+
+        let disabled = PrCommandArgs {
+            steward_handoff_preference: StewardHandoffPreference::Disabled,
+            ..pr_args()
+        };
+        assert!(resolve_steward_handoff(&disabled, true).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_handoff_default_is_read_from_protected_origin_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let remote = temp.path().join("remote.git");
+        let repo = temp.path().join("repo");
+        git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("config dir");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(&repo, &["config", "user.name", "test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        std::fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[merge_steward]\nauto_handoff = true\n",
+        )
+        .expect("config");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[merge_steward]\nauto_handoff = false\n",
+        )
+        .expect("untrusted branch config");
+
+        assert!(protected_base_auto_handoff(&repo, "main"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_branch_cannot_enable_auto_handoff() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let remote = temp.path().join("remote.git");
+        let repo = temp.path().join("repo");
+        git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("config dir");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(&repo, &["config", "user.name", "test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        std::fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[merge_steward]\nauto_handoff = false\n",
+        )
+        .expect("config");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        git(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(
+            repo.join(".shipyard/config.toml"),
+            "[merge_steward]\nauto_handoff = true\n",
+        )
+        .expect("untrusted branch config");
+
+        assert!(!protected_base_auto_handoff(&repo, "main"));
     }
 
     #[cfg(unix)]

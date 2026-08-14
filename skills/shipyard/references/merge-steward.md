@@ -20,7 +20,48 @@ may differ. Repositories without a server-owned
 merge queue receive a typed `direct_merge_refused` decision: the REST merge
 endpoint cannot atomically prove complete required-check materialization or
 bind the validated base revision. Use manual merge or enable a native merge
-queue. Add the `shipyard:no-auto-merge` label to opt a PR out.
+queue.
+
+The transient retry ceiling is fenced twice: the local ledger records intent
+before mutation, and GitHub's durable `run_attempt` must still be within the
+configured budget at live revalidation. Losing a controller cache after GitHub
+accepted a rerun therefore cannot authorize another retry on the next pass.
+
+Ownership is explicit. Before the steward may mutate a PR, the submitting
+agent writes an exact-head receipt and management label:
+
+```bash
+shipyard runner steward-handoff \
+  --repo Generous-Corp/pulp \
+  --pr 123 \
+  --head "$FULL_HEAD_SHA" \
+  --workstream-id GEN-7 \
+  --context-url https://linear.app/example/issue/GEN-7 \
+  --apply
+```
+
+The command validates the open PR and expected SHA, writes the successful
+`shipyard/steward-handoff` commit status, re-reads the PR head, and only then
+adds `shipyard:managed`. A status stranded on an older head is harmless: the
+steward requires the receipt on the current immutable head. PRs without both
+signals are reported as `unmanaged` or `handoff_missing` and receive no queue,
+rerun, cancellation, or recovery mutation. Add `shipyard:no-auto-merge` to opt
+an otherwise managed PR out.
+
+Semantic blockers (`required_failed` or a conflicting/dirty `needs_update`)
+produce a failed `shipyard/steward-recovery` status and the
+`shipyard:needs-agent` label. This pair is deduplicated on the immutable head;
+normal waiting does not summon an agent. When deterministic reconciliation
+observes recovery, it marks the recovery status successful and clears the
+label. A cheap routed agent can consume this durable exception signal without
+polling every healthy PR.
+
+For unattended operation, the configured App or workflow token needs Commit
+statuses and Issues read/write. A local read-oriented App that returns the exact
+`Resource not accessible by integration` rejection falls back visibly to
+ambient `gh` for these low-volume status/label mutations only. High-volume
+observation remains on configured auth; a controller should not rely on ambient
+fallback.
 
 Capacity preemption is an explicit repository policy. The built-in Pulp policy
 may preempt at most one in-progress PR workflow per pass when an exact

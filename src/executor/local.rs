@@ -198,7 +198,8 @@ pub struct LocalValidationRequest<'a> {
     /// Validation mode label.
     pub mode: String,
     /// Optional progress callback.
-    pub progress_callback: Option<&'a mut dyn FnMut(ProgressEvent)>,
+    pub progress_callback:
+        Option<&'a mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction>,
 }
 
 impl LocalValidationRequest<'_> {
@@ -295,7 +296,9 @@ impl LocalExecutor {
         command: &str,
         context: &LocalRunContext<'_>,
         contract: Option<&ContractConfig>,
-        mut progress_callback: Option<&mut dyn FnMut(ProgressEvent)>,
+        mut progress_callback: Option<
+            &mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction,
+        >,
     ) -> TargetResult {
         let mut request = StreamingCommand::shell(command);
         request.cwd.clone_from(&context.target.cwd);
@@ -317,7 +320,9 @@ impl LocalExecutor {
         validation: &LocalValidationConfig,
         identity: RunIdentity<'_>,
         context: &LocalRunContext<'_>,
-        mut progress_callback: Option<&mut dyn FnMut(ProgressEvent)>,
+        mut progress_callback: Option<
+            &mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction,
+        >,
     ) -> TargetResult {
         if let Some(parent) = context.log_path.parent()
             && let Err(error) = fs::create_dir_all(parent)
@@ -1200,6 +1205,7 @@ mod tests {
                 if let Some(phase) = event.phase {
                     phases.push(phase);
                 }
+                crate::executor::streaming::ProgressAction::Continue
             };
             request.progress_callback = Some(&mut callback);
             LocalExecutor::default().validate(request).status

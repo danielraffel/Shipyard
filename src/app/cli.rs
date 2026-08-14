@@ -121,6 +121,9 @@ pub(super) enum Command {
     Cancel {
         /// Job identifier.
         job_id: String,
+        /// Durable operator/controller reason recorded on the cancelled job.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Change the priority of a pending job.
     Bump {
@@ -314,6 +317,16 @@ pub(super) enum Command {
         /// SHA drift (Shipyard #346).
         #[arg(long = "adopt-head")]
         adopt_head: bool,
+        /// Durable workstream identifier for an atomic merge-steward handoff.
+        /// Also enables handoff when the project default is disabled.
+        #[arg(long = "workstream-id", conflicts_with = "no_steward_handoff")]
+        workstream_id: Option<String>,
+        /// Durable context URL for the steward receipt. Defaults to the PR URL.
+        #[arg(long = "context-url", conflicts_with = "no_steward_handoff")]
+        context_url: Option<String>,
+        /// Disable a project-configured automatic steward handoff.
+        #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
+        no_steward_handoff: bool,
     },
     /// Cloud runner operations.
     Cloud {
@@ -963,6 +976,63 @@ pub(super) enum RunnerCommand {
         /// Alert when releasable work, measured no earlier than publication, exceeds this age.
         #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
         release_stale_threshold_secs: i64,
+    },
+    /// Maintain an expiring repository-variable lease for an approved local
+    /// Linux CI lane. Dry-run unless `--apply` is supplied.
+    LocalLinuxLease {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Checked-in CI routing profile name.
+        #[arg(long, default_value = "normal-local-fast")]
+        profile: String,
+        /// Explicit profile path. Defaults to Shipyard's normal profile search.
+        #[arg(long = "profile-file")]
+        profile_file: Option<PathBuf>,
+        /// Profile context containing the lease declaration.
+        #[arg(long, default_value = "merge_group")]
+        context: String,
+        /// Profile lane containing the lease declaration.
+        #[arg(long, default_value = "linux")]
+        lane: String,
+        /// Renew or clear the repository variable. Without this flag, print
+        /// the decision without changing GitHub.
+        #[arg(long)]
+        apply: bool,
+        /// Continue probing and renewing until interrupted.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between watch ticks. Must be shorter than the lease TTL.
+        #[arg(long = "interval-secs", default_value_t = 60)]
+        interval_secs: u64,
+        /// Stop after N ticks. Test hook.
+        #[arg(long = "max-ticks", hide = true)]
+        max_ticks: Option<u32>,
+    },
+    /// Hand an exact pull-request head to the merge steward.
+    ///
+    /// Dry-run is the default. Apply mode writes a successful commit-status
+    /// receipt on the expected head, then labels the PR as managed only after
+    /// re-reading that the head is still exact.
+    StewardHandoff {
+        /// Owner/repo slug. Defaults to the current repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull-request number.
+        #[arg(long)]
+        pr: u64,
+        /// Full immutable head SHA expected by the submitting agent.
+        #[arg(long)]
+        head: String,
+        /// Durable work item identifier, such as GEN-7.
+        #[arg(long = "workstream-id")]
+        workstream_id: String,
+        /// Durable context URL, such as a Linear issue or planning document.
+        #[arg(long = "context-url")]
+        context_url: Option<String>,
+        /// Write the receipt and managed label. Without this flag, only audit.
+        #[arg(long)]
+        apply: bool,
     },
     /// Audit and conservatively advance merge-on-green across repositories.
     ///
@@ -1773,7 +1843,7 @@ impl From<PathMode> for RuntimeMode {
 mod tests {
     use clap::Parser;
 
-    use super::Cli;
+    use super::{Cli, Command, RunnerCommand};
 
     #[test]
     fn queue_observer_rejects_zero_max_polls() {
@@ -1785,5 +1855,19 @@ mod tests {
             Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "1",])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn local_linux_lease_defaults_to_trusted_merge_group_context() {
+        let cli = Cli::try_parse_from(["shipyard", "runner", "local-linux-lease"])
+            .expect("default local Linux lease command");
+        let Command::Runner {
+            command: RunnerCommand::LocalLinuxLease { context, lane, .. },
+        } = cli.command
+        else {
+            panic!("expected local Linux lease command");
+        };
+        assert_eq!(context, "merge_group");
+        assert_eq!(lane, "linux");
     }
 }

@@ -101,9 +101,32 @@ For broader Shipyard inspection, common read-only repository permissions are:
 | Contents | Read-only |
 | Actions | Read-only, or Read & write if Shipyard must cancel/dispatch workflows |
 | Checks | Read-only |
-| Commit statuses | Read-only |
-| Pull requests | Read-only |
+| Commit statuses | Read & write when using steward handoff/recovery; otherwise read-only |
+| Issues | Read & write when using steward ownership/recovery labels |
+| Pull requests | Read & write for queue stewardship; otherwise read-only |
 | Metadata | Always available |
+
+Organization runner-group inspection is a separate permission surface:
+
+| Permission | Suggested level |
+|---|---|
+| Self-hosted runners | Read-only when an operator integration lists or verifies organization runner-group policy; Read & write only when it configures groups or removes registrations |
+
+Repository `Actions` permission does not grant access to
+`/orgs/<org>/actions/runner-groups/...`. Shipyard does not currently perform this
+organization-policy comparison itself. The permission lets an App-backed
+verifier deployed alongside Shipyard fail closed when a trusted group's selected
+repositories, selected workflows, or live runners drift from policy. It enables one control plane to
+coordinate heterogeneous capacity without confusing the providers: for example,
+TartCI-managed macOS VMs on Apple Silicon, a separate Proxmox x64 Linux pool,
+and native Intel macOS/Metal hardware.
+
+If a read-oriented App rejects a low-volume steward status or label mutation
+with GitHub's exact `Resource not accessible by integration` response,
+Shipyard prints an explicit warning and retries that mutation with ambient
+`gh` credentials only. Unattended controllers should grant the App (or their
+workflow `GITHUB_TOKEN`) the write permissions above so they never depend on
+an interactive user's ambient login.
 
 After creating the app:
 
@@ -122,6 +145,12 @@ chmod 600 ~/.config/shipyard/github-apps/shipyard-local.private-key.pem
 5. Choose `All repositories` if your goal is the scaled repository-count
    bucket.
 6. Save the App ID and Installation ID.
+
+When you add or raise a permission later, saving the App definition does not
+update an existing installation automatically. Approve its pending permission
+update, then expire or replace cached installation tokens. Tokens minted before
+approval retain the old permission set and commonly fail with
+`403 Resource not accessible by integration`.
 
 The installation ID is visible in the installation URL:
 
@@ -200,6 +229,30 @@ github-auth: ok command helper (github-app-installation)
 REST (core): .../12500 remaining
 GraphQL: .../12500 remaining
 ```
+
+If the installation should inspect a runner group, mint a token with the
+configured helper and use it for these probes. The helper emits JSON, so this
+example extracts the token without assuming a separately installed `ghapp`
+wrapper:
+
+```bash
+app_token="$(scripts/shipyard-github-app-token \
+  --app-id <app-id> \
+  --installation-id <installation-id> \
+  --private-key </absolute/path/to/private-key.pem> \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+GH_TOKEN="$app_token" gh api orgs/<org>/actions/runner-groups/<group-id>
+GH_TOKEN="$app_token" gh api orgs/<org>/actions/runner-groups/<group-id>/repositories
+GH_TOKEN="$app_token" gh api orgs/<org>/actions/runner-groups/<group-id>/runners
+unset app_token
+```
+
+For `403 Resource not accessible by integration`, compare the App's requested
+organization permission with the installation's approved permission, approve
+any pending update, and mint a fresh token before changing to a broader
+credential. Other 403 responses can be primary or secondary rate limiting;
+inspect the response message and `X-RateLimit-Remaining` before changing
+permissions.
 
 To export and re-import the non-secret auth config:
 
