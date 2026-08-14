@@ -233,18 +233,25 @@ GraphQL: .../12500 remaining
 If the installation should inspect a runner group, mint a token with the
 configured helper and use it for these probes. The helper emits JSON, so this
 example extracts the token without assuming a separately installed `ghapp`
-wrapper:
+wrapper. The App must permit installation on the target organization and must
+be installed there; an installation owned only by a personal account cannot
+read that organization's runner groups even when it has repository access:
 
 ```bash
+app_id="123456"
+installation_id="987654"
+private_key="/absolute/path/to/private-key.pem"
+org="Generous-Corp"
+group_id="3"
 app_token="$(scripts/shipyard-github-app-token \
-  --app-id <app-id> \
-  --installation-id <installation-id> \
-  --private-key </absolute/path/to/private-key.pem> \
+  --app-id "$app_id" \
+  --installation-id "$installation_id" \
+  --private-key "$private_key" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
-GH_TOKEN="$app_token" gh api orgs/<org>/actions/runner-groups/<group-id>
-GH_TOKEN="$app_token" gh api orgs/<org>/actions/runner-groups/<group-id>/repositories
-GH_TOKEN="$app_token" gh api orgs/<org>/actions/runner-groups/<group-id>/runners
-unset app_token
+GH_TOKEN="$app_token" gh api "orgs/$org/actions/runner-groups/$group_id"
+GH_TOKEN="$app_token" gh api "orgs/$org/actions/runner-groups/$group_id/repositories"
+GH_TOKEN="$app_token" gh api "orgs/$org/actions/runner-groups/$group_id/runners"
+unset app_token app_id installation_id private_key org group_id
 ```
 
 For `403 Resource not accessible by integration`, compare the App's requested

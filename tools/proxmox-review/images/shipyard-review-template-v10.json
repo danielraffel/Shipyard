@@ -9,7 +9,7 @@
     "stable_config_sha256": "acfd65566faabd9240baf3fb1a630b974e71e3e88bf8dd4867946c82589a180d",
     "user_data_sha256": "5d309276ffc3f9c66f4b50bf9622953d1123f9b92cf32c8a020e7158667426e5",
     "guest_runner_sha256": "f4b949d337fbbd11f7b053ca0050f543d9a2aad765219ee4a6e78d6781cd49f4",
-    "dependency_inventory_sha256": "31ab3bd4a6bfe0666ee890f2eec4e8831138f1ecfc730586894df0eb97bc0936"
+    "dependency_inventory_sha256": "2062e2cd0802cec9425d76c4701bf962cca30b50a5c6d6fdb61252b74007f5af"
   },
   "networkless_boot": {
     "virtual_network_devices": 0,
