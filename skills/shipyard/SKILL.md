@@ -1245,10 +1245,10 @@ For Vellum's repository-scoped disposable lanes, treat an `offline + busy`
 runner as an ownership mismatch until TartCI proves otherwise. Run the bounded
 two-snapshot check, correlate the exact VM/lease/supervisor and in-progress job,
 and preserve the protected queue while the result is live or uncertain. The
-`offline_busy_orphaned_no_local_owner` result is the only basis for the narrow
-documented recovery of that exact job and runner. Never bulk-cancel busy
-runners, reset shared names, broaden a trusted group, or use a fresh worktree
-as a reason to register another runner.
+current `offline_busy_wait_for_github` result never authorizes recovery; preserve
+and escalate until a future pinned TartCI version supplies a machine-checked
+orphan verdict. Never bulk-cancel busy runners, reset shared names, broaden a
+trusted group, or use a fresh worktree as a reason to register another runner.
 
 ## Cloud Retargeting
 

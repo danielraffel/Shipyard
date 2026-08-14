@@ -238,11 +238,13 @@ not a cancellation instruction. For Vellum's repository-scoped disposable
 lanes, correlate it with `tartci doctor --reap --json`: require two bounded
 observations and record the VM, lease, supervisor, runner, and associated job
 IDs. If local ownership is live or uncertain, keep the protected job running.
-Only after TartCI proves `offline_busy_orphaned_no_local_owner` may the narrow
-documented recovery cancel that exact stale job and remove that exact runner;
-Shipyard must never bulk-cancel busy runners, reset shared names, or bypass a
-merge queue. A fresh assignment and teardown proof is required before local
-capacity is considered healthy again.
+Current TartCI reports `offline_busy_runner:<name>` with action
+`offline_busy_wait_for_github`; it does not infer orphanhood, so that result
+must be preserved and escalated rather than canceled or reaped. A future
+machine-checked orphan verdict requires a TartCI implementation and pin update
+before it can authorize narrow recovery. Shipyard must never bulk-cancel busy
+runners, reset shared names, or bypass a merge queue. A fresh assignment and
+teardown proof is required before local capacity is considered healthy again.
 
 ## Explicit Cloud Fallback
 

@@ -1348,5 +1348,7 @@ reconciliation signal, not ordinary capacity and not permission to cancel a
 job. Correlate `shipyard runner status` with `tartci doctor --reap --json`
 twice across a bounded interval; record the exact runner, VM, lease,
 supervisor, and job IDs. Preserve protected-queue work while ownership is
-live or uncertain. Only an exact `offline_busy_orphaned_no_local_owner`
-finding permits the documented, job-specific recovery and replacement proof.
+live or uncertain. Current TartCI emits `offline_busy_wait_for_github`, not a
+machine-checked orphan verdict, so preserve and escalate that state. Do not
+invent recovery authority from missing telemetry; a future orphan verdict must
+land in TartCI and be pinned before job-specific recovery is permitted.
