@@ -43,8 +43,8 @@ shipyard evidence command --list
 
 # Runner metrics
 shipyard metrics record --project pulp --job linux-arm64 --step compile --duration 18.4s --target linux-arm64 --backend local --provider tart-linux --host macstudio
-shipyard metrics import github --repo danielraffel/pulp --workflow build.yml --limit 10
-tartci runtime export --repo danielraffel/pulp | shipyard metrics import tartci
+shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
+tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics summary --project pulp --json
 shipyard metrics slowest --project pulp --limit 20
 shipyard metrics watch --project pulp --since 14d --json

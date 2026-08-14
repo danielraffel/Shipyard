@@ -6,6 +6,11 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 <a id="v0910"></a>
 ## [0.91.0] - 2026-08-14
 
+<a id="v0903"></a>
+## [0.90.3] - 2026-08-14
+
+- fix(ci): flag unproven local x64 profile targets ([#400](https://github.com/danielraffel/Shipyard/pull/400))
+
 <a id="v0902"></a>
 ## [0.90.2] - 2026-08-14
 
@@ -863,6 +868,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.90.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.3
 [0.90.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.2
 [0.90.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.1
 [0.90.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.0

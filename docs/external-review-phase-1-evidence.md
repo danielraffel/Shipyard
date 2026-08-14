@@ -36,7 +36,7 @@ does not activate the lane.
 
 - Protected template VM 132 is stopped, has no NIC, and is pinned by composite
   manifest SHA-256
-  `54e61a991ae71c9fdbcd630d005bb9cd31e2a6e9335c6462f2727e9d6465f976`.
+  `b900281f05f02e451acf0383f5e96fb74a35e75265b4af0c57b7b690b0a671da`.
 - Its stopped 80-GiB logical root digest is
   `6b9718177488469106bb6673c146cf222fecfe2c36e6328e327422ff5c030e46`.
   With `systemd-networkd-wait-online` masked, a no-NIC boot brought QEMU Guest

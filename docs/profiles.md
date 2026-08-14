@@ -153,8 +153,8 @@ tartci exposes read-only profile and host status commands:
 
 ```bash
 tartci profile list
-tartci profile explain normal-local-fast --repo danielraffel/pulp --json
-tartci profile plan normal-local-fast --repo danielraffel/pulp --json
+tartci profile explain normal-local-fast --repo Generous-Corp/pulp --json
+tartci profile plan normal-local-fast --repo Generous-Corp/pulp --json
 tartci status --json
 ```
 
@@ -163,7 +163,7 @@ without requiring tartci:
 
 ```bash
 shipyard ci profile show normal-local-fast
-shipyard ci profile plan normal-local-fast --repo danielraffel/pulp --json
+shipyard ci profile plan normal-local-fast --repo Generous-Corp/pulp --json
 ```
 
 The Shipyard command searches `.tartci/<name>.toml`,
@@ -176,6 +176,12 @@ issue-on-failure policies in commented TOML. Its target IDs are stable routing
 vocabulary, not GitHub labels. Each target maps to a concrete `runs-on` selector
 such as `["self-hosted","Windows","ARM64","pulp-build-windows"]` or
 `"windows-latest"`.
+
+Self-managed x64 targets must set `proven = true` only after a real job has
+claimed and completed on that exact selector. Until then, `plan` emits a
+warning so a profile cannot silently promote an unverified architecture or
+label set. GitHub-hosted and Namespace cloud targets are exempt because their
+provider owns the architecture claim.
 
 Shipyard's job is to consume those facts across hosts:
 
@@ -202,10 +208,11 @@ eligible unrelated PRs and turns a local routing issue into queue-wide
 serialization. Once the proof is complete, remove the label and let the normal
 steward arm protected auto-merge for that PR.
 
-For Pulp, the normal fast profile is expected to route PR macOS/Linux/Windows to
-local ARM64 VMs first where those lanes are enabled, then fall back to GitHub
-where configured, while scheduled nightly Intel Linux/Windows validation stays
-on GitHub-hosted x64 runners. Coverage targets must use dedicated ephemeral
+For Pulp, the normal fast profile routes PR macOS and Windows to local ARM64
+VMs first, and ordinary Linux PR work to the disposable Mac Pro x64 selector
+`["self-hosted","Linux","X64","pulp-build-linux-x64","pulp-host-macpro"]`,
+then falls back to GitHub only when live capacity is absent. Scheduled nightly
+Intel Linux/Windows validation stays on GitHub-hosted x64 runners. Coverage targets must use dedicated ephemeral
 labels; do not route coverage to a warm bare-metal build pool. Pulp's current
 repo-specific variables and labels live in Pulp's own docs and
 `.shipyard/ci-profiles/` files so Shipyard docs do not stale on Pulp operations.

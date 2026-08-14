@@ -29,7 +29,7 @@ mention_private_security_probes = false
 include_raw_logs = false
 require_next_owner_and_action = true
 
-[repositories."danielraffel/pulp"]
+[repositories."Generous-Corp/pulp"]
 alignment_document = "VISION.md"
 license = "MIT"
 require_realtime_review_for_signal_changes = true

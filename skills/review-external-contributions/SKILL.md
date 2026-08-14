@@ -29,6 +29,9 @@ boundary, exact-head validation, evidence redaction, or human merge gate.
    If it is unavailable, report `unverified`; never fall back to a maintainer
    machine. The untrusted job VM must have no virtual NIC or IP configuration;
    controller-side GitHub access is not guest network access.
+   When the checked-in dependency inventory changes, refresh every controller
+   and template `dependency_inventory_sha256` pin in the same change; a stale
+   pin correctly fails admission before any guest starts.
 5. Consolidate actionable feedback. Separate blockers from suggestions and
    post ordinary, specific GitHub review comments when authorized. Do not
    mention private security probes or expose raw untrusted logs.
