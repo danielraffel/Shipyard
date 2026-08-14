@@ -181,8 +181,13 @@ Fields:
   Zero on pure-polling transport.
 - `transient_errors` — count of recoverable snapshot/auth failures retried
   without dropping the waiter. Permanent auth/configuration failures are not
-  counted because they terminate immediately.
+  counted because they terminate immediately. The count is preserved when
+  `wait run --success` exits 4 for a terminal non-success conclusion.
 - `elapsed_seconds` — wall-clock since the CLI was invoked.
+
+Credential preparation and each `gh` snapshot attempt share the waiter's
+remaining overall timeout. A retry is never started after that deadline, and a
+snapshot subprocess that consumes the remaining budget is terminated.
 
 ## MVP tradeoffs
 

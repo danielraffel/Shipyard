@@ -14,8 +14,9 @@ use crate::config::LoadedConfig;
 use crate::output::write_json_envelope;
 use crate::wait as wait_logic;
 use crate::wait_transport::{
-    WaitOutcome, fetch_pr_snapshot, fetch_release_snapshot, fetch_run_snapshot, pr_event_filter,
-    read_snapshot_file, release_event_filter, run_event_filter, wait_for_condition,
+    WaitOutcome, fetch_pr_snapshot_with_timeout, fetch_release_snapshot_with_timeout,
+    fetch_run_snapshot_with_timeout, pr_event_filter, read_snapshot_file, release_event_filter,
+    run_event_filter, wait_for_condition_with_timeout,
 };
 
 pub(super) fn wait_command<W: Write>(
@@ -109,14 +110,14 @@ fn wait_release<W: Write>(
     let repo = resolve_repo_slug(repo_override, cwd)?;
     let manifest = release_manifest(mode, cwd)?;
     let event_filter = release_event_filter(version, &repo);
-    let outcome = wait_for_condition(
+    let outcome = wait_for_condition_with_timeout(
         |snapshot| {
             wait_logic::evaluate_release(snapshot, manifest.as_deref())
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
         },
-        || match snapshot_file {
+        |remaining| match snapshot_file {
             Some(path) => read_snapshot_file(path),
-            None => fetch_release_snapshot(&repo, version, cwd),
+            None => fetch_release_snapshot_with_timeout(&repo, version, cwd, remaining),
         },
         event_filter,
         timeout_seconds,
@@ -159,7 +160,7 @@ fn wait_pr<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let repo = resolve_repo_slug(repo_override, cwd)?;
     let event_filter = pr_event_filter(pr_number, &repo);
-    let outcome = wait_for_condition(
+    let outcome = wait_for_condition_with_timeout(
         |snapshot| match state {
             WaitPrState::Green => wait_logic::evaluate_pr_green(snapshot),
             WaitPrState::Merged => wait_logic::evaluate_pr_state(snapshot, "merged")
@@ -167,9 +168,9 @@ fn wait_pr<W: Write>(
             WaitPrState::Closed => wait_logic::evaluate_pr_state(snapshot, "closed")
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
         },
-        || match snapshot_file {
+        |remaining| match snapshot_file {
             Some(path) => read_snapshot_file(path),
-            None => fetch_pr_snapshot(&repo, pr_number, cwd),
+            None => fetch_pr_snapshot_with_timeout(&repo, pr_number, cwd, remaining),
         },
         event_filter,
         timeout_seconds,
@@ -219,37 +220,52 @@ fn wait_run<W: Write>(
         "require_success": require_success,
     });
 
-    match wait_for_condition(
-        |snapshot| wait_logic::evaluate_run(snapshot, require_success),
-        || match snapshot_file {
+    let mut terminal_wrong = false;
+    let result = wait_for_condition_with_timeout(
+        |snapshot| evaluate_run_for_wait(snapshot, require_success, &mut terminal_wrong),
+        |remaining| match snapshot_file {
             Some(path) => read_snapshot_file(path),
-            None => fetch_run_snapshot(&repo, run_id, cwd),
+            None => fetch_run_snapshot_with_timeout(&repo, run_id, cwd, remaining),
         },
         event_filter,
         timeout_seconds,
         poll_interval,
         no_fallback,
         socket_path,
-    ) {
-        Ok(outcome) => {
+    );
+    match result {
+        Ok(mut outcome) => {
+            if terminal_wrong {
+                outcome.matched = false;
+            }
             render_wait_outcome(stdout, json, "wait:run", condition, &outcome)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            Ok(wait_exit_code(&outcome))
-        }
-        Err(error) => {
-            if let Some(run_failed) = error.downcast_ref::<wait_logic::RunFailedFastError>() {
-                let outcome = WaitOutcome {
-                    observed: run_failed.observed.clone(),
-                    transport: "polling".to_owned(),
-                    daemon_unavailable: true,
-                    ..WaitOutcome::default()
-                };
-                render_wait_outcome(stdout, json, "wait:run", condition, &outcome)
-                    .map_err(|render_error| CliFailure::new(1, render_error.to_string()))?;
+            if terminal_wrong {
                 return Ok(ExitCode::from(WAIT_EXIT_RUN_TERMINAL_WRONG));
             }
-            Err(wait_failure(error.as_ref()))
+            Ok(wait_exit_code(&outcome))
         }
+        Err(error) => Err(wait_failure(error.as_ref())),
+    }
+}
+
+fn evaluate_run_for_wait(
+    snapshot: Option<&Value>,
+    require_success: bool,
+    terminal_wrong: &mut bool,
+) -> crate::wait_transport::WaitResult<crate::wait::TruthResult> {
+    match wait_logic::evaluate_run(snapshot, require_success) {
+        Ok(result) => Ok(result),
+        Err(error) => match error.downcast::<wait_logic::RunFailedFastError>() {
+            Ok(run_failed) => {
+                *terminal_wrong = true;
+                Ok(crate::wait::TruthResult {
+                    matched: true,
+                    observed: run_failed.observed,
+                })
+            }
+            Err(error) => Err(error),
+        },
     }
 }
 
@@ -414,15 +430,17 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        RuntimeMode, WaitOutcome, WaitPrState, parse_github_repo_slug, release_manifest,
-        render_wait_outcome, resolve_repo_slug, wait_exit_code, wait_failure, wait_pr,
-        wait_release, wait_run,
+        RuntimeMode, WaitOutcome, WaitPrState, evaluate_run_for_wait, parse_github_repo_slug,
+        release_manifest, render_wait_outcome, resolve_repo_slug, wait_exit_code, wait_failure,
+        wait_pr, wait_release, wait_run,
     };
     use crate::app::{
         WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_RUN_TERMINAL_WRONG, WAIT_EXIT_TIMEOUT,
         WAIT_EXIT_UNSUPPORTED,
     };
+    use crate::gh::GhPrepareError;
     use crate::wait as wait_logic;
+    use crate::wait_transport::wait_for_condition_with_timeout;
 
     #[test]
     fn parse_github_repo_slug_supports_common_remote_forms() {
@@ -769,6 +787,46 @@ artifacts = [
         assert_eq!(payload["matched"], false);
         assert_eq!(payload["observed"]["run_id"], 100);
         assert_eq!(payload["observed"]["conclusion"], "failure");
+    }
+
+    #[test]
+    fn wait_run_failure_fast_preserves_transient_snapshot_count() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut calls = 0;
+        let mut terminal_wrong = false;
+        let mut outcome = wait_for_condition_with_timeout(
+            |snapshot| evaluate_run_for_wait(snapshot, true, &mut terminal_wrong),
+            |_| {
+                calls += 1;
+                if calls == 1 {
+                    return Err(Box::new(GhPrepareError::HelperFailed {
+                        program: "helper".to_owned(),
+                        status: Some(1),
+                        stderr: "service unavailable".to_owned(),
+                    }) as Box<dyn std::error::Error>);
+                }
+                Ok(Some(serde_json::json!({
+                    "databaseId": 100,
+                    "status": "completed",
+                    "conclusion": "failure"
+                })))
+            },
+            |_| true,
+            1.0,
+            0.01,
+            false,
+            &temp.path().join("missing.sock"),
+        )
+        .expect("terminal failure should stop the wait");
+
+        assert!(terminal_wrong);
+        assert!(outcome.matched);
+        assert_eq!(outcome.transient_errors, 1);
+        assert_eq!(outcome.observed["conclusion"], "failure");
+
+        outcome.matched = false;
+        assert!(!outcome.matched);
+        assert!(!outcome.timed_out);
     }
 
     fn git(cwd: &Path, args: &[&str]) {
