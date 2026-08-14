@@ -1298,4 +1298,10 @@ A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever the ma
 
 **Manual release fallback:** `./scripts/release.sh` still exists for emergencies but is no longer the happy path. Normal releases flow through `shipyard pr` → merge → auto-release workflow.
 
+**Local Linux lease liveness:** one `runner local-linux-lease` fleet
+observation has a single 20-second budget across auth plus all paginated GitHub
+reads. Timeout is a reportable `fleet_unreadable` clear decision, including in
+`--json` mode; applied variable mutation has a separate 10-second budget. Do
+not wrap this operator in an unbounded `gh` polling loop.
+
 **`RELEASE_BOT_TOKEN` is required for the auto-release chain to fire.** Without it, auto-release silently degrades — tags get created via `GITHUB_TOKEN` but GitHub doesn't trigger workflows on `GITHUB_TOKEN`-pushed tags, so `release.yml` never runs and no binaries ship. Run `shipyard doctor` to check; if the secret is missing, follow the "One-time setup" section in `RELEASING.md`. `shipyard pr` will also print a heads-up before pushing the PR if the secret isn't present.

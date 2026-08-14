@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread::sleep;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Deserialize;
@@ -22,6 +22,31 @@ use super::CliFailure;
 use crate::cloud::GitHubActions;
 use crate::output::{SCHEMA_VERSION, write_json_envelope};
 use crate::runner_provision::ApiLabel;
+
+const FLEET_OBSERVATION_TIMEOUT: StdDuration = StdDuration::from_secs(20);
+const LEASE_MUTATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+
+struct ObservationBudget {
+    deadline: Instant,
+}
+
+impl ObservationBudget {
+    fn new(timeout: StdDuration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+        }
+    }
+
+    fn run_gh(&self, actions: &GitHubActions, args: &[String]) -> Result<String, String> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("fleet observation exhausted its total time budget".to_owned());
+        }
+        actions
+            .run_gh_with_timeout(args, remaining)
+            .map_err(|error| error.to_string())
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct LeaseRunner {
@@ -167,20 +192,7 @@ pub(super) fn local_linux_lease_command<W: Write>(
                     observed_at,
                 )
             }
-            Err(error) => {
-                let observed_at = Utc::now();
-                LeaseDecision {
-                    action: LeaseAction::Clear,
-                    observed_at,
-                    expires_at: None,
-                    matching: 0,
-                    online: 0,
-                    idle: 0,
-                    queued: 0,
-                    available: 0,
-                    reason: format!("fleet_unreadable: {error}"),
-                }
-            }
+            Err(error) => unreadable_decision(&error),
         };
         let (mutation, mutation_failed) = if args.apply {
             mutation_for_tick(
@@ -214,6 +226,20 @@ pub(super) fn local_linux_lease_command<W: Write>(
     }
 }
 
+fn unreadable_decision(error: &str) -> LeaseDecision {
+    LeaseDecision {
+        action: LeaseAction::Clear,
+        observed_at: Utc::now(),
+        expires_at: None,
+        matching: 0,
+        online: 0,
+        idle: 0,
+        queued: 0,
+        available: 0,
+        reason: format!("fleet_unreadable: {error}"),
+    }
+}
+
 fn mutation_for_tick(
     result: Result<String, CliFailure>,
     watch: bool,
@@ -233,14 +259,35 @@ fn observe_fleet(
     events: &[String],
     declared_burst: usize,
 ) -> Result<FleetObservation, String> {
-    let queued_matching_jobs = fetch_queued_matching_jobs(actions, repo, required_labels)?;
+    observe_fleet_with_timeout(
+        actions,
+        repo,
+        required_labels,
+        merge_queue_branch,
+        events,
+        declared_burst,
+        FLEET_OBSERVATION_TIMEOUT,
+    )
+}
+
+fn observe_fleet_with_timeout(
+    actions: &GitHubActions,
+    repo: &str,
+    required_labels: &[String],
+    merge_queue_branch: &str,
+    events: &[String],
+    declared_burst: usize,
+    timeout: StdDuration,
+) -> Result<FleetObservation, String> {
+    let budget = ObservationBudget::new(timeout);
+    let queued_matching_jobs = fetch_queued_matching_jobs(actions, repo, required_labels, &budget)?;
     let live_burst = if events == ["merge_group"] {
-        fetch_merge_queue_build_concurrency(actions, repo, merge_queue_branch)?
+        fetch_merge_queue_build_concurrency(actions, repo, merge_queue_branch, &budget)?
     } else {
         declared_burst
     };
     Ok(FleetObservation {
-        runners: fetch_runners(actions, repo)?,
+        runners: fetch_runners(actions, repo, &budget)?,
         queued_matching_jobs,
         observed_admission_burst: live_burst,
     })
@@ -250,9 +297,10 @@ fn fetch_merge_queue_build_concurrency(
     actions: &GitHubActions,
     repo: &str,
     branch: &str,
+    budget: &ObservationBudget,
 ) -> Result<usize, String> {
-    let raw = actions
-        .run_gh(&merge_queue_rules_args(repo, branch))
+    let raw = budget
+        .run_gh(actions, &merge_queue_rules_args(repo, branch))
         .map_err(|error| format!("failed to read rules for branch {branch}: {error}"))?;
     parse_merge_queue_build_concurrency(&raw, branch)
 }
@@ -295,15 +343,22 @@ fn parse_merge_queue_build_concurrency(raw: &str, branch: &str) -> Result<usize,
     })
 }
 
-fn fetch_runners(actions: &GitHubActions, repo: &str) -> Result<Vec<LeaseRunner>, String> {
-    let raw = actions
-        .run_gh(&[
-            "api".to_owned(),
-            "--paginate".to_owned(),
-            format!("repos/{repo}/actions/runners?per_page=100"),
-            "--jq".to_owned(),
-            ".runners[]".to_owned(),
-        ])
+fn fetch_runners(
+    actions: &GitHubActions,
+    repo: &str,
+    budget: &ObservationBudget,
+) -> Result<Vec<LeaseRunner>, String> {
+    let raw = budget
+        .run_gh(
+            actions,
+            &[
+                "api".to_owned(),
+                "--paginate".to_owned(),
+                format!("repos/{repo}/actions/runners?per_page=100"),
+                "--jq".to_owned(),
+                ".runners[]".to_owned(),
+            ],
+        )
         .map_err(|error| format!("failed to list runners: {error}"))?;
     raw.lines()
         .filter(|line| !line.trim().is_empty())
@@ -318,17 +373,21 @@ fn fetch_queued_matching_jobs(
     actions: &GitHubActions,
     repo: &str,
     required_labels: &[String],
+    budget: &ObservationBudget,
 ) -> Result<usize, String> {
     let mut run_ids = BTreeSet::new();
     for status in ["queued", "in_progress", "requested", "waiting", "pending"] {
-        let raw = actions
-            .run_gh(&[
-                "api".to_owned(),
-                "--paginate".to_owned(),
-                format!("repos/{repo}/actions/runs?status={status}&per_page=100"),
-                "--jq".to_owned(),
-                ".workflow_runs[].id".to_owned(),
-            ])
+        let raw = budget
+            .run_gh(
+                actions,
+                &[
+                    "api".to_owned(),
+                    "--paginate".to_owned(),
+                    format!("repos/{repo}/actions/runs?status={status}&per_page=100"),
+                    "--jq".to_owned(),
+                    ".workflow_runs[].id".to_owned(),
+                ],
+            )
             .map_err(|error| format!("failed to list {status} workflow runs: {error}"))?;
         for line in raw.lines().filter(|line| !line.trim().is_empty()) {
             run_ids.insert(
@@ -345,14 +404,17 @@ fn fetch_queued_matching_jobs(
         .collect::<BTreeSet<_>>();
     let mut queued = 0usize;
     for run_id in run_ids {
-        let raw = actions
-            .run_gh(&[
-                "api".to_owned(),
-                "--paginate".to_owned(),
-                format!("repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100"),
-                "--jq".to_owned(),
-                ".jobs[]".to_owned(),
-            ])
+        let raw = budget
+            .run_gh(
+                actions,
+                &[
+                    "api".to_owned(),
+                    "--paginate".to_owned(),
+                    format!("repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100"),
+                    "--jq".to_owned(),
+                    ".jobs[]".to_owned(),
+                ],
+            )
             .map_err(|error| format!("failed to list jobs for workflow run {run_id}: {error}"))?;
         for line in raw.lines().filter(|line| !line.trim().is_empty()) {
             let job = serde_json::from_str::<LeaseJob>(line)
@@ -484,6 +546,17 @@ fn apply_decision(
     variable: &str,
     decision: &LeaseDecision,
 ) -> Result<String, CliFailure> {
+    apply_decision_with_timeout(actions, repo, variable, decision, LEASE_MUTATION_TIMEOUT)
+}
+
+fn apply_decision_with_timeout(
+    actions: &GitHubActions,
+    repo: &str,
+    variable: &str,
+    decision: &LeaseDecision,
+    timeout: StdDuration,
+) -> Result<String, CliFailure> {
+    let budget = ObservationBudget::new(timeout);
     let path = format!("repos/{repo}/actions/variables/{variable}");
     match decision.action {
         LeaseAction::Renew => {
@@ -492,15 +565,20 @@ fn apply_decision(
                 .expect("renew decisions always carry an expiry")
                 .to_rfc3339_opts(SecondsFormat::Secs, true);
             let patch_args = variable_write_args("PATCH", &path, variable, &expires_at);
-            match actions.run_gh(&patch_args) {
+            match budget.run_gh(actions, &patch_args) {
                 Ok(_) => Ok("renewed".to_owned()),
-                Err(error) if is_not_found(&error.to_string()) => {
+                Err(error) if is_not_found(&error) => {
                     let create_path = format!("repos/{repo}/actions/variables");
                     let create_args =
                         variable_write_args("POST", &create_path, variable, &expires_at);
-                    actions.run_gh(&create_args).map_err(|create_error| {
-                        CliFailure::new(1, format!("failed to create health lease: {create_error}"))
-                    })?;
+                    budget
+                        .run_gh(actions, &create_args)
+                        .map_err(|create_error| {
+                            CliFailure::new(
+                                1,
+                                format!("failed to create health lease: {create_error}"),
+                            )
+                        })?;
                     Ok("created".to_owned())
                 }
                 Err(error) => Err(CliFailure::new(
@@ -516,7 +594,7 @@ fn apply_decision(
                 "DELETE".to_owned(),
                 path,
             ];
-            actions.run_gh(&args).map_err(|error| {
+            budget.run_gh(actions, &args).map_err(|error| {
                 CliFailure::new(
                     1,
                     format!("fleet is unhealthy and health lease clear failed: {error}"),
@@ -641,6 +719,14 @@ mod tests {
     use super::*;
     use crate::runner_provision::ApiLabel;
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).expect("write executable");
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod executable");
+    }
+
     fn runner(name: &str, status: &str, busy: bool, labels: &[&str]) -> LeaseRunner {
         LeaseRunner {
             name: name.to_owned(),
@@ -672,6 +758,71 @@ mod tests {
         let one_shot =
             mutation_for_tick(Err(CliFailure::new(1, "transient GitHub failure")), false);
         assert!(one_shot.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fleet_observation_timeout_is_bounded_and_renderable_as_fail_closed_json() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = temp.path().join("gh");
+        write_executable(&gh, "#!/bin/sh\nsleep 30\n");
+        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh);
+        let started = Instant::now();
+        let error = observe_fleet_with_timeout(
+            &actions,
+            "owner/repo",
+            &["self-hosted".to_owned()],
+            "main",
+            &["merge_group".to_owned()],
+            5,
+            StdDuration::from_millis(150),
+        )
+        .expect_err("slow GitHub read must fail closed");
+        assert!(started.elapsed() < StdDuration::from_secs(3));
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+
+        let decision = unreadable_decision(&error);
+        let mut output = Vec::new();
+        emit_decision(
+            &mut output,
+            true,
+            1,
+            "owner/repo",
+            "PULP_LOCAL_LINUX_LEASE_UNTIL",
+            &["merge_group".to_owned()],
+            &decision,
+            "dry_run",
+            false,
+        )
+        .expect("emit fail-closed JSON");
+        let envelope: Value = serde_json::from_slice(&output).expect("valid JSON envelope");
+        assert_eq!(envelope["action"], "clear");
+        assert_eq!(envelope["mutation"], "dry_run");
+        assert!(envelope["reason"].as_str().is_some_and(
+            |reason| reason.contains("fleet_unreadable") && reason.contains("timed out")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applied_clear_timeout_is_bounded_and_caller_survives() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = temp.path().join("gh");
+        write_executable(&gh, "#!/bin/sh\nsleep 30\n");
+        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh);
+        let decision = unreadable_decision("GitHub observation timed out");
+        let started = Instant::now();
+        let error = apply_decision_with_timeout(
+            &actions,
+            "owner/repo",
+            "PULP_LOCAL_LINUX_LEASE_UNTIL",
+            &decision,
+            StdDuration::from_millis(150),
+        )
+        .expect_err("slow clear mutation must fail closed");
+        assert!(started.elapsed() < StdDuration::from_secs(3));
+        assert!(error.message.contains("clear failed"));
+        assert!(error.message.contains("timed out"));
     }
 
     fn labels() -> Vec<String> {

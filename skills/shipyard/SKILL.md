@@ -728,6 +728,10 @@ changes the selector variable, dispatches or cancels a workflow, or touches the
 protected queue. Never use the generic lease for `pull_request_target`, Vellum
 trusted, WebCLAP/deploy, signing, release, or other secret-bearing work. See
 [`docs/pulp-local-linux-lease.md`](../../docs/pulp-local-linux-lease.md).
+Each fleet observation has one 20-second total budget across credential
+resolution and all GitHub pages. A slow read must emit a fail-closed
+`fleet_unreadable` decision instead of leaving the invoking controller silent;
+applied lease mutation has a separate 10-second total budget.
 
 ### Reroute watcher (cloud→local drain)
 

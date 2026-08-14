@@ -108,7 +108,12 @@ atomic admission control.
 
 The renewal expiry is computed only after the runner, job, and branch-rule
 observations finish, then written as `observation_completed_at +
-health_lease_ttl_seconds`. Insufficient
+health_lease_ttl_seconds`. A tick gives the complete GitHub observation a
+single 20-second wall-clock budget, including credential preparation and every
+paginated run/job/rules/runner read. Exhausting that budget produces the normal
+`fleet_unreadable` clear decision and JSON output; it never waits indefinitely
+for an external `gh` or token-helper process. Applied variable mutations have a
+separate 10-second total budget. Insufficient
 capacity, an offline/busy pool, malformed runner or job data, or an unreadable
 fleet/ruleset deletes the variable. A failed
 clear, including an ambiguous HTTP 404, is reported as an error. If the
