@@ -895,6 +895,13 @@ GraphQL reset time when a best-effort `gh api rate_limit` probe
 succeeds. Add this call to any new REST-fallback dispatch site so
 the operator-visible signal stays consistent.
 
+The PR snapshot's raw `statusCheckRollup` does not carry `isRequired`.
+`wait pr --state green` must therefore hydrate requiredness from
+`gh pr checks --required --json` before evaluating the rollup. A failed
+requiredness lookup is not permission to use `mergeable` as a green proxy:
+mark the snapshot unknown and make the evaluator fail closed. State-only waits
+such as `--state merged` remain usable from the same snapshot.
+
 GitHub App installation tokens can also be rejected by GitHub's GraphQL
 `createPullRequest` / `mergePullRequest` mutations even when the App token is
 otherwise the right auth source for inspection. PR creation first tries the

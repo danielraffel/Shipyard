@@ -394,11 +394,13 @@ think the build takes:
   + `GET /repos/:r/commits/:sha/check-runs` (wait pr) directly. REST
   has its own 5000/hr bucket, separate from GraphQL. Agents do not
   need to hand-roll `gh api` calls anymore. Check both buckets with
-  `shipyard doctor --rate-limit --json`. The REST `wait pr` fallback
-  is conservative — all check runs are treated as required, so a
-  green verdict cannot incorrectly fire when non-required checks
-  fail. Snapshot output carries `_rest_fallback: true` when the
-  fallback path served the value.
+  `shipyard doctor --rate-limit --json`. A green verdict additionally
+  requires a successful `gh pr checks --required --json` classification;
+  `statusCheckRollup` alone does not expose requiredness. If that
+  classification is unavailable, including on the REST snapshot path,
+  `wait pr --state green` fails closed with exit 7 rather than guessing.
+  Snapshot output carries `_rest_fallback: true` when the fallback path
+  served the value.
 
 Example — agent blocks until merge in-session:
 
@@ -644,6 +646,11 @@ in `[runner.watchdog]` (`reap_in_progress_max_min` /
 ## Waiting on conditions (`shipyard wait`)
 
 Whenever you'd otherwise write a polling loop around `gh` — wait for a release to upload, wait for a PR's required checks to go green, wait for a dispatched workflow run to finish — reach for `shipyard wait` instead. It opens a daemon subscription first (if one's running), takes one authoritative `gh` snapshot, and either exits 0 immediately or keeps re-evaluating on real webhook events (no extra REST budget). When the daemon isn't running, it falls back to polling transparently — safe to use on headless CI too.
+
+For `--state green`, Shipyard separately resolves GitHub's required-check set and
+annotates the rollup before evaluating it. Never infer requiredness from the raw
+`gh pr view --json statusCheckRollup` payload: that payload omits `isRequired`.
+If requiredness cannot be resolved, Shipyard exits 7 and does not report green.
 
 ### Before/after
 
