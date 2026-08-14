@@ -321,6 +321,47 @@ class PrCloseGuardTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("closePullRequest", message)
 
+    def test_graphql_comments_cannot_hide_close_mutation(self) -> None:
+        code, message, _ = self.run_guard(
+            [
+                "api",
+                "graphql",
+                "-f",
+                "query=mutation { closePullRequest # comment\n (input:{pullRequestId:\"x\"}) { clientMutationId } }",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("closePullRequest", message)
+
+    def test_hash_inside_graphql_string_is_not_treated_as_a_comment(self) -> None:
+        compact = guard.compact_graphql(
+            'mutation { closePullRequest(reason: "# retained") { clientMutationId } }'
+        )
+        self.assertIn("closepullrequest(", compact)
+
+    def test_equivalent_absolute_github_api_authorities_are_inspected(self) -> None:
+        for endpoint in (
+            "https://API.GITHUB.COM/repos/o/r/pulls/7",
+            "https://api.github.com:443/repos/o/r/pulls/7",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(
+                    guard.close_request(["api", "-XPATCH", endpoint, "-fstate=closed"]),
+                    guard.CloseRequest(repo="o/r", pr=7),
+                )
+
+    def test_uninspectable_absolute_api_authority_fails_closed(self) -> None:
+        for endpoint in (
+            "https://example.com/repos/o/r/pulls/7",
+            "http://api.github.com/repos/o/r/pulls/7",
+            "https://api.github.com:444/repos/o/r/pulls/7",
+            "https://api.github.com:not-a-port/repos/o/r/pulls/7",
+        ):
+            with self.subTest(endpoint=endpoint):
+                code, message, _ = self.run_guard(["api", endpoint])
+                self.assertEqual(code, 1)
+                self.assertIn("absolute API endpoint", message)
+
     def test_graphql_stdin_body_fails_closed(self) -> None:
         for args in (
             ["api", "graphql", "--input", "-"],

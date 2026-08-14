@@ -126,10 +126,53 @@ def api_target(args: list[str]) -> ApiTarget:
         parts = urlsplit(arg)
         path = parts.path
         if parts.scheme or parts.netloc:
-            if parts.scheme != "https" or parts.netloc != "api.github.com":
-                return ApiTarget("", {})
+            try:
+                port = parts.port
+            except ValueError as error:
+                raise GuardError("cannot inspect absolute API endpoint") from error
+            if (
+                parts.scheme.lower() != "https"
+                or parts.hostname is None
+                or parts.hostname.lower() != "api.github.com"
+                or port not in (None, 443)
+                or parts.username is not None
+                or parts.password is not None
+            ):
+                raise GuardError("cannot inspect absolute API endpoint")
         return ApiTarget(path.lstrip("/"), parse_qs(parts.query, keep_blank_values=True))
     return ApiTarget("", {})
+
+
+def compact_graphql(document: str) -> str:
+    """Remove insignificant GraphQL text without mistaking comments for syntax."""
+    without_comments: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(document):
+        char = document[index]
+        if in_string:
+            without_comments.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            without_comments.append(char)
+            index += 1
+            continue
+        if char == "#":
+            while index < len(document) and document[index] not in "\r\n":
+                index += 1
+            continue
+        without_comments.append(char)
+        index += 1
+    return "".join("".join(without_comments).split()).lower()
 
 
 def typed_field_closes_pr(args: list[str]) -> bool:
@@ -223,7 +266,7 @@ def close_request(args: list[str]) -> CloseRequest | None:
         endpoint = target.path
         if endpoint == "graphql":
             document = "\n".join([graphql_document(args), *target.query.get("query", [])])
-            compact = "".join(document.split()).lower()
+            compact = compact_graphql(document)
             if "closepullrequest(" in compact:
                 raise GuardError(
                     "raw closePullRequest mutation cannot bind integrated proof to a PR number"
