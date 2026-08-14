@@ -407,6 +407,9 @@ fn emit_status_report<W: Write>(
 
 fn format_symptom_human(symptom: &Symptom) -> String {
     match symptom {
+        Symptom::OfflineBusy => {
+            "offline_busy: GitHub reports busy while the runner is offline; reconcile local VM/lease/job ownership before recovery".to_owned()
+        }
         Symptom::OrphanedBusy => {
             "orphaned_busy: runner.busy=true but no Runner.Worker process visible (usually clears in 1-5 min)".to_owned()
         }

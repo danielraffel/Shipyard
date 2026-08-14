@@ -188,6 +188,20 @@ periodic queue-tick or launchd monitor. `runner watch` invokes this fleet tick
 by default whenever `[host_class.*]` is configured, so an existing durable
 watch service does not depend on an interactive agent.
 
+### Offline and busy are separate facts
+
+`shipyard runner status` reports `offline_busy` when GitHub says a runner is
+busy but the runner API says it is offline. This is a reconciliation signal,
+not a cancellation instruction. For Vellum's repository-scoped disposable
+lanes, correlate it with `tartci doctor --reap --json`: require two bounded
+observations and record the VM, lease, supervisor, runner, and associated job
+IDs. If local ownership is live or uncertain, keep the protected job running.
+Only after TartCI proves `offline_busy_orphaned_no_local_owner` may the narrow
+documented recovery cancel that exact stale job and remove that exact runner;
+Shipyard must never bulk-cancel busy runners, reset shared names, or bypass a
+merge queue. A fresh assignment and teardown proof is required before local
+capacity is considered healthy again.
+
 Use `--base` for a non-`main` merge queue and
 `--merge-queue-stall-threshold-secs` to tune the default 15-minute front-stall
 window. Each tick inspects one page of each active-run status and at most 50
