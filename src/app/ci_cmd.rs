@@ -522,12 +522,9 @@ fn lane_warnings(
                 spec.context, spec.lane, target.id
             ));
         }
-        if target.arch.as_deref() == Some("x64")
-            && !target.is_github()
-            && !target_bool(targets, &target.id, "proven")
-        {
+        if target.is_self_managed_x64() && !target_bool(targets, &target.id, "proven") {
             warnings.push(format!(
-                "{}.{}: local x64 target {} is not marked proven",
+                "{}.{}: self-managed x64 target {} is not marked proven",
                 spec.context, spec.lane, target.id
             ));
         }
@@ -569,6 +566,29 @@ fn target_plan(id: &str, targets: &Table) -> TargetPlan {
 impl TargetPlan {
     fn is_github(&self) -> bool {
         self.provider.as_deref() == Some("github") || self.id.starts_with("github.")
+    }
+
+    fn is_self_managed_x64(&self) -> bool {
+        if matches!(self.provider.as_deref(), Some("github" | "namespace")) {
+            return false;
+        }
+        let mentions_x64 = |value: &str| {
+            value
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .any(|part| part.eq_ignore_ascii_case("x64") || part.eq_ignore_ascii_case("x86_64"))
+        };
+        self.arch.as_deref().is_some_and(mentions_x64)
+            || mentions_x64(&self.id)
+            || self
+                .runs_on_json
+                .as_ref()
+                .is_some_and(|selector| match selector {
+                    Value::String(value) => mentions_x64(value),
+                    Value::Array(values) => {
+                        values.iter().filter_map(Value::as_str).any(mentions_x64)
+                    }
+                    _ => false,
+                })
     }
 }
 
@@ -710,6 +730,60 @@ runs_on_json = "windows-latest"
 
         assert!(plan.warnings.is_empty());
         assert_eq!(plan.changes[0].value, "\"windows-latest\"");
+    }
+
+    #[test]
+    fn warns_for_unproven_self_managed_x64_without_arch_metadata() {
+        for (target_id, selector) in [
+            (
+                "macpro.linux-vm",
+                r#"["self-hosted", "Linux", "X64", "pulp-host-macpro"]"#,
+            ),
+            ("local.linux-x64", r#"["self-hosted", "Linux"]"#),
+        ] {
+            let profile: Table = format!(
+                r#"
+name = "normal"
+
+[repo."owner/repo".pr.linux]
+targets = ["{target_id}"]
+github_variable = "LOCAL_LINUX_RUNS_ON_JSON"
+
+[targets."{target_id}"]
+runs_on_json = {selector}
+"#
+            )
+            .parse()
+            .expect("profile toml");
+
+            let plan = build_plan(&profile, "owner/repo", "test.toml".to_owned()).expect("plan");
+            assert_eq!(plan.warnings.len(), 1, "target={target_id}");
+            assert!(plan.warnings[0].contains("self-managed x64 target"));
+        }
+    }
+
+    #[test]
+    fn proven_or_cloud_x64_targets_do_not_warn() {
+        let profile = r#"
+name = "normal"
+
+[repo."owner/repo".pr.linux]
+targets = ["local.linux-x64", "namespace.linux-x64"]
+github_variable = "LOCAL_LINUX_RUNS_ON_JSON"
+
+[targets."local.linux-x64"]
+runs_on_json = ["self-hosted", "Linux", "X64"]
+proven = true
+
+[targets."namespace.linux-x64"]
+provider = "namespace"
+runs_on_json = ["self-hosted", "Linux", "X64"]
+"#
+        .parse()
+        .expect("profile toml");
+
+        let plan = build_plan(&profile, "owner/repo", "test.toml".to_owned()).expect("plan");
+        assert!(plan.warnings.is_empty());
     }
 
     #[test]

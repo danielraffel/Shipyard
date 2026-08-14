@@ -177,10 +177,11 @@ vocabulary, not GitHub labels. Each target maps to a concrete `runs-on` selector
 such as `["self-hosted","Windows","ARM64","pulp-build-windows"]` or
 `"windows-latest"`.
 
-Local x64 targets must set `proven = true` only after a real job has claimed
-and completed on that exact selector. Until then, `plan` reports the target as
-smoke-only so a profile cannot silently promote an unverified architecture or
-label set.
+Self-managed x64 targets must set `proven = true` only after a real job has
+claimed and completed on that exact selector. Until then, `plan` emits a
+warning so a profile cannot silently promote an unverified architecture or
+label set. GitHub-hosted and Namespace cloud targets are exempt because their
+provider owns the architecture claim.
 
 Shipyard's job is to consume those facts across hosts:
 
