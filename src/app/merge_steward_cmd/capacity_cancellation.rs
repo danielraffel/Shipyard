@@ -13,6 +13,7 @@ pub(super) enum CapacityCancelError {
     Mutation(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn cancel_capacity_preemption_after_revalidation(
     actions: &GitHubActions,
     observation: &RepoObservation,

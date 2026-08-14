@@ -8,6 +8,7 @@ use super::{
     pull_requests, queue_front_waits_for_pool, timestamp_old_enough,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn revalidate_capacity_preemption(
     actions: &GitHubActions,
     observation: &RepoObservation,

@@ -405,28 +405,27 @@ impl LocalExecutor {
             if let Err(error) = append_log(context.log_path, &format!("\n=== {stage_name} ===\n")) {
                 return io_error_result(context, &error.to_string());
             }
-            if let Some(callback) = progress_callback.as_mut() {
-                if let crate::executor::streaming::ProgressAction::Terminate(reason) =
+            if let Some(callback) = progress_callback.as_mut()
+                && let crate::executor::streaming::ProgressAction::Terminate(reason) =
                     callback(ProgressEvent::phase(stage_name))
-                {
-                    if let Err(error) = append_log(
-                        context.log_path,
-                        &format!("\n=== CANCELLED before {stage_name}: {reason} ===\n"),
-                    ) {
-                        return io_error_result(context, &error.to_string());
-                    }
-                    let mut result = error_result(
-                        context.target,
-                        context.log_path,
-                        context.started_at,
-                        Some(context.start_time.elapsed().as_secs_f64()),
-                    );
-                    result.status = TargetStatus::Cancelled;
-                    result.phase = Some(stage_name.clone());
-                    result.error_message = Some(reason);
-                    result.failure_class = None;
-                    return result;
+            {
+                if let Err(error) = append_log(
+                    context.log_path,
+                    &format!("\n=== CANCELLED before {stage_name}: {reason} ===\n"),
+                ) {
+                    return io_error_result(context, &error.to_string());
                 }
+                let mut result = error_result(
+                    context.target,
+                    context.log_path,
+                    context.started_at,
+                    Some(context.start_time.elapsed().as_secs_f64()),
+                );
+                result.status = TargetStatus::Cancelled;
+                result.phase = Some(stage_name.clone());
+                result.error_message = Some(reason);
+                result.failure_class = None;
+                return result;
             }
 
             let stage_run = {

@@ -11,6 +11,7 @@ use super::{
     revalidate_coalescing_cancellation,
 };
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn apply_repo_plan(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -315,6 +316,7 @@ pub(super) fn timestamp_old_enough(timestamp: &str) -> bool {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_run_cancellation(
     actions: &GitHubActions,
     observation: &RepoObservation,
@@ -371,6 +373,7 @@ pub(super) fn apply_run_cancellation(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_superseded_run_cancellation(
     actions: &GitHubActions,
     observation: &RepoObservation,
@@ -411,6 +414,7 @@ fn apply_superseded_run_cancellation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn acquire_final_cancellation_guard(
     actions: &GitHubActions,
     observation: &RepoObservation,

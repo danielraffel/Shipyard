@@ -27,6 +27,7 @@ fn required_workflow_capacity_reason_is_rejected_before_github_reads_or_writes()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn second_revalidation_uses_latest_safe_runner_assignment() {
     let temp = tempfile::tempdir().expect("temp");
     let calls = temp.path().join("calls");
