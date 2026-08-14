@@ -136,8 +136,7 @@ fn write_handoff_status(
         command.push("-f".to_owned());
         command.push(format!("target_url={url}"));
     }
-    actions
-        .run_gh(&command)
+    run_steward_write(actions, &command, "handoff receipt")
         .map_err(|error| CliFailure::new(1, format!("could not write handoff receipt: {error}")))?;
     Ok(())
 }
@@ -153,8 +152,9 @@ pub(super) fn ensure_label(
     let inspect = actions.run_gh(&["api".to_owned(), format!("repos/{repo}/labels/{encoded}")]);
     match inspect {
         Ok(_) => Ok(()),
-        Err(error) if error.to_string().contains("HTTP 404") => actions
-            .run_gh(&[
+        Err(error) if error.to_string().contains("HTTP 404") => run_steward_write(
+            actions,
+            &[
                 "api".to_owned(),
                 "-X".to_owned(),
                 "POST".to_owned(),
@@ -165,9 +165,11 @@ pub(super) fn ensure_label(
                 format!("color={color}"),
                 "-f".to_owned(),
                 format!("description={description}"),
-            ])
-            .map(|_| ())
-            .map_err(|error| CliFailure::new(1, format!("could not create label: {error}"))),
+            ],
+            "steward label creation",
+        )
+        .map(|_| ())
+        .map_err(|error| CliFailure::new(1, format!("could not create label: {error}"))),
         Err(error) => Err(CliFailure::new(
             1,
             format!("could not inspect managed label: {error}"),
@@ -181,17 +183,41 @@ pub(super) fn add_label(
     pr: u64,
     label: &str,
 ) -> Result<(), CliFailure> {
-    actions
-        .run_gh(&[
+    run_steward_write(
+        actions,
+        &[
             "api".to_owned(),
             "-X".to_owned(),
             "POST".to_owned(),
             format!("repos/{repo}/issues/{pr}/labels"),
             "-f".to_owned(),
             format!("labels[]={label}"),
-        ])
-        .map(|_| ())
-        .map_err(|error| CliFailure::new(1, format!("could not add managed label: {error}")))
+        ],
+        "steward label attachment",
+    )
+    .map(|_| ())
+    .map_err(|error| CliFailure::new(1, format!("could not add managed label: {error}")))
+}
+
+pub(super) fn run_steward_write(
+    actions: &GitHubActions,
+    args: &[String],
+    purpose: &str,
+) -> Result<String, crate::cloud::GitHubError> {
+    match actions.run_gh(args) {
+        Ok(value) => Ok(value),
+        Err(error)
+            if error
+                .to_string()
+                .contains("Resource not accessible by integration") =>
+        {
+            eprintln!(
+                "shipyard: configured GitHub App cannot write {purpose}; falling back to ambient gh auth for this steward mutation only."
+            );
+            actions.run_gh_ambient(args)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn render<W: Write>(
@@ -235,6 +261,33 @@ fn render<W: Write>(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn sequenced_gh(
+        temp: &tempfile::TempDir,
+        first_error: &str,
+    ) -> (GitHubActions, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let count = temp.path().join("count");
+        let script = temp.path().join("gh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncount=0\n[ ! -f '{0}' ] || count=$(cat '{0}')\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{0}'\nif [ \"$count\" -eq 1 ]; then echo '{1}' >&2; exit 1; fi\necho '{{}}'\n",
+                count.display(),
+                first_error
+            ),
+        )
+        .expect("fake gh");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+        (
+            GitHubActions::new(temp.path()).with_gh_binary_for_tests(script),
+            count,
+        )
+    }
+
     fn args() -> StewardHandoffArgs {
         StewardHandoffArgs {
             repo: Some("owner/repo".to_owned()),
@@ -262,5 +315,26 @@ mod tests {
         invalid.workstream_id = "GEN 7".to_owned();
         assert!(validate_args(&invalid).is_err());
         assert!(validate_args(&args()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_integration_permission_error_uses_one_ambient_fallback() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (actions, count) = sequenced_gh(&temp, "Resource not accessible by integration");
+        run_steward_write(&actions, &["api".to_owned(), "test".to_owned()], "test")
+            .expect("ambient fallback");
+        assert_eq!(std::fs::read_to_string(count).expect("count"), "2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_write_failure_does_not_escape_to_ambient_auth() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (actions, count) = sequenced_gh(&temp, "HTTP 403 generic forbidden");
+        assert!(
+            run_steward_write(&actions, &["api".to_owned(), "test".to_owned()], "test").is_err()
+        );
+        assert_eq!(std::fs::read_to_string(count).expect("count"), "1");
     }
 }

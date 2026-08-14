@@ -51,6 +51,13 @@ observes recovery, it marks the recovery status successful and clears the
 label. A cheap routed agent can consume this durable exception signal without
 polling every healthy PR.
 
+For unattended operation, the configured App or workflow token needs Commit
+statuses and Issues read/write. A local read-oriented App that returns the exact
+`Resource not accessible by integration` rejection falls back visibly to
+ambient `gh` for these low-volume status/label mutations only. High-volume
+observation remains on configured auth; a controller should not rely on ambient
+fallback.
+
 Capacity preemption is an explicit repository policy. The built-in Pulp policy
 may preempt at most one in-progress PR workflow per pass when an exact
 merge-group front has waited at least 15 minutes. The candidate must be an

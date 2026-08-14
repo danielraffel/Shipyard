@@ -1,6 +1,7 @@
 use super::{
     MutationApplyContext, NEEDS_AGENT_LABEL, ObservedPr, RECOVERY_CONTEXT, StewardDecision,
-    StewardLedger, StewardPolicy, acquire_pr_mutation_guard, classify_pr, handoff::ensure_label,
+    StewardLedger, StewardPolicy, acquire_pr_mutation_guard, classify_pr,
+    handoff::{ensure_label, run_steward_write},
     merge_queue_snapshot, pull_request_with_required_checks, record_audit,
 };
 
@@ -183,15 +184,19 @@ fn clear_needs_agent(
 ) -> Result<String, String> {
     write_recovery_status(context, pr, "success", "Shipyard recovery clear")?;
     let encoded = super::observation::encode_path_segment(NEEDS_AGENT_LABEL);
-    match context.actions.run_gh(&[
-        "api".to_owned(),
-        "-X".to_owned(),
-        "DELETE".to_owned(),
-        format!(
-            "repos/{}/issues/{}/labels/{encoded}",
-            context.observation.repo, pr.fact.number
-        ),
-    ]) {
+    match run_steward_write(
+        context.actions,
+        &[
+            "api".to_owned(),
+            "-X".to_owned(),
+            "DELETE".to_owned(),
+            format!(
+                "repos/{}/issues/{}/labels/{encoded}",
+                context.observation.repo, pr.fact.number
+            ),
+        ],
+        "needs-agent label removal",
+    ) {
         Ok(_) => Ok("needs_agent_cleared".to_owned()),
         Err(error) if error.to_string().contains("HTTP 404") => {
             Ok("needs_agent_cleared".to_owned())
@@ -206,9 +211,9 @@ fn write_recovery_status(
     state: &str,
     description: &str,
 ) -> Result<(), String> {
-    context
-        .actions
-        .run_gh(&[
+    run_steward_write(
+        context.actions,
+        &[
             "api".to_owned(),
             "-X".to_owned(),
             "POST".to_owned(),
@@ -227,9 +232,11 @@ fn write_recovery_status(
                 "target_url=https://github.com/{}/pull/{}",
                 context.observation.repo, pr.fact.number
             ),
-        ])
-        .map(|_| ())
-        .map_err(|error| format!("could not write recovery status: {error}"))
+        ],
+        "recovery status",
+    )
+    .map(|_| ())
+    .map_err(|error| format!("could not write recovery status: {error}"))
 }
 
 fn latest_recovery_state(pr: &ObservedPr) -> Option<&str> {

@@ -701,6 +701,10 @@ for them. A managed semantic blocker receives one deduplicated
 `shipyard:needs-agent` label plus failed `shipyard/steward-recovery` status;
 healthy deterministic progress clears the signal. This lets a cheap recovery
 agent handle exceptions without spending model tokens on polling.
+The preferred unattended credential has Commit statuses and Issues read/write.
+A local read-oriented GitHub App that receives the exact integration-permission
+403 falls back, with a visible warning, to ambient `gh` for these low-volume
+steward status/label writes only; normal observation remains on configured auth.
 
 Read [references/merge-steward.md](references/merge-steward.md) before operating
 the steward, changing its policy, or recovering a pending cancellation.

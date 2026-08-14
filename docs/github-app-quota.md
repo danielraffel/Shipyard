@@ -101,9 +101,17 @@ For broader Shipyard inspection, common read-only repository permissions are:
 | Contents | Read-only |
 | Actions | Read-only, or Read & write if Shipyard must cancel/dispatch workflows |
 | Checks | Read-only |
-| Commit statuses | Read-only |
-| Pull requests | Read-only |
+| Commit statuses | Read & write when using steward handoff/recovery; otherwise read-only |
+| Issues | Read & write when using steward ownership/recovery labels |
+| Pull requests | Read & write for queue stewardship; otherwise read-only |
 | Metadata | Always available |
+
+If a read-oriented App rejects a low-volume steward status or label mutation
+with GitHub's exact `Resource not accessible by integration` response,
+Shipyard prints an explicit warning and retries that mutation with ambient
+`gh` credentials only. Unattended controllers should grant the App (or their
+workflow `GITHUB_TOKEN`) the write permissions above so they never depend on
+an interactive user's ambient login.
 
 After creating the app:
 
