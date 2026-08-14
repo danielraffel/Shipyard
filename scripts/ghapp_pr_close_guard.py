@@ -406,6 +406,26 @@ def containment_evidence(request: CloseRequest, query: ApiJson) -> tuple[bool, s
         f"base={base_sha} head={head_sha} status={status} "
         f"ahead_by={ahead_by} behind_by={behind_by}"
     )
+
+    confirmation = query(f"repos/{request.repo}/pulls/{request.pr}")
+    confirmed_head = confirmation.get("head")
+    confirmed_base = confirmation.get("base")
+    if not isinstance(confirmed_head, dict) or not isinstance(confirmed_base, dict):
+        raise GuardError("confirmation response missing head/base")
+    confirmed_head_sha = required_string(confirmed_head.get("sha"), "confirmed head.sha")
+    confirmed_base_ref = required_string(confirmed_base.get("ref"), "confirmed base.ref")
+    confirmed_base_commit = query(
+        f"repos/{request.repo}/commits/{quote(confirmed_base_ref, safe='')}"
+    )
+    confirmed_base_sha = required_string(
+        confirmed_base_commit.get("sha"), "confirmed base commit sha"
+    )
+    if (confirmed_head_sha, confirmed_base_ref, confirmed_base_sha) != (
+        head_sha,
+        base_ref,
+        base_sha,
+    ):
+        raise GuardError("PR head or base moved during closure proof; retry")
     return content_contained, detail
 
 

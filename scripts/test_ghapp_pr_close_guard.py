@@ -80,9 +80,9 @@ class PrCloseGuardTests(unittest.TestCase):
         )
         self.assertEqual(code, 1)
         self.assertIn("3 unique commit(s)", message)
-        self.assertEqual(
-            endpoints[-1],
+        self.assertIn(
             "repos/Generous-Corp/pulp/compare/aa630815630ca259b743651dacdc335f3d94a39a...6c7ece533b36775055860b55d0cc45e3f8e3962c",
+            endpoints,
         )
 
     def test_behind_and_identical_heads_may_close_as_integrated(self) -> None:
@@ -104,6 +104,31 @@ class PrCloseGuardTests(unittest.TestCase):
                     self.run_guard(["pr", "close", "7", "-R", "o/r"], responses)[0],
                     0,
                 )
+
+    def test_head_or_base_movement_during_proof_fails_closed(self) -> None:
+        base = "b" * 40
+        original_head = "h" * 40
+        moved_head = "n" * 40
+        pulls_seen = 0
+
+        def moving_query(endpoint: str) -> dict[str, object]:
+            nonlocal pulls_seen
+            if endpoint == "repos/o/r/pulls/7":
+                pulls_seen += 1
+                return {
+                    "head": {"sha": original_head if pulls_seen == 1 else moved_head},
+                    "base": {"ref": "main"},
+                }
+            if endpoint == "repos/o/r/commits/main":
+                return {"sha": base}
+            if endpoint == f"repos/o/r/compare/{base}...{original_head}":
+                return {"status": "behind", "ahead_by": 0, "behind_by": 1}
+            self.fail(f"unexpected endpoint: {endpoint}")
+
+        with self.assertRaisesRegex(guard.GuardError, "moved during closure proof"):
+            guard.containment_evidence(
+                guard.CloseRequest(repo="o/r", pr=7), moving_query
+            )
 
     def test_diverged_head_is_refused(self) -> None:
         responses = {
