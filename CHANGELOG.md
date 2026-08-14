@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0900"></a>
-## [0.90.1]
+<a id="v0901"></a>
+## [0.90.1] - 2026-08-14
 
+- fix(wait): query supported PR fields ([#418](https://github.com/danielraffel/Shipyard/pull/418))
+
+<a id="v0900"></a>
 ## [0.90.0] - 2026-08-14
 
 - feat(pr): atomically hand off steward ownership ([#417](https://github.com/danielraffel/Shipyard/pull/417))
@@ -852,6 +855,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.90.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.1
 [0.90.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.0
 [0.89.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.89.0
 [0.88.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.4
