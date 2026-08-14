@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0873"></a>
+## [0.87.4]
+
 ## [0.87.3] - 2026-08-13
 
 - fix/local linux lease process group 20260813 ([#407](https://github.com/danielraffel/Shipyard/pull/407))
