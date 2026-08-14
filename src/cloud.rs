@@ -60,8 +60,12 @@ pub struct WorkflowDefinition {
     pub name: String,
     /// Human-readable summary for CLI rendering.
     pub description: String,
+    /// Whether the workflow declares a `workflow_dispatch` trigger.
+    pub dispatchable: bool,
     /// Declared `workflow_dispatch` input names.
     pub inputs: Vec<String>,
+    /// Required inputs that do not declare a default value.
+    pub required_inputs: Vec<String>,
 }
 
 /// Resolved GitHub Actions dispatch settings.
@@ -722,6 +726,39 @@ impl GitHubActions {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// Run one low-volume GitHub mutation with ambient `gh` credentials.
+    /// Callers must first attempt configured auth and restrict fallback to an
+    /// explicit integration-permission rejection.
+    pub(crate) fn run_gh_ambient(&self, args: &[String]) -> Result<String, GitHubError> {
+        let client = GhClient::ambient();
+        let output = client
+            .prepare_command(
+                &self.cwd,
+                self.gh_binary_override.as_deref(),
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::AmbientOnly,
+            )
+            .map_err(|error| GitHubError::new(format!("failed to prepare ambient gh: {error}")))?
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(args)
+            .output()
+            .map_err(|error| {
+                GitHubError::new(format!(
+                    "failed to run ambient gh {}: {error}",
+                    args.join(" ")
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(GitHubError::command_failed(
+                args,
+                output.status.code(),
+                &output.stderr,
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
     pub(crate) fn run_gh_with_timeout(
         &self,
         args: &[String],
@@ -895,7 +932,7 @@ pub fn discover_workflows(repo_root: &Path) -> BTreeMap<String, WorkflowDefiniti
             continue;
         };
         let contents = fs::read_to_string(&path).unwrap_or_default();
-        let inputs = discover_workflow_inputs(&contents);
+        let (dispatchable, inputs, required_inputs) = discover_workflow_dispatch(&contents);
         let key = stem.to_owned();
         let name = discover_workflow_name(&contents).unwrap_or_else(|| titleize(stem));
         let definition = WorkflowDefinition {
@@ -903,7 +940,9 @@ pub fn discover_workflows(repo_root: &Path) -> BTreeMap<String, WorkflowDefiniti
             file: filename.to_owned(),
             description: format!("{name} ({filename})"),
             name,
+            dispatchable,
             inputs,
+            required_inputs,
         };
         discovered.insert(key.clone(), definition.clone());
         if key == "ci" && !discovered.contains_key("build") {
@@ -926,14 +965,22 @@ pub fn default_workflow_key(
     workflows: &BTreeMap<String, WorkflowDefinition>,
 ) -> Option<String> {
     if let Some(configured) = config.get_str("cloud.default_workflow")
-        && workflows.contains_key(configured)
+        && workflows
+            .get(configured)
+            .is_some_and(|workflow| workflow.dispatchable)
     {
         return Some(configured.to_owned());
     }
-    if workflows.contains_key("build") {
+    if workflows
+        .get("build")
+        .is_some_and(|workflow| workflow.dispatchable)
+    {
         return Some("build".to_owned());
     }
-    workflows.keys().next().cloned()
+    workflows
+        .iter()
+        .find(|(_, workflow)| workflow.dispatchable)
+        .map(|(key, _)| key.clone())
 }
 
 /// Resolve provider and dispatch fields for a workflow.
@@ -965,6 +1012,12 @@ pub fn resolve_cloud_dispatch_plan_with_overrides(
         .get(workflow_key)
         .cloned()
         .ok_or_else(|| format!("Unknown workflow '{workflow_key}'"))?;
+    if !workflow.dispatchable {
+        return Err(format!(
+            "Workflow '{}' does not declare workflow_dispatch",
+            workflow.file
+        ));
+    }
     let repository = config.get_str("cloud.repository").map(ToOwned::to_owned);
     let workflow_config_key = format!("cloud.workflows.{workflow_key}");
     let workflow_config = table_at(config, &workflow_config_key);
@@ -1302,12 +1355,25 @@ fn discover_workflow_name(contents: &str) -> Option<String> {
     })
 }
 
-fn discover_workflow_inputs(contents: &str) -> Vec<String> {
+fn discover_workflow_dispatch(contents: &str) -> (bool, Vec<String>, Vec<String>) {
     let mut inputs = Vec::new();
-    let mut in_workflow_dispatch = false;
-    let mut in_inputs = false;
+    let mut required_inputs = Vec::new();
+    let mut dispatchable = false;
+    let mut on_indent = None;
     let mut workflow_indent = None;
+    let mut in_inputs = false;
     let mut inputs_indent = None;
+    let mut current_input: Option<(String, usize, bool, bool)> = None;
+
+    let finish_input = |current: &mut Option<(String, usize, bool, bool)>,
+                        required: &mut Vec<String>| {
+        if let Some((name, _indent, is_required, has_default)) = current.take()
+            && is_required
+            && !has_default
+        {
+            required.push(name);
+        }
+    };
 
     for raw_line in contents.lines() {
         if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
@@ -1315,36 +1381,79 @@ fn discover_workflow_inputs(contents: &str) -> Vec<String> {
         }
         let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
         let stripped = raw_line.trim();
+        let normalized = stripped.trim_start_matches(['\'', '"']);
 
-        if stripped.starts_with("workflow_dispatch:") {
-            in_workflow_dispatch = true;
+        if let Some(rest) = normalized.strip_prefix("on:") {
+            on_indent = Some(indent);
+            if rest.contains("workflow_dispatch") {
+                dispatchable = true;
+            }
+            continue;
+        }
+
+        if on_indent.is_some_and(|on_indent| indent <= on_indent) {
+            finish_input(&mut current_input, &mut required_inputs);
+            on_indent = None;
+            workflow_indent = None;
+            in_inputs = false;
+        }
+
+        if on_indent.is_some()
+            && normalized
+                .trim_start_matches('"')
+                .starts_with("workflow_dispatch:")
+        {
+            dispatchable = true;
             in_inputs = false;
             workflow_indent = Some(indent);
             continue;
         }
-        if in_workflow_dispatch
+        if workflow_indent.is_some()
             && workflow_indent.is_some_and(|workflow_indent| indent <= workflow_indent)
             && stripped.contains(':')
         {
-            in_workflow_dispatch = false;
+            finish_input(&mut current_input, &mut required_inputs);
+            workflow_indent = None;
             in_inputs = false;
         }
-        if in_workflow_dispatch && stripped.starts_with("inputs:") {
+        if workflow_indent.is_some() && stripped.starts_with("inputs:") {
             in_inputs = true;
             inputs_indent = Some(indent);
             continue;
         }
         if in_inputs && inputs_indent.is_some_and(|inputs_indent| indent <= inputs_indent) {
+            finish_input(&mut current_input, &mut required_inputs);
             in_inputs = false;
         }
         if in_inputs
             && inputs_indent.is_some_and(|inputs_indent| indent == inputs_indent + 2)
             && stripped.ends_with(':')
         {
-            inputs.push(stripped.trim_end_matches(':').to_owned());
+            finish_input(&mut current_input, &mut required_inputs);
+            let name = stripped
+                .trim_end_matches(':')
+                .trim_matches(['\'', '"'])
+                .to_owned();
+            inputs.push(name.clone());
+            current_input = Some((name, indent, false, false));
+            continue;
+        }
+        if let Some((_name, input_indent, is_required, has_default)) = current_input.as_mut()
+            && indent > *input_indent
+        {
+            if stripped
+                .strip_prefix("required:")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+            {
+                *is_required = true;
+            }
+            if stripped.starts_with("default:") {
+                *has_default = true;
+            }
         }
     }
-    inputs
+    finish_input(&mut current_input, &mut required_inputs);
+    (dispatchable, inputs, required_inputs)
 }
 
 fn titleize(key: &str) -> String {
@@ -1570,10 +1679,72 @@ on:
         let discovered = discover_workflows(temp.path());
 
         assert!(discovered.contains_key("ci"));
+        assert!(discovered["build"].dispatchable);
         assert_eq!(discovered["build"].file, "ci.yml");
         assert_eq!(
             discovered["build"].inputs,
             vec!["runner_provider", "macos_runner_selector"]
+        );
+        assert!(discovered["build"].required_inputs.is_empty());
+    }
+
+    #[test]
+    fn discovers_required_dispatch_inputs_without_defaults() {
+        let temp = TempDir::new().expect("tempdir");
+        let workflows = temp.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows dir");
+        std::fs::write(
+            workflows.join("freeze.yml"),
+            r"
+name: Freeze
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: true
+      mode:
+        required: true
+        default: safe
+",
+        )
+        .expect("workflow");
+
+        let discovered = discover_workflows(temp.path());
+
+        assert!(discovered["freeze"].dispatchable);
+        assert_eq!(discovered["freeze"].inputs, vec!["pr_number", "mode"]);
+        assert_eq!(discovered["freeze"].required_inputs, vec!["pr_number"]);
+    }
+
+    #[test]
+    fn distinguishes_workflows_without_manual_dispatch() {
+        let temp = TempDir::new().expect("tempdir");
+        let workflows = temp.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows dir");
+        std::fs::write(
+            workflows.join("lint.yml"),
+            "name: Lint\non:\n  pull_request:\njobs: {}\n",
+        )
+        .expect("workflow");
+
+        let discovered = discover_workflows(temp.path());
+
+        assert!(!discovered["lint"].dispatchable);
+        assert!(discovered["lint"].inputs.is_empty());
+        assert!(discovered["lint"].required_inputs.is_empty());
+        assert_eq!(
+            default_workflow_key(
+                &LoadedConfig {
+                    data: toml::Table::new(),
+                    global_dir: temp.path().join("global"),
+                    project_dir: None,
+                    local_dir: None,
+                    local_overlay_source: LocalOverlaySource::None,
+                },
+                &discovered
+            ),
+            None
         );
     }
 
@@ -1603,10 +1774,12 @@ macos-arm64 = "generouscorp-macos"
                 file: "ci.yml".to_owned(),
                 name: "CI".to_owned(),
                 description: "CI".to_owned(),
+                dispatchable: true,
                 inputs: vec![
                     "runner_provider".to_owned(),
                     "macos_runner_selector".to_owned(),
                 ],
+                required_inputs: Vec::new(),
             },
         );
 
@@ -1651,11 +1824,13 @@ runner_selector = "config-selector"
                 file: "ci.yml".to_owned(),
                 name: "CI".to_owned(),
                 description: "CI".to_owned(),
+                dispatchable: true,
                 inputs: vec![
                     "runner_provider".to_owned(),
                     "runner_selector".to_owned(),
                     "runner_overrides".to_owned(),
                 ],
+                required_inputs: Vec::new(),
             },
         );
 

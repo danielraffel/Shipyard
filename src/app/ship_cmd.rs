@@ -13,11 +13,13 @@ use super::{
         supervise_merge_queue,
     },
     cli::{MergeMethod, MergeResult},
+    merge_steward_cmd::{StewardHandoffArgs, steward_handoff_command},
     wait_cmd::parse_github_repo_slug,
 };
 use crate::auto_rescue::{
     WedgeClass, WedgeInputs, classify_wedge, sha_matches, validated_green_contexts,
 };
+use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::diagnostics::{
     FailureDiagnostics, FailureKind, GhDiagnosticsFetcher, fetch_failed_job_diagnostics,
@@ -63,6 +65,19 @@ pub(super) struct ShipCommandArgs {
     /// force-push), clearing prior evidence so the new head re-validates
     /// instead of dead-ending on `ShaDrift`. See Shipyard #346.
     pub(super) adopt_head: bool,
+    pub(super) steward_handoff: Option<ShipStewardHandoff>,
+}
+
+pub(super) struct ShipStewardHandoff {
+    pub(super) workstream_id: Option<String>,
+    pub(super) context_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct AppliedStewardHandoff {
+    workstream_id: String,
+    context_url: Option<String>,
+    head: String,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -95,6 +110,16 @@ pub(super) fn ship_command<W: Write>(
     }
     let lane_policy = resolve_lane_policy(config, cwd);
     let pr_context = resolve_pr_context(config, &args, cwd, &branch, &lane_policy)?;
+    let steward_handoff = apply_requested_steward_handoff(
+        args.steward_handoff.as_ref(),
+        &repo,
+        &sha,
+        &pr_context,
+        config,
+        cwd,
+        json_mode,
+        stdout,
+    )?;
 
     let mut queue = Queue::new(runtime_paths.state_dir.clone())
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -175,11 +200,78 @@ pub(super) fn ship_command<W: Write>(
             &outcome,
             &render_state,
             &diagnostics,
+            steward_handoff.as_ref(),
         )?;
     } else {
         render_human(stdout, pr_context.number, &render_state, &diagnostics)?;
     }
     Ok(render_state.exit_code())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_requested_steward_handoff<W: Write>(
+    request: Option<&ShipStewardHandoff>,
+    repo: &str,
+    head: &str,
+    pr: &ResolvedPrContext,
+    config: &LoadedConfig,
+    cwd: &Path,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<Option<AppliedStewardHandoff>, CliFailure> {
+    let actions = GitHubActions::from_loaded_config(cwd, config);
+    apply_requested_steward_handoff_with_actions(
+        request, repo, head, pr, cwd, &actions, json_mode, stdout,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_requested_steward_handoff_with_actions<W: Write>(
+    request: Option<&ShipStewardHandoff>,
+    repo: &str,
+    head: &str,
+    pr: &ResolvedPrContext,
+    cwd: &Path,
+    actions: &GitHubActions,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<Option<AppliedStewardHandoff>, CliFailure> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let workstream_id = request
+        .workstream_id
+        .clone()
+        .unwrap_or_else(|| format!("{repo}#{}", pr.number));
+    let context_url = request.context_url.clone().or_else(|| pr.pr_url.clone());
+    let mut sink = std::io::sink();
+    steward_handoff_command(
+        &StewardHandoffArgs {
+            repo: Some(repo.to_owned()),
+            pr: pr.number,
+            head: head.to_owned(),
+            workstream_id: workstream_id.clone(),
+            context_url: context_url.clone(),
+            apply: true,
+        },
+        cwd,
+        actions,
+        false,
+        &mut sink,
+    )?;
+    if !json_mode {
+        writeln!(
+            stdout,
+            "▸ Durable steward receipt: PR #{} head={} workstream={workstream_id}",
+            pr.number, head
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    Ok(Some(AppliedStewardHandoff {
+        workstream_id,
+        context_url,
+        head: head.to_owned(),
+    }))
 }
 
 /// One element per failed target. Built by `collect_failure_diagnostics`.
@@ -738,6 +830,7 @@ fn render_json<W: Write>(
     outcome: &crate::ship::ShipExecutionOutcome,
     state: &ShipRenderState,
     diagnostics: &[RenderedDiagnostics],
+    steward_handoff: Option<&AppliedStewardHandoff>,
 ) -> Result<(), CliFailure> {
     let merged = state.merged();
     // Only the flaky-required wedge carries recovery contexts; every other
@@ -785,6 +878,18 @@ fn render_json<W: Write>(
             ),
             ("diagnostics", Value::Array(diag_payload)),
             ("flaky_required_recovery", Value::Array(flaky_recovery)),
+            (
+                "steward_handoff",
+                steward_handoff.map_or(Value::Null, |receipt| {
+                    json!({
+                        "context": "shipyard/steward-handoff",
+                        "state": "success",
+                        "head": receipt.head,
+                        "workstream_id": receipt.workstream_id,
+                        "context_url": receipt.context_url,
+                    })
+                }),
+            ),
         ]),
     )
     .map_err(|error| CliFailure::new(1, error.to_string()))
@@ -1110,6 +1215,8 @@ mod tests {
         render_green_not_merged_flaky, render_green_not_merged_head_superseded, ship_command,
     };
     use crate::app::cli::MergeResult;
+    #[cfg(unix)]
+    use crate::cloud::GitHubActions;
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::identity::RuntimeMode;
     use crate::paths::RuntimePaths;
@@ -1413,6 +1520,64 @@ mod tests {
         std::fs::set_permissions(path, permissions).expect("chmod");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn atomic_handoff_uses_pr_fallback_and_writes_status_before_label() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = temp.path().join("gh");
+        let log = temp.path().join("gh.log");
+        let head = "a".repeat(40);
+        fake_gh(
+            &gh,
+            &format!(
+                r#"printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"repos/danielraffel/pulp/pulls/42"*)
+    printf '%s\n' '{{"state":"open","head":{{"sha":"{head}"}}}}'
+    ;;
+  *) printf '%s\n' '{{}}' ;;
+esac"#,
+                log.display()
+            ),
+        );
+        let config = loaded_config(temp.path());
+        let actions =
+            GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(&gh);
+        let request = super::ShipStewardHandoff {
+            workstream_id: None,
+            context_url: None,
+        };
+        let pr = super::ResolvedPrContext {
+            number: 42,
+            base_branch: String::from("main"),
+            pr_url: Some(String::from("https://github.com/danielraffel/pulp/pull/42")),
+            pr_title: Some(String::from("Fix")),
+        };
+
+        let receipt = super::apply_requested_steward_handoff_with_actions(
+            Some(&request),
+            "danielraffel/pulp",
+            &head,
+            &pr,
+            temp.path(),
+            &actions,
+            true,
+            &mut Vec::new(),
+        )
+        .expect("handoff")
+        .expect("receipt");
+
+        assert_eq!(receipt.workstream_id, "danielraffel/pulp#42");
+        assert_eq!(
+            receipt.context_url.as_deref(),
+            Some(pr.pr_url.as_deref().unwrap())
+        );
+        let calls = std::fs::read_to_string(log).expect("gh log");
+        let status = calls.find("statuses/").expect("status call");
+        let label = calls.find("issues/42/labels").expect("label call");
+        assert!(status < label, "status receipt must precede managed label");
+    }
+
     fn loaded_config(root: &std::path::Path) -> LoadedConfig {
         let data = r#"
             [validation.default]
@@ -1521,6 +1686,7 @@ mod tests {
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
+                steward_handoff: None,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1597,6 +1763,7 @@ mod tests {
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
+                steward_handoff: None,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1645,6 +1812,7 @@ mod tests {
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
+                steward_handoff: None,
             },
             &unreachable_ssh_config(temp.path()),
             &repo,
@@ -1699,6 +1867,7 @@ mod tests {
                 allow_unreachable_targets: false,
                 skip_targets: vec!["linux".to_owned()],
                 adopt_head: false,
+                steward_handoff: None,
             },
             &local_and_unreachable_config(temp.path()),
             &repo,
@@ -1762,6 +1931,7 @@ exit 2
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
+                steward_handoff: None,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1863,6 +2033,7 @@ exit 2
                 allow_unreachable_targets: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
+                steward_handoff: None,
             },
             &loaded_config(temp.path()),
             &repo,

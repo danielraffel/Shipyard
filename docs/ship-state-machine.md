@@ -175,6 +175,7 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 
 | CLI command                 | Reads                                               | Writes                                                  |
 |-----------------------------|-----------------------------------------------------|---------------------------------------------------------|
+| `shipyard pr` with steward handoff | Protected `origin/<base>:.shipyard/config.toml`, or explicit `--workstream-id` / `--context-url` | After the exact PR and head are resolved but before validation is enqueued, writes the `shipyard/steward-handoff` commit status, revalidates the open PR and exact head, then adds `shipyard:managed`. This is server-owned ownership state, separate from the local `ShipState`. |
 | `shipyard ship` (fresh)     | `ShipStateStore.get(pr)` (auto-resume decision; returns None) | Saves fresh state BEFORE preflight (cli.py:2675). Calls `_update_ship_state_from_job` once after `_execute_job` ends. `archive(pr)` on MERGED. |
 | `shipyard ship --no-resume` | Same                                                | `ShipStateStore.archive_and_replace(state)` archives prior attempt; then a new `ShipState(...)` is constructed with `attempt=1` (see Bug B2). |
 | `shipyard ship --resume`    | Refuses on SHA/policy drift via `_detect_ship_state_drift` | Refreshes `pr_url` / `pr_title` / `commit_subject` on the existing state and saves (cli.py:2679–2689). |
@@ -197,6 +198,7 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 - **Writes:** `ShipStateStore.save(ShipState(..., dispatched_runs=[], evidence_snapshot={}))` at cli.py:2675 — **before** preflight runs at cli.py:2679
 - **Externals:** `git push -u origin <branch>` at cli.py:2602 (return code ignored — see "External matrix" below), `gh pr list` / `gh pr create` for PR number. The Rust implementation falls back to REST `gh api repos/<owner>/<repo>/pulls` when GitHub GraphQL is rate-limited, so PR creation can still produce a tracked ship-state record.
 - **Failure modes**
+  - Requested steward handoff fails (invalid workstream/context, GitHub write denial, closed PR, or exact-head mismatch) → `shipyard pr` exits before queue or validation state is created. The status is written before the label and the head is re-read between them; therefore a concurrent head move can leave only a harmless stale-head status, never a managed label authorized by that stale receipt. *Recovery: resolve the failure and resubmit the current exact head.*
   - `git push` fails silently → `find_pr_for_branch` may still find an existing PR; the local SHA may not match the remote. A fresh state is saved for a branch whose tip may not be pushed. *Recovery: none automatic — the drift check on the next resume will catch it, but between the stale push and the next resume the state claims a SHA that doesn't exist on the remote.*
   - `gh pr create` fails after the REST fallback also fails → `create_pr` raises `GhError`; `ship` exits without saving state because the save at cli.py:2675 runs only after the PR has been found or created. *Recovery: retry or create the PR through REST and run `shipyard ship --pr <n>` to track it.*
   - `save` fails (disk, permission) → `save` raises; tmp file is cleaned up by the `except` branch in `core/ship_state.py`. *Recovery: resolve disk issue, retry.*
@@ -216,6 +218,12 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   scheduler starts a job only to defer it for host-pool capacity or an
   unavailable local lease, the drain owner requeues that transient `Running`
   job with a retry timestamp; admission ignores it until that timestamp expires.
+  A durable `shipyard cancel` observed by a running worker is also an execution
+  transition, not merely a queue-state update. The worker's progress callback
+  returns `ProgressAction::Terminate`; local and SSH streaming validation then
+  terminates its supervised process tree (including descendants) and preserves
+  the durable cancellation reason. A cancellation that lands during a silent
+  command is observed by the next idle heartbeat.
   The drain owner starts a replacement as each worker completes instead of
   waiting for the whole admitted batch, so an independent idle slot is refilled
   while slower siblings continue. If refill admission itself fails, the owner

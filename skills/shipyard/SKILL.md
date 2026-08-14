@@ -686,10 +686,36 @@ REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
 queue or manual merge instead. Apply mode is restricted by central mutation
 authority, durable write-ahead intent, and live revalidation immediately before
-every GitHub write. The built-in capacity preemption preset applies only to
+every GitHub write. Transient retry limits are also fenced against GitHub's
+durable `run_attempt`, so losing a controller cache after an accepted rerun
+cannot reset the budget. The built-in capacity preemption preset applies only to
 explicitly advisory Pulp workflows; required workflows and unknown repositories
 are disabled because GitHub cannot bind a cancellation to an atomic job-state
 snapshot.
+
+Stewardship is opt-in per immutable head. Prefer making the receipt atomic with
+PR creation: set `[merge_steward].auto_handoff = true` on the protected base
+branch and run `shipyard pr`, optionally adding `--workstream-id ID
+--context-url URL`. Shipyard never trusts the PR branch to enable that default.
+Immediately after the PR exists and before validation starts, Shipyard writes
+the receipt; without explicit values it uses `OWNER/REPO#PR` and the PR URL.
+Use `--no-steward-handoff` only as an explicit project-default override.
+
+For an already-created PR, the submitting agent must run
+`shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
+--workstream-id ID [--context-url URL] --apply`. That command writes a
+successful `shipyard/steward-handoff` status on the expected head, re-reads the
+PR, and only then adds `shipyard:managed` and removes `shipyard:unmanaged`.
+The apply-mode steward inventories all other open PRs as `unmanaged`, adds the
+explanatory `shipyard:unmanaged` label, but never enqueues, reruns, cancels, or
+signals recovery for them. A managed semantic blocker receives one deduplicated
+`shipyard:needs-agent` label plus failed `shipyard/steward-recovery` status;
+healthy deterministic progress clears the signal. This lets a cheap recovery
+agent handle exceptions without spending model tokens on polling.
+The preferred unattended credential has Commit statuses and Issues read/write.
+A local read-oriented GitHub App that receives the exact integration-permission
+403 falls back, with a visible warning, to ambient `gh` for these low-volume
+steward status/label writes only; normal observation remains on configured auth.
 
 Read [references/merge-steward.md](references/merge-steward.md) before operating
 the steward, changing its policy, or recovering a pending cancellation.
@@ -881,6 +907,13 @@ GraphQL reset time when a best-effort `gh api rate_limit` probe
 succeeds. Add this call to any new REST-fallback dispatch site so
 the operator-visible signal stays consistent.
 
+The PR snapshot's raw `statusCheckRollup` does not carry `isRequired`.
+`wait pr --state green` must therefore hydrate requiredness from
+`gh pr checks --required --json` before evaluating the rollup. A failed
+requiredness lookup is not permission to use `mergeable` as a green proxy:
+mark the snapshot unknown and make the evaluator fail closed. State-only waits
+such as `--state merged` remain usable from the same snapshot.
+
 GitHub App installation tokens can also be rejected by GitHub's GraphQL
 `createPullRequest` / `mergePullRequest` mutations even when the App token is
 otherwise the right auth source for inspection. PR creation first tries the
@@ -995,6 +1028,32 @@ operator to "just rerun" a genuinely-failing required check.
 The destructive counterpart (actually invoking `rescue --rerun-failed` + arming
 auto-merge automatically, behind a default-off flag) is a planned follow-up; the
 current behavior is diagnostic-only.
+
+The standalone `shipyard rescue` operator is replacement-first. Before it can
+cancel a queued PR/merge-group run, local workflow discovery must prove that the
+workflow declares `workflow_dispatch` and that every required input is either
+resolved by the dispatch plan or safely synthesized from the PR number
+(`pr`, `pr_number`, or `pull_request_number`). Shipyard submits the replacement
+first and cancels only after GitHub accepts that dispatch. A workflow without a
+dispatch trigger, an unknown required input, or a rejected dispatch leaves the
+original run untouched. If the later cancellation fails, report the duplicate
+work as an error; never roll back by cancelling the accepted replacement.
+For a completed cancelled/failed/timed-out candidate selected by
+`--rerun-failed`, the accepted replacement is the entire transaction: leave the
+terminal original untouched. Re-arming it merely to cancel it races GitHub's
+queued transition, can return HTTP 409, and can create duplicate work.
+
+Manual `shipyard cancel <job> --reason <why>` records the supplied reason on
+the durable job. If omitted, Shipyard still records command source, host, agent,
+and PID; a reasonless terminal cancellation is never valid evidence.
+When an active local or SSH validation observes that durable cancellation, its
+progress callback returns a termination action and Shipyard kills the supervised
+process tree, including descendants. Preserve the process-tree and integration
+regressions; changing the ledger without stopping active work is not cancellation.
+
+Dry-run must use the same static dispatchability/input checks as apply. Preserve
+the negative control that a rejected dispatch produces no cancel call and the
+positive control that the Vellum-style PR input is sent before cancellation.
 
 ## Validation Gates
 

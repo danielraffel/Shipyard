@@ -392,8 +392,22 @@ pub(super) fn revalidate_transient_rerun(
     Ok(run.status.eq_ignore_ascii_case("completed")
         && run.head_sha.eq_ignore_ascii_case(&live_pr.fact.head_sha)
         && run.pull_request_number == Some(live_pr.fact.number)
+        && run_attempt_allows_transient_rerun(run.run_attempt, policy.max_transient_reruns)
         && matches!(
             conclusion.as_str(),
             "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "STALE"
         ))
+}
+
+/// Fence the bounded retry budget with GitHub's durable workflow-attempt
+/// identity, not only the local steward ledger. GitHub keeps one run ID and
+/// increments `run_attempt` after each accepted rerun. If a controller dies
+/// after GitHub accepts a rerun but before its external ledger cache is saved,
+/// the next controller must still refuse another accepted retry.
+pub(super) fn run_attempt_allows_transient_rerun(
+    run_attempt: u64,
+    max_transient_reruns: u32,
+) -> bool {
+    let already_accepted = run_attempt.saturating_sub(1);
+    already_accepted < u64::from(max_transient_reruns)
 }

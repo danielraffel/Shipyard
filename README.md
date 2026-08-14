@@ -62,9 +62,13 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
 - **One-shot PR rescue.** `shipyard rescue <pr>` cancels and
   redispatches every stuck queued workflow run on a PR onto
   `github-hosted` (or any provider via `--to`). `--rerun-failed`
-  also re-arms watchdog-cancelled runs; `--all-stuck` is the
+  dispatches fresh replacements for terminal failed/cancelled runs without
+  re-arming the originals; `--all-stuck` is the
   repo-wide variant. Pairs with the watchdog to form a complete
   prevent → recover toolkit.
+- **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
+  operator reason and terminates an active local or SSH validation process tree
+  on its next progress event, including descendant build processes.
 - **In-tool self-update.** `shipyard update` is the discoverable
   upgrade path (no more curl-pipe to remember); `--check` reports
   installed-vs-available, `--to v0.55.0` pins a specific tag for
@@ -343,6 +347,15 @@ not the important factor; using an installation access token is.
 
 See [`docs/github-app-quota.md`](docs/github-app-quota.md) for the setup fields,
 permissions, Shipyard config, and quota validation commands.
+
+The App can also give a Shipyard deployment's external policy verifier read-only
+visibility into organization runner groups. That permission is separate from
+repository `Actions` access and lets the integration verify repository, workflow,
+and runner-membership boundaries while Shipyard coordinates heterogeneous local
+capacity. This is not currently a built-in `shipyard runner` check. TartCI VMs, a separate Proxmox pool,
+and native machines remain distinct execution providers; Shipyard supplies the
+shared policy and exact-head view. Approve the installation update and refresh
+cached tokens after adding the permission.
 
 ## Learn more
 

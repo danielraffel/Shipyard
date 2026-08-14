@@ -177,6 +177,12 @@ vocabulary, not GitHub labels. Each target maps to a concrete `runs-on` selector
 such as `["self-hosted","Windows","ARM64","pulp-build-windows"]` or
 `"windows-latest"`.
 
+Self-managed x64 targets must set `proven = true` only after a real job has
+claimed and completed on that exact selector. Until then, `plan` emits a
+warning so a profile cannot silently promote an unverified architecture or
+label set. GitHub-hosted and Namespace cloud targets are exempt because their
+provider owns the architecture claim.
+
 Shipyard's job is to consume those facts across hosts:
 
 1. Read `tartci status --json` from each configured host.
@@ -191,10 +197,11 @@ ordered fallback chain into a Pulp workflow and expect GitHub to handle it.
 Fallback must be resolved before repo variables or `workflow_dispatch` inputs are
 set.
 
-For Pulp, the normal fast profile is expected to route PR macOS/Linux/Windows to
-local ARM64 VMs first where those lanes are enabled, then fall back to GitHub
-where configured, while scheduled nightly Intel Linux/Windows validation stays
-on GitHub-hosted x64 runners. Coverage targets must use dedicated ephemeral
+For Pulp, the normal fast profile routes PR macOS and Windows to local ARM64
+VMs first, and ordinary Linux PR work to the disposable Mac Pro x64 selector
+`["self-hosted","Linux","X64","pulp-build-linux-x64","pulp-host-macpro"]`,
+then falls back to GitHub only when live capacity is absent. Scheduled nightly
+Intel Linux/Windows validation stays on GitHub-hosted x64 runners. Coverage targets must use dedicated ephemeral
 labels; do not route coverage to a warm bare-metal build pool. Pulp's current
 repo-specific variables and labels live in Pulp's own docs and
 `.shipyard/ci-profiles/` files so Shipyard docs do not stale on Pulp operations.

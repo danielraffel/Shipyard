@@ -1133,9 +1133,13 @@ mod tests {
         history_mode(&log, Some(2), false, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         // Most recent first, so k4 + k3.
-        assert!(text.contains("k4"));
-        assert!(text.contains("k3"));
-        assert!(!text.contains("k2"));
+        let event_rows = text
+            .lines()
+            .filter(|line| line.starts_with("  "))
+            .collect::<Vec<_>>();
+        assert_eq!(event_rows.len(), 2);
+        assert!(event_rows[0].starts_with("  k4  "));
+        assert!(event_rows[1].starts_with("  k3  "));
     }
 
     #[test]

@@ -15,6 +15,16 @@ use crate::app::merge_steward_cmd::capacity_cancellation::{
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
 use crate::app::merge_steward_cmd::pr_mutations::rollback_transient_attempt;
+use crate::app::merge_steward_cmd::pr_mutations::run_attempt_allows_transient_rerun;
+
+#[test]
+fn github_run_attempt_fences_lost_transient_retry_ledger() {
+    assert!(!run_attempt_allows_transient_rerun(1, 0));
+    assert!(run_attempt_allows_transient_rerun(1, 1));
+    assert!(!run_attempt_allows_transient_rerun(2, 1));
+    assert!(run_attempt_allows_transient_rerun(2, 2));
+    assert!(!run_attempt_allows_transient_rerun(3, 2));
+}
 
 #[test]
 fn overlapping_apply_pass_fails_fast_on_ledger_lock() {
@@ -942,6 +952,8 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         repos: vec!["owner/repo".to_owned()],
         base: "main".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
+        managed_label: "steward:managed".to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
         coalesce: true,
         preempt_capacity: true,
@@ -980,6 +992,8 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         repos: vec!["owner/repo".to_owned()],
         base: "main".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
+        managed_label: "steward:managed".to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
         coalesce: false,
         preempt_capacity: false,

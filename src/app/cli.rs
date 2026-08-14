@@ -121,6 +121,9 @@ pub(super) enum Command {
     Cancel {
         /// Job identifier.
         job_id: String,
+        /// Durable operator/controller reason recorded on the cancelled job.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Change the priority of a pending job.
     Bump {
@@ -314,6 +317,16 @@ pub(super) enum Command {
         /// SHA drift (Shipyard #346).
         #[arg(long = "adopt-head")]
         adopt_head: bool,
+        /// Durable workstream identifier for an atomic merge-steward handoff.
+        /// Also enables handoff when the project default is disabled.
+        #[arg(long = "workstream-id", conflicts_with = "no_steward_handoff")]
+        workstream_id: Option<String>,
+        /// Durable context URL for the steward receipt. Defaults to the PR URL.
+        #[arg(long = "context-url", conflicts_with = "no_steward_handoff")]
+        context_url: Option<String>,
+        /// Disable a project-configured automatic steward handoff.
+        #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
+        no_steward_handoff: bool,
     },
     /// Cloud runner operations.
     Cloud {
@@ -995,6 +1008,31 @@ pub(super) enum RunnerCommand {
         /// Stop after N ticks. Test hook.
         #[arg(long = "max-ticks", hide = true)]
         max_ticks: Option<u32>,
+    },
+    /// Hand an exact pull-request head to the merge steward.
+    ///
+    /// Dry-run is the default. Apply mode writes a successful commit-status
+    /// receipt on the expected head, then labels the PR as managed only after
+    /// re-reading that the head is still exact.
+    StewardHandoff {
+        /// Owner/repo slug. Defaults to the current repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull-request number.
+        #[arg(long)]
+        pr: u64,
+        /// Full immutable head SHA expected by the submitting agent.
+        #[arg(long)]
+        head: String,
+        /// Durable work item identifier, such as GEN-7.
+        #[arg(long = "workstream-id")]
+        workstream_id: String,
+        /// Durable context URL, such as a Linear issue or planning document.
+        #[arg(long = "context-url")]
+        context_url: Option<String>,
+        /// Write the receipt and managed label. Without this flag, only audit.
+        #[arg(long)]
+        apply: bool,
     },
     /// Audit and conservatively advance merge-on-green across repositories.
     ///

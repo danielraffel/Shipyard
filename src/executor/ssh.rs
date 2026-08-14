@@ -137,7 +137,8 @@ pub struct SshValidationRequest<'a> {
     /// Validation mode label.
     pub mode: String,
     /// Optional progress callback.
-    pub progress_callback: Option<&'a mut dyn FnMut(ProgressEvent)>,
+    pub progress_callback:
+        Option<&'a mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction>,
 }
 
 impl SshValidationRequest<'_> {
@@ -385,9 +386,10 @@ impl<O: SshOperations> SshExecutor<O> {
     pub fn validate(&self, mut request: SshValidationRequest<'_>) -> TargetResult {
         let mut progress_callback = request.progress_callback.take();
         for attempt in 0..=self.max_retries {
-            let callback = progress_callback
-                .as_mut()
-                .map(|callback| &mut **callback as &mut dyn FnMut(ProgressEvent));
+            let callback = progress_callback.as_mut().map(|callback| {
+                &mut **callback
+                    as &mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction
+            });
             let result = self.validate_once(&request, callback);
             let retryable = result
                 .error_message
@@ -410,7 +412,9 @@ impl<O: SshOperations> SshExecutor<O> {
     fn validate_once(
         &self,
         request: &SshValidationRequest<'_>,
-        progress_callback: Option<&mut dyn FnMut(ProgressEvent)>,
+        progress_callback: Option<
+            &mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction,
+        >,
     ) -> TargetResult {
         let started_at = Utc::now();
         let start_time = Instant::now();
