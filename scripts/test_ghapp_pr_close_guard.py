@@ -243,6 +243,25 @@ class PrCloseGuardTests(unittest.TestCase):
             )
         )
 
+    def test_tree_lookup_cache_reuses_shared_parent_tree(self) -> None:
+        commit = "b" * 40
+        calls: list[str] = []
+
+        def query(endpoint: str) -> dict[str, object]:
+            calls.append(endpoint)
+            return {
+                "truncated": False,
+                "tree": [
+                    {"path": "a", "mode": "100644", "type": "blob", "sha": "a" * 40},
+                    {"path": "b", "mode": "100644", "type": "blob", "sha": "c" * 40},
+                ],
+            }
+
+        cache: guard.TreeCache = {}
+        self.assertIsNotNone(guard.tree_entry_for_path("o/r", commit, "a", query, cache))
+        self.assertIsNotNone(guard.tree_entry_for_path("o/r", commit, "b", query, cache))
+        self.assertEqual(calls, [f"repos/o/r/git/trees/{commit}"])
+
     def test_raw_rest_close_is_recognized(self) -> None:
         self.assertEqual(
             guard.close_request(
