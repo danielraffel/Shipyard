@@ -310,6 +310,20 @@ class PrCloseGuardTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("closePullRequest", message)
 
+    def test_rest_endpoint_placeholders_are_resolved_before_close_classification(self) -> None:
+        with mock.patch.dict(os.environ, {"GH_REPO": "o/r"}, clear=True):
+            self.assertEqual(
+                guard.close_request(
+                    [
+                        "api",
+                        "repos/{owner}/{repo}/pulls/7",
+                        "-XPATCH",
+                        "-fstate=closed",
+                    ]
+                ),
+                guard.CloseRequest(repo="o/r", pr=7),
+            )
+
     def test_graphql_mutation_in_endpoint_query_is_refused(self) -> None:
         code, message, _ = self.run_guard(
             [
@@ -383,6 +397,27 @@ class PrCloseGuardTests(unittest.TestCase):
             )
         self.assertEqual(code, 1)
         self.assertIn("closePullRequest", message)
+
+    def test_graphql_input_decodes_escaped_close_mutation_name(self) -> None:
+        mutation = (
+            r'{"query":"mutation { closePull\u0052equest(input:{pullRequestId:\"x\"}) '
+            r'{ clientMutationId } }"}'
+        )
+        with mock.patch("pathlib.Path.read_text", return_value=mutation):
+            code, message, _ = self.run_guard(
+                ["api", "graphql", "--input", "/tmp/request.json"]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("closePullRequest", message)
+
+    def test_enterprise_hostname_is_bound_to_every_evidence_query(self) -> None:
+        request = guard.CloseRequest(repo="o/r", pr=7, hostname="ghe.example.com")
+        with mock.patch.object(guard, "command_json", return_value={"ok": True}) as command:
+            query = guard.evidence_query(request, lambda _endpoint: self.fail("fallback"))
+            self.assertEqual(query("repos/o/r/pulls/7"), {"ok": True})
+        command.assert_called_once_with(
+            ["api", "--hostname", "ghe.example.com", "repos/o/r/pulls/7"]
+        )
 
     def test_rest_issue_close_is_allowed_only_when_number_is_not_a_pr(self) -> None:
         def issue_only(endpoint: str) -> dict[str, object]:

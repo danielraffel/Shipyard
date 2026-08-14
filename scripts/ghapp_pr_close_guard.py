@@ -26,11 +26,13 @@ class CloseRequest(NamedTuple):
     repo: str
     pr: int
     allow_non_pr: bool = False
+    hostname: str | None = None
 
 
 class ApiTarget(NamedTuple):
     path: str
     query: dict[str, list[str]]
+    hostname: str | None = None
 
 
 ApiJson = Callable[[str], dict[str, Any]]
@@ -81,13 +83,23 @@ def graphql_document(args: list[str]) -> str:
         raise GuardError("cannot inspect a GraphQL body read from stdin")
     if path:
         try:
-            documents.append(pathlib.Path(path).read_text(encoding="utf-8"))
+            body = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
         except OSError as error:
             raise GuardError(f"cannot inspect GraphQL input file: {error}") from error
+        except json.JSONDecodeError as error:
+            raise GuardError(f"cannot inspect malformed GraphQL input: {error}") from error
+        if not isinstance(body, dict) or not isinstance(body.get("query"), str):
+            raise GuardError("GraphQL input must be a JSON object with a string query")
+        documents.append(body["query"])
     return "\n".join(documents)
 
 
 def api_target(args: list[str]) -> ApiTarget:
+    hostname = option_value(args, {"--hostname"})
+    if hostname is not None:
+        hostname = hostname.lower()
+        if hostname in {"github.com", "api.github.com"}:
+            hostname = None
     value_options = {
         "--cache",
         "-F",
@@ -139,8 +151,43 @@ def api_target(args: list[str]) -> ApiTarget:
                 or parts.password is not None
             ):
                 raise GuardError("cannot inspect absolute API endpoint")
-        return ApiTarget(path.lstrip("/"), parse_qs(parts.query, keep_blank_values=True))
-    return ApiTarget("", {})
+        path = resolve_api_placeholders(path.lstrip("/"))
+        return ApiTarget(path, parse_qs(parts.query, keep_blank_values=True), hostname)
+    return ApiTarget("", {}, hostname)
+
+
+def resolve_api_placeholders(path: str) -> str:
+    if "{" not in path and "}" not in path:
+        return path
+    repo_parts = os.environ.get("GH_REPO", "").split("/")
+    if len(repo_parts) >= 2:
+        owner, repo = repo_parts[-2], repo_parts[-1]
+    else:
+        owner, repo = live_repo().split("/", 1)
+    branch = ""
+    if "{branch}" in path:
+        try:
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            raise GuardError(f"cannot resolve API endpoint branch placeholder: {error}") from error
+    for placeholder, value in {
+        "{owner}": owner,
+        "{repo}": repo,
+        "{branch}": branch,
+    }.items():
+        if placeholder in path:
+            if not value:
+                raise GuardError(f"cannot resolve API endpoint placeholder {placeholder}")
+            path = path.replace(placeholder, value)
+    if "{" in path or "}" in path:
+        raise GuardError("cannot resolve unknown API endpoint placeholder")
+    return path
 
 
 def compact_graphql(document: str) -> str:
@@ -286,6 +333,7 @@ def close_request(args: list[str]) -> CloseRequest | None:
                 repo=normalize_repo(match.group(1)),
                 pr=int(match.group(3)),
                 allow_non_pr=match.group(2) == "issues",
+                hostname=target.hostname,
             )
     return None
 
@@ -327,6 +375,14 @@ def command_json(arguments: list[str]) -> dict[str, Any]:
 
 def api_json(endpoint: str) -> dict[str, Any]:
     return command_json(["api", endpoint])
+
+
+def evidence_query(request: CloseRequest, fallback: ApiJson) -> ApiJson:
+    if request.hostname is None:
+        return fallback
+    return lambda endpoint: command_json(
+        ["api", "--hostname", request.hostname, endpoint]
+    )
 
 
 def live_repo() -> str:
@@ -487,8 +543,9 @@ def main(args: list[str], *, api_json: ApiJson = api_json) -> int:
             file=sys.stderr,
         )
         return 0
+    query = evidence_query(request, api_json)
     try:
-        contained, detail = containment_evidence(request, api_json)
+        contained, detail = containment_evidence(request, query)
     except NotFound as error:
         print(
             f"pr-close-guard: refusing PR #{request.pr}; could not prove its exact "
