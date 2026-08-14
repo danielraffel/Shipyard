@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0882"></a>
+## [0.88.2] - 2026-08-14
+
+- fix(rescue): keep terminal originals terminal after replacement dispatch
+- fix(queue): record source and actor metadata for every manual cancellation
+
 <a id="v0881"></a>
 ## [0.88.1] - 2026-08-14
 

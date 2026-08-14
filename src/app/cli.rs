@@ -121,6 +121,9 @@ pub(super) enum Command {
     Cancel {
         /// Job identifier.
         job_id: String,
+        /// Durable operator/controller reason recorded on the cancelled job.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Change the priority of a pending job.
     Bump {

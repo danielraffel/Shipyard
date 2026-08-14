@@ -479,7 +479,9 @@ fn handle_state_command<W: Write>(
             None => evidence_command(branch, cwd, state_dir, json, stdout),
         },
         Command::Logs { job_id, target } => logs_command(&job_id, target, state_dir, stdout),
-        Command::Cancel { job_id } => cancel_command(&job_id, state_dir, json, stdout),
+        Command::Cancel { job_id, reason } => {
+            cancel_command(&job_id, reason.as_deref(), state_dir, json, stdout)
+        }
         Command::Bump { job_id, priority } => {
             bump_command(&job_id, priority, state_dir, json, stdout)
         }
@@ -1854,6 +1856,11 @@ mod tests {
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "cancel");
         assert_eq!(value["job"]["status"], "cancelled");
+        assert!(
+            value["job"]["cancellation_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("shipyard cancel"))
+        );
     }
 
     #[test]
@@ -1881,6 +1888,8 @@ mod tests {
             temp.path().to_str().expect("temp path"),
             "cancel",
             &job.id,
+            "--reason",
+            "controller epoch 7 replaced exact head",
         ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1891,6 +1900,10 @@ mod tests {
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "cancel");
         assert_eq!(value["job"]["status"], "cancelled");
+        assert_eq!(
+            value["job"]["cancellation_reason"],
+            "controller epoch 7 replaced exact head"
+        );
         assert_eq!(
             queue.get(&job.id).expect("get").expect("job").status,
             crate::job::JobStatus::Cancelled

@@ -62,7 +62,8 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
 - **One-shot PR rescue.** `shipyard rescue <pr>` cancels and
   redispatches every stuck queued workflow run on a PR onto
   `github-hosted` (or any provider via `--to`). `--rerun-failed`
-  also re-arms watchdog-cancelled runs; `--all-stuck` is the
+  dispatches fresh replacements for terminal failed/cancelled runs without
+  re-arming the originals; `--all-stuck` is the
   repo-wide variant. Pairs with the watchdog to form a complete
   prevent → recover toolkit.
 - **In-tool self-update.** `shipyard update` is the discoverable
