@@ -1241,6 +1241,15 @@ controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an
 explicit operator fallback when fleet status says the local Macs are
 offline/unhealthy, or when the workflow intentionally asks for hosted coverage.
 
+For Vellum's repository-scoped disposable lanes, treat an `offline + busy`
+runner as an ownership mismatch until TartCI proves otherwise. Run the bounded
+two-snapshot check, correlate the exact VM/lease/supervisor and in-progress job,
+and preserve the protected queue while the result is live or uncertain. The
+`offline_busy_orphaned_no_local_owner` result is the only basis for the narrow
+documented recovery of that exact job and runner. Never bulk-cancel busy
+runners, reset shared names, broaden a trusted group, or use a fresh worktree
+as a reason to register another runner.
+
 ## Cloud Retargeting
 
 `shipyard cloud retarget --apply` is intentionally fail-closed. It cancels
