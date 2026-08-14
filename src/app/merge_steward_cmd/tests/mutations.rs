@@ -15,6 +15,16 @@ use crate::app::merge_steward_cmd::capacity_cancellation::{
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
 use crate::app::merge_steward_cmd::pr_mutations::rollback_transient_attempt;
+use crate::app::merge_steward_cmd::pr_mutations::run_attempt_allows_transient_rerun;
+
+#[test]
+fn github_run_attempt_fences_lost_transient_retry_ledger() {
+    assert!(!run_attempt_allows_transient_rerun(1, 0));
+    assert!(run_attempt_allows_transient_rerun(1, 1));
+    assert!(!run_attempt_allows_transient_rerun(2, 1));
+    assert!(run_attempt_allows_transient_rerun(2, 2));
+    assert!(!run_attempt_allows_transient_rerun(3, 2));
+}
 
 #[test]
 fn overlapping_apply_pass_fails_fast_on_ledger_lock() {

@@ -22,6 +22,11 @@ endpoint cannot atomically prove complete required-check materialization or
 bind the validated base revision. Use manual merge or enable a native merge
 queue.
 
+The transient retry ceiling is fenced twice: the local ledger records intent
+before mutation, and GitHub's durable `run_attempt` must still be within the
+configured budget at live revalidation. Losing a controller cache after GitHub
+accepted a rerun therefore cannot authorize another retry on the next pass.
+
 Ownership is explicit. Before the steward may mutate a PR, the submitting
 agent writes an exact-head receipt and management label:
 
