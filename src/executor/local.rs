@@ -421,9 +421,10 @@ impl LocalExecutor {
                         context.started_at,
                         Some(context.start_time.elapsed().as_secs_f64()),
                     );
+                    result.status = TargetStatus::Cancelled;
                     result.phase = Some(stage_name.clone());
                     result.error_message = Some(reason);
-                    result.failure_class = Some(FailureClass::Unknown.as_str().to_owned());
+                    result.failure_class = None;
                     return result;
                 }
             }
@@ -1260,7 +1261,7 @@ mod tests {
             LocalExecutor::default().validate(request)
         };
 
-        assert_eq!(result.status, TargetStatus::Error);
+        assert_eq!(result.status, TargetStatus::Cancelled);
         assert_eq!(result.phase.as_deref(), Some("build"));
         assert_eq!(result.error_message.as_deref(), Some("cancel before build"));
         assert!(temp.path().join("setup.marker").exists());
