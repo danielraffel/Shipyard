@@ -799,6 +799,9 @@ runner owner's exact user keychain default and search-list order by never
 mutating either: pass the ephemeral keychain explicitly to `codesign`.
 Cleanup must run under `always()`, verify both settings stayed unchanged, and
 delete the ephemeral keychain even when signing setup fails.
+Because `codesign --keychain` does not bypass its search-list eligibility
+requirement, the workflow gives signing an isolated temporary `HOME` whose
+search list contains only the ephemeral keychain.
 
 ### CI routing profiles
 

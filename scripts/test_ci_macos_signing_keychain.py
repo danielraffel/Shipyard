@@ -16,6 +16,13 @@ def completed(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProc
 
 
 class SigningKeychainTests(unittest.TestCase):
+    def test_security_isolates_preferences_with_explicit_home(self) -> None:
+        with mock.patch.object(
+            subject.subprocess, "run", return_value=completed()
+        ) as run:
+            subject._security("list-keychains", "-d", "user", home=Path("/tmp/isolated home"))
+        self.assertEqual(run.call_args.kwargs["env"]["HOME"], "/tmp/isolated home")
+
     def test_prepare_never_mutates_default_or_search_list_and_handles_spaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -28,12 +35,37 @@ class SigningKeychainTests(unittest.TestCase):
                 completed("\n".join(f'"{item}"' for item in search)),
                 completed(),
                 completed(),
+                completed(f'"{keychain}"'),
+                completed(),
                 completed(),
             ]
             with mock.patch.object(subject, "_security", side_effect=responses) as security:
-                subject.prepare(keychain, state)
+                subject.prepare(keychain, state, root / "signing home")
             calls = security.call_args_list
-            self.assertFalse(any("-s" in call.args for call in calls))
+            self.assertTrue((root / "signing home/Library/Preferences").is_dir())
+            self.assertFalse(
+                any("-s" in call.args and call.kwargs.get("home") is None for call in calls)
+            )
+            self.assertIn(
+                mock.call(
+                    "list-keychains",
+                    "-d",
+                    "user",
+                    "-s",
+                    str(keychain),
+                    home=root / "signing home",
+                ),
+                calls,
+            )
+            self.assertIn(
+                mock.call(
+                    "list-keychains",
+                    "-d",
+                    "user",
+                    home=root / "signing home",
+                ),
+                calls,
+            )
             self.assertEqual(json.loads(state.read_text())["search_list"], search)
 
             verify = [
@@ -42,7 +74,7 @@ class SigningKeychainTests(unittest.TestCase):
                 completed(),
             ]
             with mock.patch.object(subject, "_security", side_effect=verify) as security:
-                subject.restore(keychain, state)
+                subject.restore(keychain, state, root / "signing home")
             self.assertEqual(
                 security.call_args_list,
                 [
@@ -59,7 +91,7 @@ class SigningKeychainTests(unittest.TestCase):
                 subject, "_security", side_effect=[completed(returncode=1), completed()]
             ) as security:
                 with self.assertRaisesRegex(RuntimeError, "could not snapshot"):
-                    subject.prepare(root / "keychain", root / "state")
+                    subject.prepare(root / "keychain", root / "state", root / "home")
             self.assertEqual(security.call_count, 2)
 
     def test_missing_state_cleanup_only_deletes_and_reports_state_loss(self) -> None:
@@ -68,7 +100,7 @@ class SigningKeychainTests(unittest.TestCase):
             keychain = root / "keychain"
             with mock.patch.object(subject, "_security", return_value=completed()) as security:
                 with self.assertRaisesRegex(RuntimeError, "state is unavailable"):
-                    subject.restore(keychain, root / "missing")
+                    subject.restore(keychain, root / "missing", root / "home")
             security.assert_called_once_with("delete-keychain", str(keychain))
 
     def test_changed_global_state_fails_without_overwriting_it(self) -> None:
@@ -83,7 +115,7 @@ class SigningKeychainTests(unittest.TestCase):
             responses = [completed('"/changed"'), completed('"/changed"'), completed()]
             with mock.patch.object(subject, "_security", side_effect=responses) as security:
                 with self.assertRaisesRegex(RuntimeError, "changed during signing"):
-                    subject.restore(root / "ephemeral", state)
+                    subject.restore(root / "ephemeral", state, root / "home")
             self.assertFalse(any("-s" in call.args for call in security.call_args_list))
 
     def test_failed_ephemeral_deletion_is_a_cleanup_failure(self) -> None:
@@ -98,7 +130,7 @@ class SigningKeychainTests(unittest.TestCase):
             responses = [completed('"/original"'), completed('"/original"'), completed(returncode=1)]
             with mock.patch.object(subject, "_security", side_effect=responses):
                 with self.assertRaisesRegex(RuntimeError, "could not delete"):
-                    subject.restore(root / "ephemeral", state)
+                    subject.restore(root / "ephemeral", state, root / "home")
 
 
 if __name__ == "__main__":

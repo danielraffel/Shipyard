@@ -7,23 +7,29 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 
-def _security(*args: str) -> subprocess.CompletedProcess[str]:
+def _security(*args: str, home: Path | None = None) -> subprocess.CompletedProcess[str]:
+    env = None
+    if home is not None:
+        env = os.environ.copy()
+        env["HOME"] = str(home)
     return subprocess.run(
         ["security", *args],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
-def _require_security(*args: str) -> subprocess.CompletedProcess[str]:
-    result = _security(*args)
+def _require_security(*args: str, home: Path | None = None) -> subprocess.CompletedProcess[str]:
+    result = _security(*args, home=home)
     if result.returncode != 0:
         raise RuntimeError(f"security {args[0]} failed with status {result.returncode}")
     return result
@@ -44,7 +50,7 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def prepare(keychain: Path, state_path: Path) -> None:
+def prepare(keychain: Path, state_path: Path, signing_home: Path) -> None:
     """Snapshot user keychain state before installing the ephemeral keychain."""
     state: dict[str, Any] = {
         "snapshot_complete": False,
@@ -72,11 +78,20 @@ def prepare(keychain: Path, state_path: Path) -> None:
     _write_state(state_path, state)
 
     _require_security("create-keychain", "-p", "ci", str(keychain))
+    (signing_home / "Library" / "Preferences").mkdir(parents=True, exist_ok=True)
+    _require_security(
+        "list-keychains", "-d", "user", "-s", str(keychain), home=signing_home
+    )
+    isolated_list = _require_security(
+        "list-keychains", "-d", "user", home=signing_home
+    )
+    if _parse_keychain_output(isolated_list.stdout) != [str(keychain)]:
+        raise RuntimeError("isolated signing keychain search list did not persist")
     _require_security("unlock-keychain", "-p", "ci", str(keychain))
     _require_security("set-keychain-settings", "-t", "21600", "-u", str(keychain))
 
 
-def restore(keychain: Path, state_path: Path) -> None:
+def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
     """Verify global state stayed unchanged and delete the ephemeral keychain."""
     failures: list[str] = []
     state: dict[str, Any] | None = None
@@ -117,6 +132,7 @@ def restore(keychain: Path, state_path: Path) -> None:
     deletion = _security("delete-keychain", str(keychain))
     if deletion.returncode != 0:
         failures.append("could not delete the ephemeral signing keychain")
+    shutil.rmtree(signing_home, ignore_errors=True)
 
     if failures:
         raise RuntimeError("; ".join(failures))
@@ -127,13 +143,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("action", choices=("prepare", "restore"))
     parser.add_argument("--keychain", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument("--signing-home", type=Path, required=True)
     args = parser.parse_args(argv)
 
     try:
         if args.action == "prepare":
-            prepare(args.keychain, args.state)
+            prepare(args.keychain, args.state, args.signing_home)
         else:
-            restore(args.keychain, args.state)
+            restore(args.keychain, args.state, args.signing_home)
     except RuntimeError as error:
         print(f"macOS signing keychain {args.action} failed: {error}", file=sys.stderr)
         return 1

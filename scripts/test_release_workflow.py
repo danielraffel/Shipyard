@@ -45,6 +45,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("Restore user keychains and delete ephemeral signing keychain", text)
         self.assertIn("if: always()", text)
         self.assertIn("SHIPYARD_SIGNING_KEYCHAIN_STATE", text)
+        self.assertIn("SHIPYARD_SIGNING_HOME", text)
+        self.assertIn("shipyard-ci-home-${GITHUB_RUN_ID}", text)
         self.assertNotIn("existing_keychains", text)
         self.assertNotIn('security default-keychain -s "$KEYCHAIN"', text)
 

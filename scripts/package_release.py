@@ -95,6 +95,7 @@ def run(
     cwd: Path = ROOT,
     capture: bool = False,
     redact_values: tuple[str, ...] = (),
+    env: dict[str, str] | None = None,
 ) -> str:
     result = subprocess.run(
         args,
@@ -102,6 +103,7 @@ def run(
         check=False,
         text=True,
         capture_output=capture,
+        env=env,
     )
     if result.returncode != 0:
         detail = f"command failed ({result.returncode}): {' '.join(redact_args(args, redact_values))}"
@@ -168,6 +170,9 @@ def sign_binary(path: Path) -> None:
     identity = os.environ["SHIPYARD_SIGNING_IDENTITY"]
     keychain = os.environ.get("SHIPYARD_SIGNING_KEYCHAIN")
     keychain_args = ["--keychain", keychain] if keychain else []
+    signing_env = os.environ.copy()
+    if signing_home := os.environ.get("SHIPYARD_SIGNING_HOME"):
+        signing_env["HOME"] = signing_home
     run(
         [
             "codesign",
@@ -179,7 +184,8 @@ def sign_binary(path: Path) -> None:
             identity,
             *keychain_args,
             str(path),
-        ]
+        ],
+        env=signing_env,
     )
 
 
@@ -205,7 +211,13 @@ def sign_dmg(path: Path) -> None:
     identity = os.environ["SHIPYARD_SIGNING_IDENTITY"]
     keychain = os.environ.get("SHIPYARD_SIGNING_KEYCHAIN")
     keychain_args = ["--keychain", keychain] if keychain else []
-    run(["codesign", "--force", "--sign", identity, *keychain_args, str(path)])
+    signing_env = os.environ.copy()
+    if signing_home := os.environ.get("SHIPYARD_SIGNING_HOME"):
+        signing_env["HOME"] = signing_home
+    run(
+        ["codesign", "--force", "--sign", identity, *keychain_args, str(path)],
+        env=signing_env,
+    )
 
 
 def create_notary_keychain(temp_dir: Path) -> tuple[Path, str]:

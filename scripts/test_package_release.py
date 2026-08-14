@@ -21,6 +21,7 @@ class PackageReleaseTests(unittest.TestCase):
             {
                 "SHIPYARD_SIGNING_IDENTITY": "identity",
                 "SHIPYARD_SIGNING_KEYCHAIN": "/tmp/signing keychain.keychain-db",
+                "SHIPYARD_SIGNING_HOME": "/tmp/isolated signing home",
             },
             clear=True,
         ), mock.patch.object(package_release, "run") as run:
@@ -29,6 +30,7 @@ class PackageReleaseTests(unittest.TestCase):
         for call in run.call_args_list:
             self.assertIn("--keychain", call.args[0])
             self.assertIn("/tmp/signing keychain.keychain-db", call.args[0])
+            self.assertEqual(call.kwargs["env"]["HOME"], "/tmp/isolated signing home")
 
     def test_artifact_filename_keeps_dev_safe_prefix(self) -> None:
         self.assertEqual(
