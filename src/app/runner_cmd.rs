@@ -367,6 +367,9 @@ fn emit_status_report<W: Write>(
                     stdout,
                     "ERR: runner is not online; investigate before trusting CI."
                 )?;
+                for symptom in &report.symptoms {
+                    writeln!(stdout, "  - {}", format_symptom_human(symptom))?;
+                }
             }
             RunnerHealth::Stuck => {
                 writeln!(stdout, "WARN: stuck-state symptoms detected:")?;
