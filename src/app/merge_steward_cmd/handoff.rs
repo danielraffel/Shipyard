@@ -1,6 +1,6 @@
 use super::{
-    CliFailure, GitHubActions, HANDOFF_CONTEXT, MANAGED_LABEL, Path, Value, Write, gh_json,
-    is_full_sha, observation::encode_path_segment, resolve_repos, write_json_envelope,
+    CliFailure, GitHubActions, HANDOFF_CONTEXT, MANAGED_LABEL, Path, UNMANAGED_LABEL, Value, Write,
+    gh_json, is_full_sha, observation::encode_path_segment, resolve_repos, write_json_envelope,
 };
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -42,6 +42,7 @@ pub(crate) fn steward_handoff_command<W: Write>(
             "Explicit Shipyard stewardship ownership",
         )?;
         add_label(actions, &repo, args.pr, MANAGED_LABEL)?;
+        remove_label(actions, &repo, args.pr, UNMANAGED_LABEL)?;
     }
 
     render(args, &repo, json_output, stdout)?;
@@ -196,7 +197,33 @@ pub(super) fn add_label(
         "steward label attachment",
     )
     .map(|_| ())
-    .map_err(|error| CliFailure::new(1, format!("could not add managed label: {error}")))
+    .map_err(|error| CliFailure::new(1, format!("could not add label {label}: {error}")))
+}
+
+pub(super) fn remove_label(
+    actions: &GitHubActions,
+    repo: &str,
+    pr: u64,
+    label: &str,
+) -> Result<(), CliFailure> {
+    let encoded = encode_path_segment(label);
+    match run_steward_write(
+        actions,
+        &[
+            "api".to_owned(),
+            "-X".to_owned(),
+            "DELETE".to_owned(),
+            format!("repos/{repo}/issues/{pr}/labels/{encoded}"),
+        ],
+        "steward label removal",
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("HTTP 404") => Ok(()),
+        Err(error) => Err(CliFailure::new(
+            1,
+            format!("could not remove label {label}: {error}"),
+        )),
+    }
 }
 
 pub(super) fn run_steward_write(
@@ -335,6 +362,16 @@ mod tests {
         assert!(
             run_steward_write(&actions, &["api".to_owned(), "test".to_owned()], "test").is_err()
         );
+        assert_eq!(std::fs::read_to_string(count).expect("count"), "1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_an_absent_explanatory_label_is_idempotent() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (actions, count) = sequenced_gh(&temp, "HTTP 404 label not found");
+        remove_label(&actions, "owner/repo", 7, UNMANAGED_LABEL)
+            .expect("absent label is already clear");
         assert_eq!(std::fs::read_to_string(count).expect("count"), "1");
     }
 }

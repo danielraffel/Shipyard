@@ -99,8 +99,9 @@ shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --works
 `runner steward-handoff` is also dry-run by default. Apply writes a durable
 successful `shipyard/steward-handoff` commit status on the expected immutable
 head, revalidates that the PR still has that head, and then adds
-`shipyard:managed`. `runner steward` inventories all open PRs but mutates only
-heads carrying both signals; old and unlabeled backlog remains `unmanaged`.
+`shipyard:managed` and removes `shipyard:unmanaged`. Apply-mode `runner steward`
+adds that explanatory label to unhanded PRs, but only heads carrying both
+management signals may be queued, rerun, cancelled, or recovery-signalled.
 Semantic blockers receive one deduplicated `shipyard:needs-agent` label and
 failed `shipyard/steward-recovery` status, which are cleared after recovery.
 

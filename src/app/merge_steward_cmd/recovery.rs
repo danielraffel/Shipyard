@@ -1,9 +1,98 @@
 use super::{
     MutationApplyContext, NEEDS_AGENT_LABEL, ObservedPr, RECOVERY_CONTEXT, StewardDecision,
-    StewardLedger, StewardPolicy, acquire_pr_mutation_guard, classify_pr,
-    handoff::{ensure_label, run_steward_write},
+    StewardLedger, StewardPolicy, UNMANAGED_LABEL, acquire_pr_mutation_guard, classify_pr,
+    handoff::{add_label, ensure_label, remove_label, run_steward_write},
     merge_queue_snapshot, pull_request_with_required_checks, record_audit,
 };
+
+pub(super) fn reconcile_management_label(
+    context: &MutationApplyContext<'_>,
+    observed: &ObservedPr,
+    policy: &StewardPolicy,
+    decision: &StewardDecision,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    let unmanaged = matches!(decision, StewardDecision::Unmanaged);
+    if management_label_is_converged(observed, unmanaged) {
+        return (None, None);
+    }
+    let live = match revalidate_recovery_target(context, observed, policy, decision, ledger) {
+        Ok(live) => live,
+        Err(result) => return result,
+    };
+    if management_label_is_converged(&live, unmanaged) {
+        return (None, None);
+    }
+    let action_name = if unmanaged {
+        "runner steward label unmanaged"
+    } else {
+        "runner steward clear unmanaged"
+    };
+    let guard = match acquire_pr_mutation_guard(
+        context.mutation_control,
+        context.observation,
+        &live,
+        action_name,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => return (None, Some(error)),
+    };
+    let result = if unmanaged {
+        ensure_label(
+            context.actions,
+            &context.observation.repo,
+            UNMANAGED_LABEL,
+            "6E7781",
+            "Not handed to Shipyard; adopt, opt out, retarget, or close",
+        )
+        .and_then(|()| {
+            add_label(
+                context.actions,
+                &context.observation.repo,
+                live.fact.number,
+                UNMANAGED_LABEL,
+            )
+        })
+        .map(|()| "unmanaged_label_added".to_owned())
+        .map_err(|error| error.message)
+    } else {
+        remove_label(
+            context.actions,
+            &context.observation.repo,
+            live.fact.number,
+            UNMANAGED_LABEL,
+        )
+        .map(|()| "unmanaged_label_cleared".to_owned())
+        .map_err(|error| error.message)
+    };
+    match result {
+        Ok(action) => {
+            let audit_result = guard.finish(&action);
+            record_audit(
+                ledger,
+                &context.observation.repo,
+                &format!("pr:{}:{}", live.fact.number, live.fact.head_sha),
+                &action,
+            );
+            match audit_result {
+                Ok(()) => (Some(action), None),
+                Err(error) => (
+                    Some(action),
+                    Some(format!("management label mutation audit failed: {error}")),
+                ),
+            }
+        }
+        Err(error) => {
+            let audit_error = guard.finish("management_label_failed").err();
+            (
+                None,
+                Some(audit_error.map_or(error.clone(), |audit| {
+                    format!("{error}; mutation audit also failed: {audit}")
+                })),
+            )
+        }
+    }
+}
 
 pub(super) fn reconcile_recovery_signal(
     context: &MutationApplyContext<'_>,
@@ -183,26 +272,14 @@ fn clear_needs_agent(
     pr: &ObservedPr,
 ) -> Result<String, String> {
     write_recovery_status(context, pr, "success", "Shipyard recovery clear")?;
-    let encoded = super::observation::encode_path_segment(NEEDS_AGENT_LABEL);
-    match run_steward_write(
+    remove_label(
         context.actions,
-        &[
-            "api".to_owned(),
-            "-X".to_owned(),
-            "DELETE".to_owned(),
-            format!(
-                "repos/{}/issues/{}/labels/{encoded}",
-                context.observation.repo, pr.fact.number
-            ),
-        ],
-        "needs-agent label removal",
-    ) {
-        Ok(_) => Ok("needs_agent_cleared".to_owned()),
-        Err(error) if error.to_string().contains("HTTP 404") => {
-            Ok("needs_agent_cleared".to_owned())
-        }
-        Err(error) => Err(format!("could not clear needs-agent label: {error}")),
-    }
+        &context.observation.repo,
+        pr.fact.number,
+        NEEDS_AGENT_LABEL,
+    )
+    .map(|()| "needs_agent_cleared".to_owned())
+    .map_err(|error| error.message)
 }
 
 fn write_recovery_status(
@@ -255,6 +332,10 @@ fn has_label(pr: &ObservedPr, label: &str) -> bool {
         .any(|value| value.eq_ignore_ascii_case(label))
 }
 
+fn management_label_is_converged(pr: &ObservedPr, unmanaged: bool) -> bool {
+    has_label(pr, UNMANAGED_LABEL) == unmanaged
+}
+
 fn signal_is_converged(pr: &ObservedPr, needs_agent: bool) -> bool {
     let labelled = has_label(pr, NEEDS_AGENT_LABEL);
     let state = latest_recovery_state(pr);
@@ -268,6 +349,7 @@ fn truncate_description(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::MANAGED_LABEL;
     use super::*;
     use crate::merge_steward::{StewardCheck, StewardPullRequest};
 
@@ -333,6 +415,20 @@ mod tests {
                 vec![NEEDS_AGENT_LABEL],
                 vec![("SUCCESS", "2026-08-13T00:00:00Z")]
             ),
+            false
+        ));
+    }
+
+    #[test]
+    fn unmanaged_label_is_deduplicated_and_cleared_after_handoff() {
+        assert!(management_label_is_converged(
+            &pr(vec![UNMANAGED_LABEL], vec![]),
+            true
+        ));
+        assert!(!management_label_is_converged(&pr(vec![], vec![]), true));
+        assert!(management_label_is_converged(&pr(vec![], vec![]), false));
+        assert!(!management_label_is_converged(
+            &pr(vec![UNMANAGED_LABEL, MANAGED_LABEL], vec![]),
             false
         ));
     }

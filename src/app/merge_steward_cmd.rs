@@ -201,13 +201,14 @@ const CANCEL_TERMINAL_POLL: Duration = Duration::from_secs(2);
 const PREEMPT_AFTER_SECS: i64 = 900;
 pub(super) const HANDOFF_CONTEXT: &str = "shipyard/steward-handoff";
 pub(super) const MANAGED_LABEL: &str = "shipyard:managed";
+pub(super) const UNMANAGED_LABEL: &str = "shipyard:unmanaged";
 pub(super) const RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
 pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
 
 mod handoff;
 pub(crate) use handoff::{StewardHandoffArgs, steward_handoff_command};
 mod recovery;
-use recovery::reconcile_recovery_signal;
+use recovery::{reconcile_management_label, reconcile_recovery_signal};
 
 pub(super) fn steward_command<W: Write>(
     args: &StewardCommandArgs,
