@@ -344,6 +344,15 @@ not the important factor; using an installation access token is.
 See [`docs/github-app-quota.md`](docs/github-app-quota.md) for the setup fields,
 permissions, Shipyard config, and quota validation commands.
 
+The App can also give a Shipyard deployment's external policy verifier read-only
+visibility into organization runner groups. That permission is separate from
+repository `Actions` access and lets the integration verify repository, workflow,
+and runner-membership boundaries while Shipyard coordinates heterogeneous local
+capacity. This is not currently a built-in `shipyard runner` check. TartCI VMs, a separate Proxmox pool,
+and native machines remain distinct execution providers; Shipyard supplies the
+shared policy and exact-head view. Approve the installation update and refresh
+cached tokens after adding the permission.
+
 ## Learn more
 
 - [Blog post: Shipyard is a cross-platform CI orchestration layer](https://danielraffel.me/2026/04/09/shipyard-is-a-cross-platform-ci-orchestration-layer-that-coordinates-validation-for-ai-agents-working-across-parallel-worktrees/)
