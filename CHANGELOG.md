@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0901"></a>
-## [0.90.2]
+<a id="v0902"></a>
+## [0.90.2] - 2026-08-14
 
+- fix(wait): resolve required PR checks safely ([#419](https://github.com/danielraffel/Shipyard/pull/419))
+
+<a id="v0901"></a>
 ## [0.90.1] - 2026-08-14
 
 - fix(wait): query supported PR fields ([#418](https://github.com/danielraffel/Shipyard/pull/418))
@@ -857,6 +860,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.90.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.2
 [0.90.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.1
 [0.90.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.0
 [0.89.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.89.0
