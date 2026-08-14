@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
@@ -294,8 +294,17 @@ pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<O
         cwd,
     )? {
         GhOutcome::Success(stdout) => {
-            let value = serde_json::from_slice::<Value>(&stdout)?;
-            Ok(value.is_object().then_some(value))
+            let mut value = serde_json::from_slice::<Value>(&stdout)?;
+            if !value.is_object() {
+                return Ok(None);
+            }
+            match fetch_required_pr_checks(&client, repo, pr_number, cwd)? {
+                Some(required) => annotate_required_checks(&mut value, &required),
+                None => {
+                    value["_required_checks_known"] = Value::Bool(false);
+                }
+            }
+            Ok(Some(value))
         }
         GhOutcome::GraphqlRateLimited => {
             crate::pr::report_rate_limit_fallback_with_client(&client, "gh pr snapshot", cwd);
@@ -310,6 +319,96 @@ pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<O
 // `state == "MERGED"` and normalized by the evaluator.
 const PR_VIEW_JSON_FIELDS: &str =
     "number,headRefOid,state,mergeable,mergeStateStatus,statusCheckRollup";
+const PR_CHECKS_JSON_FIELDS: &str = "name,state,bucket,link";
+
+fn fetch_required_pr_checks(
+    client: &GhClient,
+    repo: &str,
+    pr_number: u64,
+    cwd: &Path,
+) -> WaitResult<Option<Vec<Value>>> {
+    let pr_number = pr_number.to_string();
+    let output = client
+        .prepare_command(cwd, None, GhSupervision::Supervised, GhAuthPolicy::Default)?
+        .args([
+            "pr",
+            "checks",
+            pr_number.as_str(),
+            "--repo",
+            repo,
+            "--required",
+            "--json",
+            PR_CHECKS_JSON_FIELDS,
+        ])
+        .output()?;
+
+    if let Ok(value) = serde_json::from_slice::<Value>(&output.stdout)
+        && let Some(required) = value.as_array()
+    {
+        return Ok(Some(required.clone()));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("no required checks reported") {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(None)
+}
+
+fn annotate_required_checks(snapshot: &mut Value, required: &[Value]) {
+    let Some(snapshot) = snapshot.as_object_mut() else {
+        return;
+    };
+    snapshot.insert("_required_checks_known".to_owned(), Value::Bool(true));
+
+    let required_names = required
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let rollup = snapshot
+        .entry("statusCheckRollup")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(rollup) = rollup.as_array_mut() else {
+        return;
+    };
+
+    let mut matched_names = BTreeSet::new();
+    for entry in rollup.iter_mut().filter_map(Value::as_object_mut) {
+        let name = entry
+            .get("name")
+            .or_else(|| entry.get("context"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let is_required = required_names.contains(name.as_str());
+        entry.insert("isRequired".to_owned(), Value::Bool(is_required));
+        if is_required {
+            matched_names.insert(name);
+        }
+    }
+
+    for entry in required {
+        let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
+        if name.is_empty() || matched_names.contains(name) {
+            continue;
+        }
+        let state = entry.get("state").and_then(Value::as_str).unwrap_or("");
+        let conclusion = if matches!(
+            state.to_ascii_uppercase().as_str(),
+            "QUEUED" | "IN_PROGRESS" | "PENDING"
+        ) {
+            Value::Null
+        } else {
+            Value::String(state.to_owned())
+        };
+        rollup.push(serde_json::json!({
+            "name": name,
+            "state": state,
+            "conclusion": conclusion,
+            "isRequired": true,
+        }));
+    }
+}
 
 /// REST fallback for `fetch_pr_snapshot`. Synthesises the GraphQL-shape value
 /// `evaluate_pr_green` / `evaluate_pr_state` consume.
@@ -410,6 +509,7 @@ pub fn synthesize_pr_snapshot_from_rest(pr_number: u64, pr: &Value, check_runs: 
                 "name": name,
                 "state": status,
                 "conclusion": conclusion,
+                "isRequired": true,
             }));
         }
     }
@@ -421,6 +521,7 @@ pub fn synthesize_pr_snapshot_from_rest(pr_number: u64, pr: &Value, check_runs: 
         "mergeable": mergeable,
         "mergeStateStatus": mergeable_state,
         "statusCheckRollup": rollup,
+        "_required_checks_known": false,
         "_rest_fallback": true,
     })
 }
@@ -617,9 +718,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PR_VIEW_JSON_FIELDS, WaitOutcome, pr_event_filter, read_snapshot_file,
-        release_event_filter, run_event_filter, synthesize_pr_snapshot_from_rest,
-        wait_for_condition,
+        PR_CHECKS_JSON_FIELDS, PR_VIEW_JSON_FIELDS, WaitOutcome, annotate_required_checks,
+        pr_event_filter, read_snapshot_file, release_event_filter, run_event_filter,
+        synthesize_pr_snapshot_from_rest, wait_for_condition,
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{IpcServer, IpcState};
@@ -961,11 +1062,13 @@ mod tests {
         assert_eq!(snapshot["merged"], false);
         assert_eq!(snapshot["mergeable"], true);
         assert_eq!(snapshot["_rest_fallback"], true);
+        assert_eq!(snapshot["_required_checks_known"], false);
         let rollup = snapshot["statusCheckRollup"].as_array().expect("rollup");
         assert_eq!(rollup.len(), 2);
         assert_eq!(rollup[0]["name"], "CI");
         assert_eq!(rollup[0]["state"], "completed");
         assert_eq!(rollup[0]["conclusion"], "success");
+        assert_eq!(rollup[0]["isRequired"], true);
     }
 
     #[test]
@@ -976,6 +1079,46 @@ mod tests {
                 .split(',')
                 .any(|field| field == "merged")
         );
+    }
+
+    #[test]
+    fn required_check_query_and_annotation_preserve_advisory_failures() {
+        assert_eq!(PR_CHECKS_JSON_FIELDS, "name,state,bucket,link");
+        let mut snapshot = serde_json::json!({
+            "statusCheckRollup": [
+                {"name": "macos", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "coverage", "status": "COMPLETED", "conclusion": "FAILURE"}
+            ]
+        });
+        annotate_required_checks(
+            &mut snapshot,
+            &[serde_json::json!({
+                "name": "macos",
+                "state": "SUCCESS",
+                "bucket": "pass",
+                "link": "https://github.test/check/1"
+            })],
+        );
+        assert_eq!(snapshot["_required_checks_known"], true);
+        assert_eq!(snapshot["statusCheckRollup"][0]["isRequired"], true);
+        assert_eq!(snapshot["statusCheckRollup"][1]["isRequired"], false);
+    }
+
+    #[test]
+    fn required_check_annotation_adds_missing_status_context() {
+        let mut snapshot = serde_json::json!({"statusCheckRollup": []});
+        annotate_required_checks(
+            &mut snapshot,
+            &[serde_json::json!({
+                "name": "required-status",
+                "state": "FAILURE",
+                "bucket": "fail",
+                "link": "https://github.test/status/1"
+            })],
+        );
+        assert_eq!(snapshot["statusCheckRollup"][0]["name"], "required-status");
+        assert_eq!(snapshot["statusCheckRollup"][0]["conclusion"], "FAILURE");
+        assert_eq!(snapshot["statusCheckRollup"][0]["isRequired"], true);
     }
 
     #[test]

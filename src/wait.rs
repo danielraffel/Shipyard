@@ -191,6 +191,12 @@ pub fn evaluate_pr_green(
             "Rulesets / merge-queue governance isn't supported by `shipyard wait pr --state green` yet — see governance/profiles.py.".to_owned(),
         )));
     }
+    if snapshot.get("_required_checks_known") == Some(&serde_json::Value::Bool(false)) {
+        return Err(Box::new(UnsupportedScopeError(
+            "GitHub required-check classification is unavailable; refusing to report the PR green"
+                .to_owned(),
+        )));
+    }
 
     let rollup = snapshot
         .get("statusCheckRollup")
@@ -205,7 +211,8 @@ pub fn evaluate_pr_green(
             .get("mergeable")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
-            .eq_ignore_ascii_case("MERGEABLE");
+            .eq_ignore_ascii_case("MERGEABLE")
+            && merge_state == "CLEAN";
     }
 
     Ok(TruthResult {
@@ -287,10 +294,11 @@ fn observed_pr_check(entry: &serde_json::Map<String, serde_json::Value>) -> Obse
     let required = entry
         .get("isRequired")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(true);
     let waiting = STILL_WAITING_STATES.contains(&state.as_str())
         && !PASSING_CONCLUSIONS.contains(&conclusion.as_str());
-    let passing = PASSING_CONCLUSIONS.contains(&conclusion.as_str());
+    let passing = PASSING_CONCLUSIONS.contains(&conclusion.as_str())
+        || PASSING_CONCLUSIONS.contains(&state.as_str());
 
     ObservedPrCheck {
         value: serde_json::json!({
@@ -551,6 +559,68 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn pr_green_fails_closed_when_required_check_classification_is_unknown() {
+        let snapshot = serde_json::json!({
+            "number": 1,
+            "headRefOid": "x",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [],
+            "_required_checks_known": false
+        });
+        let error = evaluate_pr_green(Some(&snapshot)).expect_err("unknown required checks");
+        assert!(error.downcast_ref::<UnsupportedScopeError>().is_some());
+    }
+
+    #[test]
+    fn pr_green_treats_unclassified_rollup_entries_as_required() {
+        let snapshot = serde_json::json!({
+            "number": 1,
+            "headRefOid": "x",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [{
+                "name": "required but unannotated",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE"
+            }]
+        });
+        let result = evaluate_pr_green(Some(&snapshot)).expect("green evaluation");
+        assert!(!result.matched);
+        assert_eq!(result.observed["checks"][0]["required"], true);
+    }
+
+    #[test]
+    fn pr_green_accepts_passing_required_commit_status_state() {
+        let snapshot = serde_json::json!({
+            "number": 1,
+            "headRefOid": "x",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [{
+                "context": "required-status",
+                "state": "SUCCESS",
+                "isRequired": true
+            }],
+            "_required_checks_known": true
+        });
+        assert!(evaluate_pr_green(Some(&snapshot)).expect("green").matched);
+    }
+
+    #[test]
+    fn pr_green_with_no_required_checks_still_requires_clean_merge_state() {
+        let snapshot = serde_json::json!({
+            "number": 1,
+            "headRefOid": "x",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [],
+            "_required_checks_known": true
+        });
+        assert!(!evaluate_pr_green(Some(&snapshot)).expect("green").matched);
     }
 
     #[test]

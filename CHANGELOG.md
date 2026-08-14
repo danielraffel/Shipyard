@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0901"></a>
+## [0.90.2]
+
 ## [0.90.1] - 2026-08-14
 
 - fix(wait): query supported PR fields ([#418](https://github.com/danielraffel/Shipyard/pull/418))
