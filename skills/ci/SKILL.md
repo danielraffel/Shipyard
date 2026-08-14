@@ -89,7 +89,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Global warm-pool kill switch | `SHIPYARD_NO_WARM_POOL=1` in the environment |
 | Retarget one lane on an in-flight PR | `shipyard cloud retarget --pr <n> --target macos --provider github-hosted` (dry-run; add `--apply`) |
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider github-hosted]` (dry-run; add `--apply`) |
-| Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (cancels + redispatches; add `--dry-run` to preview, `--rerun-failed` for completed cancelled/failed/timed-out runs; omit `--to` to re-resolve a failed leg local-first, or pass `--to <provider>` to force) |
+| Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (preflights + dispatches a replacement before cancelling the old run; add `--dry-run` to preview, `--rerun-failed` for completed cancelled/failed/timed-out runs; omit `--to` to re-resolve a failed leg local-first, or pass `--to <provider>` to force) |
 | Rescue every stuck run repo-wide | `shipyard rescue --all-stuck` |
 | Same-PR ship refused by a killed worker (`SamePrShipRunning`) | v0.68.0+ auto-reaps the stale `running` queue job after ~180s — just retry `shipyard pr`. See the `shipyard` skill's "Durable Queue: killed-worker recovery". Don't run two `shipyard pr`s for one PR concurrently. |
 | PR stuck in-flight forever (never auto-merges after a host reboot / daemon crash) | `shipyard ship-state list` or `shipyard status` flags it `ORPHANED? [<evidence>]` — cross-referencing the queue: `queue_stale` (dead worker heartbeat) / `queue_terminal` (worker ended without finalizing) surface in ~3m; `queue_absent` / `time_fallback` are time-gated (default 45m, `[ship_state] orphan_stale_minutes`). A live or pending worker is never flagged. Re-run `shipyard ship <pr>` to re-validate (this clears any `abandoned` marker), or `shipyard ship-state discard <pr>` if truly dead. Detection is report-only; the daemon can optionally abandon a `queue_stale` orphan (so auto-merge stops waiting) via `[ship_state] auto_resume = true` (default off, fail-closed, never re-dispatches, re-reads the queue live under the per-PR lock so a concurrent re-ship is spared). See the `shipyard` skill's "Orphaned ship-state reporting". |
@@ -514,16 +514,18 @@ operation for push, schedule, tag, or `workflow_dispatch` runs.
 What it does:
 1. Resolves the PR's head branch (skipped under `--all-stuck`).
 2. Lists queued workflow runs and filters to (a) the PR's branch and (b) ones older than `--threshold` (default `30m`).
-3. With `--rerun-failed`, additionally pulls `status=completed` runs whose conclusion is `cancelled`, `failure`, or `timed_out` on that branch (#345 — previously cancelled-only, so a plain failed leg was never a candidate) — these get `gh run rerun --failed` first, then the same cancel+redispatch handoff.
-4. For each candidate, cancels the existing run and dispatches a fresh one. **Provider resolution is kind-aware when `--to` is omitted (#345):** a wedged *stuck-queued* run falls back to `github-hosted` (move off the stuck local runner), while a re-run *failed* run RE-RESOLVES the provider (config/default — local-first with overflow) so a leg that overflowed to a GPU-less hosted runner can return to a real local runner. An explicit `--to <provider>` forces the destination for any candidate.
+3. With `--rerun-failed`, additionally pulls `status=completed` runs whose conclusion is `cancelled`, `failure`, or `timed_out` on that branch (#345 — previously cancelled-only, so a plain failed leg was never a candidate). Once a replacement dispatch is accepted, these get `gh run rerun --failed` and the re-armed original is cancelled.
+4. For each candidate, proves that its workflow declares `workflow_dispatch`, resolves every required dispatch input, and submits the replacement **before** cancelling the old run. Known PR-number inputs (`pr`, `pr_number`, and `pull_request_number`) are filled from the PR argument. A workflow with no dispatch trigger, an unknown required input, or a rejected dispatch is reported as `skipped-no-plan`/`failed` and its original run is preserved. **Provider resolution is kind-aware when `--to` is omitted (#345):** a wedged *stuck-queued* run falls back to `github-hosted` (move off the stuck local runner), while a re-run *failed* run RE-RESOLVES the provider (config/default — local-first with overflow) so a leg that overflowed to a GPU-less hosted runner can return to a real local runner. An explicit `--to <provider>` forces the destination for any candidate.
 5. Emits a per-run summary (`applied`, `rerun+applied`, `planned`, `skipped-completed`, `skipped-no-plan`, `failed`) with a top-level `event=cloud.rescue` JSON envelope under `--json`.
 
 **Do not reach for `runner-watchdog.sh --fix` instead of `shipyard rescue`.**
 The watchdog's cancellation registers as required-check `failure` on the PR
 without redispatching — it makes the wedge look terminal to branch
-protection. `shipyard rescue` is the safe primitive because it cancels +
-redispatches atomically under one transaction; no orphaned `failure`
-contexts, no destructive ops on the runner host itself.
+protection. `shipyard rescue` is the safe primitive because it fail-closes
+before cancellation and uses a replacement-first transaction. A rejected or
+unconstructable dispatch leaves the original run untouched; a cancellation
+failure after an accepted replacement can create duplicate work, but never
+zero work. There are no destructive ops on the runner host itself.
 
 `shipyard rescue` is the discoverable surface for what was previously a
 5-step recipe (`gh api` + `cloud handoff list-stuck` + per-run

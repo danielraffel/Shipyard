@@ -2227,7 +2227,9 @@ mod tests {
             file: file.to_owned(),
             name: key.to_owned(),
             description: String::new(),
+            dispatchable: true,
             inputs: Vec::new(),
+            required_inputs: Vec::new(),
         }
     }
 
