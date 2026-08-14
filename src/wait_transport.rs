@@ -289,8 +289,7 @@ pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<O
             "--repo".to_owned(),
             repo.to_owned(),
             "--json".to_owned(),
-            "number,headRefOid,state,merged,mergeable,mergeStateStatus,statusCheckRollup"
-                .to_owned(),
+            PR_VIEW_JSON_FIELDS.to_owned(),
         ],
         cwd,
     )? {
@@ -305,6 +304,12 @@ pub fn fetch_pr_snapshot(repo: &str, pr_number: u64, cwd: &Path) -> WaitResult<O
         GhOutcome::OtherFailure => Ok(None),
     }
 }
+
+// Keep this list limited to fields accepted by `gh pr view --json`. In
+// particular, `merged` is not a supported field; a merged PR is represented by
+// `state == "MERGED"` and normalized by the evaluator.
+const PR_VIEW_JSON_FIELDS: &str =
+    "number,headRefOid,state,mergeable,mergeStateStatus,statusCheckRollup";
 
 /// REST fallback for `fetch_pr_snapshot`. Synthesises the GraphQL-shape value
 /// `evaluate_pr_green` / `evaluate_pr_state` consume.
@@ -612,8 +617,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        WaitOutcome, pr_event_filter, read_snapshot_file, release_event_filter, run_event_filter,
-        synthesize_pr_snapshot_from_rest, wait_for_condition,
+        PR_VIEW_JSON_FIELDS, WaitOutcome, pr_event_filter, read_snapshot_file,
+        release_event_filter, run_event_filter, synthesize_pr_snapshot_from_rest,
+        wait_for_condition,
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{IpcServer, IpcState};
@@ -960,6 +966,16 @@ mod tests {
         assert_eq!(rollup[0]["name"], "CI");
         assert_eq!(rollup[0]["state"], "completed");
         assert_eq!(rollup[0]["conclusion"], "success");
+    }
+
+    #[test]
+    fn pr_view_query_uses_only_supported_gh_json_fields() {
+        assert!(PR_VIEW_JSON_FIELDS.split(',').any(|field| field == "state"));
+        assert!(
+            !PR_VIEW_JSON_FIELDS
+                .split(',')
+                .any(|field| field == "merged")
+        );
     }
 
     #[test]

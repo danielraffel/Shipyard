@@ -370,7 +370,7 @@ pub fn evaluate_pr_state(
     let merged = snapshot
         .get("merged")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(state == "MERGED");
     let matched = match target_state {
         "merged" => merged,
         "closed" => state == "CLOSED" || state == "MERGED",
@@ -667,6 +667,13 @@ mod tests {
                 .expect("closed")
                 .matched
         );
+
+        // `gh pr view --json` has no `merged` field; its GraphQL-shaped
+        // snapshot reports the terminal state directly.
+        let graphql_merged = serde_json::json!({"number": 2, "state": "MERGED"});
+        let result = evaluate_pr_state(Some(&graphql_merged), "merged").expect("merged state");
+        assert!(result.matched);
+        assert_eq!(result.observed["merged"], true);
     }
 
     #[test]
