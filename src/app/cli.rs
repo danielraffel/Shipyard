@@ -317,6 +317,16 @@ pub(super) enum Command {
         /// SHA drift (Shipyard #346).
         #[arg(long = "adopt-head")]
         adopt_head: bool,
+        /// Durable workstream identifier for an atomic merge-steward handoff.
+        /// Also enables handoff when the project default is disabled.
+        #[arg(long = "workstream-id", conflicts_with = "no_steward_handoff")]
+        workstream_id: Option<String>,
+        /// Durable context URL for the steward receipt. Defaults to the PR URL.
+        #[arg(long = "context-url", conflicts_with = "no_steward_handoff")]
+        context_url: Option<String>,
+        /// Disable a project-configured automatic steward handoff.
+        #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
+        no_steward_handoff: bool,
     },
     /// Cloud runner operations.
     Cloud {

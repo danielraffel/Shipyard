@@ -693,7 +693,15 @@ explicitly advisory Pulp workflows; required workflows and unknown repositories
 are disabled because GitHub cannot bind a cancellation to an atomic job-state
 snapshot.
 
-Stewardship is opt-in per immutable head. The submitting agent must run
+Stewardship is opt-in per immutable head. Prefer making the receipt atomic with
+PR creation: set `[merge_steward].auto_handoff = true` on the protected base
+branch and run `shipyard pr`, optionally adding `--workstream-id ID
+--context-url URL`. Shipyard never trusts the PR branch to enable that default.
+Immediately after the PR exists and before validation starts, Shipyard writes
+the receipt; without explicit values it uses `OWNER/REPO#PR` and the PR URL.
+Use `--no-steward-handoff` only as an explicit project-default override.
+
+For an already-created PR, the submitting agent must run
 `shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
 --workstream-id ID [--context-url URL] --apply`. That command writes a
 successful `shipyard/steward-handoff` status on the expected head, re-reads the

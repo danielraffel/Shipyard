@@ -78,7 +78,7 @@ use self::merge_queue_control_cmd::merge_queue_control_command;
 use self::metrics_cmd::metrics_command;
 use self::paths_cmd::print_paths;
 use self::pin_cmd::pin_command;
-use self::pr_cmd::{PrCommandArgs, pr_command};
+use self::pr_cmd::{PrCommandArgs, StewardHandoffPreference, pr_command};
 use self::quarantine_cmd::quarantine_command;
 use self::queue_cmd::{
     bump_command, cancel_command, evidence_command, logs_command, queue_command, status_command,
@@ -636,6 +636,7 @@ fn handle_ship_variant<W: Write>(
             allow_unreachable_targets,
             skip_targets,
             adopt_head,
+            steward_handoff: None,
         },
         mode,
         cwd,
@@ -664,6 +665,9 @@ fn handle_pr_variant<W: Write>(
         skip_skill_update,
         skill_reason,
         adopt_head,
+        workstream_id,
+        context_url,
+        no_steward_handoff,
     } = command
     else {
         unreachable!("pr variant required")
@@ -681,6 +685,13 @@ fn handle_pr_variant<W: Write>(
             skip_skill_update,
             skill_reason,
             adopt_head,
+            workstream_id,
+            context_url,
+            steward_handoff_preference: if no_steward_handoff {
+                StewardHandoffPreference::Disabled
+            } else {
+                StewardHandoffPreference::ProjectDefault
+            },
             python_command: None,
         },
         &config,
