@@ -22,8 +22,9 @@ use crate::merge_steward::{
     CapacityPreemptionPolicy, QueueFrontPressure, RequiredCheck, RunCancellation,
     RunCancellationReason, StewardCheck, StewardDecision, StewardJob, StewardPolicy,
     StewardPullRequest, StewardRun, classify_pr, coalescing_reason_authorizes,
-    is_capacity_preemption_workflow, is_full_sha, is_safe_capacity_preemption,
-    plan_capacity_preemptions, plan_run_coalescing, preemption_key, queue_front_waits_for_pool,
+    has_successful_status, is_capacity_preemption_workflow, is_full_sha,
+    is_safe_capacity_preemption, plan_capacity_preemptions, plan_run_coalescing, preemption_key,
+    queue_front_waits_for_pool,
 };
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
@@ -33,6 +34,8 @@ pub(super) struct StewardCommandArgs {
     pub(super) repos: Vec<String>,
     pub(super) base: String,
     pub(super) opt_out_label: String,
+    pub(super) managed_label: String,
+    pub(super) handoff_context: String,
     pub(super) max_transient_reruns: u32,
     pub(super) coalesce: bool,
     pub(super) preempt_capacity: bool,
@@ -196,6 +199,15 @@ struct CapacityApplyContext<'a> {
 const CANCEL_TERMINAL_WAIT: Duration = Duration::from_secs(15);
 const CANCEL_TERMINAL_POLL: Duration = Duration::from_secs(2);
 const PREEMPT_AFTER_SECS: i64 = 900;
+pub(super) const HANDOFF_CONTEXT: &str = "shipyard/steward-handoff";
+pub(super) const MANAGED_LABEL: &str = "shipyard:managed";
+pub(super) const RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
+pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
+
+mod handoff;
+pub(crate) use handoff::{StewardHandoffArgs, steward_handoff_command};
+mod recovery;
+use recovery::reconcile_recovery_signal;
 
 pub(super) fn steward_command<W: Write>(
     args: &StewardCommandArgs,
@@ -442,8 +454,9 @@ use cancellation_revalidation::pull_request;
 use cancellation_revalidation::{
     acquire_pr_mutation_guard, acquire_run_mutation_guard, attempts_for,
     authoritative_head_still_superseded, current_pull_request_heads, exact_run_still_queued,
-    merge_group_pr_number, opted_out_pull_requests, pull_request_with_required_checks,
-    revalidate_capacity_preemption, revalidate_coalescing_cancellation,
+    merge_group_pr_number, opted_out_pull_requests, pull_request_is_managed,
+    pull_request_with_required_checks, revalidate_capacity_preemption,
+    revalidate_coalescing_cancellation,
 };
 use cancellation_terminalization::{
     acquire_pending_cancellation_guard, active_runner_targets, clear_pending_cancellation,

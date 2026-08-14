@@ -691,6 +691,17 @@ explicitly advisory Pulp workflows; required workflows and unknown repositories
 are disabled because GitHub cannot bind a cancellation to an atomic job-state
 snapshot.
 
+Stewardship is opt-in per immutable head. The submitting agent must run
+`shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
+--workstream-id ID [--context-url URL] --apply`. That command writes a
+successful `shipyard/steward-handoff` status on the expected head, re-reads the
+PR, and only then adds `shipyard:managed`. The steward inventories all other
+open PRs as `unmanaged` but never enqueues, reruns, cancels, or signals recovery
+for them. A managed semantic blocker receives one deduplicated
+`shipyard:needs-agent` label plus failed `shipyard/steward-recovery` status;
+healthy deterministic progress clears the signal. This lets a cheap recovery
+agent handle exceptions without spending model tokens on polling.
+
 Read [references/merge-steward.md](references/merge-steward.md) before operating
 the steward, changing its policy, or recovering a pending cancellation.
 

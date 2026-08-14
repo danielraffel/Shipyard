@@ -94,6 +94,15 @@ shipyard runner fleet-status --json                 # periodic-monitor JSON + no
 shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
 shipyard runner steward --apply                     # exact-head, green-gated mutations
 shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
+shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
+
+`runner steward-handoff` is also dry-run by default. Apply writes a durable
+successful `shipyard/steward-handoff` commit status on the expected immutable
+head, revalidates that the PR still has that head, and then adds
+`shipyard:managed`. `runner steward` inventories all open PRs but mutates only
+heads carrying both signals; old and unlabeled backlog remains `unmanaged`.
+Semantic blockers receive one deduplicated `shipyard:needs-agent` label and
+failed `shipyard/steward-recovery` status, which are cleared after recovery.
 
 `runner steward` is read-only unless `--apply` is present. Same-head duplicate
 runs are never cancelled; cancellation authority requires an immutable PR or

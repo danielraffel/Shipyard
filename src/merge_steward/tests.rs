@@ -34,8 +34,40 @@ fn queue_policy() -> StewardPolicy {
             app_id: None,
         }],
         opt_out_label: "shipyard:no-auto-merge".to_owned(),
+        managed_label: None,
+        handoff_context: "shipyard/steward-handoff".to_owned(),
         max_transient_reruns: 1,
     }
+}
+
+#[test]
+fn explicit_management_requires_label_and_current_head_receipt() {
+    let mut policy = queue_policy();
+    policy.managed_label = Some("shipyard:managed".to_owned());
+    let mut pr = green_pr();
+    assert_eq!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::Unmanaged
+    );
+
+    pr.labels.push("shipyard:managed".to_owned());
+    assert_eq!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::HandoffMissing
+    );
+
+    pr.checks.push(StewardCheck {
+        name: "shipyard/steward-handoff".to_owned(),
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-08-13T00:00:00Z".to_owned()),
+    });
+    assert_eq!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    );
 }
 
 #[test]
