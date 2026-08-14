@@ -100,6 +100,8 @@ fn queue_policy() -> StewardPolicy {
             app_id: None,
         }],
         opt_out_label: "steward:skip".to_owned(),
+        managed_label: None,
+        handoff_context: "shipyard/steward-handoff".to_owned(),
         max_transient_reruns: 1,
     }
 }

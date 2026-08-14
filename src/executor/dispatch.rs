@@ -333,7 +333,9 @@ pub struct DispatchValidationRequest<'target, 'callback> {
     /// Validation mode.
     pub mode: ValidationMode,
     /// Optional progress callback.
-    pub progress_callback: Option<&'callback mut dyn FnMut(ProgressEvent)>,
+    pub progress_callback: Option<
+        &'callback mut dyn FnMut(ProgressEvent) -> crate::executor::streaming::ProgressAction,
+    >,
 }
 
 /// Backend reachability diagnosis used by submission preflight.
@@ -553,10 +555,13 @@ impl ExecutorDispatcher {
                 log_path: attempt_log,
                 resume_from: request.resume_from.clone(),
                 mode: request.mode,
-                progress_callback: request
-                    .progress_callback
-                    .as_mut()
-                    .map(|callback| &mut **callback as &mut dyn FnMut(ProgressEvent)),
+                progress_callback: request.progress_callback.as_mut().map(|callback| {
+                    &mut **callback
+                        as &mut dyn FnMut(
+                            ProgressEvent,
+                        )
+                            -> crate::executor::streaming::ProgressAction
+                }),
             });
             let result = demote_stale_result(result, chain.heartbeat_stale_secs);
 
@@ -664,10 +669,13 @@ impl ExecutorDispatcher {
                 log_path: attempt_log,
                 resume_from: request.resume_from.clone(),
                 mode: request.mode,
-                progress_callback: request
-                    .progress_callback
-                    .as_mut()
-                    .map(|callback| &mut **callback as &mut dyn FnMut(ProgressEvent)),
+                progress_callback: request.progress_callback.as_mut().map(|callback| {
+                    &mut **callback
+                        as &mut dyn FnMut(
+                            ProgressEvent,
+                        )
+                            -> crate::executor::streaming::ProgressAction
+                }),
             });
 
             if result.status == crate::job::TargetStatus::Fail {
@@ -2134,6 +2142,7 @@ mod tests {
                 if let Some(phase) = event.phase {
                     phases.push(phase);
                 }
+                crate::executor::streaming::ProgressAction::Continue
             };
             super::ExecutorDispatcher::new(None)
                 .validate(super::DispatchValidationRequest {
@@ -2193,6 +2202,7 @@ mod tests {
                 assert_eq!(leases[0].job_id.as_deref(), Some("job-host-pool"));
                 observed_job_id.set(true);
             }
+            crate::executor::streaming::ProgressAction::Continue
         };
 
         let result = dispatcher.validate(super::DispatchValidationRequest {

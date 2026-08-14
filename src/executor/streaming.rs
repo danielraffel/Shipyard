@@ -3,12 +3,14 @@
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+
+use crate::process::ProcessTree;
 
 const OUTPUT_TAIL_BYTES_CAP: usize = 1_048_576;
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -61,6 +63,15 @@ pub enum StreamLineAction {
     Terminate(String),
 }
 
+/// Action requested by a validation progress observer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgressAction {
+    /// Continue running the validation process.
+    Continue,
+    /// Terminate the validation process tree and preserve the reason.
+    Terminate(String),
+}
+
 /// Streaming command request.
 pub struct StreamingCommand<'a> {
     /// Command or argv to execute.
@@ -82,7 +93,7 @@ pub struct StreamingCommand<'a> {
     /// Contract markers to scan as substrings in decoded output lines.
     pub required_contract_markers: Vec<String>,
     /// Optional progress callback.
-    pub progress_callback: Option<&'a mut dyn FnMut(ProgressEvent)>,
+    pub progress_callback: Option<&'a mut dyn FnMut(ProgressEvent) -> ProgressAction>,
     /// Optional decoded output-line callback.
     pub line_callback: Option<&'a mut dyn FnMut(&str) -> StreamLineAction>,
 }
@@ -182,8 +193,8 @@ pub fn run_streaming_command(
     let started_at = Utc::now();
     let start = Instant::now();
     let mut child = spawn_command(&request)?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
     let (sender, receiver) = mpsc::channel();
     let mut readers = spawn_readers(sender, stdout, stderr);
     let mut log = open_log(&request)?;
@@ -204,7 +215,14 @@ pub fn run_streaming_command(
 
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(StreamMessage::Line(line)) => {
-                state.record_line(&line, &mut log, &mut request.progress_callback)?;
+                match state.record_line(&line, &mut log, &mut request.progress_callback)? {
+                    ProgressAction::Continue => {}
+                    ProgressAction::Terminate(reason) => {
+                        termination_reason = Some(reason);
+                        kill_child(&mut child);
+                        break;
+                    }
+                }
                 state.scan_markers(&line, &request.required_contract_markers);
                 if let Some(callback) = request.line_callback.as_mut() {
                     match callback(&line) {
@@ -227,12 +245,16 @@ pub fn run_streaming_command(
                 if child.try_wait()?.is_some() && state.active_readers == 0 {
                     break;
                 }
-                state.emit_idle_heartbeat(
+                if let ProgressAction::Terminate(reason) = state.emit_idle_heartbeat(
                     &mut request.progress_callback,
                     start,
                     request.heartbeat_interval,
                     request.stuck_idle,
-                );
+                ) {
+                    termination_reason = Some(reason);
+                    kill_child(&mut child);
+                    break;
+                }
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -293,8 +315,8 @@ impl StreamState {
         &mut self,
         line: &str,
         log: &mut Option<std::fs::File>,
-        progress_callback: &mut Option<&mut dyn FnMut(ProgressEvent)>,
-    ) -> io::Result<()> {
+        progress_callback: &mut Option<&mut dyn FnMut(ProgressEvent) -> ProgressAction>,
+    ) -> io::Result<ProgressAction> {
         self.output_tail.push_back(line.to_owned());
         self.output_tail_bytes += line.len();
         while self.output_tail_bytes > OUTPUT_TAIL_BYTES_CAP && self.output_tail.len() > 1 {
@@ -316,7 +338,7 @@ impl StreamState {
         self.last_heartbeat_at = Some(now);
         self.last_output_instant = Instant::now();
         self.last_heartbeat_instant = self.last_output_instant;
-        emit_progress(
+        Ok(emit_progress(
             progress_callback,
             ProgressEvent {
                 phase: self.phase.clone(),
@@ -325,8 +347,7 @@ impl StreamState {
                 quiet_for_secs: 0.0,
                 liveness: "active".to_owned(),
             },
-        );
-        Ok(())
+        ))
     }
 
     fn scan_markers(&mut self, line: &str, required_markers: &[String]) {
@@ -339,13 +360,13 @@ impl StreamState {
 
     fn emit_idle_heartbeat(
         &mut self,
-        progress_callback: &mut Option<&mut dyn FnMut(ProgressEvent)>,
+        progress_callback: &mut Option<&mut dyn FnMut(ProgressEvent) -> ProgressAction>,
         start: Instant,
         heartbeat_interval: Duration,
         stuck_idle: Duration,
-    ) {
+    ) -> ProgressAction {
         if self.last_heartbeat_instant.elapsed() < heartbeat_interval {
-            return;
+            return ProgressAction::Continue;
         }
         let now = Utc::now();
         let quiet_duration = if self.last_output_at.is_some() {
@@ -369,7 +390,7 @@ impl StreamState {
                 quiet_for_secs: quiet_duration.as_secs_f64(),
                 liveness: liveness.to_owned(),
             },
-        );
+        )
     }
 
     fn output_tail(&self) -> String {
@@ -377,7 +398,7 @@ impl StreamState {
     }
 }
 
-fn spawn_command(request: &StreamingCommand<'_>) -> Result<Child, StreamingError> {
+fn spawn_command(request: &StreamingCommand<'_>) -> Result<ProcessTree, StreamingError> {
     let mut command = match &request.command {
         StreamingCommandSpec::Shell(command) => shell_command(command),
         StreamingCommandSpec::Args(argv) => argv_command(argv)?,
@@ -386,7 +407,7 @@ fn spawn_command(request: &StreamingCommand<'_>) -> Result<Child, StreamingError
         command.current_dir(cwd);
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    Ok(command.spawn()?)
+    Ok(ProcessTree::spawn(&mut command)?)
 }
 
 #[cfg(windows)]
@@ -467,11 +488,8 @@ fn spawn_reader<R: Read + Send + 'static>(
     })
 }
 
-fn kill_child(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+fn kill_child(child: &mut ProcessTree) {
+    child.terminate();
 }
 
 fn join_readers(readers: &mut Vec<JoinHandle<()>>) {
@@ -481,11 +499,13 @@ fn join_readers(readers: &mut Vec<JoinHandle<()>>) {
 }
 
 fn emit_progress(
-    progress_callback: &mut Option<&mut dyn FnMut(ProgressEvent)>,
+    progress_callback: &mut Option<&mut dyn FnMut(ProgressEvent) -> ProgressAction>,
     event: ProgressEvent,
-) {
+) -> ProgressAction {
     if let Some(callback) = progress_callback {
-        callback(event);
+        callback(event)
+    } else {
+        ProgressAction::Continue
     }
 }
 
@@ -511,8 +531,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ProgressEvent, StreamLineAction, StreamingCommand, StreamingCommandSpec, StreamingError,
-        run_streaming_command,
+        ProgressAction, ProgressEvent, StreamLineAction, StreamingCommand, StreamingCommandSpec,
+        StreamingError, run_streaming_command,
     };
 
     #[test]
@@ -521,7 +541,10 @@ mod tests {
         let mut events = Vec::<ProgressEvent>::new();
         let mut request = StreamingCommand::shell("echo __SHIPYARD_PHASE__:build && echo building");
         request.log_path = Some(temp.path().to_path_buf());
-        let mut callback = |event| events.push(event);
+        let mut callback = |event| {
+            events.push(event);
+            ProgressAction::Continue
+        };
         request.progress_callback = Some(&mut callback);
 
         let result = run_streaming_command(request).expect("run");
@@ -573,6 +596,27 @@ mod tests {
         assert!(result.output.contains("STOP"));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn progress_callback_terminates_the_running_process_tree() {
+        let mut request = StreamingCommand::shell("echo started; sleep 30");
+        let mut callback =
+            |_event| ProgressAction::Terminate("durable queue cancellation".to_owned());
+        request.progress_callback = Some(&mut callback);
+        let started = std::time::Instant::now();
+
+        let result = run_streaming_command(request).expect("run");
+
+        assert_eq!(
+            result.termination_reason.as_deref(),
+            Some("durable queue cancellation")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the descendant sleep process must not retain the output pipes"
+        );
+    }
+
     #[test]
     fn argv_command_rejects_empty_argv() {
         let request = StreamingCommand {
@@ -613,7 +657,10 @@ mod tests {
         let mut request = StreamingCommand::shell("echo done");
         request.heartbeat_interval = Duration::from_millis(1);
         request.stuck_idle = Duration::from_millis(1);
-        let mut callback = |event| events.push(event);
+        let mut callback = |event| {
+            events.push(event);
+            ProgressAction::Continue
+        };
         request.progress_callback = Some(&mut callback);
 
         let result = run_streaming_command(request).expect("run");

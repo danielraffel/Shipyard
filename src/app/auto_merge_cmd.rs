@@ -1781,6 +1781,13 @@ fn revoke_native_queue(
     observation: &crate::merge_queue::QueuePrObservation,
     queued: bool,
 ) -> Result<(), String> {
+    // A ship-state record owns only the exact head it validated. Once the PR
+    // advances, a queue entry or auto-merge request belongs to the newer head
+    // and may be carrying fresh required-check work. Revoking it from stale
+    // state would discard that work without any red or authority transition.
+    if !native_merge_authority_owned_by_ship_state(&state.head_sha, &observation.head_sha) {
+        return Ok(());
+    }
     // Disable the pending request first so dequeue cannot immediately admit a
     // replacement head again through the still-active auto-merge authority.
     if observation.auto_merge_active {
@@ -1813,6 +1820,10 @@ fn revoke_native_queue(
         )?;
     }
     Ok(())
+}
+
+fn native_merge_authority_owned_by_ship_state(validated_head: &str, live_head: &str) -> bool {
+    shas_match(validated_head, live_head)
 }
 
 fn revoke_drifted_native_merge(
@@ -1862,6 +1873,10 @@ fn run_queue_mutation(
     action: &str,
 ) -> Result<(), String> {
     let mut command = gh(client, cwd)?;
+    // The ghapp wrapper rejects raw queue-removal mutations. This marker is
+    // limited to Shipyard's exact-head, machine-authorized, write-ahead-audited
+    // path and lets that guard distinguish it from an ad-hoc GraphQL call.
+    command.env("SHIPYARD_INTERNAL_QUEUE_MUTATION", "1");
     let guard =
         MergeQueueMutationGuard::acquire_in_mode(store, cwd, mode, global_dir, state, action)?;
     let output = command
@@ -3310,6 +3325,18 @@ mod tests {
             .expect("last page"),
             None
         );
+    }
+
+    #[test]
+    fn stale_ship_state_cannot_own_native_merge_authority_for_a_newer_head() {
+        assert!(!native_merge_authority_owned_by_ship_state(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ));
+        assert!(native_merge_authority_owned_by_ship_state(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ));
     }
 
     #[test]
