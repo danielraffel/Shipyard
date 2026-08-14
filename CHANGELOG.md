@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0913"></a>
+## [0.91.3] - 2026-08-14
+
+- fix/vellum runner reconciliation 20260814 ([#422](https://github.com/danielraffel/Shipyard/pull/422))
+
 <a id="v0912"></a>
 ## [0.91.2] - 2026-08-14
 
@@ -882,6 +887,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.91.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.91.3
 [0.91.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.91.2
 [0.91.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.91.1
 [0.91.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.91.0
