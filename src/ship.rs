@@ -22,7 +22,7 @@ use crate::executor::dispatch::{
     DispatchValidationRequest, ExecutorDispatcher, ResolvedBackend, ResolvedHostPoolConfig,
     ResolvedHostPoolMember, ResolvedTarget,
 };
-use crate::executor::streaming::ProgressEvent;
+use crate::executor::streaming::{ProgressAction, ProgressEvent};
 use crate::host_pool::{
     HostPoolConfig, HostPoolLeaseStore, HostPoolMemberConfig, default_lease_path,
 };
@@ -1669,31 +1669,46 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
             let mut result = {
                 let mut progress_callback = |event: ProgressEvent| {
                     if progress_error.is_some() || progress_cancelled.is_some() {
-                        return;
+                        return ProgressAction::Terminate(
+                            "durable queue cancellation or progress persistence failure".to_owned(),
+                        );
                     }
                     match durable_cancelled_job(queue, &job) {
                         Ok(Some(cancelled)) => {
+                            let reason =
+                                cancelled.cancellation_reason.clone().unwrap_or_else(|| {
+                                    "durable queue cancellation requested".to_owned()
+                                });
                             progress_cancelled = Some(cancelled);
-                            return;
+                            return ProgressAction::Terminate(reason);
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            let reason = error.to_string();
                             progress_error = Some(error);
-                            return;
+                            return ProgressAction::Terminate(reason);
                         }
                     }
                     apply_progress_event(&mut job, &decision.target, &progress_log_path, event);
                     if let Err(error) = queue.update(&job) {
+                        let reason = error.to_string();
                         progress_error = Some(ShipExecutionError::Queue(error));
-                        return;
+                        return ProgressAction::Terminate(reason);
                     }
                     match durable_cancelled_job(queue, &job) {
                         Ok(Some(cancelled)) => {
+                            let reason =
+                                cancelled.cancellation_reason.clone().unwrap_or_else(|| {
+                                    "durable queue cancellation requested".to_owned()
+                                });
                             progress_cancelled = Some(cancelled);
+                            ProgressAction::Terminate(reason)
                         }
-                        Ok(None) => {}
+                        Ok(None) => ProgressAction::Continue,
                         Err(error) => {
+                            let reason = error.to_string();
                             progress_error = Some(error);
+                            ProgressAction::Terminate(reason)
                         }
                     }
                 };
@@ -2324,7 +2339,7 @@ mod tests {
     use crate::executor::dispatch::{
         DispatchValidationRequest, ResolvedTarget, resolve_targets_from_table,
     };
-    use crate::executor::streaming::ProgressEvent;
+    use crate::executor::streaming::{ProgressAction, ProgressEvent};
     use crate::host_pool::HostPoolLease;
     use crate::job::{Job, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
     use crate::queue::Queue;
@@ -2588,6 +2603,7 @@ mod tests {
         seen_workdirs: RefCell<Vec<Option<String>>>,
         seen_resume: RefCell<Vec<Option<String>>>,
         seen_durable_progress: RefCell<Vec<TargetResult>>,
+        seen_progress_actions: RefCell<Vec<ProgressAction>>,
     }
 
     impl FakeDispatcher {
@@ -2600,6 +2616,7 @@ mod tests {
                 seen_workdirs: RefCell::new(Vec::new()),
                 seen_resume: RefCell::new(Vec::new()),
                 seen_durable_progress: RefCell::new(Vec::new()),
+                seen_progress_actions: RefCell::new(Vec::new()),
             }
         }
 
@@ -2632,7 +2649,9 @@ mod tests {
                     cancel_job_from_log_path(&request.log_path);
                 }
                 if let Some(callback) = request.progress_callback.as_mut() {
-                    callback(event);
+                    self.seen_progress_actions
+                        .borrow_mut()
+                        .push(callback(event));
                 }
                 self.seen_durable_progress
                     .borrow_mut()
@@ -3858,6 +3877,12 @@ mod tests {
             Some("cancelled during progress")
         );
         assert_eq!(dispatcher.seen_workdirs.borrow().len(), 1);
+        assert_eq!(
+            dispatcher.seen_progress_actions.borrow().as_slice(),
+            &[ProgressAction::Terminate(
+                "cancelled during progress".to_owned()
+            )]
+        );
         assert!(
             QueueOutcomeStore::new(&state_dir)
                 .expect("outcome store")

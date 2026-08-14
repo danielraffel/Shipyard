@@ -1016,6 +1016,10 @@ queued transition, can return HTTP 409, and can create duplicate work.
 Manual `shipyard cancel <job> --reason <why>` records the supplied reason on
 the durable job. If omitted, Shipyard still records command source, host, agent,
 and PID; a reasonless terminal cancellation is never valid evidence.
+When an active local or SSH validation observes that durable cancellation, its
+progress callback returns a termination action and Shipyard kills the supervised
+process tree, including descendants. Preserve the process-tree and integration
+regressions; changing the ledger without stopping active work is not cancellation.
 
 Dry-run must use the same static dispatchability/input checks as apply. Preserve
 the negative control that a rejected dispatch produces no cancel call and the

@@ -88,6 +88,13 @@ impl ProcessTree {
         self.child.try_wait()
     }
 
+    /// Wait for normal completion and disarm drop-time termination.
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        self.terminated = true;
+        Ok(status)
+    }
+
     /// Wait up to `timeout` for the direct child to exit.
     pub(crate) fn wait_timeout(&mut self, timeout: Duration) -> io::Result<Option<ExitStatus>> {
         let deadline = Instant::now() + timeout;

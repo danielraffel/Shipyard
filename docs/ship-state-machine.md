@@ -216,6 +216,12 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   scheduler starts a job only to defer it for host-pool capacity or an
   unavailable local lease, the drain owner requeues that transient `Running`
   job with a retry timestamp; admission ignores it until that timestamp expires.
+  A durable `shipyard cancel` observed by a running worker is also an execution
+  transition, not merely a queue-state update. The worker's progress callback
+  returns `ProgressAction::Terminate`; local and SSH streaming validation then
+  terminates its supervised process tree (including descendants) and preserves
+  the durable cancellation reason. A cancellation that lands during a silent
+  command is observed by the next idle heartbeat.
   The drain owner starts a replacement as each worker completes instead of
   waiting for the whole admitted batch, so an independent idle slot is refilled
   while slower siblings continue. If refill admission itself fails, the owner
