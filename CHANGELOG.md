@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0883"></a>
+## [0.88.3] - 2026-08-14
+
+- fix(queue): terminate active validation process trees after durable cancellation
+
 <a id="v0882"></a>
 ## [0.88.2] - 2026-08-14
 

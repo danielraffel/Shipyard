@@ -1256,6 +1256,13 @@ The orchestration, in order:
 
 Never run `gh pr create` + release separately. Never run the gate scripts by hand.
 
+`shipyard cancel <job> --reason <why>` is an execution boundary, not only a
+ledger mutation. A running local or SSH validation observes the durable
+cancellation through its progress callback and terminates the supervised
+process tree, including descendants. The returned job remains `cancelled` with
+the exact durable reason; it must not consume a runner until the current build
+stage exits naturally.
+
 ### Gate-script path resolution
 
 `shipyard pr` looks up each gate script in this order — the first hit wins:

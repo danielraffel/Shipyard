@@ -66,6 +66,9 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   re-arming the originals; `--all-stuck` is the
   repo-wide variant. Pairs with the watchdog to form a complete
   prevent → recover toolkit.
+- **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
+  operator reason and terminates an active local or SSH validation process tree
+  on its next progress event, including descendant build processes.
 - **In-tool self-update.** `shipyard update` is the discoverable
   upgrade path (no more curl-pipe to remember); `--check` reports
   installed-vs-available, `--to v0.55.0` pins a specific tag for
