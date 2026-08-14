@@ -96,6 +96,13 @@ shipyard runner steward --apply                     # exact-head, green-gated mu
 shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 
+# On the protected base branch, make every `shipyard pr` submission durable
+# immediately after PR creation. A PR branch cannot opt itself in.
+# Optional CLI --workstream-id/--context-url values override the fallbacks.
+# In .shipyard/config.toml:
+# [merge_steward]
+# auto_handoff = true
+
 `runner steward-handoff` is also dry-run by default. Apply writes a durable
 successful `shipyard/steward-handoff` commit status on the expected immutable
 head, revalidates that the PR still has that head, and then adds

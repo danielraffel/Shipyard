@@ -9,6 +9,7 @@ Run `shipyard pr` to orchestrate the full push-a-PR flow:
 2. `scripts/version_bump_check.py --mode=apply` — rewrites `Cargo.toml` and `.claude-plugin/plugin.json` for any surface whose code moved. `--no-apply-bumps` switches to report mode so missing bumps hard-fail instead of auto-applying.
 3. `git commit` — single `chore: bump versions` commit using `--only` to pick up exactly the files the bump script touched (pre-staged files the user had in progress for other reasons stay in the index).
 4. Hands off to `shipyard ship` for push + `gh pr create` + cross-platform validate + merge on green.
+5. When the protected base branch has `[merge_steward].auto_handoff = true` (or `--workstream-id` is supplied), writes the exact-head `shipyard/steward-handoff` receipt and managed label immediately after PR creation, before validation can outlive the submitting session. The PR branch cannot enable this project default for itself.
 
 On merge, `.github/workflows/auto-release.yml` detects the `Cargo.toml` package-version move and creates a `v<x.y.z>` tag. The existing tag-triggered `release.yml` then builds + publishes the binaries.
 
@@ -25,6 +26,9 @@ shipyard pr $ARGUMENTS
 - `--base <ref>` — base branch to ship into (default `main`).
 - `--apply-bumps` / `--no-apply-bumps` — default is apply. `--no-apply-bumps` switches to report mode so the command refuses rather than auto-rewriting.
 - `--allow-unreachable-targets` — forwarded to `shipyard ship`.
+- `--workstream-id <id>` — opt into an atomic steward receipt and use this durable work item ID.
+- `--context-url <url>` — receipt link; defaults to the newly-created PR URL.
+- `--no-steward-handoff` — explicitly override a project-configured automatic handoff.
 
 ## Bypass trailers (tip commit, never PR body)
 
