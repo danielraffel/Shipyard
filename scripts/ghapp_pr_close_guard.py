@@ -463,18 +463,32 @@ def head_is_contained(comparison: dict[str, Any]) -> bool:
     return ahead_by == 0 and status in {"behind", "identical"}
 
 
-def path_blob_sha(repo: str, path: str, ref: str, query: ApiJson) -> str | None:
-    endpoint = f"repos/{repo}/contents/{quote(path, safe='/')}?ref={ref}"
-    try:
-        content = query(endpoint)
-    except NotFound:
-        return None
-    return required_string(content.get("sha"), f"contents sha for {path}")
+def tree_entries(
+    repo: str, commit_sha: str, query: ApiJson
+) -> dict[str, tuple[str, str, str]]:
+    value = query(f"repos/{repo}/git/trees/{commit_sha}?recursive=1")
+    if value.get("truncated") is not False:
+        raise GuardError("recursive Git tree evidence is truncated or ambiguous")
+    items = value.get("tree")
+    if not isinstance(items, list):
+        raise GuardError("Git tree response is missing entries")
+    entries: dict[str, tuple[str, str, str]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise GuardError("Git tree contains a non-object entry")
+        path = required_string(item.get("path"), "tree.path")
+        entries[path] = (
+            required_string(item.get("mode"), f"tree.mode for {path}"),
+            required_string(item.get("type"), f"tree.type for {path}"),
+            required_string(item.get("sha"), f"tree.sha for {path}"),
+        )
+    return entries
 
 
 def changed_content_is_contained(
     repo: str,
     base_sha: str,
+    head_sha: str,
     comparison: dict[str, Any],
     query: ApiJson,
 ) -> bool:
@@ -487,24 +501,27 @@ def changed_content_is_contained(
     # ambiguous and cannot prove the complete patch is contained.
     if len(files) >= 300:
         return False
+    base_entries = tree_entries(repo, base_sha, query)
+    head_entries = tree_entries(repo, head_sha, query)
     for item in files:
         if not isinstance(item, dict):
             raise GuardError("comparison files contains a non-object entry")
         status = required_string(item.get("status"), "files.status").lower()
         filename = required_string(item.get("filename"), "files.filename")
-        live_sha = path_blob_sha(repo, filename, base_sha, query)
+        base_entry = base_entries.get(filename)
+        head_entry = head_entries.get(filename)
         if status == "removed":
-            if live_sha is not None:
+            if base_entry is not None or head_entry is not None:
                 return False
             continue
         if status == "renamed":
             previous = required_string(item.get("previous_filename"), "files.previous_filename")
-            if previous != filename and path_blob_sha(repo, previous, base_sha, query) is not None:
+            if previous != filename and base_entries.get(previous) is not None:
                 return False
         elif status not in {"added", "modified", "changed", "copied", "unchanged"}:
             raise GuardError(f"unsupported comparison file status: {status}")
         expected_sha = required_string(item.get("sha"), f"files.sha for {filename}")
-        if live_sha != expected_sha:
+        if head_entry is None or head_entry[2] != expected_sha or base_entry != head_entry:
             return False
     return True
 
@@ -534,7 +551,7 @@ def containment_evidence(request: CloseRequest, query: ApiJson) -> tuple[bool, s
     comparison = query(f"repos/{request.repo}/compare/{base_sha}...{head_sha}")
     contained = head_is_contained(comparison)
     content_contained = contained or changed_content_is_contained(
-        request.repo, base_sha, comparison, query
+        request.repo, base_sha, head_sha, comparison, query
     )
     status = required_string(comparison.get("status"), "status").lower()
     ahead_by = required_count(comparison.get("ahead_by"), "ahead_by")

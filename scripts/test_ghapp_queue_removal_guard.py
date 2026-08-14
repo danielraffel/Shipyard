@@ -5,6 +5,7 @@ import importlib.util
 import io
 import os
 import pathlib
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -104,6 +105,11 @@ class QueueRemovalGuardTests(unittest.TestCase):
     def test_encoded_unrelated_rest_endpoint_is_allowed(self) -> None:
         self.assertEqual(self.run_guard(["api", "repos/o/r/contents/a%20b"])[0], 0)
 
+    def test_trusted_absolute_github_endpoint_is_allowed(self) -> None:
+        self.assertEqual(
+            self.run_guard(["api", "https://api.github.com/repos/o/r"])[0], 0
+        )
+
     def test_unrelated_rest_input_body_is_not_parsed_as_graphql(self) -> None:
         self.assertEqual(self.run_guard(["api", "repos/o/r/issues", "--input", "-"])[0], 0)
 
@@ -117,6 +123,16 @@ class QueueRemovalGuardTests(unittest.TestCase):
         code, message = self.run_guard(args, GH_REPO="graphql/x")
         self.assertEqual(code, 1)
         self.assertIn("refusing unaudited", message)
+
+    def test_repository_placeholders_fall_back_to_git_remote(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["git", "config", "--get", "remote.origin.url"],
+            0,
+            stdout="git@github.com:o/r.git\n",
+            stderr="",
+        )
+        with mock.patch.object(guard.subprocess, "run", return_value=completed):
+            self.assertEqual(self.run_guard(["api", "repos/{owner}/{repo}"])[0], 0)
 
     def test_manual_override_allows_ambiguous_input_loudly(self) -> None:
         code, message = self.run_guard(

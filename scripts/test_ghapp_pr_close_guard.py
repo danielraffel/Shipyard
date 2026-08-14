@@ -165,13 +165,24 @@ class PrCloseGuardTests(unittest.TestCase):
                     {"status": "modified", "filename": "src/lib.rs", "sha": blob}
                 ],
             },
-            f"repos/o/r/contents/src/lib.rs?ref={base}": {"sha": blob},
+            f"repos/o/r/git/trees/{base}?recursive=1": {
+                "truncated": False,
+                "tree": [
+                    {"path": "src/lib.rs", "mode": "100644", "type": "blob", "sha": blob}
+                ],
+            },
+            f"repos/o/r/git/trees/{head}?recursive=1": {
+                "truncated": False,
+                "tree": [
+                    {"path": "src/lib.rs", "mode": "100644", "type": "blob", "sha": blob}
+                ],
+            },
         }
         self.assertEqual(
             self.run_guard(["pr", "close", "7", "-R", "o/r"], responses)[0],
             0,
         )
-        responses[f"repos/o/r/contents/src/lib.rs?ref={base}"] = {"sha": "d" * 40}
+        responses[f"repos/o/r/git/trees/{base}?recursive=1"]["tree"][0]["sha"] = "d" * 40
         self.assertEqual(
             self.run_guard(["pr", "close", "7", "-R", "o/r"], responses)[0],
             1,
@@ -186,8 +197,37 @@ class PrCloseGuardTests(unittest.TestCase):
             guard.changed_content_is_contained(
                 "o/r",
                 "b" * 40,
+                "h" * 40,
                 {"files": files},
                 lambda endpoint: self.fail(f"unexpected query: {endpoint}"),
+            )
+        )
+
+    def test_tree_mode_difference_cannot_prove_content_containment(self) -> None:
+        base = "b" * 40
+        head = "h" * 40
+        blob = "c" * 40
+        responses = {
+            f"repos/o/r/git/trees/{base}?recursive=1": {
+                "truncated": False,
+                "tree": [
+                    {"path": "tool", "mode": "100644", "type": "blob", "sha": blob}
+                ],
+            },
+            f"repos/o/r/git/trees/{head}?recursive=1": {
+                "truncated": False,
+                "tree": [
+                    {"path": "tool", "mode": "100755", "type": "blob", "sha": blob}
+                ],
+            },
+        }
+        self.assertFalse(
+            guard.changed_content_is_contained(
+                "o/r",
+                base,
+                head,
+                {"files": [{"status": "modified", "filename": "tool", "sha": blob}]},
+                lambda endpoint: responses[endpoint],
             )
         )
 

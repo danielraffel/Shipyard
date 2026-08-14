@@ -94,13 +94,24 @@ def api_target(args: list[str]) -> tuple[str, dict[str, list[str]]]:
             continue
         parts = urlsplit(arg)
         if parts.scheme or parts.netloc:
-            raise GuardError("cannot inspect absolute API endpoint")
+            try:
+                port = parts.port
+            except ValueError as error:
+                raise GuardError("cannot inspect absolute API endpoint") from error
+            if (
+                parts.scheme.lower() != "https"
+                or parts.hostname is None
+                or parts.hostname.lower() != "api.github.com"
+                or port not in (None, 443)
+                or parts.username is not None
+                or parts.password is not None
+            ):
+                raise GuardError("cannot inspect absolute API endpoint")
         if re.search(r"%(?![0-9A-Fa-f]{2})", parts.path):
             raise GuardError("cannot inspect malformed encoded API endpoint")
         path = posixpath.normpath(unquote(parts.path)).lstrip("/")
         if "{" in path or "}" in path:
-            repo_parts = os.environ.get("GH_REPO", "").split("/")
-            owner, repo = (repo_parts[-2], repo_parts[-1]) if len(repo_parts) >= 2 else ("", "")
+            owner, repo = current_repo_identity()
             branch = ""
             if "{branch}" in path:
                 try:
@@ -122,6 +133,26 @@ def api_target(args: list[str]) -> tuple[str, dict[str, list[str]]]:
                 raise GuardError("cannot resolve unknown API endpoint placeholder")
         return path, parse_qs(parts.query, keep_blank_values=True)
     return "", {}
+
+
+def current_repo_identity() -> tuple[str, str]:
+    repo_parts = os.environ.get("GH_REPO", "").split("/")
+    if len(repo_parts) >= 2 and repo_parts[-2] and repo_parts[-1]:
+        return repo_parts[-2], repo_parts[-1]
+    try:
+        remote = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise GuardError(f"cannot resolve current repository identity: {error}") from error
+    normalized = remote.removesuffix(".git").rstrip("/").replace(":", "/")
+    parts = normalized.split("/")
+    if len(parts) < 2 or not parts[-2] or not parts[-1]:
+        raise GuardError("cannot resolve current repository identity")
+    return parts[-2], parts[-1]
 
 
 def is_queue_removal(args: list[str]) -> bool:
