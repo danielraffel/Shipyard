@@ -187,7 +187,11 @@ PR. After checking GitHub's authoritative queue/timeline state, resolve it with
 `shipyard ci profile plan` is provider-neutral and read-only. It parses a
 repo-owned TOML profile from `.tartci/`, `.shipyard/ci-profiles/`, or
 `ci-profiles/`, then reports the concrete GitHub runner variables/selectors
-that would be used for each lane. It does not require tartci to be installed.
+that would be used for each lane. Exact repository entries take precedence over
+the profile's `[repo."*"...]` onboarding default. Local target metadata includes
+the declared runner group and disposable/proven status; an unproven
+self-managed target is skipped in favor of the next eligible fallback. It does
+not require tartci to be installed or mutate GitHub configuration.
 
 ## Runner Metrics
 

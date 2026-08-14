@@ -64,7 +64,10 @@ struct TargetPlan {
     host: Option<String>,
     os: Option<String>,
     arch: Option<String>,
+    runner_group: Option<String>,
     runs_on_json: Option<Value>,
+    ephemeral: bool,
+    proven: bool,
     missing: bool,
 }
 
@@ -241,10 +244,17 @@ struct LaneOutcome {
 }
 
 fn repo_profile_table<'a>(profile: &'a Table, repo: &str) -> Result<&'a Table, CliFailure> {
-    required_table(profile, "repo")?
+    let repositories = required_table(profile, "repo")?;
+    repositories
         .get(repo)
         .and_then(Value::as_table)
-        .ok_or_else(|| CliFailure::new(1, format!("profile has no repo entry for {repo}")))
+        .or_else(|| repositories.get("*").and_then(Value::as_table))
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                format!("profile has no repo entry for {repo} and no repo.* default"),
+            )
+        })
 }
 
 fn lane_specs(repo_table: &Table) -> Vec<LaneSpec<'_>> {
@@ -272,7 +282,7 @@ fn plan_lane(spec: &LaneSpec<'_>, targets: &Table) -> LaneOutcome {
         .iter()
         .map(|id| target_plan(id, targets))
         .collect::<Vec<_>>();
-    let selected = target_plans.iter().find(|target| !target.missing);
+    let selected = target_plans.iter().find(|target| target.selectable());
     let selected_id = selected.map(|target| target.id.clone());
     let selected_runs_on_json = selected
         .and_then(|target| target.runs_on_json.as_ref())
@@ -522,10 +532,19 @@ fn lane_warnings(
                 spec.context, spec.lane, target.id
             ));
         }
-        if target.is_self_managed_x64() && !target_bool(targets, &target.id, "proven") {
+        if !target.missing
+            && !target.is_github()
+            && target.provider.as_deref() != Some("namespace")
+            && !target_bool(targets, &target.id, "proven")
+        {
+            let architecture = if target.is_self_managed_x64() {
+                "x64 target"
+            } else {
+                "target"
+            };
             warnings.push(format!(
-                "{}.{}: self-managed x64 target {} is not marked proven",
-                spec.context, spec.lane, target.id
+                "{}.{}: self-managed {} {} is not marked proven",
+                spec.context, spec.lane, architecture, target.id
             ));
         }
     }
@@ -558,12 +577,25 @@ fn target_plan(id: &str, targets: &Table) -> TargetPlan {
             .and_then(|t| t.get("arch"))
             .and_then(Value::as_str)
             .map(str::to_owned),
+        runner_group: target
+            .and_then(|t| t.get("runner_group"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         runs_on_json: target.and_then(|t| t.get("runs_on_json")).cloned(),
+        ephemeral: target_bool(targets, id, "ephemeral"),
+        proven: target_bool(targets, id, "proven"),
         missing: target.is_none(),
     }
 }
 
 impl TargetPlan {
+    fn selectable(&self) -> bool {
+        if self.missing {
+            return false;
+        }
+        matches!(self.provider.as_deref(), Some("github" | "namespace")) || self.proven
+    }
+
     fn is_github(&self) -> bool {
         self.provider.as_deref() == Some("github") || self.id.starts_with("github.")
     }
@@ -702,10 +734,41 @@ runs_on_json = "ubuntu-latest"
         assert_eq!(plan.profile, "normal");
         assert_eq!(plan.changes.len(), 1);
         assert_eq!(plan.changes[0].variable, "LOCAL_LINUX_RUNS_ON_JSON");
-        assert_eq!(
-            plan.changes[0].value,
-            "[\"self-hosted\",\"Linux\",\"ARM64\",\"build\"]"
-        );
+        assert_eq!(plan.lanes[0].selected_now.as_deref(), Some("github.linux-x64"));
+        assert_eq!(plan.changes[0].value, "\"ubuntu-latest\"");
+        assert!(plan.warnings.iter().any(|warning| warning.contains("not marked proven")));
+    }
+
+    #[test]
+    fn uses_repo_wildcard_for_new_repositories() {
+        let profile = r#"
+name = "normal"
+
+[repo."*".pr.linux]
+strategy = "ordered-fallback"
+targets = ["local.linux-x64", "github.linux-x64"]
+github_variable = "LOCAL_LINUX_RUNS_ON_JSON"
+
+[targets."local.linux-x64"]
+provider = "proxmox"
+runner_group = "repo-safe-build"
+runs_on_json = ["self-hosted", "Linux", "X64", "repo-build"]
+ephemeral = true
+proven = true
+
+[targets."github.linux-x64"]
+runs_on_json = "ubuntu-latest"
+"#
+        .parse()
+        .expect("profile toml");
+
+        let plan = build_plan(&profile, "new-owner/new-repo", "test.toml".to_owned())
+            .expect("wildcard profile plan");
+
+        assert_eq!(plan.lanes[0].selected_now.as_deref(), Some("local.linux-x64"));
+        assert_eq!(plan.lanes[0].targets[0].runner_group.as_deref(), Some("repo-safe-build"));
+        assert!(plan.lanes[0].targets[0].ephemeral);
+        assert!(plan.lanes[0].targets[0].proven);
         assert!(plan.warnings.is_empty());
     }
 

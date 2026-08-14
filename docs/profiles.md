@@ -177,11 +177,20 @@ vocabulary, not GitHub labels. Each target maps to a concrete `runs-on` selector
 such as `["self-hosted","Windows","ARM64","pulp-build-windows"]` or
 `"windows-latest"`.
 
+Profiles may define `[repo."*"...]` as the onboarding default for repositories
+that do not yet have an exact entry. An exact `[repo."OWNER/REPO"...]` entry
+still wins. This makes a new repository inherit the intended lane order and
+hosted fallback without copying labels by hand; it does not grant the
+repository access to an organization runner group by itself.
+
 Self-managed x64 targets must set `proven = true` only after a real job has
 claimed and completed on that exact selector. Until then, `plan` emits a
-warning so a profile cannot silently promote an unverified architecture or
-label set. GitHub-hosted and Namespace cloud targets are exempt because their
-provider owns the architecture claim.
+warning and selects the next eligible fallback, so an unverified architecture
+or label set cannot silently become the active route. GitHub-hosted and
+Namespace cloud targets are exempt because their provider owns the architecture
+claim. A self-managed target's optional `runner_group`, `ephemeral`, and
+`proven` fields are included in the JSON plan so onboarding and fleet tooling
+can derive the same group/label contract instead of reimplementing it.
 
 Shipyard's job is to consume those facts across hosts:
 
@@ -191,6 +200,12 @@ Shipyard's job is to consume those facts across hosts:
 4. Apply or pass one concrete GitHub `runs-on` selector per workflow run.
 5. Keep GitHub-hosted x64 scheduled validation authoritative until local x64
    emulation is explicitly proven.
+
+The plan remains read-only. Creating organization runner groups, registering
+labels, or applying repository variables requires an explicit provisioning
+step with repository-scoped authorization and a completed disposable-runner
+proof; profile defaults must never turn those privileged mutations into an
+implicit side effect of planning.
 
 GitHub Actions cannot change `runs-on` once a job is queued. Do not pass an
 ordered fallback chain into a Pulp workflow and expect GitHub to handle it.
