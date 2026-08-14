@@ -406,7 +406,26 @@ impl LocalExecutor {
                 return io_error_result(context, &error.to_string());
             }
             if let Some(callback) = progress_callback.as_mut() {
-                callback(ProgressEvent::phase(stage_name));
+                if let crate::executor::streaming::ProgressAction::Terminate(reason) =
+                    callback(ProgressEvent::phase(stage_name))
+                {
+                    if let Err(error) = append_log(
+                        context.log_path,
+                        &format!("\n=== CANCELLED before {stage_name}: {reason} ===\n"),
+                    ) {
+                        return io_error_result(context, &error.to_string());
+                    }
+                    let mut result = error_result(
+                        context.target,
+                        context.log_path,
+                        context.started_at,
+                        Some(context.start_time.elapsed().as_secs_f64()),
+                    );
+                    result.phase = Some(stage_name.clone());
+                    result.error_message = Some(reason);
+                    result.failure_class = Some(FailureClass::Unknown.as_str().to_owned());
+                    return result;
+                }
             }
 
             let stage_run = {
@@ -1213,5 +1232,38 @@ mod tests {
 
         assert_eq!(result_status, TargetStatus::Pass);
         assert!(phases.iter().any(|phase| phase == "build"));
+    }
+
+    #[test]
+    fn local_progress_callback_can_cancel_before_next_stage_starts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let validation = LocalValidationConfig {
+            stages: stage_map(&[
+                ("setup", "touch setup.marker"),
+                ("build", "touch build.marker"),
+            ]),
+            ..LocalValidationConfig::default()
+        };
+        let mut request = request(temp.path().join("run.log"), validation);
+        request.target.cwd = Some(temp.path().to_path_buf());
+        let result = {
+            let mut callback = |event: crate::executor::streaming::ProgressEvent| {
+                if event.phase.as_deref() == Some("build") {
+                    crate::executor::streaming::ProgressAction::Terminate(
+                        "cancel before build".to_owned(),
+                    )
+                } else {
+                    crate::executor::streaming::ProgressAction::Continue
+                }
+            };
+            request.progress_callback = Some(&mut callback);
+            LocalExecutor::default().validate(request)
+        };
+
+        assert_eq!(result.status, TargetStatus::Error);
+        assert_eq!(result.phase.as_deref(), Some("build"));
+        assert_eq!(result.error_message.as_deref(), Some("cancel before build"));
+        assert!(temp.path().join("setup.marker").exists());
+        assert!(!temp.path().join("build.marker").exists());
     }
 }
