@@ -1215,6 +1215,7 @@ mod tests {
         render_green_not_merged_flaky, render_green_not_merged_head_superseded, ship_command,
     };
     use crate::app::cli::MergeResult;
+    #[cfg(unix)]
     use crate::cloud::GitHubActions;
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::identity::RuntimeMode;
