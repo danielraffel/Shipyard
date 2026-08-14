@@ -61,12 +61,12 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
     }
     let workstream = args.workstream_id.trim();
     if workstream.is_empty()
-        || workstream.len() > 128
+        || workstream.len() > 124
         || workstream.chars().any(char::is_whitespace)
     {
         return Err(CliFailure::new(
             1,
-            "--workstream-id must be 1-128 non-whitespace characters",
+            "--workstream-id must be 1-124 non-whitespace characters",
         ));
     }
     if let Some(url) = args.context_url.as_deref()
@@ -80,7 +80,7 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
     Ok(())
 }
 
-fn verify_exact_open_pr(
+pub(super) fn verify_exact_open_pr(
     actions: &GitHubActions,
     repo: &str,
     pr: u64,
@@ -117,10 +117,7 @@ fn write_handoff_status(
     repo: &str,
     args: &StewardHandoffArgs,
 ) -> Result<(), CliFailure> {
-    let description = format!("Managed handoff {}", args.workstream_id)
-        .chars()
-        .take(140)
-        .collect::<String>();
+    let description = format!("Managed handoff {}", args.workstream_id);
     let mut command = vec![
         "api".to_owned(),
         "-X".to_owned(),
@@ -233,11 +230,7 @@ pub(super) fn run_steward_write(
 ) -> Result<String, crate::cloud::GitHubError> {
     match actions.run_gh(args) {
         Ok(value) => Ok(value),
-        Err(error)
-            if error
-                .to_string()
-                .contains("Resource not accessible by integration") =>
-        {
+        Err(error) if error.is_integration_permission_denial() => {
             eprintln!(
                 "shipyard: configured GitHub App cannot write {purpose}; falling back to ambient gh auth for this steward mutation only."
             );

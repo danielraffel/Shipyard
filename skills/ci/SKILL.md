@@ -132,6 +132,12 @@ then apply that selector through repo variables or `workflow_dispatch`.
 Do not pass a fallback chain into GitHub Actions. GitHub cannot change `runs-on`
 after a job queues. Pulp workflows should receive one concrete selector per run.
 
+For a routing PR whose external proof is incomplete, use the configured
+per-PR opt-out label only after explicitly dequeuing the PR or disabling its
+already-armed native auto-merge and confirming admission is gone. The label
+prevents future steward admission; it does not disarm existing admission. A
+repository-wide merge-queue hold is for incidents, not one routing PR.
+
 For Pulp's normal fast profile, local ARM64 PR lanes are fast feedback and
 GitHub-hosted nightly Intel Linux/Windows lanes are compatibility surveillance.
 Windows QEMU on Apple Silicon is Windows ARM64; x64 MSVC/Prism execution is

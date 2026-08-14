@@ -461,6 +461,7 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
     match value.get("__typename").and_then(Value::as_str)? {
         "CheckRun" => Some(StewardCheck {
             name: value.get("name")?.as_str()?.to_owned(),
+            source: crate::merge_steward::StewardCheckSource::CheckRun,
             app_id: value
                 .pointer("/checkSuite/app/databaseId")
                 .or_else(|| value.pointer("/app/id"))
@@ -486,6 +487,7 @@ pub(super) fn parse_check(value: &Value) -> Option<StewardCheck> {
             let state = value.get("state")?.as_str()?;
             Some(StewardCheck {
                 name: value.get("context")?.as_str()?.to_owned(),
+                source: crate::merge_steward::StewardCheckSource::StatusContext,
                 app_id: None,
                 status: if matches!(state, "PENDING" | "EXPECTED") {
                     "IN_PROGRESS"
@@ -614,6 +616,7 @@ pub(super) fn commit_statuses_for_head(
 pub(super) fn parse_rest_check(value: &Value) -> Option<StewardCheck> {
     Some(StewardCheck {
         name: value.get("name")?.as_str()?.to_owned(),
+        source: crate::merge_steward::StewardCheckSource::CheckRun,
         app_id: value.pointer("/app/id").and_then(Value::as_u64),
         status: value.get("status")?.as_str()?.to_owned(),
         conclusion: value
@@ -637,6 +640,7 @@ pub(super) fn parse_rest_status(value: &Value) -> Option<StewardCheck> {
     let state = value.get("state")?.as_str()?;
     Some(StewardCheck {
         name: value.get("context")?.as_str()?.to_owned(),
+        source: crate::merge_steward::StewardCheckSource::StatusContext,
         app_id: None,
         status: if state.eq_ignore_ascii_case("pending") {
             "IN_PROGRESS"

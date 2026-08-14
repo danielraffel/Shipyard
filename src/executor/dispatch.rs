@@ -565,7 +565,10 @@ impl ExecutorDispatcher {
             });
             let result = demote_stale_result(result, chain.heartbeat_stale_secs);
 
-            if result.status == crate::job::TargetStatus::Fail {
+            if matches!(
+                result.status,
+                crate::job::TargetStatus::Fail | crate::job::TargetStatus::Cancelled
+            ) {
                 return result;
             }
             if result.status == crate::job::TargetStatus::Pass {
@@ -678,7 +681,10 @@ impl ExecutorDispatcher {
                 }),
             });
 
-            if result.status == crate::job::TargetStatus::Fail {
+            if matches!(
+                result.status,
+                crate::job::TargetStatus::Fail | crate::job::TargetStatus::Cancelled
+            ) {
                 result.backend.clone_from(&member.label);
                 return result;
             }

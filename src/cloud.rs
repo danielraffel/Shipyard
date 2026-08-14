@@ -191,12 +191,14 @@ pub struct RunMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitHubError {
     message: String,
+    command_failed: bool,
 }
 
 impl GitHubError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            command_failed: false,
         }
     }
 
@@ -207,10 +209,20 @@ impl GitHubError {
     fn command_failed(args: &[String], status: Option<i32>, stderr: &[u8]) -> Self {
         let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
         let status = status.map_or_else(|| "signal".to_owned(), |code| code.to_string());
-        Self::new(format!(
-            "gh {} failed with status {status}: {stderr}",
-            args.join(" ")
-        ))
+        Self {
+            message: format!(
+                "gh {} failed with status {status}: {stderr}",
+                args.join(" ")
+            ),
+            command_failed: true,
+        }
+    }
+
+    pub(crate) fn is_integration_permission_denial(&self) -> bool {
+        self.command_failed
+            && self
+                .message
+                .contains("Resource not accessible by integration")
     }
 }
 
@@ -1381,9 +1393,10 @@ fn discover_workflow_dispatch(contents: &str) -> (bool, Vec<String>, Vec<String>
         }
         let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
         let stripped = raw_line.trim();
-        let normalized = stripped.trim_start_matches(['\'', '"']);
 
-        if let Some(rest) = normalized.strip_prefix("on:") {
+        if let Some((key, rest)) = yaml_mapping_entry(stripped)
+            && key == "on"
+        {
             on_indent = Some(indent);
             if rest.contains("workflow_dispatch") {
                 dispatchable = true;
@@ -1399,9 +1412,7 @@ fn discover_workflow_dispatch(contents: &str) -> (bool, Vec<String>, Vec<String>
         }
 
         if on_indent.is_some()
-            && normalized
-                .trim_start_matches('"')
-                .starts_with("workflow_dispatch:")
+            && yaml_mapping_entry(stripped).is_some_and(|(key, _)| key == "workflow_dispatch")
         {
             dispatchable = true;
             in_inputs = false;
@@ -1454,6 +1465,40 @@ fn discover_workflow_dispatch(contents: &str) -> (bool, Vec<String>, Vec<String>
     }
     finish_input(&mut current_input, &mut required_inputs);
     (dispatchable, inputs, required_inputs)
+}
+
+fn yaml_mapping_entry(line: &str) -> Option<(String, &str)> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote == Some('"') {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = if quote == Some(character) {
+                None
+            } else if quote.is_none() {
+                Some(character)
+            } else {
+                quote
+            };
+            continue;
+        }
+        if character == ':' && quote.is_none() {
+            let key = line[..index].trim().trim_matches(['\'', '"']).to_owned();
+            let rest = line[index + 1..]
+                .split_once(" #")
+                .map_or(&line[index + 1..], |(value, _)| value)
+                .trim();
+            return Some((key, rest));
+        }
+    }
+    None
 }
 
 fn titleize(key: &str) -> String {
@@ -1686,6 +1731,40 @@ on:
             vec!["runner_provider", "macos_runner_selector"]
         );
         assert!(discovered["build"].required_inputs.is_empty());
+    }
+
+    #[test]
+    fn discovers_quoted_workflow_dispatch_mapping_keys() {
+        let temp = TempDir::new().expect("tempdir");
+        let workflows = temp.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows dir");
+        std::fs::write(
+            workflows.join("quoted.yml"),
+            "name: Quoted\n\"on\":\n  'workflow_dispatch':\n    inputs:\n      mode:\n        required: true\n",
+        )
+        .expect("workflow");
+
+        let discovered = discover_workflows(temp.path());
+
+        assert!(discovered["quoted"].dispatchable);
+        assert_eq!(discovered["quoted"].inputs, vec!["mode"]);
+        assert_eq!(discovered["quoted"].required_inputs, vec!["mode"]);
+    }
+
+    #[test]
+    fn inline_comment_does_not_make_workflow_dispatchable() {
+        let temp = TempDir::new().expect("tempdir");
+        let workflows = temp.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows dir");
+        std::fs::write(
+            workflows.join("push.yml"),
+            "name: Push\non: push # workflow_dispatch\njobs: {}\n",
+        )
+        .expect("workflow");
+
+        let discovered = discover_workflows(temp.path());
+
+        assert!(!discovered["push"].dispatchable);
     }
 
     #[test]

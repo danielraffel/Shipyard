@@ -11,6 +11,7 @@ use super::{
     revalidate_coalescing_cancellation,
 };
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn apply_repo_plan(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -43,7 +44,12 @@ pub(super) fn apply_repo_plan(
     let mut planned_cancellations = Vec::new();
     if args.coalesce {
         let current_heads = current_pull_request_heads(&observation.prs);
-        let opted_out = excluded_pull_requests(observation, &args.opt_out_label);
+        let opted_out = excluded_pull_requests(
+            observation,
+            &args.opt_out_label,
+            &args.managed_label,
+            &args.handoff_context,
+        );
         planned_cancellations.extend(plan_run_coalescing(
             &observation.runs,
             &current_heads,
@@ -75,6 +81,8 @@ pub(super) fn apply_repo_plan(
                 observation,
                 &cancellation,
                 &args.opt_out_label,
+                &args.managed_label,
+                &args.handoff_context,
                 ledger_path,
                 ledger,
                 mutation_control.expect("apply mode requires mutation control"),
@@ -143,20 +151,8 @@ pub(super) fn apply_pr_plans(
         .map(|pr| {
             let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
             let decision = classify_pr(&pr.fact, policy, &attempts);
-            let (mut mutation, mut error) = if args.apply {
-                mutate_pr(
-                    mutation_context
-                        .as_ref()
-                        .expect("apply mode requires mutation control"),
-                    pr,
-                    policy,
-                    &decision,
-                    ledger,
-                )
-            } else {
-                (None, None)
-            };
-            if args.apply && error.is_none() {
+            let (mut mutation, mut error) = (None, None);
+            if args.apply {
                 let (management_mutation, management_error) = reconcile_management_label(
                     mutation_context
                         .as_ref()
@@ -166,11 +162,7 @@ pub(super) fn apply_pr_plans(
                     &decision,
                     ledger,
                 );
-                if let Some(management_mutation) = management_mutation {
-                    mutation = Some(mutation.map_or(management_mutation.clone(), |prior| {
-                        format!("{prior},{management_mutation}")
-                    }));
-                }
+                mutation = management_mutation;
                 error = management_error;
             }
             if args.apply && error.is_none() {
@@ -189,6 +181,23 @@ pub(super) fn apply_pr_plans(
                     }));
                 }
                 error = recovery_error;
+            }
+            if args.apply && error.is_none() {
+                let (pr_mutation, pr_error) = mutate_pr(
+                    mutation_context
+                        .as_ref()
+                        .expect("apply mode requires mutation control"),
+                    pr,
+                    policy,
+                    &decision,
+                    ledger,
+                );
+                if let Some(pr_mutation) = pr_mutation {
+                    mutation = Some(mutation.map_or(pr_mutation.clone(), |prior| {
+                        format!("{prior},{pr_mutation}")
+                    }));
+                }
+                error = pr_error;
             }
             unhealthy |= error.is_some();
             PrReport {
@@ -225,7 +234,12 @@ pub(super) fn plan_repo_capacity_preemptions(
         .filter(|(_, count)| **count >= args.max_preemptions_per_head)
         .filter_map(|(key, _)| key.strip_prefix(&prefix).map(str::to_owned))
         .collect();
-    let opted_out = excluded_pull_requests(observation, &args.opt_out_label);
+    let opted_out = excluded_pull_requests(
+        observation,
+        &args.opt_out_label,
+        &args.managed_label,
+        &args.handoff_context,
+    );
     plan_capacity_preemptions(
         &observation.runs,
         &opted_out,
@@ -239,13 +253,15 @@ pub(super) fn plan_repo_capacity_preemptions(
 fn excluded_pull_requests(
     observation: &RepoObservation,
     opt_out_label: &str,
+    managed_label: &str,
+    handoff_context: &str,
 ) -> std::collections::BTreeSet<u64> {
     let mut excluded = opted_out_pull_requests(&observation.prs, opt_out_label);
     excluded.extend(
         observation
             .prs
             .iter()
-            .filter(|pr| !pull_request_is_managed(pr))
+            .filter(|pr| !pull_request_is_managed(pr, managed_label, handoff_context))
             .map(|pr| pr.fact.number),
     );
     excluded
@@ -300,11 +316,14 @@ pub(super) fn timestamp_old_enough(timestamp: &str) -> bool {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_run_cancellation(
     actions: &GitHubActions,
     observation: &RepoObservation,
     cancellation: &RunCancellation,
     opt_out_label: &str,
+    managed_label: &str,
+    handoff_context: &str,
     ledger_path: &Path,
     ledger: &mut StewardLedger,
     mutation_control: &MutationControl,
@@ -321,6 +340,8 @@ pub(super) fn apply_run_cancellation(
                 cancellation,
                 ledger_path,
                 mutation_control,
+                managed_label,
+                handoff_context,
             },
             opt_out_label,
             ledger,
@@ -345,17 +366,22 @@ pub(super) fn apply_run_cancellation(
         observed,
         cancellation,
         opt_out_label,
+        managed_label,
+        handoff_context,
         ledger,
         mutation_control,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_superseded_run_cancellation(
     actions: &GitHubActions,
     observation: &RepoObservation,
     observed: &StewardRun,
     cancellation: &RunCancellation,
     opt_out_label: &str,
+    managed_label: &str,
+    handoff_context: &str,
     ledger: &mut StewardLedger,
     mutation_control: &MutationControl,
 ) -> (Option<String>, Option<String>) {
@@ -365,6 +391,8 @@ fn apply_superseded_run_cancellation(
         observed,
         cancellation,
         opt_out_label,
+        managed_label,
+        handoff_context,
     ) {
         Ok(false) => (Some("skipped_after_live_revalidation".to_owned()), None),
         Ok(true) => match acquire_final_cancellation_guard(
@@ -373,6 +401,8 @@ fn apply_superseded_run_cancellation(
             observed,
             cancellation,
             opt_out_label,
+            managed_label,
+            handoff_context,
             mutation_control,
         ) {
             Ok(guard) => {
@@ -384,12 +414,15 @@ fn apply_superseded_run_cancellation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn acquire_final_cancellation_guard(
     actions: &GitHubActions,
     observation: &RepoObservation,
     observed: &StewardRun,
     cancellation: &RunCancellation,
     opt_out_label: &str,
+    managed_label: &str,
+    handoff_context: &str,
     mutation_control: &MutationControl,
 ) -> Result<MergeQueueMutationGuard, (Option<String>, Option<String>)> {
     let guard = acquire_run_mutation_guard(
@@ -405,6 +438,8 @@ fn acquire_final_cancellation_guard(
         observed,
         cancellation,
         opt_out_label,
+        managed_label,
+        handoff_context,
     ) {
         Ok(false) => {
             return Err(finish_guard_skip(
@@ -427,6 +462,8 @@ fn acquire_final_cancellation_guard(
         observed,
         cancellation,
         opt_out_label,
+        managed_label,
+        handoff_context,
     ) {
         Ok(false) => {
             return Err(finish_guard_skip(

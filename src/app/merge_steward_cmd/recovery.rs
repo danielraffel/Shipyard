@@ -12,7 +12,10 @@ pub(super) fn reconcile_management_label(
     decision: &StewardDecision,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
-    let unmanaged = matches!(decision, StewardDecision::Unmanaged);
+    let unmanaged = matches!(
+        decision,
+        StewardDecision::Unmanaged | StewardDecision::HandoffMissing
+    );
     if management_label_is_converged(observed, unmanaged) {
         return (None, None);
     }
@@ -249,6 +252,18 @@ fn signal_needs_agent(
         _ => return Err("recovery signal requested for a non-blocking decision".to_owned()),
     };
     write_recovery_status(context, pr, "failure", &reason)?;
+    super::handoff::verify_exact_open_pr(
+        context.actions,
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+    )
+    .map_err(|error| {
+        format!(
+            "recovery target changed before label mutation: {}",
+            error.message()
+        )
+    })?;
     ensure_label(
         context.actions,
         &context.observation.repo,
@@ -272,6 +287,18 @@ fn clear_needs_agent(
     pr: &ObservedPr,
 ) -> Result<String, String> {
     write_recovery_status(context, pr, "success", "Shipyard recovery clear")?;
+    super::handoff::verify_exact_open_pr(
+        context.actions,
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+    )
+    .map_err(|error| {
+        format!(
+            "recovery target changed before label mutation: {}",
+            error.message()
+        )
+    })?;
     remove_label(
         context.actions,
         &context.observation.repo,
@@ -369,6 +396,7 @@ mod tests {
                     .into_iter()
                     .map(|(conclusion, observed_at)| StewardCheck {
                         name: RECOVERY_CONTEXT.to_owned(),
+                        source: crate::merge_steward::StewardCheckSource::StatusContext,
                         app_id: None,
                         status: "COMPLETED".to_owned(),
                         conclusion: Some(conclusion.to_owned()),

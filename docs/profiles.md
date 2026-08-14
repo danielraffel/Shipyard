@@ -197,6 +197,17 @@ ordered fallback chain into a Pulp workflow and expect GitHub to handle it.
 Fallback must be resolved before repo variables or `workflow_dispatch` inputs are
 set.
 
+Routing migrations use per-PR admission holds. Add the configured Shipyard
+opt-out label (for Pulp, `shipyard:no-auto-merge`) only to the routing PRs while
+their external runner-group or reporter proofs are incomplete. The label stops
+future steward admission; it does not dequeue a PR or disable auto-merge that
+is already armed. Before adding it to an admitted PR, explicitly dequeue that
+PR or disable native auto-merge and confirm the PR is no longer queued. Never use
+`shipyard merge-queue hold` for this purpose: a repository-wide hold suppresses
+eligible unrelated PRs and turns a local routing issue into queue-wide
+serialization. Once the proof is complete, remove the label and let the normal
+steward arm protected auto-merge for that PR.
+
 For Pulp, the normal fast profile routes PR macOS and Windows to local ARM64
 VMs first, and ordinary Linux PR work to the disposable Mac Pro x64 selector
 `["self-hosted","Linux","X64","pulp-build-linux-x64","pulp-host-macpro"]`,
@@ -205,3 +216,28 @@ Intel Linux/Windows validation stays on GitHub-hosted x64 runners. Coverage targ
 labels; do not route coverage to a warm bare-metal build pool. Pulp's current
 repo-specific variables and labels live in Pulp's own docs and
 `.shipyard/ci-profiles/` files so Shipyard docs do not stale on Pulp operations.
+
+### Fleet identity and drift guard
+
+The shared profile contract uses stable target IDs plus stable `host/lane/slot`
+identity for operations. It does not use static GitHub registration names:
+disposable workers register with a unique per-boot name, and the supervisor may
+reclaim only an offline registration from the same slot. This preserves audit
+continuity while preventing zombie-name collisions after a reboot.
+
+Each repository profile must explicitly cover `pr`, `debug`, `release` build,
+`coverage`, and `scheduled` classes. Signing, deployment, privileged, and
+secret-bearing jobs remain hosted-only unless separately security-reviewed.
+Missing repository policy, missing target, label mismatch, stale lease, or
+unhealthy local capacity resolves to the hosted target before dispatch. It must
+never create an empty selector or leave GitHub with a local selector that no
+runner can satisfy.
+
+For a new Pulp/Forge repository, copy the profile vocabulary, add a repository
+stanza, run both `tartci profile validate` and
+`shipyard ci profile plan <profile-name> --repo OWNER/REPO`, then
+prove one real dispatch and its fallback before enabling merge-queue routing.
+The profile and exact selectors are version-controlled in TartCI plus the
+consumer repository; secrets, registration tokens, and host state are never
+committed. This makes the repositories the durable, reviewable backup for
+policy while keeping credentials private to the host/provider.
