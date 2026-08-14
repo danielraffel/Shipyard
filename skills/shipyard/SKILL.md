@@ -860,6 +860,18 @@ manual authority action requires the loud `GHAPP_ALLOW_QUEUE_REMOVAL=1`
 override. Long-running or pending advisory/self-hosted checks are never queue
 removal authority.
 
+Raw PR closure is protected at the same chokepoint by
+`scripts/ghapp_pr_close_guard.py`. The guard resolves the live base commit and
+always calls GitHub compare as `current-base...PR-head`; in that direction,
+`ahead` means the PR still owns unique commits and must remain open, while
+`behind` or `identical` proves ancestry containment. Diverged or ahead history
+may close only when every changed path's exact blob (including rename/delete
+semantics) is already present on the pinned base. Missing, contradictory, or
+truncated compare evidence fails closed. A deliberate abandonment or temporary
+sequence lock requires the loud `GHAPP_ALLOW_UNINTEGRATED_PR_CLOSE=1` override.
+Never infer integration from `ahead_by=0` obtained from the reversed
+`PR-head...current-base` endpoint.
+
 Five operations detect `is_graphql_rate_limited` in `gh` stderr and
 fall through to a REST equivalent: PR list, PR create, PR view, PR
 snapshot (in `wait_transport`), and PR merge (in
