@@ -362,6 +362,10 @@ fn render_wait_outcome<W: Write>(
             Value::from(outcome.events_received),
         );
         data.insert(
+            "transient_errors".to_owned(),
+            Value::from(outcome.transient_errors),
+        );
+        data.insert(
             "elapsed_seconds".to_owned(),
             Value::from((outcome.elapsed_seconds * 1000.0).round() / 1000.0),
         );
@@ -535,6 +539,7 @@ artifacts = [
             transport: "daemon".to_owned(),
             fallback_used: false,
             events_received: 3,
+            transient_errors: 2,
             elapsed_seconds: 1.23456,
             ..WaitOutcome::default()
         };
@@ -556,6 +561,7 @@ artifacts = [
         assert_eq!(payload["observed"]["state"], "MERGED");
         assert_eq!(payload["transport"], "daemon");
         assert_eq!(payload["events_received"], 3);
+        assert_eq!(payload["transient_errors"], 2);
         assert_eq!(payload["elapsed_seconds"], 1.235);
     }
 

@@ -689,6 +689,59 @@ impl Error for GhPrepareError {
     }
 }
 
+impl GhPrepareError {
+    /// Whether retrying command preparation may recover without configuration
+    /// or credential changes.
+    #[must_use]
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            Self::HelperTimedOut { .. } => true,
+            Self::HelperStart { source, .. } => matches!(
+                source.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            ),
+            Self::HelperFailed { stderr, .. } => helper_failure_is_transient(stderr),
+            Self::MissingTokenEnv { .. }
+            | Self::EmptyTokenEnv { .. }
+            | Self::EmptyTokenCommand
+            | Self::HelperStdoutEmpty
+            | Self::HelperStdoutMalformed
+            | Self::TokenExpired
+            | Self::RepoSlugRequired
+            | Self::InvalidRepoSlug { .. }
+            | Self::RepoProbeFailed { .. }
+            | Self::TokenCachePoisoned => false,
+        }
+    }
+}
+
+fn helper_failure_is_transient(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    [
+        "bad gateway",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "connection reset",
+        "gateway timeout",
+        "network is unreachable",
+        "remote end closed connection",
+        "service unavailable",
+        "temporary failure",
+        "temporarily unavailable",
+        "timed out",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TokenResolution {
     token: String,
@@ -1436,6 +1489,46 @@ mod tests {
         assert!(rendered.contains("<redacted-token>"));
         assert!(!rendered.contains("ghs_secret123"));
         assert!(!rendered.contains("github_pat_abcDEF"));
+    }
+
+    #[test]
+    fn classifies_only_recoverable_token_helper_failures_as_transient() {
+        let reset = GhPrepareError::HelperFailed {
+            program: "helper".to_owned(),
+            status: Some(1),
+            stderr: "GitHub API request failed: [Errno 54] Connection reset by peer".to_owned(),
+        };
+        let unauthorized = GhPrepareError::HelperFailed {
+            program: "helper".to_owned(),
+            status: Some(1),
+            stderr: "HTTP 401: bad credentials".to_owned(),
+        };
+        let start_reset = GhPrepareError::HelperStart {
+            program: "helper".to_owned(),
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        };
+        let missing = GhPrepareError::HelperStart {
+            program: "helper".to_owned(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+
+        assert!(reset.is_transient());
+        assert!(
+            GhPrepareError::HelperTimedOut {
+                program: "helper".to_owned(),
+                timeout_ms: 1_000,
+            }
+            .is_transient()
+        );
+        assert!(start_reset.is_transient());
+        assert!(!unauthorized.is_transient());
+        assert!(!missing.is_transient());
+        assert!(
+            !GhPrepareError::MissingTokenEnv {
+                name: "TOKEN".to_owned(),
+            }
+            .is_transient()
+        );
     }
 
     fn git(cwd: &Path, args: &[&str]) {

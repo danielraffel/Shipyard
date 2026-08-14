@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
+use crate::gh::{GhAuthPolicy, GhClient, GhPrepareError, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::wait::TruthResult;
 
@@ -32,6 +32,8 @@ pub struct WaitOutcome {
     pub fallback_used: bool,
     /// Number of live events processed.
     pub events_received: u64,
+    /// Number of transient GitHub snapshot/auth failures retried in-process.
+    pub transient_errors: u64,
     /// Whether the overall wait timed out.
     pub timed_out: bool,
     /// Whether a daemon/live path was unavailable.
@@ -74,6 +76,84 @@ enum DaemonEventOutcome {
     Event(Value),
     Timeout,
     Disconnect,
+}
+
+enum SnapshotFetch {
+    Snapshot(Option<Value>),
+    TimedOut,
+}
+
+fn fetch_snapshot_resilient<F>(
+    fetch_snapshot: &mut F,
+    start: &Instant,
+    timeout: Duration,
+    poll_interval: Duration,
+    transient_errors: &mut u64,
+) -> WaitResult<SnapshotFetch>
+where
+    F: FnMut() -> WaitResult<Option<Value>>,
+{
+    let retry_interval = poll_interval
+        .max(Duration::from_millis(250))
+        .min(Duration::from_secs(5));
+    loop {
+        match fetch_snapshot() {
+            Ok(snapshot) => return Ok(SnapshotFetch::Snapshot(snapshot)),
+            Err(error) if is_transient_snapshot_error(error.as_ref()) => {
+                *transient_errors += 1;
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Ok(SnapshotFetch::TimedOut);
+                }
+                thread::sleep(retry_interval.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_transient_snapshot_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<GhPrepareError>()
+        .is_some_and(GhPrepareError::is_transient)
+}
+
+fn fetch_and_evaluate<F, E>(
+    fetch_snapshot: &mut F,
+    evaluator: &mut E,
+    start: &Instant,
+    timeout: Duration,
+    poll_interval: Duration,
+    transient_errors: &mut u64,
+) -> WaitResult<Option<TruthResult>>
+where
+    F: FnMut() -> WaitResult<Option<Value>>,
+    E: FnMut(Option<&Value>) -> WaitResult<TruthResult>,
+{
+    match fetch_snapshot_resilient(
+        fetch_snapshot,
+        start,
+        timeout,
+        poll_interval,
+        transient_errors,
+    )? {
+        SnapshotFetch::Snapshot(snapshot) => evaluator(snapshot.as_ref()).map(Some),
+        SnapshotFetch::TimedOut => Ok(None),
+    }
+}
+
+fn mark_timed_out(outcome: &mut WaitOutcome, start: &Instant) {
+    outcome.timed_out = true;
+    outcome.elapsed_seconds = start.elapsed().as_secs_f64();
+}
+
+fn record_evaluation(outcome: &mut WaitOutcome, result: TruthResult, start: &Instant) -> bool {
+    outcome.observed = result.observed;
+    outcome.matched = result.matched;
+    if result.matched {
+        outcome.elapsed_seconds = start.elapsed().as_secs_f64();
+    }
+    result.matched
 }
 
 #[cfg(unix)]
@@ -169,12 +249,19 @@ where
         WaitOutcome::polling_default()
     };
 
-    let first_snapshot = fetch_snapshot()?;
-    let first_result = evaluator(first_snapshot.as_ref())?;
-    outcome.observed = first_result.observed;
-    outcome.matched = first_result.matched;
-    if first_result.matched {
-        outcome.elapsed_seconds = start.elapsed().as_secs_f64();
+    let Some(first_result) = fetch_and_evaluate(
+        &mut fetch_snapshot,
+        &mut evaluator,
+        &start,
+        timeout,
+        poll_interval,
+        &mut outcome.transient_errors,
+    )?
+    else {
+        mark_timed_out(&mut outcome, &start);
+        return Ok(outcome);
+    };
+    if record_evaluation(&mut outcome, first_result, &start) {
         return Ok(outcome);
     }
 
@@ -196,12 +283,19 @@ where
             match connection.read_next_relevant_event(&event_filter, remaining) {
                 DaemonEventOutcome::Event(_event) => {
                     outcome.events_received += 1;
-                    let snapshot = fetch_snapshot()?;
-                    let result = evaluator(snapshot.as_ref())?;
-                    outcome.observed = result.observed;
-                    if result.matched {
-                        outcome.matched = true;
-                        outcome.elapsed_seconds = start.elapsed().as_secs_f64();
+                    let Some(result) = fetch_and_evaluate(
+                        &mut fetch_snapshot,
+                        &mut evaluator,
+                        &start,
+                        timeout,
+                        poll_interval,
+                        &mut outcome.transient_errors,
+                    )?
+                    else {
+                        mark_timed_out(&mut outcome, &start);
+                        return Ok(outcome);
+                    };
+                    if record_evaluation(&mut outcome, result, &start) {
                         return Ok(outcome);
                     }
                 }
@@ -230,12 +324,19 @@ where
         let remaining = timeout.saturating_sub(start.elapsed());
         thread::sleep(poll_interval.min(remaining));
 
-        let snapshot = fetch_snapshot()?;
-        let result = evaluator(snapshot.as_ref())?;
-        outcome.observed = result.observed;
-        if result.matched {
-            outcome.matched = true;
-            outcome.elapsed_seconds = start.elapsed().as_secs_f64();
+        let Some(result) = fetch_and_evaluate(
+            &mut fetch_snapshot,
+            &mut evaluator,
+            &start,
+            timeout,
+            poll_interval,
+            &mut outcome.transient_errors,
+        )?
+        else {
+            mark_timed_out(&mut outcome, &start);
+            return Ok(outcome);
+        };
+        if record_evaluation(&mut outcome, result, &start) {
             return Ok(outcome);
         }
     }
@@ -724,6 +825,7 @@ mod tests {
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{IpcServer, IpcState};
+    use crate::gh::GhPrepareError;
     use crate::wait::TruthResult;
 
     #[cfg(unix)]
@@ -841,6 +943,105 @@ mod tests {
 
         assert!(outcome.matched);
         assert!(calls.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn transient_token_helper_failure_is_retried_until_snapshot_matches() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let outcome = wait_for_condition(
+            |snapshot| {
+                Ok(TruthResult {
+                    matched: snapshot
+                        .and_then(|snapshot| snapshot.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("completed"),
+                    observed: std::collections::BTreeMap::new(),
+                })
+            },
+            move || {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(Box::new(GhPrepareError::HelperFailed {
+                        program: "helper".to_owned(),
+                        status: Some(1),
+                        stderr: "GitHub API request failed: connection reset by peer".to_owned(),
+                    }) as Box<dyn std::error::Error>);
+                }
+                Ok(Some(serde_json::json!({"status": "completed"})))
+            },
+            |_| true,
+            1.0,
+            0.01,
+            true,
+            &socket_path,
+        )
+        .expect("transient helper failure should recover");
+
+        assert!(outcome.matched);
+        assert_eq!(outcome.transient_errors, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn repeated_transient_token_helper_failures_consume_only_overall_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let outcome = wait_for_condition(
+            |_| {
+                Ok(TruthResult {
+                    matched: false,
+                    observed: std::collections::BTreeMap::new(),
+                })
+            },
+            || {
+                Err(Box::new(GhPrepareError::HelperFailed {
+                    program: "helper".to_owned(),
+                    status: Some(1),
+                    stderr: "service unavailable".to_owned(),
+                }) as Box<dyn std::error::Error>)
+            },
+            |_| true,
+            0.03,
+            0.01,
+            false,
+            &socket_path,
+        )
+        .expect("transient failures should time out normally");
+
+        assert!(outcome.timed_out);
+        assert!(!outcome.matched);
+        assert!(outcome.transient_errors >= 1);
+    }
+
+    #[test]
+    fn permanent_token_helper_failure_is_not_hidden_until_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let result = wait_for_condition(
+            |_| {
+                Ok(TruthResult {
+                    matched: false,
+                    observed: std::collections::BTreeMap::new(),
+                })
+            },
+            || {
+                Err(Box::new(GhPrepareError::HelperFailed {
+                    program: "helper".to_owned(),
+                    status: Some(1),
+                    stderr: "HTTP 401: bad credentials".to_owned(),
+                }) as Box<dyn std::error::Error>)
+            },
+            |_| true,
+            1.0,
+            0.01,
+            false,
+            &socket_path,
+        );
+
+        let error = result.expect_err("permanent helper failure should surface");
+        assert!(error.downcast_ref::<GhPrepareError>().is_some());
     }
 
     #[test]

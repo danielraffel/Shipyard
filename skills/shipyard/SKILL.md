@@ -920,6 +920,13 @@ requiredness lookup is not permission to use `mergeable` as a green proxy:
 mark the snapshot unknown and make the evaluator fail closed. State-only waits
 such as `--state merged` remain usable from the same snapshot.
 
+Long-lived `shipyard wait` ownership must survive brief token-helper and
+network preparation outages. Snapshot preparation retries only errors that are
+classified as transient, uses bounded backoff within the caller's existing
+overall timeout, and reports the retry count as `transient_errors`. Permanent
+credential, helper-output, and configuration failures still fail immediately;
+do not paper them over with an outer unbounded polling loop.
+
 GitHub App installation tokens can also be rejected by GitHub's GraphQL
 `createPullRequest` / `mergePullRequest` mutations even when the App token is
 otherwise the right auth source for inspection. PR creation first tries the
