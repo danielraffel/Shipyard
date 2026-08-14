@@ -52,8 +52,78 @@ class QueueRemovalGuardTests(unittest.TestCase):
     def test_input_file_mutation_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = pathlib.Path(directory) / "request.json"
-            request.write_text('{"query":"mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"}')
+            request.write_text(
+                r'{"query":"mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"}'
+            )
             self.assertEqual(self.run_guard(["api", "graphql", "--input", str(request)])[0], 1)
+
+    def test_input_file_decodes_escaped_mutation_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            request = pathlib.Path(directory) / "request.json"
+            request.write_text(
+                r'{"query":"mutation { dequeuePull\u0052equest(input:{id:\"x\"}) { clientMutationId } }"}'
+            )
+            self.assertEqual(self.run_guard(["api", "graphql", "--input", str(request)])[0], 1)
+
+    def test_graphql_endpoint_is_found_after_flags(self) -> None:
+        args = [
+            "api",
+            "--method",
+            "POST",
+            "graphql",
+            "-fquery=mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }",
+        ]
+        self.assertEqual(self.run_guard(args)[0], 1)
+
+    def test_graphql_stdin_bodies_fail_closed(self) -> None:
+        for args in (
+            ["api", "graphql", "--input", "-"],
+            ["api", "graphql", "--input=-"],
+            ["api", "graphql", "-Fquery=@-"],
+        ):
+            with self.subTest(args=args):
+                code, message = self.run_guard(args)
+                self.assertEqual(code, 1)
+                self.assertIn("stdin", message)
+
+    def test_endpoint_query_mutation_is_refused(self) -> None:
+        endpoint = (
+            "graphql?query=mutation%20%7B%20disablePullRequestAutoMerge"
+            "%28input:%7BpullRequestId:%22x%22%7D%29%20%7BclientMutationId%7D%20%7D"
+        )
+        self.assertEqual(self.run_guard(["api", endpoint])[0], 1)
+
+    def test_ambiguous_graphql_endpoint_spellings_fail_closed(self) -> None:
+        mutation = "query=mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"
+        for endpoint in ("%67raphql", "./graphql"):
+            with self.subTest(endpoint=endpoint):
+                code, message = self.run_guard(["api", endpoint, "-f", mutation])
+                self.assertEqual(code, 1)
+                self.assertIn("refusing unaudited", message)
+
+    def test_encoded_unrelated_rest_endpoint_is_allowed(self) -> None:
+        self.assertEqual(self.run_guard(["api", "repos/o/r/contents/a%20b"])[0], 0)
+
+    def test_unrelated_rest_input_body_is_not_parsed_as_graphql(self) -> None:
+        self.assertEqual(self.run_guard(["api", "repos/o/r/issues", "--input", "-"])[0], 0)
+
+    def test_endpoint_placeholder_with_removal_mutation_fails_closed(self) -> None:
+        args = [
+            "api",
+            "{owner}",
+            "-f",
+            "query=mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }",
+        ]
+        code, message = self.run_guard(args, GH_REPO="graphql/x")
+        self.assertEqual(code, 1)
+        self.assertIn("refusing unaudited", message)
+
+    def test_manual_override_allows_ambiguous_input_loudly(self) -> None:
+        code, message = self.run_guard(
+            ["api", "graphql", "--input", "-"], GHAPP_ALLOW_QUEUE_REMOVAL="1"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING", message)
 
     def test_compact_field_and_query_file_mutations_are_refused(self) -> None:
         mutation = "mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"
