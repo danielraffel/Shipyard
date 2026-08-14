@@ -174,6 +174,55 @@ class PrCloseGuardTests(unittest.TestCase):
             guard.CloseRequest(repo="o/r", pr=7),
         )
 
+    def test_rest_endpoint_accepts_leading_slash_and_query(self) -> None:
+        self.assertEqual(
+            guard.close_request(
+                ["api", "-X", "PATCH", "/repos/o/r/pulls/7?apiVersion=2022", "-f", "state=closed"]
+            ),
+            guard.CloseRequest(repo="o/r", pr=7),
+        )
+
+    def test_attached_short_options_are_recognized(self) -> None:
+        self.assertEqual(
+            guard.close_request(
+                ["api", "-XPATCH", "repos/o/r/pulls/7", "-fstate=closed"]
+            ),
+            guard.CloseRequest(repo="o/r", pr=7),
+        )
+
+    def test_flag_value_that_looks_like_endpoint_cannot_hide_real_endpoint(self) -> None:
+        self.assertEqual(
+            guard.close_request(
+                [
+                    "api",
+                    "-q",
+                    "graphql",
+                    "repos/o/r/pulls/7",
+                    "-XPATCH",
+                    "-fstate=closed",
+                ]
+            ),
+            guard.CloseRequest(repo="o/r", pr=7),
+        )
+
+    def test_typed_state_file_close_is_recognized_and_stdin_fails_closed(self) -> None:
+        with mock.patch("pathlib.Path.read_text", return_value="closed"):
+            self.assertEqual(
+                guard.close_request(
+                    ["api", "repos/o/r/pulls/7", "-XPATCH", "-Fstate=@/tmp/state"]
+                ),
+                guard.CloseRequest(repo="o/r", pr=7),
+            )
+        code, message, _ = self.run_guard(
+            ["api", "repos/o/r/pulls/7", "-XPATCH", "-Fstate=@-"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("stdin", message)
+        self.assertEqual(
+            guard.close_request(["pr", "close", "7", "-Ro/r"]),
+            guard.CloseRequest(repo="o/r", pr=7),
+        )
+
     def test_raw_rest_input_file_close_is_recognized(self) -> None:
         with mock.patch("pathlib.Path.read_text", return_value='{"state":"closed"}'):
             self.assertEqual(
@@ -215,6 +264,28 @@ class PrCloseGuardTests(unittest.TestCase):
         )
         self.assertEqual(code, 1)
         self.assertIn("closePullRequest", message)
+
+    def test_graphql_endpoint_is_recognized_after_flags(self) -> None:
+        code, message, _ = self.run_guard(
+            [
+                "api",
+                "-XPOST",
+                "graphql",
+                "-fquery=mutation { closePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("closePullRequest", message)
+
+    def test_graphql_stdin_body_fails_closed(self) -> None:
+        for args in (
+            ["api", "graphql", "--input", "-"],
+            ["api", "graphql", "-fquery=@-"],
+        ):
+            with self.subTest(args=args):
+                code, message, _ = self.run_guard(args)
+                self.assertEqual(code, 1)
+                self.assertIn("stdin", message)
 
     def test_raw_graphql_input_file_close_is_refused(self) -> None:
         mutation = (

@@ -31,46 +31,115 @@ class CloseRequest(NamedTuple):
 ApiJson = Callable[[str], dict[str, Any]]
 
 
-def option_value(args: list[str], names: set[str]) -> str | None:
-    for index, arg in enumerate(args):
-        if arg in names and index + 1 < len(args):
-            return args[index + 1]
-        for name in names:
-            prefix = f"{name}="
-            if arg.startswith(prefix):
-                return arg.removeprefix(prefix)
-    return None
-
-
-def field_values(args: list[str]) -> list[str]:
+def option_values(args: list[str], names: set[str]) -> list[str]:
     values: list[str] = []
-    names = {"-f", "-F", "--field", "--raw-field"}
     for index, arg in enumerate(args):
-        if arg in names and index + 1 < len(args):
-            values.append(args[index + 1])
-        elif any(arg.startswith(f"{name}=") for name in names):
-            values.append(arg.split("=", 1)[1])
+        for name in names:
+            if arg == name and index + 1 < len(args):
+                values.append(args[index + 1])
+                break
+            if name.startswith("--") and arg.startswith(f"{name}="):
+                values.append(arg.removeprefix(f"{name}="))
+                break
+            if len(name) == 2 and name.startswith("-") and arg.startswith(name) and len(arg) > 2:
+                values.append(arg[len(name) :].removeprefix("="))
+                break
     return values
 
 
+def option_value(args: list[str], names: set[str]) -> str | None:
+    values = option_values(args, names)
+    return values[0] if values else None
+
+
+def field_values(args: list[str]) -> list[str]:
+    return option_values(args, {"-f", "-F", "--field", "--raw-field"})
+
+
 def graphql_document(args: list[str]) -> str:
-    values = field_values(args)
-    for value in values:
+    documents: list[str] = []
+    for value in field_values(args):
+        if not value.startswith("query="):
+            continue
         query = value.removeprefix("query=")
-        if value.startswith("query=@"):
+        if query == "@-":
+            raise GuardError("cannot inspect a GraphQL body read from stdin")
+        if query.startswith("@"):
             try:
-                return pathlib.Path(query[1:]).read_text(encoding="utf-8")
-            except OSError:
-                return ""
-        if value.startswith("query="):
-            return query
+                documents.append(pathlib.Path(query[1:]).read_text(encoding="utf-8"))
+            except OSError as error:
+                raise GuardError(f"cannot inspect GraphQL query file: {error}") from error
+        else:
+            documents.append(query)
     path = option_value(args, {"--input"})
-    if path and path != "-":
+    if path == "-":
+        raise GuardError("cannot inspect a GraphQL body read from stdin")
+    if path:
         try:
-            return pathlib.Path(path).read_text(encoding="utf-8")
-        except OSError:
-            return ""
+            documents.append(pathlib.Path(path).read_text(encoding="utf-8"))
+        except OSError as error:
+            raise GuardError(f"cannot inspect GraphQL input file: {error}") from error
+    return "\n".join(documents)
+
+
+def api_endpoint(args: list[str]) -> str:
+    value_options = {
+        "--cache",
+        "-F",
+        "--field",
+        "-H",
+        "--header",
+        "--hostname",
+        "--input",
+        "-q",
+        "--jq",
+        "-X",
+        "--method",
+        "-p",
+        "--preview",
+        "-f",
+        "--raw-field",
+        "-t",
+        "--template",
+    }
+    skip_next = False
+    for arg in args[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in value_options:
+            skip_next = True
+            continue
+        if any(
+            (name.startswith("--") and arg.startswith(f"{name}="))
+            or (len(name) == 2 and arg.startswith(name) and len(arg) > 2)
+            for name in value_options
+        ):
+            continue
+        if arg.startswith("-"):
+            continue
+        endpoint = arg
+        if endpoint.startswith("https://api.github.com/"):
+            endpoint = endpoint.removeprefix("https://api.github.com/")
+        return endpoint.lstrip("/").split("?", 1)[0]
     return ""
+
+
+def typed_field_closes_pr(args: list[str]) -> bool:
+    for value in option_values(args, {"-F", "--field"}):
+        if not value.startswith("state="):
+            continue
+        state = value.removeprefix("state=")
+        if state == "@-":
+            raise GuardError("cannot inspect a PR state field read from stdin")
+        if state.startswith("@"):
+            try:
+                state = pathlib.Path(state[1:]).read_text(encoding="utf-8").strip()
+            except OSError as error:
+                raise GuardError(f"cannot inspect PR state field file: {error}") from error
+        if state.lower() == "closed":
+            return True
+    return False
 
 
 def parse_pr_number(value: str) -> int | None:
@@ -143,7 +212,8 @@ def close_request(args: list[str]) -> CloseRequest | None:
         )
 
     if len(args) >= 2 and args[0] == "api":
-        if args[1] == "graphql":
+        endpoint = api_endpoint(args)
+        if endpoint == "graphql":
             compact = "".join(graphql_document(args).split()).lower()
             if "closepullrequest(" in compact:
                 raise GuardError(
@@ -151,11 +221,13 @@ def close_request(args: list[str]) -> CloseRequest | None:
                 )
             return None
         method = (option_value(args, {"-X", "--method"}) or "GET").upper()
-        endpoint = next((arg for arg in args[1:] if arg.startswith("repos/")), "")
         match = re.fullmatch(r"repos/([^/]+/[^/]+)/(pulls|issues)/(\d+)", endpoint)
-        closes = any(value.lower() == "state=closed" for value in field_values(args))
-        closes = closes or input_closes_pr(args)
-        if method == "PATCH" and match and closes:
+        if method == "PATCH" and match:
+            closes = any(value.lower() == "state=closed" for value in field_values(args))
+            closes = closes or typed_field_closes_pr(args) or input_closes_pr(args)
+        else:
+            closes = False
+        if closes and match:
             return CloseRequest(
                 repo=normalize_repo(match.group(1)),
                 pr=int(match.group(3)),
