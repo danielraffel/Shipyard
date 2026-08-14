@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0884"></a>
+## [0.88.4] - 2026-08-14
+
+- fix/steward run attempt fence 20260814 ([#415](https://github.com/danielraffel/Shipyard/pull/415))
+
 <a id="v0883"></a>
 ## [0.88.3] - 2026-08-14
 
@@ -835,6 +840,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.88.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.4
 [0.88.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.3
 [0.88.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.2
 [0.88.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.1
