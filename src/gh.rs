@@ -1153,13 +1153,16 @@ mod tests {
         write_executable(
             &helper,
             &format!(
-                "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > '{}'\nprintf token\n",
+                "#!/bin/sh\nsleep 120 </dev/null >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > '{}'\nprintf token\n",
                 descendant_pid.display()
             ),
         );
         let mut command = Command::new(&helper);
 
-        let output = run_helper_with_timeout(&mut command, "token-helper", Duration::from_secs(10))
+        // Full macOS CI runs many process-heavy tests concurrently. Keep this
+        // boundary comfortably above scheduler latency while the descendant's
+        // 120-second lifetime still proves cleanup rather than natural exit.
+        let output = run_helper_with_timeout(&mut command, "token-helper", Duration::from_secs(30))
             .expect("helper succeeds");
         let pid = std::fs::read_to_string(&descendant_pid).expect("descendant pid");
         let pid = pid.trim();
