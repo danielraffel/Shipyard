@@ -87,7 +87,7 @@ post is the canonical reference for *why* each of these settings
 matters, and Shipyard packages the *how* into a one-command profile
 switch so you don't have to figure it out from first principles.
 
-[Pulp](https://github.com/danielraffel/pulp) is the first project to
+[Pulp](https://github.com/Generous-Corp/pulp) is the first project to
 adopt Shipyard's governance profile system. Pulp runs on the `solo`
 profile because it has a single maintainer today; switching to `multi`
 would be a single-line edit to `[project].profile` in

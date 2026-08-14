@@ -74,7 +74,7 @@ dash).
 ## Register
 
 ```bash
-shipyard runner register --repo danielraffel/pulp --count 3 \
+shipyard runner register --repo Generous-Corp/pulp --count 3 \
   --ci-root /Volumes/Workshop/ci/pulp [--machine-tag studio] [--labels a,b,c] [--dry-run]
 ```
 
@@ -121,7 +121,7 @@ without downloading, configuring, or starting anything.
 
 ```bash
 shipyard runner list                       # repos discovered from local dirs + cwd
-shipyard runner list --repo danielraffel/pulp [--repo …] [--all-repos]
+shipyard runner list --repo Generous-Corp/pulp [--repo …] [--all-repos]
 ```
 
 Renders the live pool grouped by machine tag, pulled straight from GitHub (so a
