@@ -7,7 +7,7 @@ use super::{
     authoritative_head_still_superseded, classify_pr, coalescing_reason_authorizes,
     current_pull_request_heads, exact_run_still_queued, merge_group_pr_number, mutate_pr,
     opted_out_pull_requests, plan_capacity_preemptions, plan_run_coalescing,
-    pull_request_is_managed, reconcile_recovery_signal, record_audit,
+    pull_request_is_managed, reconcile_management_label, reconcile_recovery_signal, record_audit,
     revalidate_coalescing_cancellation,
 };
 
@@ -156,6 +156,23 @@ pub(super) fn apply_pr_plans(
             } else {
                 (None, None)
             };
+            if args.apply && error.is_none() {
+                let (management_mutation, management_error) = reconcile_management_label(
+                    mutation_context
+                        .as_ref()
+                        .expect("apply mode requires mutation control"),
+                    pr,
+                    policy,
+                    &decision,
+                    ledger,
+                );
+                if let Some(management_mutation) = management_mutation {
+                    mutation = Some(mutation.map_or(management_mutation.clone(), |prior| {
+                        format!("{prior},{management_mutation}")
+                    }));
+                }
+                error = management_error;
+            }
             if args.apply && error.is_none() {
                 let (recovery_mutation, recovery_error) = reconcile_recovery_signal(
                     mutation_context
