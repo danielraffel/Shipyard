@@ -3,9 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0874"></a>
-## [0.88.0]
+<a id="v0880"></a>
+## [0.88.0] - 2026-08-14
 
+- feat: add durable exact-head steward handoff ([#410](https://github.com/danielraffel/Shipyard/pull/410))
+
+<a id="v0874"></a>
 ## [0.87.4] - 2026-08-13
 
 - fix(queue): guard exact-head removal authority ([#408](https://github.com/danielraffel/Shipyard/pull/408))
@@ -816,6 +819,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.88.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.0
 [0.87.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.4
 [0.87.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.3
 [0.87.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.2
