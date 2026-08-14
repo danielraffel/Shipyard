@@ -3,6 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0910"></a>
+## [0.91.0] - 2026-08-14
+
+- test(queue): preserve admission for unrelated pull requests ([#401](https://github.com/danielraffel/Shipyard/pull/401))
+- fix(github): guard PR close integration proof ([#409](https://github.com/danielraffel/Shipyard/pull/409))
+- chore: point framework references at Generous-Corp/pulp after the org migration ([#378](https://github.com/danielraffel/Shipyard/pull/378))
+
 <a id="v0903"></a>
 ## [0.90.3] - 2026-08-14
 
@@ -865,6 +872,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.91.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.91.0
 [0.90.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.3
 [0.90.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.2
 [0.90.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.90.1
