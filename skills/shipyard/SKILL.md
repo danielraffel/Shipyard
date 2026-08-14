@@ -686,7 +686,9 @@ REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
 queue or manual merge instead. Apply mode is restricted by central mutation
 authority, durable write-ahead intent, and live revalidation immediately before
-every GitHub write. The built-in capacity preemption preset applies only to
+every GitHub write. Transient retry limits are also fenced against GitHub's
+durable `run_attempt`, so losing a controller cache after an accepted rerun
+cannot reset the budget. The built-in capacity preemption preset applies only to
 explicitly advisory Pulp workflows; required workflows and unknown repositories
 are disabled because GitHub cannot bind a cancellation to an atomic job-state
 snapshot.
