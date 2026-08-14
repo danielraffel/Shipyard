@@ -182,6 +182,14 @@ class PrCloseGuardTests(unittest.TestCase):
             guard.CloseRequest(repo="o/r", pr=7),
         )
 
+    def test_rest_state_in_endpoint_query_is_recognized(self) -> None:
+        self.assertEqual(
+            guard.close_request(
+                ["api", "-XPATCH", "repos/o/r/pulls/7?state=%63losed"]
+            ),
+            guard.CloseRequest(repo="o/r", pr=7),
+        )
+
     def test_attached_short_options_are_recognized(self) -> None:
         self.assertEqual(
             guard.close_request(
@@ -272,6 +280,17 @@ class PrCloseGuardTests(unittest.TestCase):
                 "-XPOST",
                 "graphql",
                 "-fquery=mutation { closePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("closePullRequest", message)
+
+    def test_graphql_mutation_in_endpoint_query_is_refused(self) -> None:
+        code, message, _ = self.run_guard(
+            [
+                "api",
+                "-XPOST",
+                "graphql?query=mutation%20%7BclosePullRequest(input:%7BpullRequestId:%22x%22%7D)%7BclientMutationId%7D%7D",
             ]
         )
         self.assertEqual(code, 1)

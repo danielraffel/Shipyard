@@ -11,7 +11,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from typing import Any, NamedTuple
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 
 class GuardError(RuntimeError):
@@ -26,6 +26,11 @@ class CloseRequest(NamedTuple):
     repo: str
     pr: int
     allow_non_pr: bool = False
+
+
+class ApiTarget(NamedTuple):
+    path: str
+    query: dict[str, list[str]]
 
 
 ApiJson = Callable[[str], dict[str, Any]]
@@ -82,7 +87,7 @@ def graphql_document(args: list[str]) -> str:
     return "\n".join(documents)
 
 
-def api_endpoint(args: list[str]) -> str:
+def api_target(args: list[str]) -> ApiTarget:
     value_options = {
         "--cache",
         "-F",
@@ -118,11 +123,13 @@ def api_endpoint(args: list[str]) -> str:
             continue
         if arg.startswith("-"):
             continue
-        endpoint = arg
-        if endpoint.startswith("https://api.github.com/"):
-            endpoint = endpoint.removeprefix("https://api.github.com/")
-        return endpoint.lstrip("/").split("?", 1)[0]
-    return ""
+        parts = urlsplit(arg)
+        path = parts.path
+        if parts.scheme or parts.netloc:
+            if parts.scheme != "https" or parts.netloc != "api.github.com":
+                return ApiTarget("", {})
+        return ApiTarget(path.lstrip("/"), parse_qs(parts.query, keep_blank_values=True))
+    return ApiTarget("", {})
 
 
 def typed_field_closes_pr(args: list[str]) -> bool:
@@ -212,9 +219,11 @@ def close_request(args: list[str]) -> CloseRequest | None:
         )
 
     if len(args) >= 2 and args[0] == "api":
-        endpoint = api_endpoint(args)
+        target = api_target(args)
+        endpoint = target.path
         if endpoint == "graphql":
-            compact = "".join(graphql_document(args).split()).lower()
+            document = "\n".join([graphql_document(args), *target.query.get("query", [])])
+            compact = "".join(document.split()).lower()
             if "closepullrequest(" in compact:
                 raise GuardError(
                     "raw closePullRequest mutation cannot bind integrated proof to a PR number"
@@ -223,7 +232,9 @@ def close_request(args: list[str]) -> CloseRequest | None:
         method = (option_value(args, {"-X", "--method"}) or "GET").upper()
         match = re.fullmatch(r"repos/([^/]+/[^/]+)/(pulls|issues)/(\d+)", endpoint)
         if method == "PATCH" and match:
-            closes = any(value.lower() == "state=closed" for value in field_values(args))
+            closes = any(
+                value.lower() == "state=closed" for value in field_values(args)
+            ) or any(value.lower() == "closed" for value in target.query.get("state", []))
             closes = closes or typed_field_closes_pr(args) or input_closes_pr(args)
         else:
             closes = False
