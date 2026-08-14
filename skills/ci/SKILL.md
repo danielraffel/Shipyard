@@ -304,6 +304,11 @@ directly to `codesign`. Its `always()` cleanup deletes the ephemeral keychain.
 Never parse `security list-keychains` with line-based quote stripping or make a
 CI signing keychain the persistent runner user's default.
 
+`codesign --keychain` still requires that identity keychain to appear in the
+calling process's user search list. Configure that list under the release
+step's isolated temporary `HOME` and pass the same `HOME` only to `codesign`;
+never add the ephemeral keychain to the persistent runner user's search list.
+
 ### External contribution execution
 
 Never route contributor-controlled revisions through Shipyard's normal local,

@@ -200,14 +200,17 @@ jobs:
           fi
           KEYCHAIN="${RUNNER_TEMP}/shipyard-ci-sign-${GITHUB_RUN_ID}.keychain-db"
           KEYCHAIN_STATE="${RUNNER_TEMP}/shipyard-ci-sign-${GITHUB_RUN_ID}.json"
+          SIGNING_HOME="${RUNNER_TEMP}/shipyard-ci-home-${GITHUB_RUN_ID}"
           CERT_PATH="${RUNNER_TEMP}/shipyard-cert-${GITHUB_RUN_ID}.p12"
           {
             echo "SHIPYARD_SIGNING_KEYCHAIN=$KEYCHAIN"
             echo "SHIPYARD_SIGNING_KEYCHAIN_STATE=$KEYCHAIN_STATE"
+            echo "SHIPYARD_SIGNING_HOME=$SIGNING_HOME"
           } >> "$GITHUB_ENV"
           python3 scripts/ci_macos_signing_keychain.py prepare \
             --keychain "$KEYCHAIN" \
-            --state "$KEYCHAIN_STATE"
+            --state "$KEYCHAIN_STATE" \
+            --signing-home "$SIGNING_HOME"
           echo "$SIGN_P12_B64" | base64 -d > "$CERT_PATH"
           security import "$CERT_PATH" -k "$KEYCHAIN" \
             -P "$SIGN_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
@@ -242,7 +245,9 @@ jobs:
         run: |
           KEYCHAIN="${RUNNER_TEMP}/shipyard-ci-sign-${GITHUB_RUN_ID}.keychain-db"
           KEYCHAIN_STATE="${RUNNER_TEMP}/shipyard-ci-sign-${GITHUB_RUN_ID}.json"
+          SIGNING_HOME="${RUNNER_TEMP}/shipyard-ci-home-${GITHUB_RUN_ID}"
           rm -f "${RUNNER_TEMP}/shipyard-cert-${GITHUB_RUN_ID}.p12"
           python3 scripts/ci_macos_signing_keychain.py restore \
             --keychain "$KEYCHAIN" \
-            --state "$KEYCHAIN_STATE"
+            --state "$KEYCHAIN_STATE" \
+            --signing-home "$SIGNING_HOME"
