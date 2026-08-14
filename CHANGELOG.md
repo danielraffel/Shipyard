@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0880"></a>
+## [0.88.1]
+
 ## [0.88.0] - 2026-08-14
 
 - feat: add durable exact-head steward handoff ([#410](https://github.com/danielraffel/Shipyard/pull/410))

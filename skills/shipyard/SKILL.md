@@ -999,6 +999,20 @@ The destructive counterpart (actually invoking `rescue --rerun-failed` + arming
 auto-merge automatically, behind a default-off flag) is a planned follow-up; the
 current behavior is diagnostic-only.
 
+The standalone `shipyard rescue` operator is replacement-first. Before it can
+cancel a queued PR/merge-group run, local workflow discovery must prove that the
+workflow declares `workflow_dispatch` and that every required input is either
+resolved by the dispatch plan or safely synthesized from the PR number
+(`pr`, `pr_number`, or `pull_request_number`). Shipyard submits the replacement
+first and cancels only after GitHub accepts that dispatch. A workflow without a
+dispatch trigger, an unknown required input, or a rejected dispatch leaves the
+original run untouched. If the later cancellation fails, report the duplicate
+work as an error; never roll back by cancelling the accepted replacement.
+
+Dry-run must use the same static dispatchability/input checks as apply. Preserve
+the negative control that a rejected dispatch produces no cancel call and the
+positive control that the Vellum-style PR input is sent before cancellation.
+
 ## Validation Gates
 
 **Before `shipyard pr` / `shipyard ship`, run the *exact* chain the `mac`
