@@ -514,18 +514,19 @@ operation for push, schedule, tag, or `workflow_dispatch` runs.
 What it does:
 1. Resolves the PR's head branch (skipped under `--all-stuck`).
 2. Lists queued workflow runs and filters to (a) the PR's branch and (b) ones older than `--threshold` (default `30m`).
-3. With `--rerun-failed`, additionally pulls `status=completed` runs whose conclusion is `cancelled`, `failure`, or `timed_out` on that branch (#345 — previously cancelled-only, so a plain failed leg was never a candidate). Once a replacement dispatch is accepted, these get `gh run rerun --failed` and the re-armed original is cancelled.
-4. For each candidate, proves that its workflow declares `workflow_dispatch`, resolves every required dispatch input, and submits the replacement **before** cancelling the old run. Known PR-number inputs (`pr`, `pr_number`, and `pull_request_number`) are filled from the PR argument. A workflow with no dispatch trigger, an unknown required input, or a rejected dispatch is reported as `skipped-no-plan`/`failed` and its original run is preserved. **Provider resolution is kind-aware when `--to` is omitted (#345):** a wedged *stuck-queued* run falls back to `github-hosted` (move off the stuck local runner), while a re-run *failed* run RE-RESOLVES the provider (config/default — local-first with overflow) so a leg that overflowed to a GPU-less hosted runner can return to a real local runner. An explicit `--to <provider>` forces the destination for any candidate.
-5. Emits a per-run summary (`applied`, `rerun+applied`, `planned`, `skipped-completed`, `skipped-no-plan`, `failed`) with a top-level `event=cloud.rescue` JSON envelope under `--json`.
+3. With `--rerun-failed`, additionally pulls `status=completed` runs whose conclusion is `cancelled`, `failure`, or `timed_out` on that branch (#345 — previously cancelled-only, so a plain failed leg was never a candidate). Once a replacement dispatch is accepted, the terminal original remains untouched. Never re-arm a terminal run merely to cancel it: GitHub can accept the rerun before it becomes cancellable, producing HTTP 409 and duplicate work.
+4. For each candidate, proves that its workflow declares `workflow_dispatch`, resolves every required dispatch input, and submits the replacement **before** cancelling a still-queued old run. Terminal originals are not mutated. Known PR-number inputs (`pr`, `pr_number`, and `pull_request_number`) are filled from the PR argument. A workflow with no dispatch trigger, an unknown required input, or a rejected dispatch is reported as `skipped-no-plan`/`failed` and its original run is preserved. **Provider resolution is kind-aware when `--to` is omitted (#345):** a wedged *stuck-queued* run falls back to `github-hosted` (move off the stuck local runner), while a re-run *failed* run RE-RESOLVES the provider (config/default — local-first with overflow) so a leg that overflowed to a GPU-less hosted runner can return to a real local runner. An explicit `--to <provider>` forces the destination for any candidate.
+5. Emits a per-run summary (`applied`, `replacement-applied`, `planned`, `skipped-completed`, `skipped-no-plan`, `failed`) with a top-level `event=cloud.rescue` JSON envelope under `--json`.
 
 **Do not reach for `runner-watchdog.sh --fix` instead of `shipyard rescue`.**
 The watchdog's cancellation registers as required-check `failure` on the PR
 without redispatching — it makes the wedge look terminal to branch
 protection. `shipyard rescue` is the safe primitive because it fail-closes
 before cancellation and uses a replacement-first transaction. A rejected or
-unconstructable dispatch leaves the original run untouched; a cancellation
-failure after an accepted replacement can create duplicate work, but never
-zero work. There are no destructive ops on the runner host itself.
+unconstructable dispatch leaves the original run untouched; a queued-run
+cancellation failure after an accepted replacement can create duplicate work,
+but never zero work. Terminal originals are never re-armed. There are no
+destructive ops on the runner host itself.
 
 `shipyard rescue` is the discoverable surface for what was previously a
 5-step recipe (`gh api` + `cloud handoff list-stuck` + per-run

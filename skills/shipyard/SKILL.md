@@ -1008,6 +1008,14 @@ first and cancels only after GitHub accepts that dispatch. A workflow without a
 dispatch trigger, an unknown required input, or a rejected dispatch leaves the
 original run untouched. If the later cancellation fails, report the duplicate
 work as an error; never roll back by cancelling the accepted replacement.
+For a completed cancelled/failed/timed-out candidate selected by
+`--rerun-failed`, the accepted replacement is the entire transaction: leave the
+terminal original untouched. Re-arming it merely to cancel it races GitHub's
+queued transition, can return HTTP 409, and can create duplicate work.
+
+Manual `shipyard cancel <job> --reason <why>` records the supplied reason on
+the durable job. If omitted, Shipyard still records command source, host, agent,
+and PID; a reasonless terminal cancellation is never valid evidence.
 
 Dry-run must use the same static dispatchability/input checks as apply. Preserve
 the negative control that a rejected dispatch produces no cancel call and the

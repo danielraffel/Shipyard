@@ -28,8 +28,8 @@ enum RunOutcome {
     Planned,
     /// Cancelled + redispatched on the new provider.
     Applied,
-    /// Re-armed via `gh run rerun --failed`, then handed off.
-    RerunAndApplied,
+    /// A fresh replacement was accepted for a terminal failed/cancelled run.
+    ReplacementApplied,
     /// Skipped: completed/cancelled run encountered without `--rerun-failed`.
     SkippedCompleted,
     /// Skipped: rescue could not plan a dispatch (e.g. workflow not found locally).
@@ -43,7 +43,7 @@ impl RunOutcome {
         match self {
             Self::Planned => "planned",
             Self::Applied => "applied",
-            Self::RerunAndApplied => "rerun+applied",
+            Self::ReplacementApplied => "replacement-applied",
             Self::SkippedCompleted => "skipped-completed",
             Self::SkippedNoPlan(_) => "skipped-no-plan",
             Self::Failed(_) => "failed",
@@ -324,17 +324,12 @@ fn process_candidate(
                     "replacement workflow_dispatch failed; original run preserved: {error}"
                 ));
             }
-            if let Err(error) = actions.rerun_failed_run(repo_slug, run.database_id) {
-                return RunOutcome::Failed(format!(
-                    "replacement accepted but rerun --failed failed; original run preserved: {error}"
-                ));
-            }
-            if let Err(error) = actions.cancel_workflow_run(repo_slug, run.database_id) {
-                return RunOutcome::Failed(format!(
-                    "replacement accepted but original rerun could not be cancelled: {error}"
-                ));
-            }
-            RunOutcome::RerunAndApplied
+            // The candidate is already terminal. Re-arming it solely so it can
+            // be cancelled creates a race: GitHub accepts rerun-failed before
+            // the rerun reaches queued state, so an immediate cancel returns
+            // HTTP 409 and leaves duplicate work. The accepted replacement is
+            // the entire recovery transaction; leave terminal history alone.
+            RunOutcome::ReplacementApplied
         }
         CandidateKind::QueuedStuck => {
             if args.dry_run {
@@ -938,6 +933,52 @@ cache_ttl_seconds = 300
         assert!(lines[0].starts_with("workflow run freeze.yml"));
         assert!(lines[0].contains("-f pr_number=7507"));
         assert!(lines[1].contains("repos/owner/repo/actions/runs/42/cancel"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_run_dispatches_one_replacement_without_rearming_original() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cfg, actions, log) = scripted_actions(
+            &temp,
+            "case \"$1 $2\" in\n  \"workflow run\") exit 0 ;;\n  \"run rerun\"|\"api -X\") printf 'unexpected original mutation\\n' >&2; exit 9 ;;\nesac\nexit 2",
+        );
+        let mut workflows = BTreeMap::new();
+        workflows.insert("version".to_owned(), workflow("version.yml", true, &[]));
+        let mut run = queued_run(
+            42,
+            "feat/x",
+            "2026-05-13T10:00:00Z",
+            "completed",
+            Some("cancelled"),
+        );
+        run.path = ".github/workflows/version.yml".to_owned();
+        let candidate = Candidate {
+            kind: CandidateKind::CompletedRerunnable,
+            run,
+        };
+        let args = RescueArgs {
+            pr: Some(7507),
+            all_stuck: false,
+            provider: None,
+            rerun_failed: true,
+            dry_run: false,
+            threshold: "30m".to_owned(),
+            repo: Some("owner/repo".to_owned()),
+        };
+
+        let outcome =
+            process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
+
+        assert_eq!(outcome, RunOutcome::ReplacementApplied);
+        let calls = std::fs::read_to_string(log).expect("gh log");
+        let lines = calls.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            1,
+            "terminal original must remain untouched: {calls}"
+        );
+        assert!(lines[0].starts_with("workflow run version.yml"));
     }
 
     #[test]
