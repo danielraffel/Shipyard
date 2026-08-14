@@ -131,8 +131,19 @@ class QueueRemovalGuardTests(unittest.TestCase):
             stdout='{"nameWithOwner":"o/r"}\n',
             stderr="",
         )
-        with mock.patch.object(guard.subprocess, "run", return_value=completed):
+        with mock.patch.object(guard.subprocess, "run", return_value=completed) as run:
             self.assertEqual(self.run_guard(["api", "repos/{owner}/{repo}"])[0], 0)
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_repository_placeholder_resolution_timeout_fails_closed(self) -> None:
+        with mock.patch.object(
+            guard.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["gh", "repo", "view"], 30),
+        ):
+            code, message = self.run_guard(["api", "repos/{owner}/{repo}"])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot resolve current repository identity", message)
 
     def test_manual_override_allows_ambiguous_input_loudly(self) -> None:
         code, message = self.run_guard(

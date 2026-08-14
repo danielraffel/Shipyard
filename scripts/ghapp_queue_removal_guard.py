@@ -146,8 +146,9 @@ def current_repo_identity() -> tuple[str, str]:
             check=True,
             capture_output=True,
             text=True,
+            timeout=30,
         ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError) as error:
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         raise GuardError(f"cannot resolve current repository identity: {error}") from error
     try:
         repo = json.loads(output).get("nameWithOwner")
