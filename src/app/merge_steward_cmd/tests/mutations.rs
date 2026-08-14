@@ -981,6 +981,50 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
     assert!(!temp.path().join("state/ship").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, r#"echo "unexpected mutation: $*" >&2; exit 90"#);
+    let mut held = ready_pr();
+    held.node_id = "PR_held".to_owned();
+    held.fact.number = 41;
+    held.fact.labels.push("steward:skip".to_owned());
+    let eligible = ready_pr();
+    let mut observation = observation_for(held, true);
+    observation.prs.push(eligible);
+    let args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        managed_label: "steward:managed".to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        coalesce: true,
+        preempt_capacity: true,
+        max_preemptions_per_head: 1,
+        apply: false,
+        ledger: None,
+    };
+
+    let (reports, failed) = apply_pr_plans(
+        &actions,
+        &args,
+        &observation,
+        &queue_policy(),
+        &temp.path().join("ledger.json"),
+        &mut StewardLedger::default(),
+        None,
+    );
+
+    assert!(!failed);
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[0].number, 41);
+    assert_eq!(reports[0].decision, StewardDecision::OptedOut);
+    assert_eq!(reports[1].number, 42);
+    assert_eq!(reports[1].decision, StewardDecision::ArmMergeQueue);
+}
+
 #[test]
 fn disabled_preemption_ignores_preemption_only_observation_errors() {
     let temp = tempfile::tempdir().expect("temp");

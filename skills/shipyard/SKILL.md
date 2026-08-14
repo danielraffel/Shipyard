@@ -843,6 +843,12 @@ planner reads `.tartci/<name>.toml`, `.shipyard/ci-profiles/<name>.toml`, or
 variables that would route each lane. It is intentionally read-only; live
 capacity resolution and variable writes happen outside this command.
 
+When one routing PR needs an admission hold, first remove any existing queue
+entry or native auto-merge request and confirm that removal, then add the
+configured opt-out label. The label prevents the steward from re-admitting the
+PR but does not disarm admission that was already active. Do not serialize
+unrelated PRs with a repository-wide hold for this case.
+
 ## Supervised Subprocess Marker (issue #266)
 
 Every `git` / `gh` child process spawned by the supervised

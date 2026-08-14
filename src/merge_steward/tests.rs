@@ -81,22 +81,6 @@ fn queued_entry_is_authority_even_when_auto_merge_request_is_null() {
 }
 
 #[test]
-fn routing_readiness_hold_is_scoped_to_labeled_pr() {
-    let mut held = green_pr();
-    held.labels.push("shipyard:no-auto-merge".to_owned());
-    assert_eq!(
-        classify_pr(&held, &queue_policy(), &BTreeMap::new()),
-        StewardDecision::OptedOut
-    );
-
-    // A separate eligible PR remains admissible while the routing PR is held.
-    assert_eq!(
-        classify_pr(&green_pr(), &queue_policy(), &BTreeMap::new()),
-        StewardDecision::ArmMergeQueue
-    );
-}
-
-#[test]
 fn ignores_advisory_failure_when_required_context_is_green() {
     let mut pr = green_pr();
     pr.checks.push(StewardCheck {
