@@ -6,8 +6,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 <a id="v0882"></a>
 ## [0.88.2] - 2026-08-14
 
-- fix(rescue): keep terminal originals terminal after replacement dispatch
-- fix(queue): record source and actor metadata for every manual cancellation
+- fix: make rescue replacement terminal-safe ([#413](https://github.com/danielraffel/Shipyard/pull/413))
 
 <a id="v0881"></a>
 ## [0.88.1] - 2026-08-14
@@ -831,6 +830,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.88.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.2
 [0.88.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.1
 [0.88.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.88.0
 [0.87.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.87.4
