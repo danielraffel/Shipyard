@@ -46,8 +46,7 @@
         "scripts/test_*.py",
         "tools/sandbox-e2e/**"
       ],
-      "auto_apply_patch": true,
-      "changelog": "CHANGELOG.md"
+      "auto_apply_patch": true
     },
 
     "plugin": {
