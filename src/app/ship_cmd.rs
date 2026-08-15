@@ -1364,11 +1364,13 @@ mod tests {
 
     use toml::Table;
 
+    #[cfg(unix)]
+    use super::run_pr_provenance_hook;
     use super::{
         SHIP_EXIT_MERGE_CLIENT_DEFECT, ShipCommandArgs, ShipInvocation, ShipRenderState,
         configured_pr_provenance_hook, green_not_merged, render_green_not_merged,
         render_green_not_merged_client_defect, render_green_not_merged_flaky,
-        render_green_not_merged_head_superseded, run_pr_provenance_hook, ship_command,
+        render_green_not_merged_head_superseded, ship_command,
     };
     use crate::app::cli::MergeResult;
     #[cfg(unix)]
