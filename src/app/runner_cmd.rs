@@ -221,6 +221,25 @@ pub(super) fn runner_command<W: Write>(
             json,
             stdout,
         ),
+        RunnerCommand::AdmissionClean {
+            repo,
+            base,
+            labels,
+            apply,
+        } => super::merge_steward_cmd::admission_clean_command(
+            &super::merge_steward_cmd::AdmissionCleanArgs {
+                repo,
+                base,
+                labels,
+                apply,
+            },
+            cwd,
+            mode,
+            runtime_paths,
+            &actions,
+            json,
+            stdout,
+        ),
         RunnerCommand::StewardHandoff {
             repo,
             pr,

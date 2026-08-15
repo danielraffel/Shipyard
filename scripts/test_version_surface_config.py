@@ -31,6 +31,11 @@ class VersionSurfaceConfigTests(unittest.TestCase):
             version_bump_check._matches_any("scripts/versioning.json", patterns)
         )
 
+    def test_tag_managed_changelog_has_no_pre_tag_version_stub(self) -> None:
+        config = json.loads((ROOT / "scripts/versioning.json").read_text())
+
+        self.assertNotIn("changelog", config["surfaces"]["cli"])
+
 
 if __name__ == "__main__":
     unittest.main()

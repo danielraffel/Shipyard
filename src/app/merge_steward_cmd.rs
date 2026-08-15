@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::CliFailure;
 use crate::cloud::GitHubActions;
 use crate::identity::RuntimeMode;
 use crate::merge_queue_control::{
-    DurableMutationIntent, MergeQueueMutationGuard, lock_is_contended,
+    DurableMutationIntent, MergeQueueMutationGuard, authority_status, lock_is_contended,
 };
 use crate::merge_steward::{
     CapacityPreemptionPolicy, QueueFrontPressure, RequiredCheck, RunCancellation,
@@ -42,6 +42,13 @@ pub(super) struct StewardCommandArgs {
     pub(super) max_preemptions_per_head: u32,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
+}
+
+pub(super) struct AdmissionCleanArgs {
+    pub(super) repo: String,
+    pub(super) base: String,
+    pub(super) labels: Vec<String>,
+    pub(super) apply: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +230,467 @@ mod handoff;
 pub(crate) use handoff::{StewardHandoffArgs, steward_handoff_command};
 mod recovery;
 use recovery::{reconcile_management_label, reconcile_recovery_signal};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionVerdict {
+    Admit,
+    Defer,
+    Error,
+}
+
+impl AdmissionVerdict {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Defer => "defer",
+            Self::Error => "error",
+        }
+    }
+
+    fn exit_code(self) -> ExitCode {
+        match self {
+            Self::Admit => ExitCode::SUCCESS,
+            Self::Defer => ExitCode::from(3),
+            Self::Error => ExitCode::from(1),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_admission_verdict<W: Write>(
+    stdout: &mut W,
+    json_output: bool,
+    verdict: AdmissionVerdict,
+    reason: &str,
+    repo: &str,
+    base: &str,
+    labels: &[String],
+    blocker_run_ids: &[u64],
+) -> Result<ExitCode, CliFailure> {
+    let payload = json!({
+        "schema_version": 1,
+        "command": "runner:admission-clean",
+        "verdict": verdict.label(),
+        "reason": reason,
+        "repo": repo,
+        "base": base,
+        "labels": labels,
+        "observed_at": Utc::now().to_rfc3339(),
+        "blocker_run_ids": blocker_run_ids,
+    });
+    if json_output {
+        serde_json::to_writer(&mut *stdout, &payload)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        writeln!(stdout).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        writeln!(stdout, "{}: {reason}", verdict.label())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if !blocker_run_ids.is_empty() {
+            writeln!(stdout, "blocker runs: {blocker_run_ids:?}")
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
+    Ok(verdict.exit_code())
+}
+
+fn normalize_admission_target(
+    args: &AdmissionCleanArgs,
+) -> Result<(String, String, Vec<String>), CliFailure> {
+    let Some((owner, name)) = args.repo.split_once('/') else {
+        return Err(CliFailure::new(2, "--repo must be an owner/repo slug"));
+    };
+    if owner.is_empty()
+        || name.is_empty()
+        || name.contains('/')
+        || !owner
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || value == '-')
+        || !name
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '_' | '-'))
+    {
+        return Err(CliFailure::new(2, "--repo must be an owner/repo slug"));
+    }
+    if args.base.is_empty()
+        || args.base.starts_with('/')
+        || args.base.ends_with('/')
+        || args.base.contains("..")
+        || !args
+            .base
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '_' | '-' | '/'))
+    {
+        return Err(CliFailure::new(2, "--base is not a valid branch name"));
+    }
+    if args.labels.is_empty() || args.labels.len() > 100 {
+        return Err(CliFailure::new(
+            2,
+            "--labels must contain 1..100 comma-separated labels",
+        ));
+    }
+    let mut labels = Vec::with_capacity(args.labels.len());
+    let mut seen = BTreeSet::new();
+    for raw in &args.labels {
+        let label = raw.trim().to_ascii_lowercase();
+        if label.is_empty() || label.len() > 100 || !seen.insert(label.clone()) {
+            return Err(CliFailure::new(
+                2,
+                "--labels must be non-empty, unique, and at most 100 bytes each",
+            ));
+        }
+        labels.push(label);
+    }
+    labels.sort();
+    if !labels.iter().any(|label| label == "self-hosted") {
+        return Err(CliFailure::new(
+            2,
+            "--labels must include the self-hosted label",
+        ));
+    }
+    Ok((args.repo.clone(), args.base.clone(), labels))
+}
+
+fn job_can_claim_runner(job: &StewardJob, runner_labels: &BTreeSet<String>) -> bool {
+    if !job.status.eq_ignore_ascii_case("queued") || job.labels.is_empty() {
+        return false;
+    }
+    job.labels
+        .iter()
+        .all(|label| runner_labels.contains(&label.to_ascii_lowercase()))
+}
+
+fn admission_candidates(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    labels: &[String],
+) -> Result<Vec<RunCancellation>, String> {
+    let current_heads = current_pull_request_heads(&observation.prs);
+    let mut excluded = opted_out_pull_requests(&observation.prs, "shipyard:no-auto-merge");
+    excluded.extend(
+        observation
+            .prs
+            .iter()
+            .filter(|pr| !pull_request_is_managed(pr, MANAGED_LABEL, HANDOFF_CONTEXT))
+            .map(|pr| pr.fact.number),
+    );
+    let candidates = plan_run_coalescing(
+        &observation.runs,
+        &current_heads,
+        &observation.merge_group_heads,
+        &excluded,
+    );
+    if candidates.len() > 50 {
+        return Err("more than 50 superseded runs require admission inspection".to_owned());
+    }
+    let runner_labels = labels.iter().cloned().collect::<BTreeSet<_>>();
+    let mut compatible = Vec::new();
+    for candidate in candidates {
+        let run = observation
+            .runs
+            .iter()
+            .find(|run| run.id == candidate.run_id)
+            .ok_or_else(|| format!("planned run {} disappeared", candidate.run_id))?;
+        let jobs = fetch_run_jobs(actions, &observation.repo, run.id)?;
+        if jobs
+            .iter()
+            .any(|job| job_can_claim_runner(job, &runner_labels))
+        {
+            compatible.push(candidate);
+        }
+    }
+    compatible.sort_unstable_by_key(|candidate| candidate.run_id);
+    Ok(compatible)
+}
+
+fn observe_admission_candidates(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    labels: &[String],
+) -> Result<(RepoObservation, Vec<RunCancellation>), String> {
+    let observation = observe_repo(actions, repo, base, false)?;
+    let candidates = admission_candidates(actions, &observation, labels)?;
+    Ok((observation, candidates))
+}
+
+fn pending_admission_cancellations(
+    ledger: &StewardLedger,
+    repo: &str,
+    base: &str,
+) -> Vec<(String, PendingCancellation)> {
+    ledger
+        .pending_cancellations
+        .iter()
+        .filter(|(_, pending)| pending.repo == repo && pending.base == base)
+        .map(|(key, pending)| (key.clone(), pending.clone()))
+        .collect()
+}
+
+fn admission_blocker_run_ids(
+    candidates: &[RunCancellation],
+    pending: &[(String, PendingCancellation)],
+) -> Vec<u64> {
+    let mut run_ids = candidates
+        .iter()
+        .map(|candidate| candidate.run_id)
+        .chain(pending.iter().map(|(_, cancellation)| cancellation.run_id))
+        .collect::<Vec<_>>();
+    run_ids.sort_unstable();
+    run_ids.dedup();
+    run_ids
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn admission_clean_command<W: Write>(
+    args: &AdmissionCleanArgs,
+    cwd: &Path,
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
+    actions: &GitHubActions,
+    json_output: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let (repo, base, labels) = normalize_admission_target(args)?;
+    let Ok((mut observation, mut candidates)) =
+        observe_admission_candidates(actions, &repo, &base, &labels)
+    else {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Error,
+            "observation_failed",
+            &repo,
+            &base,
+            &labels,
+            &[],
+        );
+    };
+    let canonical_repo = observation.repo.clone();
+    let ledger_path = runtime_paths.state_dir.join("merge-steward.json");
+    let Ok(observed_ledger) = load_ledger(&ledger_path) else {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Error,
+            "mutation_failed",
+            &canonical_repo,
+            &base,
+            &labels,
+            &[],
+        );
+    };
+    let observed_pending =
+        pending_admission_cancellations(&observed_ledger, &canonical_repo, &base);
+    let mut blocker_run_ids = admission_blocker_run_ids(&candidates, &observed_pending);
+    if candidates.is_empty() && observed_pending.is_empty() {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Admit,
+            "clean",
+            &canonical_repo,
+            &base,
+            &labels,
+            &[],
+        );
+    }
+    if !args.apply {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Defer,
+            if observed_pending.is_empty() {
+                "stale_compatible_runs"
+            } else {
+                "cancellation_pending"
+            },
+            &canonical_repo,
+            &base,
+            &labels,
+            &blocker_run_ids,
+        );
+    }
+    let Ok(authority) = authority_status(
+        &runtime_paths.state_dir,
+        cwd,
+        mode,
+        &runtime_paths.global_dir,
+    ) else {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Error,
+            "authority_failed",
+            &canonical_repo,
+            &base,
+            &labels,
+            &blocker_run_ids,
+        );
+    };
+    if authority.get("authority_matches").and_then(Value::as_bool) != Some(true) {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Defer,
+            "mutation_authority_required",
+            &canonical_repo,
+            &base,
+            &labels,
+            &blocker_run_ids,
+        );
+    }
+
+    let _ledger_lock = acquire_ledger_lock(&ledger_path)?;
+    let mut ledger = load_ledger(&ledger_path)?;
+    let pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
+    blocker_run_ids = admission_blocker_run_ids(&candidates, &pending);
+    if candidates.is_empty() && pending.is_empty() {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Admit,
+            "cleaned",
+            &canonical_repo,
+            &base,
+            &labels,
+            &[],
+        );
+    }
+    let mutation_control = MutationControl {
+        store: ShipStateStore::new(runtime_paths.state_dir.join("ship")).map_err(|error| {
+            CliFailure::new(
+                1,
+                format!("could not open merge-queue mutation state: {error}"),
+            )
+        })?,
+        cwd: cwd.to_path_buf(),
+        mode,
+        global_dir: runtime_paths.global_dir.clone(),
+    };
+    for (key, pending) in pending {
+        if cancellation_recovery::resume_pending_cancellation(
+            actions,
+            &ledger_path,
+            &mut ledger,
+            &mutation_control,
+            &key,
+            &pending,
+        )
+        .is_err()
+        {
+            return emit_admission_verdict(
+                stdout,
+                json_output,
+                AdmissionVerdict::Error,
+                "mutation_failed",
+                &canonical_repo,
+                &base,
+                &labels,
+                &blocker_run_ids,
+            );
+        }
+    }
+    match observe_admission_candidates(actions, &canonical_repo, &base, &labels) {
+        Ok((refreshed_observation, refreshed_candidates)) => {
+            observation = refreshed_observation;
+            candidates = refreshed_candidates;
+            let remaining_pending =
+                pending_admission_cancellations(&ledger, &canonical_repo, &base);
+            blocker_run_ids = admission_blocker_run_ids(&candidates, &remaining_pending);
+        }
+        Err(_) => {
+            return emit_admission_verdict(
+                stdout,
+                json_output,
+                AdmissionVerdict::Error,
+                "revalidation_failed",
+                &canonical_repo,
+                &base,
+                &labels,
+                &blocker_run_ids,
+            );
+        }
+    }
+    if candidates.is_empty() {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Admit,
+            "cleaned",
+            &canonical_repo,
+            &base,
+            &labels,
+            &[],
+        );
+    }
+    for candidate in &candidates {
+        let (_, error) = cancellation::apply_run_cancellation(
+            actions,
+            &observation,
+            candidate,
+            "shipyard:no-auto-merge",
+            MANAGED_LABEL,
+            HANDOFF_CONTEXT,
+            &ledger_path,
+            &mut ledger,
+            &mutation_control,
+        );
+        if error.is_some() {
+            let _ = save_ledger(&ledger_path, &ledger);
+            return emit_admission_verdict(
+                stdout,
+                json_output,
+                AdmissionVerdict::Error,
+                "mutation_failed",
+                &canonical_repo,
+                &base,
+                &labels,
+                &blocker_run_ids,
+            );
+        }
+    }
+    save_ledger(&ledger_path, &ledger)?;
+    let Ok((_, remaining)) = observe_admission_candidates(actions, &canonical_repo, &base, &labels)
+    else {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Error,
+            "revalidation_failed",
+            &canonical_repo,
+            &base,
+            &labels,
+            &blocker_run_ids,
+        );
+    };
+    if remaining.is_empty() {
+        emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Admit,
+            "cleaned",
+            &canonical_repo,
+            &base,
+            &labels,
+            &[],
+        )
+    } else {
+        let remaining = remaining
+            .into_iter()
+            .map(|candidate| candidate.run_id)
+            .collect::<Vec<_>>();
+        emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Defer,
+            "cancellation_pending",
+            &canonical_repo,
+            &base,
+            &labels,
+            &remaining,
+        )
+    }
+}
 
 pub(super) fn steward_command<W: Write>(
     args: &StewardCommandArgs,
