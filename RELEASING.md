@@ -110,6 +110,38 @@ export SHIPYARD_SIGNING_IDENTITY=<SHA1-or-CN>           # `security find-identit
 ./scripts/release-macos-local.sh --tag vX.Y.Z --upload --rollback-tag vPREVIOUS
 ```
 
+M5 uses the existing file-backed App Store Connect API key and dedicated
+signing keychain. Both dotenv files must be mode `0600`; the script maps the
+existing `PULP_SIGN_*` and `PULP_NOTARY_*` names without copying secrets:
+
+```bash
+./scripts/release-macos-local.sh \
+  --env-file ~/.config/pulp/secrets/keychain.env \
+  --env-file ~/.config/pulp/secrets/notary.env \
+  --check-auth
+
+./scripts/release-macos-local.sh \
+  --env-file ~/.config/pulp/secrets/keychain.env \
+  --env-file ~/.config/pulp/secrets/notary.env \
+  --tag vX.Y.Z --upload --rollback-tag vPREVIOUS
+```
+
+When both standard M5 files exist, the local release script discovers them
+automatically; the explicit flags above document the portable contract and
+remain useful for a nonstandard checkout. An explicit signing keychain without
+the local `.p12` and its file-backed password fails before `codesign` rather
+than risking a Keychain UI prompt.
+
+`--check-auth` runs a timestamped hardened-runtime signature against a
+disposable Mach-O. When a signing keychain is configured, the release path
+snapshots the user keychain search list, places that keychain first, pins
+`codesign` to it, and restores the original list on every exit. API-key
+notarization invokes `notarytool` directly with the local key file; Apple-ID
+and app-password authentication remains supported for other environments. The
+full local release command runs this same check automatically before building;
+failed import, partition setup, search-list preparation, or probe is terminal
+and cannot fall through to artifact signing.
+
 The script runs the full pipeline on the local Mac:
 
 1. Fails fast if any env var is missing (before the Rust release build).

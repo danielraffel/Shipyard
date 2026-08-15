@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import os
 import platform
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,10 +22,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DIST_DIR = ROOT / "dist" / "release"
 BIN_NAME = "shipyard"
 NOTARY_WAIT_TIMEOUT = "45m"
-SENSITIVE_FLAGS = {"--password", "-p"}
+SENSITIVE_FLAGS = {"--password", "-p", "-P", "-k"}
 SENSITIVE_ENV_NAMES = (
     "SHIPYARD_NOTARIZE_APP_PASSWORD",
     "SHIPYARD_SIGNING_IDENTITY",
+    "SHIPYARD_SIGNING_P12_PASSWORD",
 )
 
 
@@ -46,11 +49,15 @@ TARGETS: dict[str, ReleaseTarget] = {
     "windows-x64": ReleaseTarget("windows-x64", "windows", "x64", ".exe"),
 }
 
-SIGNING_ENV = (
-    "SHIPYARD_SIGNING_IDENTITY",
+APPLE_ID_NOTARIZATION_ENV = (
     "SHIPYARD_NOTARIZE_APPLE_ID",
     "SHIPYARD_NOTARIZE_TEAM_ID",
     "SHIPYARD_NOTARIZE_APP_PASSWORD",
+)
+API_KEY_NOTARIZATION_ENV = (
+    "SHIPYARD_NOTARIZE_KEY_PATH",
+    "SHIPYARD_NOTARIZE_KEY_ID",
+    "SHIPYARD_NOTARIZE_ISSUER_ID",
 )
 
 
@@ -146,10 +153,91 @@ def require_commands(names: list[str]) -> None:
 
 
 def require_signing_env(*, notarize: bool) -> None:
-    required = SIGNING_ENV if notarize else ("SHIPYARD_SIGNING_IDENTITY",)
-    missing = [name for name in required if not os.environ.get(name)]
+    missing = [] if os.environ.get("SHIPYARD_SIGNING_IDENTITY") else ["SHIPYARD_SIGNING_IDENTITY"]
+    if notarize:
+        try:
+            notarization_mode()
+        except SystemExit as error:
+            if missing:
+                detail = ", ".join(missing)
+                raise SystemExit(
+                    f"Missing required environment variable(s): {detail}; {error}"
+                ) from error
+            raise
     if missing:
         raise SystemExit(f"Missing required environment variable(s): {', '.join(missing)}")
+
+
+def notarization_mode() -> str:
+    apple_present = [name for name in APPLE_ID_NOTARIZATION_ENV if os.environ.get(name)]
+    api_present = [name for name in API_KEY_NOTARIZATION_ENV if os.environ.get(name)]
+    if len(api_present) == len(API_KEY_NOTARIZATION_ENV):
+        return "api-key"
+    if len(apple_present) == len(APPLE_ID_NOTARIZATION_ENV):
+        return "apple-id"
+    expected = API_KEY_NOTARIZATION_ENV if api_present else APPLE_ID_NOTARIZATION_ENV
+    missing = [name for name in expected if not os.environ.get(name)]
+    raise SystemExit(
+        "Missing required notarization environment variable(s): " + ", ".join(missing)
+    )
+
+
+def expanded_env_path(name: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(os.environ[name]))).resolve()
+
+
+@contextlib.contextmanager
+def signing_keychain_first():
+    configured = os.environ.get("SHIPYARD_SIGNING_KEYCHAIN")
+    if not configured:
+        yield
+        return
+
+    keychain = str(Path(os.path.expandvars(os.path.expanduser(configured))).resolve())
+    if not Path(keychain).is_file():
+        raise SystemExit(f"Configured signing keychain does not exist: {keychain}")
+    original = shlex.split(
+        run(["security", "list-keychains", "-d", "user"], capture=True)
+    )
+    if not original:
+        raise SystemExit(
+            "User keychain search list read empty; refusing to replace it for signing"
+        )
+    desired = [keychain, *(item for item in original if str(Path(item).resolve()) != keychain)]
+    run(["security", "list-keychains", "-d", "user", "-s", *desired])
+    try:
+        yield
+    finally:
+        run(["security", "list-keychains", "-d", "user", "-s", *original])
+
+
+def signing_keychain_is_listed(keychain: Path) -> bool:
+    """Return whether a keychain is still referenced by the user search list.
+
+    This check deliberately fails closed.  A disposable keychain must remain on
+    disk if Shipyard cannot prove the search list was restored; deleting it
+    would leave a dangling search-list entry and make the next signing attempt
+    less predictable.
+    """
+    listed = shlex.split(
+        run(["security", "list-keychains", "-d", "user"], capture=True)
+    )
+    resolved = keychain.resolve()
+    return any(Path(item).resolve() == resolved for item in listed)
+
+
+def verify_signing_probe() -> None:
+    with tempfile.TemporaryDirectory(prefix="shipyard-signing-probe-") as temp:
+        root = Path(temp)
+        source = root / "probe.c"
+        binary = root / "probe"
+        source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        run(["clang", str(source), "-o", str(binary)])
+        sign_binary(binary)
+        run(
+            ["codesign", "--verify", "--strict", "--verbose=2", str(binary)],
+            capture=True,
+        )
 
 
 def build_release(cargo_target: str | None) -> None:
@@ -186,6 +274,7 @@ def sign_binary(path: Path) -> None:
             str(path),
         ],
         env=signing_env,
+        capture=True,
     )
 
 
@@ -217,6 +306,7 @@ def sign_dmg(path: Path) -> None:
     run(
         ["codesign", "--force", "--sign", identity, *keychain_args, str(path)],
         env=signing_env,
+        capture=True,
     )
 
 
@@ -236,6 +326,104 @@ def create_notary_keychain(temp_dir: Path) -> tuple[Path, str]:
     return keychain, password
 
 
+def create_disposable_signing_keychain(temp_dir: Path) -> tuple[Path, str]:
+    keychain = temp_dir / "shipyard-signing.keychain-db"
+    password = secrets.token_urlsafe(32)
+    p12 = expanded_env_path("SHIPYARD_SIGNING_P12")
+    if not p12.is_file():
+        raise SystemExit(f"Configured signing certificate does not exist: {p12}")
+    p12_password = os.environ["SHIPYARD_SIGNING_P12_PASSWORD"]
+    redactions = (password, p12_password)
+    run(
+        ["security", "create-keychain", "-p", password, str(keychain)],
+        redact_values=redactions,
+    )
+    run(["security", "set-keychain-settings", "-lut", "21600", str(keychain)])
+    run(
+        ["security", "unlock-keychain", "-p", password, str(keychain)],
+        redact_values=redactions,
+    )
+    run(
+        [
+            "security",
+            "import",
+            str(p12),
+            "-k",
+            str(keychain),
+            "-P",
+            p12_password,
+            "-T",
+            "/usr/bin/codesign",
+            "-T",
+            "/usr/bin/security",
+        ],
+        redact_values=redactions,
+        capture=True,
+    )
+    run(
+        [
+            "security",
+            "set-key-partition-list",
+            "-S",
+            "apple-tool:,apple:,codesign:",
+            "-s",
+            "-k",
+            password,
+            str(keychain),
+        ],
+        redact_values=redactions,
+        capture=True,
+    )
+    return keychain, password
+
+
+@contextlib.contextmanager
+def prepared_signing_keychain():
+    p12 = os.environ.get("SHIPYARD_SIGNING_P12")
+    p12_password = os.environ.get("SHIPYARD_SIGNING_P12_PASSWORD")
+    if bool(p12) != bool(p12_password):
+        missing = (
+            "SHIPYARD_SIGNING_P12_PASSWORD"
+            if p12
+            else "SHIPYARD_SIGNING_P12"
+        )
+        raise SystemExit(f"Missing required environment variable: {missing}")
+    prepared = (
+        os.environ.get("CI") == "true"
+        and os.environ.get("SHIPYARD_SIGNING_KEYCHAIN_READY") == "1"
+    )
+    if os.environ.get("SHIPYARD_SIGNING_KEYCHAIN") and not p12 and not prepared:
+        raise SystemExit(
+            "An explicit signing keychain requires SHIPYARD_SIGNING_P12 and "
+            "SHIPYARD_SIGNING_P12_PASSWORD so Shipyard can prepare a disposable, "
+            "noninteractive keychain before codesign"
+        )
+    if not p12:
+        with signing_keychain_first():
+            yield
+        return
+
+    temp = Path(tempfile.mkdtemp(prefix="shipyard-signing-keychain-"))
+    keychain, _password = create_disposable_signing_keychain(temp)
+    previous = os.environ.get("SHIPYARD_SIGNING_KEYCHAIN")
+    os.environ["SHIPYARD_SIGNING_KEYCHAIN"] = str(keychain)
+    try:
+        with signing_keychain_first():
+            yield
+    finally:
+        if previous is None:
+            os.environ.pop("SHIPYARD_SIGNING_KEYCHAIN", None)
+        else:
+            os.environ["SHIPYARD_SIGNING_KEYCHAIN"] = previous
+
+        # Never delete a disposable keychain while it may still be in the
+        # user's search list.  A restore/query failure propagates and leaves
+        # the keychain intact for deterministic manual recovery.
+        if not signing_keychain_is_listed(keychain):
+            delete_notary_keychain(keychain)
+            shutil.rmtree(temp, ignore_errors=True)
+
+
 def delete_notary_keychain(keychain: Path) -> None:
     try:
         run(["security", "delete-keychain", str(keychain)])
@@ -244,6 +432,31 @@ def delete_notary_keychain(keychain: Path) -> None:
 
 
 def notarize_and_staple(path: Path) -> None:
+    if notarization_mode() == "api-key":
+        output = run(
+            [
+                "xcrun",
+                "notarytool",
+                "submit",
+                str(path),
+                "--key",
+                str(expanded_env_path("SHIPYARD_NOTARIZE_KEY_PATH")),
+                "--key-id",
+                os.environ["SHIPYARD_NOTARIZE_KEY_ID"],
+                "--issuer",
+                os.environ["SHIPYARD_NOTARIZE_ISSUER_ID"],
+                "--wait",
+                "--timeout",
+                NOTARY_WAIT_TIMEOUT,
+            ],
+            capture=True,
+        )
+        if "status: Accepted" not in output:
+            raise SystemExit(f"Notarization was not accepted:\n{output}")
+        run(["xcrun", "stapler", "staple", str(path)])
+        run(["xcrun", "stapler", "validate", str(path)])
+        return
+
     # Keep the long-running `notarytool submit --wait` process free of the
     # app-specific password. The password is used only to create a temporary
     # keychain profile, then submit waits with that profile.
@@ -356,7 +569,7 @@ def package(args: argparse.Namespace) -> list[Path]:
     if args.sign_macos:
         if not target.is_macos:
             raise SystemExit("--sign-macos is only supported for macOS targets")
-        require_commands(["codesign"])
+        require_commands(["codesign", "clang"])
         require_signing_env(notarize=args.notarize)
     if args.dmg:
         require_commands(["hdiutil"])
@@ -384,12 +597,15 @@ def package(args: argparse.Namespace) -> list[Path]:
             stage.mkdir()
             staged_binary = stage / args.artifact_prefix
             shutil.copy2(binary, staged_binary)
-            if args.sign_macos:
-                sign_binary(staged_binary)
             dmg = output_dir / f"{artifact_base}.dmg"
-            create_dmg(stage, dmg, volume_name="Shipyard")
             if args.sign_macos:
-                sign_dmg(dmg)
+                with prepared_signing_keychain():
+                    verify_signing_probe()
+                    sign_binary(staged_binary)
+                    create_dmg(stage, dmg, volume_name="Shipyard")
+                    sign_dmg(dmg)
+            else:
+                create_dmg(stage, dmg, volume_name="Shipyard")
             if args.notarize:
                 notarize_and_staple(dmg)
             if not args.no_smoke:
@@ -399,7 +615,9 @@ def package(args: argparse.Namespace) -> list[Path]:
         artifact = output_dir / artifact_base
         shutil.copy2(binary, artifact)
         if args.sign_macos:
-            sign_binary(artifact)
+            with prepared_signing_keychain():
+                verify_signing_probe()
+                sign_binary(artifact)
         if not args.no_smoke:
             smoke = smoke_binary(artifact)
         artifacts.append(artifact)

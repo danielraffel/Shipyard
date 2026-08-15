@@ -86,6 +86,59 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             release_macos_local.require_arm64("x64")
         self.assertIn("arm64", str(ctx.exception))
 
+    def test_release_environment_file_must_be_private(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "release.env"
+            path.write_text("APPLE_ID=dev@example.com\n", encoding="utf-8")
+            path.chmod(0o644)
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.load_release_environment([path])
+        self.assertIn("0600", str(ctx.exception))
+
+    def test_local_environment_files_are_auto_discovered_as_a_pair(self) -> None:
+        files = (Path("/tmp/keychain.env"), Path("/tmp/notary.env"))
+        with mock.patch.object(release_macos_local, "DEFAULT_LOCAL_ENV_FILES", files), \
+                mock.patch.object(Path, "is_file", return_value=True):
+            resolved = release_macos_local.resolve_environment_files([])
+
+        self.assertEqual(resolved, list(files))
+
+    def test_explicit_environment_files_override_m5_defaults(self) -> None:
+        requested = [Path("/tmp/custom.env")]
+        self.assertEqual(
+            release_macos_local.resolve_environment_files(requested),
+            requested,
+        )
+
+    def test_check_auth_uses_api_key_mode_and_signing_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            key = Path(temp) / "AuthKey_TEST.p8"
+            key.write_text("private", encoding="utf-8")
+            key.chmod(0o600)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "SHIPYARD_SIGNING_IDENTITY": "identity",
+                    "SHIPYARD_NOTARIZE_KEY_PATH": str(key),
+                    "SHIPYARD_NOTARIZE_KEY_ID": "KEY123",
+                    "SHIPYARD_NOTARIZE_ISSUER_ID": "issuer-uuid",
+                },
+                clear=True,
+            ), mock.patch.object(
+                release_macos_local.package_release,
+                "require_commands",
+            ), mock.patch.object(
+                release_macos_local.package_release,
+                "prepared_signing_keychain",
+            ), mock.patch.object(
+                release_macos_local.package_release,
+                "verify_signing_probe",
+            ) as probe:
+                mode = release_macos_local.check_unattended_auth()
+
+        self.assertEqual(mode, "api-key")
+        probe.assert_called_once_with()
+
     def test_ci_mode_publishes_but_skips_install_e2e(self) -> None:
         config = release_macos_local.ReleaseConfig(
             tag="v0.1.0",
@@ -211,7 +264,7 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         self.assertIn("install:v0.2.0:shipyard 0.1.0", result)
         bash_envs = [
             env
-            for command, env in zip(runner.commands, runner.envs, strict=True)
+                for command, env in zip(runner.commands, runner.envs)
             if command and command[0] == "bash"
         ]
         self.assertEqual(len(bash_envs), 1)
@@ -241,7 +294,7 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         self.assertIn("rollback:v0.1.0:shipyard 0.1.0", result)
         bash_envs = [
             env
-            for command, env in zip(runner.commands, runner.envs, strict=True)
+                for command, env in zip(runner.commands, runner.envs)
             if command and command[0] == "bash"
         ]
         self.assertEqual(

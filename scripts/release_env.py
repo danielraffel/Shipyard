@@ -20,11 +20,26 @@ SHIPYARD_SIGNING_ENV = (
     "SHIPYARD_NOTARIZE_TEAM_ID",
     "SHIPYARD_NOTARIZE_APP_PASSWORD",
 )
+SHIPYARD_RELEASE_ENV = (
+    *SHIPYARD_SIGNING_ENV,
+    "SHIPYARD_SIGNING_KEYCHAIN",
+    "SHIPYARD_SIGNING_P12",
+    "SHIPYARD_SIGNING_P12_PASSWORD",
+    "SHIPYARD_NOTARIZE_KEY_PATH",
+    "SHIPYARD_NOTARIZE_KEY_ID",
+    "SHIPYARD_NOTARIZE_ISSUER_ID",
+)
 DOTENV_SIGNING_ALIASES: dict[str, tuple[str, ...]] = {
-    "SHIPYARD_SIGNING_IDENTITY": ("APP_CERT",),
+    "SHIPYARD_SIGNING_IDENTITY": ("APP_CERT", "PULP_SIGN_IDENTITY_HASH"),
+    "SHIPYARD_SIGNING_KEYCHAIN": ("PULP_SIGN_KEYCHAIN",),
+    "SHIPYARD_SIGNING_P12": ("PULP_SIGN_P12",),
+    "SHIPYARD_SIGNING_P12_PASSWORD": ("PULP_SIGN_P12_PW",),
     "SHIPYARD_NOTARIZE_APPLE_ID": ("APPLE_ID",),
     "SHIPYARD_NOTARIZE_TEAM_ID": ("TEAM_ID",),
     "SHIPYARD_NOTARIZE_APP_PASSWORD": ("APP_SPECIFIC_PASSWORD", "APP_PASSWORD"),
+    "SHIPYARD_NOTARIZE_KEY_PATH": ("PULP_NOTARY_KEY_PATH",),
+    "SHIPYARD_NOTARIZE_KEY_ID": ("PULP_NOTARY_KEY_ID",),
+    "SHIPYARD_NOTARIZE_ISSUER_ID": ("PULP_NOTARY_ISSUER_ID",),
 }
 
 
@@ -57,14 +72,14 @@ def apply_dotenv_aliases(
     merged = dict(environ)
     sources = {
         name: "environment"
-        for name in SHIPYARD_SIGNING_ENV
+        for name in SHIPYARD_RELEASE_ENV
         if merged.get(name)
     }
 
-    for name in (*SHIPYARD_SIGNING_ENV, RELEASE_BOT_SECRET):
+    for name in (*SHIPYARD_RELEASE_ENV, RELEASE_BOT_SECRET):
         if not merged.get(name) and dotenv.get(name):
             merged[name] = dotenv[name]
-            if name in SHIPYARD_SIGNING_ENV:
+            if name in SHIPYARD_RELEASE_ENV:
                 sources[name] = f"dotenv:{name}"
 
     for target, aliases in DOTENV_SIGNING_ALIASES.items():

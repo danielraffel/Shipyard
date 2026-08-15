@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,11 +20,9 @@ import release_env
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO = "danielraffel/Shipyard"
-REQUIRED_NOTARIZATION_ENV = (
-    "SHIPYARD_NOTARIZE_APPLE_ID",
-    "SHIPYARD_NOTARIZE_TEAM_ID",
-    "SHIPYARD_NOTARIZE_APP_PASSWORD",
-    "SHIPYARD_SIGNING_IDENTITY",
+DEFAULT_LOCAL_ENV_FILES = (
+    Path.home() / ".config" / "pulp" / "secrets" / "keychain.env",
+    Path.home() / ".config" / "pulp" / "secrets" / "notary.env",
 )
 PUBLIC_ASSET_VISIBILITY_TIMEOUT_SECS = 90
 PUBLIC_ASSET_VISIBILITY_POLL_SECS = 3
@@ -72,14 +71,63 @@ class CommandRunner:
         return result.stdout.strip() if capture else ""
 
 
-def require_env(names: tuple[str, ...] = REQUIRED_NOTARIZATION_ENV) -> None:
-    missing = [name for name in names if not os.environ.get(name)]
-    if missing:
-        raise SystemExit(
-            "missing required environment variable(s): "
-            + ", ".join(missing)
-            + "\nsee scripts/release_macos_local.py --help"
+def require_env() -> None:
+    try:
+        package_release.require_signing_env(notarize=True)
+    except SystemExit as error:
+        raise SystemExit(f"{error}\nsee scripts/release_macos_local.py --help") from error
+
+
+def require_private_file(path: Path, *, label: str) -> None:
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as error:
+        raise SystemExit(f"could not access {label} {path}: {error}") from error
+    if not path.is_file():
+        raise SystemExit(f"{label} is not a file: {path}")
+    if mode != 0o600:
+        raise SystemExit(f"{label} must have mode 0600, found {mode:04o}: {path}")
+
+
+def load_release_environment(env_files: list[Path]) -> None:
+    environ = dict(os.environ)
+    for env_file in env_files:
+        require_private_file(env_file, label="release environment file")
+        try:
+            dotenv = release_env.parse_dotenv(env_file)
+        except OSError as error:
+            raise SystemExit(f"could not read --env-file {env_file}: {error}") from error
+        environ, _sources = release_env.apply_dotenv_aliases(environ, dotenv)
+    os.environ.update(
+        {name: environ[name] for name in release_env.SHIPYARD_RELEASE_ENV if environ.get(name)}
+    )
+
+
+def resolve_environment_files(requested: list[Path]) -> list[Path]:
+    if requested:
+        return requested
+    if all(path.is_file() for path in DEFAULT_LOCAL_ENV_FILES):
+        return list(DEFAULT_LOCAL_ENV_FILES)
+    return []
+
+
+def check_unattended_auth() -> str:
+    require_env()
+    package_release.require_commands(["codesign", "clang", "security", "xcrun"])
+    mode = package_release.notarization_mode()
+    if mode == "api-key":
+        require_private_file(
+            package_release.expanded_env_path("SHIPYARD_NOTARIZE_KEY_PATH"),
+            label="notarization API key",
         )
+    if os.environ.get("SHIPYARD_SIGNING_P12"):
+        require_private_file(
+            package_release.expanded_env_path("SHIPYARD_SIGNING_P12"),
+            label="signing certificate",
+        )
+    with package_release.prepared_signing_keychain():
+        package_release.verify_signing_probe()
+    return mode
 
 
 def resolve_tag(tag: str | None, runner: CommandRunner) -> str:
@@ -386,6 +434,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--arch", default="arm64", help="Only arm64 is supported")
     parser.add_argument("--upload", action="store_true", help="Upload DMG and checksum to the GitHub release")
     parser.add_argument(
+        "--check-auth",
+        action="store_true",
+        help="Validate unattended credentials and run a disposable signing probe, then exit",
+    )
+    parser.add_argument(
         "--ci-mode",
         action="store_true",
         help="Allow same-runner DMG mount skips and skip post-publish install E2E",
@@ -406,10 +459,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--env-file",
         type=Path,
+        action="append",
         help=(
-            "Optional dotenv file with Shipyard release credentials or the "
-            "documented macOS aliases APPLE_ID, TEAM_ID, APP_SPECIFIC_PASSWORD/"
-            "APP_PASSWORD, and APP_CERT."
+            "Repeatable dotenv file with Shipyard release credentials; supports "
+            "Apple-ID aliases and M5 PULP_SIGN_*/PULP_NOTARY_* aliases."
         ),
     )
     return parser.parse_args(argv)
@@ -418,18 +471,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     runner = CommandRunner()
     args = parse_args(argv or sys.argv[1:])
-    if args.env_file:
-        try:
-            dotenv = release_env.parse_dotenv(args.env_file)
-        except OSError as error:
-            raise SystemExit(f"could not read --env-file {args.env_file}: {error}") from error
-        environ, _sources = release_env.apply_dotenv_aliases(os.environ, dotenv)
-        os.environ.update(
-            {name: environ[name] for name in REQUIRED_NOTARIZATION_ENV if environ.get(name)}
-        )
+    load_release_environment(resolve_environment_files(args.env_file or []))
     require_arm64(args.arch)
+    mode = check_unattended_auth()
+    if args.check_auth:
+        print(f"unattended release authentication ready: notarization={mode}")
+        return 0
     tag = resolve_tag(args.tag, runner)
-    require_env()
     config = ReleaseConfig(
         tag=tag,
         repo=args.repo,

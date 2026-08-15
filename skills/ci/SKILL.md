@@ -316,6 +316,19 @@ calling process's user search list. Configure that list under the release
 step's isolated temporary `HOME` and pass the same `HOME` only to `codesign`;
 never add the ephemeral keychain to the persistent runner user's search list.
 
+For an unattended local macOS release, use
+`./scripts/release-macos-local.sh --check-auth` before the real release. It
+auto-loads the standard `~/.config/pulp/secrets/{keychain,notary}.env` files,
+imports the file-backed P12 into a disposable keychain, applies the full
+`apple-tool:,apple:,codesign:` partition list, temporarily places that
+keychain first, and proves a hardened-runtime timestamped signing operation.
+The normal release runs the same gate automatically and notarizes with the
+App Store Connect P8. Never continue to `codesign` after this gate fails, use
+a persistent/login keychain as a local fallback, or ask for a keychain
+password. Cleanup restores the exact prior search list before deleting the
+disposable keychain; if restoration cannot be proven, fail and preserve the
+keychain file rather than leave a dangling search-list reference.
+
 ### External contribution execution
 
 Never route contributor-controlled revisions through Shipyard's normal local,
