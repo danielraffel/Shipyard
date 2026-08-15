@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0940"></a>
+## [0.94.0] - 2026-08-15
+
+- feat(runner): add admission-clean gate for TartCI ([#432](https://github.com/danielraffel/Shipyard/pull/432))
+
 <a id="v0930"></a>
 ## [0.93.0] - 2026-08-15
 
@@ -904,6 +909,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.94.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.94.0
 [0.93.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.93.0
 [0.92.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.92.1
 [0.92.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.92.0
