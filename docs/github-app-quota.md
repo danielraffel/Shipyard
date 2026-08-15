@@ -100,11 +100,21 @@ For broader Shipyard inspection, common read-only repository permissions are:
 |---|---|
 | Contents | Read-only |
 | Actions | Read-only, or Read & write if Shipyard must cancel/dispatch workflows |
+| Administration | Read-only for repository runner inventory; Read & write only when an unattended controller must mint or remove runner registrations |
 | Checks | Read-only |
 | Commit statuses | Read & write when using steward handoff/recovery; otherwise read-only |
 | Issues | Read & write when using steward ownership/recovery labels |
 | Pull requests | Read & write for queue stewardship; otherwise read-only |
 | Metadata | Always available |
+
+`Actions` and `Administration` are intentionally separate here. Workflow/run
+inspection uses Actions, while GitHub's repository runner endpoints
+(`/repos/{owner}/{repo}/actions/runners`) use Administration. Shipyard fleet
+admission and recovery code reads those endpoints to bind an
+observation to the configured runner and inspect its online/busy state before
+it acts. Without runner read access, the safe result is unknown/defer, not
+“idle” and not a broad reset. Read-only is sufficient for inspection and stale proof;
+write is justified only for explicit registration mint/reclaim operations.
 
 Organization runner-group inspection is a separate permission surface:
 

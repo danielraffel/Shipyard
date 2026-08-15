@@ -243,6 +243,13 @@ When debugging GitHub behavior:
   that may not be locally inspectable through `gh auth status`; verify App or
   token permissions in GitHub when cloud retarget/handoff needs Actions: Read
   and write.
+- Keep workflow and runner permissions distinct. `Actions: Read-only` covers
+  workflow/run/job inspection; repository `/actions/runners` inventory needs
+  `Administration: Read-only`, and organization runner-group verification
+  separately needs organization `Self-hosted runners: Read-only`. Add write
+  access only for explicit cancel/dispatch, registration mint/reclaim, or group
+  configuration operations. An unreadable runner inventory is unknown/defer,
+  never proof that capacity is idle or safe to reset.
 - Keep `RELEASE_BOT_TOKEN` separate. `shipyard release-bot setup/status` are
   operator actions and intentionally use ambient `gh` auth.
 - Keep high-volume GitHub inspection on the configured Shipyard auth source.

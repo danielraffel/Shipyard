@@ -66,6 +66,11 @@ github.com → Settings → Developer settings → Personal access tokens →
 **Actions: Read and write**. Save. `gh auth status` should now show
 the scope in its `Token scopes:` line.
 
+If the same token is used for repository runner inventory or recovery, also
+grant **Administration: Read-only**. Use **Read and write** only when the
+controller must generate or remove runner registrations. `Actions` permission
+does not cover the repository `/actions/runners` endpoints.
+
 ### GitHub App / bot identity
 
 If Shipyard is running under an App install (CI, `RELEASE_BOT_TOKEN`,
@@ -74,6 +79,14 @@ permissions**, not the invoking user's token. github.com →
 organizations/<org> → Settings → GitHub Apps → your app →
 **Permissions & events** → **Actions: Read and write**. Accept the
 installation permission update after saving.
+
+If Shipyard also inspects repository runner inventory (fleet admission or
+stale-runner recovery proof), grant **Repository permissions →
+Administration: Read-only**. GitHub places the repository
+`/actions/runners` endpoints under Administration, not Actions. This read lets
+Shipyard observe registered runners and their online/busy state, and fail
+closed when the inventory cannot be read; it does not authorize deletion. Use **Read and write** only when the
+controller must generate registrations or reclaim a proven-stale runner.
 
 If the Shipyard deployment includes an external organization runner-group
 verifier, also grant
@@ -155,7 +168,7 @@ Minimal GitHub App registration for a local Shipyard quota/auth helper:
 | Request user authorization / OAuth / Device Flow | disabled |
 | Setup URL / Redirect on update | blank / disabled |
 | Webhook Active | disabled |
-| Repository permissions | `Contents: Read-only`; add `Actions`, `Checks`, `Commit statuses`, and `Pull requests` as read-only for fuller Shipyard inspection |
+| Repository permissions | `Contents: Read-only`; add `Actions`, `Checks`, `Commit statuses`, and `Pull requests` as read-only for fuller Shipyard inspection; add `Administration: Read-only` for repository runner inventory |
 | Organization permissions | `Self-hosted runners: Read-only` when inspecting or verifying organization runner groups; Read & write only for configuration/removal |
 | Subscribe to events | none for quota testing |
 | Installable by | Only on this account |
@@ -163,6 +176,12 @@ Minimal GitHub App registration for a local Shipyard quota/auth helper:
 After creating the app, install it on the account and choose `All repositories`
 when validating the scaled installation bucket. Save the App ID, installation
 ID, and private-key path locally; never put the private key in tracked config.
+
+`[github.auth]` selects how Shipyard obtains a token; it cannot widen that
+token's GitHub App permissions. If runner inspection returns `Resource not
+accessible by integration`, update the App installation permissions above and
+mint a fresh installation token rather than falling back to an unrelated
+ambient credential.
 
 Runner-group access is valuable when Shipyard coordinates multiple local
 providers because an App-backed policy verifier can compare selected
