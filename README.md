@@ -348,6 +348,18 @@ not the important factor; using an installation access token is.
 See [`docs/github-app-quota.md`](docs/github-app-quota.md) for the setup fields,
 permissions, Shipyard config, and quota validation commands.
 
+Runner inventory is a separate permission surface from workflow runs. `Actions:
+Read-only` lets Shipyard inspect workflows, runs, and jobs; it does not authorize
+`/repos/{owner}/{repo}/actions/runners`. Fleet admission, runner inventory, and
+stale-runner proof need repository `Administration: Read-only` so Shipyard can
+observe registered runners and their online/busy state, and defer when that
+state cannot be read. Grant `Administration: Read & write` to any Shipyard
+credential that must mint or delete runner registrations, including interactive
+`shipyard runner register` or `shipyard runner remove` use. Organization
+runner-group verification separately needs organization `Self-hosted runners:
+Read-only`. These reads are what let Shipyard preserve healthy work and fail
+closed instead of treating an unreadable pool as idle.
+
 The App can also give a Shipyard deployment's external policy verifier read-only
 visibility into organization runner groups. That permission is separate from
 repository `Actions` access and lets the integration verify repository, workflow,
