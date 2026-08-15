@@ -68,7 +68,9 @@ the scope in its `Token scopes:` line.
 
 If the same token is used for repository runner inventory or recovery, also
 grant **Administration: Read-only**. Use **Read and write** only when the
-controller must generate or remove runner registrations. `Actions` permission
+token holder must generate or remove runner registrations. This includes
+interactive `shipyard runner register` and `shipyard runner remove` calls.
+`Actions` permission
 does not cover the repository `/actions/runners` endpoints.
 
 ### GitHub App / bot identity
@@ -85,8 +87,10 @@ stale-runner recovery proof), grant **Repository permissions →
 Administration: Read-only**. GitHub places the repository
 `/actions/runners` endpoints under Administration, not Actions. This read lets
 Shipyard observe registered runners and their online/busy state, and fail
-closed when the inventory cannot be read; it does not authorize deletion. Use **Read and write** only when the
-controller must generate registrations or reclaim a proven-stale runner.
+closed when the inventory cannot be read; it does not authorize deletion. Use
+**Read and write** whenever the App-backed Shipyard operation must generate
+registrations or reclaim a proven-stale runner, whether interactive or
+unattended.
 
 If the Shipyard deployment includes an external organization runner-group
 verifier, also grant

@@ -353,8 +353,9 @@ Read-only` lets Shipyard inspect workflows, runs, and jobs; it does not authoriz
 `/repos/{owner}/{repo}/actions/runners`. Fleet admission, runner inventory, and
 stale-runner proof need repository `Administration: Read-only` so Shipyard can
 observe registered runners and their online/busy state, and defer when that
-state cannot be read. Grant `Administration: Read & write` only to an unattended
-controller that must mint or delete runner registrations. Organization
+state cannot be read. Grant `Administration: Read & write` to any Shipyard
+credential that must mint or delete runner registrations, including interactive
+`shipyard runner register` or `shipyard runner remove` use. Organization
 runner-group verification separately needs organization `Self-hosted runners:
 Read-only`. These reads are what let Shipyard preserve healthy work and fail
 closed instead of treating an unreadable pool as idle.

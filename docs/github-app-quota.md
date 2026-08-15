@@ -100,7 +100,7 @@ For broader Shipyard inspection, common read-only repository permissions are:
 |---|---|
 | Contents | Read-only |
 | Actions | Read-only, or Read & write if Shipyard must cancel/dispatch workflows |
-| Administration | Read-only for repository runner inventory; Read & write only when an unattended controller must mint or remove runner registrations |
+| Administration | Read-only for repository runner inventory; Read & write whenever App-backed Shipyard must mint or remove runner registrations, including interactive `shipyard runner register/remove` |
 | Checks | Read-only |
 | Commit statuses | Read & write when using steward handoff/recovery; otherwise read-only |
 | Issues | Read & write when using steward ownership/recovery labels |
