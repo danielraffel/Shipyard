@@ -641,6 +641,7 @@ fn handle_ship_variant<W: Write>(
             skip_targets,
             adopt_head,
             steward_handoff: None,
+            invocation: ship_cmd::ShipInvocation::Direct,
         },
         mode,
         cwd,

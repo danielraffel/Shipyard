@@ -708,6 +708,23 @@ Immediately after the PR exists and before validation starts, Shipyard writes
 the receipt; without explicit values it uses `OWNER/REPO#PR` and the PR URL.
 Use `--no-steward-handoff` only as an explicit project-default override.
 
+When submitter provenance must survive the invoking agent disappearing after
+GitHub accepts the PR, configure an argv-only hook in project config:
+
+```toml
+[pr.provenance]
+command = ["whence", "--pr", "{pr}", "--auto"]
+required = true
+```
+
+`shipyard pr` expands `{pr}`, `{repo}`, `{head}`, `{branch}`, `{base}`, and
+`{url}`, exports the same facts as `SHIPYARD_PR_*`, and runs the hook before the
+steward status/label receipt or validation dispatch. It inherits the submitting
+session's Whence/cmux/router environment. A configured hook defaults to
+required and fails closed. Explicit recovery through `shipyard ship --pr`
+never invokes the hook, because a later recovery agent must not overwrite the
+original submitter's provenance.
+
 For an already-created PR, the submitting agent must run
 `shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA
 --workstream-id ID [--context-url URL] --apply`. That command writes a

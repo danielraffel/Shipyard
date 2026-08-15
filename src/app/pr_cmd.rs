@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::{
     CliFailure,
     branch_cmd::detect_repo_from_remote,
-    ship_cmd::{ShipCommandArgs, ship_command},
+    ship_cmd::{ShipCommandArgs, ShipInvocation, ship_command},
 };
 use crate::config::LoadedConfig;
 use crate::gate_scripts::{SKILL_SYNC, VERSION_BUMP, VERSIONING_CONFIG, resolve};
@@ -142,6 +142,7 @@ pub(super) fn pr_command<W: Write>(
             skip_targets: args.skip_targets,
             adopt_head: args.adopt_head,
             steward_handoff,
+            invocation: ShipInvocation::PrCommand,
         },
         config,
         cwd,

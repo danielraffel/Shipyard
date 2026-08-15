@@ -142,6 +142,23 @@ Downloads a standalone binary for your platform. No runtime needed. See
 and test commands, and reports what passed. `shipyard ship` does the same,
 then opens a PR and merges when every required platform is green.
 
+Repositories may make submitting-session provenance an atomic PR precondition:
+
+```toml
+[pr.provenance]
+command = ["whence", "--pr", "{pr}", "--auto"]
+required = true
+```
+
+`shipyard pr` executes this argv directly after the exact PR/head is known and
+before any steward receipt or validation dispatch. Supported placeholders are
+`{pr}`, `{repo}`, `{head}`, `{branch}`, `{base}`, and `{url}`; the same values
+are also passed as `SHIPYARD_PR_*` environment variables. The hook inherits the
+agent's cmux/provider environment. A configured hook is required by default and
+fails closed, so interrupting the later CI watcher cannot leave a managed PR
+without its provenance. Explicit `shipyard ship --pr` recovery never runs the
+hook and therefore cannot overwrite the original submitting context.
+
 For a multi-Mac fleet, store a stable tag on each host with
 `shipyard runner tag --set <studio|m1|m5>` and select exactly one queue
 writer in the trusted machine-global `config.toml` reported by
