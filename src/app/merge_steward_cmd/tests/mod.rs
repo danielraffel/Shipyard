@@ -146,6 +146,8 @@ fn pending_cancellation_record() -> PendingCancellation {
 }
 
 #[cfg(unix)]
+mod admission;
+#[cfg(unix)]
 mod capacity;
 mod mutations;
 mod observation;

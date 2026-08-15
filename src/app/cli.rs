@@ -1009,6 +1009,25 @@ pub(super) enum RunnerCommand {
         #[arg(long = "max-ticks", hide = true)]
         max_ticks: Option<u32>,
     },
+    /// Prove that no superseded queued run can claim a just-in-time runner.
+    ///
+    /// Emits the flat, versioned verdict consumed by `TartCI` immediately before
+    /// JIT registration. Apply mode may cancel only managed, exact-head-
+    /// superseded workflow runs, and only on the configured mutation machine.
+    AdmissionClean {
+        /// Canonical owner/repo slug.
+        #[arg(long)]
+        repo: String,
+        /// Base branch whose open pull requests and merge queue are authoritative.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Complete comma-separated label set the prospective runner will advertise.
+        #[arg(long, value_delimiter = ',')]
+        labels: Vec<String>,
+        /// Cancel safely superseded compatible runs when this is the mutation authority.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Hand an exact pull-request head to the merge steward.
     ///
     /// Dry-run is the default. Apply mode writes a successful commit-status

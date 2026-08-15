@@ -319,6 +319,7 @@ hours.
 - `shipyard runner cleanup --fix` — cancel stale queued PR/merge-group runs;
   release, push, schedule, tag, and dispatch runs are protected
 - `shipyard runner watch --fix` — auto-recovery loop (cron-friendly)
+- `shipyard runner admission-clean --repo <owner/repo> --base main --labels self-hosted,<exact-labels> --apply --json` — TartCI's last pre-JIT correctness gate. It emits a flat schema-v1 verdict with exit 0 `admit`, 3 `defer`, 1 operational error, or 2 invalid configuration. It inspects only managed PR/merge-group runs, blocks only queued jobs the prospective runner could actually claim, and cancels only an exact queued run whose immutable head is authoritatively superseded. A non-authority machine returns `mutation_authority_required` instead of mutating. TartCI must treat every result except typed `admit` as fail-closed and discard the still-unregistered VM.
 - `shipyard runner kill --pid X --reason "..."` — kill a specific Worker; requires typed `KILL` confirmation
 
 ### `runner kill` recovery sequence
