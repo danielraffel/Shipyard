@@ -413,6 +413,33 @@ fn observe_admission_candidates(
     Ok((observation, candidates))
 }
 
+fn pending_admission_cancellations(
+    ledger: &StewardLedger,
+    repo: &str,
+    base: &str,
+) -> Vec<(String, PendingCancellation)> {
+    ledger
+        .pending_cancellations
+        .iter()
+        .filter(|(_, pending)| pending.repo == repo && pending.base == base)
+        .map(|(key, pending)| (key.clone(), pending.clone()))
+        .collect()
+}
+
+fn admission_blocker_run_ids(
+    candidates: &[RunCancellation],
+    pending: &[(String, PendingCancellation)],
+) -> Vec<u64> {
+    let mut run_ids = candidates
+        .iter()
+        .map(|candidate| candidate.run_id)
+        .chain(pending.iter().map(|(_, cancellation)| cancellation.run_id))
+        .collect::<Vec<_>>();
+    run_ids.sort_unstable();
+    run_ids.dedup();
+    run_ids
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn admission_clean_command<W: Write>(
     args: &AdmissionCleanArgs,
@@ -439,7 +466,23 @@ pub(super) fn admission_clean_command<W: Write>(
         );
     };
     let canonical_repo = observation.repo.clone();
-    if candidates.is_empty() {
+    let ledger_path = runtime_paths.state_dir.join("merge-steward.json");
+    let Ok(observed_ledger) = load_ledger(&ledger_path) else {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Error,
+            "mutation_failed",
+            &canonical_repo,
+            &base,
+            &labels,
+            &[],
+        );
+    };
+    let observed_pending =
+        pending_admission_cancellations(&observed_ledger, &canonical_repo, &base);
+    let mut blocker_run_ids = admission_blocker_run_ids(&candidates, &observed_pending);
+    if candidates.is_empty() && observed_pending.is_empty() {
         return emit_admission_verdict(
             stdout,
             json_output,
@@ -451,16 +494,16 @@ pub(super) fn admission_clean_command<W: Write>(
             &[],
         );
     }
-    let mut blocker_run_ids = candidates
-        .iter()
-        .map(|candidate| candidate.run_id)
-        .collect::<Vec<_>>();
     if !args.apply {
         return emit_admission_verdict(
             stdout,
             json_output,
             AdmissionVerdict::Defer,
-            "stale_compatible_runs",
+            if observed_pending.is_empty() {
+                "stale_compatible_runs"
+            } else {
+                "cancellation_pending"
+            },
             &canonical_repo,
             &base,
             &labels,
@@ -497,15 +540,22 @@ pub(super) fn admission_clean_command<W: Write>(
         );
     }
 
-    let ledger_path = runtime_paths.state_dir.join("merge-steward.json");
     let _ledger_lock = acquire_ledger_lock(&ledger_path)?;
     let mut ledger = load_ledger(&ledger_path)?;
-    let pending = ledger
-        .pending_cancellations
-        .iter()
-        .filter(|(_, pending)| pending.repo == canonical_repo && pending.base == base)
-        .map(|(key, pending)| (key.clone(), pending.clone()))
-        .collect::<Vec<_>>();
+    let pending = pending_admission_cancellations(&ledger, &canonical_repo, &base);
+    blocker_run_ids = admission_blocker_run_ids(&candidates, &pending);
+    if candidates.is_empty() && pending.is_empty() {
+        return emit_admission_verdict(
+            stdout,
+            json_output,
+            AdmissionVerdict::Admit,
+            "cleaned",
+            &canonical_repo,
+            &base,
+            &labels,
+            &[],
+        );
+    }
     let mutation_control = MutationControl {
         store: ShipStateStore::new(runtime_paths.state_dir.join("ship")).map_err(|error| {
             CliFailure::new(
@@ -540,31 +590,25 @@ pub(super) fn admission_clean_command<W: Write>(
             );
         }
     }
-    if !ledger.pending_cancellations.is_empty() {
-        save_ledger(&ledger_path, &ledger)?;
-    }
-    if !blocker_run_ids.is_empty() {
-        match observe_admission_candidates(actions, &canonical_repo, &base, &labels) {
-            Ok((refreshed_observation, refreshed_candidates)) => {
-                observation = refreshed_observation;
-                candidates = refreshed_candidates;
-                blocker_run_ids = candidates
-                    .iter()
-                    .map(|candidate| candidate.run_id)
-                    .collect();
-            }
-            Err(_) => {
-                return emit_admission_verdict(
-                    stdout,
-                    json_output,
-                    AdmissionVerdict::Error,
-                    "revalidation_failed",
-                    &canonical_repo,
-                    &base,
-                    &labels,
-                    &blocker_run_ids,
-                );
-            }
+    match observe_admission_candidates(actions, &canonical_repo, &base, &labels) {
+        Ok((refreshed_observation, refreshed_candidates)) => {
+            observation = refreshed_observation;
+            candidates = refreshed_candidates;
+            let remaining_pending =
+                pending_admission_cancellations(&ledger, &canonical_repo, &base);
+            blocker_run_ids = admission_blocker_run_ids(&candidates, &remaining_pending);
+        }
+        Err(_) => {
+            return emit_admission_verdict(
+                stdout,
+                json_output,
+                AdmissionVerdict::Error,
+                "revalidation_failed",
+                &canonical_repo,
+                &base,
+                &labels,
+                &blocker_run_ids,
+            );
         }
     }
     if candidates.is_empty() {

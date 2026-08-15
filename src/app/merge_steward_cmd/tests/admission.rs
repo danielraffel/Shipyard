@@ -98,6 +98,20 @@ fn prospective_runner_matches_only_queued_subset_labels() {
 }
 
 #[test]
+fn pending_cancellation_remains_an_admission_blocker_without_a_scan_candidate() {
+    let pending = pending_cancellation_record();
+    let mut ledger = StewardLedger::default();
+    ledger
+        .pending_cancellations
+        .insert("pending".to_owned(), pending);
+
+    let matching = pending_admission_cancellations(&ledger, "owner/repo", "main");
+    assert_eq!(matching.len(), 1);
+    assert_eq!(admission_blocker_run_ids(&[], &matching), vec![100]);
+    assert!(pending_admission_cancellations(&ledger, "owner/repo", "other").is_empty());
+}
+
+#[test]
 fn admission_candidates_filter_superseded_runs_by_exact_runner_labels() {
     let temp = tempfile::tempdir().expect("temp");
     let matching = fake_gh(
