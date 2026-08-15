@@ -67,6 +67,37 @@ class ReleaseEnvTests(unittest.TestCase):
         self.assertEqual(merged["SHIPYARD_NOTARIZE_APPLE_ID"], "shipyard@example.com")
         self.assertEqual(sources["SHIPYARD_NOTARIZE_APPLE_ID"], "environment")
 
+    def test_apply_dotenv_aliases_maps_m5_unattended_files(self) -> None:
+        dotenv = {
+            "PULP_SIGN_IDENTITY_HASH": "identity-hash",
+            "PULP_SIGN_KEYCHAIN": "/tmp/pulp-signing.keychain-db",
+            "PULP_SIGN_P12": "/tmp/signing.p12",
+            "PULP_SIGN_P12_PW": "p12-secret",
+            "PULP_NOTARY_KEY_PATH": "/tmp/AuthKey_TEST.p8",
+            "PULP_NOTARY_KEY_ID": "KEY123",
+            "PULP_NOTARY_ISSUER_ID": "issuer-uuid",
+        }
+
+        environ, sources = release_env.apply_dotenv_aliases({}, dotenv)
+
+        self.assertEqual(environ["SHIPYARD_SIGNING_IDENTITY"], "identity-hash")
+        self.assertEqual(
+            environ["SHIPYARD_SIGNING_KEYCHAIN"],
+            "/tmp/pulp-signing.keychain-db",
+        )
+        self.assertEqual(
+            environ["SHIPYARD_NOTARIZE_KEY_PATH"],
+            "/tmp/AuthKey_TEST.p8",
+        )
+        self.assertEqual(environ["SHIPYARD_SIGNING_P12"], "/tmp/signing.p12")
+        self.assertEqual(environ["SHIPYARD_SIGNING_P12_PASSWORD"], "p12-secret")
+        self.assertEqual(environ["SHIPYARD_NOTARIZE_KEY_ID"], "KEY123")
+        self.assertEqual(environ["SHIPYARD_NOTARIZE_ISSUER_ID"], "issuer-uuid")
+        self.assertEqual(
+            sources["SHIPYARD_SIGNING_KEYCHAIN"],
+            "dotenv:PULP_SIGN_KEYCHAIN",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

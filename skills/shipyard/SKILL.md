@@ -833,6 +833,18 @@ Because `codesign --keychain` does not bypass its search-list eligibility
 requirement, the workflow gives signing an isolated temporary `HOME` whose
 search list contains only the ephemeral keychain.
 
+Local M5 releases use a separate fail-closed contract. Run
+`./scripts/release-macos-local.sh --check-auth`; it auto-discovers the standard
+file-backed P12 and App Store Connect P8 environment under
+`~/.config/pulp/secrets`, creates a disposable signing keychain, installs the
+full `apple-tool:,apple:,codesign:` partition list, temporarily makes it first
+in the user search list, and performs a real timestamped hardened-runtime
+signing probe. A full local release repeats that probe and uses P8 API-key
+notarization. Do not use a persistent or login keychain when this preparation
+fails, do not continue after a failed probe, and never ask for a password.
+Restore the exact search-list snapshot before deleting the disposable
+keychain; preserve it and fail if restoration cannot be proven.
+
 ### CI routing profiles
 
 Use `shipyard ci profile show <name>` and
