@@ -4,6 +4,8 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0930"></a>
+## [0.94.0]
+
 ## [0.93.0] - 2026-08-15
 
 - feat: make PR provenance atomic ([#430](https://github.com/danielraffel/Shipyard/pull/430))
