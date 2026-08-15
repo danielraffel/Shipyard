@@ -3,9 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
-<a id="v0921"></a>
-## [0.93.0]
+<a id="v0930"></a>
+## [0.93.0] - 2026-08-15
 
+- feat: make PR provenance atomic ([#430](https://github.com/danielraffel/Shipyard/pull/430))
+- docs: explain runner inventory permissions ([#427](https://github.com/danielraffel/Shipyard/pull/427))
+
+<a id="v0921"></a>
 ## [0.92.1] - 2026-08-14
 
 - release: make local signing unattended ([#426](https://github.com/danielraffel/Shipyard/pull/426))
@@ -900,6 +904,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.93.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.93.0
 [0.92.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.92.1
 [0.92.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.92.0
 [0.91.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.91.3
