@@ -611,6 +611,26 @@ mod tests {
     }
 
     #[test]
+    fn pr_green_does_not_match_when_authoritative_required_context_is_missing() {
+        let snapshot = serde_json::json!({
+            "number": 1,
+            "headRefOid": "x",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [
+                rollup_entry("present", "SUCCESS", "SUCCESS", true),
+                rollup_entry("missing", "", "PENDING", true)
+            ],
+            "_required_checks_known": true
+        });
+        let result = evaluate_pr_green(Some(&snapshot)).expect("green evaluation");
+        assert!(!result.matched);
+        assert_eq!(result.observed["checks"].as_array().unwrap().len(), 2);
+        assert_eq!(result.observed["checks"][1]["name"], "missing");
+        assert_eq!(result.observed["checks"][1]["state"], "PENDING");
+    }
+
+    #[test]
     fn pr_green_with_no_required_checks_still_requires_clean_merge_state() {
         let snapshot = serde_json::json!({
             "number": 1,

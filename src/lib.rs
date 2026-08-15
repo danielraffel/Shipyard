@@ -98,6 +98,8 @@ pub mod queue_scheduler;
 pub mod reconcile;
 /// GitHub webhook registration through the user's existing `gh` auth.
 pub mod registrar;
+/// Shared parsing for classic and ruleset required-check policies.
+pub mod required_check_policy;
 /// Cloud→local macOS reroute decision logic (#316 Part C).
 pub mod reroute;
 /// Self-hosted runner provisioning (register/list/remove) pure logic.

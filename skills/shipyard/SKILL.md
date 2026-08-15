@@ -913,12 +913,15 @@ GraphQL reset time when a best-effort `gh api rate_limit` probe
 succeeds. Add this call to any new REST-fallback dispatch site so
 the operator-visible signal stays consistent.
 
-The PR snapshot's raw `statusCheckRollup` does not carry `isRequired`.
-`wait pr --state green` must therefore hydrate requiredness from
-`gh pr checks --required --json` before evaluating the rollup. A failed
-requiredness lookup is not permission to use `mergeable` as a green proxy:
-mark the snapshot unknown and make the evaluator fail closed. State-only waits
-such as `--state merged` remain usable from the same snapshot.
+The PR snapshot's raw `statusCheckRollup` does not carry `isRequired`, and
+`gh pr checks --required --json` returns only required checks that have already
+materialized. `wait pr --state green` must therefore read the complete policy
+from classic branch protection plus evaluated repository rulesets, then use
+the `gh pr checks` result only for state and producer-aware classification.
+Materialize every policy-required context absent from that result as
+`PENDING`. A failed policy lookup is not permission to use `mergeable` as a
+green proxy: mark the snapshot unknown and make the evaluator fail closed.
+State-only waits such as `--state merged` remain usable from the same snapshot.
 
 Long-lived `shipyard wait` ownership must survive brief token-helper and
 network preparation outages. Snapshot preparation retries only errors that are
