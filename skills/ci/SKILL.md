@@ -1294,8 +1294,30 @@ The orchestration, in order:
 1. `skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without a `SKILL.md` update or a `Skill-Update:` trailer on the tip commit.
 2. `version_bump_check.py --mode=apply` — rewrites `Cargo.toml` for CLI-surface bumps and `.claude-plugin/plugin.json` for plugin-surface bumps. The two version streams are independent per `RELEASING.md`.
 3. `git commit` + `gh pr create` + `shipyard ship`.
-4. With `[merge_steward].auto_handoff = true` on the protected base branch or explicit `--workstream-id`, write the exact-head server receipt and managed label immediately after PR creation, before validation begins. The PR branch cannot enable the project default. The fallback workstream is `OWNER/REPO#PR` and the fallback context is the PR URL; `--no-steward-handoff` is an explicit override.
-5. On merge, `.github/workflows/auto-release.yml` tags the CLI bump as `v<x.y.z>`. The existing tag-triggered `release.yml` builds the 5-platform binaries and publishes the GitHub Release.
+4. If `[pr.provenance]` is configured, run its exact argv with the submitting session's environment. A required hook must succeed before any durable handoff or validation dispatch.
+5. With `[merge_steward].auto_handoff = true` on the protected base branch or explicit `--workstream-id`, write the exact-head server receipt and managed label immediately after provenance, before validation begins. The PR branch cannot enable the project default. The fallback workstream is `OWNER/REPO#PR` and the fallback context is the PR URL; `--no-steward-handoff` is an explicit override.
+6. On merge, `.github/workflows/auto-release.yml` tags the CLI bump as `v<x.y.z>`. The existing tag-triggered `release.yml` builds the 5-platform binaries and publishes the GitHub Release.
+
+### Atomic PR provenance hook
+
+Use a repo-owned argv hook when PR labels/footer must survive a submitting agent
+being interrupted immediately after the server receipt:
+
+```toml
+[pr.provenance]
+command = ["whence", "--pr", "{pr}", "--auto"]
+required = true
+```
+
+The command is never shell-evaluated. Shipyard expands `{pr}`, `{repo}`,
+`{head}`, `{branch}`, `{base}`, and `{url}` per argument and also exports them as
+`SHIPYARD_PR_NUMBER`, `SHIPYARD_PR_REPO`, `SHIPYARD_PR_HEAD`,
+`SHIPYARD_PR_BRANCH`, `SHIPYARD_PR_BASE`, and `SHIPYARD_PR_URL`. It inherits the
+current agent/cmux/router environment so Whence can record truthful workstream,
+launcher, route, and router fields. A configured hook defaults to required and
+fails before the exact-head steward receipt, managed label, queue state, or
+validation dispatch. `shipyard ship --pr` never invokes it: a recovery session
+must not overwrite provenance captured by the original submitter.
 
 Never run `gh pr create` + release separately. Never run the gate scripts by hand.
 

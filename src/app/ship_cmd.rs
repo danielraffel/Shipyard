@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use serde_json::{Value, json};
 
@@ -66,6 +66,16 @@ pub(super) struct ShipCommandArgs {
     /// instead of dead-ending on `ShaDrift`. See Shipyard #346.
     pub(super) adopt_head: bool,
     pub(super) steward_handoff: Option<ShipStewardHandoff>,
+    /// Run configured PR provenance before any durable steward receipt or
+    /// validation dispatch. Enabled by `shipyard pr`, never by an explicit
+    /// `ship --pr` recovery that lacks the submitting session's context.
+    pub(super) invocation: ShipInvocation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ShipInvocation {
+    Direct,
+    PrCommand,
 }
 
 pub(super) struct ShipStewardHandoff {
@@ -78,6 +88,12 @@ struct AppliedStewardHandoff {
     workstream_id: String,
     context_url: Option<String>,
     head: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrProvenanceHook {
+    command: Vec<String>,
+    required: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -110,6 +126,18 @@ pub(super) fn ship_command<W: Write>(
     }
     let lane_policy = resolve_lane_policy(config, cwd);
     let pr_context = resolve_pr_context(config, &args, cwd, &branch, &lane_policy)?;
+    if args.invocation == ShipInvocation::PrCommand {
+        run_pr_provenance_hook(
+            config,
+            cwd,
+            stdout,
+            &repo,
+            &branch,
+            &pr_context.base_branch,
+            &sha,
+            &pr_context,
+        )?;
+    }
     let steward_handoff = apply_requested_steward_handoff(
         args.steward_handoff.as_ref(),
         &repo,
@@ -206,6 +234,133 @@ pub(super) fn ship_command<W: Write>(
         render_human(stdout, pr_context.number, &render_state, &diagnostics)?;
     }
     Ok(render_state.exit_code())
+}
+
+fn configured_pr_provenance_hook(
+    config: &LoadedConfig,
+) -> Result<Option<PrProvenanceHook>, CliFailure> {
+    let Some(value) = config.get("pr.provenance.command") else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Err(CliFailure::new(
+            2,
+            "pr.provenance.command must be a non-empty TOML string array",
+        ));
+    };
+    let command = items
+        .iter()
+        .map(|item| item.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| CliFailure::new(2, "pr.provenance.command must contain only strings"))?;
+    if command.is_empty() || command[0].is_empty() {
+        return Err(CliFailure::new(
+            2,
+            "pr.provenance.command must be a non-empty TOML string array",
+        ));
+    }
+    let required = config
+        .get("pr.provenance.required")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+    Ok(Some(PrProvenanceHook { command, required }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pr_provenance_hook<W: Write>(
+    config: &LoadedConfig,
+    cwd: &Path,
+    stdout: &mut W,
+    repo: &str,
+    branch: &str,
+    base: &str,
+    head: &str,
+    pr: &ResolvedPrContext,
+) -> Result<(), CliFailure> {
+    let Some(hook) = configured_pr_provenance_hook(config)? else {
+        return Ok(());
+    };
+    let pr_number = pr.number.to_string();
+    let pr_url = pr.pr_url.as_deref().unwrap_or_default();
+    let values = [
+        ("{pr}", pr_number.as_str()),
+        ("{repo}", repo),
+        ("{head}", head),
+        ("{branch}", branch),
+        ("{base}", base),
+        ("{url}", pr_url),
+    ];
+    let expand = |argument: &str| {
+        values
+            .iter()
+            .fold(argument.to_owned(), |expanded, (key, value)| {
+                expanded.replace(key, value)
+            })
+    };
+    let program = expand(&hook.command[0]);
+    let arguments = hook.command[1..]
+        .iter()
+        .map(|argument| expand(argument))
+        .collect::<Vec<_>>();
+    let output = Command::new(&program)
+        .args(&arguments)
+        .current_dir(cwd)
+        .env("SHIPYARD_PR_NUMBER", &pr_number)
+        .env("SHIPYARD_PR_REPO", repo)
+        .env("SHIPYARD_PR_HEAD", head)
+        .env("SHIPYARD_PR_BRANCH", branch)
+        .env("SHIPYARD_PR_BASE", base)
+        .env("SHIPYARD_PR_URL", pr_url)
+        .output();
+    match output {
+        Ok(result) if result.status.success() => {
+            writeln!(
+                stdout,
+                "▸ PR provenance hook completed for #{pr_number} at {}",
+                head.chars().take(12).collect::<String>()
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            Ok(())
+        }
+        Ok(result) => {
+            let diagnostic = if result.stderr.is_empty() {
+                &result.stdout
+            } else {
+                &result.stderr
+            };
+            let detail = String::from_utf8_lossy(diagnostic).trim().to_owned();
+            let message = format!(
+                "PR provenance hook failed for #{pr_number} at {} (exit {}): {}",
+                head.chars().take(12).collect::<String>(),
+                result.status.code().unwrap_or(1),
+                if detail.is_empty() {
+                    "no diagnostic output"
+                } else {
+                    &detail
+                }
+            );
+            if hook.required {
+                Err(CliFailure::new(1, message))
+            } else {
+                writeln!(stdout, "⚠︎ {message}")
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let message = format!(
+                "PR provenance hook failed to start for #{pr_number} at {}: {error}",
+                head.chars().take(12).collect::<String>()
+            );
+            if hook.required {
+                Err(CliFailure::new(1, message))
+            } else {
+                writeln!(stdout, "⚠︎ {message}")
+                    .map_err(|write_error| CliFailure::new(1, write_error.to_string()))?;
+                Ok(())
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1209,10 +1364,13 @@ mod tests {
 
     use toml::Table;
 
+    #[cfg(unix)]
+    use super::run_pr_provenance_hook;
     use super::{
-        SHIP_EXIT_MERGE_CLIENT_DEFECT, ShipCommandArgs, ShipRenderState, green_not_merged,
-        render_green_not_merged, render_green_not_merged_client_defect,
-        render_green_not_merged_flaky, render_green_not_merged_head_superseded, ship_command,
+        SHIP_EXIT_MERGE_CLIENT_DEFECT, ShipCommandArgs, ShipInvocation, ShipRenderState,
+        configured_pr_provenance_hook, green_not_merged, render_green_not_merged,
+        render_green_not_merged_client_defect, render_green_not_merged_flaky,
+        render_green_not_merged_head_superseded, ship_command,
     };
     use crate::app::cli::MergeResult;
     #[cfg(unix)]
@@ -1520,6 +1678,130 @@ mod tests {
         std::fs::set_permissions(path, permissions).expect("chmod");
     }
 
+    #[test]
+    fn provenance_hook_config_is_argv_only_and_required_by_default() {
+        let mut config = loaded_config(std::path::Path::new("."));
+        let extra = r#"
+            [pr.provenance]
+            command = ["whence", "--pr", "{pr}", "--auto"]
+        "#
+        .parse::<Table>()
+        .expect("hook TOML");
+        config.data.extend(extra);
+        let hook = configured_pr_provenance_hook(&config)
+            .expect("valid config")
+            .expect("configured hook");
+        assert_eq!(hook.command, ["whence", "--pr", "{pr}", "--auto"]);
+        assert!(hook.required);
+
+        config.data.insert(
+            "pr".to_owned(),
+            toml::Value::Table(
+                r#"[provenance]
+                   command = "whence --auto""#
+                    .parse::<Table>()
+                    .expect("invalid-shape fixture"),
+            ),
+        );
+        let error = configured_pr_provenance_hook(&config).expect_err("string must fail");
+        assert!(error.message().contains("TOML string array"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provenance_hook_gets_exact_pr_facts_before_handoff() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hook = temp.path().join("provenance-hook");
+        let log = temp.path().join("hook.log");
+        fake_gh(
+            &hook,
+            r#"log=$1
+shift
+printf '%s\n' "$SHIPYARD_PR_NUMBER|$SHIPYARD_PR_REPO|$SHIPYARD_PR_HEAD|$SHIPYARD_PR_BRANCH|$SHIPYARD_PR_BASE|$SHIPYARD_PR_URL|$*" > "$log""#,
+        );
+        let mut config = loaded_config(temp.path());
+        let extra = format!(
+            r#"[pr.provenance]
+command = [{hook:?}, {log:?}, "{{pr}}", "{{repo}}", "{{head}}", "{{branch}}", "{{base}}", "{{url}}"]
+required = true
+"#,
+            hook = hook.display().to_string(),
+            log = log.display().to_string(),
+        )
+        .parse::<Table>()
+        .expect("hook config");
+        config.data.extend(extra);
+        let pr = super::ResolvedPrContext {
+            number: 42,
+            base_branch: "main".to_owned(),
+            pr_url: Some("https://github.com/danielraffel/pulp/pull/42".to_owned()),
+            pr_title: Some("Fix".to_owned()),
+        };
+        let head = "a".repeat(40);
+        let mut stdout = Vec::new();
+        run_pr_provenance_hook(
+            &config,
+            temp.path(),
+            &mut stdout,
+            "danielraffel/pulp",
+            "feature/provenance",
+            "main",
+            &head,
+            &pr,
+        )
+        .expect("hook succeeds");
+        let recorded = std::fs::read_to_string(log).expect("hook log");
+        assert_eq!(
+            recorded.trim(),
+            format!(
+                "42|danielraffel/pulp|{head}|feature/provenance|main|https://github.com/danielraffel/pulp/pull/42|42 danielraffel/pulp {head} feature/provenance main https://github.com/danielraffel/pulp/pull/42"
+            )
+        );
+        assert!(
+            String::from_utf8(stdout)
+                .expect("utf8")
+                .contains("completed for #42")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_provenance_hook_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hook = temp.path().join("provenance-hook");
+        fake_gh(&hook, "printf 'missing provenance' >&2\nexit 7");
+        let mut config = loaded_config(temp.path());
+        let extra = format!(
+            r"[pr.provenance]
+command = [{hook:?}]
+",
+            hook = hook.display().to_string(),
+        )
+        .parse::<Table>()
+        .expect("hook config");
+        config.data.extend(extra);
+        let pr = super::ResolvedPrContext {
+            number: 42,
+            base_branch: "main".to_owned(),
+            pr_url: None,
+            pr_title: None,
+        };
+        let error = run_pr_provenance_hook(
+            &config,
+            temp.path(),
+            &mut Vec::new(),
+            "danielraffel/pulp",
+            "feature/provenance",
+            "main",
+            &"a".repeat(40),
+            &pr,
+        )
+        .expect_err("required hook must fail");
+        assert_eq!(error.code, 1);
+        assert!(error.message().contains("exit 7"));
+        assert!(error.message().contains("missing provenance"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn atomic_handoff_uses_pr_fallback_and_writes_status_before_label() {
@@ -1687,6 +1969,7 @@ esac"#,
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
+                invocation: ShipInvocation::Direct,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1764,6 +2047,7 @@ esac"#,
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
+                invocation: ShipInvocation::Direct,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -1813,6 +2097,7 @@ esac"#,
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
+                invocation: ShipInvocation::Direct,
             },
             &unreachable_ssh_config(temp.path()),
             &repo,
@@ -1868,6 +2153,7 @@ esac"#,
                 skip_targets: vec!["linux".to_owned()],
                 adopt_head: false,
                 steward_handoff: None,
+                invocation: ShipInvocation::Direct,
             },
             &local_and_unreachable_config(temp.path()),
             &repo,
@@ -1932,6 +2218,7 @@ exit 2
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
+                invocation: ShipInvocation::Direct,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -2034,6 +2321,7 @@ exit 2
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
+                invocation: ShipInvocation::Direct,
             },
             &loaded_config(temp.path()),
             &repo,
