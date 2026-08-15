@@ -4,6 +4,10 @@ use super::{
     StewardPullRequest, StewardRun, Value, is_admin_protection_denied,
     is_capacity_preemption_workflow, is_full_sha, is_private_free_entitlement,
 };
+use crate::required_check_policy::{
+    classic_required_checks, encode_path_segment as encode_policy_path_segment,
+    evaluated_required_checks as parse_evaluated_required_checks, normalize_required_checks,
+};
 
 pub(super) fn resolve_repos(mut repos: Vec<String>, cwd: &Path) -> Result<Vec<String>, CliFailure> {
     if repos.is_empty() {
@@ -161,28 +165,7 @@ fn required_checks_with_evaluated_rules(
     };
     let value: Value = serde_json::from_str(&raw)
         .map_err(|error| format!("required-check policy returned malformed JSON: {error}"))?;
-    let mut checks = value
-        .get("contexts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(|context| RequiredCheck {
-            context: context.to_owned(),
-            app_id: None,
-        })
-        .collect::<Vec<_>>();
-    if let Some(required) = value.get("checks").and_then(Value::as_array) {
-        for check in required {
-            let Some(context) = check.get("context").and_then(Value::as_str) else {
-                continue;
-            };
-            checks.push(RequiredCheck {
-                context: context.to_owned(),
-                app_id: optional_app_id(check, "app_id")?,
-            });
-        }
-    }
+    let mut checks = classic_required_checks(&value)?;
     checks.extend(evaluated_required_checks(evaluated_rules)?);
     Ok(normalize_required_checks(checks))
 }
@@ -206,87 +189,11 @@ pub(super) fn evaluated_branch_rules(
 }
 
 pub(super) fn encode_path_segment(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-    }
-    encoded
+    encode_policy_path_segment(value)
 }
 
 pub(super) fn evaluated_required_checks(value: &Value) -> Result<Vec<RequiredCheck>, String> {
-    let rules = evaluated_rules(value)?;
-    let checks = rules
-        .iter()
-        .filter(|rule| rule.get("type").and_then(Value::as_str) == Some("required_status_checks"))
-        .flat_map(|rule| {
-            rule.pointer("/parameters/required_status_checks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .map(|check| {
-            let context = check
-                .get("context")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "required status check missing context".to_owned())?;
-            Ok(RequiredCheck {
-                context: context.to_owned(),
-                app_id: optional_app_id(check, "integration_id")?,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(normalize_required_checks(checks))
-}
-
-fn evaluated_rules(value: &Value) -> Result<Vec<&Value>, String> {
-    let pages = value
-        .as_array()
-        .ok_or_else(|| "evaluated branch rules was not an array".to_owned())?;
-    Ok(if pages.iter().all(Value::is_array) {
-        pages
-            .iter()
-            .flat_map(|page| page.as_array().into_iter().flatten())
-            .collect()
-    } else {
-        pages.iter().collect()
-    })
-}
-
-fn normalize_required_checks(mut checks: Vec<RequiredCheck>) -> Vec<RequiredCheck> {
-    checks.sort();
-    checks.dedup();
-    let pinned_contexts = checks
-        .iter()
-        .filter(|check| check.app_id.is_some())
-        .map(|check| check.context.clone())
-        .collect::<Vec<_>>();
-    checks.retain(|check| {
-        check.app_id.is_some()
-            || !pinned_contexts
-                .iter()
-                .any(|context| context.eq_ignore_ascii_case(&check.context))
-    });
-    checks
-}
-
-fn optional_app_id(value: &Value, field: &str) -> Result<Option<u64>, String> {
-    match value.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => match value.as_i64() {
-            Some(-1) => Ok(None),
-            Some(app_id) if app_id >= 0 => u64::try_from(app_id)
-                .map(Some)
-                .map_err(|_| format!("required status check has invalid {field}")),
-            _ => Err(format!("required status check has invalid {field}")),
-        },
-    }
+    parse_evaluated_required_checks(value)
 }
 
 pub(super) fn merge_queue_snapshot(

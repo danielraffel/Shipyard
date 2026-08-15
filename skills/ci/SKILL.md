@@ -659,10 +659,14 @@ backoff inside the existing `--timeout` and reports the count as
 `transient_errors`; permanent credential/configuration failures still exit
 immediately.
 
-For `--state green`, Shipyard separately resolves GitHub's required-check set and
-annotates the rollup before evaluating it. Never infer requiredness from the raw
-`gh pr view --json statusCheckRollup` payload: that payload omits `isRequired`.
-If requiredness cannot be resolved, Shipyard exits 7 and does not report green.
+For `--state green`, Shipyard reads the authoritative required-check policy from
+both classic branch protection and evaluated repository rulesets, then uses
+`gh pr checks --required` only to observe which policy entries have actually
+materialized and their state. A policy-required context that has not appeared
+is emitted as `PENDING`; it is never silently omitted. Never infer completeness
+from the raw `gh pr view --json statusCheckRollup` payload or from the subset
+returned by `gh pr checks --required`. If the policy cannot be read, Shipyard
+exits 7 and does not report green.
 
 ### Before/after
 

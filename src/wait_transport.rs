@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
@@ -15,6 +15,11 @@ use serde_json::Value;
 
 use crate::gh::{GhAuthPolicy, GhClient, GhPrepareError, GhSupervision};
 use crate::identity::RuntimeMode;
+use crate::merge_steward::RequiredCheck;
+use crate::required_check_policy::{
+    classic_required_checks, encode_path_segment, evaluated_required_checks,
+    normalize_required_checks,
+};
 use crate::wait::TruthResult;
 
 const SNAPSHOT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -456,9 +461,25 @@ pub(crate) fn fetch_pr_snapshot_with_timeout(
             if !value.is_object() {
                 return Ok(None);
             }
+            let base = value
+                .get("baseRefName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
             let remaining = remaining_snapshot_timeout(timeout, started.elapsed());
-            match fetch_required_pr_checks(&client, repo, pr_number, cwd, remaining)? {
-                Some(required) => annotate_required_checks(&mut value, &required),
+            let policy = fetch_required_check_policy(&client, repo, &base, cwd, remaining)?;
+            match policy {
+                Some(required) => {
+                    let remaining = remaining_snapshot_timeout(timeout, started.elapsed());
+                    let materialized = fetch_materialized_required_checks(
+                        &client, repo, pr_number, cwd, remaining,
+                    )?;
+                    annotate_required_checks(
+                        &mut value,
+                        &required,
+                        materialized.as_deref().unwrap_or_default(),
+                    );
+                }
                 None => {
                     value["_required_checks_known"] = Value::Bool(false);
                 }
@@ -481,10 +502,59 @@ pub(crate) fn fetch_pr_snapshot_with_timeout(
 // particular, `merged` is not a supported field; a merged PR is represented by
 // `state == "MERGED"` and normalized by the evaluator.
 const PR_VIEW_JSON_FIELDS: &str =
-    "number,headRefOid,state,mergeable,mergeStateStatus,statusCheckRollup";
+    "number,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup";
 const PR_CHECKS_JSON_FIELDS: &str = "name,state,bucket,link";
 
-fn fetch_required_pr_checks(
+fn fetch_required_check_policy(
+    client: &GhClient,
+    repo: &str,
+    base: &str,
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Option<Vec<RequiredCheck>>> {
+    if base.is_empty() {
+        return Ok(None);
+    }
+    let started = Instant::now();
+    let encoded_base = encode_path_segment(base);
+    let evaluated_endpoint = format!("repos/{repo}/rules/branches/{encoded_base}");
+    let evaluated_output = run_gh_output(
+        client,
+        &["api", "--paginate", "--slurp", evaluated_endpoint.as_str()],
+        cwd,
+        timeout,
+    )?;
+    if !evaluated_output.status.success() {
+        return Ok(None);
+    }
+    let evaluated_value = serde_json::from_slice::<Value>(&evaluated_output.stdout)?;
+    let mut required = evaluated_required_checks(&evaluated_value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+
+    let classic_endpoint =
+        format!("repos/{repo}/branches/{encoded_base}/protection/required_status_checks");
+    let classic_output = run_gh_output(
+        client,
+        &["api", classic_endpoint.as_str()],
+        cwd,
+        remaining_snapshot_timeout(timeout, started.elapsed()),
+    )?;
+    if classic_output.status.success() {
+        let classic_value = serde_json::from_slice::<Value>(&classic_output.stdout)?;
+        required.extend(
+            classic_required_checks(&classic_value)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+        );
+    } else {
+        let stderr = String::from_utf8_lossy(&classic_output.stderr);
+        if !stderr.contains("HTTP 404") {
+            return Ok(None);
+        }
+    }
+    Ok(Some(normalize_required_checks(required)))
+}
+
+fn fetch_materialized_required_checks(
     client: &GhClient,
     repo: &str,
     pr_number: u64,
@@ -521,16 +591,16 @@ fn fetch_required_pr_checks(
     Ok(None)
 }
 
-fn annotate_required_checks(snapshot: &mut Value, required: &[Value]) {
+fn annotate_required_checks(
+    snapshot: &mut Value,
+    policy: &[RequiredCheck],
+    materialized: &[Value],
+) {
     let Some(snapshot) = snapshot.as_object_mut() else {
         return;
     };
     snapshot.insert("_required_checks_known".to_owned(), Value::Bool(true));
 
-    let required_names = required
-        .iter()
-        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
-        .collect::<BTreeSet<_>>();
     let rollup = snapshot
         .entry("statusCheckRollup")
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -538,42 +608,61 @@ fn annotate_required_checks(snapshot: &mut Value, required: &[Value]) {
         return;
     };
 
-    let mut matched_names = BTreeSet::new();
     for entry in rollup.iter_mut().filter_map(Value::as_object_mut) {
-        let name = entry
-            .get("name")
-            .or_else(|| entry.get("context"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let is_required = required_names.contains(name.as_str());
-        entry.insert("isRequired".to_owned(), Value::Bool(is_required));
-        if is_required {
-            matched_names.insert(name);
+        entry.insert("isRequired".to_owned(), Value::Bool(false));
+    }
+
+    let mut materialized_by_name = BTreeMap::<String, Vec<Value>>::new();
+    for entry in materialized {
+        if let Some(name) = entry.get("name").and_then(Value::as_str) {
+            materialized_by_name
+                .entry(name.to_owned())
+                .or_default()
+                .push(entry.clone());
         }
     }
 
-    for entry in required {
-        let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
-        if name.is_empty() || matched_names.contains(name) {
-            continue;
-        }
-        let state = entry.get("state").and_then(Value::as_str).unwrap_or("");
-        let conclusion = if matches!(
-            state.to_ascii_uppercase().as_str(),
-            "QUEUED" | "IN_PROGRESS" | "PENDING"
-        ) {
-            Value::Null
-        } else {
-            Value::String(state.to_owned())
-        };
-        rollup.push(serde_json::json!({
-            "name": name,
-            "state": state,
-            "conclusion": conclusion,
-            "isRequired": true,
-        }));
+    for required in policy {
+        let observed = materialized_by_name
+            .get_mut(&required.context)
+            .and_then(Vec::pop);
+        let state = observed
+            .as_ref()
+            .and_then(|entry| entry.get("state"))
+            .and_then(Value::as_str)
+            .filter(|state| !state.is_empty())
+            .unwrap_or("PENDING");
+        rollup.push(required_check_rollup_entry(&required.context, state));
     }
+
+    // A materialized check that GitHub classifies as required but which was
+    // absent from both policy APIs is still a blocker. Retaining it fails
+    // closed across transient policy-surface drift.
+    for (name, entries) in materialized_by_name {
+        for entry in entries {
+            let state = entry
+                .get("state")
+                .and_then(Value::as_str)
+                .filter(|state| !state.is_empty())
+                .unwrap_or("PENDING");
+            rollup.push(required_check_rollup_entry(&name, state));
+        }
+    }
+}
+
+fn required_check_rollup_entry(name: &str, state: &str) -> Value {
+    let upper = state.to_ascii_uppercase();
+    let conclusion = if matches!(upper.as_str(), "QUEUED" | "IN_PROGRESS" | "PENDING") {
+        Value::Null
+    } else {
+        Value::String(upper.clone())
+    };
+    serde_json::json!({
+        "name": name,
+        "state": upper,
+        "conclusion": conclusion,
+        "isRequired": true,
+    })
 }
 
 /// REST fallback for `fetch_pr_snapshot`. Synthesises the GraphQL-shape value
@@ -990,6 +1079,7 @@ mod tests {
     #[cfg(unix)]
     use crate::daemon_ipc::{IpcServer, IpcState};
     use crate::gh::GhPrepareError;
+    use crate::merge_steward::RequiredCheck;
     use crate::wait::TruthResult;
 
     #[cfg(unix)]
@@ -1543,6 +1633,11 @@ mod tests {
     fn pr_view_query_uses_only_supported_gh_json_fields() {
         assert!(PR_VIEW_JSON_FIELDS.split(',').any(|field| field == "state"));
         assert!(
+            PR_VIEW_JSON_FIELDS
+                .split(',')
+                .any(|field| field == "baseRefName")
+        );
+        assert!(
             !PR_VIEW_JSON_FIELDS
                 .split(',')
                 .any(|field| field == "merged")
@@ -1560,6 +1655,10 @@ mod tests {
         });
         annotate_required_checks(
             &mut snapshot,
+            &[RequiredCheck {
+                context: "macos".to_owned(),
+                app_id: Some(42),
+            }],
             &[serde_json::json!({
                 "name": "macos",
                 "state": "SUCCESS",
@@ -1568,8 +1667,11 @@ mod tests {
             })],
         );
         assert_eq!(snapshot["_required_checks_known"], true);
-        assert_eq!(snapshot["statusCheckRollup"][0]["isRequired"], true);
+        assert_eq!(snapshot["statusCheckRollup"][0]["isRequired"], false);
         assert_eq!(snapshot["statusCheckRollup"][1]["isRequired"], false);
+        assert_eq!(snapshot["statusCheckRollup"][2]["name"], "macos");
+        assert_eq!(snapshot["statusCheckRollup"][2]["isRequired"], true);
+        assert_eq!(snapshot["statusCheckRollup"][2]["conclusion"], "SUCCESS");
     }
 
     #[test]
@@ -1577,6 +1679,10 @@ mod tests {
         let mut snapshot = serde_json::json!({"statusCheckRollup": []});
         annotate_required_checks(
             &mut snapshot,
+            &[RequiredCheck {
+                context: "required-status".to_owned(),
+                app_id: None,
+            }],
             &[serde_json::json!({
                 "name": "required-status",
                 "state": "FAILURE",
@@ -1587,6 +1693,60 @@ mod tests {
         assert_eq!(snapshot["statusCheckRollup"][0]["name"], "required-status");
         assert_eq!(snapshot["statusCheckRollup"][0]["conclusion"], "FAILURE");
         assert_eq!(snapshot["statusCheckRollup"][0]["isRequired"], true);
+    }
+
+    #[test]
+    fn required_policy_materializes_missing_context_as_pending() {
+        let mut snapshot = serde_json::json!({
+            "statusCheckRollup": [
+                {"name": "advisory", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]
+        });
+        annotate_required_checks(
+            &mut snapshot,
+            &[
+                RequiredCheck {
+                    context: "present".to_owned(),
+                    app_id: Some(42),
+                },
+                RequiredCheck {
+                    context: "missing".to_owned(),
+                    app_id: Some(42),
+                },
+            ],
+            &[serde_json::json!({
+                "name": "present",
+                "state": "SUCCESS",
+                "bucket": "pass",
+                "link": "https://github.test/check/1"
+            })],
+        );
+        assert_eq!(snapshot["statusCheckRollup"][0]["isRequired"], false);
+        assert_eq!(snapshot["statusCheckRollup"][1]["name"], "present");
+        assert_eq!(snapshot["statusCheckRollup"][1]["conclusion"], "SUCCESS");
+        assert_eq!(snapshot["statusCheckRollup"][2]["name"], "missing");
+        assert_eq!(snapshot["statusCheckRollup"][2]["state"], "PENDING");
+        assert_eq!(snapshot["statusCheckRollup"][2]["conclusion"], Value::Null);
+    }
+
+    #[test]
+    fn same_name_advisory_cannot_substitute_for_missing_required_producer() {
+        let mut snapshot = serde_json::json!({
+            "statusCheckRollup": [
+                {"name": "macos", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]
+        });
+        annotate_required_checks(
+            &mut snapshot,
+            &[RequiredCheck {
+                context: "macos".to_owned(),
+                app_id: Some(42),
+            }],
+            &[],
+        );
+        assert_eq!(snapshot["statusCheckRollup"][0]["isRequired"], false);
+        assert_eq!(snapshot["statusCheckRollup"][1]["name"], "macos");
+        assert_eq!(snapshot["statusCheckRollup"][1]["state"], "PENDING");
     }
 
     #[test]
