@@ -4,7 +4,9 @@ All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 <a id="v0921"></a>
-## [0.92.1]
+## [0.92.1] - 2026-08-14
+
+- release: make local signing unattended ([#426](https://github.com/danielraffel/Shipyard/pull/426))
 
 <a id="v0920"></a>
 ## [0.92.0] - 2026-08-14
@@ -896,6 +898,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.92.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.92.1
 [0.92.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.92.0
 [0.91.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.91.3
 [0.91.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.91.2
