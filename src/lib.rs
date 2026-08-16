@@ -17,6 +17,8 @@ pub mod capacity;
 pub mod changed_surface;
 /// Changelog tag graph extraction and markdown rendering.
 pub mod changelog;
+/// Typed CI routing profile schema.
+pub mod ci_profile;
 /// Coarse failure classification shared by executors.
 pub mod classify;
 /// GitHub Actions workflow discovery, dispatch planning, and shell helpers.
