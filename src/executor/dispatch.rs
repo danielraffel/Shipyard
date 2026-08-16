@@ -286,6 +286,19 @@ pub enum DispatchError {
         /// Normalized backend name.
         backend: String,
     },
+    /// The active profile selects a target that `[targets]` does not define.
+    ///
+    /// Fails closed rather than silently narrowing to the targets that do
+    /// exist: a profile that names a lane nobody declared would otherwise
+    /// quietly drop that lane from validation.
+    ProfileTargetMissing {
+        /// Active profile name.
+        profile: String,
+        /// Target the profile selected.
+        target: String,
+        /// Targets the config actually declares.
+        declared: Vec<String>,
+    },
 }
 
 impl Display for DispatchError {
@@ -301,6 +314,19 @@ impl Display for DispatchError {
                     "invalid validation for target {target:?}: {reason}"
                 )
             }
+            Self::ProfileTargetMissing {
+                profile,
+                target,
+                declared,
+            } => write!(
+                formatter,
+                "profile {profile:?} selects target {target:?}, which is not defined in [targets] (declared: {})",
+                if declared.is_empty() {
+                    "none".to_owned()
+                } else {
+                    declared.join(", ")
+                }
+            ),
             Self::UnsupportedBackend { target, backend } => {
                 write!(
                     formatter,
@@ -748,17 +774,68 @@ pub fn resolve_targets(
 }
 
 /// Resolve every configured target from a merged TOML table.
+///
+/// When a profile is active and declares a target selection, only the targets
+/// it names are resolved. See [`resolve_targets_for_stage`] for the
+/// stage-aware form.
 pub fn resolve_targets_from_table(
     data: &Table,
     mode: ValidationMode,
+) -> Result<Vec<ResolvedTarget>, DispatchError> {
+    resolve_targets_for_stage(data, mode, None)
+}
+
+/// Resolve configured targets for one dispatch stage.
+///
+/// The active profile decides which targets participate. A profile may declare
+/// a single `targets` list, and may additionally declare per-stage lists under
+/// `stages.<stage>.targets` -- so gates can run on a short chain while tests
+/// run on a longer one. A stage without its own list falls back to the
+/// profile's `targets`, and a profile without either resolves every declared
+/// target, which is the behavior when no profile is active.
+///
+/// # Errors
+///
+/// Returns [`DispatchError::MissingTargets`] when the config has no `[targets]`
+/// table, or [`DispatchError::ProfileTargetMissing`] when the profile selects a
+/// target nobody declared.
+pub fn resolve_targets_for_stage(
+    data: &Table,
+    mode: ValidationMode,
+    stage: Option<&str>,
 ) -> Result<Vec<ResolvedTarget>, DispatchError> {
     let targets = data
         .get("targets")
         .and_then(Value::as_table)
         .ok_or(DispatchError::MissingTargets)?;
     let base_validation = resolve_validation_table(data, mode);
-    targets
-        .iter()
+    let selection = active_profile_selection(data, stage);
+
+    let ordered: Vec<(&String, &Value)> = match &selection {
+        Some(ProfileSelection { profile, names }) => {
+            let mut resolved = Vec::with_capacity(names.len());
+            for name in names {
+                let value =
+                    targets
+                        .get(name)
+                        .ok_or_else(|| DispatchError::ProfileTargetMissing {
+                            profile: profile.clone(),
+                            target: name.clone(),
+                            declared: targets.keys().cloned().collect(),
+                        })?;
+                let key = targets
+                    .get_key_value(name)
+                    .map(|(key, _)| key)
+                    .expect("target present");
+                resolved.push((key, value));
+            }
+            resolved
+        }
+        None => targets.iter().collect(),
+    };
+
+    ordered
+        .into_iter()
         .map(|(name, value)| {
             let table = value.as_table().ok_or_else(|| {
                 invalid_target(name, "target entry must be a TOML table".to_owned())
@@ -766,6 +843,59 @@ pub fn resolve_targets_from_table(
             resolve_target(data, name, table, &base_validation)
         })
         .collect()
+}
+
+/// A target selection contributed by the active profile.
+struct ProfileSelection {
+    profile: String,
+    names: Vec<String>,
+}
+
+/// Read the active profile's target selection for a stage, if it narrows the set.
+///
+/// Returns `None` when no profile is active, the profile is undefined, or it
+/// declares no targets -- in every one of those cases the full declared target
+/// set is the correct answer, so an absent profile can never silently shrink
+/// what gets validated.
+fn active_profile_selection(data: &Table, stage: Option<&str>) -> Option<ProfileSelection> {
+    let profile_name = data
+        .get("project")
+        .and_then(Value::as_table)
+        .and_then(|project| project.get("profile"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())?;
+    let profile = data
+        .get("profiles")
+        .and_then(Value::as_table)
+        .and_then(|profiles| profiles.get(profile_name))
+        .and_then(Value::as_table)?;
+
+    let stage_names = stage.and_then(|stage| {
+        profile
+            .get("stages")
+            .and_then(Value::as_table)
+            .and_then(|stages| stages.get(stage))
+            .and_then(Value::as_table)
+            .and_then(profile_target_names)
+    });
+    let names = stage_names.or_else(|| profile_target_names(profile))?;
+
+    Some(ProfileSelection {
+        profile: profile_name.to_owned(),
+        names,
+    })
+}
+
+/// Read a non-empty `targets` string array from a profile or stage table.
+fn profile_target_names(table: &Table) -> Option<Vec<String>> {
+    let names: Vec<String> = table
+        .get("targets")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect();
+    (!names.is_empty()).then_some(names)
 }
 
 fn resolve_target(
@@ -1809,7 +1939,10 @@ mod tests {
     use chrono::{Duration, Utc};
     use toml::Table;
 
-    use super::{ResolvedBackend, ResolvedValidation, resolve_targets_from_table};
+    use super::{
+        DispatchError, ResolvedBackend, ResolvedValidation, resolve_targets_for_stage,
+        resolve_targets_from_table,
+    };
     use crate::executor::ssh::SshValidation;
     use crate::executor::ssh_windows::WindowsValidation;
     use crate::host_pool::{HostPoolLeaseRequest, HostPoolLeaseStore, default_lease_path};
@@ -2515,5 +2648,176 @@ mod tests {
         )
         .expect("target")
         .remove(0)
+    }
+
+    /// Config with three targets and an optional profile block.
+    fn profile_config(profile_block: &str) -> Table {
+        format!(
+            r#"
+[project]
+name = "demo"
+{profile_block}
+
+[targets.mac]
+backend = "local"
+platform = "macos-arm64"
+
+[targets.ubuntu]
+backend = "local"
+platform = "linux-arm64"
+
+[targets.windows]
+backend = "local"
+platform = "windows-x64"
+
+[validation.default]
+command = "true"
+"#
+        )
+        .parse()
+        .expect("config toml")
+    }
+
+    fn resolved_names(config: &Table, stage: Option<&str>) -> Vec<String> {
+        resolve_targets_for_stage(config, ValidationMode::Full, stage)
+            .expect("targets resolve")
+            .into_iter()
+            .map(|target| target.name)
+            .collect()
+    }
+
+    #[test]
+    fn control_with_no_active_profile_every_declared_target_resolves() {
+        // Negative control for the profile tests below: proves a narrowed
+        // result is the profile selecting, not the fixture losing targets.
+        let config = profile_config("");
+
+        assert_eq!(
+            resolved_names(&config, None),
+            vec!["mac".to_owned(), "ubuntu".to_owned(), "windows".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_active_profile_selects_only_its_own_targets_for_dispatch() {
+        let config = profile_config(
+            r#"profile = "local-infra"
+
+[profiles.local-infra]
+targets = ["mac", "ubuntu"]
+"#,
+        );
+
+        assert_eq!(
+            resolved_names(&config, None),
+            vec!["mac".to_owned(), "ubuntu".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_profile_selection_preserves_its_declared_order() {
+        // The chain is a fallback order, so it must not be re-sorted into the
+        // config's alphabetical target order.
+        let config = profile_config(
+            r#"profile = "local-infra"
+
+[profiles.local-infra]
+targets = ["windows", "mac"]
+"#,
+        );
+
+        assert_eq!(
+            resolved_names(&config, None),
+            vec!["windows".to_owned(), "mac".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_profile_that_declares_no_targets_does_not_narrow_dispatch() {
+        // focus_platforms-only profiles predate target selection and must keep
+        // resolving the full set rather than silently resolving nothing.
+        let config = profile_config(
+            r#"profile = "local-infra"
+
+[profiles.local-infra]
+focus_platforms = ["macos"]
+"#,
+        );
+
+        assert_eq!(
+            resolved_names(&config, None),
+            vec!["mac".to_owned(), "ubuntu".to_owned(), "windows".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_undefined_active_profile_does_not_narrow_dispatch() {
+        let config = profile_config(r#"profile = "does-not-exist""#);
+
+        assert_eq!(
+            resolved_names(&config, None),
+            vec!["mac".to_owned(), "ubuntu".to_owned(), "windows".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_profile_selecting_an_undeclared_target_fails_closed() {
+        let config = profile_config(
+            r#"profile = "local-infra"
+
+[profiles.local-infra]
+targets = ["mac", "typo-target"]
+"#,
+        );
+
+        let error = resolve_targets_for_stage(&config, ValidationMode::Full, None)
+            .expect_err("undeclared target must fail closed");
+
+        let DispatchError::ProfileTargetMissing {
+            profile, target, ..
+        } = error
+        else {
+            panic!("expected ProfileTargetMissing, got {error:?}");
+        };
+        assert_eq!(profile, "local-infra");
+        assert_eq!(target, "typo-target");
+    }
+
+    #[test]
+    fn a_stage_specific_selection_overrides_the_profile_default() {
+        let config = profile_config(
+            r#"profile = "local-infra"
+
+[profiles.local-infra]
+targets = ["mac", "ubuntu", "windows"]
+
+[profiles.local-infra.stages.gates]
+targets = ["mac"]
+"#,
+        );
+
+        assert_eq!(
+            resolved_names(&config, Some("gates")),
+            vec!["mac".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_stage_without_its_own_selection_falls_back_to_the_profile_default() {
+        let config = profile_config(
+            r#"profile = "local-infra"
+
+[profiles.local-infra]
+targets = ["mac", "ubuntu"]
+
+[profiles.local-infra.stages.gates]
+targets = ["mac"]
+"#,
+        );
+
+        assert_eq!(
+            resolved_names(&config, Some("validate")),
+            vec!["mac".to_owned(), "ubuntu".to_owned()]
+        );
     }
 }
