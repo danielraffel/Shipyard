@@ -36,6 +36,7 @@ mod metrics_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
+mod profile_apply_cmd;
 mod quarantine_cmd;
 mod queue_cmd;
 mod queue_observer_cmd;
@@ -179,7 +180,7 @@ fn dispatch<W: Write, E: Write>(
             return config_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Ci { command } => {
-            return ci_command(command, &cwd, cli.json, stdout);
+            return ci_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Metrics { command } => {
             return metrics_command(*command, &runtime_paths.state_dir, cli.json, stdout);

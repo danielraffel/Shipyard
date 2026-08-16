@@ -88,6 +88,8 @@ pub mod preflight;
 /// Prepared-state cache for warm stage reruns.
 pub mod prepared_state;
 mod process;
+/// Proof gates for applying a routing profile to GitHub variables.
+pub mod profile_apply;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
 /// Stable read-only GitHub queue snapshots, state hashing, and delta tracking.

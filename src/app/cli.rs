@@ -488,6 +488,34 @@ pub(super) enum CiProfileCommand {
         #[arg(long = "profile-file")]
         profile_file: Option<PathBuf>,
     },
+    /// Proof-gate a profile's lanes and write the GitHub routing variables.
+    ///
+    /// Dry-run by default: prints every gate and what would be written, then
+    /// stops. Pass --apply to actually write. A lane that fails any gate is
+    /// never written, with or without --apply.
+    Apply {
+        /// Profile name.
+        name: String,
+        /// Owner/repo slug.
+        #[arg(long)]
+        repo: String,
+        /// Profile context to apply: `pr`, `merge_group`, `release`, `coverage`.
+        #[arg(long)]
+        context: String,
+        /// Actually write the variables. Without it, nothing is mutated.
+        #[arg(long)]
+        apply: bool,
+        /// How stale dispatch evidence may be, in days.
+        #[arg(long = "max-evidence-age-days", default_value_t = crate::profile_apply::DEFAULT_EVIDENCE_MAX_AGE_DAYS)]
+        max_evidence_age_days: u32,
+        /// Topology checker to run. Defaults to the repo's standard path.
+        #[arg(long = "topology-check")]
+        topology_check: Option<PathBuf>,
+        /// Explicit profile TOML path. Defaults to .tartci/<name>.toml,
+        /// .shipyard/ci-profiles/<name>.toml, then ci-profiles/<name>.toml.
+        #[arg(long = "profile-file")]
+        profile_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

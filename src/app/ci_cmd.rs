@@ -74,6 +74,7 @@ struct VariableChange {
 
 pub(super) fn ci_command<W: Write>(
     command: CiCommand,
+    mode: crate::identity::RuntimeMode,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
@@ -114,6 +115,34 @@ pub(super) fn ci_command<W: Write>(
                         .map_err(|error| CliFailure::new(1, error.to_string()))?;
                 }
                 Ok(ExitCode::SUCCESS)
+            }
+            crate::app::cli::CiProfileCommand::Apply {
+                name,
+                repo,
+                context,
+                apply,
+                max_evidence_age_days,
+                topology_check,
+                profile_file,
+            } => {
+                let config = crate::config::LoadedConfig::load_from_cwd(mode, cwd)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+                let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
+                super::profile_apply_cmd::profile_apply_command(
+                    super::profile_apply_cmd::ProfileApplyArgs {
+                        name,
+                        repo,
+                        context,
+                        apply,
+                        max_evidence_age_days,
+                        topology_check,
+                        profile_file,
+                    },
+                    cwd,
+                    &actions,
+                    json,
+                    stdout,
+                )
             }
         },
     }
