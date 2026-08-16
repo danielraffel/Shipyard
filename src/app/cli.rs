@@ -237,6 +237,10 @@ pub(super) enum Command {
         /// Continue even when preflight cannot reach a backend.
         #[arg(long = "allow-unreachable-targets")]
         allow_unreachable_targets: bool,
+        /// Continue even when this host has not converged to the declared
+        /// fleet epoch.
+        #[arg(long = "allow-fleet-epoch-drift")]
+        allow_fleet_epoch_drift: bool,
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
@@ -274,6 +278,10 @@ pub(super) enum Command {
         /// Continue even when preflight cannot reach a backend.
         #[arg(long = "allow-unreachable-targets")]
         allow_unreachable_targets: bool,
+        /// Continue even when this host has not converged to the declared
+        /// fleet epoch.
+        #[arg(long = "allow-fleet-epoch-drift")]
+        allow_fleet_epoch_drift: bool,
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,
@@ -297,6 +305,10 @@ pub(super) enum Command {
         /// Continue even when preflight cannot reach a backend.
         #[arg(long = "allow-unreachable-targets")]
         allow_unreachable_targets: bool,
+        /// Continue even when this host has not converged to the declared
+        /// fleet epoch.
+        #[arg(long = "allow-fleet-epoch-drift")]
+        allow_fleet_epoch_drift: bool,
         /// Skip a target after preflight.
         #[arg(long = "skip-target")]
         skip_targets: Vec<String>,

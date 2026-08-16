@@ -43,6 +43,8 @@ pub mod doctor;
 pub mod evidence;
 /// Local and remote executor support modules.
 pub mod executor;
+/// Fail-closed check that a host has converged to the declared fleet epoch.
+pub mod fleet_epoch;
 /// Repo-local gate script resolution for `shipyard pr`.
 pub mod gate_scripts;
 /// Shared GitHub CLI command boundary and auth resolution.

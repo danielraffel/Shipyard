@@ -15,8 +15,8 @@ use crate::job::{Priority, ValidationMode};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 use crate::preflight::{
-    EXIT_BACKEND_UNREACHABLE, EXIT_HOST_UNHEALTHY, ShipPreflightError, ShipPreflightOptions,
-    collect_ship_preflight_with_options,
+    EXIT_BACKEND_UNREACHABLE, EXIT_FLEET_EPOCH_DRIFT, EXIT_HOST_UNHEALTHY, ShipPreflightError,
+    ShipPreflightOptions, collect_ship_preflight_with_options,
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
@@ -30,6 +30,8 @@ pub(super) struct RunCommandArgs {
     pub(super) resume_from: Option<String>,
     pub(super) root_mismatch: RootMismatchPolicy,
     pub(super) reachability: ReachabilityPolicy,
+    /// Proceed even when this host has not converged to the declared fleet epoch.
+    pub(super) allow_fleet_epoch_drift: bool,
     pub(super) skip_targets: Vec<String>,
     pub(super) warm: WarmPolicy,
     pub(super) tree_drift: TreeDriftPolicy,
@@ -140,6 +142,7 @@ pub(super) fn run_command<W: Write>(
         ShipPreflightOptions {
             allow_root_mismatch: args.root_mismatch == RootMismatchPolicy::Allow,
             allow_unreachable_targets: args.reachability == ReachabilityPolicy::AllowUnreachable,
+            allow_fleet_epoch_drift: args.allow_fleet_epoch_drift,
         },
     )
     .map_err(|error| preflight_failure(&error))?;
@@ -222,6 +225,7 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
         ShipPreflightError::RootMismatch { .. } => 1,
         ShipPreflightError::BackendUnreachable { .. } => EXIT_BACKEND_UNREACHABLE,
         ShipPreflightError::HostUnhealthy { .. } => EXIT_HOST_UNHEALTHY,
+        ShipPreflightError::FleetEpochDrift { .. } => EXIT_FLEET_EPOCH_DRIFT,
     };
     CliFailure::new(code, error.to_string())
 }
@@ -527,6 +531,7 @@ mod tests {
             resume_from: None,
             root_mismatch: RootMismatchPolicy::Enforce,
             reachability: ReachabilityPolicy::Enforce,
+            allow_fleet_epoch_drift: false,
             skip_targets: Vec::new(),
             warm: WarmPolicy::Disabled,
             tree_drift: TreeDriftPolicy::from_flag(allow_tree_drift),
