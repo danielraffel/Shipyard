@@ -19,15 +19,18 @@
 //! ahead of this host's receipt blocks anything.
 
 use std::fmt::{Display, Formatter};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Serialize;
 
 /// Manifest path relative to the repository root.
 pub const MANIFEST_RELATIVE_PATH: &str = "planning/fleet/manifest.toml";
 
-/// Receipt directory relative to the repository root.
-pub const RECEIPT_RELATIVE_DIR: &str = ".shipyard.local/fleet-receipts";
+/// Default receipt directory, relative to the repository root.
+///
+/// The manifest may override it via `meta.receipts_dir`; that value wins so
+/// the publisher (`tools/fleet/apply.sh`) and this reader cannot drift apart.
+pub const DEFAULT_RECEIPT_RELATIVE_DIR: &str = "planning/fleet/receipts";
 
 /// Whether this host has converged to the declared fleet epoch.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -105,72 +108,102 @@ impl Display for FleetEpochStatus {
     }
 }
 
-/// Check whether `host` has converged to the epoch declared under `repo_root`.
+/// Check whether this machine has converged to the epoch declared under
+/// `repo_root`.
+///
+/// `machine` is the local machine name (`hostname -s`). Receipts carry both a
+/// stable fleet host id (`macstudio`) and the machine's hostname
+/// (`Daniels-Mac-Studio`); either may match, so a host keeps its identity when
+/// the machine is renamed.
 #[must_use]
-pub fn check(repo_root: &Path, host: &str) -> FleetEpochStatus {
+pub fn check(repo_root: &Path, machine: &str) -> FleetEpochStatus {
     let manifest_path = repo_root.join(MANIFEST_RELATIVE_PATH);
     if !manifest_path.exists() {
         return FleetEpochStatus::NotConfigured {
             detail: format!("{} does not exist", manifest_path.display()),
         };
     }
-    let Some(declared) = read_declared_epoch(&manifest_path) else {
-        return match std::fs::read_to_string(&manifest_path) {
-            Ok(_) => FleetEpochStatus::NotConfigured {
-                detail: format!("{} declares no epoch", manifest_path.display()),
-            },
-            Err(error) => FleetEpochStatus::Unobservable {
+    let manifest = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(error) => {
+            return FleetEpochStatus::Unobservable {
                 detail: format!("cannot read {}: {error}", manifest_path.display()),
-            },
+            };
+        }
+    };
+    let Ok(manifest) = manifest.parse::<toml::Table>() else {
+        return FleetEpochStatus::Unobservable {
+            detail: format!("cannot parse {}", manifest_path.display()),
+        };
+    };
+    let Some(declared) = manifest
+        .get("epoch")
+        .and_then(toml::Value::as_integer)
+        .and_then(|epoch| u64::try_from(epoch).ok())
+    else {
+        return FleetEpochStatus::NotConfigured {
+            detail: format!("{} declares no epoch", manifest_path.display()),
         };
     };
 
-    match read_applied_epoch(&receipt_path(repo_root, host)) {
+    let receipts_dir = repo_root.join(
+        manifest
+            .get("meta")
+            .and_then(toml::Value::as_table)
+            .and_then(|meta| meta.get("receipts_dir"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or(DEFAULT_RECEIPT_RELATIVE_DIR),
+    );
+
+    match read_applied_epoch(&receipts_dir, machine) {
         Ok(Some(applied)) if applied >= declared => {
             FleetEpochStatus::Converged { declared, applied }
         }
         Ok(applied) => FleetEpochStatus::Behind {
             declared,
             applied,
-            host: host.to_owned(),
+            host: machine.to_owned(),
         },
         Err(detail) => FleetEpochStatus::Unobservable { detail },
     }
 }
 
-/// Path of the receipt a host writes after applying the manifest.
-#[must_use]
-pub fn receipt_path(repo_root: &Path, host: &str) -> PathBuf {
-    repo_root
-        .join(RECEIPT_RELATIVE_DIR)
-        .join(format!("{host}.toml"))
-}
-
-fn read_declared_epoch(path: &Path) -> Option<u64> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let table = text.parse::<toml::Table>().ok()?;
-    table.get("epoch")?.as_integer()?.try_into().ok()
-}
-
-/// Read the epoch a host recorded, distinguishing "never applied" from
-/// "receipt exists but is unreadable".
-fn read_applied_epoch(path: &Path) -> Result<Option<u64>, String> {
-    if !path.exists() {
+/// Find this machine's receipt and read the epoch it converged to.
+///
+/// Returns `Ok(None)` when no receipt claims this machine. A receipt that
+/// exists but cannot be read is an error, never a miss: an unreadable receipt
+/// is not evidence that this host is unconverged, it is evidence that we do
+/// not know, and the two must stay distinguishable.
+fn read_applied_epoch(receipts_dir: &Path, machine: &str) -> Result<Option<u64>, String> {
+    let Ok(entries) = std::fs::read_dir(receipts_dir) else {
+        // A missing receipts directory means nothing has ever applied here.
         return Ok(None);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read receipt {}: {error}", path.display()))?;
+        let receipt: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("cannot parse receipt {}: {error}", path.display()))?;
+        let matches_machine = ["hostname", "host"].iter().any(|field| {
+            receipt
+                .get(*field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(machine))
+        });
+        if !matches_machine {
+            continue;
+        }
+        let epoch = receipt
+            .get("epoch")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("receipt {} declares no integer epoch", path.display()))?;
+        return Ok(Some(epoch));
     }
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("cannot read receipt {}: {error}", path.display()))?;
-    let table = text
-        .parse::<toml::Table>()
-        .map_err(|error| format!("cannot parse receipt {}: {error}", path.display()))?;
-    let epoch = table
-        .get("epoch")
-        .ok_or_else(|| format!("receipt {} declares no epoch", path.display()))?
-        .as_integer()
-        .ok_or_else(|| format!("receipt {} epoch is not an integer", path.display()))?;
-    u64::try_from(epoch)
-        .map(Some)
-        .map_err(|_| format!("receipt {} epoch is negative", path.display()))
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -179,7 +212,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{FleetEpochStatus, check, receipt_path};
+    use super::{FleetEpochStatus, check};
 
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
@@ -190,13 +223,24 @@ mod tests {
         write(&root.join(super::MANIFEST_RELATIVE_PATH), body);
     }
 
+    /// Write a receipt in the shape `tools/fleet/apply.sh` actually emits:
+    /// JSON, carrying both the stable fleet host id and the machine hostname.
+    fn seed_receipt(root: &Path, host: &str, hostname: &str, epoch: u64) {
+        write(
+            &root
+                .join(super::DEFAULT_RECEIPT_RELATIVE_DIR)
+                .join(format!("{host}.json")),
+            &format!(r#"{{"host": "{host}", "hostname": "{hostname}", "epoch": {epoch}}}"#),
+        );
+    }
+
     #[test]
     fn a_repo_with_no_manifest_is_not_participating() {
         // Absence must never block: most repositories will never have a fleet
         // manifest, and this check must not turn that into a failure.
         let sandbox = TempDir::new().expect("tempdir");
 
-        let status = check(sandbox.path(), "m3");
+        let status = check(sandbox.path(), "Daniels-Mac-Studio");
 
         assert!(matches!(status, FleetEpochStatus::NotConfigured { .. }));
         assert!(!status.blocks());
@@ -205,9 +249,9 @@ mod tests {
     #[test]
     fn a_manifest_without_an_epoch_is_not_participating() {
         let sandbox = TempDir::new().expect("tempdir");
-        seed_manifest(sandbox.path(), "[hosts.m3]\ntart_home = \"/x\"\n");
+        seed_manifest(sandbox.path(), "[hosts.macstudio]\ntart_home = \"/x\"\n");
 
-        let status = check(sandbox.path(), "m3");
+        let status = check(sandbox.path(), "Daniels-Mac-Studio");
 
         assert!(matches!(status, FleetEpochStatus::NotConfigured { .. }));
         assert!(!status.blocks());
@@ -219,9 +263,9 @@ mod tests {
         // gap, not a fixture that can never converge.
         let sandbox = TempDir::new().expect("tempdir");
         seed_manifest(sandbox.path(), "epoch = 7\n");
-        write(&receipt_path(sandbox.path(), "m3"), "epoch = 7\n");
+        seed_receipt(sandbox.path(), "macstudio", "Daniels-Mac-Studio", 7);
 
-        let status = check(sandbox.path(), "m3");
+        let status = check(sandbox.path(), "Daniels-Mac-Studio");
 
         assert_eq!(
             status,
@@ -234,30 +278,58 @@ mod tests {
     }
 
     #[test]
-    fn a_host_ahead_of_the_manifest_is_still_converged() {
-        // A host that applied a newer epoch (e.g. mid-rollout, before the
-        // manifest commit landed in this checkout) is not stale.
+    fn a_receipt_is_matched_by_its_stable_host_id_too() {
+        // Callers may pass either the machine hostname or the fleet host id,
+        // so a machine rename does not orphan a converged host.
         let sandbox = TempDir::new().expect("tempdir");
         seed_manifest(sandbox.path(), "epoch = 7\n");
-        write(&receipt_path(sandbox.path(), "m3"), "epoch = 9\n");
+        seed_receipt(sandbox.path(), "macstudio", "Daniels-Mac-Studio", 7);
 
-        assert!(!check(sandbox.path(), "m3").blocks());
+        assert!(!check(sandbox.path(), "macstudio").blocks());
+    }
+
+    #[test]
+    fn the_manifest_can_relocate_the_receipts_directory() {
+        // apply.sh honors meta.receipts_dir; if this reader did not, the two
+        // halves would silently stop meeting.
+        let sandbox = TempDir::new().expect("tempdir");
+        seed_manifest(
+            sandbox.path(),
+            "epoch = 7\n\n[meta]\nreceipts_dir = \"custom/receipts\"\n",
+        );
+        write(
+            &sandbox.path().join("custom/receipts/macstudio.json"),
+            r#"{"host": "macstudio", "hostname": "Daniels-Mac-Studio", "epoch": 7}"#,
+        );
+
+        assert!(!check(sandbox.path(), "Daniels-Mac-Studio").blocks());
+    }
+
+    #[test]
+    fn a_host_ahead_of_the_manifest_is_still_converged() {
+        // A host that applied a newer epoch (mid-rollout, before the manifest
+        // commit landed in this checkout) is not stale.
+        let sandbox = TempDir::new().expect("tempdir");
+        seed_manifest(sandbox.path(), "epoch = 7\n");
+        seed_receipt(sandbox.path(), "macstudio", "Daniels-Mac-Studio", 9);
+
+        assert!(!check(sandbox.path(), "Daniels-Mac-Studio").blocks());
     }
 
     #[test]
     fn a_host_behind_the_manifest_blocks() {
         let sandbox = TempDir::new().expect("tempdir");
         seed_manifest(sandbox.path(), "epoch = 7\n");
-        write(&receipt_path(sandbox.path(), "m3"), "epoch = 6\n");
+        seed_receipt(sandbox.path(), "macstudio", "Daniels-Mac-Studio", 6);
 
-        let status = check(sandbox.path(), "m3");
+        let status = check(sandbox.path(), "Daniels-Mac-Studio");
 
         assert_eq!(
             status,
             FleetEpochStatus::Behind {
                 declared: 7,
                 applied: Some(6),
-                host: "m3".to_owned(),
+                host: "Daniels-Mac-Studio".to_owned(),
             }
         );
         assert!(status.blocks());
@@ -272,14 +344,14 @@ mod tests {
         let sandbox = TempDir::new().expect("tempdir");
         seed_manifest(sandbox.path(), "epoch = 7\n");
 
-        let status = check(sandbox.path(), "m3");
+        let status = check(sandbox.path(), "Daniels-Mac-Studio");
 
         assert_eq!(
             status,
             FleetEpochStatus::Behind {
                 declared: 7,
                 applied: None,
-                host: "m3".to_owned(),
+                host: "Daniels-Mac-Studio".to_owned(),
             }
         );
         assert!(status.blocks());
@@ -287,17 +359,20 @@ mod tests {
 
     #[test]
     fn an_unreadable_receipt_blocks_rather_than_passing() {
-        // The property this whole module exists for: "could not check" must
-        // never be reported as "fine". A malformed receipt is not evidence of
+        // The property this module exists for: "could not check" must never be
+        // reported as "fine". A malformed receipt is not evidence of
         // convergence.
         let sandbox = TempDir::new().expect("tempdir");
         seed_manifest(sandbox.path(), "epoch = 7\n");
         write(
-            &receipt_path(sandbox.path(), "m3"),
-            "this is not valid toml = = =\n",
+            &sandbox
+                .path()
+                .join(super::DEFAULT_RECEIPT_RELATIVE_DIR)
+                .join("macstudio.json"),
+            "{not valid json",
         );
 
-        let status = check(sandbox.path(), "m3");
+        let status = check(sandbox.path(), "Daniels-Mac-Studio");
 
         assert!(
             matches!(status, FleetEpochStatus::Unobservable { .. }),
@@ -311,11 +386,14 @@ mod tests {
         let sandbox = TempDir::new().expect("tempdir");
         seed_manifest(sandbox.path(), "epoch = 7\n");
         write(
-            &receipt_path(sandbox.path(), "m3"),
-            "applied_at = \"now\"\n",
+            &sandbox
+                .path()
+                .join(super::DEFAULT_RECEIPT_RELATIVE_DIR)
+                .join("macstudio.json"),
+            r#"{"host": "macstudio", "hostname": "Daniels-Mac-Studio"}"#,
         );
 
-        assert!(check(sandbox.path(), "m3").blocks());
+        assert!(check(sandbox.path(), "Daniels-Mac-Studio").blocks());
     }
 
     #[test]
@@ -323,12 +401,37 @@ mod tests {
         // One converged host must not vouch for another.
         let sandbox = TempDir::new().expect("tempdir");
         seed_manifest(sandbox.path(), "epoch = 7\n");
-        write(&receipt_path(sandbox.path(), "m3"), "epoch = 7\n");
+        seed_receipt(sandbox.path(), "macstudio", "Daniels-Mac-Studio", 7);
 
-        assert!(!check(sandbox.path(), "m3").blocks());
+        assert!(!check(sandbox.path(), "Daniels-Mac-Studio").blocks());
         assert!(
             check(sandbox.path(), "m5").blocks(),
-            "m5 has no receipt and must not inherit m3's convergence"
+            "m5 has no receipt and must not inherit macstudio's convergence"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_hosts_malformed_receipt_does_not_block_this_host() {
+        // Reading every file in the directory must not let a sibling host's
+        // broken receipt take this host down with it... but it also must not
+        // be silently skipped. Current behavior: a malformed receipt anywhere
+        // is unobservable, which is the conservative direction.
+        let sandbox = TempDir::new().expect("tempdir");
+        seed_manifest(sandbox.path(), "epoch = 7\n");
+        seed_receipt(sandbox.path(), "macstudio", "Daniels-Mac-Studio", 7);
+        write(
+            &sandbox
+                .path()
+                .join(super::DEFAULT_RECEIPT_RELATIVE_DIR)
+                .join("m5.json"),
+            "{not valid json",
+        );
+
+        let status = check(sandbox.path(), "Daniels-Mac-Studio");
+
+        assert!(
+            status.blocks(),
+            "a malformed receipt in the directory is unobservable, not ignorable: {status:?}"
         );
     }
 }
