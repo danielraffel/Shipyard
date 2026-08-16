@@ -7,6 +7,7 @@ use toml::{Table, Value};
 
 use crate::app::CliFailure;
 use crate::app::cli::CiCommand;
+use crate::ci_profile::{CiProfile, HealthLease, HealthLeaseFields};
 use crate::output::write_pretty_json;
 
 #[derive(Serialize)]
@@ -33,17 +34,7 @@ struct LanePlan {
     github_variable: Option<String>,
     issue_on_failure: bool,
     ephemeral_required: bool,
-    health_lease: Option<HealthLeasePlan>,
-}
-
-#[derive(Clone, Serialize)]
-struct HealthLeasePlan {
-    variable: String,
-    ttl_seconds: u64,
-    events: Vec<String>,
-    runner_name_prefix: String,
-    merge_queue_branch: String,
-    admission_burst: usize,
+    health_lease: Option<HealthLease>,
 }
 
 #[derive(Debug)]
@@ -54,6 +45,10 @@ pub(super) struct LocalLinuxLeaseProfile {
     pub(super) runner_name_prefix: String,
     pub(super) merge_queue_branch: String,
     pub(super) admission_burst: usize,
+    pub(super) min_idle: usize,
+    /// Capability label that disqualifies a runner from this lease, so a
+    /// sibling pool cannot silently satisfy it.
+    pub(super) forbidden_capability: String,
     pub(super) required_labels: Vec<String>,
 }
 
@@ -156,6 +151,19 @@ fn load_profile(
         ));
     }
     Ok((path, table))
+}
+
+/// Load a profile through the typed schema, so an unknown key is a load-time
+/// error rather than a setting that is silently dropped.
+pub(super) fn load_typed_profile(
+    cwd: &Path,
+    name: &str,
+    explicit: Option<&Path>,
+) -> Result<(PathBuf, CiProfile), CliFailure> {
+    let (path, text) = read_profile_text(cwd, name, explicit)?;
+    let profile = CiProfile::parse_named(&text, name)
+        .map_err(|error| CliFailure::new(1, format!("{}: {error}", path.display())))?;
+    Ok((path, profile))
 }
 
 fn resolve_profile_path(
@@ -291,7 +299,7 @@ fn plan_lane(spec: &LaneSpec<'_>, targets: &Table) -> LaneOutcome {
         github_variable: github_variable.map(str::to_owned),
         issue_on_failure: optional_bool(spec.table, "issue_on_failure"),
         ephemeral_required,
-        health_lease: health_lease_plan(spec.table),
+        health_lease: lane_health_lease(spec.table),
     };
     let change = variable_change(
         spec,
@@ -307,6 +315,13 @@ fn plan_lane(spec: &LaneSpec<'_>, targets: &Table) -> LaneOutcome {
     }
 }
 
+/// Load and validate one lane's health-lease declaration.
+///
+/// Works for any repository, context, and lane: the capability namespace, the
+/// runner-name prefix, and the published variable all come from the profile
+/// rather than from a hardcoded table of one repository's Linux lanes. The
+/// safety invariants that keep a trusted pool and a PR-safe pool from bleeding
+/// into each other are preserved, but they are now expressed generically.
 pub(super) fn load_local_linux_lease_profile(
     cwd: &Path,
     name: &str,
@@ -315,73 +330,68 @@ pub(super) fn load_local_linux_lease_profile(
     context: &str,
     lane: &str,
 ) -> Result<LocalLinuxLeaseProfile, CliFailure> {
-    let (_, profile) = load_profile(cwd, name, explicit)?;
-    let repo_table = repo_profile_table(&profile, repo)?;
-    let lane_table = repo_table
-        .get(context)
-        .and_then(Value::as_table)
-        .and_then(|table| table.get(lane))
-        .and_then(Value::as_table)
-        .ok_or_else(|| {
-            CliFailure::new(
-                2,
-                format!("profile has no lane repo.{repo}.{context}.{lane}"),
-            )
-        })?;
-    let lease = strict_health_lease_plan(lane_table, context)?;
-    let first_target = target_ids(lane_table).into_iter().next().ok_or_else(|| {
+    let (_, profile) = load_typed_profile(cwd, name, explicit)?;
+    let lane_body = profile
+        .lane(repo, context, lane)
+        .map_err(|error| CliFailure::new(2, error.to_string()))?;
+    let lease = strict_health_lease(&lane_body.health_lease, context)?;
+    let first_target_id = lane_body.targets.first().ok_or_else(|| {
         CliFailure::new(2, format!("profile lane {context}.{lane} has no targets"))
     })?;
-    let target = required_table(&profile, "targets")?
-        .get(&first_target)
-        .and_then(Value::as_table)
-        .ok_or_else(|| CliFailure::new(2, format!("profile target {first_target} is missing")))?;
-    let required_labels = target
-        .get("runs_on_json")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            CliFailure::new(
-                2,
-                format!("profile target {first_target} must use an array runs_on_json selector"),
-            )
-        })?
-        .iter()
-        .map(|value| {
-            value.as_str().map(str::to_owned).ok_or_else(|| {
-                CliFailure::new(
-                    2,
-                    format!("profile target {first_target} has a non-string label"),
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let (capability, forbidden_capability) = if lease.events == ["pull_request"] {
-        ("pulp-pr-safe-linux-x64", "pulp-auto-linux-x64")
-    } else {
-        ("pulp-auto-linux-x64", "pulp-pr-safe-linux-x64")
-    };
-    for required in ["self-hosted", "Linux", "X64", capability] {
+    let target = profile.target(first_target_id).ok_or_else(|| {
+        CliFailure::new(2, format!("profile target {first_target_id} is missing"))
+    })?;
+    let required_labels = target.required_labels().ok_or_else(|| {
+        CliFailure::new(
+            2,
+            format!("profile target {first_target_id} must use an array runs_on_json selector"),
+        )
+    })?;
+
+    let capability = lease.required_capability.clone().ok_or_else(|| {
+        CliFailure::new(
+            2,
+            format!(
+                "lane {context}.{lane} declares a health lease and must also declare \
+                 health_lease_required_capability"
+            ),
+        )
+    })?;
+    let forbidden_capability = lease.forbidden_capability.clone().ok_or_else(|| {
+        CliFailure::new(
+            2,
+            format!(
+                "lane {context}.{lane} declares a health lease and must also declare \
+                 health_lease_forbidden_capability so a foreign pool cannot satisfy it"
+            ),
+        )
+    })?;
+
+    // A self-hosted lease is only meaningful over self-hosted runners; the
+    // capability label is what separates one pool from its sibling.
+    for required in ["self-hosted", capability.as_str()] {
         if !required_labels
             .iter()
             .any(|label| label.eq_ignore_ascii_case(required))
         {
             return Err(CliFailure::new(
                 2,
-                format!("profile target {first_target} is missing required label {required}"),
+                format!("profile target {first_target_id} is missing required label {required}"),
             ));
         }
     }
     if required_labels
         .iter()
-        .any(|label| label.eq_ignore_ascii_case(forbidden_capability))
+        .any(|label| label.eq_ignore_ascii_case(&forbidden_capability))
     {
         return Err(CliFailure::new(
             2,
             format!(
-                "profile target {first_target} mixes the {capability} and {forbidden_capability} capability namespaces"
+                "profile target {first_target_id} mixes the {capability} and {forbidden_capability} capability namespaces"
             ),
         ));
     }
+
     Ok(LocalLinuxLeaseProfile {
         variable: lease.variable,
         ttl_seconds: lease.ttl_seconds,
@@ -389,85 +399,94 @@ pub(super) fn load_local_linux_lease_profile(
         runner_name_prefix: lease.runner_name_prefix,
         merge_queue_branch: lease.merge_queue_branch,
         admission_burst: lease.admission_burst,
+        min_idle: lease.min_idle,
+        forbidden_capability,
         required_labels,
     })
 }
 
-fn health_lease_plan(table: &Table) -> Option<HealthLeasePlan> {
-    let variable = optional_str(table, "health_lease_variable")?.to_owned();
-    let ttl_seconds = table
-        .get("health_lease_ttl_seconds")?
-        .as_integer()
-        .and_then(|value| u64::try_from(value).ok())?;
-    let events = string_array(table, "health_lease_events")?;
-    let runner_name_prefix = optional_str(table, "health_lease_runner_name_prefix")?.to_owned();
-    let merge_queue_branch = optional_str(table, "health_lease_merge_queue_branch")?.to_owned();
-    let admission_burst = health_lease_admission_burst(table).ok()?;
-    Some(HealthLeasePlan {
-        variable,
-        ttl_seconds,
-        events,
-        runner_name_prefix,
-        merge_queue_branch,
-        admission_burst,
-    })
-}
+/// Validate a lane's health-lease group, applying the generic namespace rules.
+fn strict_health_lease(
+    fields: &HealthLeaseFields,
+    context: &str,
+) -> Result<HealthLease, CliFailure> {
+    let lease = HealthLease::from_fields(fields)
+        .map_err(|error| CliFailure::new(2, error.to_string()))?
+        .ok_or_else(|| {
+            CliFailure::new(
+                2,
+                format!(
+                    "profile lane for context {context} declares no health lease; it needs \
+                     health_lease_variable, health_lease_ttl_seconds, health_lease_events, \
+                     health_lease_runner_name_prefix, health_lease_merge_queue_branch, and \
+                     health_lease_admission_burst"
+                ),
+            )
+        })?;
 
-fn health_lease_admission_burst(table: &Table) -> Result<usize, &'static str> {
-    match table.get("health_lease_admission_burst") {
-        None => Err("health_lease_admission_burst is required"),
-        Some(value) => value
-            .as_integer()
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| *value >= 1)
-            .ok_or("health_lease_admission_burst must be a positive integer"),
+    // A prefix without a trailing delimiter prefix-matches every longer
+    // sibling namespace, so `pulp-ci-ephemeral` would silently admit
+    // `pulp-ci-ephemeral-prod-*` runners into a lease meant for one pool.
+    let prefix = &lease.runner_name_prefix;
+    if prefix.len() < 4 || !prefix.ends_with('-') && !prefix.ends_with('_') {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "health lease namespace is too broad: health_lease_runner_name_prefix {prefix:?} \
+                 must be at least 4 characters and end with '-' or '_' so it cannot prefix-match \
+                 a sibling runner pool"
+            ),
+        ));
     }
-}
 
-fn strict_health_lease_plan(table: &Table, context: &str) -> Result<HealthLeasePlan, CliFailure> {
-    health_lease_admission_burst(table).map_err(|message| CliFailure::new(2, message))?;
-    let lease = health_lease_plan(table).ok_or_else(|| {
-        CliFailure::new(
-            2,
-            "profile lane needs health_lease_variable, health_lease_ttl_seconds, health_lease_events, health_lease_runner_name_prefix, health_lease_merge_queue_branch, and health_lease_admission_burst",
-        )
-    })?;
-    if !(60..=900).contains(&lease.ttl_seconds) {
+    // Trusted merge-queue capacity and untrusted pull-request capacity are
+    // different trust domains. One lease may not authorize both.
+    let admits_untrusted = lease
+        .events
+        .iter()
+        .any(|event| event.eq_ignore_ascii_case("pull_request"));
+    let admits_trusted = lease
+        .events
+        .iter()
+        .any(|event| event.eq_ignore_ascii_case("merge_group"));
+    if admits_untrusted && admits_trusted {
         return Err(CliFailure::new(
             2,
-            "health_lease_ttl_seconds must be between 60 and 900",
+            "health lease namespace must not mix trust domains: health_lease_events may name \
+             pull_request or merge_group, never both",
         ));
     }
-    let trusted_merge_group = lease.variable == "PULP_LOCAL_LINUX_LEASE_UNTIL"
-        && context == "merge_group"
-        && lease.events == ["merge_group"]
-        && lease.runner_name_prefix == "pulp-ci-ephemeral-";
-    let pr_safe = lease.variable == "PULP_PR_SAFE_LINUX_LEASE_UNTIL"
-        && context == "pr"
-        && lease.events == ["pull_request"]
-        && lease.runner_name_prefix == "pulp-pr-safe-ephemeral-";
-    if !trusted_merge_group && !pr_safe {
+
+    if let (Some(required), Some(forbidden)) = (
+        lease.required_capability.as_deref(),
+        lease.forbidden_capability.as_deref(),
+    ) && required.eq_ignore_ascii_case(forbidden)
+    {
         return Err(CliFailure::new(
             2,
-            "health lease namespace must be either context merge_group with the trusted tuple (PULP_LOCAL_LINUX_LEASE_UNTIL, merge_group, pulp-ci-ephemeral-) or context pr with the PR-safe tuple (PULP_PR_SAFE_LINUX_LEASE_UNTIL, pull_request, pulp-pr-safe-ephemeral-)",
+            "health lease namespace is degenerate: health_lease_required_capability and \
+             health_lease_forbidden_capability must name different labels",
         ));
     }
-    if lease.merge_queue_branch != "main" {
+
+    if lease.merge_queue_branch.trim().is_empty() {
         return Err(CliFailure::new(
             2,
-            "health_lease_merge_queue_branch must be main for the Pulp automatic route",
+            "health_lease_merge_queue_branch must name a branch",
         ));
     }
+
     Ok(lease)
 }
 
-fn string_array(table: &Table, key: &str) -> Option<Vec<String>> {
-    table.get(key).and_then(Value::as_array).and_then(|values| {
-        values
-            .iter()
-            .map(|value| value.as_str().map(str::to_owned))
-            .collect()
-    })
+/// Read a lane table's `health_lease_*` group as a validated lease.
+///
+/// Used by the read-only plan view, which reports what a lane declares. An
+/// invalid or absent group renders as no lease rather than failing the whole
+/// plan; `strict_health_lease` is the enforcing path.
+fn lane_health_lease(table: &Table) -> Option<HealthLease> {
+    let fields: HealthLeaseFields = table.clone().try_into().ok()?;
+    HealthLease::from_fields(&fields).ok().flatten()
 }
 
 fn target_ids(lane_table: &Table) -> Vec<String> {
@@ -675,7 +694,335 @@ mod tests {
 
     use toml::Table;
 
-    use super::{build_plan, load_local_linux_lease_profile, strict_health_lease_plan};
+    use super::{build_plan, load_local_linux_lease_profile, strict_health_lease};
+    use crate::ci_profile::HealthLeaseFields;
+
+    /// Build a lease-bearing lane body with an overridable field set.
+    ///
+    /// The generalized contract has no repo-specific allowlist, so every test
+    /// states the namespace it means rather than inheriting one.
+    fn lease_fields(overrides: &str) -> HealthLeaseFields {
+        let mut table: Table = r#"
+health_lease_variable = "TRUSTED_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "acme-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
+health_lease_required_capability = "acme-auto-linux-x64"
+health_lease_forbidden_capability = "acme-pr-safe-linux-x64"
+"#
+        .parse()
+        .expect("lease lane");
+        let overrides: Table = overrides.parse().expect("lease overrides");
+        for (key, value) in overrides {
+            table.insert(key, value);
+        }
+        table.try_into().expect("lease fields")
+    }
+
+    #[test]
+    fn accepts_a_well_formed_namespace_for_any_repo() {
+        let lease = strict_health_lease(&lease_fields(""), "merge_group").expect("valid namespace");
+
+        assert_eq!(lease.runner_name_prefix, "acme-ci-ephemeral-");
+        assert_eq!(lease.variable, "TRUSTED_LINUX_LEASE_UNTIL");
+        assert_eq!(
+            lease.forbidden_capability.as_deref(),
+            Some("acme-pr-safe-linux-x64")
+        );
+    }
+
+    #[test]
+    fn rejects_a_runner_prefix_that_can_match_a_sibling_pool() {
+        // A prefix with no trailing delimiter prefix-matches every longer
+        // sibling namespace, which is how a foreign pool silently satisfies a
+        // lease meant for one pool.
+        for prefix in ["x-", "ephemeral", "acme-ci-ephemeral"] {
+            let fields = lease_fields(&format!(
+                "\nhealth_lease_runner_name_prefix = \"{prefix}\"\n"
+            ));
+            let Err(error) = strict_health_lease(&fields, "merge_group") else {
+                panic!("unsafe prefix must fail closed: {prefix}");
+            };
+            assert!(
+                error.message.contains("too broad"),
+                "prefix={prefix} error={}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn control_a_delimited_prefix_of_the_same_shape_is_accepted() {
+        // Negative control for the prefix test: proves the rejection is the
+        // missing delimiter, not the name.
+        for prefix in ["acme-ci-ephemeral-", "acme_ci_ephemeral_"] {
+            let fields = lease_fields(&format!(
+                "\nhealth_lease_runner_name_prefix = \"{prefix}\"\n"
+            ));
+            let lease = strict_health_lease(&fields, "merge_group")
+                .unwrap_or_else(|error| panic!("prefix {prefix} should pass: {}", error.message));
+            assert_eq!(lease.runner_name_prefix, prefix);
+        }
+    }
+
+    #[test]
+    fn one_lease_may_not_authorize_both_trust_domains() {
+        let fields = lease_fields("\nhealth_lease_events = [\"merge_group\", \"pull_request\"]\n");
+
+        let Err(error) = strict_health_lease(&fields, "merge_group") else {
+            panic!("mixed trust domains must fail closed");
+        };
+        assert!(
+            error.message.contains("must not mix trust domains"),
+            "error={}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_degenerate_capability_pair_is_rejected() {
+        let fields =
+            lease_fields("\nhealth_lease_forbidden_capability = \"acme-auto-linux-x64\"\n");
+
+        let Err(error) = strict_health_lease(&fields, "merge_group") else {
+            panic!("required == forbidden must fail closed");
+        };
+        assert!(
+            error.message.contains("degenerate"),
+            "error={}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn ttl_stays_bounded() {
+        let fields = lease_fields("\nhealth_lease_ttl_seconds = 901\n");
+
+        let Err(error) = strict_health_lease(&fields, "merge_group") else {
+            panic!("oversized lease must fail");
+        };
+        assert!(error.message.contains("between 60 and 900"));
+    }
+
+    fn write_profile(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        fs::write(&path, body).expect("write profile");
+        (dir, path)
+    }
+
+    #[test]
+    fn loads_a_health_lease_for_a_non_pulp_repo_and_a_macos_lane() {
+        // The whole point of the generalization: nothing about the repo slug,
+        // the platform, or the variable name is baked into Shipyard.
+        let (dir, path) = write_profile(
+            r#"
+name = "vellum-local"
+
+[repo."Generous-Corp/vellum".pr.macos]
+strategy = "ordered-fallback"
+targets = ["m5.macos-arm64-vm", "github.macos-arm64"]
+github_variable = "VELLUM_LOCAL_MACOS_RUNS_ON_JSON"
+health_lease_variable = "VELLUM_LOCAL_MACOS_LEASE_UNTIL"
+health_lease_ttl_seconds = 600
+health_lease_events = ["pull_request"]
+health_lease_runner_name_prefix = "vellum-pr-safe-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 3
+health_lease_min_idle = 4
+health_lease_required_capability = "vellum-pr-safe-macos-arm64"
+health_lease_forbidden_capability = "vellum-auto-macos-arm64"
+
+[targets."m5.macos-arm64-vm"]
+runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-pr-safe-macos-arm64"]
+proven = true
+ephemeral = true
+
+[targets."github.macos-arm64"]
+runs_on_json = "macos-15"
+"#,
+        );
+
+        let lease = load_local_linux_lease_profile(
+            dir.path(),
+            "vellum-local",
+            Some(&path),
+            "Generous-Corp/vellum",
+            "pr",
+            "macos",
+        )
+        .expect("lease profile");
+
+        assert_eq!(lease.variable, "VELLUM_LOCAL_MACOS_LEASE_UNTIL");
+        assert_eq!(lease.ttl_seconds, 600);
+        assert_eq!(lease.events, ["pull_request"]);
+        assert_eq!(lease.runner_name_prefix, "vellum-pr-safe-ephemeral-");
+        assert_eq!(lease.admission_burst, 3);
+        assert_eq!(lease.min_idle, 4);
+        assert_eq!(lease.forbidden_capability, "vellum-auto-macos-arm64");
+        assert!(
+            lease
+                .required_labels
+                .iter()
+                .any(|label| label == "vellum-pr-safe-macos-arm64")
+        );
+    }
+
+    #[test]
+    fn rejects_a_target_that_carries_the_forbidden_sibling_capability() {
+        let (dir, path) = write_profile(
+            r#"
+name = "mixed"
+
+[repo."owner/repo".merge_group.linux]
+targets = ["host.linux-x64-vm"]
+health_lease_variable = "TRUSTED_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "acme-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 2
+health_lease_required_capability = "acme-auto-linux-x64"
+health_lease_forbidden_capability = "acme-pr-safe-linux-x64"
+
+[targets."host.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64", "acme-auto-linux-x64", "acme-pr-safe-linux-x64"]
+"#,
+        );
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "mixed",
+            Some(&path),
+            "owner/repo",
+            "merge_group",
+            "linux",
+        )
+        .expect_err("mixed capability target must fail closed");
+
+        assert!(
+            error.message.contains("mixes")
+                && error.message.contains("acme-auto-linux-x64")
+                && error.message.contains("acme-pr-safe-linux-x64"),
+            "error={}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_a_target_missing_the_required_capability() {
+        let (dir, path) = write_profile(
+            r#"
+name = "unprotected"
+
+[repo."owner/repo".merge_group.linux]
+targets = ["host.linux-x64-vm"]
+health_lease_variable = "TRUSTED_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "acme-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
+health_lease_required_capability = "acme-auto-linux-x64"
+health_lease_forbidden_capability = "acme-pr-safe-linux-x64"
+
+[targets."host.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64"]
+"#,
+        );
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "unprotected",
+            Some(&path),
+            "owner/repo",
+            "merge_group",
+            "linux",
+        )
+        .expect_err("unprotected target must fail");
+
+        assert!(error.message.contains("acme-auto-linux-x64"));
+    }
+
+    #[test]
+    fn a_lease_lane_must_declare_its_capability_namespace() {
+        // Without a forbidden capability there is nothing separating this pool
+        // from its sibling, so the lane must not load.
+        let (dir, path) = write_profile(
+            r#"
+name = "no-namespace"
+
+[repo."owner/repo".merge_group.linux]
+targets = ["host.linux-x64-vm"]
+health_lease_variable = "TRUSTED_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "acme-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 5
+
+[targets."host.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64"]
+"#,
+        );
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "no-namespace",
+            Some(&path),
+            "owner/repo",
+            "merge_group",
+            "linux",
+        )
+        .expect_err("missing capability namespace must fail");
+
+        assert!(
+            error.message.contains("health_lease_required_capability"),
+            "error={}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_health_lease_admission_burst_instead_of_defaulting() {
+        let (dir, path) = write_profile(
+            r#"
+name = "malformed"
+
+[repo."owner/repo".merge_group.linux]
+targets = ["host.linux-x64-vm"]
+health_lease_variable = "TRUSTED_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "acme-ci-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = "5"
+
+[targets."host.linux-x64-vm"]
+runs_on_json = ["self-hosted", "Linux", "X64"]
+"#,
+        );
+
+        let error = load_local_linux_lease_profile(
+            dir.path(),
+            "malformed",
+            Some(&path),
+            "owner/repo",
+            "merge_group",
+            "linux",
+        )
+        .expect_err("malformed burst must fail");
+
+        // The typed schema rejects the string before any range check runs.
+        assert!(
+            error.message.contains("health_lease_admission_burst")
+                || error.message.contains("invalid type"),
+            "error={}",
+            error.message
+        );
+    }
 
     #[test]
     fn builds_provider_neutral_profile_plan() {
@@ -784,363 +1131,5 @@ runs_on_json = ["self-hosted", "Linux", "X64"]
 
         let plan = build_plan(&profile, "owner/repo", "test.toml".to_owned()).expect("plan");
         assert!(plan.warnings.is_empty());
-    }
-
-    #[test]
-    fn loads_bounded_local_linux_health_lease_from_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("profile.toml");
-        fs::write(
-            &path,
-            r#"
-name = "normal-local-fast"
-
-[repo."owner/repo".merge_group.linux]
-strategy = "ordered-fallback"
-targets = ["macpro.linux-x64-vm", "github.linux-x64"]
-github_variable = "PULP_LOCAL_LINUX_RUNS_ON_JSON"
-health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
-health_lease_ttl_seconds = 300
-health_lease_events = ["merge_group"]
-health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
-health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = 5
-
-[targets."macpro.linux-x64-vm"]
-runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-auto-linux-x64"]
-
-[targets."github.linux-x64"]
-runs_on_json = "ubuntu-latest"
-"#,
-        )
-        .expect("write profile");
-
-        let lease = load_local_linux_lease_profile(
-            dir.path(),
-            "normal-local-fast",
-            Some(&path),
-            "owner/repo",
-            "merge_group",
-            "linux",
-        )
-        .expect("lease profile");
-
-        assert_eq!(lease.variable, "PULP_LOCAL_LINUX_LEASE_UNTIL");
-        assert_eq!(lease.ttl_seconds, 300);
-        assert_eq!(lease.events, ["merge_group"]);
-        assert_eq!(lease.runner_name_prefix, "pulp-ci-ephemeral-");
-        assert_eq!(lease.merge_queue_branch, "main");
-        assert_eq!(lease.admission_burst, 5);
-        assert!(lease.required_labels.iter().any(|label| label == "X64"));
-        assert!(
-            lease
-                .required_labels
-                .iter()
-                .any(|label| label == "pulp-auto-linux-x64")
-        );
-    }
-
-    fn lease_lane_with_runner_prefix(prefix: &str) -> Table {
-        format!(
-            r#"
-health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
-health_lease_ttl_seconds = 300
-health_lease_events = ["merge_group"]
-health_lease_runner_name_prefix = "{prefix}"
-health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = 5
-"#
-        )
-        .parse()
-        .expect("lease lane")
-    }
-
-    #[test]
-    fn accepts_exact_controller_owned_health_lease_runner_prefix() {
-        let lease = strict_health_lease_plan(
-            &lease_lane_with_runner_prefix("pulp-ci-ephemeral-"),
-            "merge_group",
-        )
-        .expect("exact approved prefix");
-        assert_eq!(lease.runner_name_prefix, "pulp-ci-ephemeral-");
-    }
-
-    #[test]
-    fn rejects_broad_deceptive_and_near_miss_health_lease_runner_prefixes() {
-        for prefix in [
-            "ephemeral",
-            "not-ephemeral-",
-            "pulp-ci-ephemeral",
-            "pulp-ci-ephemeral-prod-",
-        ] {
-            let Err(error) =
-                strict_health_lease_plan(&lease_lane_with_runner_prefix(prefix), "merge_group")
-            else {
-                panic!("unapproved prefix must fail closed: {prefix}");
-            };
-            assert!(
-                error.message.contains("health lease namespace"),
-                "prefix={prefix} error={}",
-                error.message
-            );
-        }
-    }
-
-    #[test]
-    fn accepts_distinct_pull_request_health_lease_scope() {
-        let profile = r#"
-name = "normal-local-fast"
-
-[repo."owner/repo".pr.linux]
-targets = ["macpro.linux-x64-pr-safe-vm"]
-health_lease_variable = "PULP_PR_SAFE_LINUX_LEASE_UNTIL"
-health_lease_ttl_seconds = 300
-health_lease_events = ["pull_request"]
-health_lease_runner_name_prefix = "pulp-pr-safe-ephemeral-"
-health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = 2
-
-[targets."macpro.linux-x64-pr-safe-vm"]
-runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro", "pulp-pr-safe-linux-x64"]
-"#;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("profile.toml");
-        fs::write(&path, profile).expect("write profile");
-
-        let lease = load_local_linux_lease_profile(
-            dir.path(),
-            "normal-local-fast",
-            Some(&path),
-            "owner/repo",
-            "pr",
-            "linux",
-        )
-        .expect("separate PR-safe namespace");
-        assert_eq!(lease.variable, "PULP_PR_SAFE_LINUX_LEASE_UNTIL");
-        assert_eq!(lease.events, ["pull_request"]);
-        assert_eq!(lease.runner_name_prefix, "pulp-pr-safe-ephemeral-");
-        assert!(
-            lease
-                .required_labels
-                .iter()
-                .any(|label| label == "pulp-pr-safe-linux-x64")
-        );
-    }
-
-    #[test]
-    fn rejects_mixed_trusted_and_pr_safe_lease_namespaces() {
-        let lane: Table = r#"
-health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
-health_lease_ttl_seconds = 300
-health_lease_events = ["pull_request"]
-health_lease_runner_name_prefix = "pulp-pr-safe-ephemeral-"
-health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = 2
-"#
-        .parse()
-        .expect("lease lane");
-        let Err(error) = strict_health_lease_plan(&lane, "pr") else {
-            panic!("mixed namespace must fail closed");
-        };
-        assert!(error.message.contains("health lease namespace"));
-    }
-
-    #[test]
-    fn rejects_health_lease_tuple_in_the_wrong_profile_context() {
-        for (declared_context, variable, events, prefix) in [
-            (
-                "pr",
-                "PULP_LOCAL_LINUX_LEASE_UNTIL",
-                "merge_group",
-                "pulp-ci-ephemeral-",
-            ),
-            (
-                "merge_group",
-                "PULP_PR_SAFE_LINUX_LEASE_UNTIL",
-                "pull_request",
-                "pulp-pr-safe-ephemeral-",
-            ),
-        ] {
-            let lane: Table = format!(
-                r#"
-health_lease_variable = "{variable}"
-health_lease_ttl_seconds = 300
-health_lease_events = ["{events}"]
-health_lease_runner_name_prefix = "{prefix}"
-health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = 2
-"#
-            )
-            .parse()
-            .expect("lease lane");
-            let Err(error) = strict_health_lease_plan(&lane, declared_context) else {
-                panic!("misplaced namespace must fail closed: {declared_context}");
-            };
-            assert!(
-                error.message.contains("context merge_group")
-                    && error.message.contains("context pr"),
-                "context={declared_context} error={}",
-                error.message
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_targets_that_mix_trusted_and_pr_safe_capabilities() {
-        for (context, variable, events, prefix, required, forbidden) in [
-            (
-                "merge_group",
-                "PULP_LOCAL_LINUX_LEASE_UNTIL",
-                "merge_group",
-                "pulp-ci-ephemeral-",
-                "pulp-auto-linux-x64",
-                "pulp-pr-safe-linux-x64",
-            ),
-            (
-                "pr",
-                "PULP_PR_SAFE_LINUX_LEASE_UNTIL",
-                "pull_request",
-                "pulp-pr-safe-ephemeral-",
-                "pulp-pr-safe-linux-x64",
-                "pulp-auto-linux-x64",
-            ),
-        ] {
-            let profile = format!(
-                r#"
-name = "normal-local-fast"
-
-[repo."owner/repo".{context}.linux]
-targets = ["macpro.linux-x64-vm"]
-health_lease_variable = "{variable}"
-health_lease_ttl_seconds = 300
-health_lease_events = ["{events}"]
-health_lease_runner_name_prefix = "{prefix}"
-health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = 2
-
-[targets."macpro.linux-x64-vm"]
-runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro", "{required}", "{forbidden}"]
-"#
-            );
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("profile.toml");
-            fs::write(&path, profile).expect("write profile");
-
-            let error = load_local_linux_lease_profile(
-                dir.path(),
-                "normal-local-fast",
-                Some(&path),
-                "owner/repo",
-                context,
-                "linux",
-            )
-            .expect_err("mixed capability target must fail closed");
-            assert!(
-                error.message.contains("mixes")
-                    && error.message.contains(required)
-                    && error.message.contains(forbidden),
-                "context={context} error={}",
-                error.message
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_target_without_protected_automatic_label() {
-        let profile = r#"
-name = "normal-local-fast"
-
-[repo."owner/repo".merge_group.linux]
-targets = ["macpro.linux-x64-vm"]
-health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
-health_lease_ttl_seconds = 300
-health_lease_events = ["merge_group"]
-health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
-health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = 5
-
-[targets."macpro.linux-x64-vm"]
-runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
-"#;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("profile.toml");
-        fs::write(&path, profile).expect("write profile");
-
-        let error = load_local_linux_lease_profile(
-            dir.path(),
-            "normal-local-fast",
-            Some(&path),
-            "owner/repo",
-            "merge_group",
-            "linux",
-        )
-        .expect_err("unprotected automatic target must fail");
-        assert!(error.message.contains("pulp-auto-linux-x64"));
-    }
-
-    #[test]
-    fn rejects_health_lease_longer_than_fifteen_minutes() {
-        let profile = r#"
-name = "normal-local-fast"
-
-[repo."owner/repo".merge_group.linux]
-targets = ["macpro.linux-x64-vm"]
-health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
-health_lease_ttl_seconds = 901
-health_lease_events = ["merge_group"]
-health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
-health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = 5
-
-[targets."macpro.linux-x64-vm"]
-runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
-"#;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("profile.toml");
-        fs::write(&path, profile).expect("write profile");
-
-        let error = load_local_linux_lease_profile(
-            dir.path(),
-            "normal-local-fast",
-            Some(&path),
-            "owner/repo",
-            "merge_group",
-            "linux",
-        )
-        .expect_err("oversized lease must fail");
-        assert!(error.message.contains("between 60 and 900"));
-    }
-
-    #[test]
-    fn rejects_malformed_health_lease_admission_burst_instead_of_defaulting() {
-        let profile = r#"
-name = "normal-local-fast"
-
-[repo."owner/repo".merge_group.linux]
-targets = ["macpro.linux-x64-vm"]
-health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
-health_lease_ttl_seconds = 300
-health_lease_events = ["merge_group"]
-health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
-health_lease_merge_queue_branch = "main"
-health_lease_admission_burst = "5"
-
-[targets."macpro.linux-x64-vm"]
-runs_on_json = ["self-hosted", "Linux", "X64", "pulp-host-macpro"]
-"#;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("profile.toml");
-        fs::write(&path, profile).expect("write profile");
-
-        let error = load_local_linux_lease_profile(
-            dir.path(),
-            "normal-local-fast",
-            Some(&path),
-            "owner/repo",
-            "merge_group",
-            "linux",
-        )
-        .expect_err("malformed minimum must fail");
-        assert!(error.message.contains("positive integer"));
     }
 }
