@@ -1,4 +1,4 @@
-//! External health-lease operator for Pulp's disposable Mac Pro Linux pool.
+//! External health-lease operator for a self-managed runner pool.
 //!
 //! The consumer workflow reads an RFC3339 repository variable before choosing
 //! its `runs-on` value. This command is the trusted producer: it observes the
@@ -6,6 +6,11 @@
 //! the short lease only while matching idle capacity is visible. Any unhealthy
 //! or unreadable observation clears the variable, so new jobs fall back to the
 //! hosted selector. A crashed operator is bounded by the lease expiry.
+//!
+//! Which repository, context, and lane it operates on, which variable it
+//! publishes, and which capability labels separate this pool from a sibling
+//! pool all come from the routing profile — nothing here is specific to one
+//! repository or one platform.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -73,6 +78,9 @@ struct FleetObservation {
 struct AdmissionPolicy {
     declared_burst: usize,
     live_burst: usize,
+    /// Idle floor a renewal must clear. Defaults to the declared burst, so an
+    /// undeclared floor cannot arm a lease over a fully busy fleet.
+    min_idle: usize,
     ttl_seconds: u64,
 }
 
@@ -178,15 +186,12 @@ pub(super) fn local_linux_lease_command<W: Write>(
                     &observation.runners,
                     &profile.runner_name_prefix,
                     &profile.required_labels,
-                    if profile.events == ["pull_request"] {
-                        "pulp-auto-linux-x64"
-                    } else {
-                        "pulp-pr-safe-linux-x64"
-                    },
+                    &profile.forbidden_capability,
                     observation.queued_matching_jobs,
                     AdmissionPolicy {
                         declared_burst: profile.admission_burst,
                         live_burst: observation.observed_admission_burst,
+                        min_idle: profile.min_idle,
                         ttl_seconds: profile.ttl_seconds,
                     },
                     observed_at,
@@ -502,7 +507,8 @@ fn decide_lease(
             ),
         };
     }
-    if available >= policy.declared_burst {
+    let required_available = policy.declared_burst.max(policy.min_idle);
+    if available >= required_available {
         LeaseDecision {
             action: LeaseAction::Renew,
             observed_at,
@@ -533,8 +539,8 @@ fn decide_lease(
             queued,
             available,
             reason: format!(
-                "insufficient_unreserved_idle_capacity_for_admission_burst: required={} live={} idle={idle} queued={queued} available={available}",
-                policy.declared_burst, policy.live_burst
+                "insufficient_unreserved_idle_capacity_for_admission_burst: required={required_available} live={} idle={idle} queued={queued} available={available}",
+                policy.live_burst
             ),
         }
     }
@@ -843,6 +849,7 @@ mod tests {
         AdmissionPolicy {
             declared_burst,
             live_burst,
+            min_idle: declared_burst,
             ttl_seconds: 300,
         }
     }

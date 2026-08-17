@@ -14,10 +14,16 @@ use crate::gate_scripts::{SKILL_SYNC, VERSION_BUMP, VERSIONING_CONFIG, resolve};
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::paths::RuntimePaths;
 
+// A CLI argument bag: one bool per user-facing flag is the shape the
+// command line already has, and grouping them into sub-structs would
+// only move the flags further from the flags they mirror.
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct PrCommandArgs {
     pub(super) base: String,
     pub(super) apply_bumps: bool,
     pub(super) allow_unreachable_targets: bool,
+    /// Proceed even when this host has not converged to the declared fleet epoch.
+    pub(super) allow_fleet_epoch_drift: bool,
     pub(super) skip_targets: Vec<String>,
     pub(super) skip_bump: Vec<String>,
     pub(super) bump_reason: Option<String>,
@@ -139,6 +145,7 @@ pub(super) fn pr_command<W: Write>(
             gh_command: None,
             pr_snapshot_file: None,
             allow_unreachable_targets: args.allow_unreachable_targets,
+            allow_fleet_epoch_drift: args.allow_fleet_epoch_drift,
             skip_targets: args.skip_targets,
             adopt_head: args.adopt_head,
             steward_handoff,
@@ -575,6 +582,7 @@ mod tests {
             base: String::from("main"),
             apply_bumps: true,
             allow_unreachable_targets: false,
+            allow_fleet_epoch_drift: false,
             skip_targets: Vec::new(),
             skip_bump: Vec::new(),
             bump_reason: None,

@@ -53,6 +53,44 @@ $ shipyard targets
   (ubuntu and windows are disabled in this profile)
 ```
 
+## Per-stage target selection
+
+A profile can also give individual stages their own chain. Gates are cheap
+and want the shortest path; a full test pass can afford a longer fallback.
+
+```toml
+[profiles.local-infra]
+targets = ["m3", "m5", "m1", "github"]
+
+[profiles.local-infra.stages.gates]
+# Gates are seconds of work. Don't wait on a cold fallback for them.
+targets = ["m3"]
+
+[profiles.local-infra.stages.ship]
+targets = ["m3", "m1"]
+```
+
+A stage without its own `targets` falls back to the profile's list, and a
+profile without either resolves every declared target.
+
+### What absence means
+
+Target selection is deliberately hard to trip over:
+
+| Situation | Result |
+|---|---|
+| No active profile | Every declared target resolves |
+| Active profile is not defined | Every declared target resolves |
+| Profile declares only `focus_platforms` | Every declared target resolves |
+| Profile declares `targets` | Only those, in the order given |
+| Profile names a target `[targets]` does not define | **Hard error** |
+
+The order matters and is preserved: the list is a fallback chain, not a set.
+
+That last row is the one deliberate failure. Silently skipping an undeclared
+name would drop a lane from validation with nothing anywhere to say so, which
+is exactly the kind of quiet gap this whole system exists to prevent.
+
 ## Platform-focus profiles
 
 Profiles can also describe which platforms are merge-blocking during a

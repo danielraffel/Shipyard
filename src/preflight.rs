@@ -15,6 +15,9 @@ pub const EXIT_BACKEND_UNREACHABLE: u8 = 3;
 /// Exit code used when the opt-in host-health gate hard-stops a saturated host.
 pub const EXIT_HOST_UNHEALTHY: u8 = 4;
 
+/// Exit code used when this host has not converged to the declared fleet epoch.
+pub const EXIT_FLEET_EPOCH_DRIFT: u8 = 5;
+
 /// One unreachable target discovered during preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetPreflightFailure {
@@ -118,6 +121,11 @@ pub enum ShipPreflightError {
         /// Optional daemon-version-skew hypothesis.
         skew_note: Option<String>,
     },
+    /// This host has not converged to the declared fleet epoch.
+    FleetEpochDrift {
+        /// Rendered status explaining the gap and how to close it.
+        status: String,
+    },
     /// The opt-in host-health gate hard-stopped a saturated self-hosted host.
     HostUnhealthy {
         /// Level label (currently always `critical`).
@@ -134,6 +142,9 @@ pub struct ShipPreflightOptions {
     pub allow_root_mismatch: bool,
     /// Skip backend reachability failures.
     pub allow_unreachable_targets: bool,
+    /// Proceed even when this host has not converged to the declared fleet
+    /// epoch. An explicit operator override, never a default.
+    pub allow_fleet_epoch_drift: bool,
 }
 
 impl Display for ShipPreflightError {
@@ -189,6 +200,14 @@ impl Display for ShipPreflightError {
                     "  - Skip the target(s) that don't apply to this change: {skip_flags}"
                 )
             }
+            Self::FleetEpochDrift { status } => write!(
+                formatter,
+                "{status}\n\n\
+                 This host is running against fleet assumptions that have since changed, so \
+                 dispatching from here could produce a result nobody can reproduce. Options:\n\
+                 \x20 - Run tools/fleet/apply.sh to converge this host, OR\n\
+                 \x20 - Pass --allow-fleet-epoch-drift to proceed anyway."
+            ),
             Self::HostUnhealthy { level, reason } => write!(
                 formatter,
                 "Host-health {level} before dispatch: {reason}\n\n\
@@ -234,6 +253,19 @@ pub fn run_ship_preflight_with_options(
         .map(|_| ())
 }
 
+/// Short host name used to look up this machine's fleet receipt.
+fn local_host_name() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown-host".to_owned())
+}
+
 /// Run preflight and return the Python-compatible report on success.
 pub fn collect_ship_preflight_with_options(
     config: &LoadedConfig,
@@ -262,6 +294,21 @@ pub fn collect_ship_preflight_with_options(
             return Err(ShipPreflightError::RootMismatch {
                 git_root: git_root.clone(),
                 expected_root: expected_root.clone(),
+            });
+        }
+    }
+
+    // Layer C of fleet sync: a host that never applied the declared manifest
+    // refuses here rather than dispatching on stale infrastructure
+    // assumptions. Repositories with no manifest are unaffected.
+    let fleet_root = git_root.clone().unwrap_or_else(|| cwd.to_path_buf());
+    let fleet_status = crate::fleet_epoch::check(&fleet_root, &local_host_name());
+    if fleet_status.blocks() {
+        if options.allow_fleet_epoch_drift {
+            warnings.push(fleet_status.to_string());
+        } else {
+            return Err(ShipPreflightError::FleetEpochDrift {
+                status: fleet_status.to_string(),
             });
         }
     }

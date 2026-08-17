@@ -36,6 +36,7 @@ mod metrics_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
+mod profile_apply_cmd;
 mod quarantine_cmd;
 mod queue_cmd;
 mod queue_observer_cmd;
@@ -179,7 +180,7 @@ fn dispatch<W: Write, E: Write>(
             return config_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Ci { command } => {
-            return ci_command(command, &cwd, cli.json, stdout);
+            return ci_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Metrics { command } => {
             return metrics_command(*command, &runtime_paths.state_dir, cli.json, stdout);
@@ -616,6 +617,7 @@ fn handle_ship_variant<W: Write>(
         no_warm,
         resume_from,
         allow_unreachable_targets,
+        allow_fleet_epoch_drift,
         skip_targets,
         adopt_head,
     } = command
@@ -638,6 +640,7 @@ fn handle_ship_variant<W: Write>(
             gh_command: None,
             pr_snapshot_file: None,
             allow_unreachable_targets,
+            allow_fleet_epoch_drift,
             skip_targets,
             adopt_head,
             steward_handoff: None,
@@ -664,6 +667,7 @@ fn handle_pr_variant<W: Write>(
         apply_bumps,
         no_apply_bumps,
         allow_unreachable_targets,
+        allow_fleet_epoch_drift,
         skip_targets,
         skip_bump,
         bump_reason,
@@ -684,6 +688,7 @@ fn handle_pr_variant<W: Write>(
             base,
             apply_bumps: apply_bumps && !no_apply_bumps,
             allow_unreachable_targets,
+            allow_fleet_epoch_drift,
             skip_targets,
             skip_bump,
             bump_reason,
@@ -723,6 +728,7 @@ fn handle_run_variant<W: Write>(
         resume_from,
         allow_root_mismatch,
         allow_unreachable_targets,
+        allow_fleet_epoch_drift,
         skip_targets,
         no_warm,
         allow_tree_drift,
@@ -747,6 +753,7 @@ fn handle_run_variant<W: Write>(
             resume_from,
             root_mismatch: RootMismatchPolicy::from_flag(allow_root_mismatch),
             reachability: ReachabilityPolicy::from_flag(allow_unreachable_targets),
+            allow_fleet_epoch_drift,
             skip_targets,
             warm: WarmPolicy::from_no_warm_flag(no_warm),
             tree_drift: TreeDriftPolicy::from_flag(allow_tree_drift),
