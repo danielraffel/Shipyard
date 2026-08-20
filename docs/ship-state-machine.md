@@ -222,7 +222,11 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   Before admission, the owner also groups pending ship requests by
   `(repository, PR)` and observes each distinct PR at most once per 30 seconds.
   If GitHub reports `MERGED` and the reported head exactly matches the durable
-  queued SHA, every matching pending job is cancelled as already complete.
+  queued SHA, every matching pending or running job is cancelled as already
+  complete. A running worker observes the durable cancellation on its progress
+  callback and terminates its complete supervised process tree before releasing
+  queue/host claims; an open PR, head mismatch, or unavailable observation
+  leaves the job running/pending.
   These reads use the configured GitHub credential, explicit repository scope,
   and one 15-second credential-plus-command budget. An unavailable observation,
   malformed response, or different merged head leaves the job pending.
