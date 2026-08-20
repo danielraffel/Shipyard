@@ -103,6 +103,8 @@ pub struct RequestBackedAdmitPass {
     pub same_pr_ship_admission: SamePrShipAdmission,
     /// Pending jobs whose PR was already merged while they waited in queue.
     pub already_merged_cancellations: Vec<AlreadyMergedCancellation>,
+    /// Running ship jobs whose PR was already merged at the queued head.
+    pub already_merged_running_cancellations: Vec<AlreadyMergedCancellation>,
 }
 
 /// Durable request envelope load problem observed by the scheduler.
@@ -160,14 +162,46 @@ impl AlreadyMergedObserver {
         })
     }
 
+    pub(crate) fn observe_running(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        cwd: &Path,
+        snapshot_file: Option<&Path>,
+    ) -> Vec<AlreadyMergedCancellation> {
+        let client = self.client.clone();
+        self.observe_running_with(jobs, request_store, |repo, pr| {
+            gh::pr_merged_head_sha(client.as_ref(), repo, pr, cwd, snapshot_file)
+        })
+    }
+
     fn observe_pending_with(
         &mut self,
         jobs: &[Job],
         request_store: &QueueRequestStore,
+        fetch: impl FnMut(&str, u64) -> Option<String>,
+    ) -> Vec<AlreadyMergedCancellation> {
+        self.observe_ship_with_status(jobs, request_store, JobStatus::Pending, fetch)
+    }
+
+    fn observe_running_with(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        fetch: impl FnMut(&str, u64) -> Option<String>,
+    ) -> Vec<AlreadyMergedCancellation> {
+        self.observe_ship_with_status(jobs, request_store, JobStatus::Running, fetch)
+    }
+
+    fn observe_ship_with_status(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        status: JobStatus,
         mut fetch: impl FnMut(&str, u64) -> Option<String>,
     ) -> Vec<AlreadyMergedCancellation> {
         let mut pending_by_pr = BTreeMap::<(String, u64), Vec<(String, String)>>::new();
-        for job in jobs.iter().filter(|job| job.status == JobStatus::Pending) {
+        for job in jobs.iter().filter(|job| job.status == status) {
             let Some(envelope) = request_store.load(&job.id).ok().flatten() else {
                 continue;
             };
@@ -224,6 +258,8 @@ pub struct AppliedAdmitPass {
     pub started: Vec<Job>,
     /// Pending jobs cancelled before admission.
     pub cancelled: Vec<Job>,
+    /// Running ship jobs cancelled because their PR already merged.
+    pub already_merged_running_cancelled: Vec<Job>,
     /// Whether starts were skipped because running request envelopes could not
     /// be loaded.
     pub skipped_starts_due_to_running_request_errors: bool,
@@ -536,6 +572,7 @@ pub fn plan_admit_pass_from_jobs_with_vm_slots(
         running_request_errors,
         same_pr_ship_admission,
         already_merged_cancellations: Vec::new(),
+        already_merged_running_cancellations: Vec::new(),
     }
 }
 
@@ -551,6 +588,16 @@ pub fn apply_admit_pass_for_drain(
 ) -> Result<AppliedAdmitPass, QueueError> {
     let cancellations = admit_pass_cancellations(pass);
     let cancelled = queue.cancel_pending_jobs_for_drain(drain_lock, &cancellations)?;
+    let running_cancellations = pass
+        .already_merged_running_cancellations
+        .iter()
+        .map(|cancellation| QueuePendingCancellation {
+            job_id: cancellation.job_id.clone(),
+            reason: crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let already_merged_running_cancelled =
+        queue.cancel_running_jobs_for_drain(drain_lock, &running_cancellations)?;
     // Reap stale running same-PR jobs (dead workers). `cancel_stale_running_jobs`
     // re-checks staleness under the state lock with a fresh `now`, so a worker
     // that resumed heartbeating between planning and apply is never reaped.
@@ -584,6 +631,7 @@ pub fn apply_admit_pass_for_drain(
     Ok(AppliedAdmitPass {
         started,
         cancelled,
+        already_merged_running_cancelled,
         skipped_starts_due_to_running_request_errors,
         skipped_starts_due_to_revived_stale_running,
         stale_running_cancelled,
@@ -967,8 +1015,8 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::{
-        AlreadyMergedObserver, ORPHANED_PENDING_REQUEST_REASON, PendingAdmissionRequest,
-        SchedulerAdmissionBlocker, apply_admit_pass_for_drain, can_admit,
+        AlreadyMergedCancellation, AlreadyMergedObserver, ORPHANED_PENDING_REQUEST_REASON,
+        PendingAdmissionRequest, SchedulerAdmissionBlocker, apply_admit_pass_for_drain, can_admit,
         host_pool_capacity_deficits, plan_admit_pass, plan_admit_pass_from_jobs,
     };
     use crate::host_pool::{HostPoolConfig, HostPoolLease, HostPoolMemberConfig};
@@ -1861,6 +1909,32 @@ mod tests {
             cancellations
                 .iter()
                 .any(|c| c.job_id == "two" && c.pr == 100)
+        );
+    }
+
+    /// A running ship job is also cancelled when the merged head still matches
+    /// the exact SHA it was admitted to validate. The worker's progress
+    /// callback then terminates its supervised process tree.
+    #[test]
+    fn observe_already_merged_cancels_running_ship_job() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "running", "Generous-Corp/pulp", 99);
+        let running = job("running", JobStatus::Running, Priority::Normal, 0);
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+        };
+
+        let cancellations = observer
+            .observe_running_with(&[running], &store, |_repo, _pr| Some("abc123".to_owned()));
+
+        assert_eq!(
+            cancellations,
+            [AlreadyMergedCancellation {
+                job_id: "running".to_owned(),
+                pr: 99,
+            }]
         );
     }
 

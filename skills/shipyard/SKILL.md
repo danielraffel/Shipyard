@@ -438,10 +438,12 @@ staleness under the queue lock, so a worker merely between heartbeats is never
 killed; a "stale" job that revived between plan and apply defers conflicting
 starts to the next pass rather than double-running the PR.
 
-Pending ship jobs whose PR merged while they waited are cancelled only when
-GitHub reports the same exact head SHA recorded in the durable request. The
-drain batches by `(repository, PR)`, reuses one result for duplicate jobs, and
-throttles re-observation for 30 seconds. GitHub reads must use the effective
+Pending or running ship jobs whose PR merged are cancelled only when GitHub
+reports the same exact head SHA recorded in the durable request. A running
+worker observes the durable `already_merged` cancellation through its progress
+callback and terminates the complete supervised process tree before releasing
+its queue/host claims. The drain batches by `(repository, PR)`, reuses one
+result for duplicate jobs, and throttles re-observation for 30 seconds. GitHub reads must use the effective
 `GhClient`, an explicit `--repo`, and the shared 15-second credential-plus-child
 budget; auth, timeout, malformed JSON, and head drift all fail closed.
 
@@ -454,6 +456,9 @@ budget; auth, timeout, malformed JSON, and head drift all fail closed.
 - Do NOT launch a second `shipyard pr` for the same PR while the first is still
   alive. That is what strands a `running` job in the first place — one ship per
   PR at a time.
+- The merged-head guard is mandatory for both pending and running jobs. If the
+  PR is open, the head differs, or GitHub observation is unavailable, preserve
+  the job and its claims; never infer `already_merged` from stale local state.
 - On a pre-0.68.0 binary the manual recovery is still: `shipyard ship-state
   discard <pr>`, then mark the stuck `queue.json` job terminal (or restart the
   daemon to trigger startup recovery).

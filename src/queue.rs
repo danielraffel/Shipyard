@@ -347,6 +347,37 @@ impl Queue {
         })
     }
 
+    /// Cancel selected running jobs by id. The caller must hold the drain
+    /// lock. Workers observe the durable terminal state through their
+    /// progress callback and terminate their supervised process tree.
+    pub fn cancel_running_jobs_for_drain(
+        &mut self,
+        _drain_lock: &DrainLock,
+        cancellations: &[QueuePendingCancellation],
+    ) -> QueueResult<Vec<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let mut cancelled_jobs = Vec::new();
+            let mut seen = BTreeSet::new();
+            for cancellation in cancellations {
+                if !seen.insert(cancellation.job_id.as_str()) {
+                    continue;
+                }
+                let Some(job) = jobs
+                    .iter_mut()
+                    .find(|job| job.id == cancellation.job_id && job.status == JobStatus::Running)
+                else {
+                    continue;
+                };
+                if let Ok(cancelled) = job.cancel_with_reason(Some(cancellation.reason.clone())) {
+                    *job = cancelled.clone();
+                    cancelled_jobs.push(cancelled);
+                }
+            }
+            let _ = trim_terminal(jobs);
+            Ok(cancelled_jobs)
+        })
+    }
+
     /// Cancel the given jobs only if, re-checked under the state lock, they are
     /// still `Running` and still stale by heartbeat age. Returns the jobs that
     /// were actually cancelled (terminal `Cancelled`, with `reason`).

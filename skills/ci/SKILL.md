@@ -1336,6 +1336,12 @@ process tree, including descendants. The returned job remains `cancelled` with
 the exact durable reason; it must not consume a runner until the current build
 stage exits naturally.
 
+The drain also performs the same fail-closed cancellation when it observes that
+the exact PR head for a pending or running ship job has already merged. A
+running job is only terminal after its worker sees the durable reason and the
+supervised process tree has exited; open PRs, head drift, and unavailable GitHub
+observations remain queued/running rather than being guessed away.
+
 ### Gate-script path resolution
 
 `shipyard pr` looks up each gate script in this order — the first hit wins:

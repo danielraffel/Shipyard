@@ -1208,6 +1208,8 @@ fn admit_drain_worker_inputs(
     );
     pass.already_merged_cancellations =
         already_merged_observer.observe_pending(&jobs, request_store, cwd, pr_snapshot_file);
+    pass.already_merged_running_cancellations =
+        already_merged_observer.observe_running(&jobs, request_store, cwd, pr_snapshot_file);
     cap_admit_pass_workers(&jobs, &mut pass, DEFAULT_DRAIN_MAX_WORKERS);
     let awaited_will_be_cancelled = pass
         .plan
@@ -1223,7 +1225,16 @@ fn admit_drain_worker_inputs(
             .same_pr_ship_admission
             .stale_running_cancellations
             .iter()
+            .any(|cancellation| cancellation.job_id == awaited_job_id)
+        || pass
+            .already_merged_cancellations
+            .iter()
+            .any(|cancellation| cancellation.job_id == awaited_job_id)
+        || pass
+            .already_merged_running_cancellations
+            .iter()
             .any(|cancellation| cancellation.job_id == awaited_job_id);
+
     if awaited_will_be_cancelled {
         pass.plan.admitted.clear();
     }
@@ -4042,6 +4053,7 @@ mod tests {
             running_request_errors: Vec::new(),
             same_pr_ship_admission: SamePrShipAdmission::default(),
             already_merged_cancellations: Vec::new(),
+            already_merged_running_cancellations: Vec::new(),
         };
 
         cap_admit_pass_workers(&[running], &mut pass, 2);
