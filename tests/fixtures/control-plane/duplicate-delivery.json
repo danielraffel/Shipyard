@@ -1,0 +1,30 @@
+{
+  "initial": {
+    "schema_version": 1,
+    "key": {"repository": "example/audio", "pull_request": 127, "head_sha": "3333333333333333333333333333333333333333"},
+    "generation": 1,
+    "accepted_idempotency_keys": ["incident-duplicate/accepted"],
+    "state": "accepted",
+    "superseded_by": null
+  },
+  "transitions": [
+    {
+      "schema_version": 1,
+      "key": {"repository": "example/audio", "pull_request": 127, "head_sha": "3333333333333333333333333333333333333333"},
+      "generation": 2,
+      "idempotency_key": "incident-duplicate/observe",
+      "from": "accepted",
+      "to": "observing",
+      "superseded_by": null
+    },
+    {
+      "schema_version": 1,
+      "key": {"repository": "example/audio", "pull_request": 127, "head_sha": "3333333333333333333333333333333333333333"},
+      "generation": 3,
+      "idempotency_key": "incident-duplicate/observe",
+      "from": "observing",
+      "to": "awaiting_checks",
+      "superseded_by": null
+    }
+  ]
+}

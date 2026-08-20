@@ -27,6 +27,8 @@ pub mod cloud;
 pub mod cloud_records;
 /// Layered configuration loading and worktree fallback behavior.
 pub mod config;
+/// Versioned durable control-plane work items, transitions, and receipts.
+pub mod control_plane_schema;
 /// Unix socket IPC primitives for daemon subscribers and status reads.
 pub mod daemon_ipc;
 /// Minimal daemon runtime and lifecycle helpers.

@@ -1,0 +1,59 @@
+{
+  "initial": {
+    "schema_version": 1,
+    "key": {
+      "repository": "example/audio",
+      "pull_request": 7705,
+      "head_sha": "1111111111111111111111111111111111111111"
+    },
+    "generation": 1,
+    "accepted_idempotency_keys": ["incident-head-drift/accepted"],
+    "state": "accepted",
+    "superseded_by": null
+  },
+  "transitions": [
+    {
+      "schema_version": 1,
+      "key": {
+        "repository": "example/audio",
+        "pull_request": 7705,
+        "head_sha": "1111111111111111111111111111111111111111"
+      },
+      "generation": 2,
+      "idempotency_key": "incident-head-drift/observe",
+      "from": "accepted",
+      "to": "observing",
+      "superseded_by": null
+    },
+    {
+      "schema_version": 1,
+      "key": {
+        "repository": "example/audio",
+        "pull_request": 7705,
+        "head_sha": "1111111111111111111111111111111111111111"
+      },
+      "generation": 3,
+      "idempotency_key": "incident-head-drift/wait",
+      "from": "observing",
+      "to": "awaiting_checks",
+      "superseded_by": null
+    },
+    {
+      "schema_version": 1,
+      "key": {
+        "repository": "example/audio",
+        "pull_request": 7705,
+        "head_sha": "1111111111111111111111111111111111111111"
+      },
+      "generation": 4,
+      "idempotency_key": "incident-head-drift/superseded",
+      "from": "awaiting_checks",
+      "to": "superseded",
+      "superseded_by": {
+        "repository": "example/audio",
+        "pull_request": 7705,
+        "head_sha": "2222222222222222222222222222222222222222"
+      }
+    }
+  ]
+}

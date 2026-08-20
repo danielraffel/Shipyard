@@ -1,0 +1,21 @@
+{
+  "initial": {
+    "schema_version": 1,
+    "key": {"repository": "example/audio", "pull_request": 438, "head_sha": "4444444444444444444444444444444444444444"},
+    "generation": 1,
+    "accepted_idempotency_keys": ["incident-stale/accepted"],
+    "state": "accepted",
+    "superseded_by": null
+  },
+  "transitions": [
+    {
+      "schema_version": 1,
+      "key": {"repository": "example/audio", "pull_request": 438, "head_sha": "4444444444444444444444444444444444444444"},
+      "generation": 1,
+      "idempotency_key": "incident-stale/late-observe",
+      "from": "accepted",
+      "to": "observing",
+      "superseded_by": null
+    }
+  ]
+}
