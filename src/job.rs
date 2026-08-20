@@ -295,6 +295,10 @@ pub struct Job {
     /// Durable request kind. Legacy jobs may not have this yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<JobKind>,
+    /// Stable workload identity used to keep queue supersedence repo-neutral.
+    /// Legacy jobs may not have this yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_scope: Option<String>,
     /// Target names.
     #[serde(rename = "targets")]
     pub target_names: Vec<String>,
@@ -366,6 +370,7 @@ impl Job {
             resource_claims: Vec::new(),
             results: BTreeMap::new(),
             kind: None,
+            workload_scope: None,
         }
     }
 
@@ -414,6 +419,14 @@ impl Job {
     pub fn with_kind(&self, kind: JobKind) -> Self {
         let mut next = self.clone();
         next.kind = Some(kind);
+        next
+    }
+
+    /// Return a copy tagged with the durable workload identity.
+    #[must_use]
+    pub fn with_workload_scope(&self, workload_scope: impl Into<String>) -> Self {
+        let mut next = self.clone();
+        next.workload_scope = Some(workload_scope.into());
         next
     }
 
@@ -911,6 +924,7 @@ mod tests {
         let job: Job = serde_json::from_value(value).expect("legacy job");
 
         assert_eq!(job.kind, None);
+        assert_eq!(job.workload_scope, None);
         assert!(job.resource_claims.is_empty());
         assert_eq!(job.cancel_requested_at, None);
     }

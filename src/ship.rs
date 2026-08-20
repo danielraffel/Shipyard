@@ -433,7 +433,8 @@ pub fn submit_ship(
         request.mode,
         request.priority,
     )
-    .with_kind(JobKind::Ship);
+    .with_kind(JobKind::Ship)
+    .with_workload_scope(format!("ship:{}:pr-{}", request.repo, request.pr));
     QueueRequestStore::new(state_dir)
         .map_err(QueueRequestError::from)?
         .save(&QueuedExecutionEnvelope::from_ship_request(
@@ -700,7 +701,8 @@ pub fn submit_run(
         request.mode,
         request.priority,
     )
-    .with_kind(JobKind::Run);
+    .with_kind(JobKind::Run)
+    .with_workload_scope(run_workload_scope(cwd));
     QueueRequestStore::new(state_dir)
         .map_err(QueueRequestError::from)?
         .save(&QueuedExecutionEnvelope::from_run_request(
@@ -2004,6 +2006,11 @@ fn target_names(targets: &[ResolvedTarget]) -> Vec<String> {
         .iter()
         .map(|target| target.name.clone())
         .collect::<Vec<_>>()
+}
+
+fn run_workload_scope(cwd: &Path) -> String {
+    let identity = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    format!("run:{}", identity.to_string_lossy())
 }
 
 fn target_log_path(state_dir: &Path, job_id: &str, target: &str) -> PathBuf {

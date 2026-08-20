@@ -64,9 +64,19 @@ fn run_request(branch: &str, sha: &str, target: ResolvedTarget) -> RunExecutionR
 }
 
 fn ship_request(branch: &str, sha: &str, pr: u64, target: ResolvedTarget) -> ShipExecutionRequest {
+    ship_request_for_repo("danielraffel/shipyard", branch, sha, pr, target)
+}
+
+fn ship_request_for_repo(
+    repo: &str,
+    branch: &str,
+    sha: &str,
+    pr: u64,
+    target: ResolvedTarget,
+) -> ShipExecutionRequest {
     ShipExecutionRequest {
         pr,
-        repo: "danielraffel/shipyard".to_owned(),
+        repo: repo.to_owned(),
         branch: branch.to_owned(),
         base_branch: "main".to_owned(),
         sha: sha.to_owned(),
@@ -84,6 +94,45 @@ fn ship_request(branch: &str, sha: &str, pr: u64, target: ResolvedTarget) -> Shi
         adopt_head: false,
         pr_snapshot_file: None,
         targets: vec![target],
+    }
+}
+
+#[test]
+fn repo_neutral_submit_preserves_independent_workloads_with_common_branch_and_target_names() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    let mut queue = Queue::new(&state_dir).expect("queue");
+    let workloads = [
+        ("Generous-Corp/pulp", 7718, "pulp"),
+        ("Generous-Corp/forge", 127, "forge-modular"),
+        ("Generous-Corp/forge", 128, "forge-sequencer"),
+        ("Generous-Corp/vellum", 96, "vellum"),
+    ];
+
+    let submitted = workloads
+        .iter()
+        .map(|(repo, pr, name)| {
+            let cwd = temp.path().join(name);
+            std::fs::create_dir_all(&cwd).expect("workload cwd");
+            let request = ship_request_for_repo(
+                repo,
+                "main",
+                &format!("sha-{name}"),
+                *pr,
+                local_target("macos", cwd),
+            );
+            submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit workload")
+        })
+        .collect::<Vec<_>>();
+
+    let pending = queue.get_pending().expect("pending jobs");
+    assert_eq!(pending.len(), workloads.len());
+    for job in submitted {
+        assert_eq!(
+            queue.get(&job.id).expect("queue read").expect("job").status,
+            JobStatus::Pending,
+            "submitting another repo or product workload must not supersede {job:?}"
+        );
     }
 }
 
