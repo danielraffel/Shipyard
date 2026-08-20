@@ -915,6 +915,13 @@ When multiple jobs are queued (common with parallel worktrees):
 - `shipyard bump <id> low` — deprioritize a job
 - `shipyard cancel <id>` — cancel a pending or running job
 
+Pending ship jobs are pruned when their exact queued head is observed as
+already merged. The observation is keyed by `(repository, PR)`, deduplicated
+within a drain, cached for 30 seconds, and bounded to 15 seconds including
+configured GitHub App token resolution. An unavailable or mismatched
+observation leaves the job queued; never replace this with ambient `gh`, a
+checkout-relative PR lookup, or an unbounded per-job poll.
+
 For cross-process, read-only observation of GitHub's server merge queue and
 open PR heads, use `shipyard queue-observe`. It persists a canonical snapshot,
 emits only initial state or semantic deltas, and backs unchanged polling off

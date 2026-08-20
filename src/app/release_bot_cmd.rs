@@ -680,6 +680,7 @@ concurrency:
 
 permissions:
   contents: write
+  pull-requests: write
 
 env:
   SHIPYARD_VERSION: "{shipyard_version}"
@@ -920,6 +921,7 @@ fn commit_and_push_docs(
     diffed: &[String],
     result: &mut HookResult,
 ) -> Result<(), String> {
+    validate_hook_push_mode(&config.push_mode)?;
     let mut add_args = vec![String::from("add"), String::from("--")];
     add_args.extend(diffed.iter().cloned());
     run_git_owned(cwd, &add_args)?;
@@ -950,7 +952,19 @@ fn commit_and_push_docs(
     result.committed = true;
     match config.push_mode.as_str() {
         "pr" => push_via_pr(cwd, state_root, mode, global_dir, config, tag, result),
-        _ => push_direct(cwd, config, result),
+        "direct" => push_direct(cwd, config, result),
+        other => Err(format!(
+            "invalid release.post_tag_hook.push_mode {other:?}; expected `direct` or `pr`"
+        )),
+    }
+}
+
+fn validate_hook_push_mode(push_mode: &str) -> Result<(), String> {
+    match push_mode {
+        "direct" | "pr" => Ok(()),
+        other => Err(format!(
+            "invalid release.post_tag_hook.push_mode {other:?}; expected `direct` or `pr`"
+        )),
     }
 }
 
@@ -1049,6 +1063,7 @@ fn push_via_pr(
         }
         (target, commit)
     } else {
+        record_pr_push_attempt(result);
         attach_and_push_release_bot_branch(cwd, &config.remote, &pr_branch)?;
         result.pushed = true;
         create_release_bot_pr(cwd, config, tag, &pr_branch)?;
@@ -1107,6 +1122,10 @@ fn push_via_pr(
         merge_result: None,
     };
     supervise_release_bot_admission(&store, cwd, &request)
+}
+
+fn record_pr_push_attempt(result: &mut HookResult) {
+    result.attempts = 1;
 }
 
 fn attach_and_push_release_bot_branch(
@@ -2060,6 +2079,7 @@ esac
         assert!(workflow.contains("curl -fsSL \"https://generouscorp.com/Shipyard/install.sh\""));
         assert!(workflow.contains(r#"tag="${GITHUB_REF#refs/tags/}""#));
         assert!(!workflow.contains(r#"tag="${{GITHUB_REF#refs/tags/}}""#));
+        assert!(workflow.contains("pull-requests: write"));
     }
 
     #[test]
@@ -2207,6 +2227,21 @@ pr_branch_prefix = "bot/changelog"
         assert!(parsed.enabled);
         assert_eq!(parsed.push_mode, "pr");
         assert_eq!(parsed.pr_branch_prefix, "bot/changelog");
+    }
+
+    #[test]
+    fn hook_push_mode_rejects_typos_instead_of_falling_back_to_direct() {
+        assert!(validate_hook_push_mode("direct").is_ok());
+        assert!(validate_hook_push_mode("pr").is_ok());
+        let error = validate_hook_push_mode("pull-request").expect_err("typo rejected");
+        assert!(error.contains("expected `direct` or `pr`"));
+    }
+
+    #[test]
+    fn pr_push_records_one_attempt() {
+        let mut result = HookResult::default();
+        record_pr_push_attempt(&mut result);
+        assert_eq!(result.attempts, 1);
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::identity::RuntimeMode;
 
 const DEFAULT_REFRESH_SKEW_SECONDS: u64 = 60;
 const GH_TOKEN_ENV: &str = "GH_TOKEN";
+const PR_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Auth-aware GitHub CLI command factory.
 #[derive(Clone)]
@@ -997,26 +998,67 @@ pub fn is_graphql_rate_limited(message: &str) -> bool {
 /// "never cancel when the merged head differs" guard: callers compare the
 /// merged head against the queued job's expected head and only cancel on an
 /// exact match.
-pub fn pr_merged_head_sha(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> Option<String> {
+#[must_use]
+pub fn pr_merged_head_sha(
+    client: Option<&GhClient>,
+    repo: &str,
+    pr: u64,
+    cwd: &Path,
+    snapshot_file: Option<&Path>,
+) -> Option<String> {
+    pr_merged_head_sha_with_options(
+        client,
+        repo,
+        pr,
+        cwd,
+        snapshot_file,
+        None,
+        PR_OBSERVATION_TIMEOUT,
+    )
+}
+
+fn pr_merged_head_sha_with_options(
+    client: Option<&GhClient>,
+    repo: &str,
+    pr: u64,
+    cwd: &Path,
+    snapshot_file: Option<&Path>,
+    binary_override: Option<&Path>,
+    timeout: Duration,
+) -> Option<String> {
     let value = if let Some(path) = snapshot_file {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
     } else {
-        // Build an ambient `gh` command with any available auth (token env var
-        // or config-file credential). The drain loop runs with access to the
-        // user's login session so token discovery should succeed.
-        let mut cmd = Command::new("gh");
-        // Propagate GH_TOKEN / GITHUB_TOKEN environment variables.
-        if let Ok(token) = env::var(GH_TOKEN_ENV) {
-            cmd.env(GH_TOKEN_ENV, token);
+        let started = std::time::Instant::now();
+        let client = client?.clone().with_repo_override(repo).ok()?;
+        let mut cmd = client
+            .prepare_command_with_auth_timeout(
+                cwd,
+                binary_override,
+                GhSupervision::Supervised,
+                GhAuthPolicy::Default,
+                timeout,
+            )
+            .ok()?;
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return None;
         }
-        cmd.args(["pr", "view", &pr.to_string(), "--json", "state,headRefOid"])
-            .current_dir(cwd)
-            .output()
+        cmd.args([
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "state,headRefOid",
+        ]);
+        run_helper_with_timeout(&mut cmd, "gh", remaining)
             .ok()
             .filter(|out| out.status.success())
-            .and_then(|out| serde_json::from_str::<Value>(&String::from_utf8_lossy(&out.stdout)).ok())
+            .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
     };
     let value = value?;
     let merged = value
@@ -1222,6 +1264,71 @@ mod tests {
             )
             .expect_err("helper timeout");
         assert!(matches!(error, GhPrepareError::HelperTimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merged_pr_observation_uses_configured_auth_and_explicit_repository() {
+        let temp = TempDir::new().expect("temp");
+        let fake_gh = temp.path().join("gh");
+        let invocation = temp.path().join("invocation");
+        write_executable(
+            &fake_gh,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n%s' "$GH_TOKEN" "$*" > '{}'
+printf '%s' '{{"state":"MERGED","headRefOid":"abc123"}}'
+"#,
+                invocation.display()
+            ),
+        );
+        let config = config_from_toml(
+            r#"
+            [github.auth]
+            source = "env"
+            token_env = "PATH"
+            "#,
+        );
+        let client = GhClient::from_loaded_config(&config).expect("client");
+
+        let merged = pr_merged_head_sha_with_options(
+            Some(&client),
+            "owner/repo",
+            42,
+            temp.path(),
+            None,
+            Some(&fake_gh),
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(merged.as_deref(), Some("abc123"));
+        let invocation = std::fs::read_to_string(invocation).expect("invocation");
+        let (token, args) = invocation.split_once('\n').expect("token and args");
+        assert!(!token.is_empty());
+        assert_eq!(args, "pr view 42 --repo owner/repo --json state,headRefOid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merged_pr_observation_kills_a_hung_github_command() {
+        let temp = TempDir::new().expect("temp");
+        let fake_gh = temp.path().join("gh");
+        write_executable(&fake_gh, "#!/bin/sh\nsleep 5\n");
+        let client = GhClient::ambient();
+        let started = std::time::Instant::now();
+
+        let merged = pr_merged_head_sha_with_options(
+            Some(&client),
+            "owner/repo",
+            42,
+            temp.path(),
+            None,
+            Some(&fake_gh),
+            Duration::from_millis(20),
+        );
+
+        assert_eq!(merged, None);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 

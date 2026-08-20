@@ -438,6 +438,13 @@ staleness under the queue lock, so a worker merely between heartbeats is never
 killed; a "stale" job that revived between plan and apply defers conflicting
 starts to the next pass rather than double-running the PR.
 
+Pending ship jobs whose PR merged while they waited are cancelled only when
+GitHub reports the same exact head SHA recorded in the durable request. The
+drain batches by `(repository, PR)`, reuses one result for duplicate jobs, and
+throttles re-observation for 30 seconds. GitHub reads must use the effective
+`GhClient`, an explicit `--repo`, and the shared 15-second credential-plus-child
+budget; auth, timeout, malformed JSON, and head drift all fail closed.
+
 ### Gotchas
 
 - Recovery is heartbeat-age based, so a retry waits up to ~180s after the

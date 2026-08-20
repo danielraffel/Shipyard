@@ -1008,6 +1008,7 @@ fn jobs_use_vm_slot(jobs: &[Job], request_store: &QueueRequestStore, key: &str) 
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // One drain loop owns the shared observation cache.
 fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
     queue: &mut Queue,
     drain_lock: &crate::queue::DrainLock,
@@ -1027,6 +1028,8 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
     let jobs = queue.get_all()?;
     sweep_absent_queue_envelopes(&jobs, &request_store, &outcome_store)?;
     let queue_state_dir = queue.state_dir().to_path_buf();
+    let mut already_merged_observer =
+        crate::queue_scheduler::AlreadyMergedObserver::from_config(config);
     thread::scope(|scope| -> Result<(), ShipExecutionError> {
         let (completion_tx, completion_rx) = mpsc::channel();
         let mut handles = Vec::new();
@@ -1048,6 +1051,7 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
                     awaited_job_id,
                     cwd,
                     pr_snapshot_file,
+                    &mut already_merged_observer,
                 ) {
                     Ok(worker_inputs) => worker_inputs,
                     Err(error) => {
@@ -1175,6 +1179,7 @@ fn awaited_job_allows_refill(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Scheduler state is passed explicitly at the drain boundary.
 fn admit_drain_worker_inputs(
     queue: &mut Queue,
     drain_lock: &crate::queue::DrainLock,
@@ -1184,6 +1189,7 @@ fn admit_drain_worker_inputs(
     awaited_job_id: &str,
     cwd: &Path,
     pr_snapshot_file: Option<&Path>,
+    already_merged_observer: &mut crate::queue_scheduler::AlreadyMergedObserver,
 ) -> Result<Vec<(Job, QueuedExecutionEnvelope)>, ShipExecutionError> {
     let jobs = queue.get_all()?;
     let pools = scheduler_host_pools(&jobs, request_store)?;
@@ -1199,9 +1205,9 @@ fn admit_drain_worker_inputs(
         &leases,
         &vm_slots,
         Utc::now(),
-        cwd,
-        pr_snapshot_file,
     );
+    pass.already_merged_cancellations =
+        already_merged_observer.observe_pending(&jobs, request_store, cwd, pr_snapshot_file);
     cap_admit_pass_workers(&jobs, &mut pass, DEFAULT_DRAIN_MAX_WORKERS);
     let awaited_will_be_cancelled = pass
         .plan
