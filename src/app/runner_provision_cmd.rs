@@ -280,10 +280,35 @@ fn inspect_runner_installation(runner_dir: &Path) -> RunnerInstallation {
     }
 }
 
+fn validate_planned_runner_identity(
+    runner_dir: &Path,
+    runner_name: &str,
+    installation: RunnerInstallation,
+    registered_names: &[String],
+) -> Result<(), CliFailure> {
+    if installation.configured && !registered_names.iter().any(|name| name == runner_name) {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "runner configuration at {} is not registered in GitHub as {}; remove or repair the stale local installation before retrying",
+                runner_dir.display(),
+                runner_name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn stop_runner_service_before_upgrade(runner_dir: &Path) -> Result<(), CliFailure> {
     let service = runner_dir.join("svc.sh");
     if !service.is_file() {
-        return Ok(());
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "runner service is installed at {} but svc.sh is missing; repair the installation before retrying",
+                runner_dir.display()
+            ),
+        ));
     }
     run_in(
         runner_dir,
@@ -411,20 +436,20 @@ pub(super) fn register_command<W: Write>(
     let ci_root = args.ci_root.clone().unwrap_or_else(default_ci_root);
 
     let existing = existing_runner_names(args.actions, &slug)?;
-    let start = next_index(&existing, &repo_short, &tag);
     let parallel = (cpu_count() / args.count as usize).max(1);
 
-    // Build the plan first so dry-run and real runs agree.
-    let plan: Vec<RunnerPlan> = (0..args.count)
-        .map(|k| {
-            let name = runner_name(&repo_short, &tag, start + k);
-            RunnerPlan {
-                work: ci_root.join("work").join(&name),
-                dir: home_dir().join(format!("actions-runner-{name}")),
-                name,
-            }
-        })
-        .collect();
+    // `--count` is the desired minimum local capacity. Include every runner
+    // from this machine that is still registered in GitHub so a repeated
+    // provisioning pass upgrades the fleet pin instead of silently creating
+    // new names and leaving the existing services behind.
+    let plan = build_runner_plan(
+        &existing,
+        &repo_short,
+        &tag,
+        args.count,
+        &ci_root,
+        &home_dir(),
+    );
 
     if args.dry_run {
         return report_register(
@@ -474,6 +499,7 @@ pub(super) fn register_command<W: Write>(
         fs::create_dir_all(&entry.work)
             .map_err(|e| CliFailure::new(1, format!("failed to create work dir: {e}")))?;
         let installation = inspect_runner_installation(&entry.dir);
+        validate_planned_runner_identity(&entry.dir, &entry.name, installation, &existing)?;
         if !installation.configured && installation.service_installed {
             return Err(CliFailure::new(
                 1,
@@ -590,6 +616,43 @@ struct RunnerPlan {
     name: String,
     dir: PathBuf,
     work: PathBuf,
+}
+
+fn build_runner_plan(
+    registered_names: &[String],
+    repo_short: &str,
+    machine_tag: &str,
+    minimum_count: u32,
+    ci_root: &Path,
+    home: &Path,
+) -> Vec<RunnerPlan> {
+    let prefix = format!("{repo_short}-{machine_tag}-");
+    let mut names: Vec<String> = registered_names
+        .iter()
+        .filter(|name| name.starts_with(&prefix))
+        .filter(|name| {
+            home.join(format!("actions-runner-{name}"))
+                .join(".runner")
+                .is_file()
+        })
+        .cloned()
+        .collect();
+    names.sort();
+
+    let mut next = next_index(registered_names, repo_short, machine_tag);
+    while names.len() < minimum_count as usize {
+        names.push(runner_name(repo_short, machine_tag, next));
+        next += 1;
+    }
+
+    names
+        .into_iter()
+        .map(|name| RunnerPlan {
+            work: ci_root.join("work").join(&name),
+            dir: home.join(format!("actions-runner-{name}")),
+            name,
+        })
+        .collect()
 }
 
 fn runner_config_args(
@@ -1127,6 +1190,16 @@ mod tests {
     }
 
     #[test]
+    fn runner_upgrade_refuses_an_installed_service_without_control_script() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(temp.path().join(".service"), "plist\n").expect("service marker");
+
+        let error = stop_runner_service_before_upgrade(temp.path())
+            .expect_err("missing service control must fail closed");
+        assert!(error.message.contains("svc.sh is missing"));
+    }
+
+    #[test]
     fn runner_installation_state_distinguishes_upgrade_from_fresh_registration() {
         let temp = tempfile::tempdir().expect("temp");
         assert_eq!(
@@ -1146,6 +1219,67 @@ mod tests {
                 service_installed: true,
             }
         );
+    }
+
+    #[test]
+    fn configured_runner_must_still_exist_in_github_inventory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let installation = RunnerInstallation {
+            configured: true,
+            service_installed: true,
+        };
+
+        let error = validate_planned_runner_identity(
+            temp.path(),
+            "pulp-studio-03",
+            installation,
+            &["pulp-studio-01".to_owned()],
+        )
+        .expect_err("orphaned local runner config must fail closed");
+        assert!(error.message.contains("not registered in GitHub"));
+
+        validate_planned_runner_identity(
+            temp.path(),
+            "pulp-studio-03",
+            installation,
+            &["pulp-studio-03".to_owned()],
+        )
+        .expect("matching server inventory");
+    }
+
+    #[test]
+    fn registration_plan_upgrades_local_registered_runners_before_adding_capacity() {
+        let temp = tempfile::tempdir().expect("temp");
+        let ci_root = temp.path().join("ci");
+        for name in ["pulp-m5-01", "pulp-m5-02"] {
+            let dir = temp.path().join(format!("actions-runner-{name}"));
+            std::fs::create_dir_all(&dir).expect("runner dir");
+            std::fs::write(dir.join(".runner"), "{}\n").expect("runner config");
+        }
+        let registered = vec![
+            "pulp-m5-01".to_owned(),
+            "pulp-m5-02".to_owned(),
+            "pulp-m1-01".to_owned(),
+        ];
+
+        let existing_plan = build_runner_plan(&registered, "pulp", "m5", 1, &ci_root, temp.path());
+        assert_eq!(
+            existing_plan
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pulp-m5-01", "pulp-m5-02"]
+        );
+
+        let expanded_plan = build_runner_plan(&registered, "pulp", "m5", 3, &ci_root, temp.path());
+        assert_eq!(
+            expanded_plan
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pulp-m5-01", "pulp-m5-02", "pulp-m5-03"]
+        );
+        assert_eq!(expanded_plan[2].work, ci_root.join("work/pulp-m5-03"));
     }
 
     // Runner provisioning targets self-hosted macOS runners and the env file's
