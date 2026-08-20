@@ -85,8 +85,9 @@ What it does per runner:
    appends capacity (`-04`, `-05`) without collisions.
 2. Downloads the fleet-pinned `osx-arm64` runner tarball once into
    `<ci-root>/cache/actions-runner-pkg/` and extracts it into
-   `~/actions-runner-<name>`. Registration uses `--disableupdate`; upgrades are
-   an explicit fleet-wide pin change, never a per-host automatic update.
+   `~/actions-runner-<name>`. Both the runner archive and pinned `rustup-init`
+   binary are SHA-256 verified. Registration uses `--disableupdate`; upgrades
+   are an explicit fleet-wide pin change, never a per-host automatic update.
 3. Writes a per-runner `.env` pointing ccache + FetchContent at the shared
    caches and isolating each runner's `_work` for cross-worktree cache hits
    (`CCACHE_BASEDIR` + `CCACHE_NOHASHDIR`). Depend mode is forced off and the

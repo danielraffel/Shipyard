@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -57,6 +57,9 @@ fn fetch_all_runners(actions: &GitHubActions, slug: &str) -> Result<Vec<ApiRunne
 const PINNED_RUNNER_VERSION: &str = "2.335.1";
 const PINNED_RUNNER_SHA256: &str =
     "e1a9bc7a3661e06fa0b129d15c2064fe65dc81a431001d8958a9db1409b73769";
+const PINNED_RUSTUP_VERSION: &str = "1.29.0";
+const PINNED_RUSTUP_SHA256: &str =
+    "aeb4105778ca1bd3c6b0e75768f581c656633cd51368fa61289b6a71696ac7e1";
 
 fn runner_package_url() -> (String, String) {
     let name = format!("actions-runner-osx-arm64-{PINNED_RUNNER_VERSION}.tar.gz");
@@ -66,20 +69,34 @@ fn runner_package_url() -> (String, String) {
     (name, url)
 }
 
-fn verify_runner_package(path: &Path) -> Result<(), CliFailure> {
-    let bytes = fs::read(path)
-        .map_err(|e| CliFailure::new(1, format!("failed to read runner package: {e}")))?;
-    let actual = hex::encode(Sha256::digest(bytes));
-    if actual == PINNED_RUNNER_SHA256 {
+fn verify_sha256(path: &Path, expected: &str, what: &str) -> Result<(), CliFailure> {
+    let file = fs::File::open(path)
+        .map_err(|e| CliFailure::new(1, format!("failed to read {what}: {e}")))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .map_err(|e| CliFailure::new(1, format!("failed to hash {what}: {e}")))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&chunk[..count]);
+    }
+    let actual = hex::encode(hasher.finalize());
+    if actual == expected {
         Ok(())
     } else {
         Err(CliFailure::new(
             1,
-            format!(
-                "runner package SHA-256 mismatch: got {actual}, expected {PINNED_RUNNER_SHA256}"
-            ),
+            format!("{what} SHA-256 mismatch: got {actual}, expected {expected}"),
         ))
     }
+}
+
+fn verify_runner_package(path: &Path) -> Result<(), CliFailure> {
+    verify_sha256(path, PINNED_RUNNER_SHA256, "runner package")
 }
 
 // ---------- tag ----------
@@ -217,6 +234,36 @@ fn runner_path_file(runner_dir: &Path) -> String {
     )
 }
 
+fn private_rust_is_ready(runner_dir: &Path) -> bool {
+    let rustup_home = runner_dir.join("_toolcache/rustup");
+    let cargo_home = runner_dir.join("_toolcache/cargo");
+    let private_path = runner_path_file(runner_dir);
+    let probe = |binary: &Path, args: &[&str]| {
+        Command::new(binary)
+            .args(args)
+            .env("RUSTUP_HOME", &rustup_home)
+            .env("CARGO_HOME", &cargo_home)
+            .env("PATH", private_path.trim())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    probe(&cargo_home.join("bin/cargo"), &["--version"])
+        && probe(
+            &cargo_home.join("bin/rustup"),
+            &["show", "active-toolchain"],
+        )
+}
+
+fn installed_runner_version(runner_dir: &Path) -> Option<String> {
+    Command::new(runner_dir.join("bin/Runner.Listener"))
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|version| version.trim().to_owned())
+}
+
 fn ensure_private_rust_toolchain(runner_dir: &Path) -> Result<(), CliFailure> {
     let toolcache = runner_dir.join("_toolcache");
     let rustup_home = toolcache.join("rustup");
@@ -226,31 +273,39 @@ fn ensure_private_rust_toolchain(runner_dir: &Path) -> Result<(), CliFailure> {
     fs::create_dir_all(&cargo_home)
         .map_err(|e| CliFailure::new(1, format!("failed to create private cargo home: {e}")))?;
 
-    let cargo = cargo_home.join("bin/cargo");
-    if Command::new(&cargo)
-        .arg("--version")
-        .status()
-        .is_ok_and(|status| status.success())
-    {
+    if private_rust_is_ready(runner_dir) {
         return Ok(());
     }
 
-    let installer = toolcache.join("rustup-init.sh");
+    let installer = toolcache.join("rustup-init");
+    let rustup_url = format!(
+        "https://static.rust-lang.org/rustup/archive/{PINNED_RUSTUP_VERSION}/aarch64-apple-darwin/rustup-init"
+    );
     run(
-        "curl",
+        "/usr/bin/curl",
         &[
             "--proto",
             "=https",
             "--tlsv1.2",
             "-fsSL",
-            "https://sh.rustup.rs",
+            &rustup_url,
             "-o",
             &installer.to_string_lossy(),
         ],
         "download rustup installer",
     )?;
-    let status = Command::new("/bin/sh")
-        .arg(&installer)
+    verify_sha256(&installer, PINNED_RUSTUP_SHA256, "rustup-init")?;
+    let mut permissions = fs::metadata(&installer)
+        .map_err(|e| CliFailure::new(1, format!("failed to inspect rustup-init: {e}")))?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+    }
+    fs::set_permissions(&installer, permissions)
+        .map_err(|e| CliFailure::new(1, format!("failed to make rustup-init executable: {e}")))?;
+    let status = Command::new(&installer)
         .args([
             "-y",
             "--no-modify-path",
@@ -271,17 +326,10 @@ fn ensure_private_rust_toolchain(runner_dir: &Path) -> Result<(), CliFailure> {
             format!("private rustup install failed (exit {:?})", status.code()),
         ));
     }
-    if !Command::new(&cargo)
-        .arg("--version")
-        .status()
-        .is_ok_and(|status| status.success())
-    {
+    if !private_rust_is_ready(runner_dir) {
         return Err(CliFailure::new(
             1,
-            format!(
-                "private cargo is not runnable after install: {}",
-                cargo.display()
-            ),
+            "private cargo/rustup toolchain is not runnable after install",
         ));
     }
     Ok(())
@@ -373,7 +421,7 @@ pub(super) fn register_command<W: Write>(
     if !pkg_path.exists() {
         let partial = pkg_path.with_extension("partial");
         run(
-            "curl",
+            "/usr/bin/curl",
             &[
                 "--proto",
                 "=https",
@@ -396,9 +444,10 @@ pub(super) fn register_command<W: Write>(
             .map_err(|e| CliFailure::new(1, format!("failed to create runner dir: {e}")))?;
         fs::create_dir_all(&entry.work)
             .map_err(|e| CliFailure::new(1, format!("failed to create work dir: {e}")))?;
-        if !entry.dir.join("config.sh").exists() {
+        let installed_version = installed_runner_version(&entry.dir);
+        if installed_version.as_deref() != Some(PINNED_RUNNER_VERSION) {
             run(
-                "tar",
+                "/usr/bin/tar",
                 &[
                     "xzf",
                     &pkg_path.to_string_lossy(),
@@ -407,6 +456,12 @@ pub(super) fn register_command<W: Write>(
                 ],
                 "extract runner",
             )?;
+        }
+        if installed_runner_version(&entry.dir).as_deref() != Some(PINNED_RUNNER_VERSION) {
+            return Err(CliFailure::new(
+                1,
+                format!("runner did not install at pinned version {PINNED_RUNNER_VERSION}"),
+            ));
         }
         fs::write(
             entry.dir.join(".env"),
@@ -941,6 +996,40 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(state_dir.join("machine-tag")).expect("tag"),
             "studio\n"
+        );
+    }
+
+    #[test]
+    fn sha256_verification_rejects_changed_downloads() {
+        let temp = tempfile::tempdir().expect("temp");
+        let package = temp.path().join("package");
+        std::fs::write(&package, b"known bytes").expect("write package");
+        let expected = hex::encode(Sha256::digest(b"known bytes"));
+        verify_sha256(&package, &expected, "test package").expect("matching digest");
+        assert!(verify_sha256(&package, "00", "test package").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_runner_version_reads_the_binary_not_directory_presence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let listener = temp.path().join("bin/Runner.Listener");
+        std::fs::create_dir_all(listener.parent().expect("parent")).expect("bin dir");
+        std::fs::write(&listener, "#!/bin/sh\nprintf '2.334.0\\n'\n").expect("listener");
+        let mut permissions = std::fs::metadata(&listener)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&listener, permissions).expect("chmod");
+        assert_eq!(
+            installed_runner_version(temp.path()).as_deref(),
+            Some("2.334.0")
+        );
+        assert_ne!(
+            installed_runner_version(temp.path()).as_deref(),
+            Some(PINNED_RUNNER_VERSION)
         );
     }
 
