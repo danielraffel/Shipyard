@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0950"></a>
+## [0.95.0] - 2026-08-16
+
+- feat: local-first CI profiles ([#434](https://github.com/danielraffel/Shipyard/pull/434))
+
 <a id="v0940"></a>
 ## [0.94.0] - 2026-08-15
 
@@ -909,6 +914,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.95.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.95.0
 [0.94.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.94.0
 [0.93.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.93.0
 [0.92.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.92.1

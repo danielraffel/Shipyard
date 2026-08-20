@@ -17,6 +17,8 @@ pub mod capacity;
 pub mod changed_surface;
 /// Changelog tag graph extraction and markdown rendering.
 pub mod changelog;
+/// Typed CI routing profile schema.
+pub mod ci_profile;
 /// Coarse failure classification shared by executors.
 pub mod classify;
 /// GitHub Actions workflow discovery, dispatch planning, and shell helpers.
@@ -41,6 +43,8 @@ pub mod doctor;
 pub mod evidence;
 /// Local and remote executor support modules.
 pub mod executor;
+/// Fail-closed check that a host has converged to the declared fleet epoch.
+pub mod fleet_epoch;
 /// Repo-local gate script resolution for `shipyard pr`.
 pub mod gate_scripts;
 /// Shared GitHub CLI command boundary and auth resolution.
@@ -86,6 +90,8 @@ pub mod preflight;
 /// Prepared-state cache for warm stage reruns.
 pub mod prepared_state;
 mod process;
+/// Proof gates for applying a routing profile to GitHub variables.
+pub mod profile_apply;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
 /// Stable read-only GitHub queue snapshots, state hashing, and delta tracking.

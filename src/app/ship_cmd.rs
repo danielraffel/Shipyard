@@ -36,8 +36,8 @@ use crate::paths::RuntimePaths;
 use crate::pr::{PrInfo, create_pr, find_pr_for_branch, get_pr_status, push_branch};
 use crate::pr_text::{compose_pr_body_with_policy, compose_pr_title};
 use crate::preflight::{
-    EXIT_BACKEND_UNREACHABLE, EXIT_HOST_UNHEALTHY, ShipPreflightError, ShipPreflightOptions,
-    collect_ship_preflight_with_options,
+    EXIT_BACKEND_UNREACHABLE, EXIT_FLEET_EPOCH_DRIFT, EXIT_HOST_UNHEALTHY, ShipPreflightError,
+    ShipPreflightOptions, collect_ship_preflight_with_options,
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
@@ -46,6 +46,10 @@ use crate::ship::{ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_s
 use crate::ship_state::ShipStateStore;
 use crate::warm_pool::{WarmPool, default_pool_path};
 
+// A CLI argument bag: one bool per user-facing flag is the shape the
+// command line already has, and grouping them into sub-structs would
+// only move the flags further from the flags they mirror.
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct ShipCommandArgs {
     pub(super) pr: Option<u64>,
     pub(super) base: String,
@@ -60,6 +64,8 @@ pub(super) struct ShipCommandArgs {
     /// Shipyard issue #296 for the failure mode this guards against.
     pub(super) pr_snapshot_file: Option<PathBuf>,
     pub(super) allow_unreachable_targets: bool,
+    /// Proceed even when this host has not converged to the declared fleet epoch.
+    pub(super) allow_fleet_epoch_drift: bool,
     pub(super) skip_targets: Vec<String>,
     /// Adopt the current head SHA when recorded ship-state drifted (amend /
     /// force-push), clearing prior evidence so the new head re-validates
@@ -522,6 +528,7 @@ fn prepare_ship_targets<W: Write>(
         ShipPreflightOptions {
             allow_root_mismatch: false,
             allow_unreachable_targets: args.allow_unreachable_targets,
+            allow_fleet_epoch_drift: args.allow_fleet_epoch_drift,
         },
     )
     .map_err(|error| preflight_failure(&error))?;
@@ -545,6 +552,7 @@ fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
         ShipPreflightError::RootMismatch { .. } => 1,
         ShipPreflightError::BackendUnreachable { .. } => EXIT_BACKEND_UNREACHABLE,
         ShipPreflightError::HostUnhealthy { .. } => EXIT_HOST_UNHEALTHY,
+        ShipPreflightError::FleetEpochDrift { .. } => EXIT_FLEET_EPOCH_DRIFT,
     };
     CliFailure::new(code, error.to_string())
 }
@@ -1967,6 +1975,7 @@ esac"#,
                 gh_command: None,
                 pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
+                allow_fleet_epoch_drift: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
@@ -2045,6 +2054,7 @@ esac"#,
                 gh_command: None,
                 pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
+                allow_fleet_epoch_drift: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
@@ -2095,6 +2105,7 @@ esac"#,
                 gh_command: None,
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
+                allow_fleet_epoch_drift: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
@@ -2151,6 +2162,7 @@ esac"#,
                 gh_command: None,
                 pr_snapshot_file: Some(snapshot),
                 allow_unreachable_targets: false,
+                allow_fleet_epoch_drift: false,
                 skip_targets: vec!["linux".to_owned()],
                 adopt_head: false,
                 steward_handoff: None,
@@ -2216,6 +2228,7 @@ exit 2
                 gh_command: Some(gh),
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
+                allow_fleet_epoch_drift: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
@@ -2319,6 +2332,7 @@ exit 2
                 gh_command: Some(gh),
                 pr_snapshot_file: None,
                 allow_unreachable_targets: false,
+                allow_fleet_epoch_drift: false,
                 skip_targets: Vec::new(),
                 adopt_head: false,
                 steward_handoff: None,
