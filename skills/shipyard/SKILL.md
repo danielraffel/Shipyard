@@ -548,6 +548,11 @@ naming/index/label/table logic lives in `src/runner_provision.rs`; the shell
 side (gh, `config.sh`, `svc.sh`, local `~/actions-runner-*` dirs) is
 `src/app/runner_provision_cmd.rs`. See `docs/runner-provisioning.md`.
 
+Pinned runner upgrades are fail-closed: stop an existing service before
+extracting replacement files, and abort if the stop fails. Toolchain readiness
+checks are silent probes; never let their stdout/stderr contaminate normal or
+JSON output.
+
 ### Machine tag (load-bearing for multi-Mac fleets)
 
 Runners are named `<repo>-<machine-tag>-NN` (e.g. `pulp-studio-01`). The tag is

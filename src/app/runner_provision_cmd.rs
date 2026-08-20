@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -244,6 +244,9 @@ fn private_rust_is_ready(runner_dir: &Path) -> bool {
             .env("RUSTUP_HOME", &rustup_home)
             .env("CARGO_HOME", &cargo_home)
             .env("PATH", private_path.trim())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
     };
@@ -262,6 +265,19 @@ fn installed_runner_version(runner_dir: &Path) -> Option<String> {
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|version| version.trim().to_owned())
+}
+
+fn stop_runner_service_before_upgrade(runner_dir: &Path) -> Result<(), CliFailure> {
+    let service = runner_dir.join("svc.sh");
+    if !service.is_file() {
+        return Ok(());
+    }
+    run_in(
+        runner_dir,
+        "./svc.sh",
+        &["stop"],
+        "stop runner service before upgrade",
+    )
 }
 
 fn ensure_private_rust_toolchain(runner_dir: &Path) -> Result<(), CliFailure> {
@@ -446,6 +462,10 @@ pub(super) fn register_command<W: Write>(
             .map_err(|e| CliFailure::new(1, format!("failed to create work dir: {e}")))?;
         let installed_version = installed_runner_version(&entry.dir);
         if installed_version.as_deref() != Some(PINNED_RUNNER_VERSION) {
+            // Never replace files underneath a running service. A failed stop
+            // is a hard boundary: leave the old installation intact and let
+            // the operator repair the service before attempting the upgrade.
+            stop_runner_service_before_upgrade(&entry.dir)?;
             run(
                 "/usr/bin/tar",
                 &[
@@ -1030,6 +1050,29 @@ mod tests {
         assert_ne!(
             installed_runner_version(temp.path()).as_deref(),
             Some(PINNED_RUNNER_VERSION)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_upgrade_stops_an_existing_service_before_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let service = temp.path().join("svc.sh");
+        std::fs::write(
+            &service,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > service-invocation\n",
+        )
+        .expect("service script");
+        let mut permissions = std::fs::metadata(&service).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&service, permissions).expect("chmod");
+
+        stop_runner_service_before_upgrade(temp.path()).expect("stop service");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("service-invocation")).expect("invocation"),
+            "stop\n"
         );
     }
 
