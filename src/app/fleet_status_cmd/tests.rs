@@ -267,6 +267,117 @@ fn storage_probe_flags_disk_floor_and_ccache_limit_mismatch() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn storage_probe_observes_effective_ccache_config_without_forcing_cache_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp");
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin directory");
+    let ccache = bin.join("ccache");
+    fs::write(
+        &ccache,
+        r#"#!/bin/sh
+set -eu
+if [ -n "${CCACHE_DIR:-}" ]; then
+  max_kibibyte=5242880
+  max_size=5G
+  compiler_check=mtime
+else
+  max_kibibyte=20971520
+  max_size=20G
+  compiler_check=content
+fi
+case "${1:-}" in
+  --print-stats)
+    printf 'cache_size_kibibyte\t19530432\nmax_cache_size_kibibyte\t%s\n' "$max_kibibyte"
+    ;;
+  --show-config)
+    printf 'max_size = %s\ncompiler_check = %s\n' "$max_size" "$compiler_check"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+    )
+    .expect("write fake ccache");
+    let mut permissions = fs::metadata(&ccache)
+        .expect("fake ccache metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&ccache, permissions).expect("chmod fake ccache");
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+
+    let normal_config = Command::new(&ccache)
+        .arg("--show-config")
+        .env_remove("CCACHE_DIR")
+        .output()
+        .expect("normal config");
+    let forced_config = Command::new(&ccache)
+        .arg("--show-config")
+        .env("CCACHE_DIR", temp.path().join("forced-cache"))
+        .output()
+        .expect("forced config");
+    assert_eq!(
+        String::from_utf8_lossy(&normal_config.stdout),
+        "max_size = 20G\ncompiler_check = content\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&forced_config.stdout),
+        "max_size = 5G\ncompiler_check = mtime\n"
+    );
+
+    let script = storage_probe_script(temp.path().to_str().expect("UTF-8 path"));
+    assert!(!script.contains("CCACHE_DIR="));
+    let normal_output = Command::new("sh")
+        .args(["-c", &script])
+        .env("PATH", &path)
+        .env_remove("CCACHE_DIR")
+        .output()
+        .expect("normal storage probe");
+    let forced_output = Command::new("sh")
+        .args(["-c", &script])
+        .env("PATH", &path)
+        .env("CCACHE_DIR", temp.path().join("forced-cache"))
+        .output()
+        .expect("forced storage probe");
+    let normal = storage_probe_from_output(&normal_output, "/fallback");
+    let forced = storage_probe_from_output(&forced_output, "/fallback");
+
+    assert_eq!(normal.ccache_size_kibibyte, Some(19_530_432));
+    assert_eq!(normal.ccache_max_kibibyte, Some(20_971_520));
+    assert!(
+        storage_problems(&normal)
+            .iter()
+            .all(|problem| !problem.starts_with("ccache_over_limit:"))
+    );
+    assert_eq!(forced.ccache_max_kibibyte, Some(5_242_880));
+    assert!(
+        storage_problems(&forced)
+            .iter()
+            .any(|problem| problem.starts_with("ccache_over_limit:"))
+    );
+}
+
+#[test]
+fn storage_probe_remains_readable_when_ccache_metrics_are_unavailable() {
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "printf 'disk_path\\t/Users/ci/VMs\\ndisk_available_kibibyte\\t52428800\\n'",
+        ])
+        .output()
+        .expect("sh");
+    let probe = storage_probe_from_output(&output, "/fallback");
+
+    assert!(probe.readable);
+    assert_eq!(probe.ccache_size_kibibyte, None);
+    assert_eq!(probe.ccache_max_kibibyte, None);
+    assert!(storage_problems(&probe).is_empty());
+}
+
 #[test]
 fn routing_mismatch_reports_idle_linux_pool_for_hosted_merge_group() {
     let inventory = RunnerInventory {
