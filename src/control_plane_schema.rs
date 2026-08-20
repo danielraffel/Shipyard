@@ -357,7 +357,8 @@ fn validate_key(key: &WorkItemKey) -> Result<(), SchemaError> {
     let valid_repository = repository.next().is_some_and(|part| !part.is_empty())
         && repository.next().is_some_and(|part| !part.is_empty())
         && repository.next().is_none()
-        && !key.repository.chars().any(char::is_whitespace);
+        && !key.repository.chars().any(char::is_whitespace)
+        && key.repository == key.repository.to_ascii_lowercase();
     let valid_sha = matches!(key.head_sha.len(), 40 | 64)
         && key
             .head_sha
@@ -593,6 +594,15 @@ mod tests {
             "../tests/fixtures/control-plane/head-supersession.json"
         ));
         corpus.initial.key.head_sha = "A111111111111111111111111111111111111111".to_owned();
+        assert_eq!(
+            replay(&corpus.initial, &corpus.transitions),
+            Err(SchemaError::InvalidWorkItemKey)
+        );
+
+        let mut corpus = fixture(include_str!(
+            "../tests/fixtures/control-plane/head-supersession.json"
+        ));
+        corpus.initial.key.repository = "Generous-Corp/Pulp".to_owned();
         assert_eq!(
             replay(&corpus.initial, &corpus.transitions),
             Err(SchemaError::InvalidWorkItemKey)

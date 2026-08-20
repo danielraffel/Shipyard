@@ -747,6 +747,36 @@ struct ResolvedPrContext {
     pr_title: Option<String>,
 }
 
+pub(super) fn ensure_existing_pr_base_matches(
+    actual: &str,
+    requested: &str,
+) -> Result<(), CliFailure> {
+    if actual == requested {
+        Ok(())
+    } else {
+        Err(CliFailure::new(
+            2,
+            format!(
+                "existing PR targets `{actual}`, but this invocation requested `{requested}`; rerun with --base {actual}"
+            ),
+        ))
+    }
+}
+
+fn ensure_pr_head_matches(info: &PrInfo, branch: &str, head_sha: &str) -> Result<(), CliFailure> {
+    if info.branch == branch && info.head_sha.eq_ignore_ascii_case(head_sha) {
+        Ok(())
+    } else {
+        Err(CliFailure::new(
+            1,
+            format!(
+                "PR #{} identity changed after push: expected branch `{branch}` at `{head_sha}`, found `{}` at `{}`",
+                info.number, info.branch, info.head_sha
+            ),
+        ))
+    }
+}
+
 fn resolve_pr_context(
     config: &LoadedConfig,
     args: &ShipCommandArgs,
@@ -787,22 +817,41 @@ fn resolve_pr_context(
         });
     }
 
+    let existing = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), branch)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if let Some(info) = existing.as_ref() {
+        ensure_existing_pr_base_matches(&info.base, &args.base)?;
+    }
+
     push_branch(cwd, branch).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let info = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), branch)
+    let expected_head = git_required(cwd, &["rev-parse", "HEAD"])?;
+    let info = if let Some(info) = existing {
+        get_pr_status(
+            config,
+            cwd,
+            args.gh_command.as_deref(),
+            &info.number.to_string(),
+        )
         .map_err(|error| CliFailure::new(1, error.to_string()))?
-        .map_or_else(
-            || {
-                create_current_branch_pr(
-                    config,
-                    cwd,
-                    args.gh_command.as_deref(),
-                    branch,
-                    &args.base,
-                    lane_policy,
-                )
-            },
-            Ok::<PrInfo, CliFailure>,
-        )?;
+    } else {
+        find_pr_for_branch(config, cwd, args.gh_command.as_deref(), branch)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?
+            .map_or_else(
+                || {
+                    create_current_branch_pr(
+                        config,
+                        cwd,
+                        args.gh_command.as_deref(),
+                        branch,
+                        &args.base,
+                        lane_policy,
+                    )
+                },
+                Ok::<PrInfo, CliFailure>,
+            )?
+    };
+    ensure_existing_pr_base_matches(&info.base, &args.base)?;
+    ensure_pr_head_matches(&info, branch, &expected_head)?;
     Ok(ResolvedPrContext {
         number: info.number,
         base_branch: info.base,
@@ -1452,10 +1501,10 @@ mod tests {
     use super::run_pr_provenance_hook;
     use super::{
         SHIP_EXIT_MERGE_CLIENT_DEFECT, ShipCommandArgs, ShipInvocation, ShipRenderState,
-        ShipStewardHandoff, configured_pr_provenance_hook, green_not_merged,
-        is_terminal_steward_handoff, render_green_not_merged,
+        ShipStewardHandoff, configured_pr_provenance_hook, ensure_existing_pr_base_matches,
+        git_required, green_not_merged, is_terminal_steward_handoff, render_green_not_merged,
         render_green_not_merged_client_defect, render_green_not_merged_flaky,
-        render_green_not_merged_head_superseded, ship_command,
+        render_green_not_merged_head_superseded, resolve_pr_context, ship_command,
     };
     use crate::app::cli::MergeResult;
     #[cfg(unix)]
@@ -1463,6 +1512,15 @@ mod tests {
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::identity::RuntimeMode;
     use crate::paths::RuntimePaths;
+
+    #[test]
+    fn existing_pr_base_must_match_the_requested_policy_base() {
+        assert!(ensure_existing_pr_base_matches("main", "main").is_ok());
+        let error = ensure_existing_pr_base_matches("release", "main")
+            .expect_err("mismatched base must fail closed");
+        assert!(error.message().contains("existing PR targets `release`"));
+        assert!(error.message().contains("rerun with --base release"));
+    }
 
     /// Issue #301 (2/3): the render must surface the underlying merge
     /// error verbatim and point the user at the two unblocks
@@ -2325,6 +2383,7 @@ esac"#,
         let repo = temp.path().join("repo");
         let remote = temp.path().join("remote.git");
         seed_repo_with_local_origin(&repo, &remote);
+        let expected_head = git_required(&repo, &["rev-parse", "HEAD"]).expect("head");
         let gh = temp.path().join("gh");
         let gh_log = temp.path().join("gh.log");
         fake_gh(
@@ -2333,13 +2392,18 @@ esac"#,
                 r#"
 echo "$@" >> "{}"
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":88,"url":"https://github.com/o/r/pull/88","title":"Existing PR","state":"OPEN","headRefName":"feature/test","baseRefName":"main"}}]'
+  echo '[{{"number":88,"url":"https://github.com/o/r/pull/88","title":"Existing PR","state":"OPEN","headRefName":"feature/test","headRefOid":"{1}","baseRefName":"main"}}]'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{{"number":88,"url":"https://github.com/o/r/pull/88","title":"Existing PR","state":"OPEN","headRefName":"feature/test","headRefOid":"{1}","baseRefName":"main"}}'
   exit 0
 fi
 echo "unexpected gh args: $@" >&2
 exit 2
 "#,
-                gh_log.display()
+                gh_log.display(),
+                expected_head
             ),
         );
         let paths = RuntimePaths::current_with_overrides(
@@ -2403,6 +2467,63 @@ exit 2
 
     #[test]
     #[cfg(unix)]
+    fn mismatched_existing_pr_base_is_rejected_before_push() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        seed_repo_with_local_origin(&repo, &remote);
+        std::fs::write(repo.join("feature.txt"), "local change\n").expect("feature");
+        git(&["add", "."], &repo);
+        git(&["commit", "-q", "-m", "Local head"], &repo);
+
+        let gh = temp.path().join("gh");
+        fake_gh(
+            &gh,
+            r#"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  echo '[{"number":88,"url":"https://github.com/o/r/pull/88","title":"Wrong base","state":"OPEN","headRefName":"feature/test","headRefOid":"1111111111111111111111111111111111111111","baseRefName":"release"}]'
+  exit 0
+fi
+echo "unexpected gh args: $@" >&2
+exit 2
+"#,
+        );
+        let config = loaded_config(temp.path());
+        let args = ShipCommandArgs {
+            pr: None,
+            base: "main".to_owned(),
+            auto_create_base: None,
+            no_warm: true,
+            resume_from: None,
+            merge_command: None,
+            merge_result: Some(MergeResult::Success),
+            gh_command: Some(gh),
+            pr_snapshot_file: None,
+            allow_unreachable_targets: false,
+            allow_fleet_epoch_drift: false,
+            skip_targets: Vec::new(),
+            adopt_head: false,
+            steward_handoff: None,
+            invocation: ShipInvocation::Direct,
+        };
+        let lane_policy = crate::lane_policy::resolve_lane_policy(&config, &repo);
+
+        let Err(error) = resolve_pr_context(&config, &args, &repo, "feature/test", &lane_policy)
+        else {
+            panic!("wrong base must fail before push");
+        };
+        assert!(error.message().contains("existing PR targets `release`"));
+        let remote_ref = crate::supervised::git_supervised()
+            .args(["ls-remote", "origin", "refs/heads/feature/test"])
+            .current_dir(&repo)
+            .output()
+            .expect("ls-remote");
+        assert!(remote_ref.status.success());
+        assert!(remote_ref.stdout.is_empty(), "branch must not be pushed");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn ship_command_without_pr_creates_pr_when_none_exists() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -2421,6 +2542,7 @@ exit 2
             ],
             &repo,
         );
+        let expected_head = git_required(&repo, &["rev-parse", "HEAD"]).expect("head");
         let gh = temp.path().join("gh");
         let gh_log = temp.path().join("gh.log");
         fake_gh(
@@ -2437,13 +2559,14 @@ if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  echo '{{"number":89,"url":"https://github.com/o/r/pull/89","title":"Add autopilot","state":"OPEN","headRefName":"feature/test","baseRefName":"develop/test"}}'
+  echo '{{"number":89,"url":"https://github.com/o/r/pull/89","title":"Add autopilot","state":"OPEN","headRefName":"feature/test","headRefOid":"{1}","baseRefName":"develop/test"}}'
   exit 0
 fi
 echo "unexpected gh args: $@" >&2
 exit 2
 "#,
-                gh_log.display()
+                gh_log.display(),
+                expected_head
             ),
         );
         let paths = RuntimePaths::current_with_overrides(

@@ -10,8 +10,8 @@ use super::{
     merge_steward_cmd::{StewardHandoffArgs, existing_handoff_receipt_is_valid},
     pr_invocation::{PrInvocationIdentity, PrInvocationLease, PrInvocationTransitionGuard},
     ship_cmd::{
-        AppliedStewardHandoff, ShipCommandArgs, ShipInvocation, render_terminal_steward_handoff,
-        ship_command_with_transition,
+        AppliedStewardHandoff, ShipCommandArgs, ShipInvocation, ensure_existing_pr_base_matches,
+        render_terminal_steward_handoff, ship_command_with_transition,
     },
 };
 use crate::cloud::GitHubActions;
@@ -111,6 +111,7 @@ pub(super) fn pr_command<W: Write>(
             steward_handoff.as_ref(),
             config,
             cwd,
+            &args.base,
             json_mode,
             stdout,
         )?
@@ -247,6 +248,7 @@ fn short_circuit_existing_handoff<W: Write>(
     request: Option<&super::ship_cmd::ShipStewardHandoff>,
     config: &LoadedConfig,
     cwd: &Path,
+    requested_base: &str,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<Option<ExitCode>, CliFailure> {
@@ -262,6 +264,7 @@ fn short_circuit_existing_handoff<W: Write>(
     let Ok(Some(pr)) = crate::pr::find_pr_for_branch(config, cwd, None, &identity.branch) else {
         return Ok(None);
     };
+    ensure_existing_pr_base_matches(&pr.base, requested_base)?;
     let workstream_id = request
         .workstream_id
         .clone()

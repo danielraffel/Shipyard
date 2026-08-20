@@ -23,6 +23,8 @@ pub struct PrInfo {
     pub state: String,
     /// Head branch name.
     pub branch: String,
+    /// Exact head commit reported by GitHub.
+    pub head_sha: String,
     /// Base branch name.
     pub base: String,
 }
@@ -181,7 +183,7 @@ fn get_pr_status_with_client(
     parse_pr_info(&String::from_utf8_lossy(&output.stdout))
 }
 
-const PR_JSON_FIELDS: &str = "number,url,title,state,headRefName,baseRefName";
+const PR_JSON_FIELDS: &str = "number,url,title,state,headRefName,headRefOid,baseRefName";
 
 fn gh_client(config: &LoadedConfig) -> Result<GhClient, PrError> {
     // Build the gh client from the caller's already-resolved config (not a
@@ -515,6 +517,7 @@ fn parse_pr_rest_value(value: &Value) -> Result<PrInfo, PrError> {
         title: string_field(value, "title")?,
         state: string_field(value, "state")?.to_ascii_uppercase(),
         branch: nested_string_field(value, &["head", "ref"])?,
+        head_sha: nested_string_field(value, &["head", "sha"])?,
         base: nested_string_field(value, &["base", "ref"])?,
     })
 }
@@ -535,6 +538,7 @@ fn parse_pr_value(value: &Value) -> Result<PrInfo, PrError> {
         title: string_field(value, "title")?,
         state: string_field(value, "state")?,
         branch: string_field(value, "headRefName")?,
+        head_sha: string_field(value, "headRefOid")?,
         base: string_field(value, "baseRefName")?,
     })
 }
@@ -577,6 +581,7 @@ mod tests {
                 "title": "Fix thing",
                 "state": "OPEN",
                 "headRefName": "feature/test",
+                "headRefOid": "1111111111111111111111111111111111111111",
                 "baseRefName": "main"
             }"#,
         )
@@ -590,6 +595,7 @@ mod tests {
                 title: "Fix thing".to_owned(),
                 state: "OPEN".to_owned(),
                 branch: "feature/test".to_owned(),
+                head_sha: "1111111111111111111111111111111111111111".to_owned(),
                 base: "main".to_owned(),
             }
         );
@@ -606,6 +612,7 @@ mod tests {
                     "title": "Ship it",
                     "state": "OPEN",
                     "headRefName": "feature/a",
+                    "headRefOid": "2222222222222222222222222222222222222222",
                     "baseRefName": "develop"
                 }]"#,
             )
@@ -688,7 +695,7 @@ mod tests {
                 "html_url": "https://github.com/danielraffel/Shipyard/pull/273",
                 "title": "REST fallback",
                 "state": "open",
-                "head": {"ref": "feature/rest-fallback"},
+                "head": {"ref": "feature/rest-fallback", "sha": "3333333333333333333333333333333333333333"},
                 "base": {"ref": "main"}
             }"#,
         )
@@ -702,6 +709,7 @@ mod tests {
                 title: "REST fallback".to_owned(),
                 state: "OPEN".to_owned(),
                 branch: "feature/rest-fallback".to_owned(),
+                head_sha: "3333333333333333333333333333333333333333".to_owned(),
                 base: "main".to_owned(),
             }
         );
@@ -713,7 +721,7 @@ mod tests {
                     "html_url": "https://github.com/o/r/pull/274",
                     "title": "Focus profile",
                     "state": "open",
-                    "head": {"ref": "feature/focus"},
+                    "head": {"ref": "feature/focus", "sha": "4444444444444444444444444444444444444444"},
                     "base": {"ref": "main"}
                 }]"#
             )
