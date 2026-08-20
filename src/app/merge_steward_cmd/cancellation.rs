@@ -309,11 +309,9 @@ pub(super) fn queue_front_pr(observation: &RepoObservation) -> Option<&ObservedP
 }
 
 pub(super) fn timestamp_old_enough(timestamp: &str) -> bool {
-    DateTime::parse_from_rfc3339(timestamp)
-        .ok()
-        .is_some_and(|created| {
-            (Utc::now() - created.with_timezone(&Utc)).num_seconds() >= PREEMPT_AFTER_SECS
-        })
+    DateTime::parse_from_rfc3339(timestamp).is_ok_and(|created| {
+        (Utc::now() - created.with_timezone(&Utc)).num_seconds() >= PREEMPT_AFTER_SECS
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
