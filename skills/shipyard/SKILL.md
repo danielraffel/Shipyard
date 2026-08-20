@@ -577,6 +577,12 @@ shipyard runner register --repo Generous-Corp/pulp --count 3 \
 - Per-runner `_work` is `<ci-root>/work/<name>`; the `.env` points ccache and
   FetchContent at `<ci-root>/cache/*`. Cache *size* is owned by the host's
   `ccache.conf`, not this command.
+- Runner registration is deliberately fleet-pinned and uses `--disableupdate`.
+  Its `.path` is system-first so `/usr/bin/tar` resolves before Homebrew, and
+  Rust lives under that runner's own `_toolcache/{rustup,cargo}` on local disk.
+  Never point those homes through a symlink to a shared/external build volume;
+  an offline filesystem can otherwise wedge `Runner.Worker` inside native
+  `open` before Shipyard receives a useful failure.
 
 ### List and remove
 

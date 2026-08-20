@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use super::runner_cmd::{parse_github_repo_slug, resolve_repo_slug};
@@ -51,9 +52,35 @@ fn fetch_all_runners(actions: &GitHubActions, slug: &str) -> Result<Vec<ApiRunne
     Ok(runners)
 }
 
-/// jq filter selecting the Apple-silicon macOS runner tarball download URL.
-const RUNNER_ASSET_JQ: &str =
-    r#".assets[] | select(.name | test("osx-arm64.*tar.gz$")) | .browser_download_url"#;
+/// Fleet-wide Actions runner pin. Services opt out of automatic updates so
+/// every host keeps the same reviewed runner behavior.
+const PINNED_RUNNER_VERSION: &str = "2.335.1";
+const PINNED_RUNNER_SHA256: &str =
+    "e1a9bc7a3661e06fa0b129d15c2064fe65dc81a431001d8958a9db1409b73769";
+
+fn runner_package_url() -> (String, String) {
+    let name = format!("actions-runner-osx-arm64-{PINNED_RUNNER_VERSION}.tar.gz");
+    let url = format!(
+        "https://github.com/actions/runner/releases/download/v{PINNED_RUNNER_VERSION}/{name}"
+    );
+    (name, url)
+}
+
+fn verify_runner_package(path: &Path) -> Result<(), CliFailure> {
+    let bytes = fs::read(path)
+        .map_err(|e| CliFailure::new(1, format!("failed to read runner package: {e}")))?;
+    let actual = hex::encode(Sha256::digest(bytes));
+    if actual == PINNED_RUNNER_SHA256 {
+        Ok(())
+    } else {
+        Err(CliFailure::new(
+            1,
+            format!(
+                "runner package SHA-256 mismatch: got {actual}, expected {PINNED_RUNNER_SHA256}"
+            ),
+        ))
+    }
+}
 
 // ---------- tag ----------
 
@@ -157,21 +184,107 @@ fn cpu_count() -> usize {
 /// shared caches and isolates each runner's ccache base path so cross-worktree
 /// hits work (`CCACHE_BASEDIR` + `CCACHE_NOHASHDIR`). Cache *size* is owned by
 /// the host's `ccache.conf`, not set here.
-fn runner_env_file(ci_root: &Path, work: &Path, parallel: usize) -> String {
+fn runner_env_file(ci_root: &Path, work: &Path, runner_dir: &Path, parallel: usize) -> String {
     let cache = ci_root.join("cache");
+    let toolcache = runner_dir.join("_toolcache");
     format!(
         "CCACHE_DIR={ccache}\n\
          CCACHE_BASEDIR={work}\n\
          CCACHE_NOHASHDIR=true\n\
-         CCACHE_DEPEND=true\n\
+         CCACHE_NODEPEND=true\n\
+         CCACHE_COMPILERCHECK=content\n\
          CCACHE_SLOPPINESS=time_macros,pch_defines\n\
          CMAKE_BUILD_PARALLEL_LEVEL={parallel}\n\
          CTEST_PARALLEL_LEVEL={parallel}\n\
-         FETCHCONTENT_BASE_DIR={fetchcontent}\n",
+         FETCHCONTENT_BASE_DIR={fetchcontent}\n\
+         RUSTUP_HOME={rustup}\n\
+         CARGO_HOME={cargo}\n",
         ccache = cache.join("ccache").display(),
         work = work.display(),
         fetchcontent = cache.join("fetchcontent-src").display(),
+        rustup = toolcache.join("rustup").display(),
+        cargo = toolcache.join("cargo").display(),
     )
+}
+
+fn runner_path_file(runner_dir: &Path) -> String {
+    let cargo_bin = runner_dir.join("_toolcache/cargo/bin");
+    let local_bin = home_dir().join(".local/bin");
+    format!(
+        "/usr/bin:/bin:/usr/sbin:/sbin:{}:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:{}\n",
+        cargo_bin.display(),
+        local_bin.display()
+    )
+}
+
+fn ensure_private_rust_toolchain(runner_dir: &Path) -> Result<(), CliFailure> {
+    let toolcache = runner_dir.join("_toolcache");
+    let rustup_home = toolcache.join("rustup");
+    let cargo_home = toolcache.join("cargo");
+    fs::create_dir_all(&rustup_home)
+        .map_err(|e| CliFailure::new(1, format!("failed to create private rustup home: {e}")))?;
+    fs::create_dir_all(&cargo_home)
+        .map_err(|e| CliFailure::new(1, format!("failed to create private cargo home: {e}")))?;
+
+    let cargo = cargo_home.join("bin/cargo");
+    if Command::new(&cargo)
+        .arg("--version")
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return Ok(());
+    }
+
+    let installer = toolcache.join("rustup-init.sh");
+    run(
+        "curl",
+        &[
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "-fsSL",
+            "https://sh.rustup.rs",
+            "-o",
+            &installer.to_string_lossy(),
+        ],
+        "download rustup installer",
+    )?;
+    let status = Command::new("/bin/sh")
+        .arg(&installer)
+        .args([
+            "-y",
+            "--no-modify-path",
+            "--profile",
+            "minimal",
+            "--default-toolchain",
+            "stable-aarch64-apple-darwin",
+        ])
+        .env("RUSTUP_HOME", &rustup_home)
+        .env("CARGO_HOME", &cargo_home)
+        .env("PATH", runner_path_file(runner_dir).trim())
+        .status()
+        .map_err(|e| CliFailure::new(1, format!("failed to run rustup installer: {e}")))?;
+    let _ = fs::remove_file(installer);
+    if !status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!("private rustup install failed (exit {:?})", status.code()),
+        ));
+    }
+    if !Command::new(&cargo)
+        .arg("--version")
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "private cargo is not runnable after install: {}",
+                cargo.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Existing runner names registered on a repo (any machine), for index
@@ -250,39 +363,33 @@ pub(super) fn register_command<W: Write>(
         );
     }
 
-    // Resolve + cache the runner tarball once, then provision each runner.
-    let pkg_url = args
-        .actions
-        .run_gh(&[
-            "api".to_owned(),
-            "repos/actions/runner/releases/latest".to_owned(),
-            "--jq".to_owned(),
-            RUNNER_ASSET_JQ.to_owned(),
-        ])
-        .map_err(|e| CliFailure::new(2, format!("failed to resolve runner package URL: {e}")))?
-        .trim()
-        .to_owned();
-    if pkg_url.is_empty() {
-        return Err(CliFailure::new(
-            2,
-            "could not resolve the osx-arm64 actions-runner package URL",
-        ));
-    }
-    let pkg_name = pkg_url
-        .rsplit('/')
-        .next()
-        .unwrap_or("actions-runner.tar.gz");
+    // Cache the fleet-wide pinned runner tarball once. `config.sh
+    // --disableupdate` below keeps GitHub from silently replacing it later.
+    let (pkg_name, pkg_url) = runner_package_url();
     let pkg_cache = ci_root.join("cache").join("actions-runner-pkg");
     fs::create_dir_all(&pkg_cache)
         .map_err(|e| CliFailure::new(1, format!("failed to create package cache: {e}")))?;
     let pkg_path = pkg_cache.join(pkg_name);
     if !pkg_path.exists() {
+        let partial = pkg_path.with_extension("partial");
         run(
             "curl",
-            &["-fsSL", "-o", &pkg_path.to_string_lossy(), &pkg_url],
+            &[
+                "--proto",
+                "=https",
+                "--tlsv1.2",
+                "-fsSL",
+                "-o",
+                &partial.to_string_lossy(),
+                &pkg_url,
+            ],
             "download runner",
         )?;
+        verify_runner_package(&partial)?;
+        fs::rename(&partial, &pkg_path)
+            .map_err(|e| CliFailure::new(1, format!("failed to cache runner package: {e}")))?;
     }
+    verify_runner_package(&pkg_path)?;
 
     for entry in &plan {
         fs::create_dir_all(&entry.dir)
@@ -303,9 +410,12 @@ pub(super) fn register_command<W: Write>(
         }
         fs::write(
             entry.dir.join(".env"),
-            runner_env_file(&ci_root, &entry.work, parallel),
+            runner_env_file(&ci_root, &entry.work, &entry.dir, parallel),
         )
         .map_err(|e| CliFailure::new(1, format!("failed to write .env: {e}")))?;
+        ensure_private_rust_toolchain(&entry.dir)?;
+        fs::write(entry.dir.join(".path"), runner_path_file(&entry.dir))
+            .map_err(|e| CliFailure::new(1, format!("failed to write .path: {e}")))?;
 
         let token = args
             .actions
@@ -321,23 +431,12 @@ pub(super) fn register_command<W: Write>(
             .trim()
             .to_owned();
 
+        let config_args = runner_config_args(&slug, &token, entry, &labels_csv);
+        let config_arg_refs: Vec<&str> = config_args.iter().map(String::as_str).collect();
         run_in(
             &entry.dir,
             "./config.sh",
-            &[
-                "--unattended",
-                "--replace",
-                "--url",
-                &format!("https://github.com/{slug}"),
-                "--token",
-                &token,
-                "--name",
-                &entry.name,
-                "--labels",
-                &labels_csv,
-                "--work",
-                &entry.work.to_string_lossy(),
-            ],
+            &config_arg_refs,
             "configure runner",
         )?;
         run_in(
@@ -366,6 +465,29 @@ struct RunnerPlan {
     name: String,
     dir: PathBuf,
     work: PathBuf,
+}
+
+fn runner_config_args(
+    slug: &str,
+    token: &str,
+    entry: &RunnerPlan,
+    labels_csv: &str,
+) -> Vec<String> {
+    vec![
+        "--unattended".to_owned(),
+        "--replace".to_owned(),
+        "--url".to_owned(),
+        format!("https://github.com/{slug}"),
+        "--token".to_owned(),
+        token.to_owned(),
+        "--name".to_owned(),
+        entry.name.clone(),
+        "--labels".to_owned(),
+        labels_csv.to_owned(),
+        "--work".to_owned(),
+        entry.work.display().to_string(),
+        "--disableupdate".to_owned(),
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -832,6 +954,7 @@ mod tests {
         let env = runner_env_file(
             Path::new("/Volumes/Workshop/ci/pulp"),
             Path::new("/Volumes/Workshop/ci/pulp/work/pulp-studio-01"),
+            Path::new("/Users/me/actions-runner-pulp-studio-01"),
             9,
         );
         assert!(env.contains("CCACHE_DIR=/Volumes/Workshop/ci/pulp/cache/ccache"));
@@ -842,5 +965,47 @@ mod tests {
         assert!(env.contains("CMAKE_BUILD_PARALLEL_LEVEL=9"));
         assert!(env.contains("CTEST_PARALLEL_LEVEL=9"));
         assert!(env.contains("CCACHE_NOHASHDIR=true"));
+        assert!(env.contains("CCACHE_NODEPEND=true"));
+        assert!(env.contains("CCACHE_COMPILERCHECK=content"));
+        assert!(!env.contains("CCACHE_DEPEND=true"));
+        assert!(
+            env.contains("RUSTUP_HOME=/Users/me/actions-runner-pulp-studio-01/_toolcache/rustup")
+        );
+        assert!(
+            env.contains("CARGO_HOME=/Users/me/actions-runner-pulp-studio-01/_toolcache/cargo")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_path_file_is_system_first_and_runner_private() {
+        let path = runner_path_file(Path::new("/Users/me/actions-runner-pulp-studio-01"));
+        assert!(path.starts_with("/usr/bin:/bin:/usr/sbin:/sbin:"));
+        assert!(path.contains(":/Users/me/actions-runner-pulp-studio-01/_toolcache/cargo/bin:"));
+        assert!(path.find("/usr/bin").unwrap() < path.find("/opt/homebrew/bin").unwrap());
+    }
+
+    #[test]
+    fn runner_package_and_registration_are_pinned_without_auto_update() {
+        let (name, url) = runner_package_url();
+        assert_eq!(name, "actions-runner-osx-arm64-2.335.1.tar.gz");
+        assert!(url.contains("/download/v2.335.1/"));
+        assert!(!url.contains("latest"));
+        assert_eq!(
+            PINNED_RUNNER_SHA256,
+            "e1a9bc7a3661e06fa0b129d15c2064fe65dc81a431001d8958a9db1409b73769"
+        );
+
+        let entry = RunnerPlan {
+            name: "Shipyard-studio-02".to_owned(),
+            dir: PathBuf::from("/Users/me/actions-ci/Shipyard-studio-02"),
+            work: PathBuf::from("/Volumes/Workshop/ci/shipyard/work/Shipyard-studio-02"),
+        };
+        let args = runner_config_args("danielraffel/Shipyard", "secret", &entry, "local-mac");
+        assert!(args.iter().any(|arg| arg == "--disableupdate"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--name", "Shipyard-studio-02"])
+        );
     }
 }

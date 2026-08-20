@@ -83,14 +83,21 @@ What it does per runner:
 1. Computes the next free index by listing the repo's existing runners (any
    machine) and continuing past the highest `<repo>-<tag>-NN`. Re-running
    appends capacity (`-04`, `-05`) without collisions.
-2. Downloads the `osx-arm64` runner tarball once into
+2. Downloads the fleet-pinned `osx-arm64` runner tarball once into
    `<ci-root>/cache/actions-runner-pkg/` and extracts it into
-   `~/actions-runner-<name>`.
+   `~/actions-runner-<name>`. Registration uses `--disableupdate`; upgrades are
+   an explicit fleet-wide pin change, never a per-host automatic update.
 3. Writes a per-runner `.env` pointing ccache + FetchContent at the shared
    caches and isolating each runner's `_work` for cross-worktree cache hits
-   (`CCACHE_BASEDIR` + `CCACHE_NOHASHDIR`). Cache **size** is owned by the
-   host's `ccache.conf`, not this command.
-4. Fetches a registration token, runs `config.sh --unattended --replace`, then
+   (`CCACHE_BASEDIR` + `CCACHE_NOHASHDIR`). Depend mode is forced off and the
+   compiler key is content-based. Cache **size** is owned by the host's
+   `ccache.conf`, not this command.
+4. Installs Rust into runner-private `_toolcache/{rustup,cargo}` directories on
+   the runner's own filesystem and writes a system-first `.path`
+   (`/usr/bin:/bin:/usr/sbin:/sbin` before Homebrew). This keeps runner startup
+   and tool lookup away from slow or offline Homebrew and symlinked shared-cache
+   volumes.
+5. Fetches a registration token, runs `config.sh --unattended --replace`, then
    `svc.sh install && svc.sh start` (a user LaunchAgent — no sudo).
 
 ### Labels
@@ -110,6 +117,7 @@ else (e.g. Shipyard's own CI currently selects `local-mac`).
 | Path | What |
 |------|------|
 | `~/actions-runner-<name>` | the runner install + its `.env` |
+| `~/actions-runner-<name>/_toolcache/{rustup,cargo}` | runner-private Rust toolchain state |
 | `<ci-root>/work/<name>` | that runner's `_work` (isolated per runner) |
 | `<ci-root>/cache/ccache` | shared ccache (size set by host `ccache.conf`) |
 | `<ci-root>/cache/fetchcontent-src` | shared CMake FetchContent sources |
