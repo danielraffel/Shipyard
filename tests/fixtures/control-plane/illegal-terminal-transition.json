@@ -1,0 +1,21 @@
+{
+  "initial": {
+    "schema_version": 1,
+    "key": {"repository": "example/audio", "pull_request": 12, "head_sha": "5555555555555555555555555555555555555555"},
+    "generation": 1,
+    "accepted_idempotency_keys": ["incident-terminal/closed"],
+    "state": "closed",
+    "superseded_by": null
+  },
+  "transitions": [
+    {
+      "schema_version": 1,
+      "key": {"repository": "example/audio", "pull_request": 12, "head_sha": "5555555555555555555555555555555555555555"},
+      "generation": 2,
+      "idempotency_key": "incident-terminal/reopen",
+      "from": "closed",
+      "to": "observing",
+      "superseded_by": null
+    }
+  ]
+}

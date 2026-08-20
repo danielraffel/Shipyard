@@ -7,6 +7,11 @@ description: Cross-platform CI coordination with Shipyard — validates, ships, 
 
 Shipyard coordinates validation across local, SSH, and cloud targets.
 
+The Phase 0 durable work-item schema is intentionally below every operational
+CI surface. `src/control_plane_schema.rs` validates and deterministically
+replays versioned exact-head transitions and receipts, but does not observe or
+mutate GitHub, runners, queues, fleet services, or cleanup state.
+
 ## Quick reference
 
 | Task | Command |

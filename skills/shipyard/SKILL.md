@@ -33,6 +33,13 @@ go/no-go for that operation.
 
 ## Merge-queue ownership
 
+Phase 0 durable stewardship schemas live in `src/control_plane_schema.rs`.
+They are pure, versioned records: `(repository, PR, exact head)` keys,
+monotonic generations, idempotency keys, explicit terminal states, validated
+head supersession, and deterministic replay receipts. Keep this layer free of
+GitHub, runner, queue, filesystem-cleanup, and fleet mutation adapters; replay
+must reject duplicate delivery, stale generations, and illegal transitions.
+
 When GitHub's live branch queue or evaluated rules require a merge queue,
 Shipyard is a validator and queue supervisor, not a second merge authority. A
 passing `shipyard ship` calls GitHub's queue mutation with
