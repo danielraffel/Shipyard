@@ -549,9 +549,11 @@ side (gh, `config.sh`, `svc.sh`, local `~/actions-runner-*` dirs) is
 `src/app/runner_provision_cmd.rs`. See `docs/runner-provisioning.md`.
 
 Pinned runner upgrades are fail-closed: stop an existing service before
-extracting replacement files, and abort if the stop fails. Toolchain readiness
-checks are silent probes; never let their stdout/stderr contaminate normal or
-JSON output.
+extracting replacement files, preserve its `.runner` credentials and service
+registration, restart it only after verification, and abort if the stop fails.
+Never re-run fresh `config.sh` / `svc.sh install` over a configured upgrade.
+Toolchain readiness checks are silent probes; never let their stdout/stderr
+contaminate normal or JSON output.
 
 ### Machine tag (load-bearing for multi-Mac fleets)
 
