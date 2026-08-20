@@ -142,7 +142,8 @@ impl Queue {
         self.state_dir.join("queue.state.lock")
     }
 
-    /// Add a job, superseding pending jobs for the same branch, target list, and mode.
+    /// Add a job, superseding pending jobs for the same workload, branch,
+    /// target list, and mode.
     pub fn enqueue(&mut self, job: Job) -> QueueResult<Job> {
         self.with_jobs_locked(|jobs| {
             cancel_superseded_pending(jobs, &job);
@@ -482,7 +483,8 @@ impl Queue {
 
 fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {
     for queued in jobs.iter_mut().filter(|queued| {
-        queued.branch == job.branch
+        same_workload_scope(queued, job)
+            && queued.branch == job.branch
             && queued.status == JobStatus::Pending
             && queued.target_names == job.target_names
             && queued.mode == job.mode
@@ -490,6 +492,17 @@ fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {
         if let Ok(cancelled) = queued.cancel_with_reason(Some(SUPERSEDED_MESSAGE.to_owned())) {
             *queued = cancelled;
         }
+    }
+}
+
+fn same_workload_scope(left: &Job, right: &Job) -> bool {
+    match (&left.workload_scope, &right.workload_scope) {
+        (Some(left), Some(right)) => left == right,
+        // Preserve the legacy queue contract for old callers and persisted
+        // jobs that predate workload scopes. A scoped job never supersedes an
+        // unscoped one because their ownership cannot be proven identical.
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
     }
 }
 
@@ -963,29 +976,36 @@ mod tests {
     fn supersedence_replaces_pending_same_scope_only() {
         let temp = queue_dir();
         let mut queue = Queue::new(temp.path()).expect("queue");
-        let old = job("feat/x", "old", &["mac"]);
-        let running = job("feat/x", "running", &["mac"]).start().expect("start");
-        let narrow = job("feat/x", "narrow", &["linux"]);
+        let old = job("feat/x", "old", &["mac"]).with_workload_scope("repo:pulp");
+        let running = job("feat/x", "running", &["mac"])
+            .with_workload_scope("repo:pulp")
+            .start()
+            .expect("start");
+        let narrow = job("feat/x", "narrow", &["linux"]).with_workload_scope("repo:pulp");
         let smoke = Job::create(
             "smoke",
             "feat/x",
             vec!["mac".to_owned()],
             ValidationMode::Smoke,
             Priority::Normal,
-        );
-        let new = job("feat/x", "new", &["mac"]);
+        )
+        .with_workload_scope("repo:pulp");
+        let independent = job("feat/x", "independent", &["mac"]).with_workload_scope("repo:forge");
+        let new = job("feat/x", "new", &["mac"]).with_workload_scope("repo:pulp");
 
         queue.enqueue(old).expect("old");
         queue.enqueue(running.clone()).expect("running");
         queue.update(&running).expect("update running");
         queue.enqueue(narrow).expect("narrow");
         queue.enqueue(smoke).expect("smoke");
+        queue.enqueue(independent).expect("independent");
         queue.enqueue(new).expect("new");
 
         let pending = queue.get_pending().expect("pending");
         assert_eq!(queue.running_count().expect("running"), 1);
-        assert_eq!(pending.len(), 3);
+        assert_eq!(pending.len(), 4);
         assert!(pending.iter().any(|job| job.sha == "new"));
+        assert!(pending.iter().any(|job| job.sha == "independent"));
         assert!(pending.iter().any(|job| job.sha == "narrow"));
         assert!(pending.iter().any(|job| job.sha == "smoke"));
         assert!(!pending.iter().any(|job| job.sha == "old"));
