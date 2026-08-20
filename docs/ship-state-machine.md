@@ -219,6 +219,13 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   scheduler starts a job only to defer it for host-pool capacity or an
   unavailable local lease, the drain owner requeues that transient `Running`
   job with a retry timestamp; admission ignores it until that timestamp expires.
+  Before admission, the owner also groups pending ship requests by
+  `(repository, PR)` and observes each distinct PR at most once per 30 seconds.
+  If GitHub reports `MERGED` and the reported head exactly matches the durable
+  queued SHA, every matching pending job is cancelled as already complete.
+  These reads use the configured GitHub credential, explicit repository scope,
+  and one 15-second credential-plus-command budget. An unavailable observation,
+  malformed response, or different merged head leaves the job pending.
   A durable `shipyard cancel` observed by a running worker is also an execution
   transition, not merely a queue-state update. The worker's progress callback
   returns `ProgressAction::Terminate`; local and SSH streaming validation then
