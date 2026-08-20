@@ -984,6 +984,54 @@ pub fn is_graphql_rate_limited(message: &str) -> bool {
     lower.contains("graphql") && lower.contains("rate limit")
 }
 
+/// Return the merged head SHA of pull request `pr`, or `None` if it is not
+/// merged (or cannot be observed).
+///
+/// Uses `gh pr view --json state,headRefOid` against the CWD's remote (or a
+/// `snapshot_file` for testing). Returns `Some(head_sha)` only when the PR
+/// state is exactly "merged" (case-insensitive), carrying the head commit the
+/// merge landed on. Fails closed — returns `None` on any transport error,
+/// missing token, or malformed response.
+///
+/// Returning the head SHA lets the queue-scheduler observation honour the
+/// "never cancel when the merged head differs" guard: callers compare the
+/// merged head against the queued job's expected head and only cancel on an
+/// exact match.
+pub fn pr_merged_head_sha(pr: u64, cwd: &Path, snapshot_file: Option<&Path>) -> Option<String> {
+    let value = if let Some(path) = snapshot_file {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    } else {
+        // Build an ambient `gh` command with any available auth (token env var
+        // or config-file credential). The drain loop runs with access to the
+        // user's login session so token discovery should succeed.
+        let mut cmd = Command::new("gh");
+        // Propagate GH_TOKEN / GITHUB_TOKEN environment variables.
+        if let Ok(token) = env::var(GH_TOKEN_ENV) {
+            cmd.env(GH_TOKEN_ENV, token);
+        }
+        cmd.args(["pr", "view", &pr.to_string(), "--json", "state,headRefOid"])
+            .current_dir(cwd)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| serde_json::from_str::<Value>(&String::from_utf8_lossy(&out.stdout)).ok())
+    };
+    let value = value?;
+    let merged = value
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("merged"));
+    if !merged {
+        return None;
+    }
+    value
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 fn required_nonempty(value: Option<String>, key: &str) -> Result<String, GhConfigError> {
     let value = value.ok_or_else(|| GhConfigError::Invalid {
         message: format!("`{key}` is required"),

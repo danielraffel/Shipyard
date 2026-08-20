@@ -82,6 +82,7 @@ fn ship_request(branch: &str, sha: &str, pr: u64, target: ResolvedTarget) -> Shi
         resume_from: None,
         advisory_targets: BTreeSet::new(),
         adopt_head: false,
+        pr_snapshot_file: None,
         targets: vec![target],
     }
 }

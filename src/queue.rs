@@ -32,6 +32,10 @@ const ORPHAN_REQUEST_MESSAGE: &str = "Queued request envelope missing or unreada
 const SUPERSEDED_MESSAGE: &str =
     "Superseded by a newer queued job for the same branch, targets, and mode.";
 
+/// Cancellation reason for a pending job whose pull request was already merged
+/// while it waited in the queue.
+pub const ALREADY_MERGED_CANCEL_REASON: &str = "PR already merged";
+
 /// Fallible queue operation result.
 pub type QueueResult<T> = Result<T, QueueError>;
 

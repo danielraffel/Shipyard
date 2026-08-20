@@ -90,6 +90,11 @@ pub struct ShipExecutionRequest {
     /// refuses a content change, so prior evidence is never blessed for a
     /// different tree (Shipyard #346).
     pub adopt_head: bool,
+    /// Optional PR snapshot file used to keep already-merged observation
+    /// offline and deterministic. When `Some`, the admit-pass observation reads
+    /// PR state from this path instead of shelling out to `gh` — mirroring the
+    /// `auto_merge` escape-hatch pattern so tests do not hit the network.
+    pub pr_snapshot_file: Option<PathBuf>,
     /// Ordered target list.
     pub targets: Vec<ResolvedTarget>,
 }
@@ -529,6 +534,7 @@ fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
                 config,
                 &job.id,
                 dispatcher,
+                request.pr_snapshot_file.as_deref(),
             )?;
         }
         wait_or_timeout(&job.id, &mut wait_iterations, options)?;
@@ -787,6 +793,7 @@ fn drain_or_wait_run_with_options<D: ShipTargetDispatcher + Sync>(
                 config,
                 &job.id,
                 dispatcher,
+                None,
             )?;
         }
         wait_or_timeout(&job.id, &mut wait_iterations, options)?;
@@ -839,6 +846,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         resume_from: request.resume_from.clone(),
         advisory_targets: BTreeSet::new(),
         adopt_head: false,
+        pr_snapshot_file: None,
         targets: request.targets.clone(),
     };
     job = ensure_worker_running_job(queue, &job)?;
@@ -1011,6 +1019,7 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
     config: &LoadedConfig,
     awaited_job_id: &str,
     dispatcher: &D,
+    pr_snapshot_file: Option<&Path>,
 ) -> Result<(), ShipExecutionError> {
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let outcome_store = QueueOutcomeStore::new(state_dir).map_err(QueueRequestError::from)?;
@@ -1037,6 +1046,8 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
                     config,
                     &request_store,
                     awaited_job_id,
+                    cwd,
+                    pr_snapshot_file,
                 ) {
                     Ok(worker_inputs) => worker_inputs,
                     Err(error) => {
@@ -1171,6 +1182,8 @@ fn admit_drain_worker_inputs(
     config: &LoadedConfig,
     request_store: &QueueRequestStore,
     awaited_job_id: &str,
+    cwd: &Path,
+    pr_snapshot_file: Option<&Path>,
 ) -> Result<Vec<(Job, QueuedExecutionEnvelope)>, ShipExecutionError> {
     let jobs = queue.get_all()?;
     let pools = scheduler_host_pools(&jobs, request_store)?;
@@ -1186,6 +1199,8 @@ fn admit_drain_worker_inputs(
         &leases,
         &vm_slots,
         Utc::now(),
+        cwd,
+        pr_snapshot_file,
     );
     cap_admit_pass_workers(&jobs, &mut pass, DEFAULT_DRAIN_MAX_WORKERS);
     let awaited_will_be_cancelled = pass
@@ -2573,6 +2588,7 @@ mod tests {
             resume_from: None,
             advisory_targets: BTreeSet::new(),
             adopt_head: false,
+            pr_snapshot_file: None,
             targets,
         }
     }
@@ -3280,6 +3296,7 @@ mod tests {
             &config,
             &jobs[0].id,
             &dispatcher,
+            None,
         )
         .expect("drain cycle");
 
@@ -3358,6 +3375,7 @@ mod tests {
             &config,
             &short.id,
             &dispatcher,
+            None,
         )
         .expect("drain cycle");
 
@@ -3443,6 +3461,7 @@ mod tests {
             &config,
             &awaited.id,
             &dispatcher,
+            None,
         )
         .expect("drain cycle");
 
@@ -3498,6 +3517,7 @@ mod tests {
             &config,
             &old.id,
             &dispatcher,
+            None,
         )
         .expect("drain cycle");
 
@@ -3579,6 +3599,7 @@ mod tests {
             &config,
             &pending.id,
             &dispatcher,
+            None,
         )
         .expect_err("corrupt pending request must fail refill admission");
 
@@ -4014,6 +4035,7 @@ mod tests {
             },
             running_request_errors: Vec::new(),
             same_pr_ship_admission: SamePrShipAdmission::default(),
+            already_merged_cancellations: Vec::new(),
         };
 
         cap_admit_pass_workers(&[running], &mut pass, 2);

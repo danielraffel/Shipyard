@@ -441,6 +441,7 @@ impl QueuedShipRequest {
             resume_from: self.resume_from.clone(),
             advisory_targets: self.advisory_targets.clone(),
             adopt_head: self.adopt_head,
+            pr_snapshot_file: None,
             targets: restore_targets(&self.targets)?,
         })
     }
@@ -1686,6 +1687,7 @@ mod tests {
             resume_from: None,
             advisory_targets: BTreeSet::from(["mac".to_owned()]),
             adopt_head: false,
+            pr_snapshot_file: None,
             targets: vec![local_target()],
         }
     }
