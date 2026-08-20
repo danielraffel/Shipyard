@@ -175,7 +175,7 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 
 | CLI command                 | Reads                                               | Writes                                                  |
 |-----------------------------|-----------------------------------------------------|---------------------------------------------------------|
-| `shipyard pr` with provenance and/or steward handoff | Project `[pr.provenance]` argv plus the submitting process environment; protected `origin/<base>:.shipyard/config.toml`, or explicit `--workstream-id` / `--context-url` | After the exact PR and head are resolved, runs the configured provenance hook before any durable receipt or validation dispatch. A required hook failure exits with no steward status/label or queued validation. On success, the handoff writes `shipyard/steward-handoff`, revalidates the open PR and exact head, then adds `shipyard:managed`. Explicit `shipyard ship --pr` recovery does not rerun submitter provenance. |
+| `shipyard pr` with provenance and/or steward handoff | Project `[pr.provenance]` argv plus the submitting process environment; protected `origin/<base>:.shipyard/config.toml`, or explicit `--workstream-id` / `--context-url` | Takes a machine-global advisory lease keyed by repository, branch, and exact head before gates. After the PR is resolved it runs provenance, writes or verifies the exact `shipyard/steward-handoff` receipt, revalidates the open PR/head, and adds `shipyard:managed`. A successful handoff is terminal: `shipyard pr` exits without creating local queue, validation, evidence, or ship-state records; the durable steward and repository CI own completion. An already-valid exact receipt on a clean worktree short-circuits before gates. `--no-steward-handoff` and direct `shipyard ship` preserve the local validation path. |
 | `shipyard ship` (fresh)     | `ShipStateStore.get(pr)` (auto-resume decision; returns None) | Saves fresh state BEFORE preflight (cli.py:2675). Calls `_update_ship_state_from_job` once after `_execute_job` ends. `archive(pr)` on MERGED. |
 | `shipyard ship --no-resume` | Same                                                | `ShipStateStore.archive_and_replace(state)` archives prior attempt; then a new `ShipState(...)` is constructed with `attempt=1` (see Bug B2). |
 | `shipyard ship --resume`    | Refuses on SHA/policy drift via `_detect_ship_state_drift` | Refreshes `pr_url` / `pr_title` / `commit_subject` on the existing state and saves (cli.py:2679–2689). |
@@ -189,6 +189,41 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 | `shipyard cleanup --ship-state` | `prune(active_days=14, archive_days=30, closed_prs=...)` | Deletes aged-out active (only if PR is in the supplied `closed_prs` set) + archived files. Unlinks are unguarded — a failure raises. |
 
 ## Transitions — preconditions, postconditions, failure modes
+
+### T0 — Terminal exact-head steward handoff (no ship state)
+
+- **From / to:** no local ship-state transition; `<state_dir>/ship/<pr>.json`
+  remains absent.
+- **Trigger:** `shipyard pr` when the protected base enables
+  `[merge_steward].auto_handoff`, or the caller supplies an explicit workstream.
+- **Writes:** the exact-head `shipyard/steward-handoff` commit status and
+  `shipyard:managed` label. No validation job, queue request, evidence row, or
+  build subprocess is created after the receipt succeeds.
+- **Single-flight:** the canonical production per-user machine-state root contains
+  `pr-invocations/<digest>.lock`, an advisory file lock over `(repository,
+  branch, exact head)` acquired before gate scripts. Runtime mode and
+  `--state-dir` overrides cannot partition this ownership. Metadata is
+  diagnostic only; process death releases the kernel lock, and stale PID data
+  never authorizes a signal or cancellation. A version-bump or trailer amend
+  uses a brief repo+branch transition fence, then acquires the new-head lease
+  before releasing the old one; another observer cannot enter between the ref
+  move and the new exact-head ownership. The mutator rechecks that HEAD is still
+  its leased identity before touching the ref, so a stale invocation cannot
+  edit or amend a newer independently-owned head. The same fence covers
+  version-file apply through commit, and final push/handoff revalidates and
+  retains it until the synchronous Shipyard command returns. Transition-fence
+  contention fails in-flight immediately; it never waits behind a hung owner.
+  On the explicit no-handoff path, the fence drops after push/PR resolution and
+  before queue drain so a long local validation cannot block a newer exact head.
+- **Idempotence:** on a clean worktree, the newest matching successful status
+  plus the managed label, absence of the unmanaged opt-out, and exact requested
+  workstream/context returns success before gates. The open PR/head and labels
+  are re-read after status inspection. A newer failed status, head drift, dirty
+  tree, missing label, opt-out label, or different workstream is not reusable.
+- **Failure modes:** lock contention returns an in-flight result without touching
+  sibling validation. Provenance or receipt failure exits before local
+  validation. Direct `shipyard ship` and `shipyard pr --no-steward-handoff`
+  continue through T1 and later transitions.
 
 ### T1 — Create a fresh ship state
 

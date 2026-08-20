@@ -36,6 +36,7 @@ mod metrics_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
+mod pr_invocation;
 mod profile_apply_cmd;
 mod quarantine_cmd;
 mod queue_cmd;

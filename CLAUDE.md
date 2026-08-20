@@ -49,8 +49,9 @@ When the user says "push a PR", "ship this", "ship it", "we're done", "merge thi
 
 1. `skill_sync_check.py --mode=report` — hard-fails on missing SKILL.md updates.
 2. `version_bump_check.py --mode=apply` — applies the right bump per surface.
-3. `git commit` + `gh pr create` + CI validate + merge on green.
-4. `.github/workflows/auto-release.yml` tags the moved CLI version on merge; the existing tag-triggered `release.yml` publishes binaries.
+3. `git commit` + `gh pr create`.
+4. When protected-base steward handoff is enabled, write the exact-head receipt and return; repository CI plus the durable steward own merge. Otherwise validate locally and merge on green.
+5. `.github/workflows/auto-release.yml` tags the moved CLI version on merge; the existing tag-triggered `release.yml` publishes binaries.
 
 Never invoke `gh pr create` + release separately. Never run the version-bump or skill-sync scripts by hand.
 

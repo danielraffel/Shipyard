@@ -26,9 +26,13 @@ pub(crate) fn steward_handoff_command<W: Write>(
         .into_iter()
         .next()
         .ok_or_else(|| CliFailure::new(1, "repository was not resolved"))?;
-    verify_exact_open_pr(actions, &repo, args.pr, &args.head)?;
+    let pr_snapshot = verify_exact_open_pr(actions, &repo, args.pr, &args.head)?;
 
     if args.apply {
+        if handoff_receipt_is_valid(actions, &repo, args, &pr_snapshot).unwrap_or(false) {
+            render(args, &repo, json_output, stdout)?;
+            return Ok(ExitCode::SUCCESS);
+        }
         write_handoff_status(actions, &repo, args)?;
         // A status written to a superseded commit is harmless. The management
         // label is not: re-read immediately before adding it so a newer head
@@ -43,6 +47,12 @@ pub(crate) fn steward_handoff_command<W: Write>(
         )?;
         add_label(actions, &repo, args.pr, MANAGED_LABEL)?;
         remove_label(actions, &repo, args.pr, UNMANAGED_LABEL)?;
+        if !existing_handoff_receipt_is_valid(actions, &repo, args)? {
+            return Err(CliFailure::new(
+                1,
+                "steward handoff did not converge on the final open exact head and labels",
+            ));
+        }
     }
 
     render(args, &repo, json_output, stdout)?;
@@ -85,7 +95,7 @@ pub(super) fn verify_exact_open_pr(
     repo: &str,
     pr: u64,
     expected_head: &str,
-) -> Result<(), CliFailure> {
+) -> Result<Value, CliFailure> {
     let value = gh_json(
         actions,
         &["api".to_owned(), format!("repos/{repo}/pulls/{pr}")],
@@ -109,7 +119,85 @@ pub(super) fn verify_exact_open_pr(
             format!("PR #{pr} head drift: expected {expected_head}, current {current}"),
         ));
     }
-    Ok(())
+    Ok(value)
+}
+
+/// Return true only when the exact requested receipt and management label are
+/// already present. A status on another head or for another workstream is not
+/// reusable, and an unreadable status endpoint never becomes proof.
+pub(crate) fn existing_handoff_receipt_is_valid(
+    actions: &GitHubActions,
+    repo: &str,
+    args: &StewardHandoffArgs,
+) -> Result<bool, CliFailure> {
+    validate_args(args)?;
+    let snapshot = verify_exact_open_pr(actions, repo, args.pr, &args.head)?;
+    handoff_receipt_is_valid(actions, repo, args, &snapshot)
+}
+
+fn handoff_receipt_is_valid(
+    actions: &GitHubActions,
+    repo: &str,
+    args: &StewardHandoffArgs,
+    pr_snapshot: &Value,
+) -> Result<bool, CliFailure> {
+    if !handoff_labels_are_converged(pr_snapshot) {
+        return Ok(false);
+    }
+    let combined = gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/commits/{}/status", args.head),
+        ],
+        "steward handoff receipt inspection",
+    )
+    .map_err(|error| CliFailure::new(1, error))?;
+    let expected_description = format!("Managed handoff {}", args.workstream_id);
+    let expected_url = args.context_url.as_deref();
+    let receipt_matches = combined
+        .get("statuses")
+        .and_then(Value::as_array)
+        .and_then(|statuses| {
+            statuses.iter().find(|status| {
+                status.get("context").and_then(Value::as_str) == Some(HANDOFF_CONTEXT)
+            })
+        })
+        .is_some_and(|status| receipt_status_matches(status, &expected_description, expected_url));
+    if !receipt_matches {
+        return Ok(false);
+    }
+
+    // The status read is a network boundary. Re-read the open PR immediately
+    // before declaring terminal ownership so a moved head or restored opt-out
+    // label cannot inherit an old exact-head receipt.
+    let final_snapshot = verify_exact_open_pr(actions, repo, args.pr, &args.head)?;
+    Ok(handoff_labels_are_converged(&final_snapshot))
+}
+
+fn receipt_status_matches(
+    status: &Value,
+    expected_description: &str,
+    expected_url: Option<&str>,
+) -> bool {
+    status.get("state").and_then(Value::as_str) == Some("success")
+        && status.get("description").and_then(Value::as_str) == Some(expected_description)
+        && status.get("target_url").and_then(Value::as_str) == expected_url
+}
+
+fn handoff_labels_are_converged(pr_snapshot: &Value) -> bool {
+    let Some(labels) = pr_snapshot.get("labels").and_then(Value::as_array) else {
+        return false;
+    };
+    let has = |name| {
+        labels.iter().any(|label| {
+            label
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(name))
+        })
+    };
+    has(MANAGED_LABEL) && !has(UNMANAGED_LABEL)
 }
 
 fn write_handoff_status(
@@ -335,6 +423,150 @@ mod tests {
         invalid.workstream_id = "GEN 7".to_owned();
         assert!(validate_args(&invalid).is_err());
         assert!(validate_args(&args()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_exact_receipt_short_circuits_all_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let gh = temp.path().join("gh");
+        let head = "a".repeat(40);
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"pulls/7"*) printf '%s\n' '{{"state":"open","head":{{"sha":"{head}"}},"labels":[{{"name":"{MANAGED_LABEL}"}}]}}' ;;
+  *"commits/{head}/status"*) printf '%s\n' '{{"statuses":[{{"context":"{HANDOFF_CONTEXT}","state":"success","description":"Managed handoff GEN-7","target_url":"https://linear.app/example/GEN-7"}}]}}' ;;
+  *) echo 'unexpected mutation' >&2; exit 9 ;;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .expect("fake gh");
+        let mut permissions = std::fs::metadata(&gh).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&gh, permissions).expect("chmod");
+        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(gh);
+        let mut requested = args();
+        requested.apply = true;
+
+        steward_handoff_command(&requested, temp.path(), &actions, false, &mut Vec::new())
+            .expect("existing receipt");
+
+        let calls = std::fs::read_to_string(log).expect("calls");
+        assert_eq!(calls.lines().count(), 3, "receipt reuse must not write");
+        assert!(!calls.contains("-X POST"));
+    }
+
+    #[test]
+    fn receipt_reuse_requires_managed_without_unmanaged_opt_out() {
+        let converged = serde_json::json!({"labels": [{"name": MANAGED_LABEL}]});
+        let opted_out = serde_json::json!({
+            "labels": [{"name": "Shipyard:Managed"}, {"name": "SHIPYARD:UNMANAGED"}]
+        });
+        assert!(handoff_labels_are_converged(&converged));
+        assert!(!handoff_labels_are_converged(&opted_out));
+        assert!(!handoff_labels_are_converged(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn omitted_context_requires_an_absent_receipt_target_url() {
+        let with_url = serde_json::json!({
+            "state": "success",
+            "description": "Managed handoff GEN-7",
+            "target_url": "https://example.invalid/stale"
+        });
+        let without_url = serde_json::json!({
+            "state": "success",
+            "description": "Managed handoff GEN-7",
+            "target_url": null
+        });
+        assert!(!receipt_status_matches(
+            &with_url,
+            "Managed handoff GEN-7",
+            None
+        ));
+        assert!(receipt_status_matches(
+            &without_url,
+            "Managed handoff GEN-7",
+            None
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_reuse_revalidates_exact_head_after_status_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let count = temp.path().join("count");
+        let gh = temp.path().join("gh");
+        let head = "a".repeat(40);
+        let moved = "b".repeat(40);
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"pulls/7"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n + 1))
+    printf '%s' "$n" > '{count}'
+    if [ "$n" -eq 1 ]; then sha='{head}'; else sha='{moved}'; fi
+    printf '%s\n' "{{\"state\":\"open\",\"head\":{{\"sha\":\"$sha\"}},\"labels\":[{{\"name\":\"{MANAGED_LABEL}\"}}]}}"
+    ;;
+  *) printf '%s\n' '{{"statuses":[{{"context":"{HANDOFF_CONTEXT}","state":"success","description":"Managed handoff GEN-7","target_url":"https://linear.app/example/GEN-7"}}]}}' ;;
+esac
+"#,
+                count = count.display()
+            ),
+        )
+        .expect("fake gh");
+        let mut permissions = std::fs::metadata(&gh).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&gh, permissions).expect("chmod");
+        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(gh);
+
+        let error = existing_handoff_receipt_is_valid(&actions, "owner/repo", &args())
+            .expect_err("moved head must fail closed");
+        assert!(error.message.contains("head drift"), "{}", error.message);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newest_failed_receipt_is_not_hidden_by_older_success() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let gh = temp.path().join("gh");
+        let head = "a".repeat(40);
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"pulls/7"*) printf '%s\n' '{{"state":"open","head":{{"sha":"{head}"}},"labels":[{{"name":"{MANAGED_LABEL}"}}]}}' ;;
+  *) printf '%s\n' '{{"statuses":[{{"context":"{HANDOFF_CONTEXT}","state":"failure","description":"Managed handoff GEN-7","target_url":"https://linear.app/example/GEN-7"}},{{"context":"{HANDOFF_CONTEXT}","state":"success","description":"Managed handoff GEN-7","target_url":"https://linear.app/example/GEN-7"}}]}}' ;;
+esac
+"#,
+            ),
+        )
+        .expect("fake gh");
+        let mut permissions = std::fs::metadata(&gh).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&gh, permissions).expect("chmod");
+        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(gh);
+
+        assert!(
+            !existing_handoff_receipt_is_valid(&actions, "owner/repo", &args())
+                .expect("receipt inspection")
+        );
     }
 
     #[cfg(unix)]

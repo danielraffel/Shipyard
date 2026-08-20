@@ -7,8 +7,14 @@ use serde_json::Value;
 use super::{
     CliFailure,
     branch_cmd::detect_repo_from_remote,
-    ship_cmd::{ShipCommandArgs, ShipInvocation, ship_command},
+    merge_steward_cmd::{StewardHandoffArgs, existing_handoff_receipt_is_valid},
+    pr_invocation::{PrInvocationIdentity, PrInvocationLease, PrInvocationTransitionGuard},
+    ship_cmd::{
+        AppliedStewardHandoff, ShipCommandArgs, ShipInvocation, render_terminal_steward_handoff,
+        ship_command_with_transition,
+    },
 };
+use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::gate_scripts::{SKILL_SYNC, VERSION_BUMP, VERSIONING_CONFIG, resolve};
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
@@ -96,10 +102,27 @@ pub(super) fn pr_command<W: Write>(
         ));
     }
 
+    let mut invocation_lease = acquire_current_invocation_lease(cwd)?;
+    let steward_handoff =
+        resolve_steward_handoff(&args, protected_base_auto_handoff(cwd, &args.base));
     let trailers = shortcut_trailers(&args);
+    if trailers.is_empty()
+        && let Some(code) = short_circuit_existing_handoff(
+            steward_handoff.as_ref(),
+            config,
+            cwd,
+            json_mode,
+            stdout,
+        )?
+    {
+        return Ok(code);
+    }
+
     if !trailers.is_empty() {
-        let added = append_trailers_to_tip(cwd, &trailers)
-            .map_err(|error| CliFailure::new(2, error.to_string()))?;
+        let added = with_fenced_head_transition(&mut invocation_lease, cwd, || {
+            append_trailers_to_tip(cwd, &trailers)
+                .map_err(|error| CliFailure::new(2, error.to_string()))
+        })?;
         for trailer in added {
             writeln!(stdout, "▸ Added trailer: {trailer}")
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -117,23 +140,25 @@ pub(super) fn pr_command<W: Write>(
 
     warn_missing_release_bot_token(stdout, cwd, config);
     run_skill_sync(stdout, &python, &gates, &repo_root, &args.base)?;
-    let bumped_files = run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
-    if !bumped_files.is_empty() {
-        writeln!(
-            stdout,
-            "▸ Committing version bump(s) — {} file(s)",
-            bumped_files.len()
-        )
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        commit_bumped_files(&repo_root, &bumped_files)
-            .map_err(|error| CliFailure::new(1, error))?;
-    }
+    with_fenced_head_transition(&mut invocation_lease, cwd, || {
+        let bumped_files = run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
+        if !bumped_files.is_empty() {
+            writeln!(
+                stdout,
+                "▸ Committing version bump(s) — {} file(s)",
+                bumped_files.len()
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            commit_bumped_files(&repo_root, &bumped_files)
+                .map_err(|error| CliFailure::new(1, error))?;
+        }
+        Ok(())
+    })?;
 
-    let steward_handoff =
-        resolve_steward_handoff(&args, protected_base_auto_handoff(cwd, &args.base));
     writeln!(stdout, "▸ Handing off to `shipyard ship`")
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    ship_command(
+    let handoff_transition = checked_transition_guard(&invocation_lease, cwd)?;
+    ship_command_with_transition(
         ShipCommandArgs {
             pr: None,
             base: args.base,
@@ -156,7 +181,143 @@ pub(super) fn pr_command<W: Write>(
         runtime_paths,
         json_mode,
         stdout,
+        Some(handoff_transition),
     )
+}
+
+fn with_fenced_head_transition<T>(
+    lease: &mut PrInvocationLease,
+    cwd: &Path,
+    mutation: impl FnOnce() -> Result<T, CliFailure>,
+) -> Result<T, CliFailure> {
+    let _transition = checked_transition_guard(lease, cwd)?;
+    let value = mutation()?;
+    lease
+        .rebind_machine(current_invocation_identity(cwd)?)
+        .map_err(|error| invocation_lease_failure(&error))?;
+    Ok(value)
+}
+
+fn checked_transition_guard(
+    lease: &PrInvocationLease,
+    cwd: &Path,
+) -> Result<PrInvocationTransitionGuard, CliFailure> {
+    let transition = lease
+        .transition_guard_machine()
+        .map_err(|error| transition_failure("HEAD transition", &error))?;
+    let before = current_invocation_identity(cwd)?;
+    if !lease.owns(&before) {
+        return Err(CliFailure::new(
+            3,
+            "HEAD changed while shipyard pr held its original exact-head lease; refusing to operate on the newer head",
+        ));
+    }
+    Ok(transition)
+}
+
+fn acquire_current_invocation_lease(cwd: &Path) -> Result<PrInvocationLease, CliFailure> {
+    let (repo, branch) = current_invocation_coordinates(cwd)?;
+    let _transition = PrInvocationTransitionGuard::acquire_machine(&repo, &branch)
+        .map_err(|error| transition_failure("HEAD observation", &error))?;
+    let head =
+        git_output(cwd, &["rev-parse", "HEAD"]).map_err(|error| CliFailure::new(2, error))?;
+    PrInvocationLease::acquire_machine(PrInvocationIdentity { repo, branch, head })
+        .map_err(|error| invocation_lease_failure(&error))
+}
+
+fn transition_failure(operation: &str, error: &std::io::Error) -> CliFailure {
+    let code = if error.kind() == std::io::ErrorKind::WouldBlock {
+        3
+    } else {
+        1
+    };
+    CliFailure::new(code, format!("could not fence {operation}: {error}"))
+}
+
+fn invocation_lease_failure(error: &super::pr_invocation::PrInvocationAcquireError) -> CliFailure {
+    let message = error.to_string();
+    let code = match error {
+        super::pr_invocation::PrInvocationAcquireError::Busy { .. } => 3,
+        super::pr_invocation::PrInvocationAcquireError::Io(_) => 1,
+    };
+    CliFailure::new(code, message)
+}
+
+fn short_circuit_existing_handoff<W: Write>(
+    request: Option<&super::ship_cmd::ShipStewardHandoff>,
+    config: &LoadedConfig,
+    cwd: &Path,
+    json_mode: bool,
+    stdout: &mut W,
+) -> Result<Option<ExitCode>, CliFailure> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    if !git_output(cwd, &["status", "--porcelain", "--untracked-files=normal"])
+        .is_ok_and(|status| status.is_empty())
+    {
+        return Ok(None);
+    }
+    let identity = current_invocation_identity(cwd)?;
+    let Ok(Some(pr)) = crate::pr::find_pr_for_branch(config, cwd, None, &identity.branch) else {
+        return Ok(None);
+    };
+    let workstream_id = request
+        .workstream_id
+        .clone()
+        .unwrap_or_else(|| format!("{}#{}", identity.repo, pr.number));
+    let context_url = request.context_url.clone().or_else(|| Some(pr.url.clone()));
+    let receipt_args = StewardHandoffArgs {
+        repo: Some(identity.repo.clone()),
+        pr: pr.number,
+        head: identity.head.clone(),
+        workstream_id: workstream_id.clone(),
+        context_url: context_url.clone(),
+        apply: true,
+    };
+    let actions = GitHubActions::from_loaded_config(cwd, config);
+    if !existing_handoff_receipt_is_valid(&actions, &identity.repo, &receipt_args).unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    render_terminal_steward_handoff(
+        stdout,
+        &identity.repo,
+        pr.number,
+        &AppliedStewardHandoff {
+            workstream_id,
+            context_url,
+            head: identity.head,
+        },
+        json_mode,
+    )?;
+    Ok(Some(ExitCode::SUCCESS))
+}
+
+fn current_invocation_identity(cwd: &Path) -> Result<PrInvocationIdentity, CliFailure> {
+    let (repo, branch) = current_invocation_coordinates(cwd)?;
+    let head =
+        git_output(cwd, &["rev-parse", "HEAD"]).map_err(|error| CliFailure::new(2, error))?;
+    Ok(PrInvocationIdentity { repo, branch, head })
+}
+
+fn current_invocation_coordinates(cwd: &Path) -> Result<(String, String), CliFailure> {
+    let repo = detect_repo_from_remote(cwd, None)
+        .map(|repo| canonical_repo_slug(&repo))
+        .ok_or_else(|| CliFailure::new(2, "could not resolve repository from origin remote"))?;
+    let branch = git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map_err(|error| CliFailure::new(2, error))?;
+    if branch == "HEAD" {
+        return Err(CliFailure::new(
+            2,
+            "shipyard pr requires an attached branch for exact-head ownership",
+        ));
+    }
+    Ok((repo, branch))
+}
+
+fn canonical_repo_slug(repo: &str) -> String {
+    repo.to_ascii_lowercase()
 }
 
 fn resolve_steward_handoff(
@@ -575,6 +736,18 @@ mod tests {
         // Defensive: empty / weird shapes pass through unchanged.
         assert_eq!(normalize_base(""), "");
         assert_eq!(normalize_base("origin/"), "");
+    }
+
+    #[test]
+    fn repository_slug_is_canonical_for_machine_wide_ownership() {
+        assert_eq!(
+            canonical_repo_slug("Generous-Corp/Forge"),
+            "generous-corp/forge"
+        );
+        assert_eq!(
+            canonical_repo_slug("generous-corp/forge"),
+            "generous-corp/forge"
+        );
     }
 
     fn pr_args() -> PrCommandArgs {
