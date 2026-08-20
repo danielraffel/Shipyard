@@ -90,8 +90,11 @@ What it does per runner:
    are an explicit fleet-wide pin change, never a per-host automatic update.
    When a local runner is on an older pin, Shipyard must stop its service
    successfully before replacing any installation files; a failed stop aborts
-   the upgrade. Readiness probes suppress child stdout and stderr so both human
-   and JSON command output remain machine-readable.
+   the upgrade. It preserves the existing `.runner` credentials and service
+   registration, then restarts that service after the replacement verifies;
+   `config.sh` and `svc.sh install` are only for genuinely new runners. Readiness
+   probes suppress child stdout and stderr so both human and JSON command output
+   remain machine-readable.
 3. Writes a per-runner `.env` pointing ccache + FetchContent at the shared
    caches and isolating each runner's `_work` for cross-worktree cache hits
    (`CCACHE_BASEDIR` + `CCACHE_NOHASHDIR`). Depend mode is forced off and the

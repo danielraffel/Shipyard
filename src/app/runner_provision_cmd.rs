@@ -267,6 +267,19 @@ fn installed_runner_version(runner_dir: &Path) -> Option<String> {
         .map(|version| version.trim().to_owned())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RunnerInstallation {
+    configured: bool,
+    service_installed: bool,
+}
+
+fn inspect_runner_installation(runner_dir: &Path) -> RunnerInstallation {
+    RunnerInstallation {
+        configured: runner_dir.join(".runner").is_file(),
+        service_installed: runner_dir.join(".service").is_file(),
+    }
+}
+
 fn stop_runner_service_before_upgrade(runner_dir: &Path) -> Result<(), CliFailure> {
     let service = runner_dir.join("svc.sh");
     if !service.is_file() {
@@ -460,12 +473,25 @@ pub(super) fn register_command<W: Write>(
             .map_err(|e| CliFailure::new(1, format!("failed to create runner dir: {e}")))?;
         fs::create_dir_all(&entry.work)
             .map_err(|e| CliFailure::new(1, format!("failed to create work dir: {e}")))?;
+        let installation = inspect_runner_installation(&entry.dir);
+        if !installation.configured && installation.service_installed {
+            return Err(CliFailure::new(
+                1,
+                format!(
+                    "runner service exists without configuration at {}; repair or remove the partial installation before retrying",
+                    entry.dir.display()
+                ),
+            ));
+        }
         let installed_version = installed_runner_version(&entry.dir);
-        if installed_version.as_deref() != Some(PINNED_RUNNER_VERSION) {
+        let needs_upgrade = installed_version.as_deref() != Some(PINNED_RUNNER_VERSION);
+        if needs_upgrade {
             // Never replace files underneath a running service. A failed stop
             // is a hard boundary: leave the old installation intact and let
             // the operator repair the service before attempting the upgrade.
-            stop_runner_service_before_upgrade(&entry.dir)?;
+            if installation.service_installed {
+                stop_runner_service_before_upgrade(&entry.dir)?;
+            }
             run(
                 "/usr/bin/tar",
                 &[
@@ -491,6 +517,30 @@ pub(super) fn register_command<W: Write>(
         ensure_private_rust_toolchain(&entry.dir)?;
         fs::write(entry.dir.join(".path"), runner_path_file(&entry.dir))
             .map_err(|e| CliFailure::new(1, format!("failed to write .path: {e}")))?;
+
+        // A pinned upgrade retains GitHub's `.runner` credentials and the
+        // existing LaunchAgent. Reconfigure/install only genuinely new or
+        // explicitly service-less installations; otherwise `svc.sh install`
+        // rejects the still-present plist and leaves the runner offline.
+        if installation.configured {
+            if !installation.service_installed {
+                run_in(
+                    &entry.dir,
+                    "./svc.sh",
+                    &["install"],
+                    "install runner service",
+                )?;
+                run_in(&entry.dir, "./svc.sh", &["start"], "start runner service")?;
+            } else if needs_upgrade {
+                run_in(
+                    &entry.dir,
+                    "./svc.sh",
+                    &["start"],
+                    "restart runner service after upgrade",
+                )?;
+            }
+            continue;
+        }
 
         let token = args
             .actions
@@ -1073,6 +1123,28 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(temp.path().join("service-invocation")).expect("invocation"),
             "stop\n"
+        );
+    }
+
+    #[test]
+    fn runner_installation_state_distinguishes_upgrade_from_fresh_registration() {
+        let temp = tempfile::tempdir().expect("temp");
+        assert_eq!(
+            inspect_runner_installation(temp.path()),
+            RunnerInstallation {
+                configured: false,
+                service_installed: false,
+            }
+        );
+
+        std::fs::write(temp.path().join(".runner"), "{}\n").expect("runner config");
+        std::fs::write(temp.path().join(".service"), "plist\n").expect("service marker");
+        assert_eq!(
+            inspect_runner_installation(temp.path()),
+            RunnerInstallation {
+                configured: true,
+                service_installed: true,
+            }
         );
     }
 
