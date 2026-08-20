@@ -90,10 +90,10 @@ pub(super) struct ShipStewardHandoff {
 }
 
 #[derive(Clone, Debug)]
-struct AppliedStewardHandoff {
-    workstream_id: String,
-    context_url: Option<String>,
-    head: String,
+pub(super) struct AppliedStewardHandoff {
+    pub(super) workstream_id: String,
+    pub(super) context_url: Option<String>,
+    pub(super) head: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,16 +111,34 @@ pub(super) fn ship_command<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    ship_command_with_transition(args, config, cwd, runtime_paths, json_mode, stdout, None)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn ship_command_with_transition<W: Write>(
+    args: ShipCommandArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json_mode: bool,
+    stdout: &mut W,
+    transition_guard: Option<super::pr_invocation::PrInvocationTransitionGuard>,
+) -> Result<ExitCode, CliFailure> {
+    let terminal_steward_handoff = is_terminal_steward_handoff(&args);
     let preflight_dispatcher = ExecutorDispatcher::new(None);
-    let targets = prepare_ship_targets(
-        config,
-        cwd,
-        runtime_paths,
-        &preflight_dispatcher,
-        &args,
-        json_mode,
-        stdout,
-    )?;
+    let targets = if terminal_steward_handoff {
+        None
+    } else {
+        Some(prepare_ship_targets(
+            config,
+            cwd,
+            runtime_paths,
+            &preflight_dispatcher,
+            &args,
+            json_mode,
+            stdout,
+        )?)
+    };
 
     let branch = git_required(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let sha = git_required(cwd, &["rev-parse", "HEAD"])?;
@@ -154,6 +172,21 @@ pub(super) fn ship_command<W: Write>(
         json_mode,
         stdout,
     )?;
+    if terminal_steward_handoff {
+        let receipt = steward_handoff.as_ref().ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "steward handoff was requested but no receipt was produced",
+            )
+        })?;
+        render_terminal_steward_handoff(stdout, &repo, pr_context.number, receipt, json_mode)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    // `shipyard pr` needs the branch fence through push/PR resolution, but the
+    // traditional local-validation path must not monopolize it for a long
+    // queue drain. Exact-head queue ownership takes over from this boundary.
+    drop(transition_guard);
+    let targets = targets.expect("non-terminal ship path prepares validation targets");
 
     let mut queue = Queue::new(runtime_paths.state_dir.clone())
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -241,6 +274,44 @@ pub(super) fn ship_command<W: Write>(
         render_human(stdout, pr_context.number, &render_state, &diagnostics)?;
     }
     Ok(render_state.exit_code())
+}
+
+fn is_terminal_steward_handoff(args: &ShipCommandArgs) -> bool {
+    args.invocation == ShipInvocation::PrCommand && args.steward_handoff.is_some()
+}
+
+pub(super) fn render_terminal_steward_handoff<W: Write>(
+    stdout: &mut W,
+    repo: &str,
+    pr: u64,
+    receipt: &AppliedStewardHandoff,
+    json_mode: bool,
+) -> Result<(), CliFailure> {
+    if json_mode {
+        let mut data = BTreeMap::new();
+        data.insert("status".to_owned(), Value::from("handed_off"));
+        data.insert("repo".to_owned(), Value::from(repo));
+        data.insert("pr".to_owned(), Value::from(pr));
+        data.insert("head_sha".to_owned(), Value::from(receipt.head.clone()));
+        data.insert(
+            "workstream_id".to_owned(),
+            Value::from(receipt.workstream_id.clone()),
+        );
+        data.insert("validation_owner".to_owned(), Value::from("merge_steward"));
+        if let Some(url) = receipt.context_url.as_deref() {
+            data.insert("context_url".to_owned(), Value::from(url));
+        }
+        write_json_envelope(stdout, "pr.handed-off", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        writeln!(
+            stdout,
+            "✓ PR #{pr} exact head {} handed to the durable merge steward; local validation was not duplicated",
+            receipt.head.chars().take(12).collect::<String>()
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn configured_pr_provenance_hook(
@@ -404,7 +475,7 @@ fn apply_requested_steward_handoff_with_actions<W: Write>(
     let workstream_id = request
         .workstream_id
         .clone()
-        .unwrap_or_else(|| format!("{repo}#{}", pr.number));
+        .unwrap_or_else(|| default_steward_workstream(repo, pr.number));
     let context_url = request.context_url.clone().or_else(|| pr.pr_url.clone());
     let mut sink = std::io::sink();
     steward_handoff_command(
@@ -434,6 +505,10 @@ fn apply_requested_steward_handoff_with_actions<W: Write>(
         context_url,
         head: head.to_owned(),
     }))
+}
+
+fn default_steward_workstream(repo: &str, pr: u64) -> String {
+    format!("{}#{pr}", repo.to_ascii_lowercase())
 }
 
 /// One element per failed target. Built by `collect_failure_diagnostics`.
@@ -1377,7 +1452,8 @@ mod tests {
     use super::run_pr_provenance_hook;
     use super::{
         SHIP_EXIT_MERGE_CLIENT_DEFECT, ShipCommandArgs, ShipInvocation, ShipRenderState,
-        configured_pr_provenance_hook, green_not_merged, render_green_not_merged,
+        ShipStewardHandoff, configured_pr_provenance_hook, green_not_merged,
+        is_terminal_steward_handoff, render_green_not_merged,
         render_green_not_merged_client_defect, render_green_not_merged_flaky,
         render_green_not_merged_head_superseded, ship_command,
     };
@@ -1817,6 +1893,7 @@ command = [{hook:?}]
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = temp.path().join("gh");
         let log = temp.path().join("gh.log");
+        let managed = temp.path().join("managed");
         let head = "a".repeat(40);
         fake_gh(
             &gh,
@@ -1824,11 +1901,20 @@ command = [{hook:?}]
                 r#"printf '%s\n' "$*" >> '{}'
 case "$*" in
   *"repos/danielraffel/pulp/pulls/42"*)
-    printf '%s\n' '{{"state":"open","head":{{"sha":"{head}"}}}}'
+    if [ -f '{managed}' ]; then labels='[{{"name":"shipyard:managed"}}]'; else labels='[]'; fi
+    printf '%s\n' "{{\"state\":\"open\",\"head\":{{\"sha\":\"{head}\"}},\"labels\":$labels}}"
+    ;;
+  *"repos/danielraffel/pulp/issues/42/labels"*)
+    : > '{managed}'
+    printf '%s\n' '{{}}'
+    ;;
+  *"repos/danielraffel/pulp/commits/{head}/status"*)
+    printf '%s\n' '{{"statuses":[{{"context":"shipyard/steward-handoff","state":"success","description":"Managed handoff danielraffel/pulp#42","target_url":"https://github.com/danielraffel/pulp/pull/42"}}]}}'
     ;;
   *) printf '%s\n' '{{}}' ;;
 esac"#,
-                log.display()
+                log.display(),
+                managed = managed.display()
             ),
         );
         let config = loaded_config(temp.path());
@@ -1943,6 +2029,53 @@ esac"#,
         assert!(!super::should_auto_create_base("main", None));
         assert!(super::should_auto_create_base("main", Some(true)));
         assert!(!super::should_auto_create_base("develop/next", Some(false)));
+    }
+
+    #[test]
+    fn only_pr_invocations_with_a_steward_request_skip_local_validation() {
+        let args = |invocation, steward_handoff| ShipCommandArgs {
+            pr: None,
+            base: "main".to_owned(),
+            auto_create_base: None,
+            no_warm: false,
+            resume_from: None,
+            merge_command: None,
+            merge_result: None,
+            gh_command: None,
+            pr_snapshot_file: None,
+            allow_unreachable_targets: false,
+            allow_fleet_epoch_drift: false,
+            skip_targets: Vec::new(),
+            adopt_head: false,
+            steward_handoff,
+            invocation,
+        };
+        assert!(is_terminal_steward_handoff(&args(
+            ShipInvocation::PrCommand,
+            Some(ShipStewardHandoff {
+                workstream_id: None,
+                context_url: None,
+            })
+        )));
+        assert!(!is_terminal_steward_handoff(&args(
+            ShipInvocation::Direct,
+            Some(ShipStewardHandoff {
+                workstream_id: None,
+                context_url: None,
+            })
+        )));
+        assert!(!is_terminal_steward_handoff(&args(
+            ShipInvocation::PrCommand,
+            None
+        )));
+    }
+
+    #[test]
+    fn default_steward_workstream_uses_the_canonical_repository_slug() {
+        assert_eq!(
+            super::default_steward_workstream("Generous-Corp/Forge", 7),
+            "generous-corp/forge#7"
+        );
     }
 
     #[test]

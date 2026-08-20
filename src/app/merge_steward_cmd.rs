@@ -227,7 +227,9 @@ pub(super) const RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
 pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
 
 mod handoff;
-pub(crate) use handoff::{StewardHandoffArgs, steward_handoff_command};
+pub(crate) use handoff::{
+    StewardHandoffArgs, existing_handoff_receipt_is_valid, steward_handoff_command,
+};
 mod recovery;
 use recovery::{reconcile_management_label, reconcile_recovery_signal};
 

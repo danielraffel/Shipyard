@@ -77,20 +77,7 @@ impl RuntimePaths {
                 .join(identity.config_stem),
         };
 
-        let state_dir = match platform {
-            Platform::MacOs => home_dir
-                .join("Library")
-                .join("Application Support")
-                .join(identity.state_stem),
-            Platform::Linux => home_dir
-                .join(".local")
-                .join("state")
-                .join(identity.state_stem),
-            Platform::Windows => home_dir
-                .join("AppData")
-                .join("Local")
-                .join(identity.state_stem),
-        };
+        let state_dir = state_dir_for(platform, home_dir, identity.state_stem);
 
         let daemon_dir = state_dir.join("daemon");
         let daemon_socket = daemon_dir.join("daemon.sock");
@@ -112,6 +99,33 @@ impl RuntimePaths {
     }
 }
 
+/// State shared by every runtime mode and CLI state-dir override on this
+/// machine. Cross-invocation ownership must not be partitioned with queue data.
+pub(crate) fn machine_coordination_state_dir() -> PathBuf {
+    // Shipyard's authority boundary is the OS user's machine-global state
+    // domain, and every config/state path uses this same home resolution.
+    // A deliberately different HOME/USERPROFILE is a different user-state
+    // authority, not a supported runtime-mode or --state-dir partition.
+    let home_dir = home_dir();
+    machine_coordination_state_dir_for(Platform::current(), &home_dir)
+}
+
+fn machine_coordination_state_dir_for(platform: Platform, home_dir: &Path) -> PathBuf {
+    let identity = ProductIdentity::for_mode(RuntimeMode::Shipyard);
+    state_dir_for(platform, home_dir, identity.state_stem)
+}
+
+fn state_dir_for(platform: Platform, home_dir: &Path, state_stem: &str) -> PathBuf {
+    match platform {
+        Platform::MacOs => home_dir
+            .join("Library")
+            .join("Application Support")
+            .join(state_stem),
+        Platform::Linux => home_dir.join(".local").join("state").join(state_stem),
+        Platform::Windows => home_dir.join("AppData").join("Local").join(state_stem),
+    }
+}
+
 pub(crate) fn home_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -123,7 +137,7 @@ pub(crate) fn home_dir() -> PathBuf {
 mod tests {
     use std::path::PathBuf;
 
-    use super::RuntimePaths;
+    use super::{RuntimePaths, machine_coordination_state_dir_for};
     use crate::identity::RuntimeMode;
     use crate::platform::Platform;
 
@@ -169,6 +183,19 @@ mod tests {
         assert_eq!(
             paths.daemon_socket,
             PathBuf::from("/Users/daniel/Library/Application Support/shipyard/daemon/daemon.sock")
+        );
+    }
+
+    #[test]
+    fn machine_coordination_root_is_the_production_root_not_a_runtime_mode_root() {
+        let home = PathBuf::from("/Users/daniel");
+        let isolated = RuntimePaths::for_platform(Platform::MacOs, &home, RuntimeMode::Isolated);
+        let coordination = machine_coordination_state_dir_for(Platform::MacOs, &home);
+
+        assert_ne!(coordination, isolated.state_dir);
+        assert_eq!(
+            coordination,
+            PathBuf::from("/Users/daniel/Library/Application Support/shipyard")
         );
     }
 

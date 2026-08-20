@@ -451,9 +451,9 @@ budget; auth, timeout, malformed JSON, and head drift all fail closed.
   worker dies before it goes through. That is intentional — it must not reap a
   slow-but-live worker. Don't shorten it below the ~15s heartbeat interval's
   safety margin.
-- Do NOT launch a second `shipyard pr` for the same PR while the first is still
-  alive. That is what strands a `running` job in the first place — one ship per
-  PR at a time.
+- Do not deliberately launch a second `shipyard pr` for the same exact head.
+  Current binaries refuse it before gates with the exact-head invocation lease;
+  older binaries can still strand a `running` job. Use steward/queue status.
 - On a pre-0.68.0 binary the manual recovery is still: `shipyard ship-state
   discard <pr>`, then mark the stuck `queue.json` job terminal (or restart the
   daemon to trigger startup recovery).
@@ -714,7 +714,29 @@ branch and run `shipyard pr`, optionally adding `--workstream-id ID
 --context-url URL`. Shipyard never trusts the PR branch to enable that default.
 Immediately after the PR exists and before validation starts, Shipyard writes
 the receipt; without explicit values it uses `OWNER/REPO#PR` and the PR URL.
-Use `--no-steward-handoff` only as an explicit project-default override.
+That successful receipt is the submitting process's terminal boundary:
+`shipyard pr` returns without starting its own local queue/build, while the
+durable steward and repository CI own completion. Use `--no-steward-handoff`
+only when explicitly selecting the traditional local validation path.
+
+Before any gate, `shipyard pr` holds one machine-global advisory lease keyed by
+repository, branch, and exact head. Same-head duplicates fail in-flight without
+signalling sibling work; different heads/repos coexist. The lock, not its
+diagnostic PID metadata, is liveness authority, so crash recovery is automatic
+and stale PID reuse is harmless. The lock always uses the canonical production
+per-user machine-state root, so runtime mode and `--state-dir` overrides cannot split
+ownership. A clean exact head whose newest matching handoff status is valid,
+whose managed label is present, and whose unmanaged opt-out is absent exits
+before gate scripts only after a final open-PR/head revalidation.
+HEAD observation and trailer/version-bump ref movement use a brief repo+branch
+transition fence; it is released after exact-head ownership is established, so
+immutable different heads still proceed independently outside that boundary.
+The fenced mutator refuses if HEAD no longer matches its original lease.
+Version apply and commit share that fence; final push/handoff retains a checked
+fence through the synchronous command boundary. Fence contention returns
+in-flight immediately rather than waiting behind a hung owner.
+When handoff is disabled, that fence drops after push/PR resolution and before
+the local queue drain; exact-head queue ownership then governs the long work.
 
 When submitter provenance must survive the invoking agent disappearing after
 GitHub accepts the PR, configure an argv-only hook in project config:

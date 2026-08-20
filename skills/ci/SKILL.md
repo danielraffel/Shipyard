@@ -1295,7 +1295,7 @@ Remove a target from quarantine the moment the underlying flakiness is fixed —
 
 ## Shipping a PR (the `shipyard pr` path)
 
-When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or "push it" — run `shipyard pr` (or the `/pr` slash command — see `commands/pr.md`). It wraps `shipyard ship` with the versioning gates: skill-sync check, version-bump apply, and a `chore: bump versions` commit before handing off to the push/PR/validate/merge flow.
+When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or "push it" — run `shipyard pr` (or the `/pr` slash command — see `commands/pr.md`). It wraps `shipyard ship` with the versioning gates: skill-sync check, version-bump apply, and a `chore: bump versions` commit before handing off either to the durable steward or to the local push/validate/merge flow.
 
 The orchestration, in order:
 
@@ -1303,8 +1303,29 @@ The orchestration, in order:
 2. `version_bump_check.py --mode=apply` — rewrites `Cargo.toml` for CLI-surface bumps and `.claude-plugin/plugin.json` for plugin-surface bumps. The two version streams are independent per `RELEASING.md`.
 3. `git commit` + `gh pr create` + `shipyard ship`.
 4. If `[pr.provenance]` is configured, run its exact argv with the submitting session's environment. A required hook must succeed before any durable handoff or validation dispatch.
-5. With `[merge_steward].auto_handoff = true` on the protected base branch or explicit `--workstream-id`, write the exact-head server receipt and managed label immediately after provenance, before validation begins. The PR branch cannot enable the project default. The fallback workstream is `OWNER/REPO#PR` and the fallback context is the PR URL; `--no-steward-handoff` is an explicit override.
+5. With `[merge_steward].auto_handoff = true` on the protected base branch or explicit `--workstream-id`, write the exact-head server receipt and managed label immediately after provenance, then return successfully without launching a redundant local validation tree. The durable steward plus repository CI own the remaining checks and merge. The PR branch cannot enable the project default. The fallback workstream is `OWNER/REPO#PR` and the fallback context is the PR URL; `--no-steward-handoff` explicitly selects the traditional local validation path.
 6. On merge, `.github/workflows/auto-release.yml` tags the CLI bump as `v<x.y.z>`. The existing tag-triggered `release.yml` builds the 5-platform binaries and publishes the GitHub Release.
+
+`shipyard pr` is locally single-flight before gates for one repository, branch,
+and exact head. A duplicate exits in-flight and never signals the owning
+process or its validation children. Different exact heads and repositories can
+proceed independently. The lease is a kernel advisory lock; its PID/timestamp
+metadata is diagnostic only, so process death releases ownership and PID reuse
+cannot authorize killing unrelated work. Its canonical production per-user machine-state
+root is independent of runtime mode and `--state-dir` overrides. On a clean
+worktree, a matching valid exact-head receipt short-circuits before gates only
+when `shipyard:managed` is present, `shipyard:unmanaged` is absent, and a final
+read still proves the open exact head. Trailer shortcut requests still run
+because they intentionally change the head.
+HEAD observation and trailer/version-bump ref movement are fenced briefly by
+repo+branch until the new exact-head lease is held, closing the ref-move race
+without serializing the subsequent work of different immutable heads. A stale
+invocation refuses before mutation if HEAD no longer matches its owned lease.
+Version-file apply through commit shares one fence, and final push/handoff holds
+a checked fence until the synchronous command returns. Contention returns
+in-flight immediately instead of waiting behind a hung owner.
+On `--no-steward-handoff`, the fence drops after push/PR resolution and before
+the long queue drain so a newer immutable head is not branch-blocked.
 
 ### Atomic PR provenance hook
 
