@@ -149,7 +149,7 @@ pub(super) fn ship_command_with_transition<W: Write>(
         maybe_auto_create_base_branch(cwd, &args.base, config, args.gh_command.as_deref());
     }
     let lane_policy = resolve_lane_policy(config, cwd);
-    let pr_context = resolve_pr_context(config, &args, cwd, &branch, &lane_policy)?;
+    let pr_context = resolve_pr_context(config, &args, cwd, &branch, &sha, &lane_policy)?;
     if args.invocation == ShipInvocation::PrCommand {
         run_pr_provenance_hook(
             config,
@@ -777,11 +777,33 @@ fn ensure_pr_head_matches(info: &PrInfo, branch: &str, head_sha: &str) -> Result
     }
 }
 
+fn ensure_explicit_pr_identity_matches(
+    number: u64,
+    actual_base: &str,
+    actual_branch: &str,
+    actual_head: &str,
+    requested_base: &str,
+    local_branch: &str,
+    local_head: &str,
+) -> Result<(), CliFailure> {
+    ensure_existing_pr_base_matches(actual_base, requested_base)?;
+    if actual_branch != local_branch || !actual_head.eq_ignore_ascii_case(local_head) {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "PR #{number} does not match this checkout: expected branch `{actual_branch}` at `{actual_head}`, found `{local_branch}` at `{local_head}`; check out the PR's exact head before running `shipyard ship --pr {number}`"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_pr_context(
     config: &LoadedConfig,
     args: &ShipCommandArgs,
     cwd: &Path,
     branch: &str,
+    head_sha: &str,
     lane_policy: &LanePolicy,
 ) -> Result<ResolvedPrContext, CliFailure> {
     if let Some(number) = args.pr {
@@ -798,17 +820,44 @@ fn resolve_pr_context(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .or_else(|| value.pointer("/base/ref").and_then(Value::as_str))
-                .unwrap_or(&args.base)
-                .to_owned();
-            return Ok(ResolvedPrContext {
+                .ok_or_else(|| CliFailure::new(1, "PR snapshot is missing required baseRefName"))?;
+            let pr_branch = value
+                .get("headRefName")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| CliFailure::new(1, "PR snapshot is missing required headRefName"))?;
+            let pr_head = value
+                .get("headRefOid")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| CliFailure::new(1, "PR snapshot is missing required headRefOid"))?;
+            ensure_explicit_pr_identity_matches(
                 number,
                 base_branch,
+                pr_branch,
+                pr_head,
+                &args.base,
+                branch,
+                head_sha,
+            )?;
+            return Ok(ResolvedPrContext {
+                number,
+                base_branch: base_branch.to_owned(),
                 pr_url: None,
                 pr_title: None,
             });
         }
         let info = get_pr_status(config, cwd, args.gh_command.as_deref(), &number.to_string())
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        ensure_explicit_pr_identity_matches(
+            number,
+            &info.base,
+            &info.branch,
+            &info.head_sha,
+            &args.base,
+            branch,
+            head_sha,
+        )?;
         return Ok(ResolvedPrContext {
             number,
             base_branch: info.base,
@@ -1502,7 +1551,8 @@ mod tests {
     use super::{
         SHIP_EXIT_MERGE_CLIENT_DEFECT, ShipCommandArgs, ShipInvocation, ShipRenderState,
         ShipStewardHandoff, configured_pr_provenance_hook, ensure_existing_pr_base_matches,
-        git_required, green_not_merged, is_terminal_steward_handoff, render_green_not_merged,
+        ensure_explicit_pr_identity_matches, git_required, green_not_merged,
+        is_terminal_steward_handoff, render_green_not_merged,
         render_green_not_merged_client_defect, render_green_not_merged_flaky,
         render_green_not_merged_head_superseded, resolve_pr_context, ship_command,
     };
@@ -1520,6 +1570,53 @@ mod tests {
             .expect_err("mismatched base must fail closed");
         assert!(error.message().contains("existing PR targets `release`"));
         assert!(error.message().contains("rerun with --base release"));
+    }
+
+    #[test]
+    fn explicit_pr_requires_the_checkout_to_be_its_exact_head() {
+        ensure_explicit_pr_identity_matches(
+            7705,
+            "main",
+            "fix/runner",
+            "AABBCC",
+            "main",
+            "fix/runner",
+            "aabbcc",
+        )
+        .expect("matching exact identity");
+
+        let branch_error = ensure_explicit_pr_identity_matches(
+            7705,
+            "main",
+            "fix/runner",
+            "aabbcc",
+            "main",
+            "feature/unrelated-dsp",
+            "aabbcc",
+        )
+        .expect_err("wrong worktree branch must fail closed");
+        assert!(
+            branch_error
+                .message()
+                .contains("PR #7705 does not match this checkout")
+        );
+        assert!(branch_error.message().contains("feature/unrelated-dsp"));
+
+        let head_error = ensure_explicit_pr_identity_matches(
+            7705,
+            "main",
+            "fix/runner",
+            "aabbcc",
+            "main",
+            "fix/runner",
+            "ddeeff",
+        )
+        .expect_err("stale checkout head must fail closed");
+        assert!(
+            head_error
+                .message()
+                .contains("found `fix/runner` at `ddeeff`")
+        );
     }
 
     /// Issue #301 (2/3): the render must surface the underlying merge
@@ -2151,7 +2248,13 @@ esac"#,
         // so the happy-path merge proceeds.
         let head = git_capture(&["rev-parse", "HEAD"], &repo);
         let snapshot = temp.path().join("pr.json");
-        std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{head}"}}"#)).expect("write snapshot");
+        std::fs::write(
+            &snapshot,
+            format!(
+                r#"{{"headRefOid":"{head}","headRefName":"feature/test","baseRefName":"main"}}"#
+            ),
+        )
+        .expect("write snapshot");
         let mut stdout = Vec::new();
 
         let code = ship_command(
@@ -2228,7 +2331,9 @@ esac"#,
         let snapshot = temp.path().join("pr.json");
         std::fs::write(
             &snapshot,
-            format!(r#"{{"state":"OPEN","headRefOid":"{head}"}}"#),
+            format!(
+                r#"{{"state":"OPEN","headRefOid":"{head}","headRefName":"feature/test","baseRefName":"main"}}"#
+            ),
         )
         .expect("write snapshot");
         let mut stdout = Vec::new();
@@ -2323,6 +2428,69 @@ esac"#,
     }
 
     #[test]
+    #[cfg(unix)]
+    fn explicit_pr_from_unrelated_worktree_fails_before_queue_or_ship_state_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        seed_repo(&repo);
+        let paths = RuntimePaths::current_with_overrides(
+            RuntimeMode::Isolated,
+            Some(temp.path().join("global")),
+            Some(temp.path().join("state")),
+        );
+        let gh = temp.path().join("gh");
+        fake_gh(
+            &gh,
+            r#"
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{"number":7705,"url":"https://github.com/danielraffel/pulp/pull/7705","title":"Runner fix","state":"OPEN","headRefName":"fix/runner","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefName":"main"}'
+  exit 0
+fi
+echo "unexpected gh args: $@" >&2
+exit 2
+"#,
+        );
+        let mut stdout = Vec::new();
+
+        let error = ship_command(
+            ShipCommandArgs {
+                pr: Some(7705),
+                base: "main".to_owned(),
+                auto_create_base: None,
+                no_warm: true,
+                resume_from: None,
+                merge_command: None,
+                merge_result: Some(MergeResult::Success),
+                gh_command: Some(gh),
+                pr_snapshot_file: None,
+                allow_unreachable_targets: false,
+                allow_fleet_epoch_drift: false,
+                skip_targets: Vec::new(),
+                adopt_head: true,
+                steward_handoff: None,
+                invocation: ShipInvocation::Direct,
+            },
+            &loaded_config(temp.path()),
+            &repo,
+            &paths,
+            true,
+            &mut stdout,
+        )
+        .expect_err("unrelated worktree must fail closed even with --adopt-head");
+
+        assert!(
+            error
+                .message()
+                .contains("PR #7705 does not match this checkout")
+        );
+        assert!(error.message().contains("feature/test"));
+        assert!(stdout.is_empty());
+        assert!(!paths.state_dir.join("queue.json").exists());
+        assert!(!paths.state_dir.join("queue_requests").exists());
+        assert!(!paths.state_dir.join("ship").exists());
+    }
+
+    #[test]
     fn ship_command_skip_target_excludes_unreachable_target_before_preflight() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -2336,7 +2504,9 @@ esac"#,
         let snapshot = temp.path().join("pr.json");
         std::fs::write(
             &snapshot,
-            format!(r#"{{"headRefOid":"{head}","baseRefName":"main"}}"#),
+            format!(
+                r#"{{"headRefOid":"{head}","headRefName":"feature/test","baseRefName":"main"}}"#
+            ),
         )
         .expect("write snapshot");
         let mut stdout = Vec::new();
@@ -2508,8 +2678,15 @@ exit 2
         };
         let lane_policy = crate::lane_policy::resolve_lane_policy(&config, &repo);
 
-        let Err(error) = resolve_pr_context(&config, &args, &repo, "feature/test", &lane_policy)
-        else {
+        let local_head = git_required(&repo, &["rev-parse", "HEAD"]).expect("head");
+        let Err(error) = resolve_pr_context(
+            &config,
+            &args,
+            &repo,
+            "feature/test",
+            &local_head,
+            &lane_policy,
+        ) else {
             panic!("wrong base must fail before push");
         };
         assert!(error.message().contains("existing PR targets `release`"));
