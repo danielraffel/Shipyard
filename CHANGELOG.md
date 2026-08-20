@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0960"></a>
+## [0.96.0] - 2026-08-20
+
+- feat(queue-scheduler): terminate-on-already-merged observation (GEN-32) ([#435](https://github.com/danielraffel/Shipyard/pull/435))
+
 <a id="v0950"></a>
 ## [0.95.0] - 2026-08-16
 
@@ -914,6 +919,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.96.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.96.0
 [0.95.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.95.0
 [0.94.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.94.0
 [0.93.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.93.0
