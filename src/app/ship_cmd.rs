@@ -182,6 +182,7 @@ pub(super) fn ship_command<W: Write>(
         resume_from: args.resume_from,
         advisory_targets: lane_policy.advisory_targets.clone(),
         adopt_head: args.adopt_head,
+        pr_snapshot_file: args.pr_snapshot_file.clone(),
         targets,
     };
 

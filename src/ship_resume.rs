@@ -226,6 +226,7 @@ mod tests {
             resume_from: None,
             advisory_targets: std::collections::BTreeSet::new(),
             adopt_head: false,
+            pr_snapshot_file: None,
             targets: Vec::new(),
         };
         QueueRequestStore::new(state_dir)

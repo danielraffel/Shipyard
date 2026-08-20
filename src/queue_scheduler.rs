@@ -4,9 +4,13 @@
 //! host-pool capacity math that the P2b scheduler admission loop will use.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Utc};
 
+use crate::config::LoadedConfig;
+use crate::gh::{self, GhClient};
 use crate::host_pool::{HostPoolConfig, HostPoolLease};
 use crate::job::{DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus};
 use crate::queue::{
@@ -16,6 +20,8 @@ use crate::queue_request::{
     HostPoolDemand, JobResourcePlan, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
     QueuedExecutionRequest, VmSlotDemand,
 };
+
+const ALREADY_MERGED_REOBSERVE_INTERVAL: StdDuration = StdDuration::from_secs(30);
 
 /// Standard cancellation reason for pending jobs whose durable request envelope
 /// cannot be loaded by the scheduler admit pass.
@@ -95,6 +101,8 @@ pub struct RequestBackedAdmitPass {
     pub running_request_errors: Vec<RequestLoadError>,
     /// Same-PR ship decisions for future drain-owned cancellation/defer wiring.
     pub same_pr_ship_admission: SamePrShipAdmission,
+    /// Pending jobs whose PR was already merged while they waited in queue.
+    pub already_merged_cancellations: Vec<AlreadyMergedCancellation>,
 }
 
 /// Durable request envelope load problem observed by the scheduler.
@@ -104,6 +112,109 @@ pub struct RequestLoadError {
     pub job_id: String,
     /// Human-readable reason.
     pub reason: String,
+}
+
+/// Cancellation for a pending job whose PR was already merged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlreadyMergedCancellation {
+    /// Queue job id to cancel.
+    pub job_id: String,
+    /// Pull request number that was merged.
+    pub pr: u64,
+}
+
+/// Bounded, repository-aware observer for pending ships whose PR may have
+/// merged while the job waited for admission.
+pub struct AlreadyMergedObserver {
+    client: Option<GhClient>,
+    observations: BTreeMap<(String, u64), CachedMergedObservation>,
+}
+
+struct CachedMergedObservation {
+    observed_at: Instant,
+    merged_head: Option<String>,
+}
+
+impl AlreadyMergedObserver {
+    /// Build an observer from the effective Shipyard GitHub auth configuration.
+    /// Invalid auth fails closed: pending jobs remain queued instead of being
+    /// cancelled from an unauthenticated or ambiguous observation.
+    #[must_use]
+    pub fn from_config(config: &LoadedConfig) -> Self {
+        Self {
+            client: GhClient::from_loaded_config(config).ok(),
+            observations: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn observe_pending(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        cwd: &Path,
+        snapshot_file: Option<&Path>,
+    ) -> Vec<AlreadyMergedCancellation> {
+        let client = self.client.clone();
+        self.observe_pending_with(jobs, request_store, |repo, pr| {
+            gh::pr_merged_head_sha(client.as_ref(), repo, pr, cwd, snapshot_file)
+        })
+    }
+
+    fn observe_pending_with(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        mut fetch: impl FnMut(&str, u64) -> Option<String>,
+    ) -> Vec<AlreadyMergedCancellation> {
+        let mut pending_by_pr = BTreeMap::<(String, u64), Vec<(String, String)>>::new();
+        for job in jobs.iter().filter(|job| job.status == JobStatus::Pending) {
+            let Some(envelope) = request_store.load(&job.id).ok().flatten() else {
+                continue;
+            };
+            let QueuedExecutionRequest::Ship(request) = envelope.request else {
+                continue;
+            };
+            pending_by_pr
+                .entry((request.repo, request.pr))
+                .or_default()
+                .push((job.id.clone(), request.sha));
+        }
+
+        let now = Instant::now();
+        let mut cancellations = Vec::new();
+        for ((repo, pr), pending_jobs) in pending_by_pr {
+            let cache_key = (repo.clone(), pr);
+            let fresh_cached = self.observations.get(&cache_key).filter(|cached| {
+                now.saturating_duration_since(cached.observed_at)
+                    < ALREADY_MERGED_REOBSERVE_INTERVAL
+            });
+            let merged_head = if let Some(cached) = fresh_cached {
+                cached.merged_head.clone()
+            } else {
+                let merged_head = fetch(&repo, pr);
+                self.observations.insert(
+                    cache_key,
+                    CachedMergedObservation {
+                        observed_at: now,
+                        merged_head: merged_head.clone(),
+                    },
+                );
+                merged_head
+            };
+            let Some(merged_head) = merged_head else {
+                continue;
+            };
+            cancellations.extend(
+                pending_jobs
+                    .into_iter()
+                    .filter_map(|(job_id, expected_head)| {
+                        (merged_head == expected_head)
+                            .then_some(AlreadyMergedCancellation { job_id, pr })
+                    }),
+            );
+        }
+        cancellations
+    }
 }
 
 /// Queue mutations applied from one request-backed admit pass.
@@ -424,6 +535,7 @@ pub fn plan_admit_pass_from_jobs_with_vm_slots(
         plan: plan_admit_pass_with_vm_slots(&pending, &running, pools, leases, vm_slots, now),
         running_request_errors,
         same_pr_ship_admission,
+        already_merged_cancellations: Vec::new(),
     }
 }
 
@@ -493,6 +605,14 @@ fn admit_pass_cancellations(pass: &RequestBackedAdmitPass) -> Vec<QueuePendingCa
                 .map(|cancellation| QueuePendingCancellation {
                     job_id: cancellation.job_id.clone(),
                     reason: cancellation.reason.clone(),
+                }),
+        )
+        .chain(
+            pass.already_merged_cancellations
+                .iter()
+                .map(|cancellation| QueuePendingCancellation {
+                    job_id: cancellation.job_id.clone(),
+                    reason: crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned(),
                 }),
         )
         .collect()
@@ -847,9 +967,9 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::{
-        ORPHANED_PENDING_REQUEST_REASON, PendingAdmissionRequest, SchedulerAdmissionBlocker,
-        apply_admit_pass_for_drain, can_admit, host_pool_capacity_deficits, plan_admit_pass,
-        plan_admit_pass_from_jobs,
+        AlreadyMergedObserver, ORPHANED_PENDING_REQUEST_REASON, PendingAdmissionRequest,
+        SchedulerAdmissionBlocker, apply_admit_pass_for_drain, can_admit,
+        host_pool_capacity_deficits, plan_admit_pass, plan_admit_pass_from_jobs,
     };
     use crate::host_pool::{HostPoolConfig, HostPoolLease, HostPoolMemberConfig};
     use crate::job::{Job, JobStatus, Priority, ValidationMode};
@@ -1692,6 +1812,149 @@ mod tests {
         assert_eq!(
             queue.get("pending").expect("pending").expect("job").status,
             JobStatus::Pending
+        );
+    }
+
+    /// Positive test: a pending ship job whose PR is observed as merged gets an
+    /// `already_merged` cancellation in the admit pass.
+    #[test]
+    fn observe_already_merged_cancels_pending_ship_job() {
+        // Create a temporary "merged" snapshot file. The `headRefOid` matches
+        // the `sha` recorded by `save_ship` ("abc123"), so the head-SHA guard
+        // is satisfied and the jobs are cancelled.
+        let merged_snapshot = tempfile::NamedTempFile::new().expect("temp");
+        std::fs::write(
+            merged_snapshot.path(),
+            r#"{"state":"MERGED","headRefOid":"abc123"}"#,
+        )
+        .expect("write snapshot");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+
+        // Enqueue two ship jobs — same repo, different PRs.
+        save_ship(&store, "one", "Generous-Corp/pulp", 99);
+        save_ship(&store, "two", "Generous-Corp/pulp", 100);
+        let one = job("one", JobStatus::Pending, Priority::Normal, -10);
+        let two = job("two", JobStatus::Pending, Priority::Normal, -5);
+
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+        };
+        let jobs = [one, two];
+        let cancellations = observer.observe_pending(
+            &jobs,
+            &store,
+            merged_snapshot.path(),
+            Some(merged_snapshot.path()),
+        );
+
+        // Both jobs' PRs report merged, so both should appear.
+        assert_eq!(cancellations.len(), 2);
+        assert!(
+            cancellations
+                .iter()
+                .any(|c| c.job_id == "one" && c.pr == 99)
+        );
+        assert!(
+            cancellations
+                .iter()
+                .any(|c| c.job_id == "two" && c.pr == 100)
+        );
+    }
+
+    /// Negative test: when the snapshot file says OPEN (not merged), no
+    /// `already_merged` cancellations are produced.
+    #[test]
+    fn observe_already_merged_does_not_cancel_open_pr() {
+        let open_snapshot = tempfile::NamedTempFile::new().expect("temp");
+        std::fs::write(open_snapshot.path(), r#"{"state":"OPEN"}"#).expect("write snapshot");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+
+        save_ship(&store, "open-pr", "Generous-Corp/pulp", 42);
+        let job = job("open-pr", JobStatus::Pending, Priority::Normal, 0);
+
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+        };
+        let cancellations = observer.observe_pending(
+            &[job],
+            &store,
+            open_snapshot.path(),
+            Some(open_snapshot.path()),
+        );
+
+        assert!(cancellations.is_empty());
+    }
+
+    /// Head-SHA guard: when the PR is merged but at a DIFFERENT head than the
+    /// job was queued to validate, no cancellation is produced (fail closed).
+    #[test]
+    fn observe_already_merged_does_not_cancel_when_merged_head_differs() {
+        // Merged, but `headRefOid` differs from `save_ship`'s sha ("abc123").
+        let mismatched_snapshot = tempfile::NamedTempFile::new().expect("temp");
+        std::fs::write(
+            mismatched_snapshot.path(),
+            r#"{"state":"MERGED","headRefOid":"deadbeef"}"#,
+        )
+        .expect("write snapshot");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+
+        save_ship(&store, "drifted-pr", "Generous-Corp/pulp", 7);
+        let job = job("drifted-pr", JobStatus::Pending, Priority::Normal, 0);
+
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+        };
+        let cancellations = observer.observe_pending(
+            &[job],
+            &store,
+            mismatched_snapshot.path(),
+            Some(mismatched_snapshot.path()),
+        );
+
+        assert!(cancellations.is_empty());
+    }
+
+    #[test]
+    fn observe_already_merged_deduplicates_by_repository_and_pr_and_throttles_rechecks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "one", "owner/one", 42);
+        save_ship(&store, "two", "owner/one", 42);
+        save_ship(&store, "other-repo", "owner/two", 42);
+        let jobs = [
+            job("one", JobStatus::Pending, Priority::Normal, -10),
+            job("two", JobStatus::Pending, Priority::Normal, -5),
+            job("other-repo", JobStatus::Pending, Priority::Normal, 0),
+        ];
+        let mut observer = AlreadyMergedObserver {
+            client: None,
+            observations: BTreeMap::new(),
+        };
+        let mut calls = Vec::new();
+
+        let first = observer.observe_pending_with(&jobs, &store, |repo, pr| {
+            calls.push((repo.to_owned(), pr));
+            Some("abc123".to_owned())
+        });
+        let second = observer.observe_pending_with(&jobs, &store, |repo, pr| {
+            calls.push((repo.to_owned(), pr));
+            Some("abc123".to_owned())
+        });
+
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        assert_eq!(
+            calls,
+            [("owner/one".to_owned(), 42), ("owner/two".to_owned(), 42)]
         );
     }
 }
