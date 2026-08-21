@@ -296,7 +296,7 @@ fn apply<W: Write>(
     )?);
     let hosts_file = resolve_hosts_file(args.target.hosts_file.as_deref(), paths);
     let state_file = resolve_state_file(args.target.state_file.as_deref(), paths);
-    let _lock = StateLock::acquire(&state_file)?;
+    let _lock = StateLock::acquire(&fleet_lock_file(paths))?;
     let hosts = load_hosts(&hosts_file)?;
     let inventory_sha256 = file_sha256(&hosts_file)?;
     let now = timestamp();
@@ -344,7 +344,7 @@ fn resume<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let state_file = resolve_state_file(args.state_file.as_deref(), paths);
-    let _lock = StateLock::acquire(&state_file)?;
+    let _lock = StateLock::acquire(&fleet_lock_file(paths))?;
     let mut state = read_state(&state_file)?;
     if let Some(override_file) = args.hosts_file.as_deref()
         && canonical_or_original(override_file) != canonical_or_original(&state.hosts_file)
@@ -455,7 +455,9 @@ fn reconcile_once<E: HostExecutor>(
     );
     state.canary_host = Some(canary.clone());
     let mut wave = next_wave(hosts, &state.hosts, &canary, state.canary_proven);
-    apply_wave(executor, hosts, &mut state.hosts, &state.desired, &wave);
+    persist_wave_expectations(state_file, state, &wave)?;
+    let desired = state.desired.clone();
+    apply_wave(executor, hosts, &mut state.hosts, &desired, &wave);
 
     if !state.canary_proven
         && state
@@ -465,10 +467,30 @@ fn reconcile_once<E: HostExecutor>(
     {
         state.canary_proven = true;
         wave = next_wave(hosts, &state.hosts, &canary, true);
-        apply_wave(executor, hosts, &mut state.hosts, &state.desired, &wave);
+        persist_wave_expectations(state_file, state, &wave)?;
+        apply_wave(executor, hosts, &mut state.hosts, &desired, &wave);
     }
     state.updated_at = timestamp();
     state.reconciler = inspect_reconciler_from_prior(&state.reconciler, state_file);
+    write_state(state_file, state)
+}
+
+fn persist_wave_expectations(
+    state_file: &Path,
+    state: &mut RolloutState,
+    wave: &[String],
+) -> Result<(), CliFailure> {
+    for name in wave {
+        let Some(receipt) = state.hosts.get_mut(name) else {
+            continue;
+        };
+        if receipt.expected_participation.is_none() {
+            receipt.expected_participation = receipt.observed.participation;
+        }
+        receipt.require_daemon_running |= receipt.observed.daemon_running == Some(true);
+        receipt.updated_at = timestamp();
+    }
+    state.updated_at = timestamp();
     write_state(state_file, state)
 }
 
@@ -858,7 +880,7 @@ fi
 busy=false
 if pgrep -f 'Runner.Worker spawnclient' >/dev/null 2>&1; then busy=true; fi
 if ps -axww -o command= 2>/dev/null \
-  | grep -E '[/ ]shipyard( +--json| +--mode +[^ ]+| +--state-dir +[^ ]+| +--global-dir +[^ ]+| +--cwd +[^ ]+)* +(ship|pr|run|rescue|auto-merge|watch)( |$)' \
+  | grep -E '[/ ](shipyard|sy)( +--json| +--mode +[^ ]+| +--state-dir +[^ ]+| +--global-dir +[^ ]+| +--cwd +[^ ]+)* +(ship|pr|run|rescue|auto-merge|watch)( |$)' \
   | grep -v '[g]rep -E' >/dev/null 2>&1; then busy=true; fi
 printf 'version=%s\nsha256=%s\ndaemon_running=%s\ndaemon_version=%s\nparticipation=%s\nbusy=%s\n' \
   "$version" "$sha" "$daemon_running" "$daemon_version" "$participation" "$busy"
@@ -1082,6 +1104,10 @@ fn resolve_state_file(explicit: Option<&Path>, paths: &RuntimePaths) -> PathBuf 
     }
 }
 
+fn fleet_lock_file(paths: &RuntimePaths) -> PathBuf {
+    paths.state_dir.join("fleet-release").join("mutation.lock")
+}
+
 fn read_state(path: &Path) -> Result<RolloutState, CliFailure> {
     let raw = fs::read_to_string(path).map_err(|error| {
         CliFailure::new(
@@ -1124,12 +1150,12 @@ struct StateLock {
 }
 
 impl StateLock {
-    fn acquire(state_file: &Path) -> Result<Self, CliFailure> {
-        let parent = state_file
+    fn acquire(lock_file: &Path) -> Result<Self, CliFailure> {
+        let parent = lock_file
             .parent()
             .ok_or_else(|| CliFailure::new(2, "state path has no parent"))?;
         fs::create_dir_all(parent).map_err(|error| CliFailure::new(1, error.to_string()))?;
-        let path = state_file.with_extension("lock");
+        let path = lock_file.to_path_buf();
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
