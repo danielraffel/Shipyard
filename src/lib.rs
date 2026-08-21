@@ -148,3 +148,16 @@ pub mod watch;
 pub mod webhook;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;
+
+#[cfg(all(test, unix))]
+pub(crate) mod test_support {
+    use std::sync::{LazyLock, Mutex};
+
+    /// Serializes tests that create, adopt, signal, or reap Unix process trees.
+    ///
+    /// A module-local lock is insufficient: the daemon lifecycle and execution
+    /// supervisor suites run in the same test binary and can otherwise signal
+    /// or observe each other's short-lived fixture processes.
+    pub(crate) static PROCESS_TREE_TEST_LOCK: LazyLock<Mutex<()>> =
+        LazyLock::new(|| Mutex::new(()));
+}
