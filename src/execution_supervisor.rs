@@ -92,7 +92,7 @@ pub struct ExecutionSupervisor {
     global_dir: PathBuf,
     state_dir: PathBuf,
     children: BTreeMap<String, Child>,
-    merge_observers: BTreeMap<PathBuf, AlreadyMergedObserver>,
+    merge_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, String)>,
 }
 
 impl ExecutionSupervisor {
@@ -131,7 +131,8 @@ impl ExecutionSupervisor {
         let request_store = QueueRequestStore::new(&self.state_dir)?;
         let mut queue = Queue::new(&self.state_dir)?;
         let jobs = queue.get_all()?;
-        let mut jobs_by_cwd = BTreeMap::<PathBuf, Vec<Job>>::new();
+        let mut jobs_by_cwd =
+            BTreeMap::<PathBuf, Vec<(Job, crate::queue_request::ExecutionProvenance)>>::new();
         for job in jobs
             .iter()
             .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
@@ -152,7 +153,7 @@ impl ExecutionSupervisor {
                 jobs_by_cwd
                     .entry(provenance.canonical_cwd.clone())
                     .or_default()
-                    .push(job.clone());
+                    .push((job.clone(), provenance.clone()));
             }
         }
         if jobs_by_cwd.is_empty() {
@@ -165,7 +166,7 @@ impl ExecutionSupervisor {
         let active_cwds = jobs_by_cwd.keys().cloned().collect::<BTreeSet<_>>();
         self.merge_observers
             .retain(|cwd, _| active_cwds.contains(cwd));
-        for (cwd, scoped_jobs) in jobs_by_cwd {
+        for (cwd, scoped_entries) in jobs_by_cwd {
             if !self.merge_observers.contains_key(&cwd) {
                 let Ok(config) = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
                     self.mode,
@@ -176,13 +177,30 @@ impl ExecutionSupervisor {
                     // The worker provenance gate fails it closed if admitted.
                     continue;
                 };
-                self.merge_observers
-                    .insert(cwd.clone(), AlreadyMergedObserver::from_config(&config));
+                let Some(signature) = scoped_entries.iter().find_map(|(_, provenance)| {
+                    provenance
+                        .validate_with_config(&cwd, &config)
+                        .ok()
+                        .and_then(|()| provenance.config_signature.clone())
+                }) else {
+                    continue;
+                };
+                self.merge_observers.insert(
+                    cwd.clone(),
+                    (AlreadyMergedObserver::from_config(&config), signature),
+                );
             }
-            let observer = self
+            let (observer, trusted_signature) = self
                 .merge_observers
                 .get_mut(&cwd)
                 .expect("observer inserted for active cwd");
+            let scoped_jobs = scoped_entries
+                .into_iter()
+                .filter(|(_, provenance)| {
+                    provenance.config_signature.as_ref() == Some(trusted_signature)
+                })
+                .map(|(job, _)| job)
+                .collect::<Vec<_>>();
             pending.extend(observer.observe_pending(&scoped_jobs, &request_store, &cwd, None));
             running.extend(observer.observe_running(&scoped_jobs, &request_store, &cwd, None));
         }
@@ -596,17 +614,25 @@ fn worker_generation() -> io::Result<String> {
 }
 
 fn worker_identity_is_live(receipt: &WorkerReceipt) -> bool {
-    let output = Command::new("/bin/ps")
-        .args(["-p", &receipt.pid.to_string(), "-o", "command="])
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    let command = String::from_utf8_lossy(&output.stdout);
-    output.status.success()
-        && command.contains("execution-worker")
-        && command.contains(&receipt.job_id)
-        && command.contains(&receipt.generation)
+    #[cfg(unix)]
+    {
+        let output = Command::new("/bin/ps")
+            .args(["-p", &receipt.pid.to_string(), "-o", "command="])
+            .output();
+        let Ok(output) = output else {
+            return false;
+        };
+        let command = String::from_utf8_lossy(&output.stdout);
+        output.status.success()
+            && command.contains("execution-worker")
+            && command.contains(&receipt.job_id)
+            && command.contains(&receipt.generation)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = receipt;
+        false
+    }
 }
 
 /// Verify that this exact process was fenced by the daemon before executing.
@@ -718,11 +744,24 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn pid_reuse_without_exact_worker_identity_is_rejected() {
         let receipt = WorkerReceipt {
             job_id: "not-on-this-command".to_owned(),
             generation: "unique-generation".to_owned(),
+            pid: std::process::id(),
+            started_at: Utc::now(),
+        };
+        assert!(!worker_identity_is_live(&receipt));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_worker_identity_fails_closed_without_process_probe() {
+        let receipt = WorkerReceipt {
+            job_id: "job".to_owned(),
+            generation: "generation".to_owned(),
             pid: std::process::id(),
             started_at: Utc::now(),
         };
@@ -1124,6 +1163,99 @@ mod tests {
             Queue::new(temp.path())
                 .expect("queue")
                 .get("poisoned")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Pending
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_config_cannot_invoke_auth_helper_before_signature_fence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let global = temp.path().join("global");
+        fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&global).expect("global");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        fs::write(repo.join("tracked"), "stable").expect("tracked");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ]);
+        let head = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .expect("head")
+                .stdout,
+        )
+        .expect("utf8");
+        let head = head.trim();
+        fs::write(
+            global.join("config.toml"),
+            "[github.auth]\nsource = \"command\"\ntoken_command = [\"/usr/bin/printf\", \"token\"]\n",
+        )
+        .expect("original config");
+        let original = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
+            RuntimeMode::Isolated,
+            &repo,
+            global.clone(),
+        )
+        .expect("load original config");
+        queued_ship_job(temp.path(), "config-drift", head);
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut envelope = store.load("config-drift").expect("load").expect("request");
+        let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
+            &repo,
+            Some("owner/repo"),
+            head,
+            &original,
+        )
+        .expect("provenance");
+        envelope.cwd.clone_from(&provenance.canonical_cwd);
+        envelope.provenance = Some(provenance);
+        store.save(&envelope).expect("valid envelope");
+
+        let marker = temp.path().join("changed-helper-ran");
+        fs::write(
+            global.join("config.toml"),
+            format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [\"/usr/bin/touch\", \"{}\"]\n",
+                marker.display()
+            ),
+        )
+        .expect("changed config");
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            global,
+            temp.path().into(),
+        );
+        supervisor
+            .observe_merged_ship_jobs()
+            .expect("safe observation");
+        assert!(!marker.exists(), "changed token helper executed");
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("config-drift")
                 .expect("read")
                 .expect("job")
                 .status,
