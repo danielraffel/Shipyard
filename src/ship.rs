@@ -459,7 +459,8 @@ fn submit_ship_with_config(
         request.mode,
         request.priority,
     )
-    .with_kind(JobKind::Ship);
+    .with_kind(JobKind::Ship)
+    .with_workload_scope(format!("ship:{}:pr-{}", request.repo, request.pr));
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_ship_request(job.id.clone(), cwd, request);
     if let Some(config) = config {
@@ -807,7 +808,8 @@ fn submit_run_with_config(
         request.mode,
         request.priority,
     )
-    .with_kind(JobKind::Run);
+    .with_kind(JobKind::Run)
+    .with_workload_scope(run_workload_scope(cwd));
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_run_request(job.id.clone(), cwd, request);
     if let Some(config) = config {
@@ -2391,6 +2393,11 @@ fn target_names(targets: &[ResolvedTarget]) -> Vec<String> {
         .iter()
         .map(|target| target.name.clone())
         .collect::<Vec<_>>()
+}
+
+fn run_workload_scope(cwd: &Path) -> String {
+    let identity = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    format!("run:{}", identity.to_string_lossy())
 }
 
 fn target_log_path(state_dir: &Path, job_id: &str, target: &str) -> PathBuf {

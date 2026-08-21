@@ -1069,6 +1069,68 @@ mod tests {
         }
     }
 
+    fn fleet_pool() -> HostPoolConfig {
+        HostPoolConfig {
+            name: "local_macs".to_owned(),
+            strategy: "ordered".to_owned(),
+            lease_stale_seconds: 180,
+            heartbeat_interval_seconds: 15,
+            members: vec![
+                HostPoolMemberConfig {
+                    id: "m3".to_owned(),
+                    backend_type: "ssh".to_owned(),
+                    host: Some("m3".to_owned()),
+                    repo_path: Some("/repo".to_owned()),
+                    cwd: None,
+                    max_concurrency: 1,
+                    capabilities: vec!["arm64".to_owned(), "pulp-full".to_owned()],
+                },
+                HostPoolMemberConfig {
+                    id: "m1".to_owned(),
+                    backend_type: "ssh".to_owned(),
+                    host: Some("m1".to_owned()),
+                    repo_path: Some("/repo".to_owned()),
+                    cwd: None,
+                    max_concurrency: 1,
+                    capabilities: vec!["arm64".to_owned(), "forge-modular".to_owned()],
+                },
+                HostPoolMemberConfig {
+                    id: "m5".to_owned(),
+                    backend_type: "ssh".to_owned(),
+                    host: Some("m5".to_owned()),
+                    repo_path: Some("/repo".to_owned()),
+                    cwd: None,
+                    max_concurrency: 1,
+                    capabilities: vec!["arm64".to_owned(), "forge-sequencer".to_owned()],
+                },
+                HostPoolMemberConfig {
+                    id: "controller".to_owned(),
+                    backend_type: "local".to_owned(),
+                    host: None,
+                    repo_path: None,
+                    cwd: Some(PathBuf::from("/repo")),
+                    max_concurrency: 1,
+                    capabilities: vec!["arm64".to_owned(), "vellum".to_owned()],
+                },
+            ],
+        }
+    }
+
+    fn capability_plan(workload_claim: &str, capability: &str) -> JobResourcePlan {
+        JobResourcePlan {
+            targets: vec![capability.to_owned()],
+            exclusive_claims: vec![workload_claim.to_owned()],
+            cloud_targets: Vec::new(),
+            host_pools: vec![HostPoolDemand {
+                pool_name: "local_macs".to_owned(),
+                requires: vec!["arm64".to_owned(), capability.to_owned()],
+                slots: 1,
+                capability_key: format!("arm64+{capability}"),
+            }],
+            vm_slots: Vec::new(),
+        }
+    }
+
     fn claim_plan(claims: &[&str]) -> JobResourcePlan {
         JobResourcePlan {
             targets: Vec::new(),
@@ -1127,6 +1189,7 @@ mod tests {
             branch: "main".to_owned(),
             mode: ValidationMode::Full,
             kind: None,
+            workload_scope: None,
             target_names: vec!["mac".to_owned()],
             priority,
             status,
@@ -1505,6 +1568,69 @@ mod tests {
             plan.deferred[0].blockers.as_slice(),
             [SchedulerAdmissionBlocker::HostPoolCapacity(deficit)]
                 if deficit.pool_name == "local_macs"
+        ));
+    }
+
+    #[test]
+    fn blocked_pulp_proof_does_not_head_of_line_block_forge_products_or_vellum() {
+        let now = Utc::now();
+        let running_pulp = capability_plan("evidence:Generous-Corp/pulp:pr-7718", "pulp-full");
+        let blocked_pulp = PendingAdmissionRequest {
+            job_id: "pulp-pr-7730".to_owned(),
+            resource_plan: Some(capability_plan(
+                "evidence:Generous-Corp/pulp:pr-7730",
+                "pulp-full",
+            )),
+            missing_request_reason: None,
+        };
+        let forge_modular = PendingAdmissionRequest {
+            job_id: "forge-modular-pr-127".to_owned(),
+            resource_plan: Some(capability_plan(
+                "evidence:Generous-Corp/forge:modular:pr-127",
+                "forge-modular",
+            )),
+            missing_request_reason: None,
+        };
+        let forge_sequencer = PendingAdmissionRequest {
+            job_id: "forge-sequencer-pr-128".to_owned(),
+            resource_plan: Some(capability_plan(
+                "evidence:Generous-Corp/forge:sequencer:pr-128",
+                "forge-sequencer",
+            )),
+            missing_request_reason: None,
+        };
+        let vellum = PendingAdmissionRequest {
+            job_id: "vellum-pr-96".to_owned(),
+            resource_plan: Some(capability_plan(
+                "evidence:Generous-Corp/vellum:pr-96",
+                "vellum",
+            )),
+            missing_request_reason: None,
+        };
+
+        let plan = plan_admit_pass(
+            &[blocked_pulp, forge_modular, forge_sequencer, vellum],
+            &[running_pulp],
+            &[fleet_pool()],
+            &[],
+            now,
+        );
+
+        assert_eq!(
+            plan.admitted,
+            [
+                "forge-modular-pr-127",
+                "forge-sequencer-pr-128",
+                "vellum-pr-96",
+            ]
+        );
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.deferred[0].job_id, "pulp-pr-7730");
+        assert!(matches!(
+            plan.deferred[0].blockers.as_slice(),
+            [SchedulerAdmissionBlocker::HostPoolCapacity(deficit)]
+                if deficit.capability_key == "arm64+pulp-full"
+                    && deficit.available_slots == 0
         ));
     }
 
