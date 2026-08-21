@@ -15,8 +15,7 @@ use sha2::{Digest, Sha256};
 mod execution;
 pub use execution::{
     AuthoritativeExecutionPlan, ChangedSurfaceExecutionPolicy, ExecutionDisposition, ExecutionMode,
-    ExecutionPlanError, FullExecutionReason, materialize_selected_tests,
-    plan_authoritative_execution,
+    ExecutionPlanError, FullExecutionReason, plan_authoritative_execution,
 };
 
 /// Oldest changed-surface declaration schema understood by this release.
