@@ -662,7 +662,7 @@ fn storage_probe_script(disk_path: &str) -> String {
         "disk_path={}; printf 'disk_path\\t%s\\n' \"$disk_path\"; \
          df -Pk \"$disk_path\" 2>/dev/null | awk 'END {{print \"disk_available_kibibyte\\t\" $4}}'; \
          if command -v ccache >/dev/null 2>&1; then \
-           CCACHE_DIR=\"${{CCACHE_DIR:-$HOME/Library/Caches/ccache}}\" ccache --print-stats 2>/dev/null | \
+           ccache --print-stats 2>/dev/null | \
              awk -F '\\t' '$1 == \"cache_size_kibibyte\" || $1 == \"max_cache_size_kibibyte\" {{print}}'; \
          fi",
         shlex_quote(disk_path)

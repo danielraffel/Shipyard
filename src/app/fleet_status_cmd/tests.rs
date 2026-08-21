@@ -268,6 +268,17 @@ fn storage_probe_flags_disk_floor_and_ccache_limit_mismatch() {
 }
 
 #[test]
+fn storage_probe_does_not_override_ccache_config_discovery() {
+    let script = storage_probe_script("/Volumes/Workshop/VMs");
+
+    assert!(script.contains("ccache --print-stats"));
+    assert!(
+        !script.contains("CCACHE_DIR="),
+        "the default fleet probe must let ccache discover the host's canonical config"
+    );
+}
+
+#[test]
 fn routing_mismatch_reports_idle_linux_pool_for_hosted_merge_group() {
     let inventory = RunnerInventory {
         readable: true,
