@@ -150,7 +150,14 @@ GitHub App installation helper:
 source = "command"
 token_command = ["/Users/you/Code/shipyard/scripts/shipyard-github-app-token", "--repo", "{repo_slug}"]
 refresh_skew_seconds = 60
+privileged_gh_binary = "/opt/homebrew/bin/gh"
+privileged_git_binary = "/usr/bin/git"
 ```
+
+The privileged binary paths are required for dependency pin qualification and
+publication. Put them only in trusted machine-global config. Both must be
+absolute native executables; Shipyard will not discover a token-bearing `gh` or
+`git` through `PATH`.
 
 Some low-volume mutations cannot be performed by a GitHub App installation
 token. When GitHub returns the exact integration-permission denial for one of
@@ -308,7 +315,9 @@ Preferred helper stdout for expiring tokens:
 ```
 
 Plain token stdout is also accepted. Plain tokens are cached only when
-`cache_ttl_seconds` is set.
+`cache_ttl_seconds` is set. A plain token with GitHub's documented `ghs_`
+installation-token prefix is reported as `kind=github-app-installation`, so
+App-only commands can preserve their authority boundary with existing helpers.
 
 Helpers must write tokens only to stdout. Shipyard redacts common GitHub
 token prefixes in diagnostics, but helper stderr is still surfaced for

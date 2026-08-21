@@ -54,6 +54,12 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: PinCommand,
     },
+    /// Qualify and pin immutable upstream dependencies.
+    Dependency {
+        /// Dependency family.
+        #[command(subcommand)]
+        command: DependencyCommand,
+    },
     /// Inspect and switch project profiles and configuration.
     Config {
         /// Config subcommand. Defaults to `show`.
@@ -1292,6 +1298,30 @@ pub(super) enum PinCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub(super) enum DependencyCommand {
+    /// Manage the tracked Pulp release dependency.
+    Pulp {
+        /// Pulp dependency operation.
+        #[command(subcommand)]
+        command: PulpDependencyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum PulpDependencyCommand {
+    /// Show the reviewed policy and current immutable lock without contacting GitHub.
+    Show,
+    /// Qualify the selected release and open an exact consumer pin pull request.
+    Update {
+        /// Write the lock in this checkout instead of opening a pull request.
+        #[arg(long = "no-pr")]
+        no_pr: bool,
+    },
+    /// Independently re-verify the tracked lock against GitHub release attestations.
+    Verify,
+}
+
+#[derive(Debug, Subcommand)]
 pub(super) enum ConfigCommand {
     /// Print the effective merged configuration as JSON.
     Show,
@@ -1956,7 +1986,22 @@ impl From<PathMode> for RuntimeMode {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, RunnerCommand};
+    use super::{Cli, Command, DependencyCommand, PulpDependencyCommand, RunnerCommand};
+
+    #[test]
+    fn dependency_pulp_commands_have_an_explicit_operation() {
+        let cli = Cli::try_parse_from(["shipyard", "dependency", "pulp", "verify"])
+            .expect("dependency verify command");
+        assert!(matches!(
+            cli.command,
+            Command::Dependency {
+                command: DependencyCommand::Pulp {
+                    command: PulpDependencyCommand::Verify
+                }
+            }
+        ));
+        assert!(Cli::try_parse_from(["shipyard", "dependency", "pulp"]).is_err());
+    }
 
     #[test]
     fn queue_observer_rejects_zero_max_polls() {

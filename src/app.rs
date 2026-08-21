@@ -25,6 +25,7 @@ mod cloud_read_cmd;
 mod command_evidence_cmd;
 mod config_cmd;
 mod daemon_cmd;
+mod dependency_cmd;
 mod doctor_cmd;
 mod execution_worker_cmd;
 mod fleet_status_cmd;
@@ -74,6 +75,7 @@ use self::cloud_cmd::cloud_command;
 use self::command_evidence_cmd::{run_command_evidence, show_command_evidence};
 use self::config_cmd::config_command;
 use self::daemon_cmd::daemon_command;
+use self::dependency_cmd::dependency_command;
 use self::doctor_cmd::doctor;
 use self::execution_worker_cmd::execution_worker_command;
 use self::governance_cmd::governance_command;
@@ -189,6 +191,9 @@ fn dispatch<W: Write, E: Write>(
         }
         Command::Pin { command } => {
             return pin_command(command, cli.mode.into(), &cwd, cli.json, stdout);
+        }
+        Command::Dependency { command } => {
+            return dependency_command(command, &cwd, &runtime_paths, cli.json, stdout);
         }
         Command::Update(args) => {
             return update_command(
@@ -418,6 +423,7 @@ fn handle_operational_variant<W: Write>(
         Command::Paths
         | Command::ExecutionWorker { .. }
         | Command::Pin { .. }
+        | Command::Dependency { .. }
         | Command::Config { .. }
         | Command::Ci { .. }
         | Command::Metrics { .. }

@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use tempfile::TempDir;
 
@@ -45,6 +45,8 @@ fn missing_config_uses_ambient_auth() {
     let client = GhClient::from_loaded_config(&config).expect("client");
     assert_eq!(client.auth.source, GhAuthSource::GhCli);
     assert_eq!(client.auth.ambient_gh_binary, None);
+    assert_eq!(client.auth.privileged_gh_binary, None);
+    assert_eq!(client.auth.privileged_git_binary, None);
 }
 
 #[test]
@@ -286,16 +288,20 @@ fn prepare_command_injects_env_token_and_supervised_marker() {
     );
     let expected_path = env::var("PATH").expect("PATH");
     let client = GhClient::from_loaded_config(&config).expect("client");
+    let native = std::env::current_exe().expect("native test executable");
     let command = client
         .prepare_command(
             Path::new("/tmp"),
-            Some(Path::new("/tmp/fake-gh")),
+            Some(&native),
             GhSupervision::Supervised,
             GhAuthPolicy::Default,
         )
         .expect("command");
 
-    assert_eq!(command.get_program(), Path::new("/tmp/fake-gh").as_os_str());
+    assert_eq!(
+        command.get_program(),
+        native.canonicalize().expect("canonical native executable")
+    );
     assert_eq!(
         env_value(&command, GH_TOKEN_ENV).as_deref(),
         Some(OsString::from(expected_path).as_os_str())
@@ -363,6 +369,113 @@ fn ambient_only_rejects_a_script_binary_override() {
         error,
         GhPrepareError::InvalidAmbientGhBinary { .. }
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn token_bearing_command_rejects_a_path_shim_binary() {
+    let temp = TempDir::new().expect("tempdir");
+    let wrapper = temp.path().join("gh");
+    write_executable(&wrapper, "#!/bin/sh\nexit 91\n");
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["/bin/echo", "ghs_app_token"]
+            privileged_gh_binary = "{}"
+            "#,
+        wrapper.display()
+    ));
+    let client = GhClient::from_loaded_config(&config).expect("client");
+
+    let error = client
+        .prepare_privileged_command(temp.path(), GhSupervision::Unsupervised)
+        .expect_err("token-bearing command must reject a script shim");
+
+    assert!(matches!(
+        error,
+        GhPrepareError::InvalidPrivilegedGhBinary { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn privileged_git_uses_the_exact_configured_native_binary() {
+    let temp = TempDir::new().expect("tempdir");
+    let native_dir = temp.path().join("native");
+    std::fs::create_dir_all(&native_dir).expect("native dir");
+    let native_git = native_dir.join("git");
+    std::os::unix::fs::symlink("/bin/echo", &native_git).expect("native git fixture");
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["/bin/echo", "ghs_app_token"]
+            privileged_git_binary = "{}"
+            "#,
+        native_git.display()
+    ));
+    let client = GhClient::from_loaded_config(&config).expect("client");
+
+    let command = client
+        .prepare_git_command(temp.path())
+        .expect("privileged git command");
+
+    assert_eq!(
+        command.get_program(),
+        native_git.canonicalize().expect("canonical native git")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn privileged_token_children_receive_only_allowlisted_environment() {
+    let temp = TempDir::new().expect("tempdir");
+    let native_env = Path::new("/usr/bin/env");
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["/bin/echo", "ghs_app_token"]
+            privileged_gh_binary = "{}"
+            privileged_git_binary = "{}"
+            "#,
+        native_env.display(),
+        native_env.display()
+    ));
+    let client = GhClient::from_loaded_config(&config).expect("client");
+
+    let gh = client
+        .prepare_privileged_command(temp.path(), GhSupervision::Unsupervised)
+        .expect("privileged gh")
+        .output()
+        .expect("gh environment");
+    assert!(gh.status.success());
+    let gh = String::from_utf8(gh.stdout).expect("gh environment UTF-8");
+    assert!(gh.contains("GH_TOKEN=ghs_app_token"));
+    assert!(gh.contains("GH_HOST=github.com"));
+    assert!(!gh.contains("HOME="));
+    assert!(!gh.contains("PATH="));
+    assert!(!gh.contains("LD_AUDIT="));
+    assert!(!gh.contains("DYLD_FRAMEWORK_PATH="));
+    assert!(!gh.contains("SSL_CERT_FILE="));
+    assert!(!gh.contains("HTTPS_PROXY="));
+
+    let git = client
+        .prepare_git_command(temp.path())
+        .expect("privileged git")
+        .output()
+        .expect("git environment");
+    assert!(git.status.success());
+    let git = String::from_utf8(git.stdout).expect("git environment UTF-8");
+    assert!(git.contains("GH_TOKEN=ghs_app_token"));
+    assert!(git.contains("GIT_CONFIG_NOSYSTEM=1"));
+    assert!(!git.contains("HOME="));
+    assert!(!git.contains("PATH="));
+    assert!(!git.contains("LD_AUDIT="));
+    assert!(!git.contains("DYLD_FRAMEWORK_PATH="));
+    assert!(!git.contains("SSL_CERT_FILE="));
+    assert!(!git.contains("HTTPS_PROXY="));
 }
 
 #[cfg(unix)]
@@ -480,6 +593,28 @@ fn configured_ambient_binary_must_be_absolute() {
 }
 
 #[test]
+fn privileged_binary_paths_must_be_explicit_and_absolute() {
+    let client = GhClient::ambient();
+    let error = client
+        .prepare_privileged_command(Path::new("/tmp"), GhSupervision::Unsupervised)
+        .expect_err("privileged gh path is required");
+    assert!(matches!(
+        error,
+        GhPrepareError::PrivilegedGhBinaryNotConfigured
+    ));
+
+    let config = config_from_toml(
+        r#"
+            [github.auth]
+            privileged_gh_binary = "relative/gh"
+            privileged_git_binary = "relative/git"
+            "#,
+    );
+    let error = GhClient::from_loaded_config(&config).expect_err("relative path rejected");
+    assert!(error.to_string().contains("must be an absolute path"));
+}
+
+#[test]
 fn parses_plain_helper_stdout_with_ttl() {
     let now = Utc::now();
     let token = parse_helper_stdout("ghp_plain\n", now, Some(300), DEFAULT_REFRESH_SKEW_SECONDS)
@@ -490,6 +625,19 @@ fn parses_plain_helper_stdout_with_ttl() {
             .valid_until
             .is_some_and(|valid_until| valid_until > now)
     );
+}
+
+#[test]
+fn infers_installation_kind_from_plain_github_app_token() {
+    let now = Utc::now();
+    let token = parse_helper_stdout(
+        "ghs_installation-token\n",
+        now,
+        None,
+        DEFAULT_REFRESH_SKEW_SECONDS,
+    )
+    .expect("token");
+    assert_eq!(token.kind.as_deref(), Some("github-app-installation"));
 }
 
 #[test]
@@ -649,7 +797,15 @@ fn authenticated_git_command_uses_environment_credential_helper() {
         Some(OsString::from("0"))
     );
     assert_eq!(
+        env_value(&command, "GIT_CONFIG_COUNT"),
+        Some(OsString::from("7"))
+    );
+    assert_eq!(
         env_value(&command, "GIT_CONFIG_VALUE_0"),
+        Some(OsString::from(""))
+    );
+    assert_eq!(
+        env_value(&command, "GIT_CONFIG_VALUE_1"),
         Some(OsString::from("!gh auth git-credential"))
     );
     assert!(
@@ -657,6 +813,147 @@ fn authenticated_git_command_uses_environment_credential_helper() {
             .get_args()
             .all(|arg| !arg.to_string_lossy().contains("token"))
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn token_credential_helper_releases_only_to_exact_github_https() {
+    use std::io::Write as _;
+
+    fn fill(input: &[u8]) -> Output {
+        let mut child = Command::new("/usr/bin/git")
+            .args(["-c", "credential.helper="])
+            .arg("-c")
+            .arg(format!(
+                "credential.helper={}",
+                token_environment_credential_helper()
+            ))
+            .args(["credential", "fill"])
+            .env(GH_TOKEN_ENV, "ghs_fixture_secret")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start git credential fill");
+        child
+            .stdin
+            .take()
+            .expect("credential stdin")
+            .write_all(input)
+            .expect("write credential query");
+        child.wait_with_output().expect("credential output")
+    }
+
+    let github = fill(b"protocol=https\nhost=github.com\n\n");
+    assert!(github.status.success());
+    let github_output = String::from_utf8(github.stdout).expect("credential UTF-8");
+    assert!(github_output.contains("password=ghs_fixture_secret"));
+
+    for denied in [
+        b"protocol=http\nhost=github.com\n\n".as_slice(),
+        b"protocol=https\nhost=github.example\n\n".as_slice(),
+    ] {
+        let output = fill(denied);
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("ghs_fixture_secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("ghs_fixture_secret"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_command_auth_uses_the_exact_validated_token_for_every_command() {
+    let temp = TempDir::new().expect("tempdir");
+    let helper = temp.path().join("alternating-token-helper");
+    let count = temp.path().join("helper-count");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\nif [ -e '{}' ]; then printf 'ghp_wrong_authority\\n'; else printf '1\\n' > '{}' && printf 'ghs_validated_app\\n'; fi\n",
+            count.display(),
+            count.display()
+        ),
+    );
+    let native = std::env::current_exe().expect("native test executable");
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}"]
+            privileged_git_binary = "{}"
+            "#,
+        helper.display(),
+        native.display()
+    ));
+    let mut client = GhClient::from_loaded_config(&config).expect("client");
+
+    let summary = client.pin_command_auth(temp.path()).expect("pin App auth");
+    assert_eq!(
+        summary.token_kind.as_deref(),
+        Some("github-app-installation")
+    );
+    let api = client
+        .prepare_command(
+            temp.path(),
+            Some(&native),
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .expect("API command");
+    let git = client
+        .prepare_git_command(temp.path())
+        .expect("Git command");
+    assert_eq!(
+        env_value(&api, GH_TOKEN_ENV),
+        Some(OsString::from("ghs_validated_app"))
+    );
+    assert_eq!(
+        env_value(&git, GH_TOKEN_ENV),
+        Some(OsString::from("ghs_validated_app"))
+    );
+    assert!(Path::new(git.get_program()).is_absolute());
+    assert_eq!(
+        env_value(&git, "GIT_CONFIG_NOSYSTEM"),
+        Some(OsString::from("1"))
+    );
+    assert_eq!(
+        env_value(&git, "GIT_CONFIG_GLOBAL"),
+        Some(OsString::from(null_device()))
+    );
+    assert_eq!(
+        env_value(&git, "GIT_CONFIG_COUNT"),
+        Some(OsString::from("7"))
+    );
+    assert_eq!(
+        env_value(&git, "GIT_CONFIG_VALUE_1"),
+        Some(OsString::from(token_environment_credential_helper()))
+    );
+    assert!(
+        !env_value(&git, "GIT_CONFIG_VALUE_1")
+            .expect("credential helper")
+            .to_string_lossy()
+            .contains("gh auth")
+    );
+    let credential_helper = env_value(&git, "GIT_CONFIG_VALUE_1")
+        .expect("credential helper")
+        .to_string_lossy()
+        .into_owned();
+    assert!(credential_helper.contains("$protocol\" = https"));
+    assert!(credential_helper.contains("$host\" = github.com"));
+    assert_eq!(
+        env_value(&git, "GIT_CONFIG_VALUE_3"),
+        Some(OsString::from(null_device()))
+    );
+    assert_eq!(
+        env_value(&git, "GIT_CONFIG_VALUE_4"),
+        Some(OsString::from("never"))
+    );
+    assert_eq!(
+        env_value(&git, "GIT_CONFIG_VALUE_5"),
+        Some(OsString::from("always"))
+    );
+    assert_eq!(std::fs::read_to_string(count).expect("helper count"), "1\n");
 }
 
 #[test]
