@@ -174,6 +174,7 @@ pub(super) fn changed_surface_plan_command<W: Write>(
     let secondary_proofs = collect_secondary_proofs(
         policy.as_ref().ok(),
         state_dir,
+        &repo,
         &pull.head.sha,
         &remote_commit.tree.sha,
     );
@@ -249,6 +250,7 @@ pub(super) fn changed_surface_plan_command<W: Write>(
 fn collect_secondary_proofs(
     policy: Option<&ChangedSurfacePolicy>,
     state_dir: &Path,
+    repository: &str,
     head_sha: &str,
     tree_sha: &str,
 ) -> Vec<SecondaryProof> {
@@ -258,6 +260,7 @@ fn collect_secondary_proofs(
     let Ok(store) = EvidenceStore::new(state_dir.join("evidence")) else {
         return Vec::new();
     };
+    let workload_scope = crate::evidence::repository_evidence_scope(repository);
     policy
         .families
         .iter()
@@ -272,7 +275,7 @@ fn collect_secondary_proofs(
         .filter_map(|(target, build_type)| {
             let expected_contract = policy.secondary_contract_digests.get(target)?;
             store
-                .passing_records_for_target_sha(target, head_sha)
+                .passing_records_for_target_sha_scoped(&workload_scope, target, head_sha)
                 .into_iter()
                 .find_map(|evidence| {
                     let passed = evidence.passed();
@@ -583,6 +586,7 @@ mod tests {
         let mut evidence = EvidenceRecord {
             sha: head.clone(),
             branch: "feature".to_owned(),
+            workload_scope: None,
             target_name: "release-sdk".to_owned(),
             validation_build_type: Some("release".to_owned()),
             platform: "macos-arm64".to_owned(),
@@ -604,20 +608,37 @@ mod tests {
             contract_digest: Some("contract".to_owned()),
             stages_signature: None,
         };
-        store.record(&evidence).expect("record");
+        let repository = "owner/repo";
+        let workload_scope = crate::evidence::repository_evidence_scope(repository);
+        store
+            .record_scoped(&workload_scope, &evidence)
+            .expect("record");
         assert_eq!(
-            collect_secondary_proofs(Some(&policy), temp.path(), &head, &tree).len(),
+            collect_secondary_proofs(Some(&policy), temp.path(), repository, &head, &tree).len(),
             1
         );
 
         evidence.source_checkout_clean = Some(false);
-        store.record(&evidence).expect("replace record");
-        assert!(collect_secondary_proofs(Some(&policy), temp.path(), &head, &tree).is_empty());
+        store
+            .record_scoped(&workload_scope, &evidence)
+            .expect("replace record");
+        assert!(
+            collect_secondary_proofs(Some(&policy), temp.path(), repository, &head, &tree)
+                .is_empty()
+        );
         evidence.source_checkout_clean = Some(true);
         evidence.full_execution = Some(false);
-        store.record(&evidence).expect("replace record");
-        assert!(collect_secondary_proofs(Some(&policy), temp.path(), &head, &tree).is_empty());
+        store
+            .record_scoped(&workload_scope, &evidence)
+            .expect("replace record");
+        assert!(
+            collect_secondary_proofs(Some(&policy), temp.path(), repository, &head, &tree)
+                .is_empty()
+        );
         policy.secondary_contract_digests.clear();
-        assert!(collect_secondary_proofs(Some(&policy), temp.path(), &head, &tree).is_empty());
+        assert!(
+            collect_secondary_proofs(Some(&policy), temp.path(), repository, &head, &tree)
+                .is_empty()
+        );
     }
 }

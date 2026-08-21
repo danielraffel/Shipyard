@@ -75,16 +75,16 @@ pub fn sweep_orphaned_ship_states(
     // *candidates*. The authoritative destructive decision is re-made per PR,
     // under its lock, against a fresh queue read (see `abandon_one`) — so a
     // worker that started or resumed since this snapshot is never abandoned.
-    let strong: Vec<u64> = with_liveness_context(state_dir, stale_after, |liveness| {
+    let strong: Vec<(String, u64)> = with_liveness_context(state_dir, stale_after, |liveness| {
         collect_orphans(&store, liveness, now)
             .into_iter()
-            .filter(|(_, orphan)| orphan.evidence == OrphanEvidence::QueueStale)
-            .map(|(pr, _)| pr)
+            .filter(|(_, _, orphan)| orphan.evidence == OrphanEvidence::QueueStale)
+            .map(|(repo, pr, _)| (repo, pr))
             .collect()
     });
     let mut report = AbandonReport::default();
-    for pr in strong {
-        match abandon_one(&store, state_dir, stale_after, pr, now) {
+    for (repo, pr) in strong {
+        match abandon_one(&store, state_dir, stale_after, &repo, pr, now) {
             AbandonOutcome::Abandoned(entry) => report.abandoned.push(entry),
             AbandonOutcome::Raced => report.raced += 1,
             AbandonOutcome::Skipped => {}
@@ -109,11 +109,12 @@ fn abandon_one(
     store: &ShipStateStore,
     state_dir: &Path,
     stale_after: Duration,
+    repo: &str,
     pr: u64,
     now: DateTime<Utc>,
 ) -> AbandonOutcome {
     store
-        .with_pr_state_locked(pr, |current| {
+        .with_pr_state_scoped_locked(repo, pr, |current| {
             let Some(state) = current.as_mut() else {
                 return Ok(AbandonOutcome::Skipped);
             };
@@ -400,7 +401,7 @@ mod tests {
         enqueue_owner(dir, 1, stale_running());
         let store = ShipStateStore::new(dir.join("ship")).expect("store");
 
-        let outcome = abandon_one(&store, dir, Duration::minutes(45), 1, Utc::now());
+        let outcome = abandon_one(&store, dir, Duration::minutes(45), REPO, 1, Utc::now());
         assert!(matches!(outcome, AbandonOutcome::Abandoned(_)));
         assert!(is_abandoned(dir, 1));
     }
@@ -416,7 +417,7 @@ mod tests {
         enqueue_owner(dir, 1, base_job().start().expect("start")); // live on disk
         let store = ShipStateStore::new(dir.join("ship")).expect("store");
 
-        let outcome = abandon_one(&store, dir, Duration::minutes(45), 1, Utc::now());
+        let outcome = abandon_one(&store, dir, Duration::minutes(45), REPO, 1, Utc::now());
         assert!(matches!(outcome, AbandonOutcome::Raced));
         assert!(!is_abandoned(dir, 1));
     }

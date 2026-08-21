@@ -14,6 +14,7 @@ use fs2::FileExt;
 use serde_json::{Value, json};
 
 use crate::job::{Job, JobStatus, TargetResult, TargetStatus};
+use crate::queue_request::QueueRequestStore;
 
 /// Number of completed jobs retained in the durable queue.
 pub const KEEP_COMPLETED: usize = 25;
@@ -150,7 +151,9 @@ impl Queue {
     /// Add a job, superseding pending jobs for the same workload, branch,
     /// target list, and mode.
     pub fn enqueue(&mut self, job: Job) -> QueueResult<Job> {
+        let request_store = QueueRequestStore::new(&self.state_dir).ok();
         self.with_jobs_locked(|jobs| {
+            backfill_pending_workload_scopes(jobs, request_store.as_ref());
             cancel_superseded_pending(jobs, &job);
             jobs.push(job.clone());
             Ok(())
@@ -659,6 +662,21 @@ impl Queue {
     }
 }
 
+fn backfill_pending_workload_scopes(jobs: &mut [Job], request_store: Option<&QueueRequestStore>) {
+    let Some(request_store) = request_store else {
+        return;
+    };
+    for job in jobs
+        .iter_mut()
+        .filter(|job| job.status == JobStatus::Pending && job.workload_scope.is_none())
+    {
+        let Ok(Some(envelope)) = request_store.load(&job.id) else {
+            continue;
+        };
+        job.workload_scope = Some(envelope.workload_scope());
+    }
+}
+
 fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {
     for queued in jobs.iter_mut().filter(|queued| {
         same_workload_scope(queued, job)
@@ -1022,6 +1040,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::job::{Job, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
+    use crate::queue_request::{QueueRequestStore, QueuedExecutionEnvelope, run_workload_scope};
+    use crate::ship::RunExecutionRequest;
 
     use super::{
         KEEP_COMPLETED, ORPHAN_REQUEST_MESSAGE, Queue, QueueDeferredRequeue,
@@ -1270,6 +1290,44 @@ mod tests {
         assert_eq!(superseded.status, JobStatus::Cancelled);
         assert_eq!(
             superseded.cancellation_reason.as_deref(),
+            Some(SUPERSEDED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn enqueue_backfills_legacy_pending_run_scope_from_its_durable_envelope() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let legacy = job("feat/x", "old", &["mac"]);
+        let legacy_id = legacy.id.clone();
+        let request = RunExecutionRequest {
+            branch: "feat/x".to_owned(),
+            sha: "old".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: Vec::new(),
+        };
+        QueueRequestStore::new(temp.path())
+            .expect("request store")
+            .save(&QueuedExecutionEnvelope::from_run_request(
+                legacy_id.clone(),
+                temp.path(),
+                &request,
+            ))
+            .expect("legacy envelope");
+        queue.enqueue(legacy).expect("legacy");
+
+        let replacement =
+            job("feat/x", "new", &["mac"]).with_workload_scope(run_workload_scope(temp.path()));
+        queue.enqueue(replacement).expect("replacement");
+
+        let legacy = queue.get(&legacy_id).expect("get").expect("legacy job");
+        assert_eq!(legacy.status, JobStatus::Cancelled);
+        assert_eq!(
+            legacy.cancellation_reason.as_deref(),
             Some(SUPERSEDED_MESSAGE)
         );
     }

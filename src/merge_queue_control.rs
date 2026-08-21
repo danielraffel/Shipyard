@@ -305,12 +305,16 @@ pub fn resolve_uncertainty(
         ));
     };
     if let Some(pr) = entry.get("pr").and_then(serde_json::Value::as_u64) {
+        let repo = entry
+            .get("repo")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "uncertain mutation is missing repository identity".to_owned())?;
         let store = ShipStateStore::new(state_root.join("ship"))
             .map_err(|error| format!("failed to open ship-state store: {error}"))?;
         let lock = store
-            .lock_pr(pr)
+            .lock_pr_scoped(repo, pr)
             .map_err(|error| format!("failed to lock ship-state for PR #{pr}: {error}"))?;
-        if let Some(mut state) = store.get_locked(pr, &lock) {
+        if let Some(mut state) = store.get_locked_scoped(repo, pr, &lock) {
             let action = entry
                 .get("action")
                 .and_then(serde_json::Value::as_str)
@@ -342,7 +346,7 @@ pub fn resolve_uncertainty(
             }
             if identity_matches {
                 state.touch();
-                store.save_locked(&state, &lock).map_err(|error| {
+                store.save_scoped_locked(&state, &lock).map_err(|error| {
                     format!("failed to reconcile ship-state for PR #{pr}: {error}")
                 })?;
             }

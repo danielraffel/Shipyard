@@ -17,7 +17,9 @@ use chrono::{DateTime, Utc};
 
 use crate::capacity::{gather_configured_host_capacities, total_free};
 use crate::config::LoadedConfig;
-use crate::evidence::{EvidenceRecord, EvidenceStore};
+use crate::evidence::{
+    EvidenceRecord, EvidenceStore, canonical_repository, run_evidence_scope, ship_evidence_scope,
+};
 use crate::executor::dispatch::{
     DispatchValidationRequest, ExecutorDispatcher, ResolvedBackend, ResolvedHostPoolConfig,
     ResolvedHostPoolMember, ResolvedTarget,
@@ -460,7 +462,11 @@ fn submit_ship_with_config(
         request.priority,
     )
     .with_kind(JobKind::Ship)
-    .with_workload_scope(format!("ship:{}:pr-{}", request.repo, request.pr));
+    .with_workload_scope(format!(
+        "ship:{}:pr-{}",
+        canonical_repository(&request.repo),
+        request.pr
+    ));
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_ship_request(job.id.clone(), cwd, request);
     if let Some(config) = config {
@@ -658,10 +664,10 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         });
     }
     let ship_state_lock = ship_state
-        .lock_pr(request.pr)
+        .lock_pr_scoped(&request.repo, request.pr)
         .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
     let resumed_existing_state = ship_state
-        .get_locked(request.pr, &ship_state_lock)
+        .get_locked_scoped(&request.repo, request.pr, &ship_state_lock)
         .is_some();
     let mut state = match load_or_create_state(
         request,
@@ -675,7 +681,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
             return Err(error);
         }
     };
-    if let Err(error) = ship_state.save_locked(&state, &ship_state_lock) {
+    if let Err(error) = ship_state.save_scoped_locked(&state, &ship_state_lock) {
         let execution_error = ShipExecutionError::ShipState(error.to_string());
         cancel_refused_job(queue, &job, &execution_error)?;
         return Err(execution_error);
@@ -720,10 +726,15 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         });
     }
     job = job.complete()?;
-    record_evidence(evidence, request, &job)?;
+    record_evidence(
+        evidence,
+        &ship_evidence_scope(&request.repo, cwd),
+        request,
+        &job,
+    )?;
     update_ship_state_from_job(&mut state, request, &job);
     ship_state
-        .save_locked(&state, &ship_state_lock)
+        .save_scoped_locked(&state, &ship_state_lock)
         .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
     QueueOutcomeStore::new(state_dir)
         .map_err(QueueRequestError::from)?
@@ -809,7 +820,7 @@ fn submit_run_with_config(
         request.priority,
     )
     .with_kind(JobKind::Run)
-    .with_workload_scope(run_workload_scope(cwd));
+    .with_workload_scope(crate::queue_request::run_workload_scope(cwd));
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_run_request(job.id.clone(), cwd, request);
     if let Some(config) = config {
@@ -1009,7 +1020,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         return Ok(RunExecutionOutcome { job });
     }
     job = job.complete()?;
-    record_evidence(evidence, &shim, &job)?;
+    record_evidence(evidence, &run_evidence_scope(cwd), &shim, &job)?;
     QueueOutcomeStore::new(state_dir)
         .map_err(QueueRequestError::from)?
         .save(&QueuedExecutionOutcome::run(job.id.clone()))?;
@@ -1526,7 +1537,7 @@ fn persist_recovered_outcomes(
             }
             QueuedExecutionKind::Ship => {
                 let request = envelope.to_ship_request()?;
-                let existing = ship_state.get(request.pr);
+                let existing = ship_state.get_scoped(&request.repo, request.pr);
                 let resumed_existing_state = existing.is_some();
                 let state =
                     existing.unwrap_or_else(|| unsaved_ship_state(&request, &job.target_names));
@@ -1927,7 +1938,9 @@ fn refuse_same_pr_running_ship(
         else {
             continue;
         };
-        if existing.repo != request.repo || existing.pr != request.pr {
+        if canonical_repository(&existing.repo) != canonical_repository(&request.repo)
+            || existing.pr != request.pr
+        {
             continue;
         }
 
@@ -2269,8 +2282,8 @@ fn load_or_create_state(
 ) -> Result<ShipState, ShipExecutionError> {
     let policy = policy_signature(&request.targets, target_names, request.mode);
     let existing = lock.map_or_else(
-        || store.get(request.pr),
-        |lock| store.get_locked(request.pr, lock),
+        || store.get_scoped(&request.repo, request.pr),
+        |lock| store.get_locked_scoped(&request.repo, request.pr, lock),
     );
     if let Some(mut existing) = existing {
         validate_existing_state(
@@ -2395,11 +2408,6 @@ fn target_names(targets: &[ResolvedTarget]) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn run_workload_scope(cwd: &Path) -> String {
-    let identity = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    format!("run:{}", identity.to_string_lossy())
-}
-
 fn target_log_path(state_dir: &Path, job_id: &str, target: &str) -> PathBuf {
     state_dir
         .join("logs")
@@ -2488,6 +2496,7 @@ fn annotate_retry_history(mut result: TargetResult, prior_transient: &[String]) 
 
 fn record_evidence(
     evidence: &EvidenceStore,
+    workload_scope: &str,
     request: &ShipExecutionRequest,
     job: &Job,
 ) -> Result<(), ShipExecutionError> {
@@ -2499,7 +2508,7 @@ fn record_evidence(
     for result in job.results.values() {
         let target = targets.get(result.target_name.as_str()).copied();
         evidence
-            .record(&evidence_record(request, result, target))
+            .record_scoped(workload_scope, &evidence_record(request, result, target))
             .map_err(|error| ShipExecutionError::Evidence(error.to_string()))?;
     }
     Ok(())
@@ -2513,6 +2522,7 @@ fn evidence_record(
     EvidenceRecord {
         sha: request.sha.clone(),
         branch: request.branch.clone(),
+        workload_scope: None,
         target_name: result.target_name.clone(),
         validation_build_type: target.and_then(|target| target.validation_build_type.clone()),
         platform: result.platform.clone(),
@@ -3538,7 +3548,11 @@ mod tests {
             crate::job::JobStatus::Completed
         );
         let evidence_record = evidence
-            .get_target("feature/test", "ubuntu")
+            .get_target_scoped(
+                &crate::evidence::repository_evidence_scope(&request.repo),
+                "feature/test",
+                "ubuntu",
+            )
             .expect("evidence");
         assert_eq!(evidence_record.status, "pass");
         assert_eq!(evidence_record.host.as_deref(), Some("vm"));
@@ -4813,13 +4827,10 @@ mod tests {
             .expect("start");
         assert_eq!(started.len(), 1);
 
-        let error = submit_ship(
-            &ship_request(vec![target]),
-            &mut queue,
-            temp.path(),
-            &state_dir,
-        )
-        .expect_err("same PR running");
+        let mut case_alias = ship_request(vec![target]);
+        case_alias.repo = request.repo.to_ascii_uppercase();
+        let error = submit_ship(&case_alias, &mut queue, temp.path(), &state_dir)
+            .expect_err("case-only repository alias is the same running PR");
 
         assert!(matches!(
             error,

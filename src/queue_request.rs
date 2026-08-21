@@ -17,6 +17,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::LoadedConfig;
+use crate::evidence::{
+    canonical_repository, evidence_resource_claim, run_evidence_scope, ship_evidence_scope,
+};
 use crate::executor::cloud::CloudTargetConfig;
 use crate::executor::contract::ContractConfig;
 use crate::executor::dispatch::{
@@ -351,6 +354,29 @@ impl QueuedExecutionEnvelope {
         };
         request.to_execution_request()
     }
+
+    /// Recover the stable queue supersedence identity for persisted envelopes
+    /// written before `Job::workload_scope` existed.
+    #[must_use]
+    pub(crate) fn workload_scope(&self) -> String {
+        match &self.request {
+            QueuedExecutionRequest::Run(_) => run_workload_scope(&self.cwd),
+            QueuedExecutionRequest::Ship(request) => {
+                format!(
+                    "ship:{}:pr-{}",
+                    canonical_repository(&request.repo),
+                    request.pr
+                )
+            }
+        }
+    }
+}
+
+/// Stable repository-checkout identity for repo-neutral `run` supersedence.
+#[must_use]
+pub(crate) fn run_workload_scope(cwd: &Path) -> String {
+    let identity = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    format!("run:{}", identity.to_string_lossy())
 }
 
 /// Immutable checkout identity required before a daemon-owned worker may run.
@@ -686,13 +712,19 @@ impl JobResourcePlan {
     /// Build a resource plan from resolved targets.
     #[must_use]
     pub fn from_targets(targets: &[ResolvedTarget]) -> Self {
-        Self::from_targets_with_context("", Path::new("."), None, targets)
+        Self::from_targets_with_context("", Path::new("."), None, "legacy", targets)
     }
 
     /// Build a resource plan for a run request.
     #[must_use]
     pub fn from_run_request(cwd: &Path, request: &RunExecutionRequest) -> Self {
-        Self::from_targets_with_context(&request.branch, cwd, None, &request.targets)
+        Self::from_targets_with_context(
+            &request.branch,
+            cwd,
+            None,
+            &run_evidence_scope(cwd),
+            &request.targets,
+        )
     }
 
     /// Build a resource plan for a ship request.
@@ -702,6 +734,7 @@ impl JobResourcePlan {
             &request.branch,
             cwd,
             Some((&request.repo, request.pr)),
+            &ship_evidence_scope(&request.repo, cwd),
             &request.targets,
         )
     }
@@ -710,6 +743,7 @@ impl JobResourcePlan {
         branch: &str,
         cwd: &Path,
         ship_scope: Option<(&str, u64)>,
+        evidence_scope: &str,
         targets: &[ResolvedTarget],
     ) -> Self {
         let mut plan = Self {
@@ -721,12 +755,15 @@ impl JobResourcePlan {
         };
         if let Some((repo, pr)) = ship_scope {
             plan.exclusive_claims
-                .push(format!("ship-state:{repo}:pr-{pr}"));
+                .push(format!("ship-state:{}:pr-{pr}", canonical_repository(repo)));
         }
         for target in targets {
             if !branch.is_empty() {
-                plan.exclusive_claims
-                    .push(format!("evidence:{branch}:{}", target.name));
+                plan.exclusive_claims.push(evidence_resource_claim(
+                    evidence_scope,
+                    branch,
+                    &target.name,
+                ));
             }
             if target.warm_keepalive_seconds > 0 && is_backend_eligible(&target.backend_name) {
                 plan.exclusive_claims.push(format!(
@@ -1740,6 +1777,7 @@ mod tests {
         parse_repo_slug,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
+    use crate::evidence::{evidence_resource_claim, run_evidence_scope, ship_evidence_scope};
     use crate::executor::cloud::CloudTargetConfig;
     use crate::executor::dispatch::{
         FallbackBackend, FallbackTargetConfig, ResolvedBackend, ResolvedHostPoolConfig,
@@ -2276,10 +2314,11 @@ mod tests {
             "local-cwd:{}",
             temp.path().canonicalize().expect("canonical").display()
         )));
-        assert!(
-            plan.exclusive_claims
-                .contains(&"evidence:feat/run:mac".to_owned())
-        );
+        assert!(plan.exclusive_claims.contains(&evidence_resource_claim(
+            &run_evidence_scope(temp.path()),
+            "feat/run",
+            "mac"
+        )));
         assert!(plan.exclusive_claims.contains(&"warm:mac:local".to_owned()));
     }
 
@@ -2293,10 +2332,56 @@ mod tests {
             plan.exclusive_claims
                 .contains(&"ship-state:danielraffel/shipyard:pr-42".to_owned())
         );
-        assert!(
-            plan.exclusive_claims
-                .contains(&"evidence:feat/ship:mac".to_owned())
+        assert!(plan.exclusive_claims.contains(&evidence_resource_claim(
+            &ship_evidence_scope(&request.repo, Path::new("/work/repo")),
+            "feat/ship",
+            "mac"
+        )));
+    }
+
+    #[test]
+    fn ship_workload_and_resource_claims_canonicalize_repository_case() {
+        let lower = ship_request();
+        let mut upper = lower.clone();
+        upper.repo = lower.repo.to_ascii_uppercase();
+
+        let lower_envelope =
+            QueuedExecutionEnvelope::from_ship_request("lower", "/work/repo", &lower);
+        let upper_envelope =
+            QueuedExecutionEnvelope::from_ship_request("upper", "/work/repo", &upper);
+
+        assert_eq!(
+            lower_envelope.workload_scope(),
+            upper_envelope.workload_scope()
         );
+        assert_eq!(
+            lower_envelope.resource_plan.exclusive_claims,
+            upper_envelope.resource_plan.exclusive_claims
+        );
+    }
+
+    #[test]
+    fn evidence_claims_allow_pulp_forge_products_and_vellum_to_run_in_parallel() {
+        let request = run_request();
+        let workload_paths = [
+            Path::new("/work/pulp"),
+            Path::new("/work/forge-modular"),
+            Path::new("/work/forge-sequencer"),
+            Path::new("/work/vellum"),
+        ];
+
+        let claims = workload_paths
+            .iter()
+            .map(|cwd| {
+                JobResourcePlan::from_run_request(cwd, &request)
+                    .exclusive_claims
+                    .into_iter()
+                    .find(|claim| claim.starts_with("evidence:"))
+                    .expect("evidence claim")
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(claims.len(), workload_paths.len());
     }
 
     #[test]
@@ -2336,10 +2421,11 @@ mod tests {
 
         assert_eq!(plan.cloud_targets, ["ubuntu"]);
         assert!(plan.vm_slots.is_empty());
-        assert!(
-            plan.exclusive_claims
-                .contains(&"evidence:feat/run:ubuntu".to_owned())
-        );
+        assert!(plan.exclusive_claims.contains(&evidence_resource_claim(
+            &run_evidence_scope(Path::new("/work/repo")),
+            "feat/run",
+            "ubuntu"
+        )));
         assert!(
             !plan
                 .exclusive_claims

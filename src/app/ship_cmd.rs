@@ -1088,7 +1088,7 @@ fn classify_merge_failure(
     if is_graphql_malformed_query_error(&error) {
         return ShipRenderState::GreenNotMergedClientDefect(error);
     }
-    let Some(state) = store.get(pr) else {
+    let Some(state) = store.get_scoped(repo, pr) else {
         return ShipRenderState::GreenNotMerged(error);
     };
     let green = validated_green_contexts(&state, config);
@@ -2219,7 +2219,12 @@ esac"#,
         let output: serde_json::Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(output["merged"], false);
         assert_eq!(output["run"]["overall"], "pass");
-        assert!(paths.state_dir.join("ship").join("43.json").exists());
+        assert!(
+            crate::ship_state::ShipStateStore::new(paths.state_dir.join("ship"))
+                .expect("ship-state store")
+                .get(43)
+                .is_some()
+        );
         assert_eq!(
             std::fs::read_dir(paths.state_dir.join("ship").join("archive"))
                 .expect("archive")

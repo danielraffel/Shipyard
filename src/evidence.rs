@@ -14,6 +14,14 @@ pub struct EvidenceRecord {
     pub sha: String,
     /// Git branch associated with the run.
     pub branch: String,
+    /// Repository or workload namespace that owns this evidence.
+    ///
+    /// Legacy records omit this field and remain readable through the
+    /// unscoped compatibility API. New queue-backed validation must use the
+    /// scoped APIs so repositories with the same branch and target names do
+    /// not serialize on, or overwrite, one another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_scope: Option<String>,
     /// Logical target name.
     #[serde(rename = "target")]
     pub target_name: String,
@@ -94,6 +102,9 @@ pub struct CommandEvidenceRecord {
     pub id: String,
     /// User-facing workload name.
     pub name: String,
+    /// Repository/workload namespace that owns the bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_scope: Option<String>,
     /// Git branch associated with the command, when run inside a checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
@@ -178,6 +189,29 @@ impl CommandEvidenceStore {
     #[must_use]
     pub fn artifact_dir(&self, id: &str) -> PathBuf {
         self.bundle_dir(id).join("artifacts")
+    }
+
+    /// Atomically reserve a unique bundle id derived from `preferred_id`.
+    ///
+    /// The old timestamp-only id could collide across concurrent Shipyard
+    /// processes and let one workload replace another workload's evidence and
+    /// artifacts. Directory creation is the cross-process uniqueness fence;
+    /// a numeric suffix is used only when the preferred id is already owned.
+    pub fn reserve_bundle_id(&self, preferred_id: &str) -> Result<String, std::io::Error> {
+        let preferred_id = sanitize_component(preferred_id);
+        for suffix in 0_u64.. {
+            let candidate = if suffix == 0 {
+                preferred_id.clone()
+            } else {
+                format!("{preferred_id}-{suffix}")
+            };
+            match fs::create_dir(self.bundle_dir(&candidate)) {
+                Ok(()) => return Ok(candidate),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bundle suffix space is unbounded")
     }
 
     /// Store or replace a command-evidence record.
@@ -267,6 +301,20 @@ impl EvidenceStore {
         })
     }
 
+    /// Store or replace a record inside one repository/workload namespace.
+    pub fn record_scoped(
+        &self,
+        workload_scope: &str,
+        evidence: &EvidenceRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.with_scoped_branch_records_locked(workload_scope, &evidence.branch, |records| {
+            let mut evidence = evidence.clone();
+            evidence.workload_scope = Some(workload_scope.to_owned());
+            records.insert(evidence.target_name.clone(), evidence);
+            Ok(())
+        })
+    }
+
     /// Mutate one branch's records while holding that branch's evidence lock.
     pub fn with_branch_records_locked<T>(
         &self,
@@ -281,6 +329,23 @@ impl EvidenceStore {
         Ok(output)
     }
 
+    /// Mutate one scoped branch while holding only that namespace's lock.
+    pub fn with_scoped_branch_records_locked<T>(
+        &self,
+        workload_scope: &str,
+        branch: &str,
+        f: impl FnOnce(&mut BTreeMap<String, EvidenceRecord>) -> Result<T, Box<dyn std::error::Error>>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let scope_key = collision_safe_component(workload_scope);
+        let branch_key = collision_safe_component(branch);
+        let directory = self.path.join("scoped").join(scope_key);
+        let _lock = StoreLock::acquire(directory.join(format!("{branch_key}.lock")))?;
+        let mut records = Self::load_records(&directory.join(format!("{branch_key}.json")))?;
+        let output = f(&mut records)?;
+        Self::save_records(&directory, &branch_key, &records)?;
+        Ok(output)
+    }
+
     /// Return all evidence for a branch keyed by target name.
     #[must_use]
     pub fn get_branch(&self, branch: &str) -> BTreeMap<String, EvidenceRecord> {
@@ -288,10 +353,37 @@ impl EvidenceStore {
             .unwrap_or_default()
     }
 
+    /// Return evidence for a branch in one repository/workload namespace.
+    #[must_use]
+    pub fn get_branch_scoped(
+        &self,
+        workload_scope: &str,
+        branch: &str,
+    ) -> BTreeMap<String, EvidenceRecord> {
+        let path = self
+            .path
+            .join("scoped")
+            .join(collision_safe_component(workload_scope))
+            .join(format!("{}.json", collision_safe_component(branch)));
+        Self::load_records(&path).unwrap_or_default()
+    }
+
     /// Return evidence for a specific branch and target, if present.
     #[must_use]
     pub fn get_target(&self, branch: &str, target_name: &str) -> Option<EvidenceRecord> {
         self.get_branch(branch).remove(target_name)
+    }
+
+    /// Return evidence for one scoped branch and target, if present.
+    #[must_use]
+    pub fn get_target_scoped(
+        &self,
+        workload_scope: &str,
+        branch: &str,
+        target_name: &str,
+    ) -> Option<EvidenceRecord> {
+        self.get_branch_scoped(workload_scope, branch)
+            .remove(target_name)
     }
 
     /// Return whether every required platform has passing evidence for the SHA.
@@ -327,28 +419,73 @@ impl EvidenceStore {
         target_name: &str,
         sha_candidates: &[String],
     ) -> Option<EvidenceRecord> {
+        Self::query_passing_in_directory(&self.path, target_name, sha_candidates)
+    }
+
+    /// Find the highest-ranked passing record inside one workload namespace.
+    #[must_use]
+    pub fn query_passing_for_target_scoped(
+        &self,
+        workload_scope: &str,
+        target_name: &str,
+        sha_candidates: &[String],
+    ) -> Option<EvidenceRecord> {
+        Self::query_passing_in_directory(
+            &self
+                .path
+                .join("scoped")
+                .join(collision_safe_component(workload_scope)),
+            target_name,
+            sha_candidates,
+        )
+    }
+
+    /// Return every non-reused passing record for one target and exact SHA,
+    /// newest first, so callers can apply their complete contract predicate.
+    #[must_use]
+    pub fn passing_records_for_target_sha(
+        &self,
+        target_name: &str,
+        sha: &str,
+    ) -> Vec<EvidenceRecord> {
+        Self::passing_records_in_directory(&self.path, target_name, sha)
+    }
+
+    /// Return exact-SHA passing records inside one workload namespace.
+    #[must_use]
+    pub fn passing_records_for_target_sha_scoped(
+        &self,
+        workload_scope: &str,
+        target_name: &str,
+        sha: &str,
+    ) -> Vec<EvidenceRecord> {
+        let directory = self
+            .path
+            .join("scoped")
+            .join(collision_safe_component(workload_scope));
+        Self::passing_records_in_directory(&directory, target_name, sha)
+    }
+
+    fn query_passing_in_directory(
+        directory: &Path,
+        target_name: &str,
+        sha_candidates: &[String],
+    ) -> Option<EvidenceRecord> {
         let candidate_ranks = sha_candidates
             .iter()
             .enumerate()
             .map(|(rank, sha)| (sha.as_str(), rank))
             .collect::<BTreeMap<_, _>>();
         let mut best: Option<(usize, EvidenceRecord)> = None;
-
-        let Ok(entries) = fs::read_dir(&self.path) else {
+        let Ok(entries) = fs::read_dir(directory) else {
             return None;
         };
-
-        for entry in entries.flatten() {
+        for records in entries.flatten().filter_map(|entry| {
             let path = entry.path();
-            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
-                continue;
-            }
-            let Some(branch_key) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
-                continue;
-            };
-            let Ok(records) = self.load_branch(branch_key) else {
-                continue;
-            };
+            (path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
+                .then(|| Self::load_records(&path).ok())
+                .flatten()
+        }) {
             for record in records.values() {
                 if record.target_name != target_name || !record.passed() || record.reused() {
                     continue;
@@ -364,32 +501,26 @@ impl EvidenceStore {
                 }
             }
         }
-
         best.map(|(_, record)| record)
     }
 
-    /// Return every non-reused passing record for one target and exact SHA,
-    /// newest first, so callers can apply their complete contract predicate.
-    #[must_use]
-    pub fn passing_records_for_target_sha(
-        &self,
+    fn passing_records_in_directory(
+        directory: &Path,
         target_name: &str,
         sha: &str,
     ) -> Vec<EvidenceRecord> {
-        let Ok(entries) = fs::read_dir(&self.path) else {
+        let Ok(entries) = fs::read_dir(directory) else {
             return Vec::new();
         };
         let mut records = entries
             .flatten()
             .filter_map(|entry| {
                 let path = entry.path();
-                (path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")).then_some(path)
+                (path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
+                    .then(|| Self::load_records(&path).ok())
+                    .flatten()
             })
-            .filter_map(|path| {
-                let branch_key = path.file_stem()?.to_str()?;
-                self.load_branch(branch_key).ok()
-            })
-            .flat_map(std::collections::BTreeMap::into_values)
+            .flat_map(BTreeMap::into_values)
             .filter(|record| {
                 record.target_name == target_name
                     && record.sha == sha
@@ -421,6 +552,16 @@ impl EvidenceStore {
         Ok(serde_json::from_str(&contents)?)
     }
 
+    fn load_records(
+        path: &Path,
+    ) -> Result<BTreeMap<String, EvidenceRecord>, Box<dyn std::error::Error>> {
+        if !path.exists() {
+            return Ok(BTreeMap::new());
+        }
+        let contents = fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&contents)?)
+    }
+
     fn save_branch(
         &self,
         branch_key: &str,
@@ -430,6 +571,19 @@ impl EvidenceStore {
         let temp = tempfile::NamedTempFile::new_in(&self.path)?;
         fs::write(temp.path(), format!("{payload}\n"))?;
         temp.persist(self.branch_file(branch_key))?;
+        Ok(())
+    }
+
+    fn save_records(
+        directory: &Path,
+        branch_key: &str,
+        records: &BTreeMap<String, EvidenceRecord>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::create_dir_all(directory)?;
+        let payload = serde_json::to_string_pretty(records)?;
+        let temp = tempfile::NamedTempFile::new_in(directory)?;
+        fs::write(temp.path(), format!("{payload}\n"))?;
+        temp.persist(directory.join(format!("{branch_key}.json")))?;
         Ok(())
     }
 }
@@ -483,6 +637,83 @@ fn sanitize_component(value: &str) -> String {
     }
 }
 
+fn collision_safe_component(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let readable = sanitize_component(value);
+    let digest = Sha256::digest(value.as_bytes());
+    format!(
+        "{}--{}",
+        readable.chars().take(48).collect::<String>(),
+        hex::encode(digest)
+    )
+}
+
+/// Stable evidence namespace for one repository's ship validations.
+#[must_use]
+pub fn repository_evidence_scope(repository: &str) -> String {
+    format!("repo:{}", canonical_repository(repository))
+}
+
+/// Canonical GitHub repository slug used by all durable ownership keys.
+#[must_use]
+pub fn canonical_repository(repository: &str) -> String {
+    repository.trim().to_ascii_lowercase()
+}
+
+/// Evidence namespace for a ship workload, with a checkout identity fallback
+/// for legacy/offline requests that lack a repository slug.
+#[must_use]
+pub fn ship_evidence_scope(repository: &str, cwd: &Path) -> String {
+    if repository.trim().is_empty() {
+        run_evidence_scope(cwd)
+    } else {
+        repository_evidence_scope(repository)
+    }
+}
+
+/// Stable evidence namespace for one checkout-backed arbitrary run workload.
+#[must_use]
+pub fn run_evidence_scope(cwd: &Path) -> String {
+    let identity = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    format!("run:{}", identity.to_string_lossy())
+}
+
+/// Exclusive scheduler claim for one scoped branch/target evidence writer.
+///
+/// Length-prefixing makes the tuple unambiguous before hashing, while the
+/// readable target suffix keeps queue diagnostics useful.
+#[must_use]
+pub fn evidence_resource_claim(workload_scope: &str, branch: &str, target: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for component in [workload_scope, branch, target] {
+        hasher.update(component.len().to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    let digest = hasher.finalize();
+    format!(
+        "evidence:{}:{}",
+        hex::encode(digest),
+        sanitize_component(target)
+    )
+}
+
+/// Stable scope for a named command workload in one checkout.
+#[must_use]
+pub fn command_evidence_scope(cwd: &Path, name: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(name.as_bytes());
+    format!(
+        "{}:command:{}--{}",
+        run_evidence_scope(cwd),
+        sanitize_component(name),
+        hex::encode(digest)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -492,12 +723,13 @@ mod tests {
 
     use chrono::Utc;
 
-    use super::{EvidenceRecord, EvidenceStore};
+    use super::{CommandEvidenceStore, EvidenceRecord, EvidenceStore};
 
     fn record(branch: &str, target: &str, sha: &str) -> EvidenceRecord {
         EvidenceRecord {
             sha: sha.to_owned(),
             branch: branch.to_owned(),
+            workload_scope: None,
             target_name: target.to_owned(),
             validation_build_type: None,
             platform: format!("{target}-platform"),
@@ -526,6 +758,7 @@ mod tests {
         let record = EvidenceRecord {
             sha: "new".to_owned(),
             branch: "feat/x".to_owned(),
+            workload_scope: None,
             target_name: "mac".to_owned(),
             validation_build_type: Some("release".to_owned()),
             platform: "macos-arm64".to_owned(),
@@ -665,6 +898,81 @@ mod tests {
             reopened.get_target("main", "mac").expect("record").sha,
             "abc"
         );
+    }
+
+    #[test]
+    fn scoped_store_isolates_pulp_forge_products_and_vellum() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = EvidenceStore::new(temp.path().join("evidence")).expect("store");
+        let identities = [
+            ("repo:generous-corp/pulp", "pulp-sha"),
+            ("repo:generous-corp/forge:workload:modular", "modular-sha"),
+            (
+                "repo:generous-corp/forge:workload:sequencer",
+                "sequencer-sha",
+            ),
+            ("repo:generous-corp/vellum", "vellum-sha"),
+        ];
+
+        for (scope, sha) in identities {
+            store
+                .record_scoped(scope, &record("feature/shared", "macos", sha))
+                .expect("record scoped evidence");
+        }
+
+        for (scope, sha) in identities {
+            let evidence = store
+                .get_target_scoped(scope, "feature/shared", "macos")
+                .expect("scoped record");
+            assert_eq!(evidence.sha, sha);
+            assert_eq!(evidence.workload_scope.as_deref(), Some(scope));
+        }
+        assert!(store.get_branch("feature/shared").is_empty());
+    }
+
+    #[test]
+    fn scoped_store_does_not_alias_sanitized_branch_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = EvidenceStore::new(temp.path().join("evidence")).expect("store");
+        let scope = "repo:generous-corp/forge";
+        store
+            .record_scoped(scope, &record("feature/x", "macos", "slash"))
+            .expect("slash branch");
+        store
+            .record_scoped(scope, &record("feature--x", "macos", "dashes"))
+            .expect("dash branch");
+
+        assert_eq!(
+            store
+                .get_target_scoped(scope, "feature/x", "macos")
+                .expect("slash")
+                .sha,
+            "slash"
+        );
+        assert_eq!(
+            store
+                .get_target_scoped(scope, "feature--x", "macos")
+                .expect("dashes")
+                .sha,
+            "dashes"
+        );
+    }
+
+    #[test]
+    fn command_bundle_reservation_never_reuses_an_owned_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = CommandEvidenceStore::new(temp.path().join("command")).expect("store");
+
+        let first = store.reserve_bundle_id("same-id").expect("first");
+        let second = store.reserve_bundle_id("same-id").expect("second");
+        let third = store.reserve_bundle_id("same-id").expect("third");
+
+        assert_eq!(first, "same-id");
+        assert_eq!(second, "same-id-1");
+        assert_eq!(third, "same-id-2");
+        assert!(store.bundle_dir(&first).is_dir());
+        assert!(store.bundle_dir(&second).is_dir());
+        assert!(store.bundle_dir(&third).is_dir());
     }
 
     #[test]
