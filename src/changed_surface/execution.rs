@@ -39,6 +39,17 @@ pub enum ExecutionMode {
     Authoritative,
 }
 
+/// Shell/transport contract that will consume the expanded protected command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionCommandTransport {
+    /// A local or SSH POSIX shell whose final command uses the declared bound.
+    PosixShell,
+    /// Windows PowerShell/OpenSSH re-encodes the command and is not yet eligible.
+    WindowsEncoded,
+    /// A backend whose final command representation is not proven here.
+    Unsupported,
+}
+
 /// Protected-base declaration controlling bounded execution for one target.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +111,8 @@ pub enum FullExecutionReason {
     MachineKillSwitch,
     /// The exact-head planner selected the full suite.
     PlannerSelectedFull,
+    /// The eventual backend command encoding is not eligible for bounded execution.
+    UnsupportedTransport,
 }
 
 /// Result of applying promotion policy to one exact-head selection receipt.
@@ -171,6 +184,9 @@ struct AuthoritativeExecutionPayload<'a> {
     head_sha: &'a str,
     tree_sha: &'a str,
     policy_digest: &'a str,
+    selection_receipt_digest: &'a str,
+    validation_contract_digest: &'a str,
+    workflow_digest: &'a str,
     selected_tests_digest: &'a str,
     selected_tests: &'a [String],
 }
@@ -195,6 +211,7 @@ pub fn plan_authoritative_execution(
     input: &ExactHeadInput,
     policy: &ChangedSurfacePolicy,
     machine_enabled: bool,
+    command_transport: ExecutionCommandTransport,
     validation_contract_digest: &str,
     workflow_digest: &str,
 ) -> Result<ExecutionDisposition, ExecutionPlanError> {
@@ -240,6 +257,11 @@ pub fn plan_authoritative_execution(
     if !machine_enabled {
         return Ok(ExecutionDisposition::Full {
             reason: FullExecutionReason::MachineKillSwitch,
+        });
+    }
+    if command_transport != ExecutionCommandTransport::PosixShell {
+        return Ok(ExecutionDisposition::Full {
+            reason: FullExecutionReason::UnsupportedTransport,
         });
     }
     match receipt.planned_suite {
@@ -309,6 +331,9 @@ fn bounded_execution_plan(
         head_sha: &receipt.head_sha,
         tree_sha: &receipt.tree_sha,
         policy_digest,
+        selection_receipt_digest: &selection_receipt_digest,
+        validation_contract_digest,
+        workflow_digest,
         selected_tests_digest: &selected_tests_digest,
         selected_tests: &receipt.selected_tests,
     })
@@ -415,6 +440,7 @@ mod tests {
     const HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const TREE: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const DIGEST: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const DIGEST_TWO: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
     fn fixture_policy(mode: ExecutionMode) -> ChangedSurfacePolicy {
         ChangedSurfacePolicy {
@@ -487,14 +513,30 @@ mod tests {
         plan_selection(input, Ok(policy.clone())).expect("fixture plan")
     }
 
+    fn fixture_execution(
+        receipt: &SelectionReceipt,
+        input: &ExactHeadInput,
+        policy: &ChangedSurfacePolicy,
+        machine_enabled: bool,
+    ) -> Result<ExecutionDisposition, ExecutionPlanError> {
+        plan_authoritative_execution(
+            receipt,
+            input,
+            policy,
+            machine_enabled,
+            ExecutionCommandTransport::PosixShell,
+            DIGEST,
+            DIGEST,
+        )
+    }
+
     #[test]
     fn default_shadow_and_machine_kill_switch_keep_full_execution() {
         let input = fixture_input("src/a.rs");
         let shadow = fixture_policy(ExecutionMode::Shadow);
         let shadow_receipt = fixture_receipt(&shadow, &input);
         assert_eq!(
-            plan_authoritative_execution(&shadow_receipt, &input, &shadow, true, DIGEST, DIGEST,)
-                .expect("shadow"),
+            fixture_execution(&shadow_receipt, &input, &shadow, true).expect("shadow"),
             ExecutionDisposition::Full {
                 reason: FullExecutionReason::ShadowPolicy,
             }
@@ -502,8 +544,7 @@ mod tests {
         let live = fixture_policy(ExecutionMode::Authoritative);
         let live_receipt = fixture_receipt(&live, &input);
         assert_eq!(
-            plan_authoritative_execution(&live_receipt, &input, &live, false, DIGEST, DIGEST,)
-                .expect("kill switch"),
+            fixture_execution(&live_receipt, &input, &live, false).expect("kill switch"),
             ExecutionDisposition::Full {
                 reason: FullExecutionReason::MachineKillSwitch,
             }
@@ -529,6 +570,7 @@ mod tests {
                     &input,
                     &policy,
                     machine_enabled,
+                    ExecutionCommandTransport::PosixShell,
                     DIGEST,
                     DIGEST,
                 )
@@ -546,8 +588,7 @@ mod tests {
         let input = fixture_input("src/a.rs");
         let receipt = fixture_receipt(&policy, &input);
         let ExecutionDisposition::Bounded(plan) =
-            plan_authoritative_execution(&receipt, &input, &policy, true, DIGEST, DIGEST)
-                .expect("bounded")
+            fixture_execution(&receipt, &input, &policy, true).expect("bounded")
         else {
             panic!("expected bounded plan");
         };
@@ -564,13 +605,86 @@ mod tests {
     }
 
     #[test]
+    fn payload_authorization_changes_with_validation_and_workflow_contracts() {
+        let policy = fixture_policy(ExecutionMode::Authoritative);
+        let input = fixture_input("src/a.rs");
+        let receipt = fixture_receipt(&policy, &input);
+        let ExecutionDisposition::Bounded(first) = plan_authoritative_execution(
+            &receipt,
+            &input,
+            &policy,
+            true,
+            ExecutionCommandTransport::PosixShell,
+            DIGEST,
+            DIGEST,
+        )
+        .expect("first") else {
+            panic!("expected bounded plan");
+        };
+        let ExecutionDisposition::Bounded(second) = plan_authoritative_execution(
+            &receipt,
+            &input,
+            &policy,
+            true,
+            ExecutionCommandTransport::PosixShell,
+            DIGEST_TWO,
+            DIGEST,
+        )
+        .expect("second") else {
+            panic!("expected bounded plan");
+        };
+        let ExecutionDisposition::Bounded(third) = plan_authoritative_execution(
+            &receipt,
+            &input,
+            &policy,
+            true,
+            ExecutionCommandTransport::PosixShell,
+            DIGEST,
+            DIGEST_TWO,
+        )
+        .expect("third") else {
+            panic!("expected bounded plan");
+        };
+        assert_ne!(
+            first.execution_payload_digest,
+            second.execution_payload_digest
+        );
+        assert_ne!(
+            first.execution_payload_digest,
+            third.execution_payload_digest
+        );
+        assert_ne!(first.command, second.command);
+        assert_ne!(first.command, third.command);
+    }
+
+    #[test]
+    fn unproven_command_transports_keep_the_full_suite() {
+        let policy = fixture_policy(ExecutionMode::Authoritative);
+        let input = fixture_input("src/a.rs");
+        let receipt = fixture_receipt(&policy, &input);
+        for transport in [
+            ExecutionCommandTransport::WindowsEncoded,
+            ExecutionCommandTransport::Unsupported,
+        ] {
+            assert_eq!(
+                plan_authoritative_execution(
+                    &receipt, &input, &policy, true, transport, DIGEST, DIGEST,
+                )
+                .expect("unsupported transport falls back"),
+                ExecutionDisposition::Full {
+                    reason: FullExecutionReason::UnsupportedTransport,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn literal_payload_is_cross_shell_safe_and_bound_to_the_plan_digest() {
         let policy = fixture_policy(ExecutionMode::Authoritative);
         let input = fixture_input("src/a.rs");
         let receipt = fixture_receipt(&policy, &input);
         let ExecutionDisposition::Bounded(plan) =
-            plan_authoritative_execution(&receipt, &input, &policy, true, DIGEST, DIGEST)
-                .expect("bounded")
+            fixture_execution(&receipt, &input, &policy, true).expect("bounded")
         else {
             panic!("expected bounded plan");
         };
@@ -591,6 +705,12 @@ mod tests {
         assert_eq!(decoded["head_sha"], HEAD);
         assert_eq!(decoded["tree_sha"], TREE);
         assert_eq!(decoded["policy_digest"], policy_digest(&policy));
+        assert_eq!(
+            decoded["selection_receipt_digest"],
+            plan.selection_receipt_digest
+        );
+        assert_eq!(decoded["validation_contract_digest"], DIGEST);
+        assert_eq!(decoded["workflow_digest"], DIGEST);
         assert_eq!(
             decoded["selected_tests"],
             serde_json::json!(receipt.selected_tests)
@@ -616,14 +736,10 @@ mod tests {
         let input = fixture_input("src/a.rs");
         let mut receipt = fixture_receipt(&policy, &input);
         receipt.policy_digest = Some(DIGEST.to_owned());
-        assert!(
-            plan_authoritative_execution(&receipt, &input, &policy, true, DIGEST, DIGEST,).is_err()
-        );
+        assert!(fixture_execution(&receipt, &input, &policy, true).is_err());
         let mut receipt = fixture_receipt(&policy, &input);
         receipt.selected_tests.push("bad\nname".to_owned());
-        assert!(
-            plan_authoritative_execution(&receipt, &input, &policy, true, DIGEST, DIGEST,).is_err()
-        );
+        assert!(fixture_execution(&receipt, &input, &policy, true).is_err());
     }
 
     #[test]
@@ -633,8 +749,7 @@ mod tests {
         let full = fixture_receipt(&policy, &full_input);
         assert_eq!(full.planned_suite, PlannedSuite::Full);
         assert_eq!(
-            plan_authoritative_execution(&full, &full_input, &policy, true, DIGEST, DIGEST,)
-                .expect("full"),
+            fixture_execution(&full, &full_input, &policy, true).expect("full"),
             ExecutionDisposition::Full {
                 reason: FullExecutionReason::PlannerSelectedFull,
             }
@@ -653,6 +768,7 @@ mod tests {
                 &blocked_input,
                 &blocked_policy,
                 true,
+                ExecutionCommandTransport::PosixShell,
                 DIGEST,
                 DIGEST,
             )
@@ -675,10 +791,7 @@ mod tests {
         ] {
             let mut mutated = receipt.clone();
             mutate(&mut mutated);
-            assert!(
-                plan_authoritative_execution(&mutated, &input, &policy, true, DIGEST, DIGEST,)
-                    .is_err()
-            );
+            assert!(fixture_execution(&mutated, &input, &policy, true).is_err());
         }
     }
 
@@ -689,9 +802,7 @@ mod tests {
         let input = fixture_input("src/a.rs");
         let receipt = fixture_receipt(&policy, &input);
         assert_eq!(receipt.planned_suite, PlannedSuite::Bounded);
-        assert!(
-            plan_authoritative_execution(&receipt, &input, &policy, true, DIGEST, DIGEST,).is_err()
-        );
+        assert!(fixture_execution(&receipt, &input, &policy, true).is_err());
     }
 
     #[test]
@@ -703,8 +814,6 @@ mod tests {
         ));
         let input = fixture_input("src/a.rs");
         let receipt = fixture_receipt(&policy, &input);
-        assert!(
-            plan_authoritative_execution(&receipt, &input, &policy, true, DIGEST, DIGEST,).is_err()
-        );
+        assert!(fixture_execution(&receipt, &input, &policy, true).is_err());
     }
 }
