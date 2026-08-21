@@ -217,6 +217,10 @@ trait HostExecutor: Sync {
         desired: &ReleaseIdentity,
         before: &HostObservation,
     ) -> Result<(), String>;
+
+    fn restore_participation(&self, _host: &FleetHost) -> Result<(), String> {
+        Err("runner participation recovery is unavailable".to_owned())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -391,7 +395,7 @@ fn reconcile_once<E: HostExecutor>(
     state: &mut RolloutState,
 ) -> Result<(), CliFailure> {
     let now = timestamp();
-    let observations = probe_hosts(executor, hosts);
+    let mut observations = probe_hosts(executor, hosts);
     let prior_expectations = state
         .hosts
         .iter()
@@ -405,6 +409,20 @@ fn reconcile_once<E: HostExecutor>(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    for (name, observation) in &mut observations {
+        let expected_participation = prior_expectations
+            .get(name)
+            .and_then(|(participation, _)| *participation);
+        if expected_participation == Some(true)
+            && observation.participation == Some(false)
+            && observation.reachable
+            && observation.busy == Some(false)
+            && let Some(host) = hosts.iter().find(|host| host.name == *name)
+            && executor.restore_participation(host).is_ok()
+        {
+            *observation = executor.probe(host);
+        }
+    }
     let terminal_failures = state
         .hosts
         .iter()
@@ -604,7 +622,15 @@ fn apply_host<E: HostExecutor>(
     // The fleet-wide probe only plans the wave. Re-authorize this host
     // immediately before mutation because its runner can claim work while
     // another host is being inspected.
-    let authorization = executor.probe(host);
+    let mut authorization = executor.probe(host);
+    if participation_before == Some(true)
+        && authorization.participation == Some(false)
+        && authorization.reachable
+        && authorization.busy == Some(false)
+        && executor.restore_participation(host).is_ok()
+    {
+        authorization = executor.probe(host);
+    }
     let daemon_was_running = before.require_daemon_running
         || before.observed.daemon_running == Some(true)
         || authorization.daemon_running == Some(true);
@@ -627,11 +653,25 @@ fn apply_host<E: HostExecutor>(
         );
     }
     let install_error = executor.install(host, desired, &authorization).err();
-    let after = executor.probe(host);
-    let participation_changed = matches!(
-        (participation_before, after.participation),
-        (Some(before), Some(after)) if before != after
-    );
+    let mut after = executor.probe(host);
+    if install_error.is_some()
+        && participation_before == Some(true)
+        && after.participation == Some(false)
+        && after.reachable
+        && after.busy == Some(false)
+        && executor.restore_participation(host).is_ok()
+    {
+        after = executor.probe(host);
+    }
+    let inconclusive_transport = install_error.is_some()
+        && (!after.reachable
+            || after.busy != Some(false)
+            || after.disposition(desired) == HostState::Unobservable);
+    let participation_changed = !inconclusive_transport
+        && matches!(
+            (participation_before, after.participation),
+            (Some(before), Some(after)) if before != after
+        );
     (
         host.name.clone(),
         Some(after),
@@ -787,6 +827,8 @@ impl HostExecutor for ProductionExecutor {
             r#"set -eu
 bin="$HOME/.local/bin/shipyard"
 pool="$HOME/.local/bin/tartci-pool"
+SHIPYARD_FLEET_MUTATION=1
+export SHIPYARD_FLEET_MUTATION
 restore_pool=0
 restore_participation() {{
   if [ "$restore_pool" = 1 ]; then "$pool" on >/dev/null; fi
@@ -823,7 +865,7 @@ trap - EXIT
             participating = u8::from(before.participation == Some(true)),
         );
         let output = run_host_script(host, &script, 300);
-        if mutation_required && before.participation == Some(true) {
+        if command_completed(&output) && mutation_required && before.participation == Some(true) {
             let restore = run_host_script(
                 host,
                 r#"pool="$HOME/.local/bin/tartci-pool"; [ -x "$pool" ] && "$pool" on >/dev/null"#,
@@ -845,6 +887,23 @@ trap - EXIT
             })
         }
     }
+
+    fn restore_participation(&self, host: &FleetHost) -> Result<(), String> {
+        let output = run_host_script(
+            host,
+            r#"pool="$HOME/.local/bin/tartci-pool"; [ -x "$pool" ] && "$pool" on >/dev/null"#,
+            20,
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err("failed to restore runner participation after rollout".to_owned())
+        }
+    }
+}
+
+fn command_completed(output: &Result<std::process::Output, String>) -> bool {
+    output.is_ok()
 }
 
 const PROBE_SCRIPT: &str = r#"set -u
@@ -882,6 +941,8 @@ if pgrep -f 'Runner.Worker spawnclient' >/dev/null 2>&1; then busy=true; fi
 if ps -axww -o command= 2>/dev/null \
   | grep -E '[/ ](shipyard|sy)( +--json| +--mode +[^ ]+| +--state-dir +[^ ]+| +--global-dir +[^ ]+| +--cwd +[^ ]+)* +(ship|pr|run|rescue|auto-merge|watch)( |$)' \
   | grep -v '[g]rep -E' >/dev/null 2>&1; then busy=true; fi
+if ps -axww -o command= 2>/dev/null \
+  | grep '[S]HIPYARD_FLEET_MUTATION=1' >/dev/null 2>&1; then busy=true; fi
 printf 'version=%s\nsha256=%s\ndaemon_running=%s\ndaemon_version=%s\nparticipation=%s\nbusy=%s\n' \
   "$version" "$sha" "$daemon_running" "$daemon_version" "$participation" "$busy"
 "#;

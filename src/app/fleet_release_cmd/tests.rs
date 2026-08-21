@@ -647,3 +647,9 @@ fn state_lock_refuses_a_competing_reconciler() {
     let _owner = StateLock::acquire(&state).expect("first owner");
     assert!(StateLock::acquire(&state).is_err());
 }
+
+#[test]
+fn timeout_or_lost_ssh_never_authorizes_immediate_participation_restore() {
+    let timeout = Err("host command timed out after 300s".to_owned());
+    assert!(!command_completed(&timeout));
+}
