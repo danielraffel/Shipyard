@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode};
 
 use serde_json::{Value, json};
 
+use super::daemon_cmd::ensure_execution_daemon;
 use super::{
     CliFailure, SHIP_EXIT_MERGE_CLIENT_DEFECT,
     auto_merge_cmd::{
@@ -42,7 +43,9 @@ use crate::preflight::{
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
 use crate::reconcile::fetch_head_and_status_check_rollup_with_cwd;
-use crate::ship::{ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_ship};
+use crate::ship::{
+    ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_ship, submit_ship_daemon,
+};
 use crate::ship_state::ShipStateStore;
 use crate::warm_pool::{WarmPool, default_pool_path};
 
@@ -76,6 +79,7 @@ pub(super) struct ShipCommandArgs {
     /// validation dispatch. Enabled by `shipyard pr`, never by an explicit
     /// `ship --pr` recovery that lacks the submitting session's context.
     pub(super) invocation: ShipInvocation,
+    pub(super) foreground: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +115,7 @@ pub(super) fn ship_command<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let daemon_owned = !args.foreground && cfg!(unix);
     let preflight_dispatcher = ExecutorDispatcher::new(None);
     let targets = prepare_ship_targets(
         config,
@@ -186,8 +191,79 @@ pub(super) fn ship_command<W: Write>(
         targets,
     };
 
-    let job = submit_ship(&request, &mut queue, cwd, &runtime_paths.state_dir)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if daemon_owned
+        && crate::queue_request::ExecutionProvenance::capture_with_config(
+            cwd,
+            Some(&request.repo),
+            &request.sha,
+            config,
+        )
+        .is_none()
+    {
+        return Err(CliFailure::new(
+            2,
+            "could not capture exact repository, origin, HEAD, and tree provenance for daemon ownership",
+        ));
+    }
+
+    if daemon_owned {
+        if args.merge_command.is_some()
+            || args.merge_result.is_some()
+            || args.pr_snapshot_file.is_some()
+        {
+            return Err(CliFailure::new(
+                2,
+                "test merge overrides require --foreground",
+            ));
+        }
+        if !matches!(
+            config.get_str("github.auth.source"),
+            Some("env" | "command")
+        ) {
+            return Err(CliFailure::new(
+                2,
+                "daemon-owned ship requires explicit github.auth source env or command; ambient gh auth is forbidden",
+            ));
+        }
+    }
+    if daemon_owned {
+        ensure_execution_daemon(
+            if runtime_paths.mode == RuntimeMode::Isolated.as_str() {
+                RuntimeMode::Isolated
+            } else {
+                RuntimeMode::Shipyard
+            },
+            runtime_paths,
+            vec![request.repo.clone()],
+        )?;
+    }
+    let job = if daemon_owned {
+        submit_ship_daemon(&request, &mut queue, cwd, &runtime_paths.state_dir, config)
+    } else {
+        submit_ship(&request, &mut queue, cwd, &runtime_paths.state_dir)
+    }
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if daemon_owned {
+        if json_mode {
+            write_json_envelope(
+                stdout,
+                "ship",
+                fields([
+                    ("ship", job.to_json_value()),
+                    ("pr", Value::from(pr_context.number)),
+                ]),
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        } else {
+            writeln!(
+                stdout,
+                "Queued {} for PR #{}. The Shipyard daemon owns execution.",
+                job.id, pr_context.number
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let outcome = drain_or_wait_ship(
         &request,
         job.clone(),
@@ -917,6 +993,47 @@ fn post_run_merge_state(
             format!("PR #{pr}: validation passed but ship-state was not merge-ready"),
         )),
     }
+}
+
+/// Complete the post-validation merge phase for a daemon-owned ship request.
+pub(super) fn finish_background_ship(
+    request: &ShipExecutionRequest,
+    job: &Job,
+    mode: RuntimeMode,
+    global_dir: &Path,
+    state_dir: &Path,
+) -> Result<ExitCode, CliFailure> {
+    let request_store = crate::queue_request::QueueRequestStore::new(state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let envelope = request_store
+        .load(&job.id)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+        .ok_or_else(|| CliFailure::new(1, "ship request disappeared before merge"))?;
+    let config =
+        LoadedConfig::load_from_cwd_with_global_dir(mode, &envelope.cwd, global_dir.to_path_buf())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let provenance = envelope
+        .provenance
+        .as_ref()
+        .ok_or_else(|| CliFailure::new(1, "ship request lacks unattended provenance"))?;
+    provenance
+        .validate_with_config(&envelope.cwd, &config)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let ship_state = ShipStateStore::new(state_dir.join("ship"))
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let state = post_run_merge_state(
+        request.pr,
+        &envelope.cwd,
+        &ship_state,
+        &config,
+        mode,
+        &request.repo,
+        job.passed(),
+        None,
+        None,
+        None,
+    )?;
+    Ok(state.exit_code())
 }
 
 /// Green-but-unmerged hand-back for paths with no rollup context to inspect.
@@ -1980,6 +2097,7 @@ esac"#,
                 adopt_head: false,
                 steward_handoff: None,
                 invocation: ShipInvocation::Direct,
+                foreground: true,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -2059,6 +2177,7 @@ esac"#,
                 adopt_head: false,
                 steward_handoff: None,
                 invocation: ShipInvocation::Direct,
+                foreground: true,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -2110,6 +2229,7 @@ esac"#,
                 adopt_head: false,
                 steward_handoff: None,
                 invocation: ShipInvocation::Direct,
+                foreground: true,
             },
             &unreachable_ssh_config(temp.path()),
             &repo,
@@ -2167,6 +2287,7 @@ esac"#,
                 adopt_head: false,
                 steward_handoff: None,
                 invocation: ShipInvocation::Direct,
+                foreground: true,
             },
             &local_and_unreachable_config(temp.path()),
             &repo,
@@ -2233,6 +2354,7 @@ exit 2
                 adopt_head: false,
                 steward_handoff: None,
                 invocation: ShipInvocation::Direct,
+                foreground: true,
             },
             &loaded_config(temp.path()),
             &repo,
@@ -2337,6 +2459,7 @@ exit 2
                 adopt_head: false,
                 steward_handoff: None,
                 invocation: ShipInvocation::Direct,
+                foreground: true,
             },
             &loaded_config(temp.path()),
             &repo,

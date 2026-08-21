@@ -62,6 +62,7 @@ fn normalize_base(input: &str) -> &str {
     input.strip_prefix("origin/").unwrap_or(input)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn pr_command<W: Write>(
     mut args: PrCommandArgs,
     config: &LoadedConfig,
@@ -150,6 +151,7 @@ pub(super) fn pr_command<W: Write>(
             adopt_head: args.adopt_head,
             steward_handoff,
             invocation: ShipInvocation::PrCommand,
+            foreground: false,
         },
         config,
         cwd,

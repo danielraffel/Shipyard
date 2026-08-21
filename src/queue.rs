@@ -66,6 +66,8 @@ pub enum QueueError {
     Io(io::Error),
     /// Queue JSON serialization failed.
     Json(serde_json::Error),
+    /// A worker attempted to update a queue record that no longer exists.
+    JobNotFound(String),
 }
 
 impl std::fmt::Display for QueueError {
@@ -73,6 +75,7 @@ impl std::fmt::Display for QueueError {
         match self {
             Self::Io(error) => write!(formatter, "queue I/O failed: {error}"),
             Self::Json(error) => write!(formatter, "queue JSON failed: {error}"),
+            Self::JobNotFound(job_id) => write!(formatter, "queue job not found: {job_id}"),
         }
     }
 }
@@ -82,6 +85,7 @@ impl std::error::Error for QueueError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::JobNotFound(_) => None,
         }
     }
 }
@@ -160,14 +164,32 @@ impl Queue {
 
     /// Replace a queued job matched by id, then trim old completed jobs.
     pub fn update(&mut self, job: &Job) -> QueueResult<()> {
+        let _ = self.commit_worker_update(job)?;
+        Ok(())
+    }
+
+    /// Commit a worker snapshot unless the durable record is already terminal,
+    /// returning the winning durable value either way. Callers must derive
+    /// outcomes and post-validation actions from this winner, never their
+    /// stale local snapshot.
+    pub fn commit_worker_update(&mut self, job: &Job) -> QueueResult<Job> {
         self.with_jobs_locked(|jobs| {
             for queued in jobs.iter_mut() {
                 if queued.id == job.id {
+                    // Terminal records win every race. A worker can hold a
+                    // stale Running snapshot after the daemon has cancelled
+                    // it; progress/final writes must never resurrect work or
+                    // erase the durable terminal reason.
+                    if is_terminal_job(queued.status) {
+                        return Ok(queued.clone());
+                    }
                     *queued = job.clone();
+                    let winner = queued.clone();
+                    let _ = trim_terminal(jobs);
+                    return Ok(winner);
                 }
             }
-            let _ = trim_terminal(jobs);
-            Ok(())
+            Err(QueueError::JobNotFound(job.id.clone()))
         })
     }
 
@@ -347,6 +369,37 @@ impl Queue {
         })
     }
 
+    /// Cancel selected running jobs. The daemon writes this terminal record
+    /// before it signals the supervised process group, so stale worker
+    /// progress cannot erase the reason or reclaim capacity.
+    pub fn cancel_running_jobs_for_drain(
+        &mut self,
+        _drain_lock: &DrainLock,
+        cancellations: &[QueuePendingCancellation],
+    ) -> QueueResult<Vec<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let mut cancelled_jobs = Vec::new();
+            let mut seen = BTreeSet::new();
+            for cancellation in cancellations {
+                if !seen.insert(cancellation.job_id.as_str()) {
+                    continue;
+                }
+                let Some(job) = jobs
+                    .iter_mut()
+                    .find(|job| job.id == cancellation.job_id && job.status == JobStatus::Running)
+                else {
+                    continue;
+                };
+                if let Ok(cancelled) = job.cancel_with_reason(Some(cancellation.reason.clone())) {
+                    *job = cancelled.clone();
+                    cancelled_jobs.push(cancelled);
+                }
+            }
+            let _ = trim_terminal(jobs);
+            Ok(cancelled_jobs)
+        })
+    }
+
     /// Cancel the given jobs only if, re-checked under the state lock, they are
     /// still `Running` and still stale by heartbeat age. Returns the jobs that
     /// were actually cancelled (terminal `Cancelled`, with `reason`).
@@ -417,6 +470,37 @@ impl Queue {
                 }
             }
             Ok(requeued_jobs)
+        })
+    }
+
+    /// Complete one running job with an explicit fail-closed uncertainty
+    /// result. This is used only after durable worker ownership is proven lost;
+    /// arbitrary validation commands are never replayed automatically.
+    pub fn complete_running_uncertain(
+        &mut self,
+        job_id: &str,
+        reason: &str,
+    ) -> QueueResult<Option<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let Some(job) = jobs
+                .iter_mut()
+                .find(|job| job.id == job_id && job.status == JobStatus::Running)
+            else {
+                return Ok(None);
+            };
+            for target_name in &job.target_names {
+                job.results.entry(target_name.clone()).or_insert_with(|| {
+                    let mut result = stale_recovery_result(target_name);
+                    result.error_message = Some(reason.to_owned());
+                    result.failure_class = Some("UNCERTAIN".to_owned());
+                    result
+                });
+            }
+            job.status = JobStatus::Completed;
+            job.completed_at = Some(Utc::now());
+            let completed = job.clone();
+            let _ = trim_terminal(jobs);
+            Ok(Some(completed))
         })
     }
 
@@ -850,6 +934,38 @@ mod tests {
         job = job.start().expect("start").complete().expect("complete");
         job.completed_at = Some(Utc::now() - chrono::Duration::seconds(seconds_ago));
         job
+    }
+
+    #[test]
+    fn stale_running_update_cannot_overwrite_terminal_cancellation() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let pending = job("main", "abc", &["local"]);
+        queue.enqueue(pending.clone()).expect("enqueue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        let running = queue
+            .start_pending_jobs_for_drain(&lock, std::slice::from_ref(&pending.id))
+            .expect("start")
+            .remove(0);
+        let cancelled = queue
+            .cancel_running_jobs_for_drain(
+                &lock,
+                &[QueuePendingCancellation {
+                    job_id: running.id.clone(),
+                    reason: "exact head merged".to_owned(),
+                }],
+            )
+            .expect("cancel")
+            .remove(0);
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+
+        queue.update(&running).expect("stale worker update");
+        let durable = queue.get(&running.id).expect("read").expect("durable job");
+        assert_eq!(durable.status, JobStatus::Cancelled);
+        assert_eq!(
+            durable.cancellation_reason.as_deref(),
+            Some("exact head merged")
+        );
     }
 
     fn running_aged(branch: &str, sha: &str, started_secs_ago: i64) -> Job {

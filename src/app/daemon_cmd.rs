@@ -15,6 +15,70 @@ use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 
+/// Ensure the daemon that owns queued execution is live.
+pub(super) fn ensure_execution_daemon(
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
+    repos: Vec<String>,
+) -> Result<u32, CliFailure> {
+    if let Some(status) = read_daemon_status(&runtime_paths.state_dir) {
+        let running_version = status
+            .get("shipyard_version")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if running_version != env!("CARGO_PKG_VERSION") {
+            return Err(CliFailure::new(
+                3,
+                format!(
+                    "running daemon version {running_version} cannot own jobs submitted by Shipyard {}; run `shipyard daemon refresh` first",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            ));
+        }
+        let mut registered = status
+            .get("registered_repos")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let missing_repo = repos.iter().any(|repo| !registered.contains(repo));
+        if !missing_repo {
+            return Ok(0);
+        }
+        registered.extend(repos);
+        registered.sort();
+        registered.dedup();
+        if !stop_running(&runtime_paths.state_dir) {
+            return Err(CliFailure::new(
+                3,
+                "daemon disappeared while registering a repository; retry the submission",
+            ));
+        }
+        return spawn_execution_daemon(mode, runtime_paths, registered);
+    }
+    spawn_execution_daemon(mode, runtime_paths, repos)
+}
+
+fn spawn_execution_daemon(
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
+    repos: Vec<String>,
+) -> Result<u32, CliFailure> {
+    let binary = std::env::current_exe()
+        .map_err(|error| CliFailure::new(3, format!("failed to locate current binary: {error}")))?;
+    spawn_detached(&SpawnRequest {
+        binary,
+        mode,
+        global_dir_override: Some(runtime_paths.global_dir.clone()),
+        state_dir_override: Some(runtime_paths.state_dir.clone()),
+        state_dir: runtime_paths.state_dir.clone(),
+        repos,
+    })
+    .map_err(|error| CliFailure::new(3, error.to_string()))
+}
+
 pub(super) fn daemon_command<W: Write>(
     command: DaemonCommand,
     mode: RuntimeMode,
@@ -143,6 +207,7 @@ fn daemon_run_with_repos(
 ) -> Result<ExitCode, CliFailure> {
     match run_blocking(DaemonRunConfig {
         mode,
+        global_dir: runtime_paths.global_dir.clone(),
         state_dir: runtime_paths.state_dir.clone(),
         repos,
     }) {
@@ -410,6 +475,7 @@ mod tests {
         std::thread::spawn(move || {
             run_blocking(DaemonRunConfig {
                 mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
                 state_dir,
                 repos,
             })

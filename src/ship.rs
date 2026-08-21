@@ -26,6 +26,7 @@ use crate::executor::streaming::{ProgressAction, ProgressEvent};
 use crate::host_pool::{
     HostPoolConfig, HostPoolLeaseStore, HostPoolMemberConfig, default_lease_path,
 };
+use crate::identity::RuntimeMode;
 use crate::job::{
     DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobKind, JobStatus, JobTransitionError, Priority,
     TargetResult, TargetStatus, ValidationMode,
@@ -42,7 +43,7 @@ use crate::ship_state::{
     DispatchedRun, ShipState, ShipStatePrLock, ShipStateStore, compute_policy_signature,
 };
 use crate::warm_pool::{
-    PoolEntry, WarmPool, compute_expires_at, is_backend_eligible, warm_host_key,
+    PoolEntry, WarmPool, compute_expires_at, default_pool_path, is_backend_eligible, warm_host_key,
 };
 
 const RESUME_ORDER: [&str; 4] = ["setup", "configure", "build", "test"];
@@ -236,6 +237,8 @@ pub enum ShipExecutionError {
     Queue(QueueError),
     /// Queue request/outcome persistence failed.
     QueueRequest(QueueRequestError),
+    /// Delayed-worker runtime setup failed before target execution.
+    WorkerSetup(String),
     /// Evidence persistence failed.
     Evidence(String),
     /// Ship-state persistence failed.
@@ -294,6 +297,7 @@ impl Display for ShipExecutionError {
             Self::JobTransition(error) => write!(formatter, "{error}"),
             Self::Queue(error) => write!(formatter, "{error}"),
             Self::QueueRequest(error) => write!(formatter, "{error}"),
+            Self::WorkerSetup(error) => write!(formatter, "worker setup failed: {error}"),
             Self::Evidence(error) => write!(formatter, "evidence write failed: {error}"),
             Self::ShipState(error) => write!(formatter, "ship-state write failed: {error}"),
             Self::WarmPool(error) => write!(formatter, "warm-pool write failed: {error}"),
@@ -340,6 +344,7 @@ impl Error for ShipExecutionError {
             Self::ShaDrift { .. }
             | Self::BaseDrift { .. }
             | Self::PolicyDrift { .. }
+            | Self::WorkerSetup(_)
             | Self::Evidence(_)
             | Self::ShipState(_)
             | Self::SchedulerDeferred(_)
@@ -424,6 +429,27 @@ pub fn submit_ship(
     cwd: &Path,
     state_dir: &Path,
 ) -> Result<Job, ShipExecutionError> {
+    submit_ship_with_config(request, queue, cwd, state_dir, None)
+}
+
+/// Submit a ship request with configuration provenance for daemon ownership.
+pub(crate) fn submit_ship_daemon(
+    request: &ShipExecutionRequest,
+    queue: &mut Queue,
+    cwd: &Path,
+    state_dir: &Path,
+    config: &LoadedConfig,
+) -> Result<Job, ShipExecutionError> {
+    submit_ship_with_config(request, queue, cwd, state_dir, Some(config))
+}
+
+fn submit_ship_with_config(
+    request: &ShipExecutionRequest,
+    queue: &mut Queue,
+    cwd: &Path,
+    state_dir: &Path,
+    config: Option<&LoadedConfig>,
+) -> Result<Job, ShipExecutionError> {
     refuse_same_pr_running_ship(queue, state_dir, request)?;
     let target_names = target_names(&request.targets);
     let job = Job::create(
@@ -434,14 +460,21 @@ pub fn submit_ship(
         request.priority,
     )
     .with_kind(JobKind::Ship);
-    QueueRequestStore::new(state_dir)
-        .map_err(QueueRequestError::from)?
-        .save(&QueuedExecutionEnvelope::from_ship_request(
-            job.id.clone(),
+    let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
+    let mut envelope = QueuedExecutionEnvelope::from_ship_request(job.id.clone(), cwd, request);
+    if let Some(config) = config {
+        envelope.provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
             cwd,
-            request,
-        ))?;
-    queue.enqueue(job.clone())?;
+            Some(&request.repo),
+            &request.sha,
+            config,
+        );
+    }
+    request_store.save(&envelope)?;
+    if let Err(error) = queue.enqueue(job.clone()) {
+        let _ = request_store.delete(&job.id);
+        return Err(error.into());
+    }
     Ok(job)
 }
 
@@ -633,6 +666,15 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         });
     }
     job = job.complete()?;
+    job = queue.commit_worker_update(&job)?;
+    if job.status == JobStatus::Cancelled {
+        persist_terminal_outcome(&job, state_dir)?;
+        return Ok(ShipExecutionOutcome {
+            job,
+            ship_state: state,
+            resumed_existing_state,
+        });
+    }
     record_evidence(evidence, request, &job)?;
     update_ship_state_from_job(&mut state, request, &job);
     ship_state
@@ -646,8 +688,6 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
             state.clone(),
             resumed_existing_state,
         ))?;
-    queue.update(&job)?;
-
     Ok(ShipExecutionOutcome {
         job,
         ship_state: state,
@@ -692,6 +732,27 @@ pub fn submit_run(
     cwd: &Path,
     state_dir: &Path,
 ) -> Result<Job, ShipExecutionError> {
+    submit_run_with_config(request, queue, cwd, state_dir, None)
+}
+
+/// Submit a run request with configuration provenance for daemon ownership.
+pub(crate) fn submit_run_daemon(
+    request: &RunExecutionRequest,
+    queue: &mut Queue,
+    cwd: &Path,
+    state_dir: &Path,
+    config: &LoadedConfig,
+) -> Result<Job, ShipExecutionError> {
+    submit_run_with_config(request, queue, cwd, state_dir, Some(config))
+}
+
+fn submit_run_with_config(
+    request: &RunExecutionRequest,
+    queue: &mut Queue,
+    cwd: &Path,
+    state_dir: &Path,
+    config: Option<&LoadedConfig>,
+) -> Result<Job, ShipExecutionError> {
     let target_names = target_names(&request.targets);
     let job = Job::create(
         request.sha.clone(),
@@ -701,14 +762,21 @@ pub fn submit_run(
         request.priority,
     )
     .with_kind(JobKind::Run);
-    QueueRequestStore::new(state_dir)
-        .map_err(QueueRequestError::from)?
-        .save(&QueuedExecutionEnvelope::from_run_request(
-            job.id.clone(),
+    let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
+    let mut envelope = QueuedExecutionEnvelope::from_run_request(job.id.clone(), cwd, request);
+    if let Some(config) = config {
+        envelope.provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
             cwd,
-            request,
-        ))?;
-    queue.enqueue(job.clone())?;
+            None,
+            &request.sha,
+            config,
+        );
+    }
+    request_store.save(&envelope)?;
+    if let Err(error) = queue.enqueue(job.clone()) {
+        let _ = request_store.delete(&job.id);
+        return Err(error.into());
+    }
     Ok(job)
 }
 
@@ -872,11 +940,15 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         return Ok(RunExecutionOutcome { job });
     }
     job = job.complete()?;
+    job = queue.commit_worker_update(&job)?;
+    if job.status == JobStatus::Cancelled {
+        persist_terminal_outcome(&job, state_dir)?;
+        return Ok(RunExecutionOutcome { job });
+    }
     record_evidence(evidence, &shim, &job)?;
     QueueOutcomeStore::new(state_dir)
         .map_err(QueueRequestError::from)?
         .save(&QueuedExecutionOutcome::run(job.id.clone()))?;
-    queue.update(&job)?;
     Ok(RunExecutionOutcome { job })
 }
 
@@ -1290,6 +1362,16 @@ fn persist_recovered_outcomes(
     Ok(())
 }
 
+/// Persist the kind-specific durable outcome for one terminal queue job.
+pub(crate) fn persist_terminal_outcome(
+    job: &Job,
+    state_dir: &Path,
+) -> Result<(), ShipExecutionError> {
+    let ship_state = ShipStateStore::new(state_dir.join("ship"))
+        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+    persist_recovered_outcomes(std::slice::from_ref(job), state_dir, &ship_state)
+}
+
 fn cap_admit_pass_workers(
     jobs: &[Job],
     pass: &mut crate::queue_scheduler::RequestBackedAdmitPass,
@@ -1304,7 +1386,7 @@ fn cap_admit_pass_workers(
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-fn run_started_worker<D: ShipTargetDispatcher>(
+pub(crate) fn run_started_worker<D: ShipTargetDispatcher>(
     job: Job,
     envelope: QueuedExecutionEnvelope,
     evidence: &EvidenceStore,
@@ -1361,6 +1443,76 @@ fn run_started_worker<D: ShipTargetDispatcher>(
         }
     }
     Ok(())
+}
+
+/// Execute one queue job already fenced to `Running` by the daemon supervisor.
+/// The delayed worker reloads policy from the submitted repository, validates
+/// immutable checkout provenance, and never falls back to the process cwd.
+pub(crate) fn execute_started_queued_job(
+    job_id: &str,
+    mode: RuntimeMode,
+    global_dir: &Path,
+    state_dir: &Path,
+) -> Result<(QueuedExecutionKind, Job), ShipExecutionError> {
+    let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
+    let envelope = request_store
+        .load(job_id)?
+        .ok_or_else(|| ShipExecutionError::MissingQueuedJob(job_id.to_owned()))?;
+    let provenance = envelope.provenance.as_ref().ok_or_else(|| {
+        ShipExecutionError::QueueRequest(QueueRequestError::InvalidSnapshot {
+            reason: "legacy request lacks unattended-execution provenance".to_owned(),
+        })
+    })?;
+    let config =
+        LoadedConfig::load_from_cwd_with_global_dir(mode, &envelope.cwd, global_dir.to_path_buf())
+            .map_err(|error| ShipExecutionError::WorkerSetup(error.to_string()))?;
+    provenance.validate_with_config(&envelope.cwd, &config)?;
+    if matches!(envelope.kind, QueuedExecutionKind::Ship)
+        && !matches!(
+            config.get_str("github.auth.source"),
+            Some("env" | "command")
+        )
+    {
+        return Err(ShipExecutionError::WorkerSetup(
+            "daemon-owned ship requires explicit github.auth source env or command; ambient gh auth is forbidden"
+                .to_owned(),
+        ));
+    }
+    let mut queue = Queue::new(state_dir).map_err(QueueError::from)?;
+    let job = queue
+        .get(job_id)?
+        .ok_or_else(|| ShipExecutionError::MissingQueuedJob(job_id.to_owned()))?;
+    if job.status != JobStatus::Running {
+        return Err(ShipExecutionError::QueueRequest(
+            QueueRequestError::InvalidSnapshot {
+                reason: format!("daemon worker requires running job, found {:?}", job.status),
+            },
+        ));
+    }
+    let evidence = EvidenceStore::new(state_dir.join("evidence"))
+        .map_err(|error| ShipExecutionError::Evidence(error.to_string()))?;
+    let ship_state = ShipStateStore::new(state_dir.join("ship"))
+        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+    let warm_pool = WarmPool::new(default_pool_path(state_dir));
+    let prepared = crate::prepared_state::PreparedStateStore::new(state_dir.join("prepared"))
+        .map_err(|error| ShipExecutionError::WorkerSetup(error.to_string()))?;
+    let dispatcher = ExecutorDispatcher::new_with_state_dir(Some(prepared), state_dir);
+    run_started_worker(
+        job,
+        envelope.clone(),
+        &evidence,
+        &ship_state,
+        &warm_pool,
+        &envelope.cwd,
+        state_dir,
+        state_dir,
+        &config,
+        &dispatcher,
+    )?;
+    let completed = queue
+        .get(job_id)?
+        .ok_or_else(|| ShipExecutionError::MissingQueuedJob(job_id.to_owned()))?;
+    Ok((envelope.kind, completed))
 }
 
 fn defer_until(now: DateTime<Utc>) -> DateTime<Utc> {

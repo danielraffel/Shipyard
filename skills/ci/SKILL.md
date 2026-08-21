@@ -11,7 +11,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 
 | Task | Command |
 |------|---------|
-| Validate current branch | `shipyard run --json` |
+| Validate current branch | `shipyard run --json` (Unix/macOS: queues to the single-worker daemon and returns after durable acceptance; Windows remains foreground) |
 | Validate specific targets | `shipyard run --targets mac,ubuntu --json` |
 | Iterate on one platform's CI failure | `shipyard run --skip-target <others>` (see [Iterating on a single-platform failure](#iterating-on-a-single-platform-failure)) |
 | Fast smoke check | `shipyard run --smoke --json` |
@@ -19,7 +19,8 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Start the live-mode webhook daemon | `shipyard daemon start` |
 | Inspect the daemon | `shipyard daemon status --json` |
 | Stop the daemon | `shipyard daemon stop` |
-| Full ship (PR + validate + merge) | `shipyard ship --json` |
+| Full ship (PR + validate + merge) | `shipyard ship --json` (Unix/macOS: queues to the single-worker daemon and returns after durable acceptance; Windows remains foreground) |
+| Debug validation in this terminal | `shipyard run --foreground` / `shipyard ship --foreground` |
 | Ship to develop instead of main | `shipyard ship --base develop --json` |
 | Resume an interrupted ship | `shipyard ship --resume --json` (auto when state exists) |
 | Force-restart a stale ship | `shipyard ship --no-resume --json` |

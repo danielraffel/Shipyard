@@ -160,21 +160,53 @@ impl AlreadyMergedObserver {
         })
     }
 
-    fn observe_pending_with(
+    pub(crate) fn observe_running(
         &mut self,
         jobs: &[Job],
         request_store: &QueueRequestStore,
+        cwd: &Path,
+        snapshot_file: Option<&Path>,
+    ) -> Vec<AlreadyMergedCancellation> {
+        let client = self.client.clone();
+        self.observe_running_with(jobs, request_store, |repo, pr| {
+            gh::pr_merged_head_sha(client.as_ref(), repo, pr, cwd, snapshot_file)
+        })
+    }
+
+    pub(crate) fn observe_pending_with(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        fetch: impl FnMut(&str, u64) -> Option<String>,
+    ) -> Vec<AlreadyMergedCancellation> {
+        self.observe_ship_with_status(jobs, request_store, JobStatus::Pending, fetch)
+    }
+
+    pub(crate) fn observe_running_with(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        fetch: impl FnMut(&str, u64) -> Option<String>,
+    ) -> Vec<AlreadyMergedCancellation> {
+        self.observe_ship_with_status(jobs, request_store, JobStatus::Running, fetch)
+    }
+
+    fn observe_ship_with_status(
+        &mut self,
+        jobs: &[Job],
+        request_store: &QueueRequestStore,
+        status: JobStatus,
         mut fetch: impl FnMut(&str, u64) -> Option<String>,
     ) -> Vec<AlreadyMergedCancellation> {
-        let mut pending_by_pr = BTreeMap::<(String, u64), Vec<(String, String)>>::new();
-        for job in jobs.iter().filter(|job| job.status == JobStatus::Pending) {
+        let mut jobs_by_pr = BTreeMap::<(String, u64), Vec<(String, String)>>::new();
+        for job in jobs.iter().filter(|job| job.status == status) {
             let Some(envelope) = request_store.load(&job.id).ok().flatten() else {
                 continue;
             };
             let QueuedExecutionRequest::Ship(request) = envelope.request else {
                 continue;
             };
-            pending_by_pr
+            jobs_by_pr
                 .entry((request.repo, request.pr))
                 .or_default()
                 .push((job.id.clone(), request.sha));
@@ -182,7 +214,7 @@ impl AlreadyMergedObserver {
 
         let now = Instant::now();
         let mut cancellations = Vec::new();
-        for ((repo, pr), pending_jobs) in pending_by_pr {
+        for ((repo, pr), observed_jobs) in jobs_by_pr {
             let cache_key = (repo.clone(), pr);
             let fresh_cached = self.observations.get(&cache_key).filter(|cached| {
                 now.saturating_duration_since(cached.observed_at)
@@ -204,14 +236,12 @@ impl AlreadyMergedObserver {
             let Some(merged_head) = merged_head else {
                 continue;
             };
-            cancellations.extend(
-                pending_jobs
-                    .into_iter()
-                    .filter_map(|(job_id, expected_head)| {
-                        (merged_head == expected_head)
-                            .then_some(AlreadyMergedCancellation { job_id, pr })
-                    }),
-            );
+            cancellations.extend(observed_jobs.into_iter().filter_map(
+                |(job_id, expected_head)| {
+                    (merged_head == expected_head)
+                        .then_some(AlreadyMergedCancellation { job_id, pr })
+                },
+            ));
         }
         cancellations
     }
@@ -1106,6 +1136,7 @@ mod tests {
                 kind: QueuedExecutionKind::Run,
                 cwd: PathBuf::from("/repo"),
                 created_at: Utc::now(),
+                provenance: None,
                 resource_plan,
                 request: QueuedExecutionRequest::Run(QueuedRunRequest {
                     branch: "main".to_owned(),
@@ -1129,6 +1160,7 @@ mod tests {
                 kind: QueuedExecutionKind::Ship,
                 cwd: PathBuf::from("/repo"),
                 created_at: Utc::now(),
+                provenance: None,
                 resource_plan: claim_plan(&[&format!("ship-state:{repo}:pr-{pr}")]),
                 request: QueuedExecutionRequest::Ship(QueuedShipRequest {
                     pr,

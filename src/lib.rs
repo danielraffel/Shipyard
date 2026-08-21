@@ -41,6 +41,7 @@ pub mod diagnostics;
 pub mod doctor;
 /// Durable evidence records and cross-branch lookup helpers.
 pub mod evidence;
+pub mod execution_supervisor;
 /// Local and remote executor support modules.
 pub mod executor;
 /// Fail-closed check that a host has converged to the declared fleet epoch.

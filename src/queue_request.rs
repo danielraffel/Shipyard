@@ -8,6 +8,7 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::config::LoadedConfig;
 use crate::executor::cloud::CloudTargetConfig;
 use crate::executor::contract::ContractConfig;
 use crate::executor::dispatch::{
@@ -222,6 +224,9 @@ pub struct QueuedExecutionEnvelope {
     pub cwd: PathBuf,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
+    /// Immutable checkout identity captured by the submitting process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ExecutionProvenance>,
     /// Scheduler-facing resource plan snapshot.
     pub resource_plan: JobResourcePlan,
     /// Resolved execution request.
@@ -244,6 +249,7 @@ impl QueuedExecutionEnvelope {
             kind: QueuedExecutionKind::Run,
             cwd: cwd.clone(),
             created_at: Utc::now(),
+            provenance: ExecutionProvenance::capture(&cwd, None, &request.sha),
             resource_plan: JobResourcePlan::from_run_request(&cwd, request),
             request: QueuedExecutionRequest::Run(QueuedRunRequest::from(request)),
         }
@@ -264,6 +270,7 @@ impl QueuedExecutionEnvelope {
             kind: QueuedExecutionKind::Ship,
             cwd: cwd.clone(),
             created_at: Utc::now(),
+            provenance: ExecutionProvenance::capture(&cwd, Some(&request.repo), &request.sha),
             resource_plan: JobResourcePlan::from_ship_request(&cwd, request),
             request: QueuedExecutionRequest::Ship(QueuedShipRequest::from(request)),
         }
@@ -286,6 +293,156 @@ impl QueuedExecutionEnvelope {
         };
         request.to_execution_request()
     }
+}
+
+/// Immutable checkout identity required before a daemon-owned worker may run.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExecutionProvenance {
+    /// Canonical submitting working directory.
+    pub canonical_cwd: PathBuf,
+    /// Canonical Git repository root.
+    pub repo_root: PathBuf,
+    /// Repository slug when the request performs GitHub operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_slug: Option<String>,
+    /// Exact submitted Git HEAD.
+    pub head_sha: String,
+    /// Signature of HEAD plus tracked and untracked working-tree contents.
+    pub tree_signature: String,
+    /// Signature of the resolved layered Shipyard configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_signature: Option<String>,
+}
+
+impl ExecutionProvenance {
+    pub(crate) fn capture(cwd: &Path, repo_slug: Option<&str>, expected_sha: &str) -> Option<Self> {
+        let canonical_cwd = fs::canonicalize(cwd).ok()?;
+        let repo_root = git_output(&canonical_cwd, &["rev-parse", "--show-toplevel"])?;
+        let repo_root = fs::canonicalize(repo_root.trim()).ok()?;
+        let head_sha = git_output(&canonical_cwd, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        if head_sha != expected_sha {
+            return None;
+        }
+        if let Some(expected_repo) = repo_slug {
+            let remote = git_output(&canonical_cwd, &["remote", "get-url", "origin"])?;
+            if parse_repo_slug(remote.trim()).as_deref() != Some(expected_repo) {
+                return None;
+            }
+        }
+        Some(Self {
+            canonical_cwd,
+            repo_root,
+            repo_slug: repo_slug.map(str::to_owned),
+            head_sha,
+            tree_signature: crate::tree_drift::compute_signature(cwd)?,
+            config_signature: None,
+        })
+    }
+
+    /// Capture checkout identity plus the exact resolved configuration used by
+    /// an unattended submission.
+    pub(crate) fn capture_with_config(
+        cwd: &Path,
+        repo_slug: Option<&str>,
+        expected_sha: &str,
+        config: &LoadedConfig,
+    ) -> Option<Self> {
+        let mut provenance = Self::capture(cwd, repo_slug, expected_sha)?;
+        provenance.config_signature = config_signature(config);
+        provenance.config_signature.as_ref()?;
+        Some(provenance)
+    }
+
+    /// Fail closed when a delayed worker no longer sees the submitted checkout.
+    pub fn validate(&self, cwd: &Path) -> QueueRequestResult<()> {
+        let canonical_cwd = fs::canonicalize(cwd)
+            .map_err(|error| invalid_snapshot(format!("submitted cwd is unavailable: {error}")))?;
+        if canonical_cwd != self.canonical_cwd {
+            return Err(invalid_snapshot("submitted cwd identity changed"));
+        }
+        let repo_root = git_output(cwd, &["rev-parse", "--show-toplevel"])
+            .and_then(|path| fs::canonicalize(path.trim()).ok())
+            .ok_or_else(|| invalid_snapshot("submitted cwd is no longer a Git checkout"))?;
+        if repo_root != self.repo_root {
+            return Err(invalid_snapshot("submitted repository root changed"));
+        }
+        let head = git_output(cwd, &["rev-parse", "HEAD"])
+            .map(|head| head.trim().to_owned())
+            .ok_or_else(|| invalid_snapshot("submitted Git HEAD is unreadable"))?;
+        if head != self.head_sha {
+            return Err(invalid_snapshot(format!(
+                "submitted Git HEAD drifted from {} to {head}",
+                self.head_sha
+            )));
+        }
+        if let Some(expected_repo) = &self.repo_slug {
+            let remote = git_output(cwd, &["remote", "get-url", "origin"])
+                .and_then(|remote| parse_repo_slug(remote.trim()))
+                .ok_or_else(|| invalid_snapshot("submitted Git origin is unreadable"))?;
+            if &remote != expected_repo {
+                return Err(invalid_snapshot(format!(
+                    "submitted repository changed from {expected_repo} to {remote}"
+                )));
+            }
+        }
+        let signature = crate::tree_drift::compute_signature(cwd)
+            .ok_or_else(|| invalid_snapshot("submitted working tree is unreadable"))?;
+        if signature != self.tree_signature {
+            return Err(invalid_snapshot(
+                "submitted working tree changed before execution",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate checkout identity and the resolved layered configuration.
+    pub(crate) fn validate_with_config(
+        &self,
+        cwd: &Path,
+        config: &LoadedConfig,
+    ) -> QueueRequestResult<()> {
+        self.validate(cwd)?;
+        let expected = self
+            .config_signature
+            .as_ref()
+            .ok_or_else(|| invalid_snapshot("request lacks unattended configuration provenance"))?;
+        let current = config_signature(config)
+            .ok_or_else(|| invalid_snapshot("resolved configuration cannot be signed"))?;
+        if &current != expected {
+            return Err(invalid_snapshot(
+                "resolved Shipyard configuration changed before execution",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn config_signature(config: &LoadedConfig) -> Option<String> {
+    let serialized = toml::to_string(&config.data).ok()?;
+    Some(hex::encode(Sha256::digest(serialized.as_bytes())))
+}
+
+fn parse_repo_slug(remote: &str) -> Option<String> {
+    let path = remote
+        .strip_prefix("git@github.com:")
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| remote.strip_prefix("https://github.com/"))?;
+    let slug = path.trim_end_matches('/').trim_end_matches(".git");
+    (slug.split('/').count() == 2).then(|| slug.to_owned())
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Queued execution kind.
@@ -1519,10 +1676,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        HostPoolDemand, JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION, QueueOutcomeStore,
-        QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind,
-        QueuedExecutionOutcome, QueuedExecutionRequest, VmSlotDemand,
+        ExecutionProvenance, HostPoolDemand, JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION,
+        QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
+        QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionRequest, VmSlotDemand,
     };
+    use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::executor::cloud::CloudTargetConfig;
     use crate::executor::dispatch::{
         FallbackBackend, FallbackTargetConfig, ResolvedBackend, ResolvedHostPoolConfig,
@@ -1534,6 +1692,73 @@ mod tests {
     use crate::job::{Priority, ValidationMode};
     use crate::ship::{RunExecutionRequest, ShipExecutionRequest};
     use crate::ship_state::{DispatchedRun, ShipState};
+
+    #[test]
+    fn unattended_provenance_rejects_resolved_config_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let global = temp.path().join("global");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&global).expect("global");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "Shipyard Test"],
+            vec!["config", "user.email", "shipyard@example.invalid"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+        std::fs::write(repo.join("tracked.txt"), "stable\n").expect("tracked file");
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "tracked.txt"])
+                .current_dir(&repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-qm", "fixture"])
+                .current_dir(&repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .expect("head");
+        let head = String::from_utf8(head.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned();
+        std::fs::write(global.join("config.toml"), "[queue]\nmax_workers = 2\n").expect("config");
+        let original =
+            LoadedConfig::load(Some(global.clone()), None, None, LocalOverlaySource::None)
+                .expect("original config");
+        let provenance = ExecutionProvenance::capture_with_config(&repo, None, &head, &original)
+            .expect("provenance");
+        provenance
+            .validate_with_config(&repo, &original)
+            .expect("unchanged config");
+
+        std::fs::write(global.join("config.toml"), "[queue]\nmax_workers = 3\n")
+            .expect("config drift");
+        let changed = LoadedConfig::load(Some(global), None, None, LocalOverlaySource::None)
+            .expect("changed config");
+        let error = provenance
+            .validate_with_config(&repo, &changed)
+            .expect_err("config drift must fail closed");
+        assert!(error.to_string().contains("configuration changed"));
+    }
 
     fn local_target() -> ResolvedTarget {
         local_target_with_name("mac", Some(PathBuf::from("/repo")))
