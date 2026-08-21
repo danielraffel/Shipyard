@@ -219,10 +219,27 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   scheduler starts a job only to defer it for host-pool capacity or an
   unavailable local lease, the drain owner requeues that transient `Running`
   job with a retry timestamp; admission ignores it until that timestamp expires.
+  On Unix and macOS, normal `run`, `ship`, and `pr` submission instead hands the
+  durable request to the same-version Shipyard daemon and returns after the
+  daemon accepts it. The daemon runs one worker at a time in a separate process
+  group and records an execution generation plus canonical checkout, origin,
+  HEAD, tree, and configuration provenance. After a daemon restart, it adopts
+  only an exactly matching live receipt. A `Running` job without that proof is
+  terminalized as `UNCERTAIN` and is never replayed. Windows remains explicitly
+  foreground-only for this bounded durability slice.
   Before admission, the owner also groups pending ship requests by
   `(repository, PR)` and observes each distinct PR at most once per 30 seconds.
   If GitHub reports `MERGED` and the reported head exactly matches the durable
-  queued SHA, every matching pending job is cancelled as already complete.
+  queued SHA, every matching pending job is cancelled as already complete. The
+  daemon applies the same exact-head observation to a running ship job: it first
+  commits an immutable terminal cancellation and typed outcome, then signals the
+  whole supervised process group. An open PR, a different merged head, an auth
+  or network failure, or a malformed response is a no-op. Stale worker progress
+  cannot overwrite the winning terminal record, and a live terminal receipt
+  continues to reserve the sole execution slot until process-group death is
+  proven. Each daemon tick also repairs a missing typed outcome from terminal
+  queue state, so a restart after a transient outcome-write failure preserves a
+  durable disposition.
   These reads use the configured GitHub credential, explicit repository scope,
   and one 15-second credential-plus-command budget. An unavailable observation,
   malformed response, or different merged head leaves the job pending.
