@@ -187,6 +187,65 @@ accessible by integration`, update the App installation permissions above and
 mint a fresh installation token rather than falling back to an unrelated
 ambient credential.
 
+### Unattended self-update and fleet rollout
+
+`shipyard update` reads GitHub auth only from the trusted machine-global
+configuration returned by `shipyard paths`. When that file declares an env or
+command source, helper failure stops before downloading or replacing anything;
+Shipyard does not silently fall back to the anonymous GitHub API. The updater
+downloads the installer from the exact target tag completely before executing
+it, and `--refresh-daemon` restarts the daemon only after the installer's staged
+binary smoke passes.
+
+Non-login SSH and launchd do not need a caller-built `PATH`. Shipyard resolves
+system curl/Bash from canonical absolute locations and starts detached daemons
+with Homebrew, `/usr/local/bin`, `~/.local/bin`, and system tool directories in
+a deterministic PATH. Custom locations can be configured globally:
+
+```toml
+[update]
+curl_bin = "/usr/bin/curl"
+shell_bin = "/bin/bash"
+```
+
+For one exact fleet rollout, give every remote host class the installed
+Shipyard path (the local/controller class may omit it):
+
+```toml
+[host_class.m5]
+ssh = "m5-lan"
+shipyard_bin = "/Users/you/.local/bin/shipyard"
+github_cli = "/Users/you/.local/bin/ghapp"
+shipyard_mode = "shipyard"
+shipyard_global_dir = "/Users/you/Library/Application Support/shipyard"
+shipyard_state_dir = "/Users/you/Library/Application Support/shipyard"
+```
+
+Then review and apply the same immutable release plan:
+
+```sh
+shipyard runner fleet-update --to v0.100.0 --json
+shipyard runner fleet-update --to v0.100.0 --apply --json
+```
+
+The command uses a stripped remote environment deliberately, invokes the
+configured absolute binary, bounds each host attempt to ten minutes, and
+refreshes each host's daemon only after its update succeeds. Because inherited
+secrets are intentionally stripped, fleet rollout requires a machine-global
+`github.auth.source = "command"` helper that can resolve credentials from its
+own durable configuration using only `HOME` and the canonical PATH. Remote
+classes also use their absolute `github_cli` helper to download and run the
+exact tagged installer directly, so the first rollout can bootstrap a host
+whose older Shipyard binary does not yet know the new rollout flags. The
+explicit mode/config/state fields bind verification and refresh to the daemon
+the profile actually owns; direct
+`shipyard update` continues to support env auth. A missing absolute profile
+path is reported as launch-
+environment drift, not as evidence that Homebrew, Tart, or Shipyard is
+uninstalled. Fleet rollout rejects targets older than v0.100.0 before mutation;
+use an older release's documented manual procedure when rollback crosses that
+bootstrap boundary.
+
 Runner-group access is valuable when Shipyard coordinates multiple local
 providers because an App-backed policy verifier can compare selected
 repositories, selected workflows, and live group membership before the

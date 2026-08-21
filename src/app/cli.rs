@@ -1033,6 +1033,17 @@ pub(super) enum RunnerCommand {
         #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
         release_stale_threshold_secs: i64,
     },
+    /// Roll one exact Shipyard release across configured host classes and
+    /// refresh each daemon. Plans only unless `--apply` is supplied.
+    #[command(name = "fleet-update")]
+    FleetUpdate {
+        /// Exact release tag to install on every host, for example v0.100.0.
+        #[arg(long = "to")]
+        to: String,
+        /// Execute the rollout. Without this flag, emit the exact host plan.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Maintain an expiring repository-variable lease for an approved local
     /// Linux CI lane. Dry-run unless `--apply` is supplied.
     LocalLinuxLease {
@@ -1696,6 +1707,9 @@ pub(super) struct RescueArgs {
 }
 
 #[derive(Clone, Debug, clap::Args)]
+// Clap models independent user flags as bools; unattended_fleet is an
+// internal trust-context flag rather than another user-selected update mode.
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct UpdateArgs {
     /// Report installed/available versions without applying.
     #[arg(long = "check", action = ArgAction::SetTrue)]
@@ -1706,6 +1720,14 @@ pub(super) struct UpdateArgs {
     /// Plan the upgrade without applying.
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]
     pub(super) dry_run: bool,
+    /// Refresh the detached daemon only after the update is installed and
+    /// smoke-verified. Intended for unattended fleet rollout.
+    #[arg(long = "refresh-daemon", action = ArgAction::SetTrue)]
+    pub(super) refresh_daemon: bool,
+    /// Require self-contained command-based auth suitable for a stripped
+    /// unattended fleet environment (internal fleet-update contract).
+    #[arg(long = "unattended-fleet", action = ArgAction::SetTrue, hide = true)]
+    pub(super) unattended_fleet: bool,
     /// Override the install.sh URL (test hook).
     #[arg(long = "install-script-url", hide = true)]
     pub(super) install_script_url: Option<String>,

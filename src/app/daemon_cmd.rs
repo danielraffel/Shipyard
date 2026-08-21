@@ -172,6 +172,7 @@ fn daemon_refresh<W: Write>(
         state_dir_override,
         runtime_paths,
         repos,
+        None,
         spawn_detached,
     ) {
         Ok(outcome) => {
@@ -281,27 +282,39 @@ fn execute_daemon_refresh<F>(
     state_dir_override: Option<PathBuf>,
     runtime_paths: &RuntimePaths,
     explicit_repos: &[String],
+    binary_override: Option<PathBuf>,
     spawn: F,
 ) -> Result<DaemonRefreshOutcome, DaemonRefreshError>
 where
     F: FnOnce(&SpawnRequest) -> Result<u32, DaemonSpawnFailedError>,
 {
+    let prior_status = read_daemon_status(&runtime_paths.state_dir);
+    let had_prior = prior_status.is_some();
     let prior_repos = if explicit_repos.is_empty() {
-        registered_repos_from_status(read_daemon_status(&runtime_paths.state_dir).as_ref())
+        registered_repos_from_status(prior_status.as_ref())
     } else {
         Vec::new()
     };
     let stopped_prior = stop_running(&runtime_paths.state_dir);
+    if had_prior && !stopped_prior && read_daemon_status(&runtime_paths.state_dir).is_some() {
+        return Err(DaemonRefreshError {
+            stopped_prior: false,
+            repos: prior_repos,
+            error: "prior daemon did not stop; refusing to report a refreshed daemon".to_owned(),
+        });
+    }
     let repos = if explicit_repos.is_empty() {
         prior_repos
     } else {
         resolve_repos(&runtime_paths.state_dir, explicit_repos)
     };
-    let binary = std::env::current_exe().map_err(|error| DaemonRefreshError {
-        stopped_prior,
-        repos: repos.clone(),
-        error: format!("failed to locate current binary: {error}"),
-    })?;
+    let binary = binary_override
+        .map_or_else(std::env::current_exe, Ok)
+        .map_err(|error| DaemonRefreshError {
+            stopped_prior,
+            repos: repos.clone(),
+            error: format!("failed to locate current binary: {error}"),
+        })?;
     let request = SpawnRequest {
         binary,
         mode,
@@ -321,6 +334,27 @@ where
         new_pid,
         repos,
     })
+}
+
+/// Refresh the daemon after a self-update has completed and the installed
+/// binary has passed the installer's smoke verification. No existing daemon
+/// is stopped before the caller reaches this function.
+pub(super) fn refresh_after_verified_update(
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
+    installed_binary: PathBuf,
+) -> Result<u32, String> {
+    execute_daemon_refresh(
+        mode,
+        Some(runtime_paths.global_dir.clone()),
+        Some(runtime_paths.state_dir.clone()),
+        runtime_paths,
+        &[],
+        Some(installed_binary),
+        spawn_detached,
+    )
+    .map(|outcome| outcome.new_pid)
+    .map_err(|error| error.error)
 }
 
 fn registered_repos_from_status(status: Option<&Value>) -> Vec<String> {
@@ -743,6 +777,7 @@ mod tests {
             Some(temp.path().to_path_buf()),
             &runtime_paths(temp.path()),
             &[],
+            None,
             |request: &SpawnRequest| {
                 assert_eq!(request.repos, vec!["owner/a", "owner/z"]);
                 Ok(4321)
@@ -773,6 +808,7 @@ mod tests {
                 "owner/a".to_owned(),
                 "owner/b".to_owned(),
             ],
+            None,
             |request: &SpawnRequest| {
                 assert_eq!(request.repos, vec!["owner/a", "owner/b"]);
                 Ok(1234)
@@ -788,6 +824,7 @@ mod tests {
     #[test]
     fn refresh_allows_empty_repo_list_without_running_daemon() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let installed_binary = temp.path().join("installed-shipyard");
 
         let outcome = execute_daemon_refresh(
             RuntimeMode::Isolated,
@@ -795,8 +832,10 @@ mod tests {
             Some(temp.path().to_path_buf()),
             &runtime_paths(temp.path()),
             &[],
+            Some(installed_binary.clone()),
             |request: &SpawnRequest| {
                 assert!(request.repos.is_empty());
+                assert_eq!(request.binary, installed_binary);
                 Ok(999)
             },
         )
@@ -816,6 +855,7 @@ mod tests {
             Some(temp.path().to_path_buf()),
             &runtime_paths(temp.path()),
             &["owner/repo".to_owned()],
+            None,
             |_request: &SpawnRequest| Err(super::DaemonSpawnFailedError("boom".to_owned())),
         )
         .expect_err("spawn failure");

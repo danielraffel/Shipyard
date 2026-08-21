@@ -113,6 +113,18 @@ not resume until the incident owner has restored the intended queue order.
 Queue writes are serialized process-wide and recorded in machine-global
 `merge_queue/mutations.jsonl`.
 
+For release rollout, configure absolute `shipyard_bin` and `github_cli` paths plus explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir` on every remote
+`[host_class.<name>]`. Review `shipyard runner fleet-update --to vX.Y.Z` and
+then use the same command with `--apply`; do not assemble per-host SSH/install
+pipelines. Fleet rollout requires a self-contained machine-global command auth
+helper because inherited secrets are deliberately stripped. The updater stages
+the entire exact-tag installer before execution (including when the old remote
+binary predates fleet-update), refreshes daemons only after
+the staged binary passes its smoke, and terminates any host attempt that exceeds
+ten minutes. A minimal non-login PATH that hides
+Homebrew is launch-environment drift, not evidence that Tart or Shipyard is
+missing.
+
 After changing `mutation_machine` or upgrading the release bot, regenerate the
 post-tag workflow with `shipyard release-bot hook install`. Its tag extraction
 must remain literal Bash, `tag="${GITHUB_REF#refs/tags/}"`; the double-braced

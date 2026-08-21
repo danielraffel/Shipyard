@@ -212,6 +212,22 @@ impl GhClient {
         self.resolve_token_with_timeout(cwd, None)
     }
 
+    /// Resolve configured token material for a child process that cannot use
+    /// `gh` directly (for example the self-updater's verified installer).
+    ///
+    /// The caller must keep the returned value out of argv and logs and place
+    /// it only in the child's environment. Ambient `gh-cli` auth intentionally
+    /// returns `None`; callers may then use their existing best-effort ambient
+    /// fallback without weakening a configured env/command source.
+    pub(crate) fn resolve_token_for_child(
+        &self,
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<Option<String>, GhPrepareError> {
+        self.resolve_token_with_timeout(cwd, Some(timeout))
+            .map(|token| token.map(|token| token.token))
+    }
+
     fn resolve_token_with_timeout(
         &self,
         cwd: &Path,
@@ -1357,7 +1373,12 @@ printf '%s' '{{"state":"MERGED","headRefOid":"abc123"}}'
         let temp = TempDir::new().expect("temp");
         let helper = temp.path().join("token-helper");
         write_executable(&helper, "#!/bin/sh\nread ignored || true\nprintf token\n");
-        let mut command = Command::new(&helper);
+        // Execute the just-written fixture through the immutable system shell.
+        // Directly exec'ing a mutable temp script can race macOS/coverage file
+        // instrumentation and fail with ETXTBSY before this stdin invariant is
+        // exercised.
+        let mut command = Command::new("/bin/sh");
+        command.arg(&helper);
         // A caller-provided pipe would remain open in the parent and make the
         // helper block on `read` unless the bounded boundary replaces stdin.
         command.stdin(Stdio::piped());
@@ -1384,7 +1405,8 @@ printf '%s' '{{"state":"MERGED","headRefOid":"abc123"}}'
                 descendant_pid.display()
             ),
         );
-        let mut command = Command::new(&helper);
+        let mut command = Command::new("/bin/sh");
+        command.arg(&helper);
 
         // Full macOS CI runs many process-heavy tests concurrently. Keep this
         // boundary comfortably above scheduler latency while the descendant's

@@ -173,6 +173,25 @@ use an App-authenticated GitHub wrapper, set `github_cli = "ghapp"` on each
 `TARTCI_GH_CLI`. When omitted, local probes preserve any inherited
 `TARTCI_GH_CLI` and remote probes retain tartci's default.
 
+For unattended Shipyard rollout, set `shipyard_bin` to an absolute path on
+every remote host class and make its existing `github_cli` an absolute governed
+helper path. Also declare `shipyard_mode`, `shipyard_global_dir`, and
+`shipyard_state_dir`; rollout fails closed without that exact daemon context.
+Use `shipyard runner fleet-update --to vX.Y.Z` to
+inspect the plan and add `--apply` only for the exact release being deployed.
+Each remote invocation starts from `env -i`, restores Shipyard's canonical
+automation PATH internally, requires a self-contained machine-global
+`github.auth.source = "command"` helper, installs the exact tag, and refreshes
+the daemon after verification. Remote rollout bootstraps through the exact
+tagged installer instead of requiring the old remote binary to recognize new
+flags. Each host attempt is supervised and terminated
+after ten minutes so an unavailable machine cannot wedge later hosts. Never use
+`command -v tart` or `command -v shipyard` under a raw minimal SSH PATH as an
+installation test: an absolute configured binary that is executable proves the
+tool is present, while a failed relative lookup proves only launch-environment
+drift. Fleet status and rollout therefore use profile paths rather than
+classifying PATH invisibility as absence.
+
 `shipyard runner fleet-status` is the read-only GitHub monitoring surface for
 this pool (it writes only a local observation snapshot). In addition to TartCI
 capacity and supervisor freshness, it correlates

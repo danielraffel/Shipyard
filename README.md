@@ -70,9 +70,11 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   operator reason and terminates an active local or SSH validation process tree
   on its next progress event, including descendant build processes.
 - **In-tool self-update.** `shipyard update` is the discoverable
-  upgrade path (no more curl-pipe to remember); `--check` reports
+  upgrade path (no curl-pipe to remember); it uses the trusted machine-global
+  GitHub auth helper and a tag-matched installer, and `--check` reports
   installed-vs-available, `--to v0.55.0` pins a specific tag for
-  rollback.
+  rollback. `shipyard runner fleet-update --to vX.Y.Z` plans one governed
+  rollout; add `--apply` to update and refresh every configured daemon.
 - **Graceful GraphQL rate-limit degradation.** `shipyard auto-merge`
   and `shipyard wait pr` fall back to REST automatically when
   GraphQL exhausts (separate 5000/hr bucket). `shipyard doctor
