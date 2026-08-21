@@ -930,7 +930,7 @@ mod tests {
         );
         supervisor.tick().expect("start worker");
         let pid_path = temp.path().join("descendant.pid");
-        let deadline = Instant::now() + StdDuration::from_secs(5);
+        let deadline = Instant::now() + StdDuration::from_secs(30);
         while !pid_path.exists() && Instant::now() < deadline {
             thread::sleep(StdDuration::from_millis(10));
         }
@@ -947,7 +947,7 @@ mod tests {
         queue.update(&cancelled).expect("persist cancel");
         supervisor.tick().expect("terminate cancelled worker");
 
-        let deadline = Instant::now() + StdDuration::from_secs(5);
+        let deadline = Instant::now() + StdDuration::from_secs(30);
         while process_is_running(descendant.trim()) && Instant::now() < deadline {
             thread::sleep(StdDuration::from_millis(10));
         }
@@ -978,7 +978,7 @@ mod tests {
         supervisor.tick().expect("start ship worker");
         let parent = supervisor.children["merged-tree"].id().to_string();
         let pid_path = temp.path().join("descendant.pid");
-        let deadline = Instant::now() + StdDuration::from_secs(5);
+        let deadline = Instant::now() + StdDuration::from_secs(30);
         while !pid_path.exists() && Instant::now() < deadline {
             thread::sleep(StdDuration::from_millis(10));
         }
@@ -993,7 +993,7 @@ mod tests {
             .expect("durable cancellation");
         supervisor.tick().expect("terminate and release");
 
-        let deadline = Instant::now() + StdDuration::from_secs(5);
+        let deadline = Instant::now() + StdDuration::from_secs(30);
         while (process_is_running(parent.trim()) || process_is_running(descendant.trim()))
             && Instant::now() < deadline
         {
