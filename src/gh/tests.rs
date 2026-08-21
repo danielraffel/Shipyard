@@ -991,6 +991,53 @@ fn pinned_command_auth_uses_the_exact_validated_token_for_every_command() {
     assert_eq!(std::fs::read_to_string(count).expect("helper count"), "1\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn pinned_repo_placeholder_auth_survives_an_originless_cleanup_repository() {
+    let repo = TempDir::new().expect("repository");
+    git(repo.path(), &["init", "--quiet", "--initial-branch=main"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+    );
+    let helper = repo.path().join("repo-token-helper");
+    write_executable(
+        &helper,
+        "#!/bin/sh\n[ \"$1\" = owner/repo ] || exit 88\nprintf 'ghs_repo_scoped_app\\n'\n",
+    );
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}", "{{repo_slug}}"]
+            "#,
+        helper.display()
+    ));
+    let mut primary = GhClient::from_loaded_config(&config).expect("primary client");
+    primary
+        .pin_command_auth(repo.path())
+        .expect("pin repository-scoped token");
+
+    let native = std::env::current_exe().expect("native test executable");
+    let binary_authority = GhClient::from_loaded_config(&config_from_toml(&format!(
+        r#"
+            [github.auth]
+            privileged_git_binary = "{}"
+            "#,
+        native.display()
+    )))
+    .expect("binary authority");
+    let isolated = TempDir::new().expect("originless cleanup repository");
+    let command = primary
+        .prepare_git_command_with_binary_authority(isolated.path(), &binary_authority)
+        .expect("pinned auth no longer needs repository discovery");
+
+    assert_eq!(
+        env_value(&command, GH_TOKEN_ENV),
+        Some(OsString::from("ghs_repo_scoped_app"))
+    );
+}
+
 #[test]
 fn helper_failure_display_redacts_token_like_stderr() {
     let error = GhPrepareError::HelperFailed {

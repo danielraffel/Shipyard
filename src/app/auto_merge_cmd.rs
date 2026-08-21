@@ -627,11 +627,17 @@ fn merge_pr(
     }
 
     let custom_command = merge_command.is_some();
-    let client = if custom_command {
+    let mut client = if custom_command {
         None
     } else {
         Some(gh_client(cwd)?)
     };
+    let mut isolated_branch_cleanup = false;
+    if let Some(client) = client.as_mut()
+        && delete_branch
+    {
+        isolated_branch_cleanup = require_branch_cleanup_git(client, cwd, global_dir)?;
+    }
     let mut command = if let Some(merge_command) = merge_command {
         Command::new(merge_command)
     } else {
@@ -642,12 +648,8 @@ fn merge_pr(
             cwd,
         )?
     };
-    let mut isolated_branch_cleanup = false;
     if let Some(client) = client.as_ref() {
         verify_live_merge_target(client, cwd, state, "before governance selection")?;
-        if delete_branch {
-            isolated_branch_cleanup = require_branch_cleanup_git(client, cwd, global_dir)?;
-        }
     }
     let queue_required = if custom_command {
         false
@@ -818,12 +820,11 @@ fn merge_pr(
     if output.status.success() {
         if let Some(client) = client.as_ref() {
             let disposition = classify_builtin_merge_success(client, cwd, state)?;
-            if isolated_branch_cleanup && matches!(&disposition, MergeDisposition::Merged { .. }) {
-                return Ok(MergeDisposition::Merged {
-                    cleanup_warning: delete_pr_head_branch(client, cwd, global_dir, state).err(),
-                });
-            }
-            return Ok(disposition);
+            return Ok(cleanup_confirmed_merge(
+                disposition,
+                isolated_branch_cleanup,
+                || delete_pr_head_branch(client, cwd, global_dir, state),
+            ));
         }
         return Ok(MergeDisposition::Merged {
             cleanup_warning: None,
@@ -865,9 +866,11 @@ fn merge_pr(
             &state.head_sha,
             &state.base_branch,
             merge_method,
-            delete_branch.then_some(global_dir),
         )?;
-        return classify_builtin_merge_success(client, cwd, state);
+        let disposition = classify_builtin_merge_success(client, cwd, state)?;
+        return Ok(cleanup_confirmed_merge(disposition, delete_branch, || {
+            delete_pr_head_branch(client, cwd, global_dir, state)
+        }));
     }
     Err(message)
 }
@@ -1195,7 +1198,7 @@ pub(super) fn supervise_merge_queue(
     {
         return outcome;
     }
-    let Ok(client) = gh_client(cwd) else {
+    let Ok(mut client) = gh_client(cwd) else {
         return AutoMergeOutcome::MergeFailed {
             error: "github auth config failed while supervising merge queue".to_owned(),
         };
@@ -1314,7 +1317,11 @@ pub(super) fn supervise_merge_queue(
                 }
                 if observation.merged {
                     let cleanup_warning = if delete_branch {
-                        delete_pr_head_branch(&client, cwd, global_dir, &state).err()
+                        require_branch_cleanup_git(&mut client, cwd, global_dir)
+                            .err()
+                            .or_else(|| {
+                                delete_pr_head_branch(&client, cwd, global_dir, &state).err()
+                            })
                     } else {
                         None
                     };
@@ -2096,6 +2103,19 @@ enum MergeDisposition {
     Enqueued,
 }
 
+fn cleanup_confirmed_merge(
+    disposition: MergeDisposition,
+    requested: bool,
+    cleanup: impl FnOnce() -> Result<(), String>,
+) -> MergeDisposition {
+    match disposition {
+        MergeDisposition::Merged { cleanup_warning } if requested => MergeDisposition::Merged {
+            cleanup_warning: cleanup_warning.or_else(|| cleanup().err()),
+        },
+        other => other,
+    }
+}
+
 fn repository_requires_merge_queue(
     client: &GhClient,
     cwd: &Path,
@@ -2304,8 +2324,8 @@ fn is_graphql_merge_integration_blocked(message: &str) -> bool {
 /// the actual merge POST. When GraphQL is at 0/5000 the call fails, but
 /// REST is independent (`PUT /repos/:repo/pulls/:n/merge`) and usually has
 /// budget left. This function bypasses the GraphQL probe and calls REST
-/// directly through `gh api`, then optionally deletes the head branch the
-/// same way `gh pr merge --delete-branch` would.
+/// directly through `gh api`. The caller confirms the merged state before
+/// running optional branch cleanup and preserving any cleanup warning.
 ///
 /// Race protection (issue #266 + #321): the validated head SHA
 /// (`expected_head_sha`, the SHA Shipyard actually validated) is passed
@@ -2325,7 +2345,6 @@ fn merge_pr_rest(
     expected_head_sha: &str,
     expected_base: &str,
     merge_method: MergeMethod,
-    cleanup_global_dir: Option<&Path>,
 ) -> Result<(), String> {
     let repo = repo_slug_for_rest(cwd)?;
     let info = pr_head_info_rest(client, &repo, pr, cwd)?;
@@ -2365,16 +2384,6 @@ fn merge_pr_rest(
         Err(error) => return Err(error),
     }
 
-    if let (Some(global_dir), Some(head_repo)) = (cleanup_global_dir, info.head_repo.as_deref()) {
-        let _ = delete_head_branch(
-            client,
-            cwd,
-            global_dir,
-            head_repo,
-            &info.head_ref,
-            expected_head_sha,
-        );
-    }
     Ok(())
 }
 
@@ -2422,10 +2431,16 @@ fn branch_cleanup_git_authority(
 }
 
 fn require_branch_cleanup_git(
-    client: &GhClient,
+    client: &mut GhClient,
     cwd: &Path,
     global_dir: &Path,
 ) -> Result<bool, String> {
+    let auth = client
+        .pin_command_auth(cwd)
+        .map_err(|error| format!("failed to pin Git auth for branch cleanup: {error}"))?;
+    if matches!(auth.source, GhAuthSourceSummary::GhCli) {
+        return Ok(false);
+    }
     if let Some(git_authority) = branch_cleanup_git_authority(client, cwd, global_dir)? {
         git_authority
             .prepare_privileged_git_command(cwd)
@@ -2818,8 +2833,8 @@ mod tests {
             local_dir: None,
             local_overlay_source: crate::config::LocalOverlaySource::None,
         };
-        let client = GhClient::from_loaded_config(&config).expect("App client");
-        let error = require_branch_cleanup_git(&client, Path::new("/tmp"), global.path())
+        let mut client = GhClient::from_loaded_config(&config).expect("App client");
+        let error = require_branch_cleanup_git(&mut client, Path::new("/tmp"), global.path())
             .expect_err("a layered privileged Git override must not authorize cleanup");
         assert!(error.contains("--delete-branch requires trusted isolated Git cleanup"));
 
@@ -2837,12 +2852,13 @@ mod tests {
         )
         .expect("machine-global trusted Git config");
         assert!(
-            require_branch_cleanup_git(&client, Path::new("/tmp"), global.path())
+            require_branch_cleanup_git(&mut client, Path::new("/tmp"), global.path())
                 .expect("machine-global trusted Git authorizes cleanup")
         );
 
+        let mut ambient = GhClient::ambient();
         assert!(
-            !require_branch_cleanup_git(&GhClient::ambient(), Path::new("/tmp"), global.path())
+            !require_branch_cleanup_git(&mut ambient, Path::new("/tmp"), global.path())
                 .expect("ambient cleanup retains its existing Git authority")
         );
     }
@@ -3239,6 +3255,31 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--delete-branch"));
         assert!(args.iter().any(|arg| arg == "--match-head-commit"));
         assert!(args.iter().any(|arg| arg == &state.head_sha));
+    }
+
+    #[test]
+    fn confirmed_merge_preserves_cleanup_failure_but_enqueued_state_never_cleans() {
+        let merged = cleanup_confirmed_merge(
+            MergeDisposition::Merged {
+                cleanup_warning: None,
+            },
+            true,
+            || Err("lease mismatch".to_owned()),
+        );
+        assert_eq!(
+            merged,
+            MergeDisposition::Merged {
+                cleanup_warning: Some("lease mismatch".to_owned()),
+            }
+        );
+
+        let called = std::cell::Cell::new(false);
+        let enqueued = cleanup_confirmed_merge(MergeDisposition::Enqueued, true, || {
+            called.set(true);
+            Ok(())
+        });
+        assert_eq!(enqueued, MergeDisposition::Enqueued);
+        assert!(!called.get());
     }
 
     // ── short_sha helper ────────────────────────────────────────────────
