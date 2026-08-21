@@ -335,7 +335,7 @@ fn drain_webhook_events(
     server: &IpcServer,
     last_event_at: &Arc<Mutex<Option<f64>>>,
     ship_dir: &Path,
-    previous_states: &mut BTreeMap<u64, ShipState>,
+    previous_states: &mut BTreeMap<(String, u64), ShipState>,
 ) {
     while let Ok(event) = webhook_rx.try_recv() {
         let archived_event =
@@ -360,7 +360,7 @@ fn publish_daemon_event(server: &IpcServer, last_event_at: &Arc<Mutex<Option<f64
 fn archive_closed_pull_request_ship_state(
     event: &Value,
     ship_dir: &Path,
-    previous_states: &mut BTreeMap<u64, ShipState>,
+    previous_states: &mut BTreeMap<(String, u64), ShipState>,
 ) -> Option<Value> {
     let payload = event.get("payload")?;
     if event.get("kind").and_then(Value::as_str) != Some("pull_request") {
@@ -392,13 +392,13 @@ fn archive_closed_pull_request_ship_state(
     }
 
     let store = ShipStateStore::new(ship_dir.to_path_buf()).ok()?;
-    let lock = store.lock_pr(pr).ok()?;
-    let current = store.get_locked(pr, &lock)?;
-    if current.repo != repo {
-        return None;
-    }
-    store.archive_locked(pr, &lock).ok().flatten()?;
-    previous_states.remove(&pr);
+    let lock = store.lock_pr_scoped(&repo, pr).ok()?;
+    let current = store.get_locked_scoped(&repo, pr, &lock)?;
+    store
+        .archive_scoped_locked(&repo, pr, &lock)
+        .ok()
+        .flatten()?;
+    previous_states.remove(&(crate::evidence::canonical_repository(&current.repo), pr));
 
     let outcome = if merged { "merged" } else { "closed" };
     Some(serde_json::json!({
@@ -755,26 +755,31 @@ fn ship_state_values(path: &Path) -> Vec<Value> {
 }
 
 #[cfg(unix)]
-fn ship_state_map(path: &Path) -> BTreeMap<u64, ShipState> {
+fn ship_state_map(path: &Path) -> BTreeMap<(String, u64), ShipState> {
     let Ok(store) = ShipStateStore::new(path.to_path_buf()) else {
         return BTreeMap::new();
     };
     store
         .list_active()
         .into_iter()
-        .map(|state| (state.pr, state))
+        .map(|state| {
+            (
+                (crate::evidence::canonical_repository(&state.repo), state.pr),
+                state,
+            )
+        })
         .collect()
 }
 
 #[cfg(unix)]
 fn ship_state_delta_events(
-    previous: &BTreeMap<u64, ShipState>,
-    current: &BTreeMap<u64, ShipState>,
+    previous: &BTreeMap<(String, u64), ShipState>,
+    current: &BTreeMap<(String, u64), ShipState>,
 ) -> Vec<Value> {
     let mut events = Vec::new();
 
-    for (pr, state) in current {
-        let previous_state = previous.get(pr);
+    for (identity, state) in current {
+        let previous_state = previous.get(identity);
         for run in &state.dispatched_runs {
             if run_changed(previous_state, run) {
                 events.push(workflow_run_event(state, run));
@@ -2021,7 +2026,7 @@ mod tests {
 
         assert!(store.get(151).is_none());
         assert_eq!(store.list_archived().len(), 1);
-        assert!(!previous_states.contains_key(&151));
+        assert!(!previous_states.contains_key(&("owner/repo".to_owned(), 151)));
         assert_eq!(archived_event["kind"], "state-archived");
         assert_eq!(archived_event["payload"]["pr"], 151);
         assert_eq!(archived_event["payload"]["repo"], "owner/repo");
@@ -2062,7 +2067,7 @@ mod tests {
                 .is_none()
         );
         assert!(store.get(151).is_some());
-        assert!(previous_states.contains_key(&151));
+        assert!(previous_states.contains_key(&("owner/repo".to_owned(), 151)));
     }
 
     #[cfg(unix)]

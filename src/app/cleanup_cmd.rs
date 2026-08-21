@@ -277,9 +277,13 @@ fn cleanup_ship_state(
     let closed_prs = gather_closed_prs(&store, cwd, &gh_client)?;
     let mut deleted_active = Vec::new();
     for state in store.list_active() {
-        if closed_prs.contains(&state.pr) && state.updated_at <= active_cutoff {
+        if closed_prs
+            .iter()
+            .any(|(repo, pr)| repo.eq_ignore_ascii_case(&state.repo) && *pr == state.pr)
+            && state.updated_at <= active_cutoff
+        {
             store
-                .delete(state.pr)
+                .delete_scoped(&state.repo, state.pr)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             deleted_active.push(state.pr);
         }
@@ -323,18 +327,28 @@ fn gather_closed_prs(
     store: &ShipStateStore,
     cwd: &Path,
     gh_client: &GhClient,
-) -> Result<Vec<u64>, CliFailure> {
+) -> Result<Vec<(String, u64)>, CliFailure> {
+    gather_closed_prs_with(store, |repo, pr| pr_is_closed(repo, pr, cwd, gh_client))
+}
+
+fn gather_closed_prs_with(
+    store: &ShipStateStore,
+    mut is_closed: impl FnMut(&str, u64) -> Result<bool, CliFailure>,
+) -> Result<Vec<(String, u64)>, CliFailure> {
     let mut closed = Vec::new();
     for state in store.list_active() {
-        if pr_is_closed(state.pr, cwd, gh_client)? {
-            closed.push(state.pr);
+        if is_closed(&state.repo, state.pr)? {
+            closed.push((state.repo, state.pr));
         }
     }
     Ok(closed)
 }
 
-fn pr_is_closed(pr: u64, cwd: &Path, gh_client: &GhClient) -> Result<bool, CliFailure> {
+fn pr_is_closed(repo: &str, pr: u64, cwd: &Path, gh_client: &GhClient) -> Result<bool, CliFailure> {
     let output = gh_client
+        .clone()
+        .with_repo_override(repo)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
         .prepare_command(
             cwd,
             None,
@@ -342,7 +356,15 @@ fn pr_is_closed(pr: u64, cwd: &Path, gh_client: &GhClient) -> Result<bool, CliFa
             GhAuthPolicy::Default,
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?
-        .args(["pr", "view", &pr.to_string(), "--json", "state"])
+        .args([
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "state",
+        ])
         .output()
         .map_err(|error| CliFailure::new(1, format!("failed to run gh pr view: {error}")))?;
     if !output.status.success() {
@@ -464,4 +486,50 @@ fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
         .modified()
         .ok()
         .map(DateTime::<Utc>::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gather_closed_prs_with;
+    use crate::ship_state::{ShipState, ShipStateStore};
+
+    #[test]
+    fn closed_pr_scan_uses_each_states_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("ship-state store");
+        for (repo, head) in [
+            ("Generous-Corp/pulp", "pulp-head"),
+            ("Generous-Corp/forge", "forge-head"),
+            ("Generous-Corp/vellum", "vellum-head"),
+        ] {
+            store
+                .save(&ShipState::new(
+                    42,
+                    repo,
+                    "feature/x",
+                    "main",
+                    head,
+                    "policy",
+                ))
+                .expect("save state");
+        }
+        let mut observed = Vec::new();
+
+        let closed = gather_closed_prs_with(&store, |repo, pr| {
+            observed.push((repo.to_owned(), pr));
+            Ok(repo.eq_ignore_ascii_case("Generous-Corp/forge"))
+        })
+        .expect("scan closed PRs");
+
+        observed.sort();
+        assert_eq!(
+            observed,
+            vec![
+                ("Generous-Corp/forge".to_owned(), 42),
+                ("Generous-Corp/pulp".to_owned(), 42),
+                ("Generous-Corp/vellum".to_owned(), 42),
+            ]
+        );
+        assert_eq!(closed, vec![("Generous-Corp/forge".to_owned(), 42)]);
+    }
 }

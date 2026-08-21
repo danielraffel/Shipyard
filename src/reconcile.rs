@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use wait_timeout::ChildExt;
 
+use crate::evidence::canonical_repository;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
@@ -36,18 +37,21 @@ const TERMINAL_EVIDENCE_STATUSES: &[&str] = &["pass", "fail", "reused", "skipped
 /// In-memory forced-reconcile bookkeeping carried by the daemon process.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReconcileWindow {
-    last_forced: BTreeMap<u64, DateTime<Utc>>,
+    last_forced: BTreeMap<(String, u64), DateTime<Utc>>,
 }
 
 impl ReconcileWindow {
     /// Return the last successful forced-reconcile timestamp for a PR.
     #[must_use]
-    pub fn last_forced_at(&self, pr: u64) -> Option<DateTime<Utc>> {
-        self.last_forced.get(&pr).copied()
+    pub fn last_forced_at(&self, repo: &str, pr: u64) -> Option<DateTime<Utc>> {
+        self.last_forced
+            .get(&(canonical_repository(repo), pr))
+            .copied()
     }
 
-    fn stamp(&mut self, pr: u64, now: DateTime<Utc>) {
-        self.last_forced.insert(pr, now);
+    fn stamp(&mut self, repo: &str, pr: u64, now: DateTime<Utc>) {
+        self.last_forced
+            .insert((canonical_repository(repo), pr), now);
     }
 }
 
@@ -166,7 +170,7 @@ where
         let mut reconciled_changes = Vec::new();
         let mut reconciled_transitions = Vec::new();
         let saved = store
-            .with_pr_state_locked(state.pr, |current| {
+            .with_pr_state_scoped_locked(&state.repo, state.pr, |current| {
                 let Some(current_state) = current.as_ref() else {
                     return Ok(());
                 };
@@ -185,7 +189,7 @@ where
             report.transitions.extend(reconciled_transitions);
         }
         if was_aged_candidate {
-            window.stamp(state.pr, now);
+            window.stamp(&state.repo, state.pr, now);
         }
     }
 
@@ -382,9 +386,11 @@ fn is_aged_terminal(state: &ShipState, window: &ReconcileWindow, now: DateTime<U
     if !is_aged_terminal_candidate(state, now) {
         return false;
     }
-    window.last_forced_at(state.pr).is_some_and(|last_forced| {
-        (now - last_forced).num_seconds() <= RECONCILE_FORCED_WINDOW_SECONDS
-    })
+    window
+        .last_forced_at(&state.repo, state.pr)
+        .is_some_and(|last_forced| {
+            (now - last_forced).num_seconds() <= RECONCILE_FORCED_WINDOW_SECONDS
+        })
 }
 
 fn is_aged_terminal_candidate(state: &ShipState, now: DateTime<Utc>) -> bool {
@@ -695,7 +701,7 @@ mod tests {
         state.updated_at = sample_time() - Duration::hours(2);
         store.save(&state).expect("save");
         let mut window = ReconcileWindow::default();
-        window.stamp(42, sample_time() - Duration::hours(1));
+        window.stamp("owner/repo", 42, sample_time() - Duration::hours(1));
         let mut fetch_calls = 0;
 
         let report =
@@ -723,7 +729,7 @@ mod tests {
             });
 
         assert_eq!(report.fetch_errors, 1);
-        assert_eq!(window.last_forced_at(42), None);
+        assert_eq!(window.last_forced_at("owner/repo", 42), None);
     }
 
     #[test]
@@ -740,6 +746,32 @@ mod tests {
             reconcile_active_ship_states_with(temp.path(), &mut window, now, |_| Ok(Vec::new()));
 
         assert_eq!(report.fetch_errors, 0);
-        assert_eq!(window.last_forced_at(42), Some(now));
+        assert_eq!(window.last_forced_at("owner/repo", 42), Some(now));
+    }
+
+    #[test]
+    fn forced_window_does_not_alias_same_pr_number_across_repositories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let mut pulp = state_with_run(42, "macos", "completed");
+        pulp.repo = "owner/pulp".to_owned();
+        pulp.updated_at = sample_time() - Duration::hours(2);
+        store.save(&pulp).expect("pulp state");
+        let mut forge = pulp.clone();
+        forge.repo = "owner/forge".to_owned();
+        store.save(&forge).expect("forge state");
+        let mut window = ReconcileWindow::default();
+        let now = sample_time();
+        let mut fetch_calls = 0;
+
+        let report = reconcile_active_ship_states_with(temp.path(), &mut window, now, |_| {
+            fetch_calls += 1;
+            Ok(Vec::new())
+        });
+
+        assert_eq!(report.skipped_terminal, 0);
+        assert_eq!(fetch_calls, 2);
+        assert_eq!(window.last_forced_at("OWNER/PULP", 42), Some(now));
+        assert_eq!(window.last_forced_at("owner/forge", 42), Some(now));
     }
 }

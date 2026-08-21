@@ -64,7 +64,10 @@ pub(super) fn watch_with_fetcher<W: Write, F: DiagnosticsFetcher + ?Sized>(
     let mut diagnostics_cache = WatchDiagnosticsCache::new();
 
     loop {
-        let state = context.store.get(target_pr);
+        let state = crate::watch::repository_for_cwd(context.cwd).map_or_else(
+            || context.store.get(target_pr),
+            |repository| context.store.get_scoped(&repository, target_pr),
+        );
         let Some(state) = state else {
             if !observed_any_state {
                 let message = format!(

@@ -26,9 +26,16 @@ unambiguously — they are test vocabulary, not runtime observables.
 
 ## The core persisted object: `ShipState`
 
-`ShipState` lives at `<state_dir>/ship/<pr>.json` during the active ship.
-The active file is archived to `<state_dir>/ship/archive/<pr>-<utc>.json`
-on one of:
+`ShipState` lives at
+`<state_dir>/ship/scoped/<repository-key>/<pr>.json` during the active ship.
+The repository key is a filesystem-safe encoding of the canonical owner/name.
+Older `<state_dir>/ship/<pr>.json` records are compatibility mirrors that a
+scoped operation migrates without allowing one repository to claim another
+repository's matching PR number. When two repositories share a PR number, a
+durable `<pr>.scoped-collision` fence makes newer binaries ignore any legacy
+mirror recreated by an older process until the number is unambiguous again.
+The active file is archived to
+`<state_dir>/ship/archive/<repository-key>/<pr>-<utc>.json` on one of:
 
 - `shipyard ship` success (`merge_pr` returned a merged PR)
 - `shipyard auto-merge` success (same)
@@ -43,8 +50,8 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 
 | Field               | Purpose                                                                             |
 |---------------------|-------------------------------------------------------------------------------------|
-| `pr`                | GitHub PR number — primary key.                                                     |
-| `repo`              | Owner/name (`danielraffel/pulp`) captured at dispatch so retarget/add-lane route dispatches correctly. |
+| `pr`                | GitHub PR number — unique only within `repo`; `(repo, pr)` is the durable identity. |
+| `repo`              | Owner/name (`danielraffel/pulp`) captured at dispatch and used for scoped persistence, lookup, cleanup, and GitHub routing. |
 | `branch`            | PR head branch.                                                                     |
 | `base_branch`       | Merge target.                                                                       |
 | `head_sha`          | PR head SHA at dispatch. Drift vs this value refuses resume.                        |
@@ -176,23 +183,23 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 | CLI command                 | Reads                                               | Writes                                                  |
 |-----------------------------|-----------------------------------------------------|---------------------------------------------------------|
 | `shipyard pr` with provenance and/or steward handoff | Project `[pr.provenance]` argv plus the submitting process environment; protected `origin/<base>:.shipyard/config.toml`, or explicit `--workstream-id` / `--context-url` | After the exact PR and head are resolved, runs the configured provenance hook before any durable receipt or validation dispatch. A required hook failure exits with no steward status/label or queued validation. On success, the handoff writes `shipyard/steward-handoff`, revalidates the open PR and exact head, then adds `shipyard:managed`. Explicit `shipyard ship --pr` recovery does not rerun submitter provenance. |
-| `shipyard ship` (fresh)     | `ShipStateStore.get(pr)` (auto-resume decision; returns None) | Saves fresh state BEFORE preflight (cli.py:2675). Calls `_update_ship_state_from_job` once after `_execute_job` ends. `archive(pr)` on MERGED. |
+| `shipyard ship` (fresh)     | `ShipStateStore.get_scoped(repo, pr)` (auto-resume decision; returns None) | Saves fresh state BEFORE preflight (cli.py:2675). Calls `_update_ship_state_from_job` once after `_execute_job` ends. `archive_scoped(repo, pr)` on MERGED. |
 | `shipyard ship --no-resume` | Same                                                | `ShipStateStore.archive_and_replace(state)` archives prior attempt; then a new `ShipState(...)` is constructed with `attempt=1` (see Bug B2). |
 | `shipyard ship --resume`    | Refuses on SHA/policy drift via `_detect_ship_state_drift` | Refreshes `pr_url` / `pr_title` / `commit_subject` on the existing state and saves (cli.py:2679–2689). |
-| `shipyard cloud add-lane`   | `ShipStateStore.get(pr)`; verdict check; idempotent `has_target` | `append_run` + `save`. Does NOT refresh human-context fields. |
+| `shipyard cloud add-lane`   | `ShipStateStore.get_scoped(repo, pr)`; verdict check; idempotent `has_target` | `append_run` + `save`. Does NOT refresh human-context fields. |
 | `shipyard cloud retarget`   | None (the command operates on the live GH Actions run; it does not load `ShipState` at all) | **None** — cancels old job, dispatches new workflow; never writes `ShipState`. See T9 + Bug B3. |
-| `shipyard watch`            | `ShipStateStore.get(pr)` loop                       | Never mutates; signature-based change detection emits NDJSON. |
-| `shipyard auto-merge`       | `ShipStateStore.get(pr)` + `gh pr view` fallback when state is absent | `archive(pr)` on success; no writes on failure. `_pr_is_merged` only runs on the no-state branch. |
-| `shipyard ship-state list`  | `list_active()`                                     | None                                                    |
-| `shipyard ship-state show`  | `get(pr)`                                           | None                                                    |
-| `shipyard ship-state discard` | `get(pr)` (accepts any state, not only MERGED)    | `archive(pr)` (manual tombstone)                        |
-| `shipyard cleanup --ship-state` | `prune(active_days=14, archive_days=30, closed_prs=...)` | Deletes aged-out active (only if PR is in the supplied `closed_prs` set) + archived files. Unlinks are unguarded — a failure raises. |
+| `shipyard watch`            | `ShipStateStore.get_scoped(repo, pr)` loop          | Never mutates; signature-based change detection emits NDJSON. |
+| `shipyard auto-merge`       | `ShipStateStore.get_scoped(repo, pr)` + `gh pr view` fallback when state is absent | `archive_scoped(repo, pr)` on success; no writes on failure. `_pr_is_merged` only runs on the no-state branch. |
+| `shipyard ship-state list`  | `list_active()` across all repository namespaces; human output includes `repo` beside each PR | None |
+| `shipyard ship-state show`  | `get_scoped(checkout_repo, pr)`; unscoped fallback only when the PR number is unambiguous | None |
+| `shipyard ship-state discard` | `get_scoped(checkout_repo, pr)` (accepts any state, not only MERGED) | `archive_scoped(repo, pr)` (manual tombstone) |
+| `shipyard cleanup --ship-state` | `prune(active_days=14, archive_days=30, closed_prs=...)` | Queries each active state's recorded repository and deletes aged-out active state only for the matching closed `(repo, PR)`, plus aged archives. Unlinks are unguarded — a failure raises. |
 
 ## Transitions — preconditions, postconditions, failure modes
 
 ### T1 — Create a fresh ship state
 
-- **From:** no state file exists for `<pr>`
+- **From:** no state file exists for `(repo, pr)`
 - **To:** `STATE_FRESH`
 - **Trigger:** `shipyard ship` on a branch
 - **Writes:** `ShipStateStore.save(ShipState(..., dispatched_runs=[], evidence_snapshot={}))` at cli.py:2675 — **before** preflight runs at cli.py:2679
@@ -230,7 +237,11 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   Before admission, the owner also groups pending ship requests by
   `(repository, PR)` and observes each distinct PR at most once per 30 seconds.
   If GitHub reports `MERGED` and the reported head exactly matches the durable
-  queued SHA, every matching pending job is cancelled as already complete. The
+  queued SHA, every matching pending job is cancelled as already complete.
+  Ship validation claims and evidence records use the same `(repository, PR)`
+  identity, so same-branch Forge Modular and Forge Sequencer ships can run
+  concurrently without replacing one another's target evidence. Repository
+  evidence display aggregates those PR namespaces newest-per-target. The
   daemon applies the same exact-head observation to a running ship job: it first
   commits an immutable terminal cancellation and typed outcome, then signals the
   whole supervised process group. An open PR, a different merged head, an auth

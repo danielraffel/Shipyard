@@ -64,8 +64,9 @@ pub(super) fn status_command<W: Write>(
             Value::Array(
                 orphaned
                     .iter()
-                    .map(|(pr, report)| {
+                    .map(|(repo, pr, report)| {
                         json!({
+                            "repo": repo,
                             "pr": pr,
                             "stalled_minutes": report.stalled_minutes,
                             "evidence": report.evidence.as_str(),
@@ -96,7 +97,7 @@ pub(super) fn status_command<W: Write>(
 fn collect_orphaned_ship_states(
     state_dir: &Path,
     config: &LoadedConfig,
-) -> Vec<(u64, crate::ship_liveness::OrphanReport)> {
+) -> Vec<(String, u64, crate::ship_liveness::OrphanReport)> {
     let ship_dir = state_dir.join("ship");
     if !ship_dir.is_dir() {
         return Vec::new();
@@ -123,7 +124,40 @@ pub(super) fn evidence_command<W: Write>(
         .unwrap_or_else(|| "main".to_owned());
     let store = EvidenceStore::new(state_dir.join("evidence"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let records = store.get_branch(&branch);
+    let mut records = BTreeMap::new();
+    if let Some(repository) = super::branch_cmd::detect_repo_from_remote(cwd, None) {
+        records.extend(store.get_branch_scoped(
+            &crate::evidence::repository_evidence_scope(&repository),
+            &branch,
+        ));
+        for (target, record) in store.get_branch_scoped_prefix(
+            &crate::evidence::repository_ship_evidence_scope_prefix(&repository),
+            &branch,
+        ) {
+            if records
+                .get(&target)
+                .is_none_or(|existing| record.completed_at > existing.completed_at)
+            {
+                records.insert(target, record);
+            }
+        }
+    }
+    for (target, record) in
+        store.get_branch_scoped(&crate::evidence::run_evidence_scope(cwd), &branch)
+    {
+        if records
+            .get(&target)
+            .is_none_or(|existing| record.completed_at > existing.completed_at)
+        {
+            records.insert(target, record);
+        }
+    }
+    // Legacy branch-only records remain visible until every machine has
+    // emitted scoped evidence at least once. They are display-only here and
+    // never satisfy scoped reuse or exact-head gates.
+    for (target, record) in store.get_branch(&branch) {
+        records.entry(target).or_insert(record);
+    }
     if json_mode {
         let mut data = BTreeMap::new();
         data.insert("branch".to_owned(), Value::String(branch.clone()));
@@ -301,7 +335,7 @@ fn write_status_human<W: Write>(
     pending: usize,
     recent: &[Job],
     targets: &BTreeMap<String, TargetStatusRow>,
-    orphaned: &[(u64, crate::ship_liveness::OrphanReport)],
+    orphaned: &[(String, u64, crate::ship_liveness::OrphanReport)],
 ) -> Result<(), CliFailure> {
     writeln!(stdout, "Status").map_err(|error| CliFailure::new(1, error.to_string()))?;
     writeln!(stdout, "  running: {running}")
@@ -327,10 +361,10 @@ fn write_status_human<W: Write>(
             "Orphaned ship states (in flight, worker likely gone)"
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        for (pr, report) in orphaned {
+        for (repo, pr, report) in orphaned {
             writeln!(
                 stdout,
-                "  PR #{pr}: {} ({}m stalled) — re-run `shipyard ship {pr}` or `ship-state discard {pr}`",
+                "  {repo} PR #{pr}: {} ({}m stalled) — re-run `shipyard ship {pr}` or `ship-state discard {pr}`",
                 report.evidence.cause(),
                 report.stalled_minutes,
             )

@@ -10,6 +10,7 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::config::LoadedConfig;
+use crate::evidence::canonical_repository;
 use crate::gh::{self, GhClient};
 use crate::host_pool::{HostPoolConfig, HostPoolLease};
 use crate::job::{DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus};
@@ -207,7 +208,7 @@ impl AlreadyMergedObserver {
                 continue;
             };
             jobs_by_pr
-                .entry((request.repo, request.pr))
+                .entry((canonical_repository(&request.repo), request.pr))
                 .or_default()
                 .push((job.id.clone(), request.sha));
         }
@@ -866,9 +867,10 @@ fn load_ship_key(job_id: &str, request_store: &QueueRequestStore) -> Option<((St
     }
     let foreground_owned = envelope.is_foreground_owned();
     match envelope.request {
-        QueuedExecutionRequest::Ship(request) => {
-            Some(((request.repo, request.pr), foreground_owned))
-        }
+        QueuedExecutionRequest::Ship(request) => Some((
+            (canonical_repository(&request.repo), request.pr),
+            foreground_owned,
+        )),
         QueuedExecutionRequest::Run(_) => None,
     }
 }
@@ -1006,7 +1008,7 @@ fn running_vm_reservations(running: &[&JobResourcePlan], key: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     use chrono::{Duration, Utc};
@@ -1016,6 +1018,9 @@ mod tests {
         SchedulerAdmissionBlocker, apply_admit_pass_for_drain, can_admit,
         host_pool_capacity_deficits, plan_admit_pass, plan_admit_pass_from_jobs,
     };
+    use crate::executor::dispatch::{
+        ResolvedBackend, ResolvedHostPoolConfig, ResolvedTarget, ResolvedValidation,
+    };
     use crate::host_pool::{HostPoolConfig, HostPoolLease, HostPoolMemberConfig};
     use crate::job::{Job, JobStatus, Priority, ValidationMode};
     use crate::queue::Queue;
@@ -1024,6 +1029,7 @@ mod tests {
         QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest, QueuedRunRequest,
         QueuedShipRequest, VmSlotDemand,
     };
+    use crate::ship::ShipExecutionRequest;
 
     fn pool() -> HostPoolConfig {
         HostPoolConfig {
@@ -1067,6 +1073,100 @@ mod tests {
             }],
             vm_slots: Vec::new(),
         }
+    }
+
+    fn fleet_pool() -> HostPoolConfig {
+        HostPoolConfig {
+            name: "local_macs".to_owned(),
+            strategy: "ordered".to_owned(),
+            lease_stale_seconds: 180,
+            heartbeat_interval_seconds: 15,
+            members: vec![
+                HostPoolMemberConfig {
+                    id: "m3".to_owned(),
+                    backend_type: "ssh".to_owned(),
+                    host: Some("m3".to_owned()),
+                    repo_path: Some("/repo".to_owned()),
+                    cwd: None,
+                    max_concurrency: 1,
+                    capabilities: vec!["arm64".to_owned(), "pulp-full".to_owned()],
+                },
+                HostPoolMemberConfig {
+                    id: "m1".to_owned(),
+                    backend_type: "ssh".to_owned(),
+                    host: Some("m1".to_owned()),
+                    repo_path: Some("/repo".to_owned()),
+                    cwd: None,
+                    max_concurrency: 1,
+                    capabilities: vec!["arm64".to_owned(), "forge-modular".to_owned()],
+                },
+                HostPoolMemberConfig {
+                    id: "m5".to_owned(),
+                    backend_type: "ssh".to_owned(),
+                    host: Some("m5".to_owned()),
+                    repo_path: Some("/repo".to_owned()),
+                    cwd: None,
+                    max_concurrency: 1,
+                    capabilities: vec!["arm64".to_owned(), "forge-sequencer".to_owned()],
+                },
+                HostPoolMemberConfig {
+                    id: "controller".to_owned(),
+                    backend_type: "local".to_owned(),
+                    host: None,
+                    repo_path: None,
+                    cwd: Some(PathBuf::from("/repo")),
+                    max_concurrency: 1,
+                    capabilities: vec!["arm64".to_owned(), "vellum".to_owned()],
+                },
+            ],
+        }
+    }
+
+    fn capability_ship_envelope(
+        job_id: &str,
+        repository: &str,
+        pr: u64,
+        branch: &str,
+        capability: &str,
+    ) -> QueuedExecutionEnvelope {
+        let target = ResolvedTarget {
+            name: capability.to_owned(),
+            validation_build_type: None,
+            platform: "macos-arm64".to_owned(),
+            backend_name: "host-pool".to_owned(),
+            warm_keepalive_seconds: 0,
+            host: None,
+            backend: ResolvedBackend::HostPool(ResolvedHostPoolConfig {
+                pool_name: "local_macs".to_owned(),
+                strategy: "ordered".to_owned(),
+                lease_stale_seconds: 180,
+                heartbeat_interval_seconds: 15,
+                requires: vec!["arm64".to_owned(), capability.to_owned()],
+                members: Vec::new(),
+            }),
+            validation: ResolvedValidation::HostPool,
+            failure_parser: None,
+        };
+        let request = ShipExecutionRequest {
+            pr,
+            repo: repository.to_owned(),
+            branch: branch.to_owned(),
+            base_branch: "main".to_owned(),
+            sha: format!("sha-{job_id}"),
+            commit_subject: String::new(),
+            pr_url: None,
+            pr_title: None,
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            advisory_targets: BTreeSet::new(),
+            adopt_head: false,
+            pr_snapshot_file: None,
+            targets: vec![target],
+        };
+        QueuedExecutionEnvelope::from_ship_request(job_id, "/repo", &request)
     }
 
     fn claim_plan(claims: &[&str]) -> JobResourcePlan {
@@ -1127,6 +1227,7 @@ mod tests {
             branch: "main".to_owned(),
             mode: ValidationMode::Full,
             kind: None,
+            workload_scope: None,
             target_names: vec!["mac".to_owned()],
             priority,
             status,
@@ -1506,6 +1607,82 @@ mod tests {
             [SchedulerAdmissionBlocker::HostPoolCapacity(deficit)]
                 if deficit.pool_name == "local_macs"
         ));
+    }
+
+    #[test]
+    fn blocked_pulp_proof_does_not_head_of_line_block_forge_products_or_vellum() {
+        let now = Utc::now();
+        let running_pulp = capability_ship_envelope(
+            "pulp-pr-7718",
+            "Generous-Corp/pulp",
+            7718,
+            "feature/shared",
+            "pulp-full",
+        );
+        let blocked_pulp = capability_ship_envelope(
+            "pulp-pr-7730",
+            "Generous-Corp/pulp",
+            7730,
+            "feature/other",
+            "pulp-full",
+        );
+        let forge_modular = capability_ship_envelope(
+            "forge-modular-pr-127",
+            "Generous-Corp/forge",
+            127,
+            "feature/shared",
+            "forge-modular",
+        );
+        let forge_sequencer = capability_ship_envelope(
+            "forge-sequencer-pr-128",
+            "Generous-Corp/forge",
+            128,
+            "feature/shared",
+            "forge-sequencer",
+        );
+        let vellum = capability_ship_envelope(
+            "vellum-pr-96",
+            "Generous-Corp/vellum",
+            96,
+            "feature/shared",
+            "vellum",
+        );
+
+        let pending = [
+            PendingAdmissionRequest::loaded(&blocked_pulp),
+            PendingAdmissionRequest::loaded(&forge_modular),
+            PendingAdmissionRequest::loaded(&forge_sequencer),
+            PendingAdmissionRequest::loaded(&vellum),
+        ];
+
+        let plan = plan_admit_pass(
+            &pending,
+            &[running_pulp.resource_plan],
+            &[fleet_pool()],
+            &[],
+            now,
+        );
+
+        assert_eq!(
+            plan.admitted,
+            [
+                "forge-modular-pr-127",
+                "forge-sequencer-pr-128",
+                "vellum-pr-96",
+            ]
+        );
+        assert_eq!(plan.deferred.len(), 1);
+        assert_eq!(plan.deferred[0].job_id, "pulp-pr-7730");
+        assert!(
+            matches!(
+                plan.deferred[0].blockers.as_slice(),
+                [SchedulerAdmissionBlocker::HostPoolCapacity(deficit)]
+                    if deficit.capability_key == "arm64+pulp-full"
+                        && deficit.available_slots == 0
+            ),
+            "unexpected blockers: {:?}",
+            plan.deferred[0].blockers
+        );
     }
 
     #[test]

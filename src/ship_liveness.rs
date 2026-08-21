@@ -34,6 +34,8 @@ use std::path::Path;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
+use crate::evidence::canonical_repository;
+
 use crate::config::LoadedConfig;
 use crate::job::{DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus};
 use crate::queue::Queue;
@@ -203,7 +205,7 @@ pub fn match_ship_job<'a>(
         let Some((pr, repo)) = pr_repo_of(job) else {
             continue;
         };
-        if pr != state.pr || repo != state.repo {
+        if pr != state.pr || canonical_repository(&repo) != canonical_repository(&state.repo) {
             continue;
         }
         match job.status {
@@ -341,21 +343,21 @@ impl<'a> LivenessContext<'a> {
 }
 
 /// Classify every active ship-state in `store` against `liveness`, returning the
-/// orphaned ones as `(pr, report)` pairs for rendering. Read-only — keeps the
+/// orphaned ones as `(repo, pr, report)` tuples for rendering. Read-only — keeps the
 /// store/snapshot mechanics out of the command layer.
 #[must_use]
 pub fn collect_orphans(
     store: &ShipStateStore,
     liveness: &LivenessContext<'_>,
     now: DateTime<Utc>,
-) -> Vec<(u64, OrphanReport)> {
+) -> Vec<(String, u64, OrphanReport)> {
     store
         .list_active()
         .iter()
         .filter_map(|state| {
             liveness
                 .classify(state, now)
-                .map(|report| (state.pr, report))
+                .map(|report| (state.repo.clone(), state.pr, report))
         })
         .collect()
 }
@@ -657,7 +659,7 @@ mod tests {
         let job = running_job(1000); // liveness anchor 1000s ago => stale
         let request = ShipExecutionRequest {
             pr: 1,
-            repo: "danielraffel/pulp".to_owned(),
+            repo: "DanielRaffel/Pulp".to_owned(),
             branch: "shipyard-pr-1".to_owned(),
             base_branch: "main".to_owned(),
             sha: "sha".to_owned(),

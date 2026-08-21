@@ -1020,11 +1020,13 @@ fn handle_ship_state_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Show { pr } => {
-            ship_state_show(store, pr, json, stdout)
+            let repository = self::branch_cmd::detect_repo_from_remote(cwd, None);
+            ship_state_show(store, repository.as_deref(), pr, json, stdout)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Discard { pr } => {
-            ship_state_discard(store, pr, json, stdout)
+            let repository = self::branch_cmd::detect_repo_from_remote(cwd, None);
+            ship_state_discard(store, repository.as_deref(), pr, json, stdout)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Reconcile { pr, all } => {
@@ -1160,7 +1162,12 @@ mod tests {
     }
 
     fn auto_merge_state(pr: u64, evidence: &[(&str, &str)]) -> ShipState {
-        let mut state = ShipState::new(pr, "owner/repo", "feature/x", "main", "a".repeat(40), "p1");
+        let repository = crate::app::branch_cmd::detect_repo_from_remote(
+            &std::env::current_dir().expect("current directory"),
+            None,
+        )
+        .unwrap_or_else(|| "owner/repo".to_owned());
+        let mut state = ShipState::new(pr, repository, "feature/x", "main", "a".repeat(40), "p1");
         state.evidence_snapshot = evidence
             .iter()
             .map(|(target, status)| ((*target).to_owned(), (*status).to_owned()))
@@ -1377,6 +1384,67 @@ mod tests {
         assert!(stdout.is_empty());
         let stderr = String::from_utf8(stderr).expect("utf8");
         assert!(stderr.contains("No ship state for PR #999"));
+    }
+
+    #[test]
+    fn isolated_ship_state_show_uses_checkout_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        seed_git_repo(&repo, "feature/test");
+        git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Generous-Corp/pulp.git",
+            ],
+            &repo,
+        );
+        let state_dir = temp.path().join("state");
+        let store = ShipStateStore::new(state_dir.join("ship")).expect("store");
+        store
+            .save(&ShipState::new(
+                42,
+                "Generous-Corp/pulp",
+                "feature/test",
+                "main",
+                "pulp-head",
+                "policy",
+            ))
+            .expect("Pulp state");
+        store
+            .save(&ShipState::new(
+                42,
+                "Generous-Corp/forge",
+                "feature/modular",
+                "main",
+                "forge-head",
+                "policy",
+            ))
+            .expect("Forge state");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--json",
+            "--cwd",
+            repo.to_str().expect("repo path"),
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "ship-state",
+            "show",
+            "42",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["repo"], "Generous-Corp/pulp");
+        assert_eq!(value["head_sha"], "pulp-head");
     }
 
     #[test]
@@ -1788,6 +1856,7 @@ mod tests {
             .record(&EvidenceRecord {
                 sha: "abc123456789".to_owned(),
                 branch: "feature/evidence".to_owned(),
+                workload_scope: None,
                 target_name: "linux".to_owned(),
                 validation_build_type: None,
                 platform: "linux".to_owned(),
@@ -1810,6 +1879,14 @@ mod tests {
                 stages_signature: None,
             })
             .expect("record");
+        let mut scoped = store
+            .get_target("feature/evidence", "linux")
+            .expect("legacy evidence");
+        scoped.target_name = "macos".to_owned();
+        scoped.platform = "macos".to_owned();
+        store
+            .record_scoped(&crate::evidence::run_evidence_scope(temp.path()), &scoped)
+            .expect("scoped record");
         let cli = Cli::parse_from([
             "shipyard",
             "--json",
@@ -1831,6 +1908,7 @@ mod tests {
         assert_eq!(value["branch"], "feature/evidence");
         assert_eq!(value["evidence"]["linux"]["sha"], "abc123456789");
         assert_eq!(value["evidence"]["linux"]["status"], "pass");
+        assert_eq!(value["evidence"]["macos"]["status"], "pass");
     }
 
     #[test]
@@ -3813,30 +3891,34 @@ mod tests {
         .collect();
         store.save(&state).expect("save");
         evidence
-            .record(&EvidenceRecord {
-                sha: state.head_sha.clone(),
-                branch: state.branch.clone(),
-                target_name: "macos".to_owned(),
-                validation_build_type: None,
-                platform: "macos-arm64".to_owned(),
-                status: "pass".to_owned(),
-                backend: "reused".to_owned(),
-                source_head_sha: None,
-                source_tree_sha: None,
-                source_checkout_clean: None,
-                full_execution: None,
-                completed_at: Utc::now(),
-                duration_secs: None,
-                host: None,
-                primary_backend: None,
-                failover_reason: None,
-                provider: None,
-                runner_profile: None,
-                failure_class: None,
-                reused_from: Some("b".repeat(40)),
-                contract_digest: None,
-                stages_signature: None,
-            })
+            .record_scoped(
+                &crate::evidence::repository_ship_evidence_scope(&state.repo, state.pr),
+                &EvidenceRecord {
+                    sha: state.head_sha.clone(),
+                    branch: state.branch.clone(),
+                    workload_scope: None,
+                    target_name: "macos".to_owned(),
+                    validation_build_type: None,
+                    platform: "macos-arm64".to_owned(),
+                    status: "pass".to_owned(),
+                    backend: "reused".to_owned(),
+                    source_head_sha: None,
+                    source_tree_sha: None,
+                    source_checkout_clean: None,
+                    full_execution: None,
+                    completed_at: Utc::now(),
+                    duration_secs: None,
+                    host: None,
+                    primary_backend: None,
+                    failover_reason: None,
+                    provider: None,
+                    runner_profile: None,
+                    failure_class: None,
+                    reused_from: Some("b".repeat(40)),
+                    contract_digest: None,
+                    stages_signature: None,
+                },
+            )
             .expect("record");
 
         let cli = Cli::parse_from([
@@ -3888,30 +3970,34 @@ mod tests {
         });
         store.save(&state).expect("save");
         evidence
-            .record(&EvidenceRecord {
-                sha: state.head_sha.clone(),
-                branch: state.branch.clone(),
-                target_name: "macos".to_owned(),
-                validation_build_type: None,
-                platform: "macos-arm64".to_owned(),
-                status: "pass".to_owned(),
-                backend: "reused".to_owned(),
-                source_head_sha: None,
-                source_tree_sha: None,
-                source_checkout_clean: None,
-                full_execution: None,
-                completed_at: Utc::now(),
-                duration_secs: None,
-                host: None,
-                primary_backend: None,
-                failover_reason: None,
-                provider: None,
-                runner_profile: None,
-                failure_class: None,
-                reused_from: Some("cafebabe12345678".to_owned()),
-                contract_digest: None,
-                stages_signature: None,
-            })
+            .record_scoped(
+                &crate::evidence::repository_ship_evidence_scope(&state.repo, state.pr),
+                &EvidenceRecord {
+                    sha: state.head_sha.clone(),
+                    branch: state.branch.clone(),
+                    workload_scope: None,
+                    target_name: "macos".to_owned(),
+                    validation_build_type: None,
+                    platform: "macos-arm64".to_owned(),
+                    status: "pass".to_owned(),
+                    backend: "reused".to_owned(),
+                    source_head_sha: None,
+                    source_tree_sha: None,
+                    source_checkout_clean: None,
+                    full_execution: None,
+                    completed_at: Utc::now(),
+                    duration_secs: None,
+                    host: None,
+                    primary_backend: None,
+                    failover_reason: None,
+                    provider: None,
+                    runner_profile: None,
+                    failure_class: None,
+                    reused_from: Some("cafebabe12345678".to_owned()),
+                    contract_digest: None,
+                    stages_signature: None,
+                },
+            )
             .expect("record");
 
         let cli = Cli::parse_from([

@@ -32,10 +32,16 @@ const TERMINAL_FAILURE_RUN_STATUSES: [&str; 6] = [
 #[must_use]
 pub fn active_pr_for_current_branch(store: &ShipStateStore, cwd: &Path) -> Option<u64> {
     let branch = git_branch(cwd)?;
+    let repository = repository_for_cwd(cwd);
     store
         .list_active()
         .into_iter()
-        .filter(|state| state.branch == branch)
+        .filter(|state| {
+            state.branch == branch
+                && repository
+                    .as_ref()
+                    .is_none_or(|repository| state.repo.eq_ignore_ascii_case(repository))
+        })
         .max_by_key(|state| state.updated_at)
         .map(|state| state.pr)
 }
@@ -88,8 +94,15 @@ pub fn reused_evidence_map(
     evidence_store: &EvidenceStore,
     state: &ShipState,
 ) -> BTreeMap<String, String> {
-    evidence_store
-        .get_branch(&state.branch)
+    let workload_scope = crate::evidence::repository_ship_evidence_scope(&state.repo, state.pr);
+    let mut records = evidence_store.get_branch_scoped(&workload_scope, &state.branch);
+    for (target, record) in evidence_store.get_branch_scoped(
+        &crate::evidence::repository_evidence_scope(&state.repo),
+        &state.branch,
+    ) {
+        records.entry(target).or_insert(record);
+    }
+    records
         .into_iter()
         .filter_map(|(target, record)| {
             if record.sha == state.head_sha {
@@ -593,6 +606,20 @@ fn git_branch(cwd: &Path) -> Option<String> {
     (!branch.is_empty()).then_some(branch)
 }
 
+/// Resolve the current checkout's canonical GitHub repository slug.
+#[must_use]
+pub fn repository_for_cwd(cwd: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    crate::gh::parse_github_remote_slug(String::from_utf8_lossy(&output.stdout).trim())
+}
+
 fn json_run(
     run: &DispatchedRun,
     now: DateTime<Utc>,
@@ -790,30 +817,34 @@ mod tests {
         let base = watch_event_signature(&state, &reused_evidence_map(&evidence, &state));
 
         evidence
-            .record(&EvidenceRecord {
-                sha: state.head_sha.clone(),
-                branch: state.branch.clone(),
-                target_name: "macos".to_owned(),
-                validation_build_type: None,
-                platform: "macos-arm64".to_owned(),
-                status: "pass".to_owned(),
-                backend: "reused".to_owned(),
-                source_head_sha: None,
-                source_tree_sha: None,
-                source_checkout_clean: None,
-                full_execution: None,
-                completed_at: Utc::now(),
-                duration_secs: None,
-                host: None,
-                primary_backend: None,
-                failover_reason: None,
-                provider: None,
-                runner_profile: None,
-                failure_class: None,
-                reused_from: Some("b".repeat(40)),
-                contract_digest: None,
-                stages_signature: None,
-            })
+            .record_scoped(
+                &crate::evidence::repository_ship_evidence_scope(&state.repo, state.pr),
+                &EvidenceRecord {
+                    sha: state.head_sha.clone(),
+                    branch: state.branch.clone(),
+                    workload_scope: None,
+                    target_name: "macos".to_owned(),
+                    validation_build_type: None,
+                    platform: "macos-arm64".to_owned(),
+                    status: "pass".to_owned(),
+                    backend: "reused".to_owned(),
+                    source_head_sha: None,
+                    source_tree_sha: None,
+                    source_checkout_clean: None,
+                    full_execution: None,
+                    completed_at: Utc::now(),
+                    duration_secs: None,
+                    host: None,
+                    primary_backend: None,
+                    failover_reason: None,
+                    provider: None,
+                    runner_profile: None,
+                    failure_class: None,
+                    reused_from: Some("b".repeat(40)),
+                    contract_digest: None,
+                    stages_signature: None,
+                },
+            )
             .expect("record");
 
         let updated = watch_event_signature(&state, &reused_evidence_map(&evidence, &state));
