@@ -1,9 +1,10 @@
 # Exact-head changed-surface selection
 
-Shipyard 0.85 adds a fail-closed, shadow-only planner for target-declared test
-families. It computes a bounded candidate suite while the existing full target
-suite remains authoritative. It does not change a validation command, pass a
-regex to a test runner, skip a target, or create reusable target evidence.
+Shipyard's fail-closed, shadow-only planner computes a bounded candidate suite
+while the existing full target suite remains authoritative. Schema v2 adds
+reviewed mandatory, affected, extended, and full risk tiers without changing a
+validation command, passing a regex to a test runner, skipping a target, or
+creating reusable target evidence.
 
 ## Configuration
 
@@ -19,7 +20,7 @@ platform = "macos-arm64"
 validation_build_type = "debug"
 
 [targets.mac.changed_surface_selection]
-schema_version = 1
+schema_version = 2
 full_test_count = 20091
 build_type = "debug"
 build_flags = ["-DCMAKE_BUILD_TYPE=Debug"]
@@ -28,6 +29,7 @@ baseline_tests = [
   "smoke: plugin registry loads",
 ]
 baseline_only_paths = ["docs/**"]
+full_required_paths = ["CMakeLists.txt", "cmake/**", "security/**"]
 policy_paths = [
   "tools/schemas/changed-surface-selection.json",
   "tools/scripts/test_changed_surface_config.py",
@@ -46,6 +48,7 @@ tests = [
   "capability registry no-exceptions contract",
 ]
 supported_build_types = ["debug", "release"]
+risk_class = "low"
 
 [[targets.mac.changed_surface_selection.families]]
 name = "audio-runtime"
@@ -55,6 +58,11 @@ tests = [
   "audio runtime RT safety",
 ]
 supported_build_types = ["debug", "release"]
+risk_class = "medium"
+extended_tests = [
+  "audio graph integration",
+  "audio prior co-failure regression",
+]
 
 [[targets.mac.changed_surface_selection.families]]
 name = "installed-sdk"
@@ -63,6 +71,7 @@ tests = ["agent capability installed SDK"]
 supported_build_types = ["release"]
 required_secondary_target = "release-installed-sdk"
 required_secondary_build_type = "release"
+risk_class = "low"
 
 [targets.release-installed-sdk]
 backend = "local"
@@ -74,7 +83,16 @@ validation_build_type = "release"
 command = "cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-release && ctest --test-dir build-release --output-on-failure"
 ```
 
-`tests` are literal reviewed test identities, not regexes. Every family must
+Schema v1 remains accepted and maps every family to low-risk affected selection.
+Schema v2's `risk_class = "low"` selects the family tests, `medium` also selects
+its nonempty reviewed `extended_tests`, and `high` forces the full suite.
+`full_required_paths` likewise forces full validation before family selection.
+These paths are for known global-risk surfaces; unknown or unmapped paths
+already fail closed to full and must not be listed merely to suppress mapping
+work. The receipt records `selection_tier` as `mandatory`, `affected`,
+`extended`, or `full`.
+
+`tests` and `extended_tests` are literal reviewed test identities, not regexes. Every family must
 have at least one path and one test, the baseline must be nonempty, family names
 must be unique, and the union of declared literal tests cannot exceed
 `full_test_count`. `baseline_only_paths` cannot match the entire repository.
@@ -156,6 +174,8 @@ the stable reason when:
   path, or declared test-topology path.
 
 An eligible bound always contains every baseline test plus the complete literal
-test set for every affected family. A path that matches multiple families
-selects all of them. The full suite remains authoritative throughout the shadow
-phase; activating bounded execution is a separate promotion decision.
+test set for every affected family and, for medium risk, every declared extended
+neighbor. A path that matches multiple families selects all of them and the
+highest applicable tier. High-risk and `full_required_paths` matches select
+full. The full suite remains authoritative throughout the shadow phase;
+activating bounded execution is a separate promotion decision.

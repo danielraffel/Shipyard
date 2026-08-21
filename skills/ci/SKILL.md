@@ -1040,6 +1040,11 @@ The command is shadow-only. Its receipt is queryable telemetry, not passing
 target evidence, and the configured full validation command must still run.
 Every eligible bounded candidate includes the nonempty mandatory baseline and
 the complete literal test list of every affected compatible family. A
+schema-v2 medium-risk family also includes every reviewed literal
+`extended_tests` neighbor; a high-risk family or `full_required_paths` match
+selects full. Schema v1 remains affected-only. Unknown paths never become a
+bounded success. The receipt's `selection_tier` is shadow telemetry and cannot
+authorize a merge. A
 build-incompatible family must name a typed, non-advisory secondary target; the
 plan stays blocked until evidence from that target proves its own declared
 `validation_build_type`, the same exact head, and completion within 24 hours.
