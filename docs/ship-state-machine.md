@@ -403,6 +403,17 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 
 ### T12 — Aging prune
 
+The default cleanup scope also manages queue-job logs independently of
+`ShipState`. When a ship job reaches a structurally complete terminal state,
+the queue path durably writes `logs/<job-id>/.retention.json` before queue
+trimming can remove its pass/failure classification. Malformed or
+timestamp-less completions remain failure/unclassified evidence. Default
+cleanup retains active writers and audit pins, compresses closed logs, and
+pressure-deletes only manifest-proven successful terminal directories; the
+`--ship-state` flag adds the state-file pruning below. See
+[`log-retention.md`](log-retention.md) for the bounded Phase 1 policy and its
+continuously-active-writer Phase 2 boundary.
+
 - **From:** any old active state (gated by the PR being closed) or any old archive
 - **To:** deleted
 - **Trigger:** `shipyard cleanup --ship-state --apply`
