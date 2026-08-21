@@ -82,19 +82,42 @@ What it does per runner:
 
 1. Computes the next free index by listing the repo's existing runners (any
    machine) and continuing past the highest `<repo>-<tag>-NN`. Re-running
-   appends capacity (`-04`, `-05`) without collisions.
+   appends exactly `--count` capacity (`-04`, `-05`) without collisions. Existing
+   configured runners on this host are also included as a separate upgrade set;
+   they do not consume the additive count. Every existing runner retains its
+   allocation from `.env`; Shipyard also discovers configured local runners for
+   other repositories and older machine tags, reserves all those slots, then divides
+   remaining host cores across the additive runners. It exits 3 instead of
+   adding capacity when existing allocations leave fewer than one core per new
+   runner. Preserving existing allocations keeps a runner that becomes active
+   after preflight from invalidating the capacity plan.
 2. Downloads the fleet-pinned `osx-arm64` runner tarball once into
    `<ci-root>/cache/actions-runner-pkg/` and extracts it into
    `~/actions-runner-<name>`. Both the runner archive and pinned `rustup-init`
    binary are SHA-256 verified. Registration uses `--disableupdate`; upgrades
    are an explicit fleet-wide pin change, never a per-host automatic update.
-   When a local runner is on an older pin, Shipyard must stop its service
-   successfully before replacing any installation files; a failed stop aborts
-   the upgrade. It preserves the existing `.runner` credentials and service
-   registration, then restarts that service after the replacement verifies;
-   `config.sh` and `svc.sh install` are only for genuinely new runners. Readiness
-   probes suppress child stdout and stderr so both human and JSON command output
-   remain machine-readable.
+   Before touching an existing installation, Shipyard parses `.runner` and
+   requires both `agentName` and the GitHub repository URL to match the planned
+   runner and requested repo. Live GitHub `status`/`busy` evidence is retained in
+   the plan. Shipyard never automatically stops or upgrades a service-installed
+   runner. An already-pinned service is retained unchanged; a service that
+   needs an upgrade is reported as deferred and causes exit 3, leaving its
+   current job eligibility unchanged. A configured service-less runner is upgradeable
+   only after fresh GitHub observations prove it is offline and idle both
+   immediately before clone-staging and at the activation boundary; online,
+   busy, missing, or unknown evidence fails closed. Eligible upgrades
+   clone-stage the complete installation, extract and verify the new runner,
+   and prepare its toolchain before an atomic rename. The intact old directory
+   is retained until the replacement service starts; a partially started
+   replacement is stopped and removed through the runner's compound
+   `svc.sh uninstall` before the verified original directory is restored. A failed
+   extraction never modifies the live directory. `config.sh` and `svc.sh
+   install` are only for genuinely new or service-less configured runners.
+   A runner that becomes busy, online, or service-managed during staging is
+   deferred without blocking the separately requested additive runners.
+   Readiness probes
+   suppress child stdout and stderr so both human and JSON command output remain
+   machine-readable.
 3. Writes a per-runner `.env` pointing ccache + FetchContent at the shared
    caches and isolating each runner's `_work` for cross-worktree cache hits
    (`CCACHE_BASEDIR` + `CCACHE_NOHASHDIR`). Depend mode is forced off and the

@@ -7,6 +7,7 @@
 //! pure code in [`crate::runner_provision`]; this module only does I/O.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -197,6 +198,69 @@ fn cpu_count() -> usize {
         .unwrap_or(4)
 }
 
+fn parallel_per_runner(cpus: usize, participating_runners: usize) -> usize {
+    (cpus / participating_runners.max(1)).max(1)
+}
+
+fn configured_parallel(runner_dir: &Path) -> Result<usize, CliFailure> {
+    let path = runner_dir.join(".env");
+    let raw = fs::read_to_string(&path).map_err(|error| {
+        CliFailure::new(
+            3,
+            format!(
+                "cannot reserve capacity for deferred runner at {}: failed to read {}: {error}",
+                runner_dir.display(),
+                path.display()
+            ),
+        )
+    })?;
+    let value = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("CMAKE_BUILD_PARALLEL_LEVEL="))
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            CliFailure::new(
+                3,
+                format!(
+                    "cannot reserve capacity for deferred runner at {}: {} has no positive CMAKE_BUILD_PARALLEL_LEVEL",
+                    runner_dir.display(),
+                    path.display()
+                ),
+            )
+        })?;
+    Ok(value)
+}
+
+fn external_runner_parallel(home: &Path, plan: &[RunnerPlan]) -> Result<usize, CliFailure> {
+    let entries = fs::read_dir(home).map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("failed to inspect local runner directories: {error}"),
+        )
+    })?;
+    let mut reserved = 0_usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CliFailure::new(1, format!("failed to inspect local runner entry: {error}"))
+        })?;
+        let path = entry.path();
+        let is_runner_dir = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("actions-runner-"));
+        if !is_runner_dir
+            || !path.is_dir()
+            || !path.join(".runner").is_file()
+            || plan.iter().any(|planned| planned.dir == path)
+        {
+            continue;
+        }
+        reserved = reserved.saturating_add(configured_parallel(&path)?);
+    }
+    Ok(reserved)
+}
+
 /// The per-runner `.env` the GitHub Actions service loads: points jobs at the
 /// shared caches and isolates each runner's ccache base path so cross-worktree
 /// hits work (`CCACHE_BASEDIR` + `CCACHE_NOHASHDIR`). Cache *size* is owned by
@@ -280,13 +344,112 @@ fn inspect_runner_installation(runner_dir: &Path) -> RunnerInstallation {
     }
 }
 
+fn require_service_less_at_boundary(
+    runner_dir: &Path,
+    runner_name: &str,
+    boundary: &str,
+) -> Result<RunnerInstallation, CliFailure> {
+    let installation = inspect_runner_installation(runner_dir);
+    if installation.configured && installation.service_installed {
+        return Err(CliFailure::new(
+            3,
+            format!(
+                "runner `{runner_name}` gained a service {boundary}; deferring without modifying it"
+            ),
+        ));
+    }
+    Ok(installation)
+}
+
+fn validate_installation_shape(
+    runner_dir: &Path,
+    installation: RunnerInstallation,
+) -> Result<(), CliFailure> {
+    if !installation.configured && installation.service_installed {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "runner service exists without configuration at {}; repair or remove the partial installation before retrying",
+                runner_dir.display()
+            ),
+        ));
+    }
+    if runner_dir.exists() && !installation.configured {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "unconfigured runner directory {} already exists; inspect or remove the partial installation before retrying",
+                runner_dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RunnerIdentity {
+    agent_name: String,
+    repo_slug: String,
+}
+
+fn read_runner_identity(runner_dir: &Path) -> Result<RunnerIdentity, CliFailure> {
+    let path = runner_dir.join(".runner");
+    let raw = fs::read_to_string(&path).map_err(|error| {
+        CliFailure::new(
+            1,
+            format!(
+                "failed to read runner identity at {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let (agent_name, repo_slug) = parse_dot_runner(&raw).ok_or_else(|| {
+        CliFailure::new(
+            1,
+            format!(
+                "runner identity at {} is invalid; repair the .runner file before retrying",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(RunnerIdentity {
+        agent_name,
+        repo_slug,
+    })
+}
+
 fn validate_planned_runner_identity(
     runner_dir: &Path,
     runner_name: &str,
+    expected_repo_slug: &str,
     installation: RunnerInstallation,
-    registered_names: &[String],
+    registered_runner: Option<&ApiRunner>,
 ) -> Result<(), CliFailure> {
-    if installation.configured && !registered_names.iter().any(|name| name == runner_name) {
+    if !installation.configured {
+        return Ok(());
+    }
+    let identity = read_runner_identity(runner_dir)?;
+    if identity.agent_name != runner_name {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "runner identity mismatch at {}: directory plan expects `{runner_name}`, .runner names `{}`",
+                runner_dir.display(),
+                identity.agent_name
+            ),
+        ));
+    }
+    if !identity.repo_slug.eq_ignore_ascii_case(expected_repo_slug) {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "runner repository mismatch at {}: requested `{expected_repo_slug}`, .runner targets `{}`",
+                runner_dir.display(),
+                identity.repo_slug
+            ),
+        ));
+    }
+    if registered_runner.is_none() {
         return Err(CliFailure::new(
             1,
             format!(
@@ -299,54 +462,272 @@ fn validate_planned_runner_identity(
     Ok(())
 }
 
-fn stop_runner_service_before_upgrade(runner_dir: &Path) -> Result<(), CliFailure> {
-    let service = runner_dir.join("svc.sh");
-    if !service.is_file() {
+fn runner_by_name<'a>(runners: &'a [ApiRunner], name: &str) -> Option<&'a ApiRunner> {
+    runners.iter().find(|runner| runner.name == name)
+}
+
+fn require_offline_idle_runner<'a>(
+    runners: &'a [ApiRunner],
+    runner_name: &str,
+) -> Result<&'a ApiRunner, CliFailure> {
+    let runner = runner_by_name(runners, runner_name).ok_or_else(|| {
+        CliFailure::new(
+            1,
+            format!(
+                "runner `{runner_name}` disappeared from GitHub inventory; refusing to modify its installation"
+            ),
+        )
+    })?;
+    if !runner.status.eq_ignore_ascii_case("online")
+        && !runner.status.eq_ignore_ascii_case("offline")
+    {
         return Err(CliFailure::new(
             1,
             format!(
-                "runner service is installed at {} but svc.sh is missing; repair the installation before retrying",
-                runner_dir.display()
+                "runner `{runner_name}` has unknown GitHub status `{}`; refusing to modify its installation",
+                runner.status
             ),
         ));
     }
-    run_in(
-        runner_dir,
-        "./svc.sh",
-        &["stop"],
-        "stop runner service before upgrade",
-    )
+    if runner.busy {
+        return Err(CliFailure::new(
+            3,
+            format!(
+                "runner `{runner_name}` is {}/busy; deferring its upgrade without stopping the service",
+                runner.status
+            ),
+        ));
+    }
+    if runner.status.eq_ignore_ascii_case("online") {
+        return Err(CliFailure::new(
+            3,
+            format!(
+                "runner `{runner_name}` is online without a Shipyard-managed service; deferring its upgrade because another process may be using the installation"
+            ),
+        ));
+    }
+    Ok(runner)
 }
 
-fn recover_runner_service_after_upgrade_failure(
+fn sibling_transaction_path(runner_dir: &Path, suffix: &str) -> Result<PathBuf, CliFailure> {
+    let parent = runner_dir.parent().ok_or_else(|| {
+        CliFailure::new(
+            1,
+            format!("runner directory {} has no parent", runner_dir.display()),
+        )
+    })?;
+    let name = runner_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                format!(
+                    "runner directory {} has no UTF-8 name",
+                    runner_dir.display()
+                ),
+            )
+        })?;
+    Ok(parent.join(format!(".{name}.shipyard-{suffix}")))
+}
+
+fn clone_runner_installation(source: &Path, destination: &Path) -> Result<(), CliFailure> {
+    if destination.exists() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "stale runner transaction path {} exists; inspect and remove it before retrying",
+                destination.display()
+            ),
+        ));
+    }
+    let mut command = Command::new("/bin/cp");
+    #[cfg(target_os = "macos")]
+    command.arg(OsStr::new("-cR"));
+    #[cfg(not(target_os = "macos"))]
+    command.arg(OsStr::new("-R"));
+    let status = command
+        .args([source.as_os_str(), destination.as_os_str()])
+        .status()
+        .map_err(|error| CliFailure::new(1, format!("failed to stage runner clone: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliFailure::new(
+            1,
+            format!("stage runner clone failed (exit {:?})", status.code()),
+        ))
+    }
+}
+
+fn prepare_staged_runner(
     runner_dir: &Path,
-    original: CliFailure,
-) -> CliFailure {
-    if installed_runner_version(runner_dir).is_none() {
+    package: &Path,
+    installation: RunnerInstallation,
+    ci_root: &Path,
+    work: &Path,
+    parallel: usize,
+) -> Result<PathBuf, CliFailure> {
+    let staged = sibling_transaction_path(runner_dir, "stage")?;
+    if installation.configured {
+        clone_runner_installation(runner_dir, &staged)?;
+    } else {
+        fs::create_dir(&staged).map_err(|error| {
+            CliFailure::new(
+                1,
+                format!("failed to create runner staging directory: {error}"),
+            )
+        })?;
+    }
+    let result = (|| -> Result<(), CliFailure> {
+        run(
+            "/usr/bin/tar",
+            &[
+                "xzf",
+                &package.to_string_lossy(),
+                "-C",
+                &staged.to_string_lossy(),
+            ],
+            "extract staged runner",
+        )?;
+        if installed_runner_version(&staged).as_deref() != Some(PINNED_RUNNER_VERSION) {
+            return Err(CliFailure::new(
+                1,
+                format!("staged runner is not pinned version {PINNED_RUNNER_VERSION}"),
+            ));
+        }
+        fs::write(
+            staged.join(".env"),
+            runner_env_file(ci_root, work, runner_dir, parallel),
+        )
+        .map_err(|error| CliFailure::new(1, format!("failed to write staged .env: {error}")))?;
+        ensure_private_rust_toolchain(&staged)?;
+        fs::write(staged.join(".path"), runner_path_file(runner_dir)).map_err(|error| {
+            CliFailure::new(1, format!("failed to write staged .path: {error}"))
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&staged);
+        return Err(error);
+    }
+    Ok(staged)
+}
+
+fn restore_original_runner(runner_dir: &Path, backup: &Path, original: CliFailure) -> CliFailure {
+    let Some(failed) = (0_u8..100).find_map(|attempt| {
+        sibling_transaction_path(
+            runner_dir,
+            &format!("failed-{}-{attempt}", std::process::id()),
+        )
+        .ok()
+        .filter(|path| !path.exists())
+    }) else {
         return CliFailure::new(
             original.code,
             format!(
-                "{}; runner service remains stopped because no runnable listener could be verified",
+                "{}; could not reserve a unique failed-upgrade recovery path",
                 original.message()
             ),
         );
-    }
-    match run_in(
-        runner_dir,
-        "./svc.sh",
-        &["start"],
-        "restore runner service after failed upgrade",
-    ) {
+    };
+    let recovery = (|| -> Result<(), CliFailure> {
+        if runner_dir.exists() {
+            fs::rename(runner_dir, &failed).map_err(|error| {
+                CliFailure::new(1, format!("failed to quarantine replacement: {error}"))
+            })?;
+        }
+        fs::rename(backup, runner_dir).map_err(|error| {
+            CliFailure::new(1, format!("failed to restore original runner: {error}"))
+        })?;
+        let _ = fs::remove_dir_all(&failed);
+        Ok(())
+    })();
+    match recovery {
         Ok(()) => original,
-        Err(restart) => CliFailure::new(
+        Err(recovery_error) => CliFailure::new(
             original.code,
             format!(
-                "{}; runner service recovery also failed: {}",
+                "{}; original runner recovery also failed: {}",
                 original.message(),
-                restart.message()
+                recovery_error.message()
             ),
         ),
     }
+}
+
+fn activate_staged_service_install(runner_dir: &Path, staged: &Path) -> Result<(), CliFailure> {
+    let backup = sibling_transaction_path(runner_dir, "backup")?;
+    if backup.exists() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "stale runner backup {} exists; inspect it before retrying",
+                backup.display()
+            ),
+        ));
+    }
+    fs::rename(runner_dir, &backup).map_err(|error| {
+        CliFailure::new(1, format!("failed to preserve configured runner: {error}"))
+    })?;
+    if let Err(error) = fs::rename(staged, runner_dir) {
+        let original = CliFailure::new(1, format!("failed to activate staged runner: {error}"));
+        return Err(restore_original_runner(runner_dir, &backup, original));
+    }
+    let install_result = run_in(
+        runner_dir,
+        "./svc.sh",
+        &["install"],
+        "install runner service",
+    );
+    if let Err(error) = install_result {
+        // `svc.sh install` may have created external launchd state even when
+        // it returned failure. Do not restore the old directory underneath
+        // an ambiguous service registration unless cleanup succeeds.
+        if let Err(uninstall) = run_in(
+            runner_dir,
+            "./svc.sh",
+            &["uninstall"],
+            "uninstall failed replacement service",
+        ) {
+            return Err(CliFailure::new(
+                error.code,
+                format!(
+                    "{}; replacement service cleanup also failed: {}; original remains preserved at {}",
+                    error.message(),
+                    uninstall.message(),
+                    backup.display()
+                ),
+            ));
+        }
+        return Err(restore_original_runner(runner_dir, &backup, error));
+    }
+    if let Err(error) = run_in(runner_dir, "./svc.sh", &["start"], "start runner service") {
+        // A nonzero start may still have launched Listener/Worker. The runner's
+        // `svc.sh uninstall` is the single compound stop+uninstall operation;
+        // invoking `svc.sh stop` first makes its internal second stop fail on
+        // an already-unloaded LaunchAgent.
+        if let Err(uninstall) = run_in(
+            runner_dir,
+            "./svc.sh",
+            &["uninstall"],
+            "uninstall failed replacement service",
+        ) {
+            return Err(CliFailure::new(
+                error.code,
+                format!(
+                    "{}; replacement service cleanup also failed: {}; original remains preserved at {}",
+                    error.message(),
+                    uninstall.message(),
+                    backup.display()
+                ),
+            ));
+        }
+        return Err(restore_original_runner(runner_dir, &backup, error));
+    }
+    fs::remove_dir_all(&backup)
+        .map_err(|error| CliFailure::new(1, format!("failed to remove runner backup: {error}")))?;
+    Ok(())
 }
 
 fn ensure_private_rust_toolchain(runner_dir: &Path) -> Result<(), CliFailure> {
@@ -420,17 +801,6 @@ fn ensure_private_rust_toolchain(runner_dir: &Path) -> Result<(), CliFailure> {
     Ok(())
 }
 
-/// Existing runner names registered on a repo (any machine), for index
-/// continuation.
-fn existing_runner_names(actions: &GitHubActions, slug: &str) -> Result<Vec<String>, CliFailure> {
-    // Paginated: a fleet with >100 runners must not under-count, or the next
-    // index could collide with an existing `<repo>-<tag>-NN`.
-    Ok(fetch_all_runners(actions, slug)?
-        .into_iter()
-        .map(|r| r.name)
-        .collect())
-}
-
 /// `shipyard runner register`.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub(super) fn register_command<W: Write>(
@@ -466,24 +836,90 @@ pub(super) fn register_command<W: Write>(
     let labels_csv = labels.join(",");
     let ci_root = args.ci_root.clone().unwrap_or_else(default_ci_root);
 
-    let existing = existing_runner_names(args.actions, &slug)?;
-    let parallel = (cpu_count() / args.count as usize).max(1);
+    let existing = fetch_all_runners(args.actions, &slug)?;
 
-    // `--count` is the desired minimum local capacity. Include every runner
-    // from this machine that is still registered in GitHub so a repeated
-    // provisioning pass upgrades the fleet pin instead of silently creating
-    // new names and leaving the existing services behind.
-    let plan = build_runner_plan(
-        &existing,
-        &repo_short,
-        &tag,
-        args.count,
-        &ci_root,
-        &home_dir(),
-    );
+    // Preserve `--count` as the documented additive registration count while
+    // also including this host's existing configured runners for pin upgrades.
+    let home = home_dir();
+    let mut plan = build_runner_plan(&existing, &repo_short, &tag, args.count, &ci_root, &home);
+    let mut deferred = BTreeMap::new();
+    let mut retained = BTreeMap::new();
+    for entry in &mut plan {
+        let installation = inspect_runner_installation(&entry.dir);
+        validate_planned_runner_identity(
+            &entry.dir,
+            &entry.name,
+            &slug,
+            installation,
+            entry.registered.as_ref(),
+        )?;
+        validate_installation_shape(&entry.dir, installation)?;
+        if installation.configured {
+            entry.registered.as_ref().ok_or_else(|| {
+                CliFailure::new(
+                    1,
+                    format!(
+                        "configured runner `{}` has no retained GitHub status; refusing to modify it",
+                        entry.name
+                    ),
+                )
+            })?;
+            if installation.service_installed {
+                if installed_runner_version(&entry.dir).as_deref() == Some(PINNED_RUNNER_VERSION) {
+                    retained.insert(entry.name.clone(), "pinned_service".to_owned());
+                } else {
+                    deferred.insert(entry.name.clone(), "service_installed".to_owned());
+                }
+                continue;
+            }
+            let refreshed = fetch_all_runners(args.actions, &slug)?;
+            if let Some(observed) = runner_by_name(&refreshed, &entry.name) {
+                entry.registered = Some(observed.clone());
+            }
+            if let Err(error) = require_offline_idle_runner(&refreshed, &entry.name) {
+                if error.code == 3 {
+                    let reason = if runner_by_name(&refreshed, &entry.name)
+                        .is_some_and(|runner| runner.busy)
+                    {
+                        "busy"
+                    } else {
+                        "online_without_service"
+                    };
+                    deferred.insert(entry.name.clone(), reason.to_owned());
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    let mut unchanged = deferred.clone();
+    unchanged.extend(retained.clone());
+    // Existing runners may become active after any API snapshot. Preserve and
+    // reserve every configured runner's current allocation; only genuinely
+    // additive runners divide the remaining capacity. This keeps a late
+    // deferral from invalidating allocations already activated earlier.
+    let mut reserved_allocations = unchanged.clone();
+    for entry in &plan {
+        if entry.registered.is_some() {
+            reserved_allocations
+                .entry(entry.name.clone())
+                .or_insert_with(|| "existing_allocation".to_owned());
+        }
+    }
+    let external_reserved = external_runner_parallel(&home, &plan)?;
+    let available_to_plan = cpu_count().checked_sub(external_reserved).ok_or_else(|| {
+        CliFailure::new(
+            3,
+            format!(
+                "other local runners reserve {external_reserved} build slots, exceeding this host's detected CPU capacity; reconcile local allocations before adding runners"
+            ),
+        )
+    })?;
+    let parallel = allocate_plan_parallel(&mut plan, &reserved_allocations, available_to_plan)?;
 
     if args.dry_run {
-        return report_register(
+        report_register(
             stdout,
             args.json,
             &slug,
@@ -492,8 +928,15 @@ pub(super) fn register_command<W: Write>(
             &ci_root,
             parallel,
             &plan,
+            &deferred,
+            &retained,
             true,
-        );
+        )?;
+        return Ok(if deferred.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(3)
+        });
     }
 
     // Cache the fleet-wide pinned runner tarball once. `config.sh
@@ -524,80 +967,146 @@ pub(super) fn register_command<W: Write>(
     }
     verify_runner_package(&pkg_path)?;
 
+    // Close the long package-download window before any runner is changed.
+    // A newly installed service transfers control away from this command.
     for entry in &plan {
-        fs::create_dir_all(&entry.dir)
-            .map_err(|e| CliFailure::new(1, format!("failed to create runner dir: {e}")))?;
+        if !unchanged.contains_key(&entry.name)
+            && require_service_less_at_boundary(&entry.dir, &entry.name, "after preflight").is_err()
+        {
+            deferred.insert(entry.name.clone(), "service_installed".to_owned());
+            unchanged.insert(entry.name.clone(), "service_installed".to_owned());
+        }
+    }
+
+    for entry in &mut plan {
+        let installation = inspect_runner_installation(&entry.dir);
+        if unchanged.contains_key(&entry.name) {
+            continue;
+        }
+        if require_service_less_at_boundary(&entry.dir, &entry.name, "at the mutation boundary")
+            .is_err()
+        {
+            deferred.insert(entry.name.clone(), "service_installed".to_owned());
+            unchanged.insert(entry.name.clone(), "service_installed".to_owned());
+            continue;
+        }
         fs::create_dir_all(&entry.work)
             .map_err(|e| CliFailure::new(1, format!("failed to create work dir: {e}")))?;
-        let installation = inspect_runner_installation(&entry.dir);
-        validate_planned_runner_identity(&entry.dir, &entry.name, installation, &existing)?;
-        if !installation.configured && installation.service_installed {
-            return Err(CliFailure::new(
-                1,
-                format!(
-                    "runner service exists without configuration at {}; repair or remove the partial installation before retrying",
-                    entry.dir.display()
-                ),
-            ));
-        }
         let installed_version = installed_runner_version(&entry.dir);
         let needs_upgrade = installed_version.as_deref() != Some(PINNED_RUNNER_VERSION);
-        let stopped_for_upgrade = needs_upgrade && installation.service_installed;
-        if stopped_for_upgrade {
-            // Never replace files underneath a running service. A failed stop
-            // is a hard boundary: leave the old installation intact and let
-            // the operator repair the service before attempting the upgrade.
-            stop_runner_service_before_upgrade(&entry.dir)?;
+        if installation.configured {
+            let refreshed = fetch_all_runners(args.actions, &slug)?;
+            if let Some(observed) = runner_by_name(&refreshed, &entry.name) {
+                entry.registered = Some(observed.clone());
+            }
+            if let Err(error) = require_offline_idle_runner(&refreshed, &entry.name) {
+                if error.code == 3 {
+                    let reason = if runner_by_name(&refreshed, &entry.name)
+                        .is_some_and(|runner| runner.busy)
+                    {
+                        "busy"
+                    } else {
+                        "online_without_service"
+                    };
+                    deferred.insert(entry.name.clone(), reason.to_owned());
+                    unchanged.insert(entry.name.clone(), reason.to_owned());
+                    continue;
+                }
+                return Err(error);
+            }
         }
         let provision_result = (|| -> Result<(), CliFailure> {
-            if needs_upgrade {
-                run(
-                    "/usr/bin/tar",
-                    &[
-                        "xzf",
-                        &pkg_path.to_string_lossy(),
-                        "-C",
-                        &entry.dir.to_string_lossy(),
-                    ],
-                    "extract runner",
+            if needs_upgrade || installation.configured {
+                let staged = prepare_staged_runner(
+                    &entry.dir,
+                    &pkg_path,
+                    installation,
+                    &ci_root,
+                    &entry.work,
+                    entry.parallel,
                 )?;
-            }
-            if installed_runner_version(&entry.dir).as_deref() != Some(PINNED_RUNNER_VERSION) {
-                return Err(CliFailure::new(
-                    1,
-                    format!("runner did not install at pinned version {PINNED_RUNNER_VERSION}"),
-                ));
-            }
-            fs::write(
-                entry.dir.join(".env"),
-                runner_env_file(&ci_root, &entry.work, &entry.dir, parallel),
-            )
-            .map_err(|e| CliFailure::new(1, format!("failed to write .env: {e}")))?;
-            ensure_private_rust_toolchain(&entry.dir)?;
-            fs::write(entry.dir.join(".path"), runner_path_file(&entry.dir))
-                .map_err(|e| CliFailure::new(1, format!("failed to write .path: {e}")))?;
-
-            // A pinned upgrade retains GitHub's `.runner` credentials and the
-            // existing LaunchAgent. Reconfigure/install only genuinely new or
-            // explicitly service-less installations; otherwise `svc.sh install`
-            // rejects the still-present plist and leaves the runner offline.
-            if installation.configured {
-                if !installation.service_installed {
-                    run_in(
-                        &entry.dir,
-                        "./svc.sh",
-                        &["install"],
-                        "install runner service",
-                    )?;
-                    run_in(&entry.dir, "./svc.sh", &["start"], "start runner service")?;
-                } else if needs_upgrade {
-                    run_in(
-                        &entry.dir,
-                        "./svc.sh",
-                        &["start"],
-                        "restart runner service after upgrade",
-                    )?;
+                if let Err(error) = validate_planned_runner_identity(
+                    &staged,
+                    &entry.name,
+                    &slug,
+                    installation,
+                    entry.registered.as_ref(),
+                ) {
+                    let _ = fs::remove_dir_all(&staged);
+                    return Err(error);
                 }
+
+                if installation.configured {
+                    // Staging can include archive extraction and toolchain
+                    // preparation. Refresh at the final rename boundary so an
+                    // offline observation made before that work cannot
+                    // authorize mutation after the runner becomes active.
+                    if require_service_less_at_boundary(&entry.dir, &entry.name, "during staging")
+                        .is_err()
+                    {
+                        let _ = fs::remove_dir_all(&staged);
+                        deferred.insert(entry.name.clone(), "service_installed".to_owned());
+                        unchanged.insert(entry.name.clone(), "service_installed".to_owned());
+                        return Ok(());
+                    }
+                    let refreshed = fetch_all_runners(args.actions, &slug)?;
+                    if let Some(observed) = runner_by_name(&refreshed, &entry.name) {
+                        entry.registered = Some(observed.clone());
+                    }
+                    if let Err(error) = require_offline_idle_runner(&refreshed, &entry.name) {
+                        let _ = fs::remove_dir_all(&staged);
+                        if error.code == 3 {
+                            let reason = if runner_by_name(&refreshed, &entry.name)
+                                .is_some_and(|runner| runner.busy)
+                            {
+                                "busy"
+                            } else {
+                                "online_without_service"
+                            };
+                            deferred.insert(entry.name.clone(), reason.to_owned());
+                            unchanged.insert(entry.name.clone(), reason.to_owned());
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                    if require_service_less_at_boundary(
+                        &entry.dir,
+                        &entry.name,
+                        "at final activation",
+                    )
+                    .is_err()
+                    {
+                        let _ = fs::remove_dir_all(&staged);
+                        deferred.insert(entry.name.clone(), "service_installed".to_owned());
+                        unchanged.insert(entry.name.clone(), "service_installed".to_owned());
+                        return Ok(());
+                    }
+                    if let Err(error) = activate_staged_service_install(&entry.dir, &staged) {
+                        let _ = fs::remove_dir_all(&staged);
+                        return Err(error);
+                    }
+                } else if let Err(error) = fs::rename(&staged, &entry.dir) {
+                    let _ = fs::remove_dir_all(&staged);
+                    return Err(CliFailure::new(
+                        1,
+                        format!("failed to activate new runner: {error}"),
+                    ));
+                }
+            } else {
+                fs::write(
+                    entry.dir.join(".env"),
+                    runner_env_file(&ci_root, &entry.work, &entry.dir, entry.parallel),
+                )
+                .map_err(|e| CliFailure::new(1, format!("failed to write .env: {e}")))?;
+                ensure_private_rust_toolchain(&entry.dir)?;
+                fs::write(entry.dir.join(".path"), runner_path_file(&entry.dir))
+                    .map_err(|e| CliFailure::new(1, format!("failed to write .path: {e}")))?;
+            }
+
+            // Configured service-less installations were clone-staged and
+            // activated above. They retain `.runner` credentials and must not
+            // be passed through fresh `config.sh` registration.
+            if installation.configured {
                 return Ok(());
             }
 
@@ -632,13 +1141,7 @@ pub(super) fn register_command<W: Write>(
             run_in(&entry.dir, "./svc.sh", &["start"], "start runner service")?;
             Ok(())
         })();
-        if let Err(error) = provision_result {
-            return Err(if stopped_for_upgrade {
-                recover_runner_service_after_upgrade_failure(&entry.dir, error)
-            } else {
-                error
-            });
-        }
+        provision_result?;
     }
 
     report_register(
@@ -650,51 +1153,115 @@ pub(super) fn register_command<W: Write>(
         &ci_root,
         parallel,
         &plan,
+        &deferred,
+        &retained,
         false,
-    )
+    )?;
+    if deferred.is_empty() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        if !args.json {
+            let summary = deferred
+                .iter()
+                .map(|(name, reason)| format!("{name} ({reason})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(stdout, "Deferred existing runner upgrade(s): {summary}").ok();
+        }
+        Ok(ExitCode::from(3))
+    }
 }
 
+#[derive(Clone)]
 struct RunnerPlan {
     name: String,
     dir: PathBuf,
     work: PathBuf,
+    registered: Option<ApiRunner>,
+    parallel: usize,
+}
+
+fn allocate_plan_parallel(
+    plan: &mut [RunnerPlan],
+    deferred: &BTreeMap<String, String>,
+    cpus: usize,
+) -> Result<usize, CliFailure> {
+    let mut reserved_parallel = 0_usize;
+    for entry in &mut *plan {
+        if deferred.contains_key(&entry.name) {
+            entry.parallel = configured_parallel(&entry.dir)?;
+            reserved_parallel = reserved_parallel.saturating_add(entry.parallel);
+        }
+    }
+    let mutable_count = plan.len().saturating_sub(deferred.len());
+    let available_parallel = cpus.saturating_sub(reserved_parallel);
+    if mutable_count > 0 && available_parallel < mutable_count {
+        return Err(CliFailure::new(
+            3,
+            format!(
+                "deferred runners reserve {reserved_parallel} build slots, leaving {available_parallel} for {mutable_count} eligible runner(s); drain and reconcile existing runners before adding capacity"
+            ),
+        ));
+    }
+    let parallel = parallel_per_runner(available_parallel, mutable_count);
+    for entry in plan {
+        if !deferred.contains_key(&entry.name) {
+            entry.parallel = parallel;
+        }
+    }
+    Ok(parallel)
 }
 
 fn build_runner_plan(
-    registered_names: &[String],
+    registered_runners: &[ApiRunner],
     repo_short: &str,
     machine_tag: &str,
-    minimum_count: u32,
+    add_count: u32,
     ci_root: &Path,
     home: &Path,
 ) -> Vec<RunnerPlan> {
     let prefix = format!("{repo_short}-{machine_tag}-");
-    let mut names: Vec<String> = registered_names
+    let registered_names: Vec<String> = registered_runners
         .iter()
-        .filter(|name| name.starts_with(&prefix))
-        .filter(|name| {
-            home.join(format!("actions-runner-{name}"))
+        .map(|runner| runner.name.clone())
+        .collect();
+    let mut existing: Vec<ApiRunner> = registered_runners
+        .iter()
+        .filter(|runner| runner.name.starts_with(&prefix))
+        .filter(|runner| {
+            home.join(format!("actions-runner-{}", runner.name))
                 .join(".runner")
                 .is_file()
         })
         .cloned()
         .collect();
-    names.sort();
+    existing.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let mut next = next_index(registered_names, repo_short, machine_tag);
-    while names.len() < minimum_count as usize {
-        names.push(runner_name(repo_short, machine_tag, next));
-        next += 1;
-    }
-
-    names
+    let mut plan: Vec<RunnerPlan> = existing
         .into_iter()
-        .map(|name| RunnerPlan {
+        .map(|runner| {
+            let name = runner.name.clone();
+            RunnerPlan {
+                work: ci_root.join("work").join(&name),
+                dir: home.join(format!("actions-runner-{name}")),
+                name,
+                registered: Some(runner),
+                parallel: 0,
+            }
+        })
+        .collect();
+    let start = next_index(&registered_names, repo_short, machine_tag);
+    for next in (start..).take(add_count as usize) {
+        let name = runner_name(repo_short, machine_tag, next);
+        plan.push(RunnerPlan {
             work: ci_root.join("work").join(&name),
             dir: home.join(format!("actions-runner-{name}")),
             name,
-        })
-        .collect()
+            registered: None,
+            parallel: 0,
+        });
+    }
+    plan
 }
 
 fn runner_config_args(
@@ -720,7 +1287,7 @@ fn runner_config_args(
     ]
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn report_register<W: Write>(
     stdout: &mut W,
     json: bool,
@@ -730,6 +1297,8 @@ fn report_register<W: Write>(
     ci_root: &Path,
     parallel: usize,
     plan: &[RunnerPlan],
+    deferred: &BTreeMap<String, String>,
+    retained: &BTreeMap<String, String>,
     dry_run: bool,
 ) -> Result<ExitCode, CliFailure> {
     if json {
@@ -742,6 +1311,14 @@ fn report_register<W: Write>(
             "parallel_per_runner".to_owned(),
             Value::from(parallel as u64),
         );
+        data.insert(
+            "deferred_runners".to_owned(),
+            serde_json::to_value(deferred).unwrap_or(Value::Null),
+        );
+        data.insert(
+            "retained_runners".to_owned(),
+            serde_json::to_value(retained).unwrap_or(Value::Null),
+        );
         let runners: Vec<Value> = plan
             .iter()
             .map(|p| {
@@ -749,6 +1326,26 @@ fn report_register<W: Write>(
                 m.insert("name".to_owned(), Value::from(p.name.clone()));
                 m.insert("dir".to_owned(), Value::from(p.dir.display().to_string()));
                 m.insert("work".to_owned(), Value::from(p.work.display().to_string()));
+                m.insert("parallel".to_owned(), Value::from(p.parallel as u64));
+                if let Some(runner) = &p.registered {
+                    m.insert("status".to_owned(), Value::from(runner.status.clone()));
+                    m.insert("busy".to_owned(), Value::from(runner.busy));
+                    let deferred_reason = deferred.get(&p.name).map(String::as_str);
+                    m.insert(
+                        "action".to_owned(),
+                        Value::from(if let Some(reason) = deferred_reason {
+                            format!("defer_{reason}")
+                        } else if let Some(reason) = retained.get(&p.name) {
+                            format!("retain_{reason}")
+                        } else {
+                            "upgrade_or_refresh".to_owned()
+                        }),
+                    );
+                } else {
+                    m.insert("status".to_owned(), Value::Null);
+                    m.insert("busy".to_owned(), Value::from(false));
+                    m.insert("action".to_owned(), Value::from("register"));
+                }
                 Value::Object(m)
             })
             .collect();
@@ -764,14 +1361,40 @@ fn report_register<W: Write>(
     };
     writeln!(
         stdout,
-        "{verb} {} runner(s) for {slug} [tag={tag}, ~{parallel} cores each]",
+        "{verb} {} runner(s) for {slug} [tag={tag}, ~{parallel} cores per eligible runner]",
         plan.len()
     )
     .ok();
     writeln!(stdout, "  labels:  {labels_csv}").ok();
     writeln!(stdout, "  ci-root: {}", ci_root.display()).ok();
     for p in plan {
-        writeln!(stdout, "  - {}  (work={})", p.name, p.work.display()).ok();
+        let state = p.registered.as_ref().map_or_else(
+            || "new/register".to_owned(),
+            |runner| {
+                let deferred = deferred.contains_key(&p.name);
+                let retained = retained.contains_key(&p.name);
+                format!(
+                    "{}/{}:{}",
+                    runner.status,
+                    if runner.busy { "busy" } else { "idle" },
+                    if deferred {
+                        "defer"
+                    } else if retained {
+                        "retain"
+                    } else {
+                        "upgrade"
+                    }
+                )
+            },
+        );
+        writeln!(
+            stdout,
+            "  - {}  (work={}, parallel={}, {state})",
+            p.name,
+            p.work.display(),
+            p.parallel
+        )
+        .ok();
     }
     if dry_run {
         writeln!(stdout, "\nRe-run without --dry-run to apply.").ok();
@@ -1148,6 +1771,15 @@ fn envelope<W: Write>(
 mod tests {
     use super::*;
 
+    fn api_runner(name: &str, status: &str, busy: bool) -> ApiRunner {
+        ApiRunner {
+            name: name.to_owned(),
+            status: status.to_owned(),
+            busy,
+            labels: Vec::new(),
+        }
+    }
+
     #[test]
     fn parse_dot_runner_handles_bom_and_extracts_slug() {
         let raw = "\u{feff}{\"agentName\":\"pulp-m1-01\",\"gitHubUrl\":\"https://github.com/danielraffel/pulp\"}";
@@ -1208,83 +1840,198 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn runner_upgrade_stops_an_existing_service_before_replacement() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn service_installed_runner_is_reported_deferred_without_control() {
         let temp = tempfile::tempdir().expect("temp");
-        let service = temp.path().join("svc.sh");
-        std::fs::write(
-            &service,
-            "#!/bin/sh\nprintf '%s\\n' \"$1\" > service-invocation\n",
+        let runner_dir = temp.path().join("actions-runner-pulp-m5-01");
+        std::fs::create_dir_all(&runner_dir).expect("runner dir");
+        std::fs::write(runner_dir.join(".runner"), "{}\n").expect("runner marker");
+        std::fs::write(runner_dir.join(".service"), "plist\n").expect("service marker");
+        let plan = vec![RunnerPlan {
+            name: "pulp-m5-01".to_owned(),
+            dir: runner_dir,
+            work: temp.path().join("work"),
+            registered: Some(api_runner("pulp-m5-01", "online", false)),
+            parallel: 4,
+        }];
+        let deferred = BTreeMap::from([("pulp-m5-01".to_owned(), "service_installed".to_owned())]);
+        let mut output = Vec::new();
+        report_register(
+            &mut output,
+            true,
+            "Generous-Corp/pulp",
+            "m5",
+            "self-hosted,macos,arm64",
+            temp.path(),
+            4,
+            &plan,
+            &deferred,
+            &BTreeMap::new(),
+            true,
         )
-        .expect("service script");
-        let mut permissions = std::fs::metadata(&service).expect("metadata").permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&service, permissions).expect("chmod");
-
-        stop_runner_service_before_upgrade(temp.path()).expect("stop service");
+        .expect("report");
+        let json: Value = serde_json::from_slice(&output).expect("one JSON document");
         assert_eq!(
-            std::fs::read_to_string(temp.path().join("service-invocation")).expect("invocation"),
-            "stop\n"
+            json.pointer("/runners/0/action").and_then(Value::as_str),
+            Some("defer_service_installed")
+        );
+
+        let mut post_apply = Vec::new();
+        report_register(
+            &mut post_apply,
+            true,
+            "Generous-Corp/pulp",
+            "m5",
+            "self-hosted,macos,arm64",
+            temp.path(),
+            4,
+            &plan,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        )
+        .expect("post-apply report");
+        let post_apply: Value =
+            serde_json::from_slice(&post_apply).expect("one post-apply JSON document");
+        assert_eq!(
+            post_apply
+                .pointer("/runners/0/action")
+                .and_then(Value::as_str),
+            Some("upgrade_or_refresh")
+        );
+
+        let mut retained_output = Vec::new();
+        let retained = BTreeMap::from([("pulp-m5-01".to_owned(), "pinned_service".to_owned())]);
+        report_register(
+            &mut retained_output,
+            true,
+            "Generous-Corp/pulp",
+            "m5",
+            "self-hosted,macos,arm64",
+            temp.path(),
+            4,
+            &plan,
+            &BTreeMap::new(),
+            &retained,
+            true,
+        )
+        .expect("retained report");
+        let retained_output: Value =
+            serde_json::from_slice(&retained_output).expect("one retained JSON document");
+        assert_eq!(
+            retained_output
+                .pointer("/runners/0/action")
+                .and_then(Value::as_str),
+            Some("retain_pinned_service")
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn runner_upgrade_refuses_an_installed_service_without_control_script() {
-        let temp = tempfile::tempdir().expect("temp");
-        std::fs::write(temp.path().join(".service"), "plist\n").expect("service marker");
+    fn failed_service_less_activation_uninstalls_then_restores_original() {
+        use std::os::unix::fs::PermissionsExt;
 
-        let error = stop_runner_service_before_upgrade(temp.path())
-            .expect_err("missing service control must fail closed");
-        assert!(error.message.contains("svc.sh is missing"));
+        let temp = tempfile::tempdir().expect("temp");
+        let runner = temp.path().join("actions-runner-pulp-m5-01");
+        let staged = temp
+            .path()
+            .join(".actions-runner-pulp-m5-01.shipyard-stage");
+        std::fs::create_dir_all(&runner).expect("runner");
+        std::fs::write(runner.join("original-marker"), "intact\n").expect("marker");
+        std::fs::create_dir_all(staged.join("bin")).expect("staged bin");
+        std::fs::write(staged.join("bin/Runner.Listener"), "new\n").expect("new listener");
+        let staged_service = staged.join("svc.sh");
+        std::fs::write(
+            &staged_service,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> ../service-recovery\ncase \"$1\" in\n  start) touch ../replacement-running; exit 1 ;;\n  uninstall) rm -f ../replacement-running ;;\nesac\n",
+        )
+        .expect("staged service");
+        let mut permissions = std::fs::metadata(&staged_service)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&staged_service, permissions).expect("chmod");
+
+        let returned = activate_staged_service_install(&runner, &staged)
+            .expect_err("failed start must restore original");
+        assert!(returned.message().contains("start runner service"));
+        assert_eq!(
+            std::fs::read_to_string(runner.join("original-marker")).expect("original restored"),
+            "intact\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("service-recovery")).expect("invocations"),
+            "install\nstart\nuninstall\n"
+        );
+        assert!(!temp.path().join("replacement-running").exists());
+        assert!(
+            !temp
+                .path()
+                .join(".actions-runner-pulp-m5-01.shipyard-backup")
+                .exists()
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn failed_upgrade_restores_a_stopped_runnable_service() {
+    fn failed_staged_extraction_never_stops_or_changes_the_live_runner() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("temp");
-        let listener = temp.path().join("bin/Runner.Listener");
-        std::fs::create_dir_all(listener.parent().expect("parent")).expect("bin dir");
-        std::fs::write(&listener, "#!/bin/sh\nprintf '2.334.0\\n'\n").expect("listener");
-        let service = temp.path().join("svc.sh");
+        let runner = temp.path().join("actions-runner-pulp-m5-01");
+        let package_root = temp.path().join("package-root");
+        std::fs::create_dir_all(runner.join("bin")).expect("runner bin");
+        std::fs::create_dir_all(package_root.join("bin")).expect("package bin");
+        let listener = runner.join("bin/Runner.Listener");
+        std::fs::write(&listener, "#!/bin/sh\nprintf '2.334.0\\n'\n").expect("old listener");
+        let service = runner.join("svc.sh");
         std::fs::write(
             &service,
-            "#!/bin/sh\nprintf '%s\\n' \"$1\" > service-recovery\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > ../service-invocation\n",
         )
-        .expect("service script");
-        for executable in [&listener, &service] {
+        .expect("service");
+        let corrupt = package_root.join("bin/Runner.Listener");
+        std::fs::write(&corrupt, "#!/bin/sh\nprintf 'corrupt\\n'\n").expect("corrupt");
+        for executable in [&listener, &service, &corrupt] {
             let mut permissions = std::fs::metadata(executable)
                 .expect("metadata")
                 .permissions();
             permissions.set_mode(0o700);
             std::fs::set_permissions(executable, permissions).expect("chmod");
         }
+        let package = temp.path().join("runner.tar.gz");
+        let status = Command::new("/usr/bin/tar")
+            .args(["czf", package.to_str().expect("package path"), "-C"])
+            .arg(&package_root)
+            .arg(".")
+            .status()
+            .expect("create package");
+        assert!(status.success());
 
-        let original = CliFailure::new(1, "rustup install failed");
-        let returned = recover_runner_service_after_upgrade_failure(temp.path(), original);
-        assert_eq!(returned.message(), "rustup install failed");
+        let error = prepare_staged_runner(
+            &runner,
+            &package,
+            RunnerInstallation {
+                configured: true,
+                service_installed: false,
+            },
+            &temp.path().join("ci"),
+            &temp.path().join("work"),
+            4,
+        )
+        .expect_err("corrupt staged listener must fail before service stop");
+        assert!(error.message().contains("staged runner is not pinned"));
         assert_eq!(
-            std::fs::read_to_string(temp.path().join("service-recovery"))
-                .expect("recovery invocation"),
-            "start\n"
+            installed_runner_version(&runner).as_deref(),
+            Some("2.334.0")
         );
-    }
-
-    #[test]
-    fn failed_upgrade_keeps_an_unrunnable_service_stopped() {
-        let temp = tempfile::tempdir().expect("temp");
-        std::fs::write(temp.path().join("svc.sh"), "#!/bin/sh\nexit 0\n").expect("service script");
-
-        let returned = recover_runner_service_after_upgrade_failure(
-            temp.path(),
-            CliFailure::new(1, "extract failed"),
+        assert!(!temp.path().join("service-invocation").exists());
+        assert!(
+            !temp
+                .path()
+                .join(".actions-runner-pulp-m5-01.shipyard-stage")
+                .exists()
         );
-        assert!(returned.message().contains("extract failed"));
-        assert!(returned.message().contains("remains stopped"));
     }
 
     #[test]
@@ -1310,29 +2057,126 @@ mod tests {
     }
 
     #[test]
+    fn service_appearing_after_preflight_blocks_the_mutation_boundary() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(temp.path().join(".runner"), "{}\n").expect("runner config");
+        require_service_less_at_boundary(temp.path(), "pulp-m5-01", "before staging")
+            .expect("service-less runner");
+
+        std::fs::write(temp.path().join(".service"), "plist\n").expect("service marker");
+        let error = require_service_less_at_boundary(temp.path(), "pulp-m5-01", "during staging")
+            .expect_err("new service must transfer control away from reconciliation");
+        assert_eq!(error.code, 3);
+        assert!(error.message().contains("during staging"));
+    }
+
+    #[test]
+    fn unconfigured_existing_directory_is_not_a_fresh_install_target() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(temp.path().join("partial-file"), "partial\n").expect("partial");
+        let installation = inspect_runner_installation(temp.path());
+        assert!(!installation.configured);
+        let error = validate_installation_shape(temp.path(), installation)
+            .expect_err("partial directory must not be overwritten as a fresh install");
+        assert!(error.message().contains("unconfigured runner directory"));
+    }
+
+    #[test]
     fn configured_runner_must_still_exist_in_github_inventory() {
         let temp = tempfile::tempdir().expect("temp");
         let installation = RunnerInstallation {
             configured: true,
             service_installed: true,
         };
+        std::fs::write(
+            temp.path().join(".runner"),
+            r#"{"agentName":"pulp-studio-03","gitHubUrl":"https://github.com/Generous-Corp/pulp"}"#,
+        )
+        .expect("runner identity");
 
         let error = validate_planned_runner_identity(
             temp.path(),
             "pulp-studio-03",
+            "Generous-Corp/pulp",
             installation,
-            &["pulp-studio-01".to_owned()],
+            None,
         )
         .expect_err("orphaned local runner config must fail closed");
         assert!(error.message.contains("not registered in GitHub"));
 
+        let registered = api_runner("pulp-studio-03", "online", false);
         validate_planned_runner_identity(
             temp.path(),
             "pulp-studio-03",
+            "Generous-Corp/pulp",
             installation,
-            &["pulp-studio-03".to_owned()],
+            Some(&registered),
         )
         .expect("matching server inventory");
+    }
+
+    #[test]
+    fn configured_runner_identity_must_match_name_and_repository() {
+        let temp = tempfile::tempdir().expect("temp");
+        let installation = RunnerInstallation {
+            configured: true,
+            service_installed: true,
+        };
+        let registered = api_runner("pulp-m5-01", "online", false);
+        std::fs::write(
+            temp.path().join(".runner"),
+            r#"{"agentName":"forge-m5-01","gitHubUrl":"https://github.com/Generous-Corp/forge"}"#,
+        )
+        .expect("runner identity");
+        let error = validate_planned_runner_identity(
+            temp.path(),
+            "pulp-m5-01",
+            "Generous-Corp/pulp",
+            installation,
+            Some(&registered),
+        )
+        .expect_err("foreign runner must never be controlled");
+        assert!(error.message().contains("identity mismatch"));
+
+        std::fs::write(
+            temp.path().join(".runner"),
+            r#"{"agentName":"pulp-m5-01","gitHubUrl":"https://github.com/Generous-Corp/forge"}"#,
+        )
+        .expect("runner identity");
+        let error = validate_planned_runner_identity(
+            temp.path(),
+            "pulp-m5-01",
+            "Generous-Corp/pulp",
+            installation,
+            Some(&registered),
+        )
+        .expect_err("foreign repository must never be controlled");
+        assert!(error.message().contains("repository mismatch"));
+    }
+
+    #[test]
+    fn service_less_runner_requires_offline_idle_evidence() {
+        let runners = vec![api_runner("pulp-m5-01", "online", true)];
+        let error = require_offline_idle_runner(&runners, "pulp-m5-01")
+            .expect_err("busy runner must never be stopped");
+        assert_eq!(error.code, 3);
+        assert!(error.message().contains("online/busy"));
+
+        let unknown = vec![api_runner("pulp-m5-01", "", false)];
+        let error = require_offline_idle_runner(&unknown, "pulp-m5-01")
+            .expect_err("missing status evidence must fail closed");
+        assert_eq!(error.code, 1);
+        assert!(error.message().contains("unknown GitHub status"));
+
+        let online = vec![api_runner("pulp-m5-01", "online", false)];
+        let error = require_offline_idle_runner(&online, "pulp-m5-01")
+            .expect_err("online service-less runner may be manually active");
+        assert_eq!(error.code, 3);
+        assert!(error.message().contains("online without"));
+
+        let offline = vec![api_runner("pulp-m5-01", "offline", false)];
+        require_offline_idle_runner(&offline, "pulp-m5-01")
+            .expect("offline idle service-less runner is safe to stage");
     }
 
     #[test]
@@ -1345,9 +2189,9 @@ mod tests {
             std::fs::write(dir.join(".runner"), "{}\n").expect("runner config");
         }
         let registered = vec![
-            "pulp-m5-01".to_owned(),
-            "pulp-m5-02".to_owned(),
-            "pulp-m1-01".to_owned(),
+            api_runner("pulp-m5-01", "online", false),
+            api_runner("pulp-m5-02", "offline", false),
+            api_runner("pulp-m1-01", "online", false),
         ];
 
         let existing_plan = build_runner_plan(&registered, "pulp", "m5", 1, &ci_root, temp.path());
@@ -1356,7 +2200,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["pulp-m5-01", "pulp-m5-02"]
+            vec!["pulp-m5-01", "pulp-m5-02", "pulp-m5-03"]
         );
 
         let expanded_plan = build_runner_plan(&registered, "pulp", "m5", 3, &ci_root, temp.path());
@@ -1365,9 +2209,99 @@ mod tests {
                 .iter()
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["pulp-m5-01", "pulp-m5-02", "pulp-m5-03"]
+            vec![
+                "pulp-m5-01",
+                "pulp-m5-02",
+                "pulp-m5-03",
+                "pulp-m5-04",
+                "pulp-m5-05"
+            ]
         );
         assert_eq!(expanded_plan[2].work, ci_root.join("work/pulp-m5-03"));
+        assert_eq!(parallel_per_runner(26, expanded_plan.len()), 5);
+    }
+
+    #[test]
+    fn deferred_allocations_are_reserved_before_new_parallelism_is_assigned() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut plan = Vec::new();
+        let mut deferred = BTreeMap::new();
+        for (name, existing_parallel) in [
+            ("pulp-m5-01", Some(2)),
+            ("pulp-m5-02", Some(2)),
+            ("pulp-m5-03", None),
+            ("pulp-m5-04", None),
+        ] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("runner dir");
+            if let Some(value) = existing_parallel {
+                std::fs::write(
+                    dir.join(".env"),
+                    format!("CMAKE_BUILD_PARALLEL_LEVEL={value}\n"),
+                )
+                .expect("runner env");
+                deferred.insert(name.to_owned(), "service_installed".to_owned());
+            }
+            plan.push(RunnerPlan {
+                name: name.to_owned(),
+                dir,
+                work: temp.path().join(format!("work-{name}")),
+                registered: None,
+                parallel: 0,
+            });
+        }
+
+        let eligible_parallel =
+            allocate_plan_parallel(&mut plan, &deferred, 12).expect("capacity plan");
+        assert_eq!(eligible_parallel, 4);
+        assert_eq!(
+            plan.iter().map(|entry| entry.parallel).collect::<Vec<_>>(),
+            vec![2, 2, 4, 4]
+        );
+
+        for entry in &plan[..2] {
+            std::fs::write(entry.dir.join(".env"), "CMAKE_BUILD_PARALLEL_LEVEL=6\n")
+                .expect("runner env");
+        }
+        let error = allocate_plan_parallel(&mut plan, &deferred, 12)
+            .expect_err("fully reserved host must not overcommit new runners");
+        assert_eq!(error.code, 3);
+        assert!(error.message().contains("leaving 0 for 2 eligible"));
+    }
+
+    #[test]
+    fn cross_repo_and_old_tag_local_runners_reserve_host_capacity() {
+        let temp = tempfile::tempdir().expect("temp");
+        for (name, parallel) in [
+            ("actions-runner-forge-m5-01", 3),
+            ("actions-runner-pulp-oldtag-01", 2),
+        ] {
+            let dir = temp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("runner dir");
+            std::fs::write(dir.join(".runner"), "{}\n").expect("runner config");
+            std::fs::write(
+                dir.join(".env"),
+                format!("CMAKE_BUILD_PARALLEL_LEVEL={parallel}\n"),
+            )
+            .expect("runner env");
+        }
+        let planned_dir = temp.path().join("actions-runner-pulp-m5-01");
+        std::fs::create_dir_all(&planned_dir).expect("planned runner dir");
+        std::fs::write(planned_dir.join(".runner"), "{}\n").expect("planned config");
+        std::fs::write(planned_dir.join(".env"), "CMAKE_BUILD_PARALLEL_LEVEL=7\n")
+            .expect("planned env");
+        let plan = vec![RunnerPlan {
+            name: "pulp-m5-01".to_owned(),
+            dir: planned_dir,
+            work: temp.path().join("work"),
+            registered: Some(api_runner("pulp-m5-01", "online", false)),
+            parallel: 0,
+        }];
+
+        assert_eq!(
+            external_runner_parallel(temp.path(), &plan).expect("capacity"),
+            5
+        );
     }
 
     // Runner provisioning targets self-hosted macOS runners and the env file's
@@ -1426,6 +2360,8 @@ mod tests {
             name: "Shipyard-studio-02".to_owned(),
             dir: PathBuf::from("/Users/me/actions-ci/Shipyard-studio-02"),
             work: PathBuf::from("/Volumes/Workshop/ci/shipyard/work/Shipyard-studio-02"),
+            registered: None,
+            parallel: 4,
         };
         let args = runner_config_args("danielraffel/Shipyard", "secret", &entry, "local-mac");
         assert!(args.iter().any(|arg| arg == "--disableupdate"));
