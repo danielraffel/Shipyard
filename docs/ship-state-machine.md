@@ -591,14 +591,20 @@ queue_absent_recovery = true
 ```
 
 Age is never recovery authority. Under the repository-scoped PR lock the daemon
-requires one exact preserved daemon work envelope, validates its
-checkout/tree/config provenance against the registered path, confirms the live
-PR is still OPEN at the stored head branch, head SHA, and base branch, and
-proves that no pending/running queue owner, newer owner, or worker receipt
-exists. It persists a fresh fenced generation before an idempotent queue insert,
-so a crash after either commit resumes the same generation. Missing auth,
-configuration, checkout, provenance, or GitHub evidence fails closed and emits
-a durable `needs_agent` receipt; absence never abandons or merges the ship state.
+requires the exact preserved daemon work envelope whose queue job ID is stored
+on the current ship attempt. Repo/PR/SHA equality alone is insufficient because
+a fresh attempt may deliberately reuse all three. The registered path identifies
+the repository root; a preserved canonical submission cwd may be a proven
+subdirectory beneath it. Recovery validates checkout/tree/config provenance
+from that cwd, confirms the live PR is still OPEN at the stored head branch,
+head SHA, and base branch, and proves that no pending/running queue owner, newer
+owner, or worker receipt exists. It persists a fresh fenced generation before
+an idempotent queue insert, so a crash after either commit resumes the same
+generation. Legacy state without an owning queue job keeps its envelope during
+retention but cannot replay it automatically. Missing auth, configuration,
+checkout, provenance, ownership identity, or GitHub evidence fails closed and
+emits a durable `needs_agent` receipt; absence never abandons or merges the ship
+state.
 
 ## Separate recovery-worker lifecycle (not `ShipState`)
 
