@@ -23,8 +23,9 @@ pub const SELECTED_TESTS_PAYLOAD_PLACEHOLDER: &str = "{selected_tests_b64}";
 pub const SELECTED_TESTS_DIGEST_PLACEHOLDER: &str = "{selected_tests_digest}";
 /// Current bounded-execution planning receipt schema.
 pub const AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
-/// Avoid exceeding platform command-line limits; larger selections fall back.
-pub const MAX_SELECTED_TEST_BYTES: usize = 128 * 1024;
+/// Stay below the Windows `cmd.exe` command-line ceiling after base64 expansion;
+/// larger selections fail closed to the ordinary full suite.
+pub const MAX_SELECTED_TEST_BYTES: usize = 4 * 1024;
 
 /// Protected-base execution posture.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -629,5 +630,17 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn oversized_cross_shell_payload_falls_back_before_command_construction() {
+        let mut policy = fixture_policy(ExecutionMode::Authoritative);
+        policy.baseline_tests = vec!["x".repeat(MAX_SELECTED_TEST_BYTES)];
+        let input = fixture_input("src/a.rs");
+        let receipt = fixture_receipt(&policy, &input);
+        assert_eq!(receipt.planned_suite, PlannedSuite::Bounded);
+        assert!(
+            plan_authoritative_execution(&receipt, &input, &policy, true, DIGEST, DIGEST,).is_err()
+        );
     }
 }
