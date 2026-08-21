@@ -548,6 +548,19 @@ naming/index/label/table logic lives in `src/runner_provision.rs`; the shell
 side (gh, `config.sh`, `svc.sh`, local `~/actions-runner-*` dirs) is
 `src/app/runner_provision_cmd.rs`. See `docs/runner-provisioning.md`.
 
+Pinned runner upgrades are fail-closed: never automatically stop or upgrade a
+service-installed runner. Retain it unchanged when it already matches the pin;
+otherwise report it deferred with exit 3 and leave its job eligibility
+unchanged. Upgrade a configured service-less runner only after a
+fresh GitHub observation proves it offline and idle, then repeat that check at
+the final rename boundary after staging. Clone-stage and verify the replacement
+before activation, keep the intact original until the new service starts, and
+use the runner's compound `svc.sh uninstall` to stop/remove a partially started
+replacement before restoring the original directory. Never re-run fresh
+`config.sh` over a configured upgrade.
+Toolchain readiness checks are silent probes; never let their stdout/stderr
+contaminate normal or JSON output.
+
 ### Machine tag (load-bearing for multi-Mac fleets)
 
 Runners are named `<repo>-<machine-tag>-NN` (e.g. `pulp-studio-01`). The tag is
@@ -570,13 +583,35 @@ shipyard runner register --repo Generous-Corp/pulp --count 3 \
 ```
 
 - Names continue from the highest existing `<repo>-<tag>-NN` (any machine), so
-  re-running appends capacity without collisions.
+  re-running appends exactly `--count` capacity without collisions. Existing
+  configured runners are reconciled separately. Reserve every existing
+  runner's unchanged `.env` allocation, including other repos and old tags on
+  the same host, before dividing remaining cores across
+  additive runners; fail closed rather than let a late activation overcommit
+  the host.
 - Default labels: `self-hosted,macos,arm64,<repo>-build,<repo>-build-<tag>`.
   `<repo>-build` is what a repo's workflow selects for normal routing;
   `<repo>-build-<tag>` pins work to one machine. Override with `--labels`.
 - Per-runner `_work` is `<ci-root>/work/<name>`; the `.env` points ccache and
   FetchContent at `<ci-root>/cache/*`. Cache *size* is owned by the host's
   `ccache.conf`, not this command.
+- Runner registration is deliberately fleet-pinned and uses `--disableupdate`.
+  Its `.path` is system-first so `/usr/bin/tar` resolves before Homebrew, and
+  Rust lives under that runner's own `_toolcache/{rustup,cargo}` on local disk.
+  Never point those homes through a symlink to a shared/external build volume;
+  an offline filesystem can otherwise wedge `Runner.Worker` inside native
+  `open` before Shipyard receives a useful failure.
+- Existing-runner reconciliation parses `.runner` and requires its `agentName`
+  and repository URL to match the requested runner before any mutation.
+  Service-installed runners are never auto-stopped or upgraded; matching pins
+  are retained, while outdated services are deferred unchanged (exit 3). A service-less runner is eligible only after a
+  fresh GitHub observation proves it offline and idle, with a second check at
+  the final rename boundary after staging. Eligible upgrades clone-stage and
+  verify the full replacement before activation, retain the intact original
+  until the replacement service starts, and uninstall failed service setup
+  before rollback. Never activate a partial extraction.
+  If an existing runner becomes busy, online, or service-managed during
+  staging, defer that reconciliation and continue the additive registrations.
 
 ### List and remove
 

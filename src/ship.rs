@@ -3485,6 +3485,11 @@ mod tests {
     #[test]
     fn drain_does_not_start_replacements_when_admission_cancels_the_awaited_job() {
         let temp = tempfile::tempdir().expect("tempdir");
+        // Admission also checks whether queued PRs merged while waiting. Keep
+        // this scheduler test hermetic: an ambient `gh pr view` can block on
+        // host auth/network and obscures the same-PR cancellation invariant.
+        let open_pr_snapshot = temp.path().join("open-pr.json");
+        std::fs::write(&open_pr_snapshot, r#"{"state":"OPEN"}"#).expect("open PR snapshot");
         let state_dir = temp.path().join("state");
         let mut queue = Queue::new(&state_dir).expect("queue");
         let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
@@ -3523,7 +3528,7 @@ mod tests {
             &config,
             &old.id,
             &dispatcher,
-            None,
+            Some(&open_pr_snapshot),
         )
         .expect("drain cycle");
 
