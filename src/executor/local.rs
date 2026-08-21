@@ -220,10 +220,16 @@ impl LocalValidationRequest<'_> {
 }
 
 /// Execute validation commands locally.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct LocalExecutor {
     prepared_state_store: Option<PreparedStateStore>,
     rotated_segments: usize,
+}
+
+impl Default for LocalExecutor {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl LocalExecutor {

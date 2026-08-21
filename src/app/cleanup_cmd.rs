@@ -487,10 +487,8 @@ fn plan_cleanup_staging(
         ));
     }
     let mut candidates = Vec::new();
-    for entry in fs::read_dir(&staging)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?
-        .flatten()
-    {
+    for entry in fs::read_dir(&staging).map_err(|error| CliFailure::new(1, error.to_string()))? {
+        let entry = entry.map_err(|error| CliFailure::new(1, error.to_string()))?;
         let kind = entry
             .file_type()
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -578,6 +576,7 @@ struct LogCandidate {
     terminal_at: Option<DateTime<Utc>>,
     manifest_disposition: Option<(bool, DateTime<Utc>)>,
     failed: Option<bool>,
+    queue_disposition: Option<bool>,
     active: bool,
     audit_pinned: bool,
     reason: String,
@@ -685,10 +684,10 @@ fn collect_log_candidates(
             let manifest_disposition = manifest
                 .as_ref()
                 .map(|value| (value.failed, value.terminal_at));
-            let failed = manifest
-                .as_ref()
-                .map(|value| value.failed)
-                .or_else(|| queue_state?.failed);
+            // A terminal manifest is the durable classification boundary.
+            // Queue-only outcomes remain unclassified so a failed manifest
+            // transition can never shorten evidence retention.
+            let failed = manifest.as_ref().map(|value| value.failed);
             let terminal_at = manifest
                 .as_ref()
                 .map(|value| value.terminal_at)
@@ -708,6 +707,7 @@ fn collect_log_candidates(
                 audit_pinned: audit_pin_exists(&path),
                 path,
                 failed,
+                queue_disposition: queue_state.and_then(|value| value.failed),
                 reason,
                 logs_root: logs_dir.to_path_buf(),
                 logs_root_identity: logs_root_identity.clone(),
@@ -1548,7 +1548,7 @@ fn recheck_mutation_boundary(candidate: &LogCandidate) -> Result<(), CliFailure>
     }
     if let Some(current) = jobs.get(job_id) {
         if current.active
-            || current.failed != candidate.failed
+            || current.failed != candidate.queue_disposition
             || current.terminal_at != candidate.terminal_at
         {
             return Err(CliFailure::new(
@@ -1811,6 +1811,42 @@ mod retention_tests {
     }
 
     #[test]
+    fn queue_success_without_manifest_remains_failure_retained() {
+        let temp = tempfile::tempdir().expect("temp");
+        let job = temp.path().join("logs/job");
+        fs::create_dir_all(&job).expect("job dir");
+        fs::write(job.join("target.log"), "diagnostic evidence").expect("log");
+        let queue_jobs = BTreeMap::from([(
+            "job".to_owned(),
+            QueueLogState {
+                active: false,
+                failed: Some(false),
+                terminal_at: Some(Utc::now() - Duration::days(2)),
+            },
+        )]);
+        let policy = LogRetentionPolicy {
+            success_days: 1,
+            failure_days: 30,
+            ..LogRetentionPolicy::default()
+        };
+        let mut items = Vec::new();
+        let mut protected = Vec::new();
+        scan_job_logs(
+            temp.path(),
+            &queue_jobs,
+            policy,
+            true,
+            &mut items,
+            &mut protected,
+        )
+        .expect("scan");
+        assert!(!items.iter().any(|item| item.action == "delete"));
+        assert!(protected.iter().any(|item| {
+            item.path.ends_with("job") && item.reason.contains("failure/unclassified")
+        }));
+    }
+
+    #[test]
     fn explicit_audit_pin_survives_expiry_and_pressure() {
         let temp = tempfile::tempdir().expect("temp");
         let job = temp.path().join("logs/audit");
@@ -2028,6 +2064,7 @@ mod retention_tests {
             terminal_at: Some(terminal_at),
             manifest_disposition: Some((false, terminal_at)),
             failed: Some(false),
+            queue_disposition: Some(false),
             active: false,
             audit_pinned: false,
             reason: "passed".to_owned(),
@@ -2247,7 +2284,7 @@ mod retention_tests {
         assert!(preview.items.iter().any(|item| {
             item.kind == "log_recovery"
                 && item.action == "restore"
-                && item.path.ends_with("logs/success")
+                && Path::new(&item.path).ends_with(Path::new("logs").join("success"))
         }));
 
         let applied = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())

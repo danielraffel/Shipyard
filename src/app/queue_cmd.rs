@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use serde_json::{Value, json};
@@ -189,9 +189,26 @@ pub(super) fn logs_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let mut queue = open_queue(state_dir)?;
-    let job = queue
-        .get(job_id)?
-        .ok_or_else(|| CliFailure::new(1, format!("Job {job_id} not found")))?;
+    let Some(job) = queue.get(job_id)? else {
+        let target = target.ok_or_else(|| {
+            CliFailure::new(
+                1,
+                format!("Job {job_id} is retained; specify --target to read its log"),
+            )
+        })?;
+        if !is_plain_component(job_id) || !is_plain_component(&target) {
+            return Err(CliFailure::new(2, "target must be one path component"));
+        }
+        let job_dir = state_dir.join("logs").join(job_id);
+        let job_kind = fs::symlink_metadata(&job_dir)
+            .ok()
+            .map(|value| value.file_type());
+        if !job_kind.is_some_and(|kind| kind.is_dir() && !kind.is_symlink()) {
+            return Err(CliFailure::new(1, format!("Job {job_id} not found")));
+        }
+        write_retained_target_logs(stdout, &job_dir, &target)?;
+        return Ok(ExitCode::SUCCESS);
+    };
     if let Some(target) = target {
         let result = job
             .results
@@ -215,6 +232,75 @@ pub(super) fn logs_command<W: Write>(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn is_plain_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && Path::new(value).file_name().and_then(|name| name.to_str()) == Some(value)
+}
+
+fn write_retained_target_logs<W: Write>(
+    stdout: &mut W,
+    job_dir: &Path,
+    target: &str,
+) -> Result<(), CliFailure> {
+    let base_name = format!("{target}.log");
+    let mut logical_logs = BTreeMap::new();
+    for entry in fs::read_dir(job_dir).map_err(|error| CliFailure::new(1, error.to_string()))? {
+        let entry = entry.map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if !kind.is_file() || kind.is_symlink() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some((order, root_name)) = retained_log_root(&name, &base_name) {
+            logical_logs.insert(order, job_dir.join(root_name));
+        }
+    }
+    if logical_logs.is_empty() {
+        return Err(CliFailure::new(
+            1,
+            format!("No retained log for target {target}"),
+        ));
+    }
+    for path in logical_logs.into_values() {
+        write_log(stdout, &path.to_string_lossy())?;
+    }
+    Ok(())
+}
+
+fn retained_log_root(name: &str, base_name: &str) -> Option<([u32; 2], String)> {
+    let without_gzip = name.strip_suffix(".gz").unwrap_or(name);
+    let (root, _) = without_gzip
+        .rsplit_once('.')
+        .filter(|(_, suffix)| suffix.parse::<usize>().is_ok())
+        .unwrap_or((without_gzip, ""));
+    let mut suffix = root.strip_prefix(base_name)?;
+    let mut order = [0, 0];
+    while !suffix.is_empty() {
+        let (slot, offset, rest) = if let Some(rest) = suffix.strip_prefix(".retry") {
+            (0, 0, rest)
+        } else {
+            (1, 1, suffix.strip_prefix(".attempt-")?)
+        };
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let index = rest[..digits].parse::<u32>().ok()?;
+        if order[slot] != 0 || (slot == 0 && order[1] != 0) {
+            return None;
+        }
+        order[slot] = index.checked_add(offset)?;
+        suffix = &rest[digits..];
+    }
+    Some((order, root.to_owned()))
 }
 
 pub(super) fn cancel_command<W: Write>(
@@ -460,20 +546,50 @@ fn write_job_envelope<W: Write>(
 }
 
 fn write_log<W: Write>(stdout: &mut W, log_path: &str) -> Result<(), CliFailure> {
-    let text = if let Ok(text) = fs::read_to_string(log_path) {
-        text
+    let mut retained = Vec::new();
+    for index in (1..=32).rev() {
+        let rotated = PathBuf::from(format!("{log_path}.{index}"));
+        let compressed = PathBuf::from(format!("{log_path}.{index}.gz"));
+        if rotated.exists() {
+            retained.push((rotated, false));
+        } else if compressed.exists() {
+            retained.push((compressed, true));
+        }
+    }
+    let base = PathBuf::from(log_path);
+    if base.exists() {
+        retained.push((base, false));
     } else {
-        let compressed_path = format!("{log_path}.gz");
-        let file = fs::File::open(&compressed_path)
-            .map_err(|_| CliFailure::new(1, format!("Log file not found: {log_path}")))?;
-        let mut decoder = flate2::read::GzDecoder::new(file);
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut decoder, &mut text).map_err(|error| {
-            CliFailure::new(1, format!("failed to read {compressed_path}: {error}"))
-        })?;
-        text
-    };
-    write!(stdout, "{text}").map_err(|error| CliFailure::new(1, error.to_string()))
+        let compressed = PathBuf::from(format!("{log_path}.gz"));
+        if compressed.exists() {
+            retained.push((compressed, true));
+        }
+    }
+    if retained.is_empty() {
+        return Err(CliFailure::new(
+            1,
+            format!("Log file not found: {log_path}"),
+        ));
+    }
+    for (path, compressed) in retained {
+        let text = if compressed {
+            let file = fs::File::open(&path).map_err(|error| {
+                CliFailure::new(1, format!("failed to read {}: {error}", path.display()))
+            })?;
+            let mut decoder = flate2::read::GzDecoder::new(file);
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut decoder, &mut text).map_err(|error| {
+                CliFailure::new(1, format!("failed to read {}: {error}", path.display()))
+            })?;
+            text
+        } else {
+            fs::read_to_string(&path).map_err(|error| {
+                CliFailure::new(1, format!("failed to read {}: {error}", path.display()))
+            })?
+        };
+        write!(stdout, "{text}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn current_git_branch(cwd: &Path) -> Option<String> {
@@ -527,7 +643,9 @@ impl From<QueuePriority> for Priority {
 
 #[cfg(test)]
 mod tests {
-    use super::write_log;
+    use super::{logs_command, write_log};
+    use crate::log_retention::{TERMINAL_MANIFEST_FILE, TerminalLogManifest};
+    use chrono::Utc;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write;
@@ -543,5 +661,74 @@ mod tests {
         let mut stdout = Vec::new();
         write_log(&mut stdout, path.to_str().expect("path")).expect("read gzip");
         assert_eq!(stdout, b"retained evidence\n");
+    }
+
+    #[test]
+    fn write_log_includes_rotated_segments_oldest_first() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("target.log");
+        std::fs::write(format!("{}.2", path.display()), "oldest\n").expect("oldest");
+        std::fs::write(format!("{}.1", path.display()), "older\n").expect("older");
+        std::fs::write(&path, "active\n").expect("active");
+        let mut stdout = Vec::new();
+        write_log(&mut stdout, path.to_str().expect("path")).expect("read history");
+        assert_eq!(stdout, b"oldest\nolder\nactive\n");
+    }
+
+    #[test]
+    fn trimmed_terminal_job_log_is_readable_by_target() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(temp.path().join("queue.json"), r#"{"jobs":[]}"#).expect("queue");
+        let job_dir = temp.path().join("logs/job");
+        std::fs::create_dir_all(&job_dir).expect("job dir");
+        std::fs::write(job_dir.join("macos.log"), "first attempt\n").expect("log");
+        std::fs::write(job_dir.join("macos.log.attempt-1"), "first failover\n").expect("failover");
+        std::fs::write(job_dir.join("macos.log.retry1"), "terminal retry\n").expect("retry");
+        let nested = std::fs::File::create(job_dir.join("macos.log.retry1.attempt-2.gz"))
+            .expect("nested gzip");
+        let mut encoder = GzEncoder::new(nested, Compression::fast());
+        encoder
+            .write_all(b"terminal failover\n")
+            .expect("nested log");
+        encoder.finish().expect("finish nested gzip");
+        let manifest = TerminalLogManifest {
+            schema_version: 1,
+            job_id: "job".to_owned(),
+            terminal_at: Utc::now(),
+            failed: false,
+            reason: "passed".to_owned(),
+        };
+        std::fs::write(
+            job_dir.join(TERMINAL_MANIFEST_FILE),
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("manifest");
+        let mut stdout = Vec::new();
+        logs_command("job", Some("macos".to_owned()), temp.path(), &mut stdout)
+            .expect("retained log");
+        assert_eq!(
+            stdout,
+            b"first attempt\nfirst failover\nterminal retry\nterminal failover\n"
+        );
+
+        std::fs::remove_file(job_dir.join(TERMINAL_MANIFEST_FILE)).expect("remove manifest");
+        let mut unclassified = Vec::new();
+        logs_command(
+            "job",
+            Some("macos".to_owned()),
+            temp.path(),
+            &mut unclassified,
+        )
+        .expect("unclassified retained log");
+        assert_eq!(unclassified, stdout);
+
+        let error = logs_command(
+            "../job",
+            Some("macos".to_owned()),
+            temp.path(),
+            &mut Vec::new(),
+        )
+        .expect_err("job traversal rejected");
+        assert_eq!(error.code, 2);
     }
 }

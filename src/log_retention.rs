@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -198,17 +198,15 @@ pub fn write_terminal_manifest(state_dir: &Path, job: &Job) -> io::Result<()> {
         return Ok(());
     }
     let destination = job_dir.join(TERMINAL_MANIFEST_FILE);
-    let temporary = job_dir.join(format!("{TERMINAL_MANIFEST_FILE}.tmp"));
     let bytes = serde_json::to_vec_pretty(&TerminalLogManifest::from_job(job))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&temporary)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&job_dir)?;
+    let file = temporary.as_file_mut();
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
-    fs::rename(temporary, &destination)?;
+    temporary
+        .persist(&destination)
+        .map_err(|error| error.error)?;
     sync_parent_directory(&destination)
 }
 
@@ -642,9 +640,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_failure_does_not_strand_terminal_queue_outcome() {
+    #[cfg(unix)]
+    fn fixed_manifest_temporary_symlink_is_never_followed() {
         use crate::queue::Queue;
+        use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().expect("temp");
+        let external = temp.path().join("external");
+        fs::write(&external, "outside evidence\n").expect("external");
         let mut queue = Queue::new(temp.path()).expect("queue");
         let mut job = Job::create(
             "sha",
@@ -655,8 +657,12 @@ mod tests {
         );
         queue.enqueue(job.clone()).expect("enqueue");
         let log_dir = temp.path().join("logs").join(&job.id);
-        fs::create_dir_all(log_dir.join(format!("{TERMINAL_MANIFEST_FILE}.tmp")))
-            .expect("blocking temporary directory");
+        fs::create_dir_all(&log_dir).expect("log dir");
+        symlink(
+            &external,
+            log_dir.join(format!("{TERMINAL_MANIFEST_FILE}.tmp")),
+        )
+        .expect("adversarial fixed temporary symlink");
         job.status = JobStatus::Completed;
         job.completed_at = Some(Utc::now());
         job.results.insert(
@@ -668,11 +674,15 @@ mod tests {
             queue.get(&job.id).expect("read queue").expect("job").status,
             JobStatus::Completed
         );
-        assert!(read_terminal_manifest(&log_dir).is_none());
+        assert!(read_terminal_manifest(&log_dir).is_some());
+        assert_eq!(
+            fs::read_to_string(external).expect("external"),
+            "outside evidence\n"
+        );
     }
 
     #[test]
-    fn failed_reclassification_rewrite_cannot_leave_stale_success_manifest() {
+    fn fixed_temporary_collision_cannot_block_failure_reclassification() {
         use crate::queue::Queue;
         let temp = tempfile::tempdir().expect("temp");
         let mut queue = Queue::new(temp.path()).expect("queue");
@@ -708,7 +718,11 @@ mod tests {
         queue
             .update(&job)
             .expect("failed reclassification is durable");
-        assert!(read_terminal_manifest(&log_dir).is_none());
+        assert!(
+            read_terminal_manifest(&log_dir)
+                .expect("failure manifest")
+                .failed
+        );
         assert!(!queue.get(&job.id).expect("queue").expect("job").passed());
     }
 

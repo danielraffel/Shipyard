@@ -1589,8 +1589,9 @@ mod tests {
     use super::{
         DaemonRunConfig, DaemonRunError, RegistrationSyncState, WebhookRequest,
         archive_closed_pull_request_ship_state, daemon_tunnel_config, handle_webhook_request,
-        load_or_create_webhook_secret, parse_tunnel_enabled, pid_alive, reconcile_healed_event,
-        run_blocking, ship_state_map, should_start_reconcile, start_tunnel_runtime, stop_running,
+        load_or_create_webhook_secret, parse_tunnel_enabled, pid_alive,
+        process_looks_like_shipyard_daemon, reconcile_healed_event, run_blocking, ship_state_map,
+        should_start_reconcile, start_tunnel_runtime, stop_running,
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{read_daemon_ship_state_list, read_daemon_status};
@@ -2208,6 +2209,15 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(pid_path.exists(), "pid file was not written");
+        let identity_deadline = Instant::now() + Duration::from_secs(1);
+        while !process_looks_like_shipyard_daemon(child.id()) && Instant::now() < identity_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_looks_like_shipyard_daemon(child.id()),
+            "daemon identity was not observable"
+        );
 
         assert!(stop_running(temp.path()));
 

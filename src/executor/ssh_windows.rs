@@ -1300,7 +1300,7 @@ fn value_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn write_bundle_apply_stderr(log_file: &Path, output: &CommandCapture) -> Option<PathBuf> {
-    let path = PathBuf::from(format!("{}.bundle-apply-stderr", log_file.display()));
+    let path = bundle_apply_stderr_path(log_file);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok()?;
     }
@@ -1317,6 +1317,10 @@ fn write_bundle_apply_stderr(log_file: &Path, output: &CommandCapture) -> Option
     )
     .ok()?;
     Some(path)
+}
+
+fn bundle_apply_stderr_path(log_file: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.bundle-apply-stderr", log_file.display()))
 }
 
 fn detect_vs_toolchain(host: &str, ssh_options: &[String]) -> Option<VsToolchain> {
@@ -1597,6 +1601,10 @@ fn bootstrap_bundle_upload_log(
         fs::create_dir_all(parent)?;
     }
     crate::log_retention::rotate_before_open(context.log_path, request.rotated_segments)?;
+    crate::log_retention::rotate_before_open(
+        &bundle_apply_stderr_path(context.log_path),
+        request.rotated_segments,
+    )?;
     let mut text = String::new();
     let _ = writeln!(text, "# shipyard ssh-windows lane log");
     let _ = writeln!(text, "target: {}", context.target.name);

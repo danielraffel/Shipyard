@@ -261,18 +261,23 @@ fn ordered_audit_paths(audit_path: &Path) -> Result<Option<Vec<PathBuf>>, String
     if !audit_dir.is_dir() {
         return Ok(None);
     }
-    let mut audit_paths = fs::read_dir(audit_dir)
+    let mut audit_paths = Vec::new();
+    for entry in fs::read_dir(audit_dir)
         .map_err(|error| format!("failed to list merge-queue mutation audit: {error}"))?
-        .flatten()
-        .filter_map(|entry| {
+    {
+        let entry =
+            entry.map_err(|error| format!("failed to list merge-queue mutation audit: {error}"))?;
+        if let Some(indexed_path) = (|| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
             name.strip_prefix("mutations.jsonl.")?
                 .parse::<usize>()
                 .ok()
                 .map(|index| (index, path))
-        })
-        .collect::<Vec<_>>();
+        })() {
+            audit_paths.push(indexed_path);
+        }
+    }
     audit_paths.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
     let mut ordered_paths = audit_paths
         .into_iter()
