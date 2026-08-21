@@ -728,7 +728,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
     job = job.complete()?;
     record_evidence(
         evidence,
-        &ship_evidence_scope(&request.repo, cwd),
+        &ship_evidence_scope(&request.repo, request.pr, cwd),
         request,
         &job,
     )?;
@@ -3549,7 +3549,7 @@ mod tests {
         );
         let evidence_record = evidence
             .get_target_scoped(
-                &crate::evidence::repository_evidence_scope(&request.repo),
+                &crate::evidence::repository_ship_evidence_scope(&request.repo, request.pr),
                 "feature/test",
                 "ubuntu",
             )

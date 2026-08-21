@@ -368,6 +368,41 @@ impl EvidenceStore {
         Self::load_records(&path).unwrap_or_default()
     }
 
+    /// Return the newest record per target for scoped workloads whose stored
+    /// scope starts with `workload_scope_prefix`.
+    #[must_use]
+    pub fn get_branch_scoped_prefix(
+        &self,
+        workload_scope_prefix: &str,
+        branch: &str,
+    ) -> BTreeMap<String, EvidenceRecord> {
+        let mut merged = BTreeMap::<String, EvidenceRecord>::new();
+        let Ok(scopes) = fs::read_dir(self.path.join("scoped")) else {
+            return merged;
+        };
+        let branch_key = collision_safe_component(branch);
+        for records in scopes.flatten().filter_map(|scope| {
+            Self::load_records(&scope.path().join(format!("{branch_key}.json"))).ok()
+        }) {
+            for (target, record) in records {
+                if !record
+                    .workload_scope
+                    .as_deref()
+                    .is_some_and(|scope| scope.starts_with(workload_scope_prefix))
+                {
+                    continue;
+                }
+                if merged
+                    .get(&target)
+                    .is_none_or(|existing| record.completed_at > existing.completed_at)
+                {
+                    merged.insert(target, record);
+                }
+            }
+        }
+        merged
+    }
+
     /// Return evidence for a specific branch and target, if present.
     #[must_use]
     pub fn get_target(&self, branch: &str, target_name: &str) -> Option<EvidenceRecord> {
@@ -464,6 +499,44 @@ impl EvidenceStore {
             .join("scoped")
             .join(collision_safe_component(workload_scope));
         Self::passing_records_in_directory(&directory, target_name, sha)
+    }
+
+    /// Return exact-SHA passing records across scoped workloads whose stored
+    /// scope starts with `workload_scope_prefix`.
+    #[must_use]
+    pub fn passing_records_for_target_sha_scoped_prefix(
+        &self,
+        workload_scope_prefix: &str,
+        target_name: &str,
+        sha: &str,
+    ) -> Vec<EvidenceRecord> {
+        let Ok(scopes) = fs::read_dir(self.path.join("scoped")) else {
+            return Vec::new();
+        };
+        let mut records = scopes
+            .flatten()
+            .filter_map(|scope| fs::read_dir(scope.path()).ok())
+            .flat_map(Iterator::flatten)
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
+                    .then(|| Self::load_records(&path).ok())
+                    .flatten()
+            })
+            .flat_map(BTreeMap::into_values)
+            .filter(|record| {
+                record
+                    .workload_scope
+                    .as_deref()
+                    .is_some_and(|scope| scope.starts_with(workload_scope_prefix))
+                    && record.target_name == target_name
+                    && record.sha == sha
+                    && record.passed()
+                    && !record.reused()
+            })
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| std::cmp::Reverse(record.completed_at));
+        records
     }
 
     fn query_passing_in_directory(
@@ -649,10 +722,23 @@ fn collision_safe_component(value: &str) -> String {
     )
 }
 
-/// Stable evidence namespace for one repository's ship validations.
+/// Stable evidence namespace for repository-level validations that are not
+/// owned by a single pull request.
 #[must_use]
 pub fn repository_evidence_scope(repository: &str) -> String {
     format!("repo:{}", canonical_repository(repository))
+}
+
+/// Stable evidence namespace for one repository-scoped ship workload.
+#[must_use]
+pub fn repository_ship_evidence_scope(repository: &str, pr: u64) -> String {
+    format!("ship:{}:pr-{pr}", canonical_repository(repository))
+}
+
+/// Prefix shared by every PR-scoped ship evidence namespace in a repository.
+#[must_use]
+pub fn repository_ship_evidence_scope_prefix(repository: &str) -> String {
+    format!("ship:{}:pr-", canonical_repository(repository))
 }
 
 /// Canonical GitHub repository slug used by all durable ownership keys.
@@ -664,11 +750,11 @@ pub fn canonical_repository(repository: &str) -> String {
 /// Evidence namespace for a ship workload, with a checkout identity fallback
 /// for legacy/offline requests that lack a repository slug.
 #[must_use]
-pub fn ship_evidence_scope(repository: &str, cwd: &Path) -> String {
+pub fn ship_evidence_scope(repository: &str, pr: u64, cwd: &Path) -> String {
     if repository.trim().is_empty() {
-        run_evidence_scope(cwd)
+        format!("{}:ship-pr-{pr}", run_evidence_scope(cwd))
     } else {
-        repository_evidence_scope(repository)
+        repository_ship_evidence_scope(repository, pr)
     }
 }
 
@@ -723,7 +809,10 @@ mod tests {
 
     use chrono::Utc;
 
-    use super::{CommandEvidenceStore, EvidenceRecord, EvidenceStore};
+    use super::{
+        CommandEvidenceStore, EvidenceRecord, EvidenceStore, repository_ship_evidence_scope,
+        repository_ship_evidence_scope_prefix,
+    };
 
     fn record(branch: &str, target: &str, sha: &str) -> EvidenceRecord {
         EvidenceRecord {
@@ -928,6 +1017,47 @@ mod tests {
             assert_eq!(evidence.workload_scope.as_deref(), Some(scope));
         }
         assert!(store.get_branch("feature/shared").is_empty());
+    }
+
+    #[test]
+    fn prefix_read_aggregates_pr_scopes_without_collapsing_storage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = EvidenceStore::new(temp.path().join("evidence")).expect("store");
+        let modular_scope = repository_ship_evidence_scope("Generous-Corp/forge", 127);
+        let sequencer_scope = repository_ship_evidence_scope("Generous-Corp/forge", 128);
+        let mut modular = record("main", "macos", "modular");
+        modular.completed_at = Utc::now() - chrono::Duration::minutes(1);
+        let mut sequencer = record("main", "macos", "sequencer");
+        sequencer.completed_at = Utc::now();
+        store
+            .record_scoped(&modular_scope, &modular)
+            .expect("modular evidence");
+        store
+            .record_scoped(&sequencer_scope, &sequencer)
+            .expect("sequencer evidence");
+
+        assert_eq!(
+            store
+                .get_target_scoped(&modular_scope, "main", "macos")
+                .expect("modular scoped")
+                .sha,
+            "modular"
+        );
+        assert_eq!(
+            store
+                .get_target_scoped(&sequencer_scope, "main", "macos")
+                .expect("sequencer scoped")
+                .sha,
+            "sequencer"
+        );
+        assert_eq!(
+            store.get_branch_scoped_prefix(
+                &repository_ship_evidence_scope_prefix("Generous-Corp/forge"),
+                "main",
+            )["macos"]
+                .sha,
+            "sequencer"
+        );
     }
 
     #[test]

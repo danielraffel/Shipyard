@@ -124,14 +124,24 @@ pub(super) fn evidence_command<W: Write>(
         .unwrap_or_else(|| "main".to_owned());
     let store = EvidenceStore::new(state_dir.join("evidence"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let mut records = super::branch_cmd::detect_repo_from_remote(cwd, None)
-        .map(|repository| {
-            store.get_branch_scoped(
-                &crate::evidence::repository_evidence_scope(&repository),
-                &branch,
-            )
-        })
-        .unwrap_or_default();
+    let mut records = BTreeMap::new();
+    if let Some(repository) = super::branch_cmd::detect_repo_from_remote(cwd, None) {
+        records.extend(store.get_branch_scoped(
+            &crate::evidence::repository_evidence_scope(&repository),
+            &branch,
+        ));
+        for (target, record) in store.get_branch_scoped_prefix(
+            &crate::evidence::repository_ship_evidence_scope_prefix(&repository),
+            &branch,
+        ) {
+            if records
+                .get(&target)
+                .is_none_or(|existing| record.completed_at > existing.completed_at)
+            {
+                records.insert(target, record);
+            }
+        }
+    }
     for (target, record) in
         store.get_branch_scoped(&crate::evidence::run_evidence_scope(cwd), &branch)
     {

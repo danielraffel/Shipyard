@@ -734,7 +734,7 @@ impl JobResourcePlan {
             &request.branch,
             cwd,
             Some((&request.repo, request.pr)),
-            &ship_evidence_scope(&request.repo, cwd),
+            &ship_evidence_scope(&request.repo, request.pr, cwd),
             &request.targets,
         )
     }
@@ -2359,10 +2359,33 @@ mod tests {
                 .contains(&"ship-state:danielraffel/shipyard:pr-42".to_owned())
         );
         assert!(plan.exclusive_claims.contains(&evidence_resource_claim(
-            &ship_evidence_scope(&request.repo, Path::new("/work/repo")),
+            &ship_evidence_scope(&request.repo, request.pr, Path::new("/work/repo")),
             "feat/ship",
             "mac"
         )));
+    }
+
+    #[test]
+    fn ship_evidence_claims_isolate_prs_in_the_same_repository() {
+        let modular = ship_request();
+        let mut sequencer = modular.clone();
+        sequencer.pr += 1;
+
+        let modular_plan = JobResourcePlan::from_ship_request(Path::new("/work/repo"), &modular);
+        let sequencer_plan =
+            JobResourcePlan::from_ship_request(Path::new("/work/repo"), &sequencer);
+        let evidence_claim = |plan: &JobResourcePlan| {
+            plan.exclusive_claims
+                .iter()
+                .find(|claim| claim.starts_with("evidence:"))
+                .cloned()
+                .expect("evidence claim")
+        };
+
+        assert_ne!(
+            evidence_claim(&modular_plan),
+            evidence_claim(&sequencer_plan)
+        );
     }
 
     #[test]

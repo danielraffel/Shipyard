@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use shipyard::config::{LoadedConfig, LocalOverlaySource};
-use shipyard::evidence::EvidenceStore;
+use shipyard::evidence::{EvidenceStore, ship_evidence_scope};
 use shipyard::executor::dispatch::{
     DispatchValidationRequest, ResolvedBackend, ResolvedTarget, ResolvedValidation,
 };
@@ -133,6 +133,78 @@ fn repo_neutral_submit_preserves_independent_workloads_with_common_branch_and_ta
             JobStatus::Pending,
             "submitting another repo or product workload must not supersede {job:?}"
         );
+    }
+}
+
+#[test]
+fn forge_products_run_concurrently_and_keep_distinct_evidence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    let modular_cwd = temp.path().join("forge-modular");
+    let sequencer_cwd = temp.path().join("forge-sequencer");
+    std::fs::create_dir_all(&modular_cwd).expect("modular cwd");
+    std::fs::create_dir_all(&sequencer_cwd).expect("sequencer cwd");
+    let mut queue = Queue::new(&state_dir).expect("queue");
+    let evidence = EvidenceStore::new(state_dir.join("evidence")).expect("evidence");
+    let ship_state = ShipStateStore::new(state_dir.join("ship")).expect("ship state");
+    let warm_pool = WarmPool::new(state_dir.join("warm_pool.json"));
+    let config = empty_config(temp.path());
+    let dispatcher = ProbeDispatcher::new(true, Duration::from_millis(20));
+    let modular = ship_request_for_repo(
+        "Generous-Corp/forge",
+        "main",
+        "sha-forge-modular",
+        127,
+        local_target("macos", &modular_cwd),
+    );
+    let sequencer = ship_request_for_repo(
+        "Generous-Corp/forge",
+        "main",
+        "sha-forge-sequencer",
+        128,
+        local_target("macos", &sequencer_cwd),
+    );
+    let modular_job =
+        submit_ship(&modular, &mut queue, temp.path(), &state_dir).expect("submit modular");
+    let sequencer_job =
+        submit_ship(&sequencer, &mut queue, temp.path(), &state_dir).expect("submit sequencer");
+
+    let outcome = drain_or_wait_ship(
+        &modular,
+        modular_job,
+        ship_stores(
+            &mut queue,
+            &evidence,
+            &ship_state,
+            &warm_pool,
+            temp.path(),
+            &state_dir,
+            &config,
+        ),
+        &dispatcher,
+    )
+    .expect("drain Forge products");
+
+    assert_eq!(outcome.job.status, JobStatus::Completed);
+    assert_eq!(dispatcher.calls(), 2);
+    assert_eq!(dispatcher.max_active(), 2);
+    assert_eq!(
+        queue
+            .get(&sequencer_job.id)
+            .expect("queue")
+            .expect("sequencer job")
+            .status,
+        JobStatus::Completed
+    );
+    for request in [&modular, &sequencer] {
+        let record = evidence
+            .get_target_scoped(
+                &ship_evidence_scope(&request.repo, request.pr, temp.path()),
+                &request.branch,
+                "macos",
+            )
+            .expect("product evidence");
+        assert_eq!(record.sha, request.sha);
     }
 }
 

@@ -3892,7 +3892,7 @@ mod tests {
         store.save(&state).expect("save");
         evidence
             .record_scoped(
-                &crate::evidence::repository_evidence_scope(&state.repo),
+                &crate::evidence::repository_ship_evidence_scope(&state.repo, state.pr),
                 &EvidenceRecord {
                     sha: state.head_sha.clone(),
                     branch: state.branch.clone(),
@@ -3971,7 +3971,7 @@ mod tests {
         store.save(&state).expect("save");
         evidence
             .record_scoped(
-                &crate::evidence::repository_evidence_scope(&state.repo),
+                &crate::evidence::repository_ship_evidence_scope(&state.repo, state.pr),
                 &EvidenceRecord {
                     sha: state.head_sha.clone(),
                     branch: state.branch.clone(),

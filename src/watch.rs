@@ -94,9 +94,15 @@ pub fn reused_evidence_map(
     evidence_store: &EvidenceStore,
     state: &ShipState,
 ) -> BTreeMap<String, String> {
-    let workload_scope = crate::evidence::repository_evidence_scope(&state.repo);
-    evidence_store
-        .get_branch_scoped(&workload_scope, &state.branch)
+    let workload_scope = crate::evidence::repository_ship_evidence_scope(&state.repo, state.pr);
+    let mut records = evidence_store.get_branch_scoped(&workload_scope, &state.branch);
+    for (target, record) in evidence_store.get_branch_scoped(
+        &crate::evidence::repository_evidence_scope(&state.repo),
+        &state.branch,
+    ) {
+        records.entry(target).or_insert(record);
+    }
+    records
         .into_iter()
         .filter_map(|(target, record)| {
             if record.sha == state.head_sha {
@@ -812,7 +818,7 @@ mod tests {
 
         evidence
             .record_scoped(
-                &crate::evidence::repository_evidence_scope(&state.repo),
+                &crate::evidence::repository_ship_evidence_scope(&state.repo, state.pr),
                 &EvidenceRecord {
                     sha: state.head_sha.clone(),
                     branch: state.branch.clone(),

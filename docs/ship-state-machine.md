@@ -237,7 +237,11 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   Before admission, the owner also groups pending ship requests by
   `(repository, PR)` and observes each distinct PR at most once per 30 seconds.
   If GitHub reports `MERGED` and the reported head exactly matches the durable
-  queued SHA, every matching pending job is cancelled as already complete. The
+  queued SHA, every matching pending job is cancelled as already complete.
+  Ship validation claims and evidence records use the same `(repository, PR)`
+  identity, so same-branch Forge Modular and Forge Sequencer ships can run
+  concurrently without replacing one another's target evidence. Repository
+  evidence display aggregates those PR namespaces newest-per-target. The
   daemon applies the same exact-head observation to a running ship job: it first
   commits an immutable terminal cancellation and typed outcome, then signals the
   whole supervised process group. An open PR, a different merged head, an auth

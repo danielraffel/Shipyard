@@ -174,6 +174,7 @@ pub(super) fn changed_surface_plan_command<W: Write>(
     let secondary_proofs = collect_secondary_proofs(
         policy.as_ref().ok(),
         state_dir,
+        cwd,
         &repo,
         &pull.head.sha,
         &remote_commit.tree.sha,
@@ -250,6 +251,7 @@ pub(super) fn changed_surface_plan_command<W: Write>(
 fn collect_secondary_proofs(
     policy: Option<&ChangedSurfacePolicy>,
     state_dir: &Path,
+    cwd: &Path,
     repository: &str,
     head_sha: &str,
     tree_sha: &str,
@@ -260,7 +262,9 @@ fn collect_secondary_proofs(
     let Ok(store) = EvidenceStore::new(state_dir.join("evidence")) else {
         return Vec::new();
     };
-    let workload_scope = crate::evidence::repository_evidence_scope(repository);
+    let repository_scope = crate::evidence::repository_evidence_scope(repository);
+    let ship_scope_prefix = crate::evidence::repository_ship_evidence_scope_prefix(repository);
+    let run_scope = crate::evidence::run_evidence_scope(cwd);
     policy
         .families
         .iter()
@@ -274,34 +278,41 @@ fn collect_secondary_proofs(
         .into_iter()
         .filter_map(|(target, build_type)| {
             let expected_contract = policy.secondary_contract_digests.get(target)?;
-            store
-                .passing_records_for_target_sha_scoped(&workload_scope, target, head_sha)
-                .into_iter()
-                .find_map(|evidence| {
-                    let passed = evidence.passed();
-                    let reused = evidence.reused();
-                    let observed_build_type = evidence
-                        .validation_build_type
-                        .as_deref()
-                        .and_then(parse_build_type);
-                    (observed_build_type == Some(build_type)
-                        && evidence.contract_digest.as_ref() == Some(expected_contract)
-                        && evidence.source_head_sha.as_deref() == Some(head_sha)
-                        && evidence.source_tree_sha.as_deref() == Some(tree_sha)
-                        && evidence.source_checkout_clean == Some(true)
-                        && evidence.full_execution == Some(true))
-                    .then_some(SecondaryProof {
-                        target: target.clone(),
-                        build_type,
-                        head_sha: evidence.sha,
-                        tree_sha: evidence.source_tree_sha.expect("matched tree identity"),
-                        full_execution: true,
-                        passed,
-                        reused,
-                        completed_at: evidence.completed_at,
-                        contract_digest: evidence.contract_digest,
-                    })
+            let mut candidates =
+                store.passing_records_for_target_sha_scoped(&repository_scope, target, head_sha);
+            candidates.extend(store.passing_records_for_target_sha_scoped_prefix(
+                &ship_scope_prefix,
+                target,
+                head_sha,
+            ));
+            candidates
+                .extend(store.passing_records_for_target_sha_scoped(&run_scope, target, head_sha));
+            candidates.sort_by_key(|evidence| std::cmp::Reverse(evidence.completed_at));
+            candidates.into_iter().find_map(|evidence| {
+                let passed = evidence.passed();
+                let reused = evidence.reused();
+                let observed_build_type = evidence
+                    .validation_build_type
+                    .as_deref()
+                    .and_then(parse_build_type);
+                (observed_build_type == Some(build_type)
+                    && evidence.contract_digest.as_ref() == Some(expected_contract)
+                    && evidence.source_head_sha.as_deref() == Some(head_sha)
+                    && evidence.source_tree_sha.as_deref() == Some(tree_sha)
+                    && evidence.source_checkout_clean == Some(true)
+                    && evidence.full_execution == Some(true))
+                .then_some(SecondaryProof {
+                    target: target.clone(),
+                    build_type,
+                    head_sha: evidence.sha,
+                    tree_sha: evidence.source_tree_sha.expect("matched tree identity"),
+                    full_execution: true,
+                    passed,
+                    reused,
+                    completed_at: evidence.completed_at,
+                    contract_digest: evidence.contract_digest,
                 })
+            })
         })
         .collect()
 }
@@ -609,12 +620,20 @@ mod tests {
             stages_signature: None,
         };
         let repository = "owner/repo";
-        let workload_scope = crate::evidence::repository_evidence_scope(repository);
+        let workload_scope = crate::evidence::run_evidence_scope(temp.path());
         store
             .record_scoped(&workload_scope, &evidence)
             .expect("record");
         assert_eq!(
-            collect_secondary_proofs(Some(&policy), temp.path(), repository, &head, &tree).len(),
+            collect_secondary_proofs(
+                Some(&policy),
+                temp.path(),
+                temp.path(),
+                repository,
+                &head,
+                &tree,
+            )
+            .len(),
             1
         );
 
@@ -623,8 +642,15 @@ mod tests {
             .record_scoped(&workload_scope, &evidence)
             .expect("replace record");
         assert!(
-            collect_secondary_proofs(Some(&policy), temp.path(), repository, &head, &tree)
-                .is_empty()
+            collect_secondary_proofs(
+                Some(&policy),
+                temp.path(),
+                temp.path(),
+                repository,
+                &head,
+                &tree,
+            )
+            .is_empty()
         );
         evidence.source_checkout_clean = Some(true);
         evidence.full_execution = Some(false);
@@ -632,13 +658,46 @@ mod tests {
             .record_scoped(&workload_scope, &evidence)
             .expect("replace record");
         assert!(
-            collect_secondary_proofs(Some(&policy), temp.path(), repository, &head, &tree)
-                .is_empty()
+            collect_secondary_proofs(
+                Some(&policy),
+                temp.path(),
+                temp.path(),
+                repository,
+                &head,
+                &tree,
+            )
+            .is_empty()
+        );
+        evidence.full_execution = Some(true);
+        store
+            .record_scoped(
+                &crate::evidence::repository_ship_evidence_scope(repository, 42),
+                &evidence,
+            )
+            .expect("record ship proof");
+        assert_eq!(
+            collect_secondary_proofs(
+                Some(&policy),
+                temp.path(),
+                temp.path(),
+                repository,
+                &head,
+                &tree,
+            )
+            .len(),
+            1
         );
         policy.secondary_contract_digests.clear();
         assert!(
-            collect_secondary_proofs(Some(&policy), temp.path(), repository, &head, &tree)
-                .is_empty()
+            collect_secondary_proofs(
+                Some(&policy),
+                temp.path(),
+                temp.path(),
+                repository,
+                &head,
+                &tree,
+            )
+            .is_empty()
         );
     }
 }
