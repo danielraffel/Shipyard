@@ -441,9 +441,19 @@ pub(crate) fn fetch_pr_snapshot_with_timeout(
     timeout: Duration,
 ) -> WaitResult<Option<Value>> {
     let client = gh_client(cwd)?;
+    fetch_pr_snapshot_with_client(&client, repo, pr_number, cwd, timeout)
+}
+
+pub(crate) fn fetch_pr_snapshot_with_client(
+    client: &GhClient,
+    repo: &str,
+    pr_number: u64,
+    cwd: &Path,
+    timeout: Duration,
+) -> WaitResult<Option<Value>> {
     let started = Instant::now();
     match run_gh_capturing(
-        &client,
+        client,
         &[
             "pr".to_owned(),
             "view".to_owned(),
@@ -467,12 +477,12 @@ pub(crate) fn fetch_pr_snapshot_with_timeout(
                 .unwrap_or("")
                 .to_owned();
             let remaining = remaining_snapshot_timeout(timeout, started.elapsed());
-            let policy = fetch_required_check_policy(&client, repo, &base, cwd, remaining)?;
+            let policy = fetch_required_check_policy(client, repo, &base, cwd, remaining)?;
             match policy {
                 Some(required) => {
                     let remaining = remaining_snapshot_timeout(timeout, started.elapsed());
                     let materialized = fetch_materialized_required_checks(
-                        &client, repo, pr_number, cwd, remaining,
+                        client, repo, pr_number, cwd, remaining,
                     )?;
                     annotate_required_checks(
                         &mut value,
@@ -492,7 +502,7 @@ pub(crate) fn fetch_pr_snapshot_with_timeout(
             // its overall deadline, so retain the notice and skip the probe.
             eprintln!("shipyard: GraphQL rate limit hit for gh pr snapshot. Falling back to REST.");
             let remaining = timeout.saturating_sub(started.elapsed());
-            fetch_pr_snapshot_rest_with_client(&client, repo, pr_number, cwd, remaining)
+            fetch_pr_snapshot_rest_with_client(client, repo, pr_number, cwd, remaining)
         }
         GhOutcome::OtherFailure => Ok(None),
     }
@@ -502,7 +512,7 @@ pub(crate) fn fetch_pr_snapshot_with_timeout(
 // particular, `merged` is not a supported field; a merged PR is represented by
 // `state == "MERGED"` and normalized by the evaluator.
 const PR_VIEW_JSON_FIELDS: &str =
-    "number,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup";
+    "number,headRefName,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup";
 const PR_CHECKS_JSON_FIELDS: &str = "name,state,bucket,link";
 
 fn fetch_required_check_policy(
@@ -755,6 +765,16 @@ pub fn synthesize_pr_snapshot_from_rest(pr_number: u64, pr: &Value, check_runs: 
         .and_then(|h| h.get("sha"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let head_ref = pr
+        .get("head")
+        .and_then(|h| h.get("ref"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let base_ref = pr
+        .get("base")
+        .and_then(|b| b.get("ref"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let state = pr
         .get("state")
         .and_then(Value::as_str)
@@ -783,7 +803,9 @@ pub fn synthesize_pr_snapshot_from_rest(pr_number: u64, pr: &Value, check_runs: 
     }
     serde_json::json!({
         "number": pr_number,
+        "headRefName": head_ref,
         "headRefOid": head_sha,
+        "baseRefName": base_ref,
         "state": state,
         "merged": merged,
         "mergeable": mergeable,

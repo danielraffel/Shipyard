@@ -579,6 +579,27 @@ which acts on the strongest (`queue_stale`) evidence this diagnostic surfaces. T
 `QueueMatch` the classifier returns carries the owning `Job` so the sweep records
 the dead worker's id.
 
+Exact `queue_absent` recovery is a separate, machine-global opt-in. It is off by
+default and requires both the kill switch and an explicit checkout registry:
+
+```toml
+[ship_state]
+queue_absent_recovery = true
+
+[ship_state.repo_paths]
+"Generous-Corp/pulp" = "/Volumes/Workshop/Code/pulp"
+```
+
+Age is never recovery authority. Under the repository-scoped PR lock the daemon
+requires one exact preserved daemon work envelope, validates its
+checkout/tree/config provenance against the registered path, confirms the live
+PR is still OPEN at the stored head branch, head SHA, and base branch, and
+proves that no pending/running queue owner, newer owner, or worker receipt
+exists. It persists a fresh fenced generation before an idempotent queue insert,
+so a crash after either commit resumes the same generation. Missing auth,
+configuration, checkout, provenance, or GitHub evidence fails closed and emits
+a durable `needs_agent` receipt; absence never abandons or merges the ship state.
+
 ## Separate recovery-worker lifecycle (not `ShipState`)
 
 The merge steward's semantic exception worker deliberately does not add a

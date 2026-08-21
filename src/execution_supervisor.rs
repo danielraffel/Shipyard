@@ -108,6 +108,16 @@ pub struct ExecutionSupervisor {
     state_dir: PathBuf,
     children: BTreeMap<String, Child>,
     merge_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, String)>,
+    next_queue_absent_recovery: std::time::Instant,
+    queue_absent_recovery_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct QueueAbsentRecoveryFlight(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for QueueAbsentRecoveryFlight {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl ExecutionSupervisor {
@@ -126,12 +136,17 @@ impl ExecutionSupervisor {
             state_dir,
             children: BTreeMap::new(),
             merge_observers: BTreeMap::new(),
+            next_queue_absent_recovery: std::time::Instant::now(),
+            queue_absent_recovery_in_flight: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
         }
     }
 
     /// Reconcile worker ownership and admit safe pending jobs.
     pub fn tick(&mut self) -> Result<(), SupervisorError> {
         fs::create_dir_all(self.worker_dir())?;
+        self.recover_queue_absent();
         self.observe_merged_ship_jobs()?;
         self.reconcile_terminal_outcomes()?;
         self.terminate_cancelled_workers()?;
@@ -143,6 +158,37 @@ impl ExecutionSupervisor {
             self.admit_pending()?;
         }
         Ok(())
+    }
+
+    fn recover_queue_absent(&mut self) {
+        let now = std::time::Instant::now();
+        if now < self.next_queue_absent_recovery {
+            return;
+        }
+        self.next_queue_absent_recovery = now + StdDuration::from_mins(1);
+        if self
+            .queue_absent_recovery_in_flight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let in_flight = std::sync::Arc::clone(&self.queue_absent_recovery_in_flight);
+        let state_dir = self.state_dir.clone();
+        let global_dir = self.global_dir.clone();
+        let mode = self.mode;
+        thread::spawn(move || {
+            let _flight = QueueAbsentRecoveryFlight(in_flight);
+            if let Ok(config) =
+                crate::config::LoadedConfig::load_machine_global_from_dir(global_dir.clone())
+            {
+                let _ = crate::queue_absent_recovery::recover_queue_absent_ships(
+                    &state_dir,
+                    mode,
+                    &global_dir,
+                    &config,
+                );
+            }
+        });
     }
 
     fn observe_merged_ship_jobs(&mut self) -> Result<(), SupervisorError> {
