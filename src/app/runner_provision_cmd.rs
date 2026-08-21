@@ -318,6 +318,37 @@ fn stop_runner_service_before_upgrade(runner_dir: &Path) -> Result<(), CliFailur
     )
 }
 
+fn recover_runner_service_after_upgrade_failure(
+    runner_dir: &Path,
+    original: CliFailure,
+) -> CliFailure {
+    if installed_runner_version(runner_dir).is_none() {
+        return CliFailure::new(
+            original.code,
+            format!(
+                "{}; runner service remains stopped because no runnable listener could be verified",
+                original.message()
+            ),
+        );
+    }
+    match run_in(
+        runner_dir,
+        "./svc.sh",
+        &["start"],
+        "restore runner service after failed upgrade",
+    ) {
+        Ok(()) => original,
+        Err(restart) => CliFailure::new(
+            original.code,
+            format!(
+                "{}; runner service recovery also failed: {}",
+                original.message(),
+                restart.message()
+            ),
+        ),
+    }
+}
+
 fn ensure_private_rust_toolchain(runner_dir: &Path) -> Result<(), CliFailure> {
     let toolcache = runner_dir.join("_toolcache");
     let rustup_home = toolcache.join("rustup");
@@ -511,92 +542,103 @@ pub(super) fn register_command<W: Write>(
         }
         let installed_version = installed_runner_version(&entry.dir);
         let needs_upgrade = installed_version.as_deref() != Some(PINNED_RUNNER_VERSION);
-        if needs_upgrade {
+        let stopped_for_upgrade = needs_upgrade && installation.service_installed;
+        if stopped_for_upgrade {
             // Never replace files underneath a running service. A failed stop
             // is a hard boundary: leave the old installation intact and let
             // the operator repair the service before attempting the upgrade.
-            if installation.service_installed {
-                stop_runner_service_before_upgrade(&entry.dir)?;
+            stop_runner_service_before_upgrade(&entry.dir)?;
+        }
+        let provision_result = (|| -> Result<(), CliFailure> {
+            if needs_upgrade {
+                run(
+                    "/usr/bin/tar",
+                    &[
+                        "xzf",
+                        &pkg_path.to_string_lossy(),
+                        "-C",
+                        &entry.dir.to_string_lossy(),
+                    ],
+                    "extract runner",
+                )?;
             }
-            run(
-                "/usr/bin/tar",
-                &[
-                    "xzf",
-                    &pkg_path.to_string_lossy(),
-                    "-C",
-                    &entry.dir.to_string_lossy(),
-                ],
-                "extract runner",
+            if installed_runner_version(&entry.dir).as_deref() != Some(PINNED_RUNNER_VERSION) {
+                return Err(CliFailure::new(
+                    1,
+                    format!("runner did not install at pinned version {PINNED_RUNNER_VERSION}"),
+                ));
+            }
+            fs::write(
+                entry.dir.join(".env"),
+                runner_env_file(&ci_root, &entry.work, &entry.dir, parallel),
+            )
+            .map_err(|e| CliFailure::new(1, format!("failed to write .env: {e}")))?;
+            ensure_private_rust_toolchain(&entry.dir)?;
+            fs::write(entry.dir.join(".path"), runner_path_file(&entry.dir))
+                .map_err(|e| CliFailure::new(1, format!("failed to write .path: {e}")))?;
+
+            // A pinned upgrade retains GitHub's `.runner` credentials and the
+            // existing LaunchAgent. Reconfigure/install only genuinely new or
+            // explicitly service-less installations; otherwise `svc.sh install`
+            // rejects the still-present plist and leaves the runner offline.
+            if installation.configured {
+                if !installation.service_installed {
+                    run_in(
+                        &entry.dir,
+                        "./svc.sh",
+                        &["install"],
+                        "install runner service",
+                    )?;
+                    run_in(&entry.dir, "./svc.sh", &["start"], "start runner service")?;
+                } else if needs_upgrade {
+                    run_in(
+                        &entry.dir,
+                        "./svc.sh",
+                        &["start"],
+                        "restart runner service after upgrade",
+                    )?;
+                }
+                return Ok(());
+            }
+
+            let token = args
+                .actions
+                .run_gh(&[
+                    "api".to_owned(),
+                    "-X".to_owned(),
+                    "POST".to_owned(),
+                    format!("repos/{slug}/actions/runners/registration-token"),
+                    "--jq".to_owned(),
+                    ".token".to_owned(),
+                ])
+                .map_err(|e| CliFailure::new(2, format!("failed to get registration token: {e}")))?
+                .trim()
+                .to_owned();
+
+            let config_args = runner_config_args(&slug, &token, entry, &labels_csv);
+            let config_arg_refs: Vec<&str> = config_args.iter().map(String::as_str).collect();
+            run_in(
+                &entry.dir,
+                "./config.sh",
+                &config_arg_refs,
+                "configure runner",
             )?;
+            run_in(
+                &entry.dir,
+                "./svc.sh",
+                &["install"],
+                "install runner service",
+            )?;
+            run_in(&entry.dir, "./svc.sh", &["start"], "start runner service")?;
+            Ok(())
+        })();
+        if let Err(error) = provision_result {
+            return Err(if stopped_for_upgrade {
+                recover_runner_service_after_upgrade_failure(&entry.dir, error)
+            } else {
+                error
+            });
         }
-        if installed_runner_version(&entry.dir).as_deref() != Some(PINNED_RUNNER_VERSION) {
-            return Err(CliFailure::new(
-                1,
-                format!("runner did not install at pinned version {PINNED_RUNNER_VERSION}"),
-            ));
-        }
-        fs::write(
-            entry.dir.join(".env"),
-            runner_env_file(&ci_root, &entry.work, &entry.dir, parallel),
-        )
-        .map_err(|e| CliFailure::new(1, format!("failed to write .env: {e}")))?;
-        ensure_private_rust_toolchain(&entry.dir)?;
-        fs::write(entry.dir.join(".path"), runner_path_file(&entry.dir))
-            .map_err(|e| CliFailure::new(1, format!("failed to write .path: {e}")))?;
-
-        // A pinned upgrade retains GitHub's `.runner` credentials and the
-        // existing LaunchAgent. Reconfigure/install only genuinely new or
-        // explicitly service-less installations; otherwise `svc.sh install`
-        // rejects the still-present plist and leaves the runner offline.
-        if installation.configured {
-            if !installation.service_installed {
-                run_in(
-                    &entry.dir,
-                    "./svc.sh",
-                    &["install"],
-                    "install runner service",
-                )?;
-                run_in(&entry.dir, "./svc.sh", &["start"], "start runner service")?;
-            } else if needs_upgrade {
-                run_in(
-                    &entry.dir,
-                    "./svc.sh",
-                    &["start"],
-                    "restart runner service after upgrade",
-                )?;
-            }
-            continue;
-        }
-
-        let token = args
-            .actions
-            .run_gh(&[
-                "api".to_owned(),
-                "-X".to_owned(),
-                "POST".to_owned(),
-                format!("repos/{slug}/actions/runners/registration-token"),
-                "--jq".to_owned(),
-                ".token".to_owned(),
-            ])
-            .map_err(|e| CliFailure::new(2, format!("failed to get registration token: {e}")))?
-            .trim()
-            .to_owned();
-
-        let config_args = runner_config_args(&slug, &token, entry, &labels_csv);
-        let config_arg_refs: Vec<&str> = config_args.iter().map(String::as_str).collect();
-        run_in(
-            &entry.dir,
-            "./config.sh",
-            &config_arg_refs,
-            "configure runner",
-        )?;
-        run_in(
-            &entry.dir,
-            "./svc.sh",
-            &["install"],
-            "install runner service",
-        )?;
-        run_in(&entry.dir, "./svc.sh", &["start"], "start runner service")?;
     }
 
     report_register(
@@ -1197,6 +1239,52 @@ mod tests {
         let error = stop_runner_service_before_upgrade(temp.path())
             .expect_err("missing service control must fail closed");
         assert!(error.message.contains("svc.sh is missing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_upgrade_restores_a_stopped_runnable_service() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let listener = temp.path().join("bin/Runner.Listener");
+        std::fs::create_dir_all(listener.parent().expect("parent")).expect("bin dir");
+        std::fs::write(&listener, "#!/bin/sh\nprintf '2.334.0\\n'\n").expect("listener");
+        let service = temp.path().join("svc.sh");
+        std::fs::write(
+            &service,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > service-recovery\n",
+        )
+        .expect("service script");
+        for executable in [&listener, &service] {
+            let mut permissions = std::fs::metadata(executable)
+                .expect("metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(executable, permissions).expect("chmod");
+        }
+
+        let original = CliFailure::new(1, "rustup install failed");
+        let returned = recover_runner_service_after_upgrade_failure(temp.path(), original);
+        assert_eq!(returned.message(), "rustup install failed");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("service-recovery"))
+                .expect("recovery invocation"),
+            "start\n"
+        );
+    }
+
+    #[test]
+    fn failed_upgrade_keeps_an_unrunnable_service_stopped() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(temp.path().join("svc.sh"), "#!/bin/sh\nexit 0\n").expect("service script");
+
+        let returned = recover_runner_service_after_upgrade_failure(
+            temp.path(),
+            CliFailure::new(1, "extract failed"),
+        );
+        assert!(returned.message().contains("extract failed"));
+        assert!(returned.message().contains("remains stopped"));
     }
 
     #[test]
