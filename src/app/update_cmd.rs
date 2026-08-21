@@ -1220,21 +1220,25 @@ mod tests {
 
     #[test]
     fn ordinary_update_does_not_overwrite_a_shadowing_source_binary() {
-        let source_binary = Path::new("/tmp/checkout/target/release/shipyard");
+        let temp = tempfile::tempdir().expect("temp");
+        let source_binary = temp.path().join("checkout/target/release/shipyard");
+        let custom_install = temp.path().join("custom-install");
         assert_eq!(
-            update_install_dir(false, source_binary, None).expect("canonical install"),
+            update_install_dir(false, &source_binary, None).expect("canonical install"),
             home_dir().join(".local/bin")
         );
         assert_eq!(
-            update_install_dir(true, source_binary, None).expect("governed install"),
-            PathBuf::from("/tmp/checkout/target/release")
+            update_install_dir(true, &source_binary, None).expect("governed install"),
+            source_binary.parent().expect("source parent")
         );
         assert_eq!(
-            update_install_dir(false, source_binary, Some(Path::new("/opt/shipyard/bin")))
+            update_install_dir(false, &source_binary, Some(&custom_install))
                 .expect("custom install"),
-            PathBuf::from("/opt/shipyard/bin")
+            custom_install
         );
-        assert!(update_install_dir(false, source_binary, Some(Path::new("relative/bin"))).is_err());
+        assert!(
+            update_install_dir(false, &source_binary, Some(Path::new("relative/bin"))).is_err()
+        );
     }
 
     #[cfg(unix)]

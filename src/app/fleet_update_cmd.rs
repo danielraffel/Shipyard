@@ -218,7 +218,16 @@ fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdateP
             ));
         }
     };
-    if !binary.is_absolute() {
+    let is_remote = class.ssh.is_some();
+    let binary_is_absolute = if is_remote {
+        class
+            .shipyard_bin
+            .as_deref()
+            .is_some_and(|path| path.starts_with('/'))
+    } else {
+        binary.is_absolute()
+    };
+    if !binary_is_absolute {
         return Err(CliFailure::new(
             2,
             format!(
@@ -232,7 +241,15 @@ fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdateP
     } else {
         format!("shipyard{}", std::env::consts::EXE_SUFFIX)
     };
-    if binary.file_name().and_then(|name| name.to_str()) != Some(expected_binary_name.as_str()) {
+    let binary_name = if is_remote {
+        class
+            .shipyard_bin
+            .as_deref()
+            .and_then(|path| path.rsplit('/').next())
+    } else {
+        binary.file_name().and_then(|name| name.to_str())
+    };
+    if binary_name != Some(expected_binary_name.as_str()) {
         return Err(CliFailure::new(
             2,
             format!(
@@ -278,7 +295,19 @@ fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdateP
             ),
         )
     })?);
-    if !global_dir.is_absolute() || !state_dir.is_absolute() {
+    let daemon_paths_are_absolute = if is_remote {
+        class
+            .shipyard_global_dir
+            .as_deref()
+            .is_some_and(|path| path.starts_with('/'))
+            && class
+                .shipyard_state_dir
+                .as_deref()
+                .is_some_and(|path| path.starts_with('/'))
+    } else {
+        global_dir.is_absolute() && state_dir.is_absolute()
+    };
+    if !daemon_paths_are_absolute {
         return Err(CliFailure::new(
             2,
             format!(
@@ -298,7 +327,7 @@ fn host_update_plan(class: &HostClassConfig, target: &str) -> Result<HostUpdateP
             )
         })?;
         let helper = PathBuf::from(helper);
-        if !helper.is_absolute() {
+        if !helper.to_string_lossy().starts_with('/') {
             return Err(CliFailure::new(
                 2,
                 format!(
@@ -617,6 +646,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_plan_preserves_host_class_daemon_context() {
         let mut class = host(None, Some("/Users/ci/.local/bin/shipyard"));
@@ -688,6 +718,7 @@ mod tests {
         assert!(error.message.contains("must end in /shipyard"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_rollout_rejects_a_filename_the_installer_cannot_replace() {
         let error = host_update_plan(&host(None, Some("/Users/ci/.local/bin/current")), "v0.98.1")
