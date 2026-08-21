@@ -164,8 +164,15 @@ impl Queue {
 
     /// Replace a queued job matched by id, then trim old completed jobs.
     pub fn update(&mut self, job: &Job) -> QueueResult<()> {
-        let _ = self.commit_worker_update(job)?;
-        Ok(())
+        self.with_jobs_locked(|jobs| {
+            if let Some(queued) = jobs.iter_mut().find(|queued| queued.id == job.id)
+                && !is_terminal_job(queued.status)
+            {
+                *queued = job.clone();
+            }
+            let _ = trim_terminal(jobs);
+            Ok(())
+        })
     }
 
     /// Commit a worker snapshot unless the durable record is already terminal,

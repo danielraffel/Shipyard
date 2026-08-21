@@ -149,6 +149,12 @@ pub(super) fn run_command<W: Write>(
             "daemon-owned cloud validation requires explicit github.auth source env or command; ambient gh auth is forbidden",
         ));
     }
+    if daemon_owned && config.get_str("github.auth.source") == Some("env") {
+        return Err(CliFailure::new(
+            2,
+            "daemon-owned run cannot use github.auth.source = env because an existing daemon does not inherit the submitting shell; use source = command or --foreground",
+        ));
+    }
 
     let preflight_dispatcher = ExecutorDispatcher::new(None);
     let mut preflight = collect_ship_preflight_with_options(

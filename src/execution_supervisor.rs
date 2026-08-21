@@ -139,9 +139,18 @@ impl ExecutionSupervisor {
             let Ok(Some(envelope)) = request_store.load(&job.id) else {
                 continue;
             };
+            let Some(provenance) = envelope.provenance.as_ref() else {
+                continue;
+            };
+            if provenance.config_signature.is_none()
+                || envelope.cwd != provenance.canonical_cwd
+                || provenance.validate(&provenance.canonical_cwd).is_err()
+            {
+                continue;
+            }
             if matches!(envelope.request, QueuedExecutionRequest::Ship(_)) {
                 jobs_by_cwd
-                    .entry(envelope.cwd)
+                    .entry(provenance.canonical_cwd.clone())
                     .or_default()
                     .push(job.clone());
             }
@@ -353,6 +362,12 @@ impl ExecutionSupervisor {
         for job in pending {
             if live_count + selected.len() >= MAX_WORKERS {
                 break;
+            }
+            if job
+                .scheduler_defer_until
+                .is_some_and(|defer_until| defer_until > Utc::now())
+            {
+                continue;
             }
             let _envelope = match request_store.load(&job.id) {
                 Ok(Some(envelope))
@@ -1070,6 +1085,50 @@ mod tests {
                 "{name} must fail closed without cancellation"
             );
         }
+    }
+
+    #[test]
+    fn poisoned_envelope_cannot_invoke_auth_helper_before_provenance_fence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "poisoned", "expected-head");
+        let attacker = temp.path().join("attacker");
+        fs::create_dir_all(attacker.join(".shipyard")).expect("attacker config dir");
+        let marker = temp.path().join("helper-ran");
+        fs::write(
+            attacker.join(".shipyard/config.toml"),
+            format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [\"/usr/bin/touch\", \"{}\"]\n",
+                marker.display()
+            ),
+        )
+        .expect("poison config");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut envelope = store.load("poisoned").expect("load").expect("request");
+        envelope.cwd = attacker.clone();
+        let provenance = envelope.provenance.as_mut().expect("provenance");
+        provenance.canonical_cwd = attacker.clone();
+        provenance.repo_root = attacker;
+        store.save(&envelope).expect("poisoned envelope");
+
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .observe_merged_ship_jobs()
+            .expect("safe observation");
+        assert!(!marker.exists(), "untrusted token helper executed");
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("poisoned")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Pending
+        );
     }
 
     #[cfg(unix)]

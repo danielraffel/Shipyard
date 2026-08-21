@@ -216,13 +216,10 @@ pub(super) fn ship_command<W: Write>(
                 "test merge overrides require --foreground",
             ));
         }
-        if !matches!(
-            config.get_str("github.auth.source"),
-            Some("env" | "command")
-        ) {
+        if config.get_str("github.auth.source") != Some("command") {
             return Err(CliFailure::new(
                 2,
-                "daemon-owned ship requires explicit github.auth source env or command; ambient gh auth is forbidden",
+                "daemon-owned ship requires github.auth.source = command so an existing daemon can refresh credentials; env and ambient gh auth are forbidden",
             ));
         }
     }

@@ -455,8 +455,9 @@ failure, timeout, and malformed or ambiguous responses are no-ops. Terminal
 queue records are immutable against stale worker progress, and a later daemon
 tick repairs a missing typed outcome from the winning terminal record.
 
-Daemon-owned GitHub work requires an explicit `[github.auth]` source of `env`
-or `command`; ambient interactive `gh` auth is intentionally rejected. A
+Daemon-owned GitHub work requires `[github.auth] source = "command"`, so an
+existing daemon can refresh credentials independently of the submitting shell;
+`env` and ambient interactive `gh` auth are intentionally rejected. A
 running daemon from another Shipyard version must be refreshed before a new
 job is persisted. Adding a new repository to a same-version daemon refreshes
 its registration set while exact live workers remain independently owned.

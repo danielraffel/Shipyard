@@ -1679,6 +1679,7 @@ mod tests {
         ExecutionProvenance, HostPoolDemand, JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION,
         QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
         QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionRequest, VmSlotDemand,
+        parse_repo_slug,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::executor::cloud::CloudTargetConfig;
@@ -1692,6 +1693,29 @@ mod tests {
     use crate::job::{Priority, ValidationMode};
     use crate::ship::{RunExecutionRequest, ShipExecutionRequest};
     use crate::ship_state::{DispatchedRun, ShipState};
+
+    #[test]
+    fn repository_slug_accepts_only_canonical_authenticated_github_origins() {
+        assert_eq!(
+            parse_repo_slug("git@github.com:owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+        assert_eq!(
+            parse_repo_slug("https://github.com/owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+        for hostile in [
+            "http://github.com/owner/repo.git",
+            "https://github.com.evil.test/owner/repo.git",
+            "https://user@github.com/owner/repo.git",
+        ] {
+            assert_eq!(
+                parse_repo_slug(hostile),
+                None,
+                "accepted hostile origin {hostile}"
+            );
+        }
+    }
 
     #[test]
     fn unattended_provenance_rejects_resolved_config_drift() {

@@ -240,7 +240,7 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   proven. Each daemon tick also repairs a missing typed outcome from terminal
   queue state, so a restart after a transient outcome-write failure preserves a
   durable disposition.
-  These reads use the configured GitHub credential, explicit repository scope,
+  These reads use a refreshable command-sourced GitHub credential, explicit repository scope,
   and one 15-second credential-plus-command budget. An unavailable observation,
   malformed response, or different merged head leaves the job pending.
   A durable `shipyard cancel` observed by a running worker is also an execution

@@ -463,12 +463,19 @@ fn submit_ship_with_config(
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_ship_request(job.id.clone(), cwd, request);
     if let Some(config) = config {
-        envelope.provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
+        let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
             cwd,
             Some(&request.repo),
             &request.sha,
             config,
-        );
+        )
+        .ok_or_else(|| {
+            ShipExecutionError::QueueRequest(QueueRequestError::InvalidSnapshot {
+                reason: "exact unattended ship provenance changed before enqueue".to_owned(),
+            })
+        })?;
+        envelope.cwd.clone_from(&provenance.canonical_cwd);
+        envelope.provenance = Some(provenance);
     }
     request_store.save(&envelope)?;
     if let Err(error) = queue.enqueue(job.clone()) {
@@ -767,12 +774,19 @@ fn submit_run_with_config(
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_run_request(job.id.clone(), cwd, request);
     if let Some(config) = config {
-        envelope.provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
+        let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
             cwd,
             None,
             &request.sha,
             config,
-        );
+        )
+        .ok_or_else(|| {
+            ShipExecutionError::QueueRequest(QueueRequestError::InvalidSnapshot {
+                reason: "exact unattended run provenance changed before enqueue".to_owned(),
+            })
+        })?;
+        envelope.cwd.clone_from(&provenance.canonical_cwd);
+        envelope.provenance = Some(provenance);
     }
     request_store.save(&envelope)?;
     if let Err(error) = queue.enqueue(job.clone()) {
@@ -1467,18 +1481,16 @@ pub(crate) fn execute_started_queued_job(
             reason: "legacy request lacks unattended-execution provenance".to_owned(),
         })
     })?;
+    let canonical_cwd = provenance.canonical_cwd.clone();
     let config =
-        LoadedConfig::load_from_cwd_with_global_dir(mode, &envelope.cwd, global_dir.to_path_buf())
+        LoadedConfig::load_from_cwd_with_global_dir(mode, &canonical_cwd, global_dir.to_path_buf())
             .map_err(|error| ShipExecutionError::WorkerSetup(error.to_string()))?;
-    provenance.validate_with_config(&envelope.cwd, &config)?;
+    provenance.validate_with_config(&canonical_cwd, &config)?;
     if matches!(envelope.kind, QueuedExecutionKind::Ship)
-        && !matches!(
-            config.get_str("github.auth.source"),
-            Some("env" | "command")
-        )
+        && config.get_str("github.auth.source") != Some("command")
     {
         return Err(ShipExecutionError::WorkerSetup(
-            "daemon-owned ship requires explicit github.auth source env or command; ambient gh auth is forbidden"
+            "daemon-owned ship requires github.auth.source = command; env and ambient gh auth are forbidden"
                 .to_owned(),
         ));
     }
@@ -1501,6 +1513,8 @@ pub(crate) fn execute_started_queued_job(
     let prepared = crate::prepared_state::PreparedStateStore::new(state_dir.join("prepared"))
         .map_err(|error| ShipExecutionError::WorkerSetup(error.to_string()))?;
     let dispatcher = ExecutorDispatcher::new_with_state_dir(Some(prepared), state_dir);
+    let mut envelope = envelope;
+    envelope.cwd = canonical_cwd;
     run_started_worker(
         job,
         envelope.clone(),
