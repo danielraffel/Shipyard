@@ -31,7 +31,31 @@ pub(super) fn execution_worker_command(
                 let request = envelope
                     .to_ship_request()
                     .map_err(|error| CliFailure::new(1, error.to_string()))?;
-                return finish_background_ship(&request, &job, mode, global_dir, state_dir);
+                let finish = finish_background_ship(&request, &job, mode, global_dir, state_dir)
+                    .and_then(|code| {
+                        // Refresh the typed handoff from the ship state written
+                        // by the merge phase; the validation-time copy predates
+                        // that terminal disposition.
+                        persist_terminal_outcome(&job, state_dir)
+                            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+                        Ok(code)
+                    });
+                return match finish {
+                    Ok(code) => Ok(code),
+                    Err(error) => {
+                        let mut queue = Queue::new(state_dir)
+                            .map_err(|queue_error| CliFailure::new(1, queue_error.to_string()))?;
+                        if let Some(uncertain) = queue
+                            .reclassify_completed_uncertain(&job, error.message())
+                            .map_err(|queue_error| CliFailure::new(1, queue_error.to_string()))?
+                        {
+                            persist_terminal_outcome(&uncertain, state_dir).map_err(
+                                |persist_error| CliFailure::new(1, persist_error.to_string()),
+                            )?;
+                        }
+                        Err(error)
+                    }
+                };
             }
             Ok(if job.passed() {
                 ExitCode::SUCCESS

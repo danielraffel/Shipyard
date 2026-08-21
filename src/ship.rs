@@ -659,40 +659,42 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
                 state.clone(),
                 resumed_existing_state,
             ))?;
-        return Ok(ShipExecutionOutcome {
-            job,
-            ship_state: state,
-            resumed_existing_state,
-        });
+        return Ok(ship_execution_outcome(job, state, resumed_existing_state));
     }
     job = job.complete()?;
-    job = queue.commit_worker_update(&job)?;
+    job = queue.commit_worker_terminal_after(&job, |candidate| {
+        record_evidence(evidence, request, candidate)?;
+        update_ship_state_from_job(&mut state, request, candidate);
+        ship_state
+            .save_locked(&state, &ship_state_lock)
+            .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+        QueueOutcomeStore::new(state_dir)
+            .map_err(QueueRequestError::from)?
+            .save(&QueuedExecutionOutcome::ship(
+                candidate.id.clone(),
+                request.pr,
+                state.clone(),
+                resumed_existing_state,
+            ))?;
+        Ok::<(), ShipExecutionError>(())
+    })?;
     if job.status == JobStatus::Cancelled {
         persist_terminal_outcome(&job, state_dir)?;
-        return Ok(ShipExecutionOutcome {
-            job,
-            ship_state: state,
-            resumed_existing_state,
-        });
+        return Ok(ship_execution_outcome(job, state, resumed_existing_state));
     }
-    record_evidence(evidence, request, &job)?;
-    update_ship_state_from_job(&mut state, request, &job);
-    ship_state
-        .save_locked(&state, &ship_state_lock)
-        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
-    QueueOutcomeStore::new(state_dir)
-        .map_err(QueueRequestError::from)?
-        .save(&QueuedExecutionOutcome::ship(
-            job.id.clone(),
-            request.pr,
-            state.clone(),
-            resumed_existing_state,
-        ))?;
-    Ok(ShipExecutionOutcome {
+    Ok(ship_execution_outcome(job, state, resumed_existing_state))
+}
+
+fn ship_execution_outcome(
+    job: Job,
+    ship_state: ShipState,
+    resumed_existing_state: bool,
+) -> ShipExecutionOutcome {
+    ShipExecutionOutcome {
         job,
-        ship_state: state,
+        ship_state,
         resumed_existing_state,
-    })
+    }
 }
 
 /// Execute configured targets for `shipyard run` without PR/ship-state mutation.
@@ -940,15 +942,17 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         return Ok(RunExecutionOutcome { job });
     }
     job = job.complete()?;
-    job = queue.commit_worker_update(&job)?;
+    job = queue.commit_worker_terminal_after(&job, |candidate| {
+        record_evidence(evidence, &shim, candidate)?;
+        QueueOutcomeStore::new(state_dir)
+            .map_err(QueueRequestError::from)?
+            .save(&QueuedExecutionOutcome::run(candidate.id.clone()))?;
+        Ok::<(), ShipExecutionError>(())
+    })?;
     if job.status == JobStatus::Cancelled {
         persist_terminal_outcome(&job, state_dir)?;
         return Ok(RunExecutionOutcome { job });
     }
-    record_evidence(evidence, &shim, &job)?;
-    QueueOutcomeStore::new(state_dir)
-        .map_err(QueueRequestError::from)?
-        .save(&QueuedExecutionOutcome::run(job.id.clone()))?;
     Ok(RunExecutionOutcome { job })
 }
 

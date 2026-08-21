@@ -193,6 +193,35 @@ impl Queue {
         })
     }
 
+    /// Run durable side-record writes while the current job is fenced, then
+    /// publish the worker's terminal snapshot. If another actor already won
+    /// with a terminal record, the callback is not run and that record wins.
+    /// A callback failure leaves the queue record non-terminal so the worker
+    /// failure path can terminalize it as uncertain.
+    pub fn commit_worker_terminal_after<E>(
+        &self,
+        job: &Job,
+        before_commit: impl FnOnce(&Job) -> Result<(), E>,
+    ) -> Result<Job, E>
+    where
+        E: From<QueueError>,
+    {
+        let _lock = StateLock::acquire(self.state_lock_file()).map_err(QueueError::from)?;
+        let mut jobs = self.read_jobs_from_disk().map_err(E::from)?;
+        let Some(index) = jobs.iter().position(|queued| queued.id == job.id) else {
+            return Err(E::from(QueueError::JobNotFound(job.id.clone())));
+        };
+        if is_terminal_job(jobs[index].status) {
+            return Ok(jobs[index].clone());
+        }
+        before_commit(job)?;
+        jobs[index] = job.clone();
+        let winner = jobs[index].clone();
+        let _ = trim_terminal(&mut jobs);
+        self.save_jobs_to_disk(&jobs).map_err(E::from)?;
+        Ok(winner)
+    }
+
     /// Look up a job by id.
     pub fn get(&mut self, job_id: &str) -> QueueResult<Option<Job>> {
         let jobs = self.read_jobs_locked()?;
@@ -498,6 +527,37 @@ impl Queue {
             }
             job.status = JobStatus::Completed;
             job.completed_at = Some(Utc::now());
+            let completed = job.clone();
+            let _ = trim_terminal(jobs);
+            Ok(Some(completed))
+        })
+    }
+
+    /// Reclassify the exact completed snapshot produced by an authoritative
+    /// worker when its required post-validation phase fails. The full snapshot
+    /// comparison fences this exceptional terminal correction from stale
+    /// workers and preserves any independently won cancellation.
+    pub fn reclassify_completed_uncertain(
+        &mut self,
+        expected: &Job,
+        reason: &str,
+    ) -> QueueResult<Option<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let Some(job) = jobs
+                .iter_mut()
+                .find(|job| job.id == expected.id && **job == *expected)
+            else {
+                return Ok(None);
+            };
+            if job.status != JobStatus::Completed {
+                return Ok(None);
+            }
+            for target_name in &job.target_names {
+                let mut result = stale_recovery_result(target_name);
+                result.error_message = Some(reason.to_owned());
+                result.failure_class = Some("UNCERTAIN".to_owned());
+                job.results.insert(target_name.clone(), result);
+            }
             let completed = job.clone();
             let _ = trim_terminal(jobs);
             Ok(Some(completed))
@@ -910,7 +970,7 @@ mod tests {
     use crate::job::{Job, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
 
     use super::{
-        KEEP_COMPLETED, ORPHAN_REQUEST_MESSAGE, Queue, QueueDeferredRequeue,
+        KEEP_COMPLETED, ORPHAN_REQUEST_MESSAGE, Queue, QueueDeferredRequeue, QueueError,
         QueuePendingCancellation, ReplaceRetryPolicy, STALE_RECOVERY_MESSAGE,
         STALE_RUNNING_CANCEL_REASON, SUPERSEDED_MESSAGE, WINDOWS_REPLACE_ATTEMPTS,
         retry_replace_with_strategy, scaled_delay,
@@ -965,6 +1025,53 @@ mod tests {
         assert_eq!(
             durable.cancellation_reason.as_deref(),
             Some("exact head merged")
+        );
+    }
+
+    #[test]
+    fn failed_side_record_write_does_not_publish_terminal_success() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let running = job("main", "abc", &["local"]).start().expect("running");
+        queue.enqueue(running.clone()).expect("enqueue");
+        let completed = running.complete().expect("completed snapshot");
+
+        let result = queue.commit_worker_terminal_after(&completed, |_| {
+            Err::<(), QueueError>(QueueError::Io(io::Error::other(
+                "injected side-record failure",
+            )))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            queue.get(&running.id).expect("read").expect("job").status,
+            JobStatus::Running
+        );
+    }
+
+    #[test]
+    fn authoritative_post_validation_failure_becomes_uncertain() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let completed = job("main", "abc", &["local"])
+            .start()
+            .expect("running")
+            .complete()
+            .expect("complete");
+        queue.enqueue(completed.clone()).expect("enqueue");
+
+        let uncertain = queue
+            .reclassify_completed_uncertain(&completed, "merge phase failed")
+            .expect("reclassify")
+            .expect("exact snapshot");
+        assert!(uncertain.results.values().all(|result| {
+            result.failure_class.as_deref() == Some("UNCERTAIN")
+                && result.error_message.as_deref() == Some("merge phase failed")
+        }));
+        assert!(
+            queue
+                .reclassify_completed_uncertain(&completed, "stale retry")
+                .expect("stale retry")
+                .is_none()
         );
     }
 

@@ -355,7 +355,21 @@ impl ExecutionSupervisor {
                 break;
             }
             let _envelope = match request_store.load(&job.id) {
-                Ok(Some(envelope)) if envelope.provenance.is_some() => envelope,
+                Ok(Some(envelope))
+                    if envelope
+                        .provenance
+                        .as_ref()
+                        .and_then(|provenance| provenance.config_signature.as_ref())
+                        .is_some() =>
+                {
+                    envelope
+                }
+                Ok(Some(envelope)) if envelope.provenance.is_some() => {
+                    // Foreground submissions intentionally omit the resolved
+                    // configuration signature. Their submitting process owns
+                    // the drain; the daemon must neither steal nor cancel them.
+                    continue;
+                }
                 Ok(Some(_)) => {
                     cancellations.push(QueuePendingCancellation {
                         job_id: job.id,
@@ -1214,6 +1228,39 @@ mod tests {
         let mut child = supervisor.children.remove("valid").expect("valid worker");
         let _ = terminate_process_group(child.id());
         let _ = child.wait();
+    }
+
+    #[test]
+    fn foreground_request_is_not_admitted_or_cancelled_by_daemon() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_job(temp.path(), "foreground");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = store.load("foreground").expect("load").expect("request");
+        request
+            .provenance
+            .as_mut()
+            .expect("checkout provenance")
+            .config_signature = None;
+        store.save(&request).expect("foreground request");
+
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        fs::create_dir_all(supervisor.worker_dir()).expect("worker dir");
+        supervisor.admit_pending().expect("admission pass");
+        assert!(supervisor.children.is_empty());
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("foreground")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Pending
+        );
     }
 
     #[test]
