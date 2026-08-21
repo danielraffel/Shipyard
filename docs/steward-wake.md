@@ -6,6 +6,9 @@ webhooks and coalesces terminal transitions into one `runner steward` pass per
 repository. The submitting agent can stop after the exact-head steward handoff;
 no model session needs to remain alive.
 
+The worker discovers and caches each repository's GitHub default branch for
+the daemon lifetime; it does not assume that every repository uses `main`.
+
 Only the host whose runner tag matches the trusted machine-global
 `merge_queue.mutation_machine` starts the worker. Other Shipyard daemons remain
 passive event consumers, and the steward's ledger lock plus exact-head mutation

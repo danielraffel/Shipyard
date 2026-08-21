@@ -7,35 +7,38 @@
 
 #![cfg(unix)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::{Value, json};
 
+use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::merge_queue_control::authority_status;
 use crate::paths::RuntimePaths;
+use crate::process::ProcessTree;
 
 const EVENT_DEBOUNCE: Duration = Duration::from_secs(2);
 const RECONCILE_INTERVAL: Duration = Duration::from_mins(30);
 const FAILURE_RETRY_DELAY: Duration = Duration::from_secs(30);
+const DEFAULT_BRANCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
-#[derive(Debug)]
 struct ActiveWake {
     repo: String,
-    child: Child,
+    child: ProcessTree,
 }
 
 /// Live event-to-steward bridge owned by the daemon.
-#[derive(Debug)]
 pub struct StewardWakeRuntime {
     scheduler: StewardWakeScheduler,
     active: Option<ActiveWake>,
+    default_branches: BTreeMap<String, String>,
     binary: PathBuf,
     cwd: PathBuf,
     state_dir: PathBuf,
@@ -46,8 +49,7 @@ pub struct StewardWakeRuntime {
 impl Drop for StewardWakeRuntime {
     fn drop(&mut self) {
         if let Some(active) = self.active.as_mut() {
-            let _ = active.child.kill();
-            let _ = active.child.wait();
+            active.child.terminate();
         }
     }
 }
@@ -74,6 +76,7 @@ impl StewardWakeRuntime {
         Some(Self {
             scheduler: StewardWakeScheduler::new(repos, Instant::now()),
             active: None,
+            default_branches: BTreeMap::new(),
             binary,
             cwd: cwd.to_path_buf(),
             state_dir: state_dir.to_path_buf(),
@@ -95,9 +98,14 @@ impl StewardWakeRuntime {
                 Ok(Some(status)) => {
                     let repo = active.repo.clone();
                     let code = status.code();
+                    let succeeded = status.success();
                     self.active = None;
                     self.write_status(&repo, code, None);
-                    self.scheduler.worker_finished(now);
+                    if succeeded {
+                        self.scheduler.worker_finished(now);
+                    } else {
+                        self.scheduler.worker_failed(repo, now);
+                    }
                 }
                 Ok(None) => return,
                 Err(error) => {
@@ -111,7 +119,15 @@ impl StewardWakeRuntime {
         let Some(repo) = self.scheduler.take_ready(now) else {
             return;
         };
-        match self.spawn(&repo) {
+        let base = match self.default_branch(&repo) {
+            Ok(base) => base,
+            Err(error) => {
+                self.write_status(&repo, None, Some(&error));
+                self.scheduler.worker_failed(repo, now);
+                return;
+            }
+        };
+        match self.spawn(&repo, &base) {
             Ok(child) => self.active = Some(ActiveWake { repo, child }),
             Err(error) => {
                 self.write_status(&repo, None, Some(&error.to_string()));
@@ -120,7 +136,7 @@ impl StewardWakeRuntime {
         }
     }
 
-    fn spawn(&self, repo: &str) -> std::io::Result<Child> {
+    fn spawn(&self, repo: &str, base: &str) -> std::io::Result<ProcessTree> {
         let log_path = self.state_dir.join("daemon").join("steward-wake.log");
         rotate_log(&log_path)?;
         let stdout = OpenOptions::new()
@@ -128,18 +144,29 @@ impl StewardWakeRuntime {
             .append(true)
             .open(&log_path)?;
         let stderr = stdout.try_clone()?;
-        Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .current_dir(&self.cwd)
             .args(steward_args(
                 repo,
+                base,
                 &self.cwd,
                 &self.state_dir,
                 &self.global_dir,
                 self.mode,
             ))
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
+            .stderr(Stdio::from(stderr));
+        ProcessTree::spawn(&mut command)
+    }
+
+    fn default_branch(&mut self, repo: &str) -> Result<String, String> {
+        if let Some(base) = self.default_branches.get(repo) {
+            return Ok(base.clone());
+        }
+        let base = resolve_default_branch(repo, &self.cwd, self.mode)?;
+        self.default_branches.insert(repo.to_owned(), base.clone());
+        Ok(base)
     }
 
     fn write_status(&self, repo: &str, exit_code: Option<i32>, error: Option<&str>) {
@@ -166,6 +193,7 @@ impl StewardWakeRuntime {
 
 fn steward_args(
     repo: &str,
+    base: &str,
     cwd: &Path,
     state_dir: &Path,
     global_dir: &Path,
@@ -186,7 +214,7 @@ fn steward_args(
         "--repo".to_owned(),
         repo.to_owned(),
         "--base".to_owned(),
-        "main".to_owned(),
+        base.to_owned(),
         // The event wake owns routine exact-head queue admission only.
         // Durable retries and capacity preemption remain separate pilots.
         "--max-transient-reruns".to_owned(),
@@ -195,6 +223,77 @@ fn steward_args(
         "--no-preempt-capacity".to_owned(),
         "--apply".to_owned(),
     ]
+}
+
+fn resolve_default_branch(repo: &str, cwd: &Path, mode: RuntimeMode) -> Result<String, String> {
+    let client = GhClient::from_cwd(mode, cwd)
+        .map_err(|error| format!("could not load GitHub auth for {repo}: {error}"))?
+        .with_repo_hint(repo);
+    let mut command = client
+        .prepare_command_with_auth_timeout(
+            cwd,
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+            DEFAULT_BRANCH_TIMEOUT,
+        )
+        .map_err(|error| format!("could not prepare default-branch query for {repo}: {error}"))?;
+    let mut stdout = tempfile::tempfile()
+        .map_err(|error| format!("could not capture default branch for {repo}: {error}"))?;
+    let mut stderr = tempfile::tempfile()
+        .map_err(|error| format!("could not capture default-branch errors for {repo}: {error}"))?;
+    command
+        .args([
+            "repo",
+            "view",
+            repo,
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.try_clone().map_err(|error| {
+            format!("could not capture default branch for {repo}: {error}")
+        })?))
+        .stderr(Stdio::from(stderr.try_clone().map_err(|error| {
+            format!("could not capture default-branch errors for {repo}: {error}")
+        })?));
+    let mut process = ProcessTree::spawn(&mut command)
+        .map_err(|error| format!("could not start default-branch query for {repo}: {error}"))?;
+    let status = process
+        .wait_timeout(DEFAULT_BRANCH_TIMEOUT)
+        .map_err(|error| format!("default-branch query failed for {repo}: {error}"))?
+        .ok_or_else(|| {
+            process.terminate();
+            format!(
+                "default-branch query timed out for {repo} after {} seconds",
+                DEFAULT_BRANCH_TIMEOUT.as_secs()
+            )
+        })?;
+    process.terminate();
+
+    let read_capture = |file: &mut std::fs::File| -> std::io::Result<String> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        Ok(text)
+    };
+    let output = read_capture(&mut stdout)
+        .map_err(|error| format!("could not read default branch for {repo}: {error}"))?;
+    let error = read_capture(&mut stderr)
+        .map_err(|read_error| format!("could not read GitHub error for {repo}: {read_error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "default-branch query failed for {repo}: {}",
+            error.trim()
+        ));
+    }
+    let base = output.trim();
+    if base.is_empty() {
+        return Err(format!("GitHub returned no default branch for {repo}"));
+    }
+    Ok(base.to_owned())
 }
 
 #[derive(Debug)]
@@ -375,16 +474,36 @@ mod tests {
     }
 
     #[test]
+    fn failed_worker_is_retried_after_a_bounded_delay() {
+        let now = Instant::now();
+        let mut scheduler = StewardWakeScheduler::new(&["owner/repo".to_owned()], now);
+        scheduler.schedule_periodic(now);
+        assert_eq!(scheduler.take_ready(now).as_deref(), Some("owner/repo"));
+        scheduler.worker_failed("owner/repo".to_owned(), now);
+        let just_before_retry = (now + super::FAILURE_RETRY_DELAY)
+            .checked_sub(Duration::from_millis(1))
+            .expect("retry delay exceeds one millisecond");
+        assert_eq!(scheduler.take_ready(just_before_retry), None);
+        assert_eq!(
+            scheduler
+                .take_ready(now + super::FAILURE_RETRY_DELAY)
+                .as_deref(),
+            Some("owner/repo")
+        );
+    }
+
+    #[test]
     fn worker_is_apply_but_excludes_retry_cleanup_and_preemption_pilots() {
         let args = steward_args(
             "owner/repo",
+            "trunk",
             std::path::Path::new("/repo"),
             std::path::Path::new("/state"),
             std::path::Path::new("/global"),
             RuntimeMode::Shipyard,
         );
         assert!(args.windows(2).any(|pair| pair == ["--repo", "owner/repo"]));
-        assert!(args.windows(2).any(|pair| pair == ["--base", "main"]));
+        assert!(args.windows(2).any(|pair| pair == ["--base", "trunk"]));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--max-transient-reruns", "0"])
