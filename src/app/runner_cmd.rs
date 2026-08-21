@@ -271,27 +271,37 @@ pub(super) fn runner_command<W: Write>(
             max_preemptions_per_head,
             apply,
             ledger,
-        } => super::merge_steward_cmd::steward_command(
-            &super::merge_steward_cmd::StewardCommandArgs {
-                repos: repo,
-                base,
-                opt_out_label,
-                managed_label: super::merge_steward_cmd::MANAGED_LABEL.to_owned(),
-                handoff_context: super::merge_steward_cmd::HANDOFF_CONTEXT.to_owned(),
-                max_transient_reruns,
-                coalesce: !no_coalesce,
-                preempt_capacity: !no_preempt_capacity,
-                max_preemptions_per_head,
-                apply,
-                ledger,
-            },
-            cwd,
-            mode,
-            runtime_paths,
-            &actions,
-            json,
-            stdout,
-        ),
+        } => {
+            // A daemon authority invokes one repository per pass. Force that
+            // repository into token-command placeholder expansion even when
+            // the daemon CWD belongs to a different checkout.
+            let scoped_actions = if let [repo] = repo.as_slice() {
+                actions.clone().with_repo_override(repo)
+            } else {
+                actions.clone()
+            };
+            super::merge_steward_cmd::steward_command(
+                &super::merge_steward_cmd::StewardCommandArgs {
+                    repos: repo,
+                    base,
+                    opt_out_label,
+                    managed_label: super::merge_steward_cmd::MANAGED_LABEL.to_owned(),
+                    handoff_context: super::merge_steward_cmd::HANDOFF_CONTEXT.to_owned(),
+                    max_transient_reruns,
+                    coalesce: !no_coalesce,
+                    preempt_capacity: !no_preempt_capacity,
+                    max_preemptions_per_head,
+                    apply,
+                    ledger,
+                },
+                cwd,
+                mode,
+                runtime_paths,
+                &scoped_actions,
+                json,
+                stdout,
+            )
+        }
         RunnerCommand::RerouteWatch {
             repo,
             target,

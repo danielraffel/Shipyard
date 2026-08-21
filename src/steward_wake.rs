@@ -311,7 +311,8 @@ fn resolve_default_branch(
         .map_err(|error| format!("could not load GitHub auth for {repo}: {error}"))?;
     let client = GhClient::from_loaded_config(&config)
         .map_err(|error| format!("could not load GitHub auth for {repo}: {error}"))?
-        .with_repo_hint(repo);
+        .with_repo_override(repo)
+        .map_err(|error| format!("could not scope GitHub auth to {repo}: {error}"))?;
     let mut command = client
         .prepare_command_with_auth_timeout(
             cwd,
