@@ -1497,8 +1497,7 @@ fn watched_diffs(cwd: &Path, paths: &[String]) -> Vec<String> {
             .args(["status", "--porcelain", "--", path])
             .current_dir(cwd)
             .output()
-            .ok()
-            .is_some_and(|output| !output.stdout.is_empty());
+            .is_ok_and(|output| !output.stdout.is_empty());
         if status {
             diffed.push(path.clone());
             continue;
@@ -1507,8 +1506,7 @@ fn watched_diffs(cwd: &Path, paths: &[String]) -> Vec<String> {
             .args(["diff", "--quiet", "HEAD", "--", path])
             .current_dir(cwd)
             .status()
-            .ok()
-            .is_some_and(|status| !status.success());
+            .is_ok_and(|status| !status.success());
         if changed {
             diffed.push(path.clone());
         }

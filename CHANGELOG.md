@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0961"></a>
+## [0.96.1] - 2026-08-20
+
+- fix/fleet offline prevention ([#438](https://github.com/danielraffel/Shipyard/pull/438))
+
 <a id="v0960"></a>
 ## [0.96.0] - 2026-08-20
 
@@ -919,6 +924,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.96.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.96.1
 [0.96.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.96.0
 [0.95.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.95.0
 [0.94.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.94.0

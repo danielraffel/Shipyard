@@ -1332,6 +1332,25 @@ printf '%s' '{{"state":"MERGED","headRefOid":"abc123"}}'
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    #[test]
+    fn merged_pr_snapshot_never_invokes_external_github_command() {
+        let temp = TempDir::new().expect("temp");
+        let snapshot = temp.path().join("merged.json");
+        std::fs::write(&snapshot, r#"{"state":"MERGED","headRefOid":"abc123"}"#).expect("snapshot");
+
+        let merged = pr_merged_head_sha_with_options(
+            Some(&GhClient::ambient()),
+            "owner/repo",
+            42,
+            temp.path(),
+            Some(&snapshot),
+            Some(Path::new("/definitely/missing/gh-must-not-run")),
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(merged.as_deref(), Some("abc123"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_helper_receives_eof_instead_of_inheriting_caller_stdin() {

@@ -555,10 +555,16 @@ naming/index/label/table logic lives in `src/runner_provision.rs`; the shell
 side (gh, `config.sh`, `svc.sh`, local `~/actions-runner-*` dirs) is
 `src/app/runner_provision_cmd.rs`. See `docs/runner-provisioning.md`.
 
-Pinned runner upgrades are fail-closed: stop an existing service before
-extracting replacement files, preserve its `.runner` credentials and service
-registration, restart it only after verification, and abort if the stop fails.
-Never re-run fresh `config.sh` / `svc.sh install` over a configured upgrade.
+Pinned runner upgrades are fail-closed: never automatically stop or upgrade a
+service-installed runner. Retain it unchanged when it already matches the pin;
+otherwise report it deferred with exit 3 and leave its job eligibility
+unchanged. Upgrade a configured service-less runner only after a
+fresh GitHub observation proves it offline and idle, then repeat that check at
+the final rename boundary after staging. Clone-stage and verify the replacement
+before activation, keep the intact original until the new service starts, and
+use the runner's compound `svc.sh uninstall` to stop/remove a partially started
+replacement before restoring the original directory. Never re-run fresh
+`config.sh` over a configured upgrade.
 Toolchain readiness checks are silent probes; never let their stdout/stderr
 contaminate normal or JSON output.
 
@@ -584,7 +590,12 @@ shipyard runner register --repo Generous-Corp/pulp --count 3 \
 ```
 
 - Names continue from the highest existing `<repo>-<tag>-NN` (any machine), so
-  re-running appends capacity without collisions.
+  re-running appends exactly `--count` capacity without collisions. Existing
+  configured runners are reconciled separately. Reserve every existing
+  runner's unchanged `.env` allocation, including other repos and old tags on
+  the same host, before dividing remaining cores across
+  additive runners; fail closed rather than let a late activation overcommit
+  the host.
 - Default labels: `self-hosted,macos,arm64,<repo>-build,<repo>-build-<tag>`.
   `<repo>-build` is what a repo's workflow selects for normal routing;
   `<repo>-build-<tag>` pins work to one machine. Override with `--labels`.
@@ -597,6 +608,17 @@ shipyard runner register --repo Generous-Corp/pulp --count 3 \
   Never point those homes through a symlink to a shared/external build volume;
   an offline filesystem can otherwise wedge `Runner.Worker` inside native
   `open` before Shipyard receives a useful failure.
+- Existing-runner reconciliation parses `.runner` and requires its `agentName`
+  and repository URL to match the requested runner before any mutation.
+  Service-installed runners are never auto-stopped or upgraded; matching pins
+  are retained, while outdated services are deferred unchanged (exit 3). A service-less runner is eligible only after a
+  fresh GitHub observation proves it offline and idle, with a second check at
+  the final rename boundary after staging. Eligible upgrades clone-stage and
+  verify the full replacement before activation, retain the intact original
+  until the replacement service starts, and uninstall failed service setup
+  before rollback. Never activate a partial extraction.
+  If an existing runner becomes busy, online, or service-managed during
+  staging, defer that reconciliation and continue the additive registrations.
 
 ### List and remove
 
