@@ -271,13 +271,14 @@ impl QueuedExecutionEnvelope {
     /// configuration signature in that format.
     #[must_use]
     pub fn is_daemon_admissible(&self) -> bool {
-        self.is_daemon_owned()
-            || (self.execution_owner == QueuedExecutionOwner::LegacyUnspecified
-                && self
-                    .provenance
-                    .as_ref()
-                    .and_then(|provenance| provenance.config_signature.as_ref())
-                    .is_some())
+        matches!(
+            self.execution_owner,
+            QueuedExecutionOwner::Daemon | QueuedExecutionOwner::LegacyUnspecified
+        ) && self
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.config_signature.as_ref())
+            .is_some()
     }
 
     /// Whether a cooperative foreground drain may execute or recover this
@@ -1773,8 +1774,8 @@ mod tests {
     use super::{
         ExecutionProvenance, HostPoolDemand, JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION,
         QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
-        QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionRequest, VmSlotDemand,
-        parse_repo_slug,
+        QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner, QueuedExecutionRequest,
+        VmSlotDemand, parse_repo_slug,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::{evidence_resource_claim, run_evidence_scope, ship_evidence_scope};
@@ -2051,6 +2052,32 @@ mod tests {
         assert_eq!(loaded.kind, QueuedExecutionKind::Run);
         assert!(matches!(loaded.request, QueuedExecutionRequest::Run(_)));
         assert_eq!(loaded.to_run_request().expect("restore run"), run_request());
+    }
+
+    #[test]
+    fn daemon_admission_requires_signed_configuration_provenance() {
+        let mut envelope =
+            QueuedExecutionEnvelope::from_run_request("job-run", "/work/repo", &run_request());
+        envelope.execution_owner = QueuedExecutionOwner::Daemon;
+        envelope.provenance = None;
+
+        assert!(envelope.is_daemon_owned());
+        assert!(!envelope.is_daemon_admissible());
+
+        envelope.provenance = Some(ExecutionProvenance {
+            canonical_cwd: PathBuf::from("/work/repo"),
+            repo_root: PathBuf::from("/work/repo"),
+            repo_slug: None,
+            head_sha: "abc123".to_owned(),
+            tree_signature: "tree".to_owned(),
+            config_signature: Some("config".to_owned()),
+        });
+        assert!(envelope.is_daemon_admissible());
+
+        envelope.execution_owner = QueuedExecutionOwner::LegacyUnspecified;
+        assert!(envelope.is_daemon_admissible());
+        envelope.execution_owner = QueuedExecutionOwner::Foreground;
+        assert!(!envelope.is_daemon_admissible());
     }
 
     #[test]

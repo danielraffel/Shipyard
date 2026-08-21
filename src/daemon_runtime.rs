@@ -398,7 +398,7 @@ fn archive_closed_pull_request_ship_state(
         .archive_scoped_locked(&repo, pr, &lock)
         .ok()
         .flatten()?;
-    previous_states.remove(&(canonical_repo(&current.repo), pr));
+    previous_states.remove(&(crate::evidence::canonical_repository(&current.repo), pr));
 
     let outcome = if merged { "merged" } else { "closed" };
     Some(serde_json::json!({
@@ -762,7 +762,12 @@ fn ship_state_map(path: &Path) -> BTreeMap<(String, u64), ShipState> {
     store
         .list_active()
         .into_iter()
-        .map(|state| ((canonical_repo(&state.repo), state.pr), state))
+        .map(|state| {
+            (
+                (crate::evidence::canonical_repository(&state.repo), state.pr),
+                state,
+            )
+        })
         .collect()
 }
 
@@ -783,11 +788,6 @@ fn ship_state_delta_events(
     }
 
     events
-}
-
-#[cfg(unix)]
-fn canonical_repo(repository: &str) -> String {
-    repository.trim().to_ascii_lowercase()
 }
 
 #[cfg(unix)]

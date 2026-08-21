@@ -1031,15 +1031,17 @@ pub(super) fn finish_background_ship(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let ship_state = ShipStateStore::new(state_dir.join("ship"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let terminal_state = ship_state.get(request.pr).ok_or_else(|| {
-        CliFailure::new(
-            1,
-            format!(
-                "validated ship state for PR #{} disappeared before merge",
-                request.pr
-            ),
-        )
-    })?;
+    let terminal_state = ship_state
+        .get_scoped(&request.repo, request.pr)
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                format!(
+                    "validated ship state for PR #{} disappeared before merge",
+                    request.pr
+                ),
+            )
+        })?;
     let state = post_run_merge_state(
         request.pr,
         &envelope.cwd,

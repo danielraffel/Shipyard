@@ -526,9 +526,6 @@ impl ExecutionSupervisor {
         let mut cancellations = Vec::new();
         let now = Utc::now();
         for job in pending {
-            if live_count + selected.len() >= MAX_WORKERS {
-                break;
-            }
             if job
                 .scheduler_defer_until
                 .is_some_and(|defer_until| defer_until > now)
@@ -580,6 +577,12 @@ impl ExecutionSupervisor {
                 }
                 Err(error) => return Err(error.into()),
             };
+            // Keep scanning after worker capacity is full so malformed or
+            // legacy pending envelopes cannot linger indefinitely behind a
+            // valid job selected earlier in this tick.
+            if live_count + selected.len() >= MAX_WORKERS {
+                continue;
+            }
             if !admissible(&envelope, &occupied) {
                 continue;
             }

@@ -1930,7 +1930,7 @@ fn refuse_same_pr_running_ship(
                 },
             ));
         }
-        let daemon_owned = envelope.is_daemon_admissible();
+        let daemon_owned = envelope.is_daemon_owned() || envelope.is_daemon_admissible();
         let QueuedExecutionEnvelope {
             request: crate::queue_request::QueuedExecutionRequest::Ship(existing),
             ..

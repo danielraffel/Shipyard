@@ -8,6 +8,8 @@ use fs2::FileExt;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::evidence::canonical_repository;
+
 /// Schema version for durable ship-state files.
 pub const SHIP_STATE_SCHEMA_VERSION: u32 = 1;
 
@@ -568,7 +570,7 @@ impl ShipStateStore {
                 if let Ok(contents) = fs::read_to_string(&path)
                     && let Ok(state) = serde_json::from_str::<ShipState>(&contents)
                 {
-                    states.insert((canonical_repository(&state.repo), state.pr), state);
+                    insert_newest_state(&mut states, state);
                 }
             }
         }
@@ -585,7 +587,7 @@ impl ShipStateStore {
                             continue;
                         }
                         if let Some(state) = Self::get_unlocked_path(&path) {
-                            states.insert((canonical_repository(&state.repo), state.pr), state);
+                            insert_newest_state(&mut states, state);
                         }
                     }
                 }
@@ -844,12 +846,18 @@ impl Drop for ShipStatePrLock {
     }
 }
 
-fn canonical_repository(repository: &str) -> String {
-    repository.trim().to_ascii_lowercase()
-}
-
 fn same_repository(left: &str, right: &str) -> bool {
     canonical_repository(left) == canonical_repository(right)
+}
+
+fn insert_newest_state(states: &mut BTreeMap<(String, u64), ShipState>, state: ShipState) {
+    let key = (canonical_repository(&state.repo), state.pr);
+    if states
+        .get(&key)
+        .is_none_or(|existing| state.updated_at > existing.updated_at)
+    {
+        states.insert(key, state);
+    }
 }
 
 fn repository_key(repository: &str) -> String {
@@ -1402,6 +1410,12 @@ mod tests {
             .save_locked(&legacy, &legacy_lock)
             .expect("mixed-version legacy save");
         drop(legacy_lock);
+
+        assert_eq!(
+            store.get(92).expect("newest unscoped state").head_sha,
+            "legacy-new",
+            "compatibility reads must not let an older scoped mirror hide a newer legacy write"
+        );
 
         let active = store
             .get_scoped("danielraffel/pulp", 92)

@@ -867,12 +867,10 @@ fn load_ship_key(job_id: &str, request_store: &QueueRequestStore) -> Option<((St
     }
     let foreground_owned = envelope.is_foreground_owned();
     match envelope.request {
-        QueuedExecutionRequest::Ship(request) => {
-            Some((
-                (canonical_repository(&request.repo), request.pr),
-                foreground_owned,
-            ))
-        }
+        QueuedExecutionRequest::Ship(request) => Some((
+            (canonical_repository(&request.repo), request.pr),
+            foreground_owned,
+        )),
         QueuedExecutionRequest::Run(_) => None,
     }
 }

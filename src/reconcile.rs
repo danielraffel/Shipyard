@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use wait_timeout::ChildExt;
 
+use crate::evidence::canonical_repository;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::ship_state::{DispatchedRun, ShipState, ShipStateStore};
@@ -44,13 +45,13 @@ impl ReconcileWindow {
     #[must_use]
     pub fn last_forced_at(&self, repo: &str, pr: u64) -> Option<DateTime<Utc>> {
         self.last_forced
-            .get(&(repo.trim().to_ascii_lowercase(), pr))
+            .get(&(canonical_repository(repo), pr))
             .copied()
     }
 
     fn stamp(&mut self, repo: &str, pr: u64, now: DateTime<Utc>) {
         self.last_forced
-            .insert((repo.trim().to_ascii_lowercase(), pr), now);
+            .insert((canonical_repository(repo), pr), now);
     }
 }
 
