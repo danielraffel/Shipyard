@@ -339,8 +339,19 @@ impl EvidenceStore {
         let scope_key = collision_safe_component(workload_scope);
         let branch_key = collision_safe_component(branch);
         let directory = self.path.join("scoped").join(scope_key);
+        let legacy_scope_key = legacy_collision_safe_component(workload_scope);
+        let legacy_branch_key = legacy_collision_safe_component(branch);
+        let legacy_directory = self.path.join("scoped").join(legacy_scope_key);
+        let legacy_file = legacy_directory.join(format!("{legacy_branch_key}.json"));
+        // Do not create the long legacy namespace for new writes: that would
+        // reintroduce the Windows MAX_PATH failure this encoding fixes.
+        let _legacy_lock = legacy_file
+            .try_exists()
+            .unwrap_or(false)
+            .then(|| StoreLock::acquire(legacy_directory.join(format!("{legacy_branch_key}.lock"))))
+            .transpose()?;
         let _lock = StoreLock::acquire(directory.join(format!("{branch_key}.lock")))?;
-        let mut records = Self::load_records(&directory.join(format!("{branch_key}.json")))?;
+        let mut records = self.load_scoped_records(workload_scope, branch)?;
         let output = f(&mut records)?;
         Self::save_records(&directory, &branch_key, &records)?;
         Ok(output)
@@ -360,12 +371,8 @@ impl EvidenceStore {
         workload_scope: &str,
         branch: &str,
     ) -> BTreeMap<String, EvidenceRecord> {
-        let path = self
-            .path
-            .join("scoped")
-            .join(collision_safe_component(workload_scope))
-            .join(format!("{}.json", collision_safe_component(branch)));
-        Self::load_records(&path).unwrap_or_default()
+        self.load_scoped_records(workload_scope, branch)
+            .unwrap_or_default()
     }
 
     /// Return the newest record per target for scoped workloads whose stored
@@ -380,23 +387,28 @@ impl EvidenceStore {
         let Ok(scopes) = fs::read_dir(self.path.join("scoped")) else {
             return merged;
         };
-        let branch_key = collision_safe_component(branch);
-        for records in scopes.flatten().filter_map(|scope| {
-            Self::load_records(&scope.path().join(format!("{branch_key}.json"))).ok()
-        }) {
-            for (target, record) in records {
-                if !record
-                    .workload_scope
-                    .as_deref()
-                    .is_some_and(|scope| scope.starts_with(workload_scope_prefix))
-                {
-                    continue;
-                }
-                if merged
-                    .get(&target)
-                    .is_none_or(|existing| record.completed_at > existing.completed_at)
-                {
-                    merged.insert(target, record);
+        let branch_keys = [
+            collision_safe_component(branch),
+            legacy_collision_safe_component(branch),
+        ];
+        for scope in scopes.flatten() {
+            for records in branch_keys.iter().filter_map(|branch_key| {
+                Self::load_records(&scope.path().join(format!("{branch_key}.json"))).ok()
+            }) {
+                for (target, record) in records {
+                    if !record
+                        .workload_scope
+                        .as_deref()
+                        .is_some_and(|scope| scope.starts_with(workload_scope_prefix))
+                    {
+                        continue;
+                    }
+                    if merged
+                        .get(&target)
+                        .is_none_or(|existing| record.completed_at > existing.completed_at)
+                    {
+                        merged.insert(target, record);
+                    }
                 }
             }
         }
@@ -419,6 +431,30 @@ impl EvidenceStore {
     ) -> Option<EvidenceRecord> {
         self.get_branch_scoped(workload_scope, branch)
             .remove(target_name)
+    }
+
+    fn load_scoped_records(
+        &self,
+        workload_scope: &str,
+        branch: &str,
+    ) -> Result<BTreeMap<String, EvidenceRecord>, Box<dyn std::error::Error>> {
+        let scoped = self.path.join("scoped");
+        let current = scoped
+            .join(collision_safe_component(workload_scope))
+            .join(format!("{}.json", collision_safe_component(branch)));
+        let legacy = scoped
+            .join(legacy_collision_safe_component(workload_scope))
+            .join(format!("{}.json", legacy_collision_safe_component(branch)));
+        let mut merged = Self::load_records(&legacy)?;
+        for (target, record) in Self::load_records(&current)? {
+            if merged
+                .get(&target)
+                .is_none_or(|existing| record.completed_at >= existing.completed_at)
+            {
+                merged.insert(target, record);
+            }
+        }
+        Ok(merged)
     }
 
     /// Return whether every required platform has passing evidence for the SHA.
@@ -465,11 +501,9 @@ impl EvidenceStore {
         target_name: &str,
         sha_candidates: &[String],
     ) -> Option<EvidenceRecord> {
-        Self::query_passing_in_directory(
-            &self
-                .path
-                .join("scoped")
-                .join(collision_safe_component(workload_scope)),
+        let directories = self.scoped_directories(workload_scope);
+        Self::query_passing_in_directories(
+            directories.iter().map(PathBuf::as_path),
             target_name,
             sha_candidates,
         )
@@ -494,11 +528,12 @@ impl EvidenceStore {
         target_name: &str,
         sha: &str,
     ) -> Vec<EvidenceRecord> {
-        let directory = self
-            .path
-            .join("scoped")
-            .join(collision_safe_component(workload_scope));
-        Self::passing_records_in_directory(&directory, target_name, sha)
+        let directories = self.scoped_directories(workload_scope);
+        Self::passing_records_in_directories(
+            directories.iter().map(PathBuf::as_path),
+            target_name,
+            sha,
+        )
     }
 
     /// Return exact-SHA passing records across scoped workloads whose stored
@@ -544,33 +579,43 @@ impl EvidenceStore {
         target_name: &str,
         sha_candidates: &[String],
     ) -> Option<EvidenceRecord> {
+        Self::query_passing_in_directories(std::iter::once(directory), target_name, sha_candidates)
+    }
+
+    fn query_passing_in_directories<'a>(
+        directories: impl IntoIterator<Item = &'a Path>,
+        target_name: &str,
+        sha_candidates: &[String],
+    ) -> Option<EvidenceRecord> {
         let candidate_ranks = sha_candidates
             .iter()
             .enumerate()
             .map(|(rank, sha)| (sha.as_str(), rank))
             .collect::<BTreeMap<_, _>>();
         let mut best: Option<(usize, EvidenceRecord)> = None;
-        let Ok(entries) = fs::read_dir(directory) else {
-            return None;
-        };
-        for records in entries.flatten().filter_map(|entry| {
-            let path = entry.path();
-            (path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
-                .then(|| Self::load_records(&path).ok())
-                .flatten()
-        }) {
-            for record in records.values() {
-                if record.target_name != target_name || !record.passed() || record.reused() {
-                    continue;
-                }
-                let Some(rank) = candidate_ranks.get(record.sha.as_str()).copied() else {
-                    continue;
-                };
-                if best.as_ref().is_none_or(|(best_rank, current)| {
-                    rank < *best_rank
-                        || (rank == *best_rank && record.completed_at > current.completed_at)
-                }) {
-                    best = Some((rank, record.clone()));
+        for directory in directories {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for records in entries.flatten().filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
+                    .then(|| Self::load_records(&path).ok())
+                    .flatten()
+            }) {
+                for record in records.values() {
+                    if record.target_name != target_name || !record.passed() || record.reused() {
+                        continue;
+                    }
+                    let Some(rank) = candidate_ranks.get(record.sha.as_str()).copied() else {
+                        continue;
+                    };
+                    if best.as_ref().is_none_or(|(best_rank, current)| {
+                        rank < *best_rank
+                            || (rank == *best_rank && record.completed_at > current.completed_at)
+                    }) {
+                        best = Some((rank, record.clone()));
+                    }
                 }
             }
         }
@@ -582,11 +627,18 @@ impl EvidenceStore {
         target_name: &str,
         sha: &str,
     ) -> Vec<EvidenceRecord> {
-        let Ok(entries) = fs::read_dir(directory) else {
-            return Vec::new();
-        };
-        let mut records = entries
-            .flatten()
+        Self::passing_records_in_directories(std::iter::once(directory), target_name, sha)
+    }
+
+    fn passing_records_in_directories<'a>(
+        directories: impl IntoIterator<Item = &'a Path>,
+        target_name: &str,
+        sha: &str,
+    ) -> Vec<EvidenceRecord> {
+        let mut records = directories
+            .into_iter()
+            .filter_map(|directory| fs::read_dir(directory).ok())
+            .flat_map(Iterator::flatten)
             .filter_map(|entry| {
                 let path = entry.path();
                 (path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
@@ -603,6 +655,14 @@ impl EvidenceStore {
             .collect::<Vec<_>>();
         records.sort_by_key(|record| std::cmp::Reverse(record.completed_at));
         records
+    }
+
+    fn scoped_directories(&self, workload_scope: &str) -> [PathBuf; 2] {
+        let scoped = self.path.join("scoped");
+        [
+            scoped.join(collision_safe_component(workload_scope)),
+            scoped.join(legacy_collision_safe_component(workload_scope)),
+        ]
     }
 
     fn branch_file(&self, branch_key: &str) -> PathBuf {
@@ -715,6 +775,22 @@ fn collision_safe_component(value: &str) -> String {
 
     let readable = sanitize_component(value);
     let digest = Sha256::digest(value.as_bytes());
+    // Scoped evidence nests one encoded scope and one encoded branch. Keep
+    // both components compact enough for Windows runners that still enforce
+    // MAX_PATH while retaining a 128-bit digest (about 64 bits of birthday
+    // collision security, which is sufficient for this local file namespace).
+    format!(
+        "{}--{}",
+        readable.chars().take(16).collect::<String>(),
+        &hex::encode(digest)[..32]
+    )
+}
+
+fn legacy_collision_safe_component(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let readable = sanitize_component(value);
+    let digest = Sha256::digest(value.as_bytes());
     format!(
         "{}--{}",
         readable.chars().take(48).collect::<String>(),
@@ -802,6 +878,8 @@ pub fn command_evidence_scope(cwd: &Path, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
@@ -810,7 +888,8 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        CommandEvidenceStore, EvidenceRecord, EvidenceStore, repository_ship_evidence_scope,
+        CommandEvidenceStore, EvidenceRecord, EvidenceStore, collision_safe_component,
+        legacy_collision_safe_component, repository_ship_evidence_scope,
         repository_ship_evidence_scope_prefix,
     };
 
@@ -1017,6 +1096,90 @@ mod tests {
             assert_eq!(evidence.workload_scope.as_deref(), Some(scope));
         }
         assert!(store.get_branch("feature/shared").is_empty());
+    }
+
+    #[test]
+    fn scoped_evidence_keys_fit_windows_path_budget() {
+        let scope = collision_safe_component(&"repository-workload-scope-".repeat(12));
+        let branch = collision_safe_component(&"generated-agent-feature-branch-".repeat(12));
+        let other_scope = collision_safe_component(&format!(
+            "{}different",
+            "repository-workload-scope-".repeat(12)
+        ));
+
+        assert!(scope.len() <= 50);
+        assert!(branch.len() <= 50);
+        assert_ne!(scope, other_scope);
+
+        // GitHub-hosted Windows temp roots can already consume substantial
+        // path space. Preserve headroom below legacy MAX_PATH for the final
+        // atomic-persist destination.
+        let relative = Path::new("scoped")
+            .join(scope)
+            .join(format!("{branch}.json"));
+        let representative_temp_root_len = 96;
+        assert!(representative_temp_root_len + 1 + relative.as_os_str().len() <= 240);
+    }
+
+    #[test]
+    fn scoped_store_reads_and_migrates_legacy_long_keys() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("evidence");
+        let store = EvidenceStore::new(root.clone()).expect("store");
+        let scope = "repo:generous-corp/forge:workload:modular";
+        let branch = "feature/legacy-scoped-evidence";
+        let legacy_scope = legacy_collision_safe_component(scope);
+        let legacy_branch = legacy_collision_safe_component(branch);
+        let legacy_directory = root.join("scoped").join(legacy_scope);
+        let mut records = BTreeMap::new();
+        let mut legacy = record(branch, "macos", "legacy-sha");
+        legacy.workload_scope = Some(scope.to_owned());
+        records.insert("macos".to_owned(), legacy);
+        EvidenceStore::save_records(&legacy_directory, &legacy_branch, &records)
+            .expect("legacy records");
+
+        assert_eq!(
+            store
+                .get_target_scoped(scope, branch, "macos")
+                .expect("legacy lookup")
+                .sha,
+            "legacy-sha"
+        );
+        assert_eq!(
+            store.get_branch_scoped_prefix("repo:generous-corp/forge", branch)["macos"].sha,
+            "legacy-sha"
+        );
+        assert_eq!(
+            store
+                .query_passing_for_target_scoped(scope, "macos", &["legacy-sha".to_owned()],)
+                .expect("legacy ranked lookup")
+                .sha,
+            "legacy-sha"
+        );
+        assert_eq!(
+            store
+                .passing_records_for_target_sha_scoped(scope, "macos", "legacy-sha")
+                .len(),
+            1
+        );
+
+        store
+            .record_scoped(scope, &record(branch, "windows", "current-sha"))
+            .expect("migrate and record");
+        assert_eq!(
+            store
+                .get_target_scoped(scope, branch, "macos")
+                .expect("migrated legacy target")
+                .sha,
+            "legacy-sha"
+        );
+        assert_eq!(
+            store
+                .get_target_scoped(scope, branch, "windows")
+                .expect("current target")
+                .sha,
+            "current-sha"
+        );
     }
 
     #[test]
