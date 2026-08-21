@@ -687,9 +687,7 @@ fn save_record(path: &Path, record: &QueueAbsentRecoveryRecord) -> Result<(), St
         .sync_all()
         .map_err(|error| error.to_string())?;
     temp.persist(path).map_err(|error| error.to_string())?;
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| error.to_string())?;
+    crate::log_retention::sync_parent_directory(path).map_err(|error| error.to_string())?;
     Ok(())
 }
 
