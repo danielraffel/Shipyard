@@ -26,7 +26,6 @@ use serde_json::Value;
 #[cfg(unix)]
 use chrono::Utc;
 
-#[cfg(unix)]
 use crate::config::LoadedConfig;
 use crate::daemon_ipc::read_daemon_status;
 #[cfg(unix)]
@@ -1496,11 +1495,6 @@ fn wait_until_pid_stops(pid: u32, timeout: Duration) -> bool {
 fn live_daemon_pid(daemon_dir: &Path) -> Option<u32> {
     let pid = read_pid_file(&daemon_dir.join("daemon.pid"))?;
     (pid > 0 && pid_alive(pid) && process_looks_like_shipyard_daemon(pid)).then_some(pid)
-}
-
-#[cfg(not(unix))]
-fn live_daemon_pid(_daemon_dir: &Path) -> Option<u32> {
-    None
 }
 
 #[cfg(unix)]

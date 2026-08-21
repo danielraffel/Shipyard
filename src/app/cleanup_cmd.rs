@@ -10,8 +10,6 @@ use serde::Serialize;
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 
 use super::CliFailure;
 use crate::config::LoadedConfig;
@@ -595,7 +593,7 @@ struct PathIdentity {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    volume_serial: u32,
+    volume_serial: u64,
     #[cfg(windows)]
     file_index: u64,
 }
@@ -1584,15 +1582,20 @@ fn path_identity(path: &Path) -> Option<PathIdentity> {
     if metadata.file_type().is_symlink() {
         return None;
     }
+    #[cfg(windows)]
+    let windows_info = {
+        let handle = winapi_util::Handle::from_path_any(path).ok()?;
+        winapi_util::file::information(&handle).ok()?
+    };
     Some(PathIdentity {
         #[cfg(unix)]
         device: metadata.dev(),
         #[cfg(unix)]
         inode: metadata.ino(),
         #[cfg(windows)]
-        volume_serial: metadata.volume_serial_number()?,
+        volume_serial: windows_info.volume_serial_number(),
         #[cfg(windows)]
-        file_index: metadata.file_index()?,
+        file_index: windows_info.file_index(),
     })
 }
 
@@ -2016,6 +2019,8 @@ mod retention_tests {
     #[test]
     fn pressure_uses_exact_terminal_time_before_path_order() {
         let now = Utc::now();
+        let temp = tempfile::tempdir().expect("temp");
+        let identity = path_identity(temp.path()).expect("identity");
         let candidate = |path: &str, terminal_at| LogCandidate {
             path: PathBuf::from(path),
             size: 1,
@@ -2027,26 +2032,8 @@ mod retention_tests {
             audit_pinned: false,
             reason: "passed".to_owned(),
             logs_root: PathBuf::new(),
-            logs_root_identity: PathIdentity {
-                #[cfg(unix)]
-                device: 0,
-                #[cfg(unix)]
-                inode: 0,
-                #[cfg(windows)]
-                volume_serial: 0,
-                #[cfg(windows)]
-                file_index: 0,
-            },
-            job_identity: PathIdentity {
-                #[cfg(unix)]
-                device: 0,
-                #[cfg(unix)]
-                inode: 0,
-                #[cfg(windows)]
-                volume_serial: 0,
-                #[cfg(windows)]
-                file_index: 0,
-            },
+            logs_root_identity: identity.clone(),
+            job_identity: identity.clone(),
         };
         let newer = candidate("a-newer", now);
         let older = candidate("z-older", now - Duration::minutes(1));

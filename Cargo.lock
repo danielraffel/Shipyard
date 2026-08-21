@@ -785,6 +785,7 @@ dependencies = [
  "tempfile",
  "toml",
  "wait-timeout",
+ "winapi-util",
 ]
 
 [[package]]

@@ -14,8 +14,6 @@ use std::time::SystemTime;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 
 use chrono::{DateTime, Utc};
 use flate2::Compression;
@@ -349,13 +347,18 @@ struct FileSignature {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    volume_serial: u32,
+    volume_serial: u64,
     #[cfg(windows)]
     file_index: u64,
 }
 
 fn file_signature(path: &Path) -> io::Result<FileSignature> {
     let metadata = path.metadata()?;
+    #[cfg(windows)]
+    let windows_info = {
+        let handle = winapi_util::Handle::from_path_any(path)?;
+        winapi_util::file::information(&handle)?
+    };
     Ok(FileSignature {
         len: metadata.len(),
         modified: metadata.modified()?,
@@ -364,13 +367,9 @@ fn file_signature(path: &Path) -> io::Result<FileSignature> {
         #[cfg(unix)]
         inode: metadata.ino(),
         #[cfg(windows)]
-        volume_serial: metadata
-            .volume_serial_number()
-            .ok_or_else(|| io::Error::other("missing Windows volume identity"))?,
+        volume_serial: windows_info.volume_serial_number(),
         #[cfg(windows)]
-        file_index: metadata
-            .file_index()
-            .ok_or_else(|| io::Error::other("missing Windows file identity"))?,
+        file_index: windows_info.file_index(),
     })
 }
 
@@ -778,5 +777,25 @@ mod tests {
         assert_eq!(changed, "diagnostic evidence\nlate line\n");
         gzip_closed_log(&path).expect("retire matching source");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn gzip_retirement_rejects_same_content_source_replacement() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("target.log");
+        fs::write(&path, "diagnostic evidence\n").expect("write source");
+        gzip_closed_log(&path).expect("publish gzip");
+        let verification = verify_gzip_for_retirement(&path)
+            .expect("verify gzip")
+            .expect("matching derivative");
+
+        fs::rename(&path, temp.path().join("original.log")).expect("move verified source");
+        fs::write(&path, "diagnostic evidence\n").expect("replace with equal content");
+
+        assert!(
+            !retire_verified_gzip_source(&path, &verification).expect("reject replacement"),
+            "path identity must prevent retiring a source replaced after verification"
+        );
+        assert!(path.exists());
     }
 }
