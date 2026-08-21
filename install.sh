@@ -316,6 +316,7 @@ mv -f "${STAGED_DEST}" "${DEST}"
 ln -sf "${DEST}" "${INSTALL_DIR}/${ALIAS_NAME}"
 verify_expected_binary_sha256 "${DEST}" "installed"
 smoke_binary_or_repair "${DEST}"
+verify_expected_binary_sha256 "${DEST}" "post-smoke"
 
 echo ""
 echo "Installed ${BINARY_NAME} to ${DEST}"
