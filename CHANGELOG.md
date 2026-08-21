@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0970"></a>
+## [0.97.0] - 2026-08-20
+
+- feat(execution): make queued work daemon-owned ([#441](https://github.com/danielraffel/Shipyard/pull/441))
+
 <a id="v0961"></a>
 ## [0.96.1] - 2026-08-20
 
@@ -924,6 +929,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.97.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.97.0
 [0.96.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.96.1
 [0.96.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.96.0
 [0.95.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.95.0
