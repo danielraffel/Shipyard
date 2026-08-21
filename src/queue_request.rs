@@ -376,8 +376,7 @@ impl QueuedExecutionEnvelope {
 /// Stable repository-checkout identity for repo-neutral `run` supersedence.
 #[must_use]
 pub(crate) fn run_workload_scope(cwd: &Path) -> String {
-    let identity = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    format!("run:{}", identity.to_string_lossy())
+    run_evidence_scope(cwd)
 }
 
 /// Immutable checkout identity required before a daemon-owned worker may run.

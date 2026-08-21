@@ -1515,16 +1515,22 @@ mod tests {
     use super::run_pr_provenance_hook;
     use super::{
         SHIP_EXIT_MERGE_CLIENT_DEFECT, ShipCommandArgs, ShipInvocation, ShipRenderState,
-        configured_pr_provenance_hook, green_not_merged, render_green_not_merged,
-        render_green_not_merged_client_defect, render_green_not_merged_flaky,
-        render_green_not_merged_head_superseded, ship_command,
+        configured_pr_provenance_hook, finish_background_ship, green_not_merged,
+        render_green_not_merged, render_green_not_merged_client_defect,
+        render_green_not_merged_flaky, render_green_not_merged_head_superseded, ship_command,
     };
     use crate::app::cli::MergeResult;
     #[cfg(unix)]
     use crate::cloud::GitHubActions;
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::identity::RuntimeMode;
+    use crate::job::{Job, JobKind, Priority, TargetResult, TargetStatus, ValidationMode};
     use crate::paths::RuntimePaths;
+    use crate::queue_request::{
+        ExecutionProvenance, QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionOwner,
+    };
+    use crate::ship::ShipExecutionRequest;
+    use crate::ship_state::{ShipState, ShipStateStore};
 
     /// Issue #301 (2/3): the render must surface the underlying merge
     /// error verbatim and point the user at the two unblocks
@@ -2233,6 +2239,104 @@ esac"#,
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn daemon_finish_selects_repository_when_pr_numbers_collide() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        seed_repo(&repo);
+        let global_dir = temp.path().join("global");
+        let state_dir = temp.path().join("state");
+        let config = LoadedConfig::load_from_cwd_with_global_dir(
+            RuntimeMode::Isolated,
+            &repo,
+            global_dir.clone(),
+        )
+        .expect("load config");
+        let head = git_capture(&["rev-parse", "HEAD"], &repo);
+        let request = ShipExecutionRequest {
+            pr: 42,
+            repo: "danielraffel/pulp".to_owned(),
+            branch: "feature/test".to_owned(),
+            base_branch: "main".to_owned(),
+            sha: head.clone(),
+            commit_subject: "test collision".to_owned(),
+            pr_url: None,
+            pr_title: None,
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: true,
+            fail_fast: false,
+            resume_from: None,
+            advisory_targets: std::collections::BTreeSet::new(),
+            adopt_head: false,
+            pr_snapshot_file: None,
+            targets: Vec::new(),
+        };
+        let job = Job::create(
+            &head,
+            &request.branch,
+            vec!["mac".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        )
+        .with_kind(JobKind::Ship)
+        .start()
+        .expect("start job")
+        .with_result(TargetResult::new(
+            "mac",
+            "macos-arm64",
+            TargetStatus::Fail,
+            "local",
+        ))
+        .complete()
+        .expect("complete job");
+        let mut envelope = QueuedExecutionEnvelope::from_ship_request(&job.id, &repo, &request);
+        envelope.execution_owner = QueuedExecutionOwner::Daemon;
+        envelope.provenance =
+            ExecutionProvenance::capture_with_config(&repo, Some(&request.repo), &head, &config);
+        QueueRequestStore::new(&state_dir)
+            .expect("request store")
+            .save(&envelope)
+            .expect("save request");
+
+        let store = ShipStateStore::new(state_dir.join("ship")).expect("ship-state store");
+        store
+            .save(&ShipState::new(
+                42,
+                "danielraffel/pulp",
+                "feature/test",
+                "main",
+                &head,
+                "policy-pulp",
+            ))
+            .expect("save Pulp state");
+        store
+            .save(&ShipState::new(
+                42,
+                "Generous-Corp/forge",
+                "feature/modular",
+                "main",
+                "forge-head",
+                "policy-forge",
+            ))
+            .expect("save Forge state");
+        assert!(store.get(42).is_none(), "unscoped lookup must be ambiguous");
+
+        let (code, terminal_state) = finish_background_ship(
+            &request,
+            &job,
+            RuntimeMode::Isolated,
+            &global_dir,
+            &state_dir,
+        )
+        .expect("finish Pulp ship despite colliding Forge PR number");
+
+        assert_eq!(code, ExitCode::from(1));
+        assert_eq!(terminal_state.repo, "danielraffel/pulp");
+        assert_eq!(terminal_state.head_sha, head);
+        assert!(store.get_scoped("Generous-Corp/forge", 42).is_some());
     }
 
     #[test]
