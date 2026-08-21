@@ -328,24 +328,27 @@ fn gather_closed_prs(
     cwd: &Path,
     gh_client: &GhClient,
 ) -> Result<Vec<(String, u64)>, CliFailure> {
-    let repository = super::branch_cmd::detect_repo_from_remote(cwd, None);
+    gather_closed_prs_with(store, |repo, pr| pr_is_closed(repo, pr, cwd, gh_client))
+}
+
+fn gather_closed_prs_with(
+    store: &ShipStateStore,
+    mut is_closed: impl FnMut(&str, u64) -> Result<bool, CliFailure>,
+) -> Result<Vec<(String, u64)>, CliFailure> {
     let mut closed = Vec::new();
     for state in store.list_active() {
-        if repository
-            .as_ref()
-            .is_none_or(|repository| !repository.eq_ignore_ascii_case(&state.repo))
-        {
-            continue;
-        }
-        if pr_is_closed(state.pr, cwd, gh_client)? {
+        if is_closed(&state.repo, state.pr)? {
             closed.push((state.repo, state.pr));
         }
     }
     Ok(closed)
 }
 
-fn pr_is_closed(pr: u64, cwd: &Path, gh_client: &GhClient) -> Result<bool, CliFailure> {
+fn pr_is_closed(repo: &str, pr: u64, cwd: &Path, gh_client: &GhClient) -> Result<bool, CliFailure> {
     let output = gh_client
+        .clone()
+        .with_repo_override(repo)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
         .prepare_command(
             cwd,
             None,
@@ -353,7 +356,15 @@ fn pr_is_closed(pr: u64, cwd: &Path, gh_client: &GhClient) -> Result<bool, CliFa
             GhAuthPolicy::Default,
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?
-        .args(["pr", "view", &pr.to_string(), "--json", "state"])
+        .args([
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "state",
+        ])
         .output()
         .map_err(|error| CliFailure::new(1, format!("failed to run gh pr view: {error}")))?;
     if !output.status.success() {
@@ -475,4 +486,50 @@ fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
         .modified()
         .ok()
         .map(DateTime::<Utc>::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gather_closed_prs_with;
+    use crate::ship_state::{ShipState, ShipStateStore};
+
+    #[test]
+    fn closed_pr_scan_uses_each_states_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("ship-state store");
+        for (repo, head) in [
+            ("Generous-Corp/pulp", "pulp-head"),
+            ("Generous-Corp/forge", "forge-head"),
+            ("Generous-Corp/vellum", "vellum-head"),
+        ] {
+            store
+                .save(&ShipState::new(
+                    42,
+                    repo,
+                    "feature/x",
+                    "main",
+                    head,
+                    "policy",
+                ))
+                .expect("save state");
+        }
+        let mut observed = Vec::new();
+
+        let closed = gather_closed_prs_with(&store, |repo, pr| {
+            observed.push((repo.to_owned(), pr));
+            Ok(repo.eq_ignore_ascii_case("Generous-Corp/forge"))
+        })
+        .expect("scan closed PRs");
+
+        observed.sort();
+        assert_eq!(
+            observed,
+            vec![
+                ("Generous-Corp/forge".to_owned(), 42),
+                ("Generous-Corp/pulp".to_owned(), 42),
+                ("Generous-Corp/vellum".to_owned(), 42),
+            ]
+        );
+        assert_eq!(closed, vec![("Generous-Corp/forge".to_owned(), 42)]);
+    }
 }

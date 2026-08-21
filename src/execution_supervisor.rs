@@ -517,9 +517,6 @@ impl ExecutionSupervisor {
         let running_resources = running_resource_claims(&running, &request_store)?;
         let mut occupied = running_resources.claims;
         let live_count = running.len();
-        if live_count >= MAX_WORKERS {
-            return Ok(());
-        }
 
         let pending = queue.get_pending()?;
         let mut selected = Vec::new();
@@ -1847,6 +1844,43 @@ mod tests {
             JobStatus::Running
         );
         let mut child = supervisor.children.remove("valid").expect("valid worker");
+        terminate_process_group(child.id());
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_pending_job_is_cancelled_while_worker_capacity_is_full() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_job(temp.path(), "running");
+        let mut supervisor = ExecutionSupervisor::new(
+            fake_worker(temp.path()),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor.tick().expect("start running worker");
+        queued_job(temp.path(), "malformed");
+        fs::write(
+            QueueRequestStore::new(temp.path())
+                .expect("store")
+                .path_for("malformed"),
+            b"{",
+        )
+        .expect("malformed request");
+
+        supervisor.admit_pending().expect("scan full queue");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        assert_eq!(
+            queue.get("running").expect("read").expect("job").status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            queue.get("malformed").expect("read").expect("job").status,
+            JobStatus::Cancelled
+        );
+        let mut child = supervisor.children.remove("running").expect("worker");
         terminate_process_group(child.id());
         let _ = child.wait();
     }
