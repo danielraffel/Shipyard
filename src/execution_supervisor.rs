@@ -146,12 +146,16 @@ impl ExecutionSupervisor {
     /// Reconcile worker ownership and admit safe pending jobs.
     pub fn tick(&mut self) -> Result<(), SupervisorError> {
         fs::create_dir_all(self.worker_dir())?;
-        self.recover_queue_absent()?;
         self.observe_merged_ship_jobs()?;
         self.reconcile_terminal_outcomes()?;
         self.terminate_cancelled_workers()?;
         self.terminate_deferred_workers()?;
+        // Drop exited children from the in-memory ownership map before queue-
+        // absence recovery checks receipts. Otherwise a stale child-map entry
+        // preserves its dead receipt during the recovery preflight and can
+        // turn already-dead ownership into a durable needs-agent fence.
         self.reap_owned_children()?;
+        self.recover_queue_absent()?;
         self.sweep_terminal_receipts()?;
         let unknown_worker = self.reconcile_running()?;
         if !unknown_worker {
@@ -1549,7 +1553,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn queue_absent_recovery_preflight_removes_only_proven_dead_receipts() {
+    fn queue_absent_recovery_reaps_stale_child_before_receipt_preflight() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut supervisor = ExecutionSupervisor::new(
             PathBuf::from("/does/not/exist"),
@@ -1558,6 +1562,15 @@ mod tests {
             temp.path().into(),
         );
         fs::create_dir_all(supervisor.worker_dir()).expect("worker dir");
+
+        let mut exited_child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("exited child");
+        exited_child.wait().expect("wait for child");
+        supervisor
+            .children
+            .insert("dead-owner".to_owned(), exited_child);
 
         let dead_receipt_path = supervisor.receipt_path("dead-owner");
         write_json_atomic(
@@ -1576,10 +1589,14 @@ mod tests {
         let unknown_receipt_path = supervisor.receipt_path("unknown-owner");
         fs::write(&unknown_receipt_path, b"not-json").expect("unknown receipt");
 
+        // This is the ordering used by tick: clear stale in-memory ownership,
+        // then remove only receipts whose exact generation is proven dead.
+        supervisor.reap_owned_children().expect("reap stale child");
         supervisor
             .recover_queue_absent()
             .expect("recovery preflight");
 
+        assert!(!supervisor.children.contains_key("dead-owner"));
         assert!(
             !dead_receipt_path.exists(),
             "a provably dead receipt must be removed before detached recovery"

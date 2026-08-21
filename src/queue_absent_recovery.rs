@@ -684,7 +684,6 @@ fn validate_replacement(
         && job.sha == state.head_sha
         && job.branch == state.branch
         && job.mode == request.mode
-        && job.priority == request.priority
         && job.target_names == source.resource_plan.targets
         && job.workload_scope.as_deref() == Some(workload_scope.as_str());
     let mut expected = source.clone();
@@ -1879,6 +1878,42 @@ mod tests {
                 .expect("jobs")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn active_recovered_owner_survives_queue_priority_bump() {
+        let fixture = Fixture::new();
+        let first = fixture.sweep(fixture.live(), |_| Ok(()));
+        let (_, _, replacement_id) = first.enqueued.first().expect("recovered owner");
+
+        let mut queue = Queue::new(&fixture.state_dir).expect("queue");
+        let replacement = queue
+            .get(replacement_id)
+            .expect("read replacement")
+            .expect("replacement");
+        queue
+            .update(&replacement.with_priority(Priority::High))
+            .expect("priority bump");
+
+        let second = fixture.sweep(fixture.live(), |_| {
+            panic!("an active recovered owner must not be replayed")
+        });
+        assert!(second.enqueued.is_empty(), "{second:?}");
+        assert!(second.needs_agent.is_empty(), "{second:?}");
+        assert_eq!(second.skipped, 1, "{second:?}");
+
+        let record = load_record(&recovery_record_path(&fixture.state_dir, REPO, 42))
+            .expect("record read")
+            .expect("record");
+        assert_eq!(record.status, QueueAbsentRecoveryStatus::Enqueued);
+        assert_eq!(
+            queue
+                .get(replacement_id)
+                .expect("read bumped owner")
+                .expect("bumped owner")
+                .priority,
+            Priority::High
         );
     }
 
