@@ -7,7 +7,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -186,6 +186,17 @@ pub fn plan_authoritative_execution(
             "selection receipt is not an original shadow planner receipt",
         ));
     }
+    // A blocked plan means the ordinary full suite cannot prove an affected
+    // family. Preserve that safety disposition independently of whether this
+    // host or policy currently permits bounded execution.
+    if receipt.planned_suite == PlannedSuite::Blocked {
+        return Ok(ExecutionDisposition::Blocked {
+            reason: receipt
+                .fallback_detail
+                .clone()
+                .unwrap_or_else(|| "required exact-head secondary proof is unavailable".to_owned()),
+        });
+    }
     let Some(execution) = policy.execution.as_ref() else {
         return Ok(ExecutionDisposition::Full {
             reason: FullExecutionReason::ShadowPolicy,
@@ -210,13 +221,7 @@ pub fn plan_authoritative_execution(
                 reason: FullExecutionReason::PlannerSelectedFull,
             });
         }
-        PlannedSuite::Blocked => {
-            return Ok(ExecutionDisposition::Blocked {
-                reason: receipt.fallback_detail.clone().unwrap_or_else(|| {
-                    "required exact-head secondary proof is unavailable".to_owned()
-                }),
-            });
-        }
+        PlannedSuite::Blocked => unreachable!("blocked plans return before policy fallbacks"),
         PlannedSuite::Bounded => {}
     }
     if receipt.authoritative_suite != PlannedSuite::Full {
@@ -302,10 +307,27 @@ pub fn materialize_selected_tests(
         .write_all(&bytes)
         .and_then(|()| temporary.as_file().sync_all())
         .map_err(|failure| error(format!("write selected-test file: {failure}")))?;
-    temporary
-        .persist(&plan.selected_tests_file)
-        .map_err(|failure| error(format!("persist selected-test file: {}", failure.error)))?;
-    Ok(())
+    match temporary.persist_noclobber(&plan.selected_tests_file) {
+        Ok(_) => Ok(()),
+        Err(failure) if failure.error.kind() == ErrorKind::AlreadyExists => {
+            let existing = fs::read(&plan.selected_tests_file).map_err(|read_failure| {
+                error(format!(
+                    "read concurrently published selected-test file: {read_failure}"
+                ))
+            })?;
+            if existing == bytes {
+                Ok(())
+            } else {
+                Err(error(
+                    "immutable selected-test path was concurrently published with different bytes",
+                ))
+            }
+        }
+        Err(failure) => Err(error(format!(
+            "persist selected-test file: {}",
+            failure.error
+        ))),
+    }
 }
 
 fn selected_tests_path(
@@ -505,6 +527,33 @@ mod tests {
     }
 
     #[test]
+    fn blocked_receipt_survives_shadow_policy_and_machine_kill_switch() {
+        for (mode, machine_enabled) in [
+            (ExecutionMode::Shadow, true),
+            (ExecutionMode::Authoritative, false),
+        ] {
+            let policy = fixture_policy(mode);
+            let mut receipt = fixture_receipt(&policy);
+            receipt.planned_suite = PlannedSuite::Blocked;
+            receipt.fallback_detail = Some("secondary proof missing".to_owned());
+            assert_eq!(
+                plan_authoritative_execution(
+                    &receipt,
+                    &policy,
+                    machine_enabled,
+                    Path::new("/state"),
+                    DIGEST,
+                    DIGEST,
+                )
+                .expect("blocked"),
+                ExecutionDisposition::Blocked {
+                    reason: "secondary proof missing".to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn bounded_plan_binds_all_contracts_and_never_embeds_test_names() {
         let policy = fixture_policy(ExecutionMode::Authoritative);
         let receipt = fixture_receipt(&policy);
@@ -548,6 +597,18 @@ mod tests {
         assert!(
             materialize_selected_tests(&plan, &["different".to_owned()]).is_err(),
             "a different test set must not overwrite the exact-bound file"
+        );
+        materialize_selected_tests(&plan, &receipt.selected_tests)
+            .expect("identical publication is idempotent");
+        fs::write(&plan.selected_tests_file, b"conflicting\n").expect("replace fixture");
+        assert!(
+            materialize_selected_tests(&plan, &receipt.selected_tests).is_err(),
+            "an existing conflicting immutable file must be rejected"
+        );
+        assert_eq!(
+            fs::read(&plan.selected_tests_file).expect("read conflicting fixture"),
+            b"conflicting\n",
+            "conflicting bytes must never be overwritten"
         );
     }
 
