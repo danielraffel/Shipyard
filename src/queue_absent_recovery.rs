@@ -273,7 +273,9 @@ where
     let selection_lock = queue
         .acquire_workload_admission_lock(&workload_scope)
         .map_err(|error| error.to_string())?;
-    let jobs = queue.get_all().map_err(|error| error.to_string())?;
+    let jobs = queue
+        .get_all_strict()
+        .map_err(|error| format!("durable queue state is unreadable: {error}"))?;
     let record_path = recovery_record_path(state_dir, &state.repo, state.pr);
     let existing = load_record(&record_path)?;
     let existing = existing.filter(|record| record_matches_state(record, state));
@@ -1032,6 +1034,104 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn corrupt_queue_cannot_turn_a_live_owner_into_recoverable_absence() {
+        let fixture = Fixture::new();
+        let mut queue = Queue::new(&fixture.state_dir).expect("queue");
+        let owner = crate::ship::submit_ship(
+            &fixture.request,
+            &mut queue,
+            &fixture.repo_path,
+            &fixture.state_dir,
+        )
+        .expect("live owner");
+        let corrupt_payload = serde_json::json!({
+            "jobs": [
+                owner.to_json_value(),
+                {"id": "malformed-hostile-owner"}
+            ]
+        });
+        let corrupt_payload = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&corrupt_payload).expect("serialize corrupt fixture")
+        );
+        fs::write(queue.queue_file(), &corrupt_payload).expect("write corrupt queue");
+
+        // Positive control for the regression: the legacy tolerant reader
+        // really does collapse this mixed live/corrupt payload to absence.
+        assert!(queue.get_all().expect("tolerant read").is_empty());
+
+        let report = fixture.sweep(fixture.live(), |_| {
+            panic!("corrupt durable ownership must fail before GitHub or enqueue")
+        });
+        assert!(report.enqueued.is_empty(), "{report:?}");
+        assert_eq!(report.needs_agent.len(), 1, "{report:?}");
+        assert!(
+            report.needs_agent[0]
+                .2
+                .contains("durable queue state is unreadable"),
+            "{report:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(queue.queue_file()).expect("queue remains present"),
+            corrupt_payload,
+            "recovery must not overwrite ambiguous durable ownership"
+        );
+    }
+
+    #[test]
+    fn corruption_after_claim_cannot_be_overwritten_by_recovery_enqueue() {
+        let fixture = Fixture::new();
+        let state_dir = fixture.state_dir.clone();
+        let source_job_id = fixture.source_job_id.clone();
+        let report = fixture.sweep(fixture.live(), move |_| {
+            let source = QueueRequestStore::new(&state_dir)
+                .map_err(|error| error.to_string())?
+                .load(&source_job_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "source envelope disappeared".to_owned())?;
+            let owner = Job::create(
+                "competing-sha",
+                "feature",
+                Vec::new(),
+                ValidationMode::Full,
+                Priority::Normal,
+            )
+            .with_kind(JobKind::Ship)
+            .with_workload_scope(source.workload_scope());
+            let payload = serde_json::json!({
+                "jobs": [
+                    owner.to_json_value(),
+                    {"id": "malformed-after-claim"}
+                ]
+            });
+            fs::write(
+                Queue::queue_file_at(&state_dir),
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+
+        assert!(report.enqueued.is_empty(), "{report:?}");
+        assert_eq!(report.needs_agent.len(), 1, "{report:?}");
+        assert!(
+            report.needs_agent[0].2.contains("queue JSON failed"),
+            "{report:?}"
+        );
+        let raw = fs::read_to_string(Queue::queue_file_at(&fixture.state_dir))
+            .expect("ambiguous queue remains present");
+        assert!(raw.contains("malformed-after-claim"), "{raw}");
+        let record = load_record(&recovery_record_path(&fixture.state_dir, REPO, 42))
+            .expect("record read")
+            .expect("needs-agent record");
+        assert_eq!(record.status, QueueAbsentRecoveryStatus::NeedsAgent);
+        assert!(!raw.contains(&record.replacement_job_id), "{raw}");
     }
 
     #[test]

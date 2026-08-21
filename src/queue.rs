@@ -205,7 +205,7 @@ impl Queue {
         ownership_cutoff: DateTime<Utc>,
     ) -> QueueResult<RecoveryEnqueue> {
         let request_store = QueueRequestStore::new(&self.state_dir).ok();
-        self.with_jobs_locked(|jobs| {
+        self.with_jobs_locked_strict(|jobs| {
             backfill_recovery_owner_scopes(jobs, request_store.as_ref());
             if jobs.iter().any(|queued| queued.id == job.id) {
                 return Ok(RecoveryEnqueue::Existing);
@@ -360,6 +360,16 @@ impl Queue {
     /// Return all durable jobs in queue storage order.
     pub fn get_all(&mut self) -> QueueResult<Vec<Job>> {
         self.read_jobs_locked()
+    }
+
+    /// Return all durable jobs without treating malformed queue state as empty.
+    ///
+    /// Ordinary queue inspection preserves the historical tolerant read used
+    /// for startup and status display. Recovery decisions must instead fail
+    /// closed: an unreadable live owner is not proof that work is absent.
+    pub(crate) fn get_all_strict(&mut self) -> QueueResult<Vec<Job>> {
+        let _lock = StateLock::acquire(self.state_lock_file())?;
+        self.read_jobs_from_disk_strict()
     }
 
     /// Count pending jobs.
@@ -721,6 +731,20 @@ impl Queue {
         Ok(output)
     }
 
+    /// Mutate recovery-owned queue state only after a strict read under the
+    /// same lock. This prevents a malformed payload that appears after the
+    /// recovery selection pass from being replaced as if it were empty.
+    fn with_jobs_locked_strict<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<Job>) -> QueueResult<T>,
+    ) -> QueueResult<T> {
+        let _lock = StateLock::acquire(self.state_lock_file())?;
+        let mut jobs = self.read_jobs_from_disk_strict()?;
+        let output = f(&mut jobs)?;
+        self.save_jobs_to_disk(&jobs)?;
+        Ok(output)
+    }
+
     fn read_jobs_locked(&self) -> QueueResult<Vec<Job>> {
         let _lock = StateLock::acquire(self.state_lock_file())?;
         self.read_jobs_from_disk()
@@ -734,6 +758,16 @@ impl Queue {
             Err(error) => return Err(error.into()),
         };
         Ok(parse_jobs_payload(&raw))
+    }
+
+    fn read_jobs_from_disk_strict(&self) -> QueueResult<Vec<Job>> {
+        let queue_file = self.queue_file();
+        let raw = match fs::read_to_string(&queue_file) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        parse_jobs_payload_strict(&raw)
     }
 
     fn save_jobs_to_disk(&self, jobs: &[Job]) -> QueueResult<()> {
@@ -1140,6 +1174,14 @@ fn parse_jobs_payload(raw: &str) -> Vec<Job> {
         parsed_jobs.push(parsed_job);
     }
     parsed_jobs
+}
+
+fn parse_jobs_payload_strict(raw: &str) -> QueueResult<Vec<Job>> {
+    let parsed: Value = serde_json::from_str(raw)?;
+    let jobs = parsed.get("jobs").ok_or_else(|| {
+        QueueError::StateConflict("durable queue payload is missing its jobs array".to_owned())
+    })?;
+    serde_json::from_value(jobs.clone()).map_err(QueueError::Json)
 }
 
 fn compare_pending_jobs(left: &Job, right: &Job) -> Ordering {
@@ -2115,6 +2157,27 @@ mod tests {
             let mut queue = Queue::new(temp.path()).expect("queue");
             assert_eq!(queue.pending_count().expect("pending"), 0);
         }
+    }
+
+    #[test]
+    fn strict_queue_read_distinguishes_missing_valid_and_corrupt_state() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        assert!(queue.get_all_strict().expect("missing queue").is_empty());
+
+        let expected = job("main", "abc", &["mac"]);
+        queue.enqueue(expected.clone()).expect("enqueue");
+        assert_eq!(queue.get_all_strict().expect("valid queue"), vec![expected]);
+
+        fs::write(
+            queue.queue_file(),
+            r#"{"jobs":[{"id":"truncated-live-owner"}]}"#,
+        )
+        .expect("corrupt queue");
+        assert!(matches!(
+            queue.get_all_strict(),
+            Err(super::QueueError::Json(_))
+        ));
     }
 
     #[test]
