@@ -306,7 +306,7 @@ fn apply_update<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    if !update_available && args.to.is_none() {
+    if !update_available && args.to.is_none() && args.expected_sha256.is_none() {
         // No-op fast path; --to forces install even if equal/older.
         let mut data = BTreeMap::new();
         data.insert("event".to_owned(), Value::from("noop"));
@@ -349,6 +349,7 @@ fn apply_update<W: Write>(
         install_script_url,
         target_tag,
         token,
+        args.expected_sha256.as_deref(),
         json,
     )?;
 
@@ -370,6 +371,7 @@ fn invoke_install_script(
     install_script_url: &str,
     target_tag: &str,
     token: Option<&str>,
+    expected_sha256: Option<&str>,
     json: bool,
 ) -> Result<(), CliFailure> {
     let mut curl = Command::new(curl_bin)
@@ -412,6 +414,9 @@ fn invoke_install_script(
     // authenticated (and not rate-limited) when one is available.
     if let Some(token) = token {
         sh_command.env("GITHUB_TOKEN", token);
+    }
+    if let Some(expected_sha256) = expected_sha256 {
+        sh_command.env("SHIPYARD_EXPECTED_BINARY_SHA256", expected_sha256);
     }
     let mut sh = sh_command
         .stdin(curl_stdout)
