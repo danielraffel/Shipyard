@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -240,6 +240,31 @@ pub(crate) struct GitHubCommandOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+struct CapturedCommandStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_command_capture(
+    capture: &mut File,
+    limit: Option<usize>,
+) -> std::io::Result<CapturedCommandStream> {
+    capture.seek(SeekFrom::Start(0))?;
+    let mut bytes = limit.map_or_else(Vec::new, |limit| Vec::with_capacity(limit.min(8_192)));
+    let captured_bytes = capture.metadata()?.len();
+    let truncated = limit.is_some_and(|limit| captured_bytes > limit as u64);
+    if let Some(limit) = limit {
+        capture.take(limit as u64).read_to_end(&mut bytes)?;
+    } else {
+        capture.read_to_end(&mut bytes)?;
+    }
+    Ok(CapturedCommandStream { bytes, truncated })
+}
+
+fn capture_exceeds_limit(capture: &File, limit: usize) -> std::io::Result<bool> {
+    Ok(capture.metadata()?.len() > limit as u64)
 }
 
 impl GitHubCommandOutput {
@@ -788,6 +813,38 @@ impl GitHubActions {
         args: &[String],
         timeout: Duration,
     ) -> Result<GitHubCommandOutput, GitHubError> {
+        self.run_gh_with_timeout_output_limits(args, timeout, None)
+    }
+
+    pub(crate) fn run_gh_with_timeout_bounded(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        max_stdout_bytes: usize,
+        max_stderr_bytes: usize,
+    ) -> Result<String, GitHubError> {
+        if max_stdout_bytes == 0 || max_stderr_bytes == 0 {
+            return Err(GitHubError::new(
+                "bounded gh output limits must be positive".to_owned(),
+            ));
+        }
+        let output = self.run_gh_with_timeout_output_limits(
+            args,
+            timeout,
+            Some((max_stdout_bytes, max_stderr_bytes)),
+        )?;
+        if !output.success() {
+            return Err(output.command_error(args));
+        }
+        Ok(String::from_utf8_lossy(output.stdout()).to_string())
+    }
+
+    fn run_gh_with_timeout_output_limits(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        output_limits: Option<(usize, usize)>,
+    ) -> Result<GitHubCommandOutput, GitHubError> {
         let started = Instant::now();
         let mut command = self.prepare_gh_command_with_timeout(timeout)?;
         if started.elapsed() >= timeout {
@@ -797,87 +854,93 @@ impl GitHubActions {
                 timeout.as_millis()
             )));
         }
+        let mut stdout_capture = tempfile::NamedTempFile::new().map_err(|error| {
+            GitHubError::new(format!("failed to create gh stdout capture: {error}"))
+        })?;
+        let mut stderr_capture = tempfile::NamedTempFile::new().map_err(|error| {
+            GitHubError::new(format!("failed to create gh stderr capture: {error}"))
+        })?;
         command
             .args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            // Regular-file capture cannot leave a Rust reader blocked when a
+            // detached descendant inherits stdio. Each reopened writer has an
+            // independent cursor; the retained handles below remain readable
+            // on every timeout/error path without a helper thread to join.
+            .stdout(std::process::Stdio::from(stdout_capture.reopen().map_err(
+                |error| GitHubError::new(format!("failed to open gh stdout capture: {error}")),
+            )?))
+            .stderr(std::process::Stdio::from(stderr_capture.reopen().map_err(
+                |error| GitHubError::new(format!("failed to open gh stderr capture: {error}")),
+            )?));
         let mut process_tree =
             crate::process::ProcessTree::spawn(&mut command).map_err(|error| {
                 GitHubError::new(format!("failed to run gh {}: {error}", args.join(" ")))
             })?;
-        let mut stdout = process_tree
-            .take_stdout()
-            .ok_or_else(|| GitHubError::new("failed to capture gh stdout".to_owned()))?;
-        let mut stderr = process_tree
-            .take_stderr()
-            .ok_or_else(|| GitHubError::new("failed to capture gh stderr".to_owned()))?;
-        let stdout_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).map(|_| bytes)
-        });
+        let stdout_limit = output_limits.map(|(stdout, _)| stdout);
+        let stderr_limit = output_limits.map(|(_, stderr)| stderr);
+        let mut terminal_error = None;
         let status = loop {
+            if let Some((max_stdout, max_stderr)) = output_limits {
+                let stdout_exceeded = capture_exceeds_limit(stdout_capture.as_file(), max_stdout)
+                    .map_err(|error| {
+                    GitHubError::new(format!("failed inspecting gh stdout capture: {error}"))
+                })?;
+                let stderr_exceeded = capture_exceeds_limit(stderr_capture.as_file(), max_stderr)
+                    .map_err(|error| {
+                    GitHubError::new(format!("failed inspecting gh stderr capture: {error}"))
+                })?;
+                if stdout_exceeded || stderr_exceeded {
+                    terminal_error = Some(format!(
+                        "gh {} exceeded bounded output capture (stdout limit {max_stdout} bytes, stderr limit {max_stderr} bytes)",
+                        args.join(" ")
+                    ));
+                    break None;
+                }
+            }
             match process_tree.try_wait() {
-                Ok(Some(status)) => break status,
+                Ok(Some(status)) => break Some(status),
                 Ok(None) if started.elapsed() < timeout => {
-                    std::thread::sleep(Duration::from_millis(50));
+                    let poll = if output_limits.is_some() { 10 } else { 50 };
+                    std::thread::sleep(Duration::from_millis(poll));
                 }
                 Ok(None) => {
-                    process_tree.terminate();
-                    return Err(GitHubError::new(format!(
+                    terminal_error = Some(format!(
                         "gh {} timed out after {}ms",
                         args.join(" "),
                         timeout.as_millis()
-                    )));
+                    ));
+                    break None;
                 }
                 Err(error) => {
-                    process_tree.terminate();
-                    return Err(GitHubError::new(format!(
-                        "failed waiting for gh {}: {error}",
-                        args.join(" ")
-                    )));
+                    terminal_error =
+                        Some(format!("failed waiting for gh {}: {error}", args.join(" ")));
+                    break None;
                 }
             }
         };
-        while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
-            && started.elapsed() < timeout
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
-            process_tree.terminate();
-            let drain_deadline = Instant::now() + Duration::from_millis(500);
-            while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
-                && Instant::now() < drain_deadline
-            {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+        // Reap the complete supervised tree even after the direct child exits.
+        // A process that escaped the tree may retain the regular file, but it
+        // cannot block capture reads or retain a detached Rust reader thread.
+        process_tree.terminate();
+        let stdout = read_command_capture(stdout_capture.as_file_mut(), stdout_limit)
+            .map_err(|error| GitHubError::new(format!("failed reading gh stdout: {error}")))?;
+        let stderr = read_command_capture(stderr_capture.as_file_mut(), stderr_limit)
+            .map_err(|error| GitHubError::new(format!("failed reading gh stderr: {error}")))?;
+        if stdout.truncated || stderr.truncated {
+            let (stdout_limit, stderr_limit) =
+                output_limits.expect("truncation requires configured output limits");
             return Err(GitHubError::new(format!(
-                "gh {} left output pipes open after {}ms",
-                args.join(" "),
-                timeout.as_millis()
+                "gh {} exceeded bounded output capture (stdout limit {stdout_limit} bytes, stderr limit {stderr_limit} bytes)",
+                args.join(" ")
             )));
         }
-        // The command is complete and its captured pipes are closed, but a
-        // detached descendant may have redirected stdio. Reap that tree too.
-        process_tree.terminate();
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| GitHubError::new("gh stdout reader panicked".to_owned()))?
-            .map_err(|error| GitHubError::new(format!("failed reading gh stdout: {error}")))?;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| GitHubError::new("gh stderr reader panicked".to_owned()))?
-            .map_err(|error| GitHubError::new(format!("failed reading gh stderr: {error}")))?;
+        if let Some(error) = terminal_error {
+            return Err(GitHubError::new(error));
+        }
         Ok(GitHubCommandOutput {
-            status,
-            stdout,
-            stderr,
+            status: status.expect("successful wait has a process status"),
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
         })
     }
 

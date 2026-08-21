@@ -33,6 +33,37 @@ pub(super) struct AutoMergeRequest {
     pub(super) pr_snapshot_file: Option<PathBuf>,
     pub(super) merge_command: Option<PathBuf>,
     pub(super) merge_result: Option<MergeResult>,
+    /// Exact validation identity whose completed proof authorized this merge
+    /// phase. Standalone `auto-merge` calls intentionally leave this absent;
+    /// `ship` always supplies its captured terminal state so a later same-PR
+    /// submission cannot redirect the old job's merge authority.
+    pub(super) expected_validation: Option<ValidatedShipIdentity>,
+}
+
+/// Immutable part of a ship-state that binds validation proof to merge
+/// authority. Queue timestamps and evidence may advance during stewardship;
+/// these fields may not change without a new validation request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ValidatedShipIdentity {
+    repo: String,
+    pr: u64,
+    branch: String,
+    base_branch: String,
+    head_sha: String,
+    policy_signature: String,
+}
+
+impl From<&ShipState> for ValidatedShipIdentity {
+    fn from(state: &ShipState) -> Self {
+        Self {
+            repo: state.repo.clone(),
+            pr: state.pr,
+            branch: state.branch.clone(),
+            base_branch: state.base_branch.clone(),
+            head_sha: state.head_sha.clone(),
+            policy_signature: state.policy_signature.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +90,11 @@ pub(super) enum AutoMergeOutcome {
     SupersededSha {
         validated: String,
         current: String,
+    },
+    /// A newer same-PR submission replaced a completed validation identity
+    /// without necessarily changing the head SHA. No merge mutation ran.
+    ValidationIdentityMismatch {
+        detail: String,
     },
     Merged {
         cleanup_warning: Option<String>,
@@ -114,6 +150,13 @@ pub(super) fn execute_auto_merge(
     let Some(mut state) = store.get_locked_scoped(&discovered.repo, request.pr, &lock) else {
         return Ok(AutoMergeOutcome::PrNotFound);
     };
+    if let Some(outcome) = request
+        .expected_validation
+        .as_ref()
+        .and_then(|expected| validation_identity_mismatch(expected, &state))
+    {
+        return Ok(outcome);
+    }
 
     match ship_terminal_verdict(&state) {
         None => Ok(AutoMergeOutcome::InFlight {
@@ -173,6 +216,42 @@ pub(super) fn execute_auto_merge(
             Ok(AutoMergeOutcome::Merged { cleanup_warning })
         }
     }
+}
+
+fn validation_identity_mismatch(
+    expected: &ValidatedShipIdentity,
+    current: &ShipState,
+) -> Option<AutoMergeOutcome> {
+    let mut changed = Vec::new();
+    if !expected.repo.eq_ignore_ascii_case(&current.repo) {
+        changed.push("repository");
+    }
+    if expected.pr != current.pr {
+        changed.push("pull-request number");
+    }
+    if expected.branch != current.branch {
+        changed.push("head branch");
+    }
+    if expected.base_branch != current.base_branch {
+        changed.push("base branch");
+    }
+    if !shas_match(&expected.head_sha, &current.head_sha) {
+        changed.push("head SHA");
+    }
+    if expected.policy_signature != current.policy_signature {
+        changed.push("validation policy");
+    }
+    (!changed.is_empty()).then(|| AutoMergeOutcome::ValidationIdentityMismatch {
+        detail: format!(
+            "completed validation identity for PR #{} was replaced before merge ({changed}); refusing stale merge authority",
+            expected.pr,
+            changed = changed.join(", ")
+        ),
+    })
+}
+
+fn same_validation_identity(left: &ShipState, right: &ShipState) -> bool {
+    validation_identity_mismatch(&ValidatedShipIdentity::from(left), right).is_none()
 }
 
 /// Bind validated evidence to the live PR head and target immediately before
@@ -272,6 +351,7 @@ pub(super) fn auto_merge<W: Write>(
         pr_snapshot_file,
         merge_command,
         merge_result,
+        expected_validation: None,
     };
     let outcome = execute_auto_merge(store, cwd, &request)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -354,6 +434,15 @@ fn render_auto_merge_outcome<W: Write>(
                     ("validated", Value::from(validated)),
                     ("current", Value::from(current)),
                 ]),
+            )?;
+            Ok(ExitCode::from(1))
+        }
+        AutoMergeOutcome::ValidationIdentityMismatch { detail } => {
+            render_event(
+                stdout,
+                json,
+                "validation-identity-mismatch",
+                fields([("pr", Value::from(pr)), ("detail", Value::from(detail))]),
             )?;
             Ok(ExitCode::from(1))
         }
@@ -1053,6 +1142,7 @@ pub(super) fn supervise_merge_queue(
     global_dir: &Path,
     pr: u64,
     delete_branch: bool,
+    expected_validation: Option<&ValidatedShipIdentity>,
 ) -> AutoMergeOutcome {
     let repository = super::branch_cmd::detect_repo_from_remote(cwd, None);
     let Some(mut state) = repository.as_ref().map_or_else(
@@ -1061,6 +1151,11 @@ pub(super) fn supervise_merge_queue(
     ) else {
         return AutoMergeOutcome::PrNotFound;
     };
+    if let Some(outcome) =
+        expected_validation.and_then(|expected| validation_identity_mismatch(expected, &state))
+    {
+        return outcome;
+    }
     let Ok(client) = gh_client(cwd) else {
         return AutoMergeOutcome::MergeFailed {
             error: "github auth config failed while supervising merge queue".to_owned(),
@@ -1075,6 +1170,18 @@ pub(super) fn supervise_merge_queue(
     let mut consecutive_errors = 0_u32;
 
     while started.elapsed() < QUEUE_WAIT_TIMEOUT {
+        if let Some(expected) = expected_validation {
+            let current = repository.as_ref().map_or_else(
+                || store.get(pr),
+                |repository| store.get_scoped(repository, pr),
+            );
+            let Some(current) = current else {
+                return AutoMergeOutcome::PrNotFound;
+            };
+            if let Some(outcome) = validation_identity_mismatch(expected, &current) {
+                return outcome;
+            }
+        }
         match fetch_queue_poll_pages(&client, cwd, &state) {
             Ok(pages) => {
                 let Some(body) = pages.first() else {
@@ -1481,7 +1588,7 @@ fn update_queue_state_if_current(
     let Some(mut current) = store.get_locked_scoped(&local.repo, local.pr, &lock) else {
         return Err("active ship-state disappeared".to_owned());
     };
-    if !shas_match(&current.head_sha, &local.head_sha)
+    if !same_validation_identity(&current, local)
         || current.merge_queue_attempt_started_at != expected_attempt
     {
         return Err(format!(
@@ -1541,7 +1648,7 @@ fn archive_queue_state_if_current(
     let Some(current) = store.get_locked_scoped(&local.repo, local.pr, &lock) else {
         return Err("active ship-state disappeared".to_owned());
     };
-    if !shas_match(&current.head_sha, &local.head_sha)
+    if !same_validation_identity(&current, local)
         || current.merge_queue_attempt_started_at != expected_attempt
     {
         return Err(format!(
@@ -1570,7 +1677,7 @@ fn with_current_queue_state_locked<T>(
     let Some(current) = store.get_locked_scoped(&local.repo, local.pr, &lock) else {
         return Ok(None);
     };
-    if !shas_match(&current.head_sha, &local.head_sha)
+    if !same_validation_identity(&current, local)
         || current.merge_queue_attempt_started_at != expected_attempt
     {
         return Ok(None);
@@ -2521,6 +2628,11 @@ fn render_event<W: Write>(
                 short_sha(current)
             )
         }
+        "validation-identity-mismatch" => writeln!(
+            stdout,
+            "PR #{pr}: {}",
+            data.get("detail").and_then(Value::as_str).unwrap_or("")
+        ),
         "merged" => {
             if let Some(warning) = data.get("cleanup_warning").and_then(Value::as_str) {
                 writeln!(stdout, "PR #{pr}: merged. Cleanup warning: {warning}")
@@ -2543,6 +2655,54 @@ fn fields(items: impl IntoIterator<Item = (&'static str, Value)>) -> BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_validation_cannot_merge_replacement_same_head_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let head = "a".repeat(40);
+        let mut completed =
+            ShipState::new(7751, "owner/repo", "feature/a", "main", &head, "policy-a");
+        completed.update_evidence("local", "pass");
+
+        // Job B reused the PR and exact head but changed its validation policy
+        // after job A captured its terminal proof. Without the request-bound
+        // identity guard, A's synthetic successful merge archives B's state.
+        let mut replacement = completed.clone();
+        replacement.policy_signature = "policy-b".to_owned();
+        replacement.touch();
+        store.save(&replacement).expect("replacement state");
+        let request = AutoMergeRequest {
+            mode: RuntimeMode::Isolated,
+            global_dir: temp.path().join("global"),
+            pr: 7751,
+            merge_method: MergeMethod::Squash,
+            delete_branch: true,
+            admin: false,
+            pr_snapshot_file: None,
+            merge_command: None,
+            merge_result: Some(MergeResult::Success),
+            expected_validation: Some(ValidatedShipIdentity::from(&completed)),
+        };
+
+        let outcome = execute_auto_merge(&store, temp.path(), &request).expect("merge phase");
+        assert!(matches!(
+            outcome,
+            AutoMergeOutcome::ValidationIdentityMismatch { ref detail }
+                if detail.contains("validation policy")
+        ));
+        assert_eq!(
+            store
+                .get_scoped("owner/repo", 7751)
+                .expect("replacement remains active")
+                .policy_signature,
+            "policy-b"
+        );
+        assert!(
+            store.list_archived().is_empty(),
+            "stale post-validation work must not archive the replacement state"
+        );
+    }
 
     // ── merge-queue poll query shape ────────────────────────────────────
 

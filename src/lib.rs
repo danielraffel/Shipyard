@@ -105,6 +105,8 @@ pub mod queue_request;
 pub mod queue_scheduler;
 /// Best-effort reconciliation of durable ship-state against GitHub truth.
 pub mod reconcile;
+/// Durable, fail-closed requests for bounded model-assisted recovery.
+pub mod recovery_worker;
 /// GitHub webhook registration through the user's existing `gh` auth.
 pub mod registrar;
 /// Shared parsing for classic and ruleset required-check policies.

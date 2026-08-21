@@ -28,6 +28,7 @@ fn mutation_control(temp: &tempfile::TempDir, authority: &str, machine: &str) ->
         cwd: temp.path().to_path_buf(),
         mode: RuntimeMode::Shipyard,
         global_dir,
+        state_dir,
     }
 }
 
@@ -151,3 +152,5 @@ mod admission;
 mod capacity;
 mod mutations;
 mod observation;
+#[cfg(unix)]
+mod recovery;

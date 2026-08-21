@@ -5,6 +5,8 @@
 //! the warm-pool and durable execution logic so executor wiring can
 //! reuse it without embedding policy decisions in CLI code.
 
+mod validation_outcome;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -36,17 +38,18 @@ use crate::job::{
 use crate::queue::{Queue, QueueDeferredRequeue, QueueError, STALE_RUNNING_CANCEL_REASON};
 use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
-    QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner,
+    QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner, QueuedShipDisposition,
 };
 use crate::queue_scheduler::{
     VmSlotCapacity, apply_admit_pass_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
 };
-use crate::ship_state::{
-    DispatchedRun, ShipState, ShipStatePrLock, ShipStateStore, compute_policy_signature,
-};
+use crate::ship_state::{DispatchedRun, ShipState, ShipStatePrLock, ShipStateStore};
 use crate::warm_pool::{
     PoolEntry, WarmPool, compute_expires_at, default_pool_path, is_backend_eligible, warm_host_key,
 };
+
+use validation_outcome::{persist_recovered_outcomes, policy_signature};
+pub(crate) use validation_outcome::{persist_terminal_outcome, validation_proof_state};
 
 const RESUME_ORDER: [&str; 4] = ["setup", "configure", "build", "test"];
 const WARM_DEFAULT_RESUME_FROM: &str = "configure";
@@ -166,6 +169,8 @@ pub struct ShipExecutionOutcome {
     pub ship_state: ShipState,
     /// Whether an existing compatible state was reused.
     pub resumed_existing_state: bool,
+    /// Durable merge-readiness result kept separate from validation proof.
+    pub post_validation: Option<QueuedShipDisposition>,
 }
 
 /// Outcome of one `shipyard run` execution.
@@ -508,6 +513,7 @@ pub fn load_ship_outcome(
     let QueuedExecutionOutcome::Ship {
         ship_state,
         resumed_existing_state,
+        post_validation,
         ..
     } = outcome
     else {
@@ -523,6 +529,7 @@ pub fn load_ship_outcome(
         job,
         ship_state,
         resumed_existing_state,
+        post_validation,
     })
 }
 
@@ -661,6 +668,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
             job: cancelled,
             ship_state: unsaved_ship_state(request, &job.target_names),
             resumed_existing_state: false,
+            post_validation: None,
         });
     }
     let ship_state_lock = ship_state
@@ -723,6 +731,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
             job,
             ship_state: state,
             resumed_existing_state,
+            post_validation: None,
         });
     }
     job = job.complete()?;
@@ -750,6 +759,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         job,
         ship_state: state,
         resumed_existing_state,
+        post_validation: None,
     })
 }
 
@@ -1517,55 +1527,6 @@ fn sweep_absent_queue_envelopes(
     Ok(())
 }
 
-fn persist_recovered_outcomes(
-    recovered: &[Job],
-    state_dir: &Path,
-    ship_state: &ShipStateStore,
-) -> Result<(), ShipExecutionError> {
-    if recovered.is_empty() {
-        return Ok(());
-    }
-    let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
-    let outcome_store = QueueOutcomeStore::new(state_dir).map_err(QueueRequestError::from)?;
-    for job in recovered {
-        let Some(envelope) = request_store.load(&job.id)? else {
-            continue;
-        };
-        match envelope.kind {
-            QueuedExecutionKind::Run => {
-                outcome_store.save(&QueuedExecutionOutcome::run(job.id.clone()))?;
-            }
-            QueuedExecutionKind::Ship => {
-                let request = envelope.to_ship_request()?;
-                let existing = ship_state.get_scoped(&request.repo, request.pr);
-                let resumed_existing_state = existing.is_some();
-                let state =
-                    existing.unwrap_or_else(|| unsaved_ship_state(&request, &job.target_names));
-                outcome_store.save(&QueuedExecutionOutcome::ship(
-                    job.id.clone(),
-                    request.pr,
-                    state,
-                    resumed_existing_state,
-                ))?;
-            }
-        }
-        Queue::new(state_dir)
-            .map_err(QueueError::from)?
-            .publish_terminal_manifest_if_current(job)?;
-    }
-    Ok(())
-}
-
-/// Persist the kind-specific durable outcome for one terminal queue job.
-pub(crate) fn persist_terminal_outcome(
-    job: &Job,
-    state_dir: &Path,
-) -> Result<(), ShipExecutionError> {
-    let ship_state = ShipStateStore::new(state_dir.join("ship"))
-        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
-    persist_recovered_outcomes(std::slice::from_ref(job), state_dir, &ship_state)
-}
-
 fn cap_admit_pass_workers(
     jobs: &[Job],
     pass: &mut crate::queue_scheduler::RequestBackedAdmitPass,
@@ -1890,6 +1851,7 @@ fn terminal_ship_outcome(
                 job,
                 ship_state: unsaved_ship_state(request, &target_names(&request.targets)),
                 resumed_existing_state: false,
+                post_validation: None,
             }))
         }
         JobStatus::Completed => load_ship_outcome(queue, state_dir, job_id).map(Some),
@@ -2387,25 +2349,6 @@ fn validate_existing_state(
         });
     }
     Ok(())
-}
-
-fn policy_signature(
-    targets: &[ResolvedTarget],
-    target_names: &[String],
-    mode: ValidationMode,
-) -> String {
-    let platforms = targets
-        .iter()
-        .map(|target| target.platform.clone())
-        .collect::<Vec<_>>();
-    compute_policy_signature(&platforms, target_names, policy_mode_label(mode))
-}
-
-fn policy_mode_label(mode: ValidationMode) -> &'static str {
-    match mode {
-        ValidationMode::Full => "FULL",
-        ValidationMode::Smoke => "SMOKE",
-    }
 }
 
 fn target_names(targets: &[ResolvedTarget]) -> Vec<String> {

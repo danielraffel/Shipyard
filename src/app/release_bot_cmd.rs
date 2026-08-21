@@ -1121,6 +1121,7 @@ fn push_via_pr(
         pr_snapshot_file: None,
         merge_command: None,
         merge_result: None,
+        expected_validation: None,
     };
     supervise_release_bot_admission(&store, cwd, &request)
 }

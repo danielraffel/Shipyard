@@ -9,6 +9,9 @@ use crate::required_check_policy::{
     evaluated_required_checks as parse_evaluated_required_checks, normalize_required_checks,
 };
 
+const BOUNDED_GH_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const BOUNDED_GH_STDERR_BYTES: usize = 64 * 1024;
+
 pub(super) fn resolve_repos(mut repos: Vec<String>, cwd: &Path) -> Result<Vec<String>, CliFailure> {
     if repos.is_empty() {
         repos.push(super::super::runner_cmd::resolve_repo_slug(None, cwd)?);
@@ -129,6 +132,40 @@ pub(super) fn gh_json_timeout(
         .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
 }
 
+pub(super) fn gh_json_before(
+    actions: &GitHubActions,
+    args: &[String],
+    purpose: &str,
+    deadline: Instant,
+) -> Result<Value, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("{purpose} exceeded its bounded deadline"));
+    }
+    let raw = actions
+        .run_gh_with_timeout_bounded(
+            args,
+            remaining,
+            BOUNDED_GH_STDOUT_BYTES,
+            BOUNDED_GH_STDERR_BYTES,
+        )
+        .map_err(|error| format!("{purpose} failed: {error}"))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("{purpose} returned malformed JSON: {error}"))
+}
+
+fn gh_json_with_deadline(
+    actions: &GitHubActions,
+    args: &[String],
+    purpose: &str,
+    deadline: Option<Instant>,
+) -> Result<Value, String> {
+    deadline.map_or_else(
+        || gh_json(actions, args, purpose),
+        |deadline| gh_json_before(actions, args, purpose, deadline),
+    )
+}
+
 #[cfg(all(test, unix))]
 pub(super) fn required_checks(
     actions: &GitHubActions,
@@ -201,6 +238,24 @@ pub(super) fn merge_queue_snapshot(
     repo: &str,
     base: &str,
 ) -> Result<MergeQueueSnapshot, String> {
+    merge_queue_snapshot_with_deadline(actions, repo, base, None)
+}
+
+pub(super) fn merge_queue_snapshot_before(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    deadline: Instant,
+) -> Result<MergeQueueSnapshot, String> {
+    merge_queue_snapshot_with_deadline(actions, repo, base, Some(deadline))
+}
+
+fn merge_queue_snapshot_with_deadline(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    deadline: Option<Instant>,
+) -> Result<MergeQueueSnapshot, String> {
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
@@ -217,7 +272,7 @@ pub(super) fn merge_queue_snapshot(
         "-F".to_owned(),
         format!("branch={base}"),
     ];
-    let value = match gh_json(actions, &args, "merge-queue policy") {
+    let value = match gh_json_with_deadline(actions, &args, "merge-queue policy", deadline) {
         Ok(value) => value,
         Err(error) if is_private_free_entitlement(&error) => {
             return Ok((false, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()));
@@ -427,10 +482,36 @@ pub(super) fn hydrate_required_check_identities(
     required_checks: &[RequiredCheck],
     prs: &mut [ObservedPr],
 ) -> Result<(), String> {
+    hydrate_required_check_identities_with_deadline(actions, repo, required_checks, prs, None)
+}
+
+pub(super) fn hydrate_required_check_identities_before(
+    actions: &GitHubActions,
+    repo: &str,
+    required_checks: &[RequiredCheck],
+    prs: &mut [ObservedPr],
+    deadline: Instant,
+) -> Result<(), String> {
+    hydrate_required_check_identities_with_deadline(
+        actions,
+        repo,
+        required_checks,
+        prs,
+        Some(deadline),
+    )
+}
+
+fn hydrate_required_check_identities_with_deadline(
+    actions: &GitHubActions,
+    repo: &str,
+    required_checks: &[RequiredCheck],
+    prs: &mut [ObservedPr],
+    deadline: Option<Instant>,
+) -> Result<(), String> {
     if !required_checks.iter().any(|check| check.app_id.is_some()) {
         for pr in prs {
             if pr.check_rollup_maybe_truncated {
-                hydrate_complete_head_checks(actions, repo, pr)?;
+                hydrate_complete_head_checks(actions, repo, pr, deadline)?;
             }
         }
         return Ok(());
@@ -440,11 +521,14 @@ pub(super) fn hydrate_required_check_identities(
             continue;
         }
         if pr.check_rollup_maybe_truncated {
-            hydrate_complete_head_checks(actions, repo, pr)?;
+            hydrate_complete_head_checks(actions, repo, pr, deadline)?;
         } else {
-            pr.fact
-                .checks
-                .extend(check_runs_for_head(actions, repo, &pr.fact.head_sha)?);
+            pr.fact.checks.extend(check_runs_for_head_with_deadline(
+                actions,
+                repo,
+                &pr.fact.head_sha,
+                deadline,
+            )?);
         }
     }
     Ok(())
@@ -454,31 +538,48 @@ fn hydrate_complete_head_checks(
     actions: &GitHubActions,
     repo: &str,
     pr: &mut ObservedPr,
+    deadline: Option<Instant>,
 ) -> Result<(), String> {
     if !is_full_sha(&pr.fact.head_sha) {
         return Ok(());
     }
-    let mut checks = check_runs_for_head(actions, repo, &pr.fact.head_sha)?;
-    checks.extend(commit_statuses_for_head(actions, repo, &pr.fact.head_sha)?);
+    let mut checks = check_runs_for_head_with_deadline(actions, repo, &pr.fact.head_sha, deadline)?;
+    checks.extend(commit_statuses_for_head_with_deadline(
+        actions,
+        repo,
+        &pr.fact.head_sha,
+        deadline,
+    )?);
     pr.fact.checks = checks;
     pr.check_rollup_maybe_truncated = false;
     Ok(())
 }
 
+#[cfg(all(test, unix))]
 pub(super) fn check_runs_for_head(
     actions: &GitHubActions,
     repo: &str,
     head_sha: &str,
 ) -> Result<Vec<StewardCheck>, String> {
+    check_runs_for_head_with_deadline(actions, repo, head_sha, None)
+}
+
+fn check_runs_for_head_with_deadline(
+    actions: &GitHubActions,
+    repo: &str,
+    head_sha: &str,
+    deadline: Option<Instant>,
+) -> Result<Vec<StewardCheck>, String> {
     let mut checks = Vec::new();
     for page in 1..=10 {
-        let value = gh_json(
+        let value = gh_json_with_deadline(
             actions,
             &[
                 "api".to_owned(),
                 format!("repos/{repo}/commits/{head_sha}/check-runs?per_page=100&page={page}"),
             ],
             "current-head check identities",
+            deadline,
         )?;
         let rows = value
             .get("check_runs")
@@ -493,20 +594,22 @@ pub(super) fn check_runs_for_head(
     Err("current-head check runs exceed 1000; refusing partial identity scan".to_owned())
 }
 
-pub(super) fn commit_statuses_for_head(
+fn commit_statuses_for_head_with_deadline(
     actions: &GitHubActions,
     repo: &str,
     head_sha: &str,
+    deadline: Option<Instant>,
 ) -> Result<Vec<StewardCheck>, String> {
     let mut checks = Vec::new();
     for page in 1..=10 {
-        let value = gh_json(
+        let value = gh_json_with_deadline(
             actions,
             &[
                 "api".to_owned(),
                 format!("repos/{repo}/commits/{head_sha}/statuses?per_page=100&page={page}"),
             ],
             "current-head commit statuses",
+            deadline,
         )?;
         let rows = value
             .as_array()

@@ -841,6 +841,30 @@ signals recovery for them. A managed semantic blocker receives one deduplicated
 `shipyard:needs-agent` label plus failed `shipyard/steward-recovery` status;
 healthy deterministic progress clears the signal. This lets a cheap recovery
 agent handle exceptions without spending model tokens on polling.
+
+For phase-1 automated triage, run `shipyard runner recovery-worker` to inspect
+and revalidate one durable pending request's target base, exact head, and
+complete failed-required-check set or recorded merge state, or add `--apply` to launch its single
+bounded worker attempt. `--drain --apply` handles only a bounded initial
+snapshot. Apply-mode pre-claim failures preserve the unused attempt but
+durably rotate behind untouched pending work, so one unavailable repository
+cannot starve the queue. The policy comes exclusively from trusted
+machine-global `[merge_steward.recovery_worker]`; Shipyard constructs the exact
+fail-closed `codex exec` read-only/ephemeral argv, defaults to
+`gpt-5.3-codex-spark`, disables tool surfaces, receives request JSON on stdin,
+and runs from scratch with an empty, minimal allow-listed environment.
+Alternate runtime modes and global/state path overrides are rejected so the
+policy and one-attempt ledger cannot split.
+Outputs are strict JSON and remain advisory. Phase 1 rejects repair and
+`no_change` verdicts, evidence, paths, and test suggestions; every accepted
+result explicitly escalates, with classification used only for routing. A
+global lease, overall deadline, and pre/post policy-evidence witnesses prevent
+parallel calls and stale authorization. This phase cannot edit, rerun, enqueue,
+merge, or release; quota/provider failures become typed terminal failures
+rather than blocking unrelated stewardship.
+See [references/merge-steward.md](references/merge-steward.md) for the config,
+schema, limits, and exact authority boundary.
+
 The preferred unattended credential has Commit statuses and Issues read/write.
 A local read-oriented GitHub App that receives the exact integration-permission
 403 falls back, with a visible warning, to ambient `gh` for these low-volume
@@ -1118,7 +1142,7 @@ from a snapshot or a fresh `gh`/REST read) and compares it with
 `shas_match` against the `state.head_sha` Shipyard actually validated.
 If they differ, it returns `AutoMergeOutcome::SupersededSha { validated,
 current }` and **refuses to merge** rather than landing a SHA whose
-green evidence is stale — `ship_cmd`'s `post_run_merge_state` maps that
+green evidence is stale — `ship_cmd::post_validation::post_run_merge_state` maps that
 outcome to `GreenNotMerged`. This is fail-closed: if the live head
 cannot be read, the preflight does not assume safety. It is a belt-and-
 suspenders layer in front of the server-side `--match-head-commit`/`sha=`
@@ -1155,7 +1179,8 @@ to name one real field.
 
 **Never let a client defect render as a PR problem.**
 `is_graphql_malformed_query_error` classifies malformed-document stderr, and
-`post_run_merge_state` routes it to `ShipRenderState::GreenNotMergedClientDefect`
+`ship_cmd::post_validation::post_run_merge_state` routes it to
+`ShipRenderState::GreenNotMergedClientDefect`
 *before* any PR-inspecting classification runs. That state renders a diagnostic
 naming Shipyard as the fault, reports `status:"green_not_merged_client_defect"`
 in `--json`, and exits `8` — distinct from `1` (validation genuinely failed) and
@@ -1166,13 +1191,24 @@ never lose their branch-protection guidance. Extend
 "must NOT match" test cases — a false positive would tell an operator to report a
 Shipyard bug when their PR really was blocked.
 
+**Never convert passed validation into failed merge readiness.** Once the
+queued validation job is complete and passed, a later `InFlight` or
+`TargetFailed` merge-readiness observation is `green_pending_merge_readiness`,
+not a worker failure. The completed target
+results remain immutable pass evidence, deterministic stewardship owns the
+readiness transition, and the operator should use
+`shipyard wait pr <N> --state green` rather than rerun validation.
+`PrNotFound` instead means the durable scoped ship state is missing: report
+`green_validation_state_missing` with exit `9`, preserve the validation proof,
+forbid an automatic rerun, and recover state before waiting or merging.
+
 ### Flaky-required-leg wedge → rescue hand-off (`auto_rescue`)
 
 When Shipyard validated every target green but `gh pr merge` is *rejected*
 (`post_run_merge_state` sees `AutoMergeOutcome::MergeFailed`), the usual cause
 is a GitHub branch-protection **required check that is RED on the exact SHA
 Shipyard just validated** — a *flaky* required leg, not a real regression.
-`classify_merge_failure` (`src/app/ship_cmd.rs`, backed by the pure
+`classify_merge_failure` (`src/app/ship_cmd/post_validation.rs`, backed by the pure
 `auto_rescue::classify_wedge`) decides whether that's the case and, if so,
 renders `GreenNotMergedFlakyRequired` — a hand-back that hands the operator the
 one-liner `shipyard rescue <PR> --rerun-failed` instead of the generic message.

@@ -96,6 +96,9 @@ shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
 shipyard runner steward --apply                     # exact-head, green-gated mutations
 shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
+shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
+shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
+shipyard runner recovery-worker --drain --apply     # process one bounded pending snapshot (maximum 32)
 
 # On the protected base branch, make every `shipyard pr` submission durable
 # immediately after PR creation. A PR branch cannot opt itself in.
@@ -127,6 +130,82 @@ Accepted capacity cancellations remain in the handoff ledger until an exact
 run/job read proves terminal; each apply pass resumes those records with an
 exact-run force-cancel before planning new work. Read failures keep the record
 pending and make the pass unhealthy. Dry-run does not require mutation
+authority.
+
+`runner recovery-worker` consumes the steward's durable semantic-blocker
+requests. It is phase-1 **read-only triage**: even with `--apply`, the worker
+cannot push, edit GitHub state, rerun checks, enqueue, merge, sign, publish, or
+release. Without `--apply`, it only inspects pending records and revalidates
+their target base, immutable PR head, and complete failed-required-check set or
+recorded merge state. Each request carries the complete structured
+required-check policy, so a newly failed required check supersedes same-head
+work while advisory failures remain irrelevant. No model process starts.
+Requests retain a base/evidence/policy-bound identity,
+while the attempt gate is stricter: a repository/PR/exact-head tuple receives
+at most one model call even if normalized evidence changes. A retarget, newer
+head, recovered check, or changed merge state supersedes the old request
+instead of spending an attempt on stale evidence.
+An apply-mode repository or GitHub preflight error remains pending without
+spending the attempt, but is durably moved behind untouched pending work so a
+persistently unavailable repository cannot block the machine-global queue.
+Required-check policy entries and failure facts store the literal context and
+optional GitHub App ID as separate fields, so display-like text cannot change
+producer identity. Clearing the deterministic recovery signal supersedes
+active receipts and removes only the matching exact-head witness under the same
+lease used by final worker completion; a newer-head witness published during
+the GitHub-operation gap remains intact.
+
+Worker policy is loaded only from the trusted machine-global `config.toml`
+reported by `shipyard paths`; project config and checkout-local overlays cannot
+enable or redirect it. Alternate runtime modes and `--global-dir`/`--state-dir`
+overrides are rejected so neither policy nor the one-attempt ledger can fork.
+Example:
+
+```toml
+[merge_steward.recovery_worker]
+enabled = true
+provider = "codex"
+codex_binary = "/Users/you/.local/bin/codex"
+codex_home = "/Users/you/.codex"
+# Optional; this is also the built-in default.
+first_line_model = "gpt-5.3-codex-spark"
+timeout_seconds = 120          # hard maximum: 300
+max_attempts_per_head = 1      # phase 1 permits exactly one
+max_log_tail_bytes = 16384     # hard maximum: 65536
+allowed_repositories = [
+  "Generous-Corp/pulp",
+  "Generous-Corp/forge",
+  "Generous-Corp/vellum",
+]
+
+[merge_steward.recovery_worker.repo_paths]
+"Generous-Corp/pulp" = "/Volumes/Workshop/Code/pulp"
+"Generous-Corp/forge" = "/Volumes/Workshop/Code/forge"
+"Generous-Corp/vellum" = "/Volumes/Workshop/Code/vellum"
+```
+
+The model command is not configurable. Shipyard constructs the complete
+ephemeral/read-only `codex exec` argv, disables Codex shell, browser, app, MCP,
+computer-use, image, and search tool surfaces, and delivers the request only on
+stdin. The child runs from isolated scratch rather than the mapped repository,
+ignores user/project rules, and starts after `env_clear` with only explicit
+`CODEX_HOME`, scratch-local `HOME`/`TMPDIR`, a minimal `PATH`, and the Windows
+system root where required. GitHub preflights, the model, and final validation
+share one overall deadline; stdout/stderr and durable failure details are
+bounded. Each provenance read scans at most four explicit 100-status pages. A
+machine-global file lease permits one model invocation at a time.
+Shipyard accepts only the strict versioned JSON result
+documented in
+[the merge-steward reference](../skills/shipyard/references/merge-steward.md).
+Phase 1 is escalation routing only: `bounded_repair`, `no_change`, evidence,
+candidate paths, and focused tests are rejected. Every accepted result
+explicitly escalates; category and confidence are routing metadata only.
+This universal rule does not rely on check names to infer protected paths, so
+generic check labels cannot downgrade agent-instruction, workflow/CI, signing,
+release, environment, credential, or other high-risk changes.
+Current deterministic evidence and steward-policy witnesses are checked before
+claim and after model output; pending same-head drift supersedes and replaces
+stale work. Failures do not block unrelated stewardship or grant model
 authority.
 
 # Self-hosted runner provisioning (register / list / remove on this machine)
