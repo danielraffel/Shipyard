@@ -78,6 +78,15 @@ pub enum RegistrarError {
     },
     /// GitHub CLI returned a successful response without a hook ID.
     MissingHookId(String),
+    /// Multiple server-side hooks already target the requested callback URL.
+    AmbiguousExistingHooks {
+        /// Repository whose hook list was ambiguous.
+        repo: String,
+        /// Callback URL shared by the duplicate hooks.
+        url: String,
+        /// Matching server-side hook identifiers.
+        hook_ids: Vec<u64>,
+    },
     /// Persisted registration state could not be serialized or parsed.
     Json(serde_json::Error),
 }
@@ -112,6 +121,14 @@ impl std::fmt::Display for RegistrarError {
                     output.trim()
                 )
             }
+            Self::AmbiguousExistingHooks {
+                repo,
+                url,
+                hook_ids,
+            } => write!(
+                formatter,
+                "refusing to adopt duplicate webhooks for {repo} at {url}: {hook_ids:?}"
+            ),
             Self::Json(error) => write!(formatter, "{error}"),
         }
     }
@@ -231,6 +248,16 @@ impl Registrar {
     ) -> Result<u64, RegistrarError> {
         if let Some(hook_id) = self.by_repo.get(repo).copied() {
             update_hook(client, &self.cwd, gh_binary, repo, hook_id, url, secret)?;
+            return Ok(hook_id);
+        }
+
+        if let Some(hook_id) = find_existing_hook(client, &self.cwd, gh_binary, repo, url)? {
+            // The server-side hook is authoritative. Adopt and rotate it when
+            // recoverable local registration state was lost instead of
+            // retrying GitHub's "Hook already exists" failure forever.
+            update_hook(client, &self.cwd, gh_binary, repo, hook_id, url, secret)?;
+            self.by_repo.insert(repo.to_owned(), hook_id);
+            self.save()?;
             return Ok(hook_id);
         }
 
@@ -388,6 +415,42 @@ fn create_hook(
         .ok_or(RegistrarError::MissingHookId(output.stdout))
 }
 
+fn find_existing_hook(
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
+    repo: &str,
+    url: &str,
+) -> Result<Option<u64>, RegistrarError> {
+    let endpoint = format!("repos/{repo}/hooks?per_page=100");
+    let output = run_gh(client, cwd, gh_binary, &["api", &endpoint], None)?;
+    if output.status != 0 {
+        return Err(classify_gh_failure("list", output.combined_output()));
+    }
+    let hooks = serde_json::from_str::<Vec<serde_json::Value>>(&output.stdout)
+        .map_err(|_| RegistrarError::MissingHookId(output.stdout.clone()))?;
+    let mut matching = hooks
+        .iter()
+        .filter(|hook| {
+            hook.pointer("/config/url")
+                .and_then(serde_json::Value::as_str)
+                == Some(url)
+        })
+        .filter_map(|hook| hook.get("id").and_then(serde_json::Value::as_u64))
+        .collect::<Vec<_>>();
+    matching.sort_unstable();
+    matching.dedup();
+    match matching.as_slice() {
+        [] => Ok(None),
+        [hook_id] => Ok(Some(*hook_id)),
+        _ => Err(RegistrarError::AmbiguousExistingHooks {
+            repo: repo.to_owned(),
+            url: url.to_owned(),
+            hook_ids: matching,
+        }),
+    }
+}
+
 fn update_hook(
     client: &GhClient,
     cwd: &Path,
@@ -405,6 +468,7 @@ fn update_hook(
             "insecure_ssl": "0",
         },
         "active": true,
+        "events": SUBSCRIBED_EVENTS,
     });
     let output = run_gh(
         client,
@@ -680,12 +744,14 @@ mod tests {
             .expect("delete");
         assert!(reloaded.all().is_empty());
 
-        let first_args = read_log(temp.path(), "args-1");
-        let first_body = read_json_log(temp.path(), "stdin-1");
-        let second_args = read_log(temp.path(), "args-2");
-        let second_body = read_json_log(temp.path(), "stdin-2");
-        let third_args = read_log(temp.path(), "args-3");
+        let list_args = read_log(temp.path(), "args-1");
+        let first_args = read_log(temp.path(), "args-2");
+        let first_body = read_json_log(temp.path(), "stdin-2");
+        let second_args = read_log(temp.path(), "args-3");
+        let second_body = read_json_log(temp.path(), "stdin-3");
+        let third_args = read_log(temp.path(), "args-4");
 
+        assert!(list_args.contains("repos/owner/repo/hooks?per_page=100"));
         assert!(first_args.contains("-X POST"));
         assert!(first_args.contains("repos/owner/repo/hooks"));
         assert_eq!(first_body["name"], "web");
@@ -713,6 +779,50 @@ mod tests {
 
         assert!(third_args.contains("-X DELETE"));
         assert!(third_args.contains("repos/owner/repo/hooks/4242"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopts_exact_server_hook_when_local_state_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::ExistingHook);
+        let mut registrar = Registrar::new(temp.path());
+
+        let hook_id = registrar
+            .ensure_registered_with_gh(
+                "owner/repo",
+                "https://example.test/webhook",
+                "rotated-secret",
+                &gh,
+            )
+            .expect("adopt");
+
+        assert_eq!(hook_id, 667_647_843);
+        assert!(read_log(temp.path(), "args-1").contains("hooks?per_page=100"));
+        assert!(read_log(temp.path(), "args-2").contains("hooks/667647843"));
+        assert_eq!(
+            read_json_log(temp.path(), "stdin-2")["config"]["secret"],
+            "rotated-secret"
+        );
+        assert_eq!(registrar.all().get("owner/repo"), Some(&667_647_843));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_ambiguous_exact_server_hooks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::DuplicateHooks);
+        let mut registrar = Registrar::new(temp.path());
+
+        let error = registrar
+            .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
+            .expect_err("duplicates must fail closed");
+
+        assert!(matches!(
+            error,
+            RegistrarError::AmbiguousExistingHooks { .. }
+        ));
+        assert!(registrar.all().is_empty());
     }
 
     #[cfg(unix)]
@@ -876,6 +986,8 @@ mod tests {
         MissingWebhookScope,
         Unauthorized,
         AnonRateLimit,
+        ExistingHook,
+        DuplicateHooks,
     }
 
     #[cfg(unix)]
@@ -887,7 +999,9 @@ mod tests {
             | GhStubMode::Delete404
             | GhStubMode::MissingWebhookScope
             | GhStubMode::Unauthorized
-            | GhStubMode::AnonRateLimit => "{\"id\":4242}",
+            | GhStubMode::AnonRateLimit
+            | GhStubMode::ExistingHook
+            | GhStubMode::DuplicateHooks => "{\"id\":4242}",
         };
         let delete_branch = match mode {
             GhStubMode::Delete404 => {
@@ -897,7 +1011,9 @@ mod tests {
             | GhStubMode::MissingId
             | GhStubMode::MissingWebhookScope
             | GhStubMode::Unauthorized
-            | GhStubMode::AnonRateLimit => "  *\" -X DELETE \"*) exit 0 ;;",
+            | GhStubMode::AnonRateLimit
+            | GhStubMode::ExistingHook
+            | GhStubMode::DuplicateHooks => "  *\" -X DELETE \"*) exit 0 ;;",
         };
         let create_branch = match mode {
             GhStubMode::MissingWebhookScope => String::from(
@@ -909,9 +1025,22 @@ mod tests {
             GhStubMode::AnonRateLimit => String::from(
                 "  *\" -X POST \"*) printf 'HTTP 403: API rate limit exceeded for 203.0.113.7. (But here is the good news: Authenticated requests get a higher rate limit.)\\n' >&2; exit 1 ;;",
             ),
-            GhStubMode::Ok | GhStubMode::Delete404 | GhStubMode::MissingId => {
+            GhStubMode::Ok
+            | GhStubMode::Delete404
+            | GhStubMode::MissingId
+            | GhStubMode::ExistingHook
+            | GhStubMode::DuplicateHooks => {
                 format!("  *\" -X POST \"*) printf '%s\\n' '{create_response}' ;;")
             }
+        };
+        let list_response = match mode {
+            GhStubMode::ExistingHook => {
+                r#"[{"id":667647843,"config":{"url":"https://example.test/webhook"}}]"#
+            }
+            GhStubMode::DuplicateHooks => {
+                r#"[{"id":1,"config":{"url":"https://example.test/webhook"}},{"id":2,"config":{"url":"https://example.test/webhook"}}]"#
+            }
+            _ => "[]",
         };
         let script = format!(
             r#"#!/bin/sh
@@ -924,6 +1053,7 @@ printf '%s' "$COUNT" > "$COUNT_FILE"
 printf '%s\n' "$*" > "$LOG_DIR/args-$COUNT"
 cat > "$LOG_DIR/stdin-$COUNT" || true
 case " $* " in
+  *"hooks?per_page=100"*) printf '%s\n' '{list_response}' ;;
 {create_branch}
   *" -X PATCH "*) printf '%s\n' '{{}}' ;;
 {delete_branch}
@@ -933,6 +1063,7 @@ esac
             log_dir = shell_quote(temp),
             create_branch = create_branch,
             delete_branch = delete_branch,
+            list_response = list_response,
         );
         fs::write(&gh, script).expect("write gh stub");
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("chmod");

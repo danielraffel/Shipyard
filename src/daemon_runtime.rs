@@ -45,6 +45,8 @@ use crate::ship_state::ShipStateStore;
 #[cfg(unix)]
 use crate::ship_state::{DispatchedRun, ShipState};
 #[cfg(unix)]
+use crate::steward_wake::StewardWakeRuntime;
+#[cfg(unix)]
 use crate::tunnel::{
     TailscaleFunnelBackend, TunnelSnapshot, TunnelSupervisorHooks, TunnelSupervisorPolicy,
     TunnelSupervisorState, supervise_tunnel,
@@ -181,6 +183,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     )?;
     let repos = normalize_repos(config.repos);
     let registrar_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut steward_wake =
+        StewardWakeRuntime::for_authority(&repos, &config.state_dir, &registrar_cwd, config.mode);
     let registrar = Arc::new(Mutex::new(Registrar::new_with_context(
         config.mode,
         &config.state_dir,
@@ -220,6 +224,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             &last_event_at,
             &ship_dir,
             &mut previous_states,
+            steward_wake.as_mut(),
         );
         sync_tunnel_registration(
             &tunnel_runtime,
@@ -238,6 +243,9 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         }
 
         let now = Instant::now();
+        if let Some(steward_wake) = steward_wake.as_mut() {
+            steward_wake.tick(now);
+        }
         let has_subscribers = server.subscriber_count() > 0;
         if should_start_reconcile(has_subscribers, reconcile_in_flight, now, next_reconcile_at) {
             reconcile_in_flight = true;
@@ -315,8 +323,12 @@ fn drain_webhook_events(
     last_event_at: &Arc<Mutex<Option<f64>>>,
     ship_dir: &Path,
     previous_states: &mut BTreeMap<(String, u64), ShipState>,
+    mut steward_wake: Option<&mut StewardWakeRuntime>,
 ) {
     while let Ok(event) = webhook_rx.try_recv() {
+        if let Some(steward_wake) = steward_wake.as_deref_mut() {
+            steward_wake.observe(&event, Instant::now());
+        }
         let archived_event =
             archive_closed_pull_request_ship_state(&event, ship_dir, previous_states);
         publish_daemon_event(server, last_event_at, event);

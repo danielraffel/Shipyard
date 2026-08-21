@@ -126,6 +126,9 @@ pub mod ship_retry;
 pub mod ship_state;
 /// GitHub stacked pull request discovery and initial fail-closed policy.
 pub mod stacked_pr;
+/// Event-driven merge-steward wake scheduling for the authority daemon.
+#[cfg(unix)]
+pub mod steward_wake;
 /// Subprocess helpers that mark supervised child processes with
 /// `SHIPYARD_PR_RUNNING=1` (issue #266). Used by every `git` / `gh`
 /// spawn site that participates in the supervised PR / ship / merge
