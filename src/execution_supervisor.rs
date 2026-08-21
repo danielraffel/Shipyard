@@ -542,6 +542,17 @@ impl ExecutionSupervisor {
     }
 
     fn sweep_terminal_receipts(&self) -> Result<(), SupervisorError> {
+        // Queue-absence recovery validates orphan receipts as durable evidence
+        // that the prior worker no longer owns this ship. The recovery runs in
+        // a detached thread so GitHub I/O cannot stall the daemon; do not erase
+        // that evidence from the same tick while the validation is in flight.
+        // The next tick resumes bounded cleanup after the flight guard drops.
+        if self
+            .queue_absent_recovery_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         let mut queue = Queue::new(&self.state_dir)?;
         let running = queue
             .get_running()?
@@ -1519,6 +1530,55 @@ mod tests {
         let _ = child.wait();
         restarted.tick().expect("cleanup tick");
         assert!(!restarted.receipt_path("post-validation").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_absent_recovery_flight_preserves_orphan_worker_ownership_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        fs::create_dir_all(supervisor.worker_dir()).expect("worker dir");
+        let receipt_path = supervisor.receipt_path("preserved-owner");
+        write_json_atomic(
+            &receipt_path,
+            &WorkerReceipt {
+                job_id: "preserved-owner".to_owned(),
+                generation: "preserved-generation".to_owned(),
+                // The test process is live but cannot match this fabricated
+                // worker identity, so the normal receipt sweep proves it dead.
+                pid: std::process::id(),
+                started_at: Utc::now(),
+            },
+        )
+        .expect("receipt");
+
+        supervisor
+            .queue_absent_recovery_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        supervisor
+            .sweep_terminal_receipts()
+            .expect("concurrent sweep");
+
+        assert!(
+            receipt_path.exists(),
+            "a queue-absence recovery must retain the orphan ownership evidence it validates"
+        );
+
+        supervisor
+            .queue_absent_recovery_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        supervisor
+            .sweep_terminal_receipts()
+            .expect("post-recovery sweep");
+        assert!(
+            !receipt_path.exists(),
+            "ordinary terminal receipt cleanup resumes after recovery exits"
+        );
     }
 
     #[cfg(unix)]
