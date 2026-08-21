@@ -715,10 +715,13 @@ fn collision_safe_component(value: &str) -> String {
 
     let readable = sanitize_component(value);
     let digest = Sha256::digest(value.as_bytes());
+    // Scoped evidence nests one encoded scope and one encoded branch. Keep
+    // both components compact enough for Windows runners that still enforce
+    // MAX_PATH while retaining a 128-bit digest for collision resistance.
     format!(
         "{}--{}",
-        readable.chars().take(48).collect::<String>(),
-        hex::encode(digest)
+        readable.chars().take(16).collect::<String>(),
+        &hex::encode(digest)[..32]
     )
 }
 
@@ -802,6 +805,7 @@ pub fn command_evidence_scope(cwd: &Path, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
@@ -810,8 +814,8 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        CommandEvidenceStore, EvidenceRecord, EvidenceStore, repository_ship_evidence_scope,
-        repository_ship_evidence_scope_prefix,
+        CommandEvidenceStore, EvidenceRecord, EvidenceStore, collision_safe_component,
+        repository_ship_evidence_scope, repository_ship_evidence_scope_prefix,
     };
 
     fn record(branch: &str, target: &str, sha: &str) -> EvidenceRecord {
@@ -1017,6 +1021,29 @@ mod tests {
             assert_eq!(evidence.workload_scope.as_deref(), Some(scope));
         }
         assert!(store.get_branch("feature/shared").is_empty());
+    }
+
+    #[test]
+    fn scoped_evidence_keys_fit_windows_path_budget() {
+        let scope = collision_safe_component(&"repository-workload-scope-".repeat(12));
+        let branch = collision_safe_component(&"generated-agent-feature-branch-".repeat(12));
+        let other_scope = collision_safe_component(&format!(
+            "{}different",
+            "repository-workload-scope-".repeat(12)
+        ));
+
+        assert!(scope.len() <= 50);
+        assert!(branch.len() <= 50);
+        assert_ne!(scope, other_scope);
+
+        // GitHub-hosted Windows temp roots can already consume substantial
+        // path space. Preserve headroom below legacy MAX_PATH for the final
+        // atomic-persist destination.
+        let relative = Path::new("scoped")
+            .join(scope)
+            .join(format!("{branch}.json"));
+        let representative_temp_root_len = 96;
+        assert!(representative_temp_root_len + 1 + relative.as_os_str().len() <= 240);
     }
 
     #[test]
