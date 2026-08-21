@@ -42,7 +42,10 @@ use crate::preflight::{
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
 use crate::reconcile::fetch_head_and_status_check_rollup_with_cwd;
-use crate::ship::{ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_ship};
+use crate::ship::{
+    ShipExecutionRequest, ShipStores, drain_or_wait_ship, drain_or_wait_ship_awaited_only,
+    submit_ship,
+};
 use crate::ship_state::ShipStateStore;
 use crate::warm_pool::{WarmPool, default_pool_path};
 
@@ -221,20 +224,20 @@ pub(super) fn ship_command_with_transition<W: Write>(
 
     let job = submit_ship(&request, &mut queue, cwd, &runtime_paths.state_dir)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let outcome = drain_or_wait_ship(
-        &request,
-        job.clone(),
-        ShipStores {
-            queue: &mut queue,
-            evidence: &evidence,
-            ship_state: &ship_state,
-            warm_pool: &warm_pool,
-            cwd,
-            state_dir: &runtime_paths.state_dir,
-            config,
-        },
-        &dispatcher,
-    )
+    let stores = ShipStores {
+        queue: &mut queue,
+        evidence: &evidence,
+        ship_state: &ship_state,
+        warm_pool: &warm_pool,
+        cwd,
+        state_dir: &runtime_paths.state_dir,
+        config,
+    };
+    let outcome = if args.invocation == ShipInvocation::Direct && args.pr.is_some() {
+        drain_or_wait_ship_awaited_only(&request, job.clone(), stores, &dispatcher)
+    } else {
+        drain_or_wait_ship(&request, job.clone(), stores, &dispatcher)
+    }
     .map_err(|error| CliFailure::new(1, error.to_string()))?;
 
     let render_state = post_run_merge_state(
