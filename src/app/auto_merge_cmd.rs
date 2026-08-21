@@ -701,6 +701,7 @@ fn merge_pr(
                         .expect("built-in merge should have gh client"),
                     cwd,
                     state,
+                    global_dir,
                 )?;
                 let guard = MergeQueueMutationGuard::acquire_in_mode(
                     store,
@@ -795,6 +796,7 @@ fn merge_pr(
                 .expect("built-in merge should have gh client"),
             cwd,
             state,
+            global_dir,
         )?;
         command.args(classic_merge_args(
             state,
@@ -858,24 +860,48 @@ fn merge_pr(
     Err(message)
 }
 
-fn ensure_unstacked(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<(), String> {
-    if let Some(stack) = crate::stacked_pr::fetch(client, cwd, &state.repo, state.pr)? {
-        return Err(crate::stacked_pr::unsupported_message(state.pr, &stack));
-    }
-    Ok(())
+fn ensure_unstacked(
+    client: &GhClient,
+    cwd: &Path,
+    state: &ShipState,
+    global_dir: &Path,
+) -> Result<(), String> {
+    inspect_unstacked(client, cwd, state, global_dir)
+        .map_err(crate::stacked_pr::StackInspectionError::into_message)
+}
+
+fn inspect_unstacked(
+    client: &GhClient,
+    cwd: &Path,
+    state: &ShipState,
+    global_dir: &Path,
+) -> Result<(), crate::stacked_pr::StackInspectionError> {
+    let inspection = crate::stacked_pr::fetch_inspection(
+        client,
+        cwd,
+        &state.repo,
+        &state.base_branch,
+        state.pr,
+        global_dir,
+    )?;
+    crate::stacked_pr::ensure_unstacked(&state.repo, state.pr, &state.head_sha, &inspection)
+        .map_err(crate::stacked_pr::StackInspectionError::validation)
 }
 
 fn ensure_unstacked_for_classic_merge(
     client: &GhClient,
     cwd: &Path,
     state: &ShipState,
+    global_dir: &Path,
 ) -> Result<(), String> {
-    allow_classic_rest_fallback(ensure_unstacked(client, cwd, state))
+    allow_classic_rest_fallback(inspect_unstacked(client, cwd, state, global_dir))
 }
 
-fn allow_classic_rest_fallback(result: Result<(), String>) -> Result<(), String> {
+fn allow_classic_rest_fallback(
+    result: Result<(), crate::stacked_pr::StackInspectionError>,
+) -> Result<(), String> {
     match result {
-        Err(error) if crate::pr::is_graphql_rate_limited(&error) => {
+        Err(error) if error.is_graphql_rate_limited() => {
             // The classic REST merge endpoint cannot merge a formal stack; the
             // asynchronous endpoint is required for that. Preserve Shipyard's
             // independent REST quota fallback when this last read exhausts
@@ -885,7 +911,8 @@ fn allow_classic_rest_fallback(result: Result<(), String>) -> Result<(), String>
             );
             Ok(())
         }
-        result => result,
+        Ok(()) => Ok(()),
+        Err(error) => Err(error.into_message()),
     }
 }
 
@@ -1344,7 +1371,7 @@ pub(super) fn supervise_merge_queue(
                                 ),
                             };
                         }
-                        if let Err(error) = ensure_unstacked(&client, cwd, &state) {
+                        if let Err(error) = ensure_unstacked(&client, cwd, &state, global_dir) {
                             return AutoMergeOutcome::MergeFailed { error };
                         }
                         let guard = match MergeQueueMutationGuard::acquire_in_mode(
@@ -1452,7 +1479,7 @@ pub(super) fn supervise_merge_queue(
                                 ),
                             };
                         }
-                        if let Err(error) = ensure_unstacked(&client, cwd, &state) {
+                        if let Err(error) = ensure_unstacked(&client, cwd, &state, global_dir) {
                             return AutoMergeOutcome::MergeFailed { error };
                         }
                         let guard = match MergeQueueMutationGuard::acquire_in_mode(
@@ -2788,14 +2815,23 @@ mod tests {
     #[test]
     fn classic_stack_inspection_preserves_only_graphql_rate_limit_fallback() {
         assert_eq!(
-            allow_classic_rest_fallback(Err(
+            allow_classic_rest_fallback(Err(crate::stacked_pr::StackInspectionError::query(
                 "GraphQL: API rate limit already exceeded for user ID 123".to_owned()
-            )),
+            ))),
             Ok(())
         );
         assert_eq!(
-            allow_classic_rest_fallback(Err("stack metadata was malformed".to_owned())),
+            allow_classic_rest_fallback(Err(crate::stacked_pr::StackInspectionError::validation(
+                "stack metadata was malformed".to_owned(),
+            ),)),
             Err("stack metadata was malformed".to_owned())
+        );
+        let poisoned_policy = "protected-base stacked_pr_mode must be one of off, observe, or apply; got \"graphql rate limit\"";
+        assert_eq!(
+            allow_classic_rest_fallback(Err(crate::stacked_pr::StackInspectionError::validation(
+                poisoned_policy.to_owned()
+            ),)),
+            Err(poisoned_policy.to_owned())
         );
     }
 

@@ -128,6 +128,7 @@ case "$*" in
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
   "pr view "*)
     printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"stackConfig"*) printf '%s' '{{"data":{{"repository":{{"stackConfig":{{"text":"stacked_pr_mode = \"observe\"\n"}},"pullRequest":{{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":null,"stackEntry":null}}}}}}}}' ;;
   *"stackEntry"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":null,"stackEntry":null}}}}}}}}' ;;
   *"enqueuePullRequest"*) printf '%s' '{{"data":{{"enqueuePullRequest":{{"mergeQueueEntry":{{"position":1}}}}}}}}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
@@ -171,6 +172,8 @@ fn steward_refuses_formal_stack_before_enqueue_mutation() {
             r#"
 printf '%s\n' "$*" >> '{}'
 case "$*" in
+  *"stackConfig"*)
+    printf '%s' '{{"data":{{"repository":{{"stackConfig":{{"text":"stacked_pr_mode = \"observe\"\n"}},"pullRequest":{{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":{{"number":7,"size":3,"baseRefName":"main"}},"stackEntry":{{"position":2}}}}}}}}}}' ;;
   *"stackEntry"*)
     printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":{{"number":7,"size":3,"baseRefName":"main"}},"stackEntry":{{"position":2}}}}}}}}}}' ;;
   *"enqueuePullRequest"*) echo "mutation must not run" >&2; exit 90 ;;
@@ -181,7 +184,8 @@ esac
         ),
     );
     let pr = ready_pr();
-    let observation = observation_for(pr.clone(), true);
+    let mut observation = observation_for(pr.clone(), true);
+    observation.base = "layer-one".to_owned();
     let mut ledger = StewardLedger::default();
     let mutation_control = mutation_control(&temp, "studio", "studio");
     let ledger_path = temp.path().join("ledger.json");
@@ -191,13 +195,21 @@ esac
 
     assert!(mutation.is_none());
     assert!(
-        error
-            .as_deref()
-            .is_some_and(|message| message.contains("position 2/3 in GitHub stack #7")),
+        error.as_deref().is_some_and(
+            |message| message.contains("position 2/3 in GitHub stack #7")
+                && message.contains("\"mode\":\"observe\"")
+                && message.contains("\"github_mutation\":false")
+                && message.contains("\"required_checks_suppressed\":false")
+        ),
         "{error:?}"
     );
     let calls = fs::read_to_string(log).expect("calls");
     assert!(calls.contains("stackEntry"), "{calls}");
+    assert!(
+        calls.contains("config=main:.shipyard/config.toml"),
+        "{calls}"
+    );
+    assert!(!calls.contains("config=layer-one:"), "{calls}");
     assert!(!calls.contains("enqueuePullRequest"), "{calls}");
     let state_root = mutation_control.store.path().parent().expect("state root");
     assert!(
@@ -924,6 +936,7 @@ case "$*" in
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
   "pr view "*)
     printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"stackConfig"*) printf '%s' '{{"data":{{"repository":{{"stackConfig":null,"pullRequest":{{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":null,"stackEntry":null}}}}}}}}' ;;
   *"stackEntry"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":null,"stackEntry":null}}}}}}}}' ;;
   *"enqueuePullRequest"*) echo "connection reset after request body" >&2; exit 1 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
@@ -1182,6 +1195,7 @@ case "$*" in
     printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   "pr view "*)
     printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"BLOCKED","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}]}' ;;
+  *"stackConfig"*) printf '%s' '{"data":{"repository":{"stackConfig":null,"pullRequest":{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":null,"stackEntry":null}}}}' ;;
   *"stackEntry"*) printf '%s' '{"data":{"repository":{"pullRequest":{"stack":null,"stackEntry":null}}}}' ;;
   *"enqueuePullRequest"*)
     echo "Required approving review has not been submitted" >&2

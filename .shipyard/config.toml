@@ -1,6 +1,10 @@
 # Shipyard validates itself.
 # This config is what runs when you do `shipyard run` in this repo.
 
+# Formal GitHub stacks remain fail-closed. Repositories may select `observe`
+# for exact-head plan telemetry; `apply` is reserved and currently NO-GO.
+stacked_pr_mode = "off"
+
 [project]
 name = "shipyard"
 type = "rust"
