@@ -1020,16 +1020,12 @@ fn handle_ship_state_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Show { pr } => {
-            let repository = (mode == RuntimeMode::Shipyard)
-                .then(|| self::branch_cmd::detect_repo_from_remote(cwd, None))
-                .flatten();
+            let repository = self::branch_cmd::detect_repo_from_remote(cwd, None);
             ship_state_show(store, repository.as_deref(), pr, json, stdout)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
         ShipStateCommand::Discard { pr } => {
-            let repository = (mode == RuntimeMode::Shipyard)
-                .then(|| self::branch_cmd::detect_repo_from_remote(cwd, None))
-                .flatten();
+            let repository = self::branch_cmd::detect_repo_from_remote(cwd, None);
             ship_state_discard(store, repository.as_deref(), pr, json, stdout)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
@@ -1388,6 +1384,67 @@ mod tests {
         assert!(stdout.is_empty());
         let stderr = String::from_utf8(stderr).expect("utf8");
         assert!(stderr.contains("No ship state for PR #999"));
+    }
+
+    #[test]
+    fn isolated_ship_state_show_uses_checkout_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        seed_git_repo(&repo, "feature/test");
+        git(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Generous-Corp/pulp.git",
+            ],
+            &repo,
+        );
+        let state_dir = temp.path().join("state");
+        let store = ShipStateStore::new(state_dir.join("ship")).expect("store");
+        store
+            .save(&ShipState::new(
+                42,
+                "Generous-Corp/pulp",
+                "feature/test",
+                "main",
+                "pulp-head",
+                "policy",
+            ))
+            .expect("Pulp state");
+        store
+            .save(&ShipState::new(
+                42,
+                "Generous-Corp/forge",
+                "feature/modular",
+                "main",
+                "forge-head",
+                "policy",
+            ))
+            .expect("Forge state");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--json",
+            "--cwd",
+            repo.to_str().expect("repo path"),
+            "--state-dir",
+            state_dir.to_str().expect("state path"),
+            "ship-state",
+            "show",
+            "42",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["repo"], "Generous-Corp/pulp");
+        assert_eq!(value["head_sha"], "pulp-head");
     }
 
     #[test]

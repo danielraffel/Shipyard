@@ -58,7 +58,8 @@ pub(super) fn ship_state_list<W: Write>(
         };
         writeln!(
             stdout,
-            "PR #{}  sha={}  attempt={}  runs={}  age={}m  {}",
+            "{} PR #{}  sha={}  attempt={}  runs={}  age={}m  {}",
+            state.repo,
             state.pr,
             abbreviate_sha(&state.head_sha),
             state.attempt,
@@ -190,9 +191,7 @@ pub(super) fn ship_state_reconcile<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repository = (mode == RuntimeMode::Shipyard)
-        .then(|| super::branch_cmd::detect_repo_from_remote(cwd, None))
-        .flatten();
+    let repository = super::branch_cmd::detect_repo_from_remote(cwd, None);
     ship_state_reconcile_with(
         store,
         repository.as_deref(),
@@ -412,6 +411,7 @@ mod tests {
         ship_state_list(&store, &time_ctx(), false, &mut out).expect("list should render");
 
         let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("danielraffel/pulp PR #42"));
         assert!(text.contains("PR #42"));
         assert!(text.contains("sha=abcdef012345"));
         assert!(text.contains("attempt=3"));
