@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v0980"></a>
+## [0.98.0] - 2026-08-21
+
+- feat: add shadow risk tiers to changed-surface selection ([#447](https://github.com/danielraffel/Shipyard/pull/447))
+
 <a id="v0972"></a>
 ## [0.97.2] - 2026-08-21
 
@@ -934,6 +939,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.98.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.98.0
 [0.97.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.97.2
 [0.97.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.97.0
 [0.96.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.96.1
