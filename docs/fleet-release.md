@@ -81,6 +81,9 @@ immutable copy at `~/.local/libexec/shipyard-fleet-controller`, separate from
 the managed `~/.local/bin/shipyard`; rolling the fleet back cannot remove the
 controller's ability to converge an offline host later. The reconciler replays
 the exact state every five minutes. It does not follow `latest`.
+The controller carries the checksum-aware installer source it was built with;
+it never depends on an older installed CLI or a mutable branch copy of the
+installer to bootstrap another host.
 
 Rollout behavior is intentionally per-host:
 
@@ -96,11 +99,14 @@ Rollout behavior is intentionally per-host:
 6. On a later reconciler tick, a rejoined host enters the same convergence
    flow. Already-converged peers are not reinstalled.
 
-Shipyard never disables runner participation for an update. A host with an
-active `Runner.Worker` is deferred. The participation flag is sampled before
-and after installation; a change is a terminal host failure. A daemon that was
-running is refreshed and must report the target version. A host with no daemon
-is allowed to remain daemonless.
+Shipyard drains only the host crossing the mutation boundary: it temporarily
+turns that host's runner pool off, verifies that no `Runner.Worker` won the
+race, performs the exact-byte install, and restores the prior participation
+before continuing. Other fleet members remain available throughout. A host
+with an active worker is deferred. The participation flag is sampled before
+and after installation; failure to restore it is a terminal host failure. A
+daemon that was running is refreshed and must report the target version. A host
+with no daemon is allowed to remain daemonless.
 
 The durable state defaults to
 `<state-dir>/fleet-release/state.json`. Apply/reconcile/rollback share a
