@@ -1276,7 +1276,10 @@ fn activate_rollback(state: &mut RolloutState) -> Result<(), CliFailure> {
     state.generation = generation(&state.desired, &timestamp());
     state.canary_host = None;
     state.canary_proven = false;
-    state.hosts.clear();
+    for receipt in state.hosts.values_mut() {
+        receipt.state = receipt.observed.disposition(&state.desired);
+        receipt.updated_at = timestamp();
+    }
     state.updated_at = timestamp();
     Ok(())
 }
