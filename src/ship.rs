@@ -459,6 +459,15 @@ fn submit_ship_with_config(
     state_dir: &Path,
     config: Option<&LoadedConfig>,
 ) -> Result<Job, ShipExecutionError> {
+    // Queue-absence recovery uses this same repository-scoped lock while it
+    // claims and commits a replacement. Hold it across the normal submitter's
+    // running-owner check, durable envelope write, and queue insertion so
+    // neither side can miss the other's pre-commit ownership window.
+    let ship_state = ShipStateStore::new(state_dir.join("ship"))
+        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+    let _ownership_lock = ship_state
+        .lock_pr_scoped(&request.repo, request.pr)
+        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
     refuse_same_pr_running_ship(queue, state_dir, request)?;
     let target_names = target_names(&request.targets);
     let job = Job::create(

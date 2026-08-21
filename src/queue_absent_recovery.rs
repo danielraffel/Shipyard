@@ -723,6 +723,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::process::Command;
+    use std::sync::mpsc;
 
     use crate::config::LoadedConfig;
     use crate::job::{Priority, ValidationMode};
@@ -736,7 +737,9 @@ mod tests {
         _temp: tempfile::TempDir,
         state_dir: PathBuf,
         global_dir: PathBuf,
+        repo_path: PathBuf,
         config: LoadedConfig,
+        request: ShipExecutionRequest,
         source_job_id: String,
     }
 
@@ -831,7 +834,9 @@ mod tests {
                 _temp: temp,
                 state_dir,
                 global_dir,
+                repo_path,
                 config,
+                request,
                 source_job_id,
             }
         }
@@ -902,6 +907,74 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn normal_submitter_and_recovery_share_the_precommit_ownership_fence() {
+        let fixture = Fixture::new();
+        let live = fixture.live();
+        let (claimed_tx, claimed_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (submit_started_tx, submit_started_rx) = mpsc::sync_channel(0);
+        let (submit_done_tx, submit_done_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let recovery_fixture = &fixture;
+            let recovery = scope.spawn(move || {
+                recovery_fixture.sweep(live, |_| {
+                    claimed_tx.send(()).expect("announce claim");
+                    release_rx.recv().expect("release recovery");
+                    Ok(())
+                })
+            });
+            claimed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("recovery claim");
+
+            let submit_fixture = &fixture;
+            let submitter = scope.spawn(move || {
+                submit_started_tx.send(()).expect("submit started");
+                let mut queue = Queue::new(&submit_fixture.state_dir).expect("queue");
+                let result = crate::ship::submit_ship(
+                    &submit_fixture.request,
+                    &mut queue,
+                    &submit_fixture.repo_path,
+                    &submit_fixture.state_dir,
+                );
+                submit_done_tx.send(()).expect("submit done");
+                result
+            });
+            submit_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("submit start");
+            assert!(
+                submit_done_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err(),
+                "normal submit escaped while recovery held the ownership fence"
+            );
+
+            release_tx.send(()).expect("release claim");
+            let report = recovery.join().expect("recovery thread");
+            assert_eq!(report.enqueued.len(), 1, "{report:?}");
+            let normal_job = submitter
+                .join()
+                .expect("submitter thread")
+                .expect("normal submit");
+            submit_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("submit completion");
+
+            let active = Queue::new(&fixture.state_dir)
+                .expect("queue")
+                .get_all()
+                .expect("jobs")
+                .into_iter()
+                .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
+                .collect::<Vec<_>>();
+            assert_eq!(active.len(), 1, "{active:?}");
+            assert_eq!(active[0].id, normal_job.id);
+        });
     }
 
     #[test]
