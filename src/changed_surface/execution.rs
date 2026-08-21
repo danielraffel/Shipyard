@@ -18,9 +18,9 @@ use super::{
 };
 
 /// Stable URL-safe payload placeholder accepted in a protected-base command.
-pub const SELECTED_TESTS_PAYLOAD_PLACEHOLDER: &str = "{selected_tests_b64}";
+pub const SELECTED_TESTS_PAYLOAD_PLACEHOLDER: &str = "{selection_receipt_b64}";
 /// Stable payload-digest placeholder accepted in a protected-base command.
-pub const SELECTED_TESTS_DIGEST_PLACEHOLDER: &str = "{selected_tests_digest}";
+pub const SELECTED_TESTS_DIGEST_PLACEHOLDER: &str = "{selection_receipt_digest}";
 /// Current bounded-execution planning receipt schema.
 pub const AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
 /// Stay below the Windows `cmd.exe` command-line ceiling after base64 expansion;
@@ -149,6 +149,8 @@ pub struct AuthoritativeExecutionPlan {
     pub selection_receipt_digest: String,
     /// Digest of the exact ordered literal test file.
     pub selected_tests_digest: String,
+    /// Digest of the exact identity-bound payload consumed by the adapter.
+    pub execution_payload_digest: String,
     /// Selected risk tier.
     pub selection_tier: SelectionTier,
     /// Number of literal test names written to the file.
@@ -157,6 +159,20 @@ pub struct AuthoritativeExecutionPlan {
     pub stage: String,
     /// Protected-base command with only the file path substituted.
     pub command: String,
+}
+
+#[derive(Serialize)]
+struct AuthoritativeExecutionPayload<'a> {
+    schema_version: u32,
+    repository: &'a str,
+    pull_request: u64,
+    target: &'a str,
+    base_sha: &'a str,
+    head_sha: &'a str,
+    tree_sha: &'a str,
+    policy_digest: &'a str,
+    selected_tests_digest: &'a str,
+    selected_tests: &'a [String],
 }
 
 /// Promotion error. Callers must fail closed to the full suite and retain the
@@ -276,16 +292,34 @@ fn bounded_execution_plan(
     validate_digest("validation contract", validation_contract_digest)?;
     validate_digest("workflow", workflow_digest)?;
     let selected = literal_file_bytes(&receipt.selected_tests)?;
-    if selected.len() > MAX_SELECTED_TEST_BYTES {
-        return Err(error(
-            "bounded selection payload exceeds the safe command limit",
-        ));
-    }
     let selection_receipt = serde_json::to_vec(receipt)
         .map_err(|failure| error(format!("serialize selection receipt: {failure}")))?;
     let selection_receipt_digest = sha256_hex(&selection_receipt);
     let selected_tests_digest = sha256_hex(&selected);
-    let selected_tests_payload = URL_SAFE_NO_PAD.encode(&selected);
+    let policy_digest = receipt
+        .policy_digest
+        .as_deref()
+        .expect("matched policy digest");
+    let execution_payload = serde_json::to_vec(&AuthoritativeExecutionPayload {
+        schema_version: AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION,
+        repository: &receipt.repository,
+        pull_request: receipt.pull_request,
+        target: &receipt.target,
+        base_sha: &receipt.pr_base_sha,
+        head_sha: &receipt.head_sha,
+        tree_sha: &receipt.tree_sha,
+        policy_digest,
+        selected_tests_digest: &selected_tests_digest,
+        selected_tests: &receipt.selected_tests,
+    })
+    .map_err(|failure| error(format!("serialize authoritative payload: {failure}")))?;
+    if execution_payload.len() > MAX_SELECTED_TEST_BYTES {
+        return Err(error(
+            "bounded selection payload exceeds the safe command limit",
+        ));
+    }
+    let execution_payload_digest = sha256_hex(&execution_payload);
+    let selected_tests_payload = URL_SAFE_NO_PAD.encode(&execution_payload);
     let template = execution
         .command
         .as_deref()
@@ -295,7 +329,11 @@ fn bounded_execution_plan(
         &selected_tests_payload,
         1,
     );
-    let command = command.replacen(SELECTED_TESTS_DIGEST_PLACEHOLDER, &selected_tests_digest, 1);
+    let command = command.replacen(
+        SELECTED_TESTS_DIGEST_PLACEHOLDER,
+        &execution_payload_digest,
+        1,
+    );
     if command.encode_utf16().count() > MAX_EXECUTION_COMMAND_UNITS {
         return Err(error(
             "bounded execution command exceeds the smallest supported shell limit",
@@ -319,6 +357,7 @@ fn bounded_execution_plan(
             workflow_digest: workflow_digest.to_owned(),
             selection_receipt_digest,
             selected_tests_digest,
+            execution_payload_digest,
             selection_tier: receipt.selection_tier,
             selected_count: receipt.selected_tests.len(),
             stage: execution.stage.clone(),
@@ -403,7 +442,7 @@ mod tests {
                 stage: "test".to_owned(),
                 command: (mode == ExecutionMode::Authoritative)
                     .then(|| {
-                        "tools/run-selected --selection {selected_tests_b64} --sha256 {selected_tests_digest}"
+                        "tools/run-selected --receipt {selection_receipt_b64} --receipt-sha256 {selection_receipt_digest}"
                             .to_owned()
                     }),
             }),
@@ -521,7 +560,7 @@ mod tests {
         assert!(!plan.command.contains("smoke"));
         assert!(!plan.command.contains(SELECTED_TESTS_PAYLOAD_PLACEHOLDER));
         assert!(!plan.command.contains(SELECTED_TESTS_DIGEST_PLACEHOLDER));
-        assert!(plan.command.contains(&plan.selected_tests_digest));
+        assert!(plan.command.contains(&plan.execution_payload_digest));
     }
 
     #[test]
@@ -538,7 +577,7 @@ mod tests {
         let payload = plan
             .command
             .split_whitespace()
-            .skip_while(|token| *token != "--selection")
+            .skip_while(|token| *token != "--receipt")
             .nth(1)
             .expect("payload token");
         assert!(
@@ -548,18 +587,22 @@ mod tests {
             "payload must be safe as one token in POSIX and cmd shells"
         );
         let bytes = URL_SAFE_NO_PAD.decode(payload).expect("decode payload");
+        let decoded: serde_json::Value = serde_json::from_slice(&bytes).expect("payload json");
+        assert_eq!(decoded["head_sha"], HEAD);
+        assert_eq!(decoded["tree_sha"], TREE);
+        assert_eq!(decoded["policy_digest"], policy_digest(&policy));
         assert_eq!(
-            bytes,
-            literal_file_bytes(&receipt.selected_tests).expect("literal bytes")
+            decoded["selected_tests"],
+            serde_json::json!(receipt.selected_tests)
         );
-        assert_eq!(sha256_hex(&bytes), plan.selected_tests_digest);
+        assert_eq!(sha256_hex(&bytes), plan.execution_payload_digest);
     }
 
     #[test]
     fn malformed_policy_and_receipt_fail_closed() {
         let mut policy = fixture_policy(ExecutionMode::Authoritative);
         policy.execution.as_mut().expect("execution").command =
-            Some("run {selected_tests_b64} {selected_tests_b64}".to_owned());
+            Some("run {selection_receipt_b64} {selection_receipt_b64}".to_owned());
         assert!(
             policy
                 .execution
@@ -655,7 +698,7 @@ mod tests {
     fn final_command_includes_template_overhead_in_shell_limit() {
         let mut policy = fixture_policy(ExecutionMode::Authoritative);
         policy.execution.as_mut().expect("execution").command = Some(format!(
-            "{} {{selected_tests_b64}} {{selected_tests_digest}}",
+            "{} {{selection_receipt_b64}} {{selection_receipt_digest}}",
             "x".repeat(MAX_EXECUTION_COMMAND_UNITS)
         ));
         let input = fixture_input("src/a.rs");
