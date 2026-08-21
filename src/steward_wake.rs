@@ -12,6 +12,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -29,9 +31,16 @@ const FAILURE_RETRY_DELAY: Duration = Duration::from_secs(30);
 const DEFAULT_BRANCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
-struct ActiveWake {
-    repo: String,
-    child: ProcessTree,
+enum ActiveWake {
+    Resolve {
+        repo: String,
+        result: Receiver<Result<String, String>>,
+        thread: Option<JoinHandle<()>>,
+    },
+    Steward {
+        repo: String,
+        child: ProcessTree,
+    },
 }
 
 /// Live event-to-steward bridge owned by the daemon.
@@ -48,8 +57,8 @@ pub struct StewardWakeRuntime {
 
 impl Drop for StewardWakeRuntime {
     fn drop(&mut self) {
-        if let Some(active) = self.active.as_mut() {
-            active.child.terminate();
+        if let Some(ActiveWake::Steward { child, .. }) = self.active.as_mut() {
+            child.terminate();
         }
     }
 }
@@ -93,44 +102,93 @@ impl StewardWakeRuntime {
     /// Advance the singleflight worker without blocking the daemon event loop.
     pub fn tick(&mut self, now: Instant) {
         self.scheduler.schedule_periodic(now);
-        if let Some(active) = self.active.as_mut() {
-            match active.child.try_wait() {
-                Ok(Some(status)) => {
-                    let repo = active.repo.clone();
-                    let code = status.code();
-                    let succeeded = status.success();
-                    self.active = None;
-                    self.write_status(&repo, code, None);
-                    if succeeded {
-                        self.scheduler.worker_finished(now);
-                    } else {
+        if let Some(mut active) = self.active.take() {
+            match &mut active {
+                ActiveWake::Steward { repo, child } => match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let repo = repo.clone();
+                        let code = status.code();
+                        let succeeded = status.success();
+                        self.write_status(&repo, code, None);
+                        if succeeded {
+                            self.scheduler.worker_finished(now);
+                        } else {
+                            self.scheduler.worker_failed(repo, now);
+                        }
+                    }
+                    Ok(None) => {
+                        self.active = Some(active);
+                        return;
+                    }
+                    Err(error) => {
+                        let repo = repo.clone();
+                        self.write_status(&repo, None, Some(&error.to_string()));
                         self.scheduler.worker_failed(repo, now);
                     }
-                }
-                Ok(None) => return,
-                Err(error) => {
-                    let repo = active.repo.clone();
-                    self.active = None;
-                    self.write_status(&repo, None, Some(&error.to_string()));
-                    self.scheduler.worker_failed(repo, now);
-                }
+                },
+                ActiveWake::Resolve {
+                    repo,
+                    result,
+                    thread,
+                } => match result.try_recv() {
+                    Ok(Ok(base)) => {
+                        let repo = repo.clone();
+                        if let Some(thread) = thread.take() {
+                            let _ = thread.join();
+                        }
+                        self.default_branches.insert(repo.clone(), base.clone());
+                        match self.spawn(&repo, &base) {
+                            Ok(child) => {
+                                self.active = Some(ActiveWake::Steward { repo, child });
+                            }
+                            Err(error) => {
+                                self.write_status(&repo, None, Some(&error.to_string()));
+                                self.scheduler.worker_failed(repo, now);
+                            }
+                        }
+                        return;
+                    }
+                    Ok(Err(error)) => {
+                        let repo = repo.clone();
+                        if let Some(thread) = thread.take() {
+                            let _ = thread.join();
+                        }
+                        self.write_status(&repo, None, Some(&error));
+                        self.scheduler.worker_failed(repo, now);
+                    }
+                    Err(TryRecvError::Empty) => {
+                        self.active = Some(active);
+                        return;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        let repo = repo.clone();
+                        if let Some(thread) = thread.take() {
+                            let _ = thread.join();
+                        }
+                        let error = "default-branch resolver exited without a result";
+                        self.write_status(&repo, None, Some(error));
+                        self.scheduler.worker_failed(repo, now);
+                    }
+                },
             }
         }
         let Some(repo) = self.scheduler.take_ready(now) else {
             return;
         };
-        let base = match self.default_branch(&repo) {
-            Ok(base) => base,
+        if let Some(base) = self.default_branches.get(&repo).cloned() {
+            match self.spawn(&repo, &base) {
+                Ok(child) => self.active = Some(ActiveWake::Steward { repo, child }),
+                Err(error) => {
+                    self.write_status(&repo, None, Some(&error.to_string()));
+                    self.scheduler.worker_failed(repo, now);
+                }
+            }
+            return;
+        }
+        match self.spawn_default_branch_resolver(&repo) {
+            Ok(active) => self.active = Some(active),
             Err(error) => {
                 self.write_status(&repo, None, Some(&error));
-                self.scheduler.worker_failed(repo, now);
-                return;
-            }
-        };
-        match self.spawn(&repo, &base) {
-            Ok(child) => self.active = Some(ActiveWake { repo, child }),
-            Err(error) => {
-                self.write_status(&repo, None, Some(&error.to_string()));
                 self.scheduler.worker_failed(repo, now);
             }
         }
@@ -160,13 +218,31 @@ impl StewardWakeRuntime {
         ProcessTree::spawn(&mut command)
     }
 
-    fn default_branch(&mut self, repo: &str) -> Result<String, String> {
-        if let Some(base) = self.default_branches.get(repo) {
-            return Ok(base.clone());
-        }
-        let base = resolve_default_branch(repo, &self.cwd, &self.global_dir, self.mode)?;
-        self.default_branches.insert(repo.to_owned(), base.clone());
-        Ok(base)
+    fn spawn_default_branch_resolver(&self, repo: &str) -> Result<ActiveWake, String> {
+        let (sender, result) = mpsc::channel();
+        let resolved_repo = repo.to_owned();
+        let repo = resolved_repo.clone();
+        let cwd = self.cwd.clone();
+        let global_dir = self.global_dir.clone();
+        let mode = self.mode;
+        let thread = thread::Builder::new()
+            .name(format!("shipyard-base-{}", repo.replace('/', "-")))
+            .spawn(move || {
+                let _ = sender.send(resolve_default_branch(
+                    &resolved_repo,
+                    &cwd,
+                    &global_dir,
+                    mode,
+                ));
+            })
+            .map_err(|error| {
+                format!("could not start default-branch resolver for {repo}: {error}")
+            })?;
+        Ok(ActiveWake::Resolve {
+            repo,
+            result,
+            thread: Some(thread),
+        })
     }
 
     fn write_status(&self, repo: &str, exit_code: Option<i32>, error: Option<&str>) {

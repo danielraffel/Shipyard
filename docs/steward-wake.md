@@ -8,6 +8,8 @@ no model session needs to remain alive.
 
 The worker discovers and caches each repository's GitHub default branch for
 the daemon lifetime; it does not assume that every repository uses `main`.
+Discovery runs in a bounded background resolver so slow GitHub auth or API
+responses cannot pause the daemon's webhook and reconciliation loop.
 
 Only the host whose runner tag matches the trusted machine-global
 `merge_queue.mutation_machine` starts the worker. Other Shipyard daemons remain
