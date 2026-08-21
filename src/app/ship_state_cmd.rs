@@ -26,6 +26,7 @@ pub(super) fn ship_state_list<W: Write>(
             .filter_map(|state| {
                 liveness.classify(state, now).map(|report| {
                     serde_json::json!({
+                        "repo": state.repo.as_str(),
                         "pr": state.pr,
                         "stalled_minutes": report.stalled_minutes,
                         "evidence": report.evidence.as_str(),
@@ -57,7 +58,8 @@ pub(super) fn ship_state_list<W: Write>(
         };
         writeln!(
             stdout,
-            "PR #{}  sha={}  attempt={}  runs={}  age={}m  {}",
+            "{} PR #{}  sha={}  attempt={}  runs={}  age={}m  {}",
+            state.repo,
             state.pr,
             abbreviate_sha(&state.head_sha),
             state.attempt,
@@ -461,9 +463,46 @@ mod tests {
         let payload: Value = serde_json::from_slice(&out).expect("json payload");
         let orphaned = payload["orphaned"].as_array().expect("orphaned array");
         assert_eq!(orphaned.len(), 1, "only the stale in-flight PR is orphaned");
+        assert_eq!(orphaned[0]["repo"], "danielraffel/pulp");
         assert_eq!(orphaned[0]["pr"], 3);
         assert_eq!(orphaned[0]["evidence"], "time_fallback");
         assert!(orphaned[0]["stalled_minutes"].as_i64().unwrap() >= DEFAULT_ORPHAN_STALE_MINUTES);
+    }
+
+    #[test]
+    fn orphan_listings_distinguish_same_pr_number_across_repositories() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        let stale_at = Utc::now() - Duration::minutes(DEFAULT_ORPHAN_STALE_MINUTES + 10);
+        let mut pulp = sample_state(42, "pulp");
+        pulp.updated_at = stale_at;
+        store.save(&pulp).expect("pulp state should save");
+        let mut forge = sample_state(42, "forge");
+        forge.repo = "Generous-Corp/forge".to_owned();
+        forge.updated_at = stale_at;
+        store.save(&forge).expect("forge state should save");
+
+        let mut json_out = Vec::new();
+        ship_state_list(&store, &time_ctx(), true, &mut json_out).expect("json list");
+        let payload: Value = serde_json::from_slice(&json_out).expect("json payload");
+        let orphaned = payload["orphaned"].as_array().expect("orphaned array");
+        assert_eq!(orphaned.len(), 2);
+        assert!(
+            orphaned
+                .iter()
+                .any(|row| { row["repo"] == "danielraffel/pulp" && row["pr"] == 42 })
+        );
+        assert!(
+            orphaned
+                .iter()
+                .any(|row| { row["repo"] == "Generous-Corp/forge" && row["pr"] == 42 })
+        );
+
+        let mut human_out = Vec::new();
+        ship_state_list(&store, &time_ctx(), false, &mut human_out).expect("human list");
+        let human = String::from_utf8(human_out).expect("utf8");
+        assert!(human.contains("danielraffel/pulp PR #42"));
+        assert!(human.contains("Generous-Corp/forge PR #42"));
     }
 
     #[test]
