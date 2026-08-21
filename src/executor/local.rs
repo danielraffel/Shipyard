@@ -223,6 +223,7 @@ impl LocalValidationRequest<'_> {
 #[derive(Clone, Debug, Default)]
 pub struct LocalExecutor {
     prepared_state_store: Option<PreparedStateStore>,
+    rotated_segments: usize,
 }
 
 impl LocalExecutor {
@@ -231,7 +232,15 @@ impl LocalExecutor {
     pub fn new(prepared_state_store: Option<PreparedStateStore>) -> Self {
         Self {
             prepared_state_store,
+            rotated_segments: crate::log_retention::LogRetentionPolicy::default().rotated_segments,
         }
+    }
+
+    /// Apply the effective target-log reopen retention policy.
+    #[must_use]
+    pub fn with_rotated_segments(mut self, rotated_segments: usize) -> Self {
+        self.rotated_segments = rotated_segments;
+        self
     }
 
     /// Run a local validation request and return a target result.
@@ -261,7 +270,7 @@ impl LocalExecutor {
         let source = source_cwd.as_deref().and_then(source_provenance);
 
         let mut result = match plan {
-            LocalValidationPlan::SingleCommand(command) => Self::run_single(
+            LocalValidationPlan::SingleCommand(command) => self.run_single(
                 &command,
                 &context,
                 request.validation.contract.as_ref(),
@@ -293,6 +302,7 @@ impl LocalExecutor {
     }
 
     fn run_single(
+        &self,
         command: &str,
         context: &LocalRunContext<'_>,
         contract: Option<&ContractConfig>,
@@ -303,6 +313,7 @@ impl LocalExecutor {
         let mut request = StreamingCommand::shell(command);
         request.cwd.clone_from(&context.target.cwd);
         request.log_path = Some(context.log_path.to_path_buf());
+        request.rotated_segments = self.rotated_segments;
         request.timeout = Some(context.target.timeout());
         request.required_contract_markers = required_markers(contract);
         request.progress_callback = progress_callback.take();
@@ -329,7 +340,10 @@ impl LocalExecutor {
         {
             return io_error_result(context, &error.to_string());
         }
-        if let Err(error) = fs::write(context.log_path, "") {
+        if let Err(error) =
+            crate::log_retention::rotate_before_open(context.log_path, self.rotated_segments)
+                .and_then(|_| fs::write(context.log_path, ""))
+        {
             return io_error_result(context, &error.to_string());
         }
 

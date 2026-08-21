@@ -460,8 +460,19 @@ fn write_job_envelope<W: Write>(
 }
 
 fn write_log<W: Write>(stdout: &mut W, log_path: &str) -> Result<(), CliFailure> {
-    let text = fs::read_to_string(log_path)
-        .map_err(|_| CliFailure::new(1, format!("Log file not found: {log_path}")))?;
+    let text = if let Ok(text) = fs::read_to_string(log_path) {
+        text
+    } else {
+        let compressed_path = format!("{log_path}.gz");
+        let file = fs::File::open(&compressed_path)
+            .map_err(|_| CliFailure::new(1, format!("Log file not found: {log_path}")))?;
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut text).map_err(|error| {
+            CliFailure::new(1, format!("failed to read {compressed_path}: {error}"))
+        })?;
+        text
+    };
     write!(stdout, "{text}").map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
@@ -511,5 +522,26 @@ impl From<QueuePriority> for Priority {
             QueuePriority::Normal => Self::Normal,
             QueuePriority::High => Self::High,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_log;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    #[test]
+    fn write_log_falls_back_to_retained_gzip() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("target.log");
+        let output = std::fs::File::create(format!("{}.gz", path.display())).expect("gzip");
+        let mut encoder = GzEncoder::new(output, Compression::fast());
+        encoder.write_all(b"retained evidence\n").expect("write");
+        encoder.finish().expect("finish");
+        let mut stdout = Vec::new();
+        write_log(&mut stdout, path.to_str().expect("path")).expect("read gzip");
+        assert_eq!(stdout, b"retained evidence\n");
     }
 }

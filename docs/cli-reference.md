@@ -54,7 +54,8 @@ shipyard metrics compare --project pulp --lane windows-arm64 --before 7d --after
 # Manage
 shipyard bump <id> high        # reprioritize a pending job
 shipyard cancel <id>           # cancel a job
-shipyard cleanup --apply       # prune old logs and artifacts
+shipyard cleanup               # explain retention/compression actions (dry-run)
+shipyard cleanup --apply       # apply log retention and prune artifacts
 
 # Profiles & config
 shipyard config profiles       # list defined profiles
@@ -145,6 +146,12 @@ shipyard runner kill --history                                  # review past ki
 shipyard runner kill --history --last 5
 shipyard runner kill --recover kill-59996-deadbeef              # restore quarantine
 ```
+
+Cleanup protects active, failed, unclassified, and explicitly audit-pinned log
+evidence; it pressure-deletes only successful terminal jobs. See
+[Log retention and rotation](log-retention.md) for defaults, configuration, and
+the active-writer Phase 2 boundary.
+Use `shipyard cleanup --pin <job-id>` for serialized indefinite audit pinning.
 
 See `docs/runner-watchdog.md` for the full reference.
 

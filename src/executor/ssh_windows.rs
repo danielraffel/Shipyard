@@ -153,6 +153,8 @@ pub struct WindowsValidationRequest<'a> {
     pub contract: Option<ContractConfig>,
     /// Local log file path.
     pub log_path: PathBuf,
+    /// Number of prior target-log segments preserved on reopen.
+    pub rotated_segments: usize,
     /// Optional stage to resume from.
     pub resume_from: Option<String>,
     /// Validation mode label.
@@ -202,6 +204,7 @@ impl WindowsValidationRequest<'_> {
             validation,
             contract: None,
             log_path,
+            rotated_segments: crate::log_retention::LogRetentionPolicy::default().rotated_segments,
             resume_from: None,
             mode: "default".to_owned(),
             progress_callback: None,
@@ -517,17 +520,20 @@ impl<O: WindowsOperations> WindowsExecutor<O> {
             request.target.identity_file.as_deref(),
         );
 
-        if !self.operations.remote_has_sha(
+        let bootstrapped_log = if self.operations.remote_has_sha(
             host,
             &request.target.repo_path,
             &request.sha,
             &ssh_options,
         ) {
+            false
+        } else {
             let bundle_result = self.deliver_bundle(&context, request, host, &ssh_options);
             if let Err(message) = bundle_result {
                 return windows_error_result(&context, &message);
             }
-        }
+            true
+        };
 
         let toolchain = self
             .operations
@@ -570,6 +576,8 @@ impl<O: WindowsOperations> WindowsExecutor<O> {
         let mut stream_request = StreamingCommand::shell(String::new());
         stream_request.command = StreamingCommandSpec::Args(argv);
         stream_request.log_path = Some(request.log_path.clone());
+        stream_request.rotated_segments = request.rotated_segments;
+        stream_request.append = bootstrapped_log;
         stream_request.timeout = Some(request.target.timeout());
         stream_request.required_contract_markers = required_markers(request.contract.as_ref());
         stream_request.progress_callback = progress_callback;
@@ -617,8 +625,8 @@ impl<O: WindowsOperations> WindowsExecutor<O> {
 
         let bundle_bytes = safe_filesize(&bundle_path);
         let expected_bundle_bytes = u64::try_from(bundle_bytes).ok();
-        let _ =
-            bootstrap_bundle_upload_log(context, request, host, &request.target.remote_bundle_path);
+        bootstrap_bundle_upload_log(context, request, host, &request.target.remote_bundle_path)
+            .map_err(|error| format!("Unable to initialize bundle upload log: {error}"))?;
         let _ = append_log(
             context.log_path,
             &format!(
@@ -1588,6 +1596,7 @@ fn bootstrap_bundle_upload_log(
     if let Some(parent) = context.log_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    crate::log_retention::rotate_before_open(context.log_path, request.rotated_segments)?;
     let mut text = String::new();
     let _ = writeln!(text, "# shipyard ssh-windows lane log");
     let _ = writeln!(text, "target: {}", context.target.name);
@@ -1925,6 +1934,7 @@ mod tests {
                 .expect("log")
                 .path()
                 .to_path_buf(),
+            rotated_segments: 4,
             resume_from: None,
             mode: "default".to_owned(),
             progress_callback: None,
@@ -2310,8 +2320,10 @@ mod tests {
         operations.remote_has_sha = false;
         operations.remote_head = Some("abc1234".to_owned());
         let executor = WindowsExecutor::with_operations(operations);
-        let request = windows_request(WindowsValidation::Command("ctest".to_owned()));
+        let mut request = windows_request(WindowsValidation::Command("ctest".to_owned()));
+        request.rotated_segments = 2;
         let log_path = request.log_path.clone();
+        std::fs::write(&log_path, "prior validation evidence\n").expect("prior log");
 
         let result = executor.validate(request);
 
@@ -2321,10 +2333,14 @@ mod tests {
         assert_eq!(calls.upload_count, 1);
         assert_eq!(calls.probe_count, 1);
         assert_eq!(calls.apply_count, 1);
-        let log = std::fs::read_to_string(log_path).expect("log");
+        let log = std::fs::read_to_string(&log_path).expect("log");
         assert!(log.contains("bundle_mode=delta"));
         assert!(log.contains("remote_head=abc1234"));
         assert!(log.contains("bundle post-upload probe: OK size=123"));
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.1", log_path.display())).expect("rotated log"),
+            "prior validation evidence\n"
+        );
     }
 
     #[test]

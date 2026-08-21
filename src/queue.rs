@@ -169,35 +169,71 @@ impl Queue {
 
     /// Replace a queued job matched by id, then trim old completed jobs.
     pub fn update(&mut self, job: &Job) -> QueueResult<()> {
-        self.with_jobs_locked(|jobs| {
-            let Some(queued) = jobs.iter_mut().find(|queued| queued.id == job.id) else {
-                return Err(QueueError::StateConflict(format!(
-                    "job {} is not present in the durable queue",
-                    job.id
-                )));
-            };
-            if queued.status == JobStatus::Running
-                && queued.cancel_requested_at.is_some()
-                && (job.cancel_requested_at != queued.cancel_requested_at
-                    || job.cancellation_reason != queued.cancellation_reason)
-            {
-                return Err(QueueError::StateConflict(format!(
-                    "job {} has a newer cancellation request",
-                    job.id
-                )));
-            }
-            if matches!(queued.status, JobStatus::Completed | JobStatus::Cancelled)
-                && queued.status != job.status
-            {
-                return Err(QueueError::StateConflict(format!(
-                    "job {} is already terminal as {:?}",
-                    job.id, queued.status
-                )));
-            }
-            *queued = job.clone();
-            let _ = trim_terminal(jobs);
-            Ok(())
+        let _lock = StateLock::acquire(self.state_lock_file())?;
+        let mut jobs = self.read_jobs_from_disk()?;
+        let Some(queued) = jobs.iter_mut().find(|queued| queued.id == job.id) else {
+            return Err(QueueError::StateConflict(format!(
+                "job {} is not present in the durable queue",
+                job.id
+            )));
+        };
+        if queued.status == JobStatus::Running
+            && queued.cancel_requested_at.is_some()
+            && (job.cancel_requested_at != queued.cancel_requested_at
+                || job.cancellation_reason != queued.cancellation_reason)
+        {
+            return Err(QueueError::StateConflict(format!(
+                "job {} has a newer cancellation request",
+                job.id
+            )));
+        }
+        if matches!(queued.status, JobStatus::Completed | JobStatus::Cancelled)
+            && queued.status != job.status
+        {
+            return Err(QueueError::StateConflict(format!(
+                "job {} is already terminal as {:?}",
+                job.id, queued.status
+            )));
+        }
+        let terminal = matches!(job.status, JobStatus::Completed | JobStatus::Cancelled);
+        if terminal {
+            crate::log_retention::invalidate_conflicting_terminal_manifest(&self.state_dir, job)?;
+        }
+        *queued = job.clone();
+        let _ = trim_terminal(&mut jobs);
+        self.save_jobs_to_disk(&jobs)?;
+        if terminal {
+            // The queue outcome is authoritative and must not be stranded by
+            // an ancillary manifest failure (notably a full log filesystem).
+            // Missing manifests remain fail-safe protected during cleanup.
+            let _ = crate::log_retention::write_terminal_manifest(&self.state_dir, job);
+        }
+        Ok(())
+    }
+
+    /// Hold the queue state lock across a retention mutation boundary.
+    pub(crate) fn lock_for_log_cleanup(&self) -> QueueResult<QueueStateGuard> {
+        Ok(QueueStateGuard {
+            _inner: StateLock::acquire(self.state_lock_file())?,
         })
+    }
+
+    /// Publish a recovered terminal manifest only if its queue disposition is
+    /// still current, serialized with all other queue/manifest mutations.
+    pub(crate) fn publish_terminal_manifest_if_current(&self, recovered: &Job) -> QueueResult<()> {
+        let _lock = StateLock::acquire(self.state_lock_file())?;
+        let jobs = self.read_jobs_from_disk()?;
+        let Some(current) = jobs.iter().find(|job| job.id == recovered.id) else {
+            return Ok(());
+        };
+        let recovered_manifest = crate::log_retention::TerminalLogManifest::from_job(recovered);
+        if !matches!(current.status, JobStatus::Completed | JobStatus::Cancelled)
+            || crate::log_retention::TerminalLogManifest::from_job(current) != recovered_manifest
+        {
+            return Ok(());
+        }
+        let _ = crate::log_retention::write_terminal_manifest(&self.state_dir, current);
+        Ok(())
     }
 
     /// Atomically request cancellation. Running jobs retain their status and
@@ -567,6 +603,10 @@ impl Queue {
             job.status = JobStatus::Completed;
             job.completed_at = Some(Utc::now());
             let completed = job.clone();
+            crate::log_retention::invalidate_conflicting_terminal_manifest(
+                &self.state_dir,
+                &completed,
+            )?;
             let _ = trim_terminal(jobs);
             Ok(Some(completed))
         })
@@ -597,6 +637,10 @@ impl Queue {
                 job.results.insert(target_name.clone(), result);
             }
             let completed = job.clone();
+            crate::log_retention::invalidate_conflicting_terminal_manifest(
+                &self.state_dir,
+                &completed,
+            )?;
             let _ = trim_terminal(jobs);
             Ok(Some(completed))
         })
@@ -675,6 +719,11 @@ fn backfill_pending_workload_scopes(jobs: &mut [Job], request_store: Option<&Que
         };
         job.workload_scope = Some(envelope.workload_scope());
     }
+}
+
+/// Opaque queue-state guard used to serialize cleanup with terminal publication.
+pub(crate) struct QueueStateGuard {
+    _inner: StateLock,
 }
 
 fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {

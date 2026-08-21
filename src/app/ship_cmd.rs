@@ -176,8 +176,11 @@ pub(super) fn ship_command<W: Write>(
     let prepared = PreparedStateStore::new(runtime_paths.state_dir.join("prepared"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let warm_pool = WarmPool::new(default_pool_path(&runtime_paths.state_dir));
-    let dispatcher =
-        ExecutorDispatcher::new_with_state_dir(Some(prepared), &runtime_paths.state_dir);
+    let dispatcher = ExecutorDispatcher::new_with_state_dir_and_log_retention(
+        Some(prepared),
+        &runtime_paths.state_dir,
+        crate::log_retention::LogRetentionPolicy::from_config(config),
+    );
     let request = ShipExecutionRequest {
         pr: pr_context.number,
         repo,

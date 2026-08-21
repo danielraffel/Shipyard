@@ -212,79 +212,154 @@ pub fn preflight_mutation_authority(
 /// termination cannot run `Drop`, so readers classify these as uncertain.
 pub fn uncertain_mutations(state_root: &Path) -> Result<Vec<serde_json::Value>, String> {
     let audit_path = state_root.join(AUDIT_FILE);
-    let contents = match fs::read_to_string(&audit_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(format!(
-                "failed to read merge-queue mutation audit {}: {error}; mutations remain blocked",
-                audit_path.display()
-            ));
-        }
+    let Some((_audit_lock, ordered_paths)) = locked_audit_paths(&audit_path)? else {
+        return Ok(Vec::new());
     };
+    read_uncertain_from_paths(&ordered_paths)
+}
+
+fn read_uncertain_from_paths(ordered_paths: &[PathBuf]) -> Result<Vec<serde_json::Value>, String> {
     let mut started = BTreeMap::new();
-    for (index, line) in contents.lines().enumerate() {
-        let mut value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+    for path in ordered_paths {
+        let contents = fs::read_to_string(path).map_err(|error| {
             format!(
-                "malformed merge-queue mutation audit {} at line {}: {error}; mutations remain blocked",
-                audit_path.display(),
-                index + 1
+                "failed to read merge-queue mutation audit {}: {error}; mutations remain blocked",
+                path.display()
             )
         })?;
-        let Some(correlation_id) = value
-            .get("correlation_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-        else {
-            return Err(format!(
-                "malformed merge-queue mutation audit {} at line {}: missing correlation_id; mutations remain blocked",
-                audit_path.display(),
-                index + 1
-            ));
-        };
-        match value.get("phase").and_then(serde_json::Value::as_str) {
-            Some("started") => {
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("outcome".to_owned(), json!("uncertain"));
-                }
-                started.insert(correlation_id, value);
-            }
-            Some("finished") => {
-                if value.get("outcome").and_then(serde_json::Value::as_str) == Some("uncertain") {
-                    if let Some(existing) = started.get_mut(&correlation_id) {
-                        if let Some(object) = existing.as_object_mut() {
-                            object.insert("outcome".to_owned(), json!("uncertain"));
-                            object.insert(
-                                "finished_at".to_owned(),
-                                value
-                                    .get("timestamp")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null),
-                            );
-                        }
-                    } else {
-                        started.insert(correlation_id, value);
-                    }
-                } else {
-                    started.remove(&correlation_id);
-                }
-            }
-            _ => {
-                return Err(format!(
-                    "malformed merge-queue mutation audit {} at line {}: invalid phase; mutations remain blocked",
-                    audit_path.display(),
-                    index + 1
-                ));
-            }
+        for (index, line) in contents.lines().enumerate() {
+            apply_audit_line(path, index, line, &mut started)?;
         }
     }
     Ok(started.into_values().collect())
+}
+
+fn locked_audit_paths(audit_path: &Path) -> Result<Option<(File, Vec<PathBuf>)>, String> {
+    let Some(audit_dir) = audit_path.parent() else {
+        return Ok(None);
+    };
+    if !audit_dir.is_dir() {
+        return Ok(None);
+    }
+    let audit_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(audit_path.with_extension("lock"))
+        .map_err(|error| format!("failed to lock merge-queue mutation audit: {error}"))?;
+    audit_lock
+        .lock_exclusive()
+        .map_err(|error| format!("failed to lock merge-queue mutation audit: {error}"))?;
+    Ok(ordered_audit_paths(audit_path)?.map(|paths| (audit_lock, paths)))
+}
+
+fn ordered_audit_paths(audit_path: &Path) -> Result<Option<Vec<PathBuf>>, String> {
+    let Some(audit_dir) = audit_path.parent() else {
+        return Ok(None);
+    };
+    if !audit_dir.is_dir() {
+        return Ok(None);
+    }
+    let mut audit_paths = fs::read_dir(audit_dir)
+        .map_err(|error| format!("failed to list merge-queue mutation audit: {error}"))?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            name.strip_prefix("mutations.jsonl.")?
+                .parse::<usize>()
+                .ok()
+                .map(|index| (index, path))
+        })
+        .collect::<Vec<_>>();
+    audit_paths.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+    let mut ordered_paths = audit_paths
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect::<Vec<_>>();
+    if audit_path.exists() && !audit_path.is_file() {
+        return Err(format!(
+            "failed to read merge-queue mutation audit {}: not a regular file; mutations remain blocked",
+            audit_path.display()
+        ));
+    }
+    if audit_path.is_file() {
+        ordered_paths.push(audit_path.to_path_buf());
+    }
+    if ordered_paths.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ordered_paths))
+}
+
+fn apply_audit_line(
+    path: &Path,
+    index: usize,
+    line: &str,
+    started: &mut BTreeMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+        format!(
+            "malformed merge-queue mutation audit {} at line {}: {error}; mutations remain blocked",
+            path.display(),
+            index + 1
+        )
+    })?;
+    let Some(correlation_id) = value
+        .get("correlation_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Err(format!(
+            "malformed merge-queue mutation audit {} at line {}: missing correlation_id; mutations remain blocked",
+            path.display(),
+            index + 1
+        ));
+    };
+    match value.get("phase").and_then(serde_json::Value::as_str) {
+        Some("started") => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("outcome".to_owned(), json!("uncertain"));
+            }
+            started.insert(correlation_id, value);
+        }
+        Some("finished") => {
+            if value.get("outcome").and_then(serde_json::Value::as_str) == Some("uncertain") {
+                if let Some(existing) = started.get_mut(&correlation_id) {
+                    if let Some(object) = existing.as_object_mut() {
+                        object.insert("outcome".to_owned(), json!("uncertain"));
+                        object.insert(
+                            "finished_at".to_owned(),
+                            value
+                                .get("timestamp")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        );
+                    }
+                } else {
+                    started.insert(correlation_id, value);
+                }
+            } else {
+                started.remove(&correlation_id);
+            }
+        }
+        _ => {
+            return Err(format!(
+                "malformed merge-queue mutation audit {} at line {}: invalid phase; mutations remain blocked",
+                path.display(),
+                index + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve one previously uncertain mutation after authoritative GitHub
 /// reconciliation. The resolution itself is serialized and audited.
 pub fn resolve_uncertainty(
     state_root: &Path,
+    global_dir: &Path,
     correlation_id: &str,
     outcome: &str,
     reason: &str,
@@ -293,6 +368,9 @@ pub fn resolve_uncertainty(
         return Err("uncertain mutation outcome must be `accepted` or `rejected`".to_owned());
     }
     let mut control_lock = acquire_control_lock(state_root, false)?;
+    let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+        .map_err(|error| format!("failed to load merge-queue log policy: {error}"))?;
+    let retention_policy = crate::log_retention::LogRetentionPolicy::from_config(&config);
     let unresolved = uncertain_mutations(state_root)?;
     let Some(entry) = unresolved.iter().find(|entry| {
         entry
@@ -354,6 +432,7 @@ pub fn resolve_uncertainty(
     }
     append_audit(
         &state_root.join(AUDIT_FILE),
+        retention_policy,
         &json!({
             "timestamp": Utc::now(),
             "correlation_id": correlation_id,
@@ -402,6 +481,7 @@ pub fn supersede_uncertainty(
     validate_machine_authority(&config, state_root)?;
     append_audit(
         &state_root.join(AUDIT_FILE),
+        crate::log_retention::LogRetentionPolicy::from_config(&config),
         &json!({
             "timestamp": Utc::now(),
             "correlation_id": correlation_id,
@@ -427,6 +507,11 @@ pub struct MergeQueueMutationGuard {
     correlation_id: String,
     action: String,
     finished: bool,
+    retention_policy: crate::log_retention::LogRetentionPolicy,
+    repo: String,
+    base: String,
+    pr: u64,
+    head: String,
 }
 
 /// A mutation correlation that may be persisted before authority is acquired.
@@ -734,6 +819,7 @@ impl MergeQueueMutationGuard {
         let audit_path = state_root.join(AUDIT_FILE);
         append_audit(
             &audit_path,
+            crate::log_retention::LogRetentionPolicy::from_config(config),
             &json!({
                 "timestamp": Utc::now(),
                 "correlation_id": correlation_id,
@@ -756,6 +842,11 @@ impl MergeQueueMutationGuard {
             correlation_id,
             action: action.to_owned(),
             finished: false,
+            retention_policy: crate::log_retention::LogRetentionPolicy::from_config(config),
+            repo: state.repo.clone(),
+            base: state.base_branch.clone(),
+            pr: state.pr,
+            head: state.head_sha.clone(),
         })
     }
 
@@ -763,12 +854,17 @@ impl MergeQueueMutationGuard {
     pub fn finish(mut self, outcome: &str) -> Result<(), String> {
         append_audit(
             &self.audit_path,
+            self.retention_policy,
             &json!({
                 "timestamp": Utc::now(),
                 "correlation_id": self.correlation_id,
                 "phase": "finished",
                 "action": self.action,
                 "outcome": outcome,
+                "repo": self.repo,
+                "base": self.base,
+                "pr": self.pr,
+                "head": self.head,
             }),
         )
         .map_err(|error| format!("failed to write merge-queue mutation result: {error}"))?;
@@ -782,12 +878,17 @@ impl Drop for MergeQueueMutationGuard {
         if !self.finished {
             let _ = append_audit(
                 &self.audit_path,
+                self.retention_policy,
                 &json!({
                     "timestamp": Utc::now(),
                     "correlation_id": self.correlation_id,
                     "phase": "finished",
                     "action": self.action,
                     "outcome": "uncertain",
+                    "repo": self.repo,
+                    "base": self.base,
+                    "pr": self.pr,
+                    "head": self.head,
                 }),
             );
         }
@@ -880,7 +981,11 @@ fn queue_key(repo: &str, base: &str) -> String {
     hex::encode(&digest.finalize()[..12])
 }
 
-fn append_audit(path: &Path, value: &serde_json::Value) -> io::Result<()> {
+fn append_audit(
+    path: &Path,
+    policy: crate::log_retention::LogRetentionPolicy,
+    value: &serde_json::Value,
+) -> io::Result<()> {
     let lock_path = path.with_extension("lock");
     let lock = OpenOptions::new()
         .create(true)
@@ -889,13 +994,21 @@ fn append_audit(path: &Path, value: &serde_json::Value) -> io::Result<()> {
         .write(true)
         .open(lock_path)?;
     lock.lock_exclusive()?;
+    let unresolved = ordered_audit_paths(path)
+        .map_err(io::Error::other)?
+        .map_or_else(|| Ok(Vec::new()), |paths| read_uncertain_from_paths(&paths))
+        .map_err(io::Error::other)?;
+    if unresolved.is_empty() {
+        crate::log_retention::rotate_if_oversize(path, policy)?;
+    }
     let result = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .and_then(|mut audit| {
             writeln!(audit, "{value}")?;
-            audit.sync_all()
+            audit.sync_all()?;
+            crate::log_retention::sync_parent_directory(path)
         });
     let unlock_result = lock.unlock();
     result.and(unlock_result)

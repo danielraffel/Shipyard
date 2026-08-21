@@ -604,12 +604,34 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
     if read_daemon_status(&request.state_dir).is_some() {
         return Ok(read_pid_file(&daemon_dir.join("daemon.pid")).unwrap_or(0));
     }
-    if let Some(pid) = live_daemon_pid(&daemon_dir) {
-        let _ = terminate_daemon_pid(pid, Duration::from_secs(3));
+    if let Some(pid) = read_pid_file(&daemon_dir.join("daemon.pid"))
+        && pid > 0
+        && pid_alive(pid)
+    {
+        if !process_looks_like_shipyard_daemon(pid) {
+            return Err(DaemonSpawnFailedError(format!(
+                "refusing to replace live process {pid}: daemon identity could not be confirmed"
+            )));
+        }
+        if !terminate_daemon_pid(pid, Duration::from_secs(3)) {
+            return Err(DaemonSpawnFailedError(format!(
+                "refusing to replace daemon process {pid}: termination could not be confirmed"
+            )));
+        }
     }
     cleanup_stale_runtime_files(&daemon_dir).map_err(|error| io_spawn_error(&error))?;
 
     let log_path = daemon_dir.join("daemon.log");
+    let retention_config = request.global_dir_override.clone().map_or_else(
+        || LoadedConfig::load_machine_global(request.mode),
+        LoadedConfig::load_machine_global_from_dir,
+    );
+    let retention_policy = retention_config.map_or_else(
+        |_| crate::log_retention::LogRetentionPolicy::default(),
+        |config| crate::log_retention::LogRetentionPolicy::from_config(&config),
+    );
+    crate::log_retention::rotate_if_oversize(&log_path, retention_policy)
+        .map_err(|error| io_spawn_error(&error))?;
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1439,6 +1461,11 @@ fn process_looks_like_shipyard_daemon(pid: u32) -> bool {
 
     let args = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
     args.contains("shipyard") && args.contains("daemon") && args.contains("run")
+}
+
+#[cfg(not(unix))]
+fn process_looks_like_shipyard_daemon(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(unix)]

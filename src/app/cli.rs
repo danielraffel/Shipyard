@@ -188,6 +188,9 @@ pub(super) enum Command {
     },
     /// Clean up old logs, bundles, evidence, and optional ship-state.
     Cleanup {
+        /// Indefinitely pin one job's logs for incident/audit preservation.
+        #[arg(long, value_name = "JOB_ID")]
+        pin: Option<String>,
         /// Show what would be cleaned up.
         #[arg(long = "dry-run", action = ArgAction::SetTrue, default_value_t = true)]
         dry_run: bool,
