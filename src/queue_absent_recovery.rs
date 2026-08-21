@@ -1,7 +1,7 @@
 //! Opt-in, crash-safe recovery for an in-flight ship whose exact durable work
 //! item has fallen out of the queue.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,14 +19,41 @@ use crate::identity::RuntimeMode;
 use crate::job::{Job, JobKind, JobStatus};
 use crate::queue::{Queue, RecoveryEnqueue};
 use crate::queue_request::{
-    JobResourcePlan, QueueOutcomeStore, QueueRequestStore, QueuedExecutionEnvelope,
-    QueuedExecutionKind, QueuedExecutionRequest,
+    JobResourcePlan, QueueOutcomeStore, QueueRequestError, QueueRequestStore,
+    QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest,
 };
 use crate::ship_liveness::{queue_absent_recovery_enabled, queue_absent_repo_path};
 use crate::ship_state::{ShipState, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
 
 const RECOVERY_SCHEMA_VERSION: u32 = 1;
+
+/// Request envelopes that remain authoritative for active ship recovery.
+///
+/// The generic absent-envelope sweep runs much earlier than queue-absence
+/// recovery becomes eligible. Preserve exact request provenance for every
+/// nonterminal ship state so cleanup cannot destroy the only recovery
+/// authority before the supervisor claims it.
+pub(crate) fn protected_request_job_ids(
+    state_dir: &Path,
+    request_store: &QueueRequestStore,
+) -> Result<BTreeSet<String>, QueueRequestError> {
+    let active_states = ShipStateStore::new(state_dir.join("ship"))?
+        .list_active()
+        .into_iter()
+        .filter(|state| ship_terminal_verdict(state).is_none())
+        .collect::<Vec<_>>();
+    let envelopes = request_store.list()?;
+    Ok(envelopes
+        .into_iter()
+        .filter(|envelope| {
+            active_states
+                .iter()
+                .any(|state| envelope_matches_state(envelope, state))
+        })
+        .map(|envelope| envelope.job_id)
+        .collect())
+}
 
 /// Typed durable recovery disposition.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -874,6 +901,43 @@ mod tests {
                 .expect("pending")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn absent_envelope_sweep_preserves_nonterminal_ship_recovery_authority() {
+        let fixture = Fixture::new();
+        let request_store = QueueRequestStore::new(&fixture.state_dir).expect("requests");
+        let retained = protected_request_job_ids(&fixture.state_dir, &request_store)
+            .expect("protected request ids");
+        assert_eq!(retained, BTreeSet::from([fixture.source_job_id.clone()]));
+        assert!(
+            request_store
+                .sweep_absent_older_than(&retained, Duration::ZERO)
+                .expect("sweep active ship requests")
+                .is_empty()
+        );
+        assert!(
+            request_store
+                .load(&fixture.source_job_id)
+                .expect("load retained source")
+                .is_some()
+        );
+
+        let state_store = ShipStateStore::new(fixture.state_dir.join("ship")).expect("state store");
+        let mut state = state_store.get_scoped(REPO, 42).expect("state");
+        state
+            .evidence_snapshot
+            .insert("mac".to_owned(), "pass".to_owned());
+        state_store.save(&state).expect("terminal state");
+        let retained = protected_request_job_ids(&fixture.state_dir, &request_store)
+            .expect("terminal request ids");
+        assert!(retained.is_empty());
+        assert_eq!(
+            request_store
+                .sweep_absent_older_than(&retained, Duration::ZERO)
+                .expect("sweep terminal ship requests"),
+            vec![fixture.source_job_id]
         );
     }
 

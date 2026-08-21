@@ -1220,7 +1220,7 @@ fn run_drain_worker_cycle_scoped<D: ShipTargetDispatcher + Sync>(
     let outcome_store = QueueOutcomeStore::new(state_dir).map_err(QueueRequestError::from)?;
     let _trimmed_job_ids = queue.trim_terminal_jobs_for_drain(drain_lock)?;
     let jobs = queue.get_all()?;
-    sweep_absent_queue_envelopes(&jobs, &request_store, &outcome_store)?;
+    sweep_absent_queue_envelopes(state_dir, &jobs, &request_store, &outcome_store)?;
     let queue_state_dir = queue.state_dir().to_path_buf();
     let mut already_merged_observer =
         crate::queue_scheduler::AlreadyMergedObserver::from_config(config);
@@ -1518,6 +1518,7 @@ fn restrict_admit_pass_to_awaited(
 }
 
 fn sweep_absent_queue_envelopes(
+    state_dir: &Path,
     jobs: &[Job],
     request_store: &QueueRequestStore,
     outcome_store: &QueueOutcomeStore,
@@ -1526,7 +1527,12 @@ fn sweep_absent_queue_envelopes(
         .iter()
         .map(|job| job.id.clone())
         .collect::<BTreeSet<_>>();
-    request_store.sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
+    let mut retained_request_ids = active_job_ids.clone();
+    retained_request_ids.extend(crate::queue_absent_recovery::protected_request_job_ids(
+        state_dir,
+        request_store,
+    )?);
+    request_store.sweep_absent_older_than(&retained_request_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
     outcome_store.sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
     Ok(())
 }
