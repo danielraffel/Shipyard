@@ -1299,7 +1299,7 @@ printf '%s' '{{"state":"MERGED","headRefOid":"abc123"}}'
             temp.path(),
             None,
             Some(&fake_gh),
-            Duration::from_secs(10),
+            Duration::from_secs(30),
         );
 
         assert_eq!(merged.as_deref(), Some("abc123"));

@@ -418,7 +418,51 @@ the default `0`, execution is byte-identical to no retry. Composes with
 `classify_local_failures` (a relabelled-`INFRA` failure becomes retry-eligible).
 Full behavior: `docs/local-mac-pool.md` § Same-backend transient retry.
 
-## Durable Queue: killed-worker recovery (stale-running reaping)
+## Durable Queue: daemon-owned execution
+
+When local validation is required, normal `shipyard run`, `shipyard ship`, and
+`shipyard pr` submissions persist their resolved request and exact
+checkout/configuration provenance, ensure the matching-version daemon is live,
+and return after the daemon accepts durable ownership. (`shipyard pr` may
+instead complete an enabled terminal steward handoff before local validation.)
+Ending the submitting terminal, agent session, or model allocation must not
+terminate the validation worker. Use `--foreground` only for explicit
+interactive debugging where terminal lifetime should own execution.
+This first replacement is deliberately Unix-only (macOS and Unix hosts) and
+single-worker. On Windows and other platforms where the Unix process-group
+contract is unavailable, these commands retain foreground execution instead of
+pretending the job has durable daemon ownership. Parallel proof, sharding, and
+multi-worker admission are separate work and are not implied by this feature.
+
+Each worker runs in a separate process group with an unpredictable generation
+receipt. A restarted daemon adopts only a live process whose PID, job id, and
+generation all match the durable receipt. A `Running` job without that exact
+live identity becomes terminal `UNCERTAIN`; Shipyard never blindly replays work
+that may already have produced side effects. Pending work is replay-safe only
+when its canonical cwd, repository root/origin, HEAD, tree signature, and
+resolved layered configuration still match. Legacy or malformed pending
+requests are cancelled with an explicit reason and cannot block unrelated
+valid jobs. `shipyard cancel` terminates the complete daemon-owned process
+group, including descendants. A terminal worker receipt continues to reserve
+the single execution slot until process-group death is proven; a failed kill
+cannot release capacity into overlapping side effects.
+
+The daemon also observes queued and running ship PRs. It cancels only when the
+authoritative PR state is merged and GitHub reports the exact head SHA stored in
+the durable request. It writes the terminal queue record and typed outcome
+before terminating the process group. Open PRs, a different merged head, auth
+failure, timeout, and malformed or ambiguous responses are no-ops. Terminal
+queue records are immutable against stale worker progress, and a later daemon
+tick repairs a missing typed outcome from the winning terminal record.
+
+Daemon-owned GitHub work requires `[github.auth] source = "command"`, so an
+existing daemon can refresh credentials independently of the submitting shell;
+`env` and ambient interactive `gh` auth are intentionally rejected. A
+running daemon from another Shipyard version must be refreshed before a new
+job is persisted. Adding a new repository to a same-version daemon refreshes
+its registration set while exact live workers remain independently owned.
+
+## Legacy Queue Recovery: killed-worker stale-running reaping
 
 A `shipyard ship` / `shipyard pr` worker that is killed (SIGTERM, crash,
 `kill <pid>`) leaves its job `status: running` in the durable queue
@@ -429,7 +473,8 @@ the queue job intact, and the startup reaper
 (`recover_stale_running_jobs_for_drain`) only fires on daemon restart, so a
 long-lived daemon never recovered. The only fix was hand-editing `queue.json`.
 
-As of v0.68.0 the queue auto-recovers: a `Running` job whose freshest heartbeat
+For foreground and pre-daemon-owned jobs, the v0.68.0 queue recovery remains:
+a `Running` job whose freshest heartbeat
 is older than `DEFAULT_RUNNING_JOB_STALE_SECONDS` (180s) is treated as a dead
 worker and reaped to `Cancelled` — at ship-submit time
 (`refuse_same_pr_running_ship` reaps the stale job, then proceeds) and on every
@@ -438,9 +483,9 @@ staleness under the queue lock, so a worker merely between heartbeats is never
 killed; a "stale" job that revived between plan and apply defers conflicting
 starts to the next pass rather than double-running the PR.
 
-Pending ship jobs whose PR merged while they waited are cancelled only when
-GitHub reports the same exact head SHA recorded in the durable request. The
-drain batches by `(repository, PR)`, reuses one result for duplicate jobs, and
+Pending and running ship jobs whose PR merged are cancelled only when GitHub
+reports the same exact head SHA recorded in the durable request. The observer
+batches by `(repository, PR)`, reuses one result for duplicate jobs, and
 throttles re-observation for 30 seconds. GitHub reads must use the effective
 `GhClient`, an explicit `--repo`, and the shared 15-second credential-plus-child
 budget; auth, timeout, malformed JSON, and head drift all fail closed.

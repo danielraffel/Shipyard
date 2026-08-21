@@ -377,6 +377,8 @@ impl Job {
         let mut next = self.clone();
         next.status = JobStatus::Running;
         next.started_at = Some(Utc::now());
+        next.scheduler_defer_reason = None;
+        next.scheduler_defer_until = None;
         Ok(next)
     }
 
@@ -405,7 +407,27 @@ impl Job {
         next.status = JobStatus::Cancelled;
         next.completed_at = Some(Utc::now());
         next.cancellation_reason = reason;
-        next.cancel_requested_at = next.completed_at;
+        next.cancel_requested_at = self.cancel_requested_at.or(next.completed_at);
+        Ok(next)
+    }
+
+    /// Request cancellation without releasing a running job's resource claims.
+    /// Pending work can terminate immediately; running work remains running
+    /// until its exact owner has stopped the process tree and acknowledges the
+    /// request with [`Self::cancel_with_reason`].
+    pub fn request_cancel_with_reason(
+        &self,
+        reason: Option<String>,
+    ) -> Result<Self, JobTransitionError> {
+        if self.status == JobStatus::Pending {
+            return self.cancel_with_reason(reason);
+        }
+        if self.status != JobStatus::Running {
+            return Err(JobTransitionError::InvalidCancel(self.status));
+        }
+        let mut next = self.clone();
+        next.cancellation_reason = reason;
+        next.cancel_requested_at = Some(Utc::now());
         Ok(next)
     }
 

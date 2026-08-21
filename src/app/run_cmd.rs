@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode};
 use serde_json::Value;
 
 use super::CliFailure;
+use super::daemon_cmd::ensure_execution_daemon;
 use crate::config::LoadedConfig;
 use crate::evidence::EvidenceStore;
 use crate::executor::dispatch::{
@@ -20,7 +21,9 @@ use crate::preflight::{
 };
 use crate::prepared_state::PreparedStateStore;
 use crate::queue::Queue;
-use crate::ship::{RunExecutionRequest, RunStores, drain_or_wait_run, submit_run};
+use crate::ship::{
+    RunExecutionRequest, RunStores, drain_or_wait_run, submit_run, submit_run_daemon,
+};
 use crate::warm_pool::{WarmPool, default_pool_path};
 
 pub(super) struct RunCommandArgs {
@@ -35,6 +38,7 @@ pub(super) struct RunCommandArgs {
     pub(super) skip_targets: Vec<String>,
     pub(super) warm: WarmPolicy,
     pub(super) tree_drift: TreeDriftPolicy,
+    pub(super) foreground: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +113,7 @@ impl TreeDriftPolicy {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn run_command<W: Write>(
     args: RunCommandArgs,
     config: &LoadedConfig,
@@ -117,6 +122,7 @@ pub(super) fn run_command<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let daemon_owned = !args.foreground && cfg!(unix);
     let mode = args.mode;
     let resolved =
         resolve_targets(config, mode).map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -131,6 +137,11 @@ pub(super) fn run_command<W: Write>(
     if args.tree_drift == TreeDriftPolicy::Allow {
         set_allow_tree_drift(&mut targets);
     }
+    validate_daemon_run_auth(
+        daemon_owned,
+        targets.iter().any(target_uses_cloud),
+        config.get_str("github.auth.source"),
+    )?;
 
     let preflight_dispatcher = ExecutorDispatcher::new(None);
     let mut preflight = collect_ship_preflight_with_options(
@@ -184,8 +195,58 @@ pub(super) fn run_command<W: Write>(
         resume_from: args.resume_from,
         targets,
     };
-    let job = submit_run(&request, &mut queue, cwd, &runtime_paths.state_dir)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if daemon_owned
+        && crate::queue_request::ExecutionProvenance::capture_with_config(
+            cwd,
+            None,
+            &request.sha,
+            config,
+        )
+        .is_none()
+    {
+        return Err(CliFailure::new(
+            2,
+            "could not capture exact repository, HEAD, and tree provenance for daemon ownership",
+        ));
+    }
+    if daemon_owned {
+        ensure_execution_daemon(
+            if runtime_paths.mode == crate::identity::RuntimeMode::Isolated.as_str() {
+                crate::identity::RuntimeMode::Isolated
+            } else {
+                crate::identity::RuntimeMode::Shipyard
+            },
+            runtime_paths,
+            Vec::new(),
+        )?;
+    }
+    let job = if daemon_owned {
+        submit_run_daemon(&request, &mut queue, cwd, &runtime_paths.state_dir, config)
+    } else {
+        submit_run(&request, &mut queue, cwd, &runtime_paths.state_dir)
+    }
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if daemon_owned {
+        if json_mode {
+            write_json_envelope(
+                stdout,
+                "run",
+                fields([
+                    ("run", job.to_json_value()),
+                    ("preflight", preflight.to_json_value()),
+                ]),
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        } else {
+            writeln!(
+                stdout,
+                "Queued {}. The Shipyard daemon owns execution.",
+                job.id
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let outcome = drain_or_wait_run(
         &request,
         job.clone(),
@@ -218,6 +279,43 @@ pub(super) fn run_command<W: Write>(
     }
 
     Ok(run_exit_code(&outcome.job))
+}
+
+fn target_uses_cloud(target: &ResolvedTarget) -> bool {
+    match &target.backend {
+        ResolvedBackend::Cloud(_) => true,
+        ResolvedBackend::Fallback(fallback) => fallback
+            .backends
+            .iter()
+            .any(|backend| target_uses_cloud(&backend.target)),
+        ResolvedBackend::Local(_)
+        | ResolvedBackend::Ssh(_)
+        | ResolvedBackend::Windows(_)
+        | ResolvedBackend::HostPool(_) => false,
+    }
+}
+
+fn validate_daemon_run_auth(
+    daemon_owned: bool,
+    uses_cloud: bool,
+    auth_source: Option<&str>,
+) -> Result<(), CliFailure> {
+    if !daemon_owned || !uses_cloud {
+        return Ok(());
+    }
+    if !matches!(auth_source, Some("env" | "command")) {
+        return Err(CliFailure::new(
+            2,
+            "daemon-owned cloud validation requires explicit github.auth source env or command; ambient gh auth is forbidden",
+        ));
+    }
+    if auth_source == Some("env") {
+        return Err(CliFailure::new(
+            2,
+            "daemon-owned run cannot use github.auth.source = env because an existing daemon does not inherit the submitting shell; use source = command or --foreground",
+        ));
+    }
+    Ok(())
 }
 
 fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
@@ -535,7 +633,18 @@ mod tests {
             skip_targets: Vec::new(),
             warm: WarmPolicy::Disabled,
             tree_drift: TreeDriftPolicy::from_flag(allow_tree_drift),
+            foreground: true,
         }
+    }
+
+    #[test]
+    fn daemon_run_env_auth_is_rejected_only_for_cloud_targets() {
+        assert!(super::validate_daemon_run_auth(true, false, Some("env")).is_ok());
+        let error = super::validate_daemon_run_auth(true, true, Some("env"))
+            .expect_err("cloud env auth must be rejected");
+        assert_eq!(error.code, 2);
+        assert!(error.message().contains("existing daemon"));
+        assert!(super::validate_daemon_run_auth(true, true, Some("command")).is_ok());
     }
 
     #[test]

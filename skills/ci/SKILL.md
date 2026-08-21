@@ -11,7 +11,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 
 | Task | Command |
 |------|---------|
-| Validate current branch | `shipyard run --json` |
+| Validate current branch | `shipyard run --json` (Unix/macOS: queues to the single-worker daemon and returns after durable acceptance; Windows remains foreground) |
 | Validate specific targets | `shipyard run --targets mac,ubuntu --json` |
 | Iterate on one platform's CI failure | `shipyard run --skip-target <others>` (see [Iterating on a single-platform failure](#iterating-on-a-single-platform-failure)) |
 | Fast smoke check | `shipyard run --smoke --json` |
@@ -19,7 +19,8 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Start the live-mode webhook daemon | `shipyard daemon start` |
 | Inspect the daemon | `shipyard daemon status --json` |
 | Stop the daemon | `shipyard daemon stop` |
-| Full ship (PR + validate + merge) | `shipyard ship --json` |
+| Full ship (PR + validate + merge) | `shipyard ship --json` (Unix/macOS: queues to the single-worker daemon and returns after durable acceptance; Windows remains foreground) |
+| Debug validation in this terminal | `shipyard run --foreground` / `shipyard ship --foreground` |
 | Ship to develop instead of main | `shipyard ship --base develop --json` |
 | Resume an interrupted ship | `shipyard ship --resume --json` (auto when state exists) |
 | Force-restart a stale ship | `shipyard ship --no-resume --json` |
@@ -93,7 +94,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Add a new lane to an in-flight PR | `shipyard cloud add-lane --pr <n> --target windows [--provider github-hosted]` (dry-run; add `--apply`) |
 | Rescue a PR whose runs are wedged on a self-hosted runner | `shipyard rescue <pr>` (preflights + dispatches a replacement before cancelling the old run; add `--dry-run` to preview, `--rerun-failed` for completed cancelled/failed/timed-out runs; omit `--to` to re-resolve a failed leg local-first, or pass `--to <provider>` to force) |
 | Rescue every stuck run repo-wide | `shipyard rescue --all-stuck` |
-| Same-PR ship refused by a killed worker (`SamePrShipRunning`) | v0.68.0+ auto-reaps the stale `running` queue job after ~180s — just retry `shipyard pr`. See the `shipyard` skill's "Durable Queue: killed-worker recovery". Don't run two `shipyard pr`s for one PR concurrently. |
+| Same-PR ship refused by a killed worker (`SamePrShipRunning`) | v0.68.0+ auto-reaps the stale `running` queue job after ~180s — just retry `shipyard pr`. See the `shipyard` skill's "Legacy Queue Recovery: killed-worker stale-running reaping". Don't run two `shipyard pr`s for one PR concurrently. |
 | PR stuck in-flight forever (never auto-merges after a host reboot / daemon crash) | `shipyard ship-state list` or `shipyard status` flags it `ORPHANED? [<evidence>]` — cross-referencing the queue: `queue_stale` (dead worker heartbeat) / `queue_terminal` (worker ended without finalizing) surface in ~3m; `queue_absent` / `time_fallback` are time-gated (default 45m, `[ship_state] orphan_stale_minutes`). A live or pending worker is never flagged. Re-run `shipyard ship <pr>` to re-validate (this clears any `abandoned` marker), or `shipyard ship-state discard <pr>` if truly dead. Detection is report-only; the daemon can optionally abandon a `queue_stale` orphan (so auto-merge stops waiting) via `[ship_state] auto_resume = true` (default off, fail-closed, never re-dispatches, re-reads the queue live under the per-PR lock so a concurrent re-ship is spared). See the `shipyard` skill's "Orphaned ship-state reporting". |
 | Skip a version-bump gate | `shipyard pr --skip-bump sdk --bump-reason "docs only"` |
 | Skip a skill-sync gate | `shipyard pr --skip-skill-update ci --skill-reason "mechanical"` |

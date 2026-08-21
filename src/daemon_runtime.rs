@@ -31,6 +31,8 @@ use crate::config::LoadedConfig;
 use crate::daemon_ipc::read_daemon_status;
 #[cfg(unix)]
 use crate::daemon_ipc::{IpcServer, IpcState, github_auth_degraded_message};
+#[cfg(unix)]
+use crate::execution_supervisor::ExecutionSupervisor;
 use crate::identity::RuntimeMode;
 #[cfg(unix)]
 use crate::reconcile::{
@@ -62,6 +64,8 @@ const WEBHOOK_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 pub struct DaemonRunConfig {
     /// Runtime mode used to decide production-vs-sandbox side effects.
     pub mode: RuntimeMode,
+    /// Global configuration root passed to delayed execution workers.
+    pub global_dir: PathBuf,
     /// Root state directory for the selected runtime mode.
     pub state_dir: PathBuf,
     /// Repos that the daemon should advertise in status.
@@ -187,12 +191,14 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         &registrar_cwd,
     )));
     let registration_error = Arc::new(Mutex::new(None::<String>));
+    let execution_error = Arc::new(Mutex::new(None::<String>));
     let ship_dir = config.state_dir.join("ship");
     let ship_dir_for_list = ship_dir.clone();
 
     let status_provider = daemon_status_provider(
         Arc::clone(&registrar),
         Arc::clone(&registration_error),
+        Arc::clone(&execution_error),
         Arc::clone(&last_event_at),
         Arc::clone(&tunnel_runtime.snapshot),
     );
@@ -213,7 +219,20 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut previous_states = ship_state_map(&ship_dir);
     let mut next_ship_state_scan_at = Instant::now() + SHIP_STATE_SCAN_INTERVAL;
     let mut registration_sync = RegistrationSyncState::default();
+    let mut execution_supervisor = ExecutionSupervisor::new(
+        std::env::current_exe()?,
+        config.mode,
+        config.global_dir.clone(),
+        config.state_dir.clone(),
+    );
     while running.load(Ordering::Acquire) {
+        let supervisor_error = execution_supervisor
+            .tick()
+            .err()
+            .map(|error| format!("execution_supervisor: {error}"));
+        if let Ok(mut last_error) = execution_error.lock() {
+            *last_error = supervisor_error;
+        }
         drain_webhook_events(
             &webhook_rx,
             &server,
@@ -285,6 +304,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
 fn daemon_status_provider(
     registrar: Arc<Mutex<Registrar>>,
     registration_error: Arc<Mutex<Option<String>>>,
+    execution_error: Arc<Mutex<Option<String>>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
     tunnel_snapshot: Arc<Mutex<TunnelSnapshot>>,
 ) -> impl Fn() -> IpcState + Send + Sync + 'static {
@@ -303,7 +323,8 @@ fn daemon_status_provider(
             last_error: registration_error
                 .lock()
                 .ok()
-                .and_then(|guard| guard.clone()),
+                .and_then(|guard| guard.clone())
+                .or_else(|| execution_error.lock().ok().and_then(|guard| guard.clone())),
         }
     }
 }
@@ -2069,6 +2090,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             run_blocking(DaemonRunConfig {
                 mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
                 state_dir,
                 repos: vec!["owner/repo".to_owned()],
             })
@@ -2103,6 +2125,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             run_blocking(DaemonRunConfig {
                 mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
                 state_dir,
                 repos: vec!["owner/repo".to_owned()],
             })
@@ -2116,6 +2139,7 @@ mod tests {
 
         let error = run_blocking(DaemonRunConfig {
             mode: RuntimeMode::Isolated,
+            global_dir: other_state_dir.clone(),
             state_dir: other_state_dir,
             repos: vec!["owner/repo".to_owned()],
         })
@@ -2249,6 +2273,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             run_blocking(DaemonRunConfig {
                 mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
                 state_dir,
                 repos: vec!["owner/repo".to_owned()],
             })
