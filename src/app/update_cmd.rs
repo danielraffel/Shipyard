@@ -9,35 +9,69 @@
 //!   That's the canonical bootstrap path; Phase 2 will move it native.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::time::Duration;
 
 use serde_json::Value;
 
 use super::{CliFailure, cli::UpdateArgs};
+use crate::config::LoadedConfig;
+use crate::gh::GhClient;
+use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
+use crate::paths::{RuntimePaths, home_dir, unattended_tool_path};
 
 const UPDATE_EVENT: &str = "update";
 const DEFAULT_RELEASES_API_BASE: &str =
     "https://api.github.com/repos/danielraffel/Shipyard/releases";
-const DEFAULT_INSTALL_SCRIPT_URL: &str =
-    "https://raw.githubusercontent.com/danielraffel/Shipyard/main/install.sh";
+const UPDATE_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// CLI dispatch entry.
 pub(super) fn update_command<W: Write>(
     args: &UpdateArgs,
+    mode: RuntimeMode,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let installed = installed_version();
-    // Opportunistic auth: the Shipyard repo is public, so unauthenticated reads
-    // work but are capped at GitHub's 60/hr limit. If a token is easily
-    // discoverable we use it (5000/hr); if not, we fall back to unauthenticated
-    // exactly as before. A token is never required.
-    let token = discover_github_token();
-    let target = resolve_target_tag(args, token.as_deref())
+    // Self-update is machine policy, so only the trusted machine-global layer
+    // may select credentials or executable paths. A configured auth source is
+    // authoritative and fail-closed; only an unconfigured/ambient installation
+    // retains the public-repo unauthenticated fallback.
+    let config = LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if args.unattended_fleet {
+        validate_unattended_auth(&config)?;
+    }
+    let explicit_target = args.to.as_deref().filter(|value| !value.trim().is_empty());
+    let (target, mut token, staged_curl) = if let Some(raw) = explicit_target {
+        (
+            normalize_tag(raw).map_err(|message| CliFailure::new(2, message))?,
+            None,
+            None,
+        )
+    } else {
+        let token =
+            discover_github_token(&config, cwd).map_err(|message| CliFailure::new(1, message))?;
+        let curl = resolve_update_tool(args.curl_bin.as_deref(), &config, "curl_bin", "curl")?;
+        let target = fetch_latest_tag(
+            args.releases_api_base
+                .as_deref()
+                .unwrap_or(DEFAULT_RELEASES_API_BASE),
+            &curl,
+            token.as_deref(),
+        )
         .map_err(|message| CliFailure::new(1, message))?;
+        (target, token, Some(curl))
+    };
+    if args.unattended_fleet && token.is_none() {
+        token =
+            discover_github_token(&config, cwd).map_err(|message| CliFailure::new(1, message))?;
+    }
     let update_available = target_is_newer(&installed, &target);
 
     if args.check {
@@ -54,27 +88,144 @@ pub(super) fn update_command<W: Write>(
         return render_plan(&installed, &target, update_available, json, stdout);
     }
 
-    apply_update(
+    if explicit_target.is_some() && token.is_none() {
+        token =
+            discover_github_token(&config, cwd).map_err(|message| CliFailure::new(1, message))?;
+    }
+    let curl_bin = match staged_curl {
+        Some(curl) => curl,
+        None => resolve_update_tool(args.curl_bin.as_deref(), &config, "curl_bin", "curl")?,
+    };
+    let shell_bin = resolve_update_tool(args.shell_bin.as_deref(), &config, "shell_bin", "bash")?;
+    let current_binary = std::env::current_exe()
+        .map_err(|error| CliFailure::new(1, format!("failed to locate current binary: {error}")))?;
+    let configured_install_dir = std::env::var_os("SHIPYARD_INSTALL_DIR").map(PathBuf::from);
+    let install_dir = update_install_dir(
+        args.unattended_fleet,
+        &current_binary,
+        configured_install_dir.as_deref(),
+    )?;
+    let installed_binary = install_dir.join(format!("shipyard{}", std::env::consts::EXE_SUFFIX));
+    let tools = UpdateTools {
+        token: token.as_deref(),
+        curl_bin: &curl_bin,
+        shell_bin: &shell_bin,
+        install_dir: &install_dir,
+    };
+    let applied = apply_update(
         args,
         &installed,
         &target,
         update_available,
-        token.as_deref(),
+        &tools,
         json,
         stdout,
-    )
+    )?;
+    if !applied {
+        return Ok(ExitCode::SUCCESS);
+    }
+    verify_installed_version(&installed_binary, &target)?;
+
+    if args.refresh_daemon {
+        let pid =
+            super::daemon_cmd::refresh_after_verified_update(mode, runtime_paths, installed_binary)
+                .map_err(|message| {
+                    CliFailure::new(
+                        3,
+                        format!("update installed, but daemon refresh failed: {message}"),
+                    )
+                })?;
+        let mut data = BTreeMap::new();
+        data.insert("event".to_owned(), Value::from("daemon_refreshed"));
+        data.insert("target".to_owned(), Value::from(target));
+        data.insert("daemon_pid".to_owned(), Value::from(pid));
+        render(stdout, json, data, || {
+            format!("daemon refreshed (pid {pid}).")
+        })?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn update_install_dir(
+    unattended_fleet: bool,
+    current_binary: &Path,
+    configured_install_dir: Option<&Path>,
+) -> Result<PathBuf, CliFailure> {
+    if unattended_fleet {
+        return current_binary
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| CliFailure::new(1, "current binary has no install directory"));
+    }
+    if let Some(configured) = configured_install_dir {
+        if !configured.is_absolute() {
+            return Err(CliFailure::new(
+                2,
+                "SHIPYARD_INSTALL_DIR must be an absolute path",
+            ));
+        }
+        return Ok(configured.to_path_buf());
+    }
+    // Ordinary self-update retains install.sh's canonical destination even
+    // when a source-built or PATH-shadowing Shipyard invoked the command.
+    Ok(home_dir().join(".local/bin"))
+}
+
+fn verify_installed_version(binary: &Path, target_tag: &str) -> Result<(), CliFailure> {
+    let expected = format!("shipyard {}", target_tag.trim_start_matches('v'));
+    let output = Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            CliFailure::new(
+                1,
+                format!(
+                    "failed to verify installed binary {}: {error}",
+                    binary.display()
+                ),
+            )
+        })?;
+    let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if output.status.success() && actual == expected {
+        return Ok(());
+    }
+    Err(CliFailure::new(
+        1,
+        format!(
+            "installed binary verification mismatch: expected {expected:?}, observed {actual:?}; daemon was not refreshed"
+        ),
+    ))
+}
+
+fn validate_unattended_auth(config: &LoadedConfig) -> Result<(), CliFailure> {
+    if config.get_str("github.auth.source") == Some("command") {
+        return Ok(());
+    }
+    Err(CliFailure::new(
+        1,
+        "unattended fleet update requires machine-global github.auth.source = \"command\"; env and ambient auth are intentionally unavailable under the stripped launch environment",
+    ))
 }
 
 fn installed_version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
-/// Discover a GitHub token for read-only release queries, or `None`. Never
-/// errors: env vars first (so CI/automation win), then ambient `gh` auth. A
-/// missing or unauthenticated `gh` simply yields `None` and we proceed
-/// unauthenticated.
-fn discover_github_token() -> Option<String> {
-    select_env_token(|name| std::env::var(name).ok()).or_else(gh_cli_token)
+/// Discover a GitHub token for read-only release queries. A configured
+/// machine-global source is authoritative and errors fail closed. Only an
+/// ambient configuration may fall back through env, absolute `gh`, and finally
+/// the public repository's unauthenticated API.
+fn discover_github_token(config: &LoadedConfig, cwd: &Path) -> Result<Option<String>, String> {
+    let configured = GhClient::from_loaded_config(config)
+        .map_err(|error| format!("failed to load governed GitHub auth: {error}"))?
+        .with_repo_override("danielraffel/Shipyard")
+        .map_err(|error| format!("failed to bind governed GitHub auth: {error}"))?
+        .resolve_token_for_child(cwd, UPDATE_AUTH_TIMEOUT)
+        .map_err(|error| format!("failed to resolve governed GitHub auth: {error}"))?;
+    Ok(configured
+        .or_else(|| select_env_token(|name| std::env::var(name).ok()))
+        .or_else(gh_cli_token))
 }
 
 /// Pure precedence over the recognized token env vars, factored for testing.
@@ -93,7 +244,8 @@ fn select_env_token<F: Fn(&str) -> Option<String>>(get: F) -> Option<String> {
 /// Best-effort `gh auth token`. Returns `None` if `gh` is absent, not logged
 /// in, or emits nothing — callers degrade to unauthenticated.
 fn gh_cli_token() -> Option<String> {
-    let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
+    let gh = default_tool_path("gh")?;
+    let output = Command::new(gh).args(["auth", "token"]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -101,28 +253,109 @@ fn gh_cli_token() -> Option<String> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-fn resolve_target_tag(args: &UpdateArgs, token: Option<&str>) -> Result<String, String> {
-    let api_base = args
-        .releases_api_base
-        .as_deref()
-        .unwrap_or(DEFAULT_RELEASES_API_BASE);
-    let curl_bin = args
-        .curl_bin
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("curl"));
-    if let Some(raw) = args.to.as_deref().filter(|value| !value.trim().is_empty()) {
-        return Ok(normalize_tag(raw));
+fn resolve_update_tool(
+    cli_override: Option<&Path>,
+    config: &LoadedConfig,
+    config_key: &str,
+    program: &str,
+) -> Result<PathBuf, CliFailure> {
+    if let Some(path) = cli_override {
+        if !path.is_absolute() {
+            let flag = config_key.replace('_', "-");
+            return Err(CliFailure::new(
+                1,
+                format!("--{flag} must be an absolute path"),
+            ));
+        }
+        return Ok(path.to_path_buf());
     }
-    fetch_latest_tag(api_base, &curl_bin, token)
+    if let Some(configured) = config.get_str(&format!("update.{config_key}")) {
+        let path = PathBuf::from(configured);
+        if !path.is_absolute() {
+            return Err(CliFailure::new(
+                1,
+                format!("update.{config_key} must be an absolute path"),
+            ));
+        }
+        return Ok(path);
+    }
+    default_tool_path(program).ok_or_else(|| {
+        CliFailure::new(
+            1,
+            format!(
+                "could not resolve {program} from canonical unattended paths; configure update.{config_key} with an absolute path"
+            ),
+        )
+    })
 }
 
-fn normalize_tag(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.starts_with('v') {
-        trimmed.to_owned()
-    } else {
-        format!("v{trimmed}")
+fn default_tool_path(program: &str) -> Option<PathBuf> {
+    canonical_tool_candidates(program)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
+fn canonical_tool_candidates(program: &str) -> Vec<PathBuf> {
+    #[cfg(unix)]
+    return match program {
+        // Prefer OS-owned clients. User-prefix curl/bash entries may be shell
+        // wrappers that inject a different GitHub identity.
+        "curl" => vec![PathBuf::from("/usr/bin/curl"), PathBuf::from("/bin/curl")],
+        "bash" => vec![PathBuf::from("/bin/bash"), PathBuf::from("/usr/bin/bash")],
+        "gh" => vec![
+            PathBuf::from("/opt/homebrew/bin/gh"),
+            PathBuf::from("/usr/local/bin/gh"),
+            home_dir().join(".local/bin/gh"),
+        ],
+        _ => Vec::new(),
+    };
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
+        let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+        let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        match program {
+            "curl" => system_root
+                .into_iter()
+                .map(|root| root.join("System32/curl.exe"))
+                .collect(),
+            "bash" => program_files
+                .into_iter()
+                .flat_map(|root| {
+                    [
+                        root.join("Git/bin/bash.exe"),
+                        root.join("Git/usr/bin/bash.exe"),
+                    ]
+                })
+                .chain(
+                    local_app_data
+                        .into_iter()
+                        .map(|root| root.join("Programs/Git/bin/bash.exe")),
+                )
+                .collect(),
+            "gh" => program_files
+                .into_iter()
+                .map(|root| root.join("GitHub CLI/gh.exe"))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
+    #[cfg(not(any(unix, windows)))]
+    Vec::new()
+}
+
+fn normalize_tag(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let version = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let parts = version.split('.').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Err("update --to requires an exact stable vMAJOR.MINOR.PATCH tag".to_owned());
+    }
+    Ok(format!("v{version}"))
 }
 
 fn fetch_latest_tag(
@@ -145,9 +378,13 @@ fn fetch_latest_tag(
         "User-Agent: shipyard-update",
     ]);
     if let Some(token) = token {
-        command
-            .arg("-H")
-            .arg(format!("Authorization: Bearer {token}"));
+        let mut config = tempfile::tempfile()
+            .map_err(|error| format!("failed to stage curl auth config: {error}"))?;
+        let escaped = token.replace('\\', "\\\\").replace('"', "\\\"");
+        writeln!(config, "header = \"Authorization: Bearer {escaped}\"")
+            .and_then(|()| config.seek(SeekFrom::Start(0)))
+            .map_err(|error| format!("failed to stage curl auth config: {error}"))?;
+        command.args(["--config", "-"]).stdin(Stdio::from(config));
     }
     command.arg(&url);
     let output = command
@@ -297,15 +534,22 @@ fn render_plan<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+struct UpdateTools<'a> {
+    token: Option<&'a str>,
+    curl_bin: &'a Path,
+    shell_bin: &'a Path,
+    install_dir: &'a Path,
+}
+
 fn apply_update<W: Write>(
     args: &UpdateArgs,
     installed: &str,
     target_tag: &str,
     update_available: bool,
-    token: Option<&str>,
+    tools: &UpdateTools<'_>,
     json: bool,
     stdout: &mut W,
-) -> Result<ExitCode, CliFailure> {
+) -> Result<bool, CliFailure> {
     if !update_available && args.to.is_none() {
         // No-op fast path; --to forces install even if equal/older.
         let mut data = BTreeMap::new();
@@ -315,21 +559,15 @@ fn apply_update<W: Write>(
         render(stdout, json, data, || {
             format!("installed={installed} already matches target={target_tag}; no update applied.")
         })?;
-        return Ok(ExitCode::SUCCESS);
+        return Ok(false);
     }
 
+    let tagged_install_script_url =
+        format!("https://raw.githubusercontent.com/danielraffel/Shipyard/{target_tag}/install.sh");
     let install_script_url = args
         .install_script_url
         .as_deref()
-        .unwrap_or(DEFAULT_INSTALL_SCRIPT_URL);
-    let curl_bin = args
-        .curl_bin
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("curl"));
-    let shell_bin = args
-        .shell_bin
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("sh"));
+        .unwrap_or(&tagged_install_script_url);
 
     let mut data = BTreeMap::new();
     data.insert("event".to_owned(), Value::from("apply"));
@@ -344,11 +582,12 @@ fn apply_update<W: Write>(
     })?;
 
     invoke_install_script(
-        &curl_bin,
-        &shell_bin,
+        tools.curl_bin,
+        tools.shell_bin,
         install_script_url,
         target_tag,
-        token,
+        tools.token,
+        tools.install_dir,
         json,
     )?;
 
@@ -361,7 +600,7 @@ fn apply_update<W: Write>(
             "Update to {target_tag} applied. Run `shipyard --version` to confirm the new binary is on PATH."
         )
     })?;
-    Ok(ExitCode::SUCCESS)
+    Ok(true)
 }
 
 fn invoke_install_script(
@@ -370,19 +609,40 @@ fn invoke_install_script(
     install_script_url: &str,
     target_tag: &str,
     token: Option<&str>,
+    install_dir: &Path,
     json: bool,
 ) -> Result<(), CliFailure> {
-    let mut curl = Command::new(curl_bin)
-        .args(["-fsSL", install_script_url])
-        .stdout(Stdio::piped())
+    // Fetch the entire tagged installer before executing any of it. Streaming
+    // curl into a shell allowed a truncated response to run far enough to
+    // mutate the install before curl's failure was known.
+    let installer = tempfile::NamedTempFile::new()
+        .map_err(|error| CliFailure::new(1, format!("failed to stage installer: {error}")))?;
+    let curl_status = Command::new(curl_bin)
+        .args(["-fsSL", "--output"])
+        .arg(installer.path())
+        .arg(install_script_url)
         .stderr(Stdio::inherit())
-        .spawn()
+        .status()
         .map_err(|error| CliFailure::new(1, format!("failed to spawn curl: {error}")))?;
-
-    let curl_stdout = curl
-        .stdout
-        .take()
-        .ok_or_else(|| CliFailure::new(1, "curl stdout pipe missing"))?;
+    if !curl_status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "curl exited {} while fetching {install_script_url}; installer was not executed",
+                curl_status.code().unwrap_or(-1)
+            ),
+        ));
+    }
+    if installer
+        .as_file()
+        .metadata()
+        .map_or(true, |meta| meta.len() == 0)
+    {
+        return Err(CliFailure::new(
+            1,
+            "downloaded installer was empty; installer was not executed",
+        ));
+    }
 
     // Under `--json`, route installer progress to stderr so the stdout
     // stream stays a clean sequence of JSON envelopes for downstream
@@ -406,35 +666,28 @@ fn invoke_install_script(
 
     let env_tag = target_tag.strip_prefix('v').unwrap_or(target_tag);
     let mut sh_command = Command::new(shell_bin);
-    sh_command.env("SHIPYARD_VERSION", env_tag);
+    sh_command
+        .arg(installer.path())
+        .env("PATH", unattended_tool_path())
+        .env("SHIPYARD_VERSION", env_tag)
+        .env("SHIPYARD_INSTALL_DIR", install_dir)
+        .env("SHIPYARD_CURL_BIN", curl_bin);
     // install.sh reads SHIPYARD_GITHUB_TOKEN/GITHUB_TOKEN for its own release
     // lookup; pass the discovered token through so its API calls are also
     // authenticated (and not rate-limited) when one is available.
     if let Some(token) = token {
-        sh_command.env("GITHUB_TOKEN", token);
+        sh_command.env("SHIPYARD_GITHUB_TOKEN", token);
     }
     let mut sh = sh_command
-        .stdin(curl_stdout)
+        .stdin(Stdio::null())
         .stdout(install_stdout)
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| CliFailure::new(1, format!("failed to spawn shell: {error}")))?;
 
-    let curl_status = curl
-        .wait()
-        .map_err(|error| CliFailure::new(1, format!("curl wait failed: {error}")))?;
     let sh_status = sh
         .wait()
         .map_err(|error| CliFailure::new(1, format!("install.sh wait failed: {error}")))?;
-    if !curl_status.success() {
-        return Err(CliFailure::new(
-            1,
-            format!(
-                "curl exited {} while fetching {install_script_url}",
-                curl_status.code().unwrap_or(-1)
-            ),
-        ));
-    }
     if !sh_status.success() {
         return Err(CliFailure::new(
             1,
@@ -465,11 +718,366 @@ fn render<W: Write>(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).expect("write executable");
+        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).expect("permissions");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn governed_absolute_token_helper_works_without_ambient_cli_lookup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let helper = temp.path().join("token-helper");
+        write_executable(&helper, "#!/bin/sh\nprintf governed-test-token\n");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [{}]\n",
+                toml::Value::String(helper.display().to_string())
+            ),
+        )
+        .expect("config");
+        let config = LoadedConfig::load_machine_global_from_dir(temp.path().to_path_buf())
+            .expect("load config");
+
+        assert_eq!(
+            discover_github_token(&config, temp.path()).expect("resolve"),
+            Some("governed-test-token".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn governed_token_helper_failure_is_fail_closed_and_redacted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let helper = temp.path().join("token-helper");
+        write_executable(
+            &helper,
+            "#!/bin/sh\nprintf 'helper failed with ghp_should_not_leak' >&2\nexit 7\n",
+        );
+        std::fs::write(
+            temp.path().join("config.toml"),
+            format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [{}]\n",
+                toml::Value::String(helper.display().to_string())
+            ),
+        )
+        .expect("config");
+        let config = LoadedConfig::load_machine_global_from_dir(temp.path().to_path_buf())
+            .expect("load config");
+
+        let error = discover_github_token(&config, temp.path()).expect_err("helper must fail");
+        assert!(error.contains("failed to resolve governed GitHub auth"));
+        assert!(!error.contains("ghp_should_not_leak"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_query_keeps_governed_token_out_of_process_arguments() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let curl = temp.path().join("curl");
+        let args_capture = temp.path().join("args");
+        let stdin = temp.path().join("stdin");
+        write_executable(
+            &curl,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\ncat > {}\nprintf '{{\"tag_name\":\"v0.98.1\"}}\\n200'\n",
+                shlex_quote_path(&args_capture),
+                shlex_quote_path(&stdin),
+            ),
+        );
+
+        assert_eq!(
+            fetch_latest_tag(
+                "https://example.invalid/releases",
+                &curl,
+                Some("ghp_governed_secret"),
+            )
+            .expect("release tag"),
+            "v0.98.1"
+        );
+        let argv = std::fs::read_to_string(args_capture).expect("argv capture");
+        let curl_config = std::fs::read_to_string(stdin).expect("stdin capture");
+        assert!(!argv.contains("ghp_governed_secret"));
+        assert!(argv.contains("--config\n-"));
+        assert!(curl_config.contains("Authorization: Bearer ghp_governed_secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_installer_download_never_executes_partial_script() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let curl = temp.path().join("curl");
+        let shell = temp.path().join("shell");
+        let marker = temp.path().join("shell-ran");
+        write_executable(
+            &curl,
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then shift; printf partial > \"$1\"; fi\n  shift\ndone\nexit 22\n",
+        );
+        write_executable(
+            &shell,
+            &format!("#!/bin/sh\n/usr/bin/touch {}\n", shlex_quote_path(&marker)),
+        );
+
+        let error = invoke_install_script(
+            &curl,
+            &shell,
+            "https://example.invalid/install.sh",
+            "v0.98.1",
+            Some("governed-test-token"),
+            temp.path(),
+            false,
+        )
+        .expect_err("curl failure");
+
+        assert!(error.message.contains("installer was not executed"));
+        assert!(!marker.exists());
+        assert!(!error.message.contains("governed-test-token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_receives_exact_binary_directory_and_curl_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let curl = temp.path().join("custom-curl");
+        let shell = temp.path().join("shell");
+        let marker = temp.path().join("installer-env");
+        let install_dir = temp.path().join("custom install");
+        std::fs::create_dir(&install_dir).expect("install dir");
+        write_executable(
+            &curl,
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then shift; printf '#!/bin/sh\\n' > \"$1\"; fi\n  shift\ndone\n",
+        );
+        write_executable(
+            &shell,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n' \"$SHIPYARD_INSTALL_DIR\" \"$SHIPYARD_CURL_BIN\" > {}\n",
+                shlex_quote_path(&marker)
+            ),
+        );
+
+        invoke_install_script(
+            &curl,
+            &shell,
+            "https://example.invalid/install.sh",
+            "v0.98.1",
+            Some("governed-test-token"),
+            &install_dir,
+            false,
+        )
+        .expect("installer invocation");
+
+        let captured = std::fs::read_to_string(marker).expect("captured environment");
+        assert_eq!(
+            captured,
+            format!("{}\n{}\n", install_dir.display(), curl.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_installed_version_is_required_before_daemon_refresh() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("shipyard");
+        write_executable(&binary, "#!/bin/sh\nprintf 'shipyard 0.99.1\\n'\n");
+
+        verify_installed_version(&binary, "v0.99.1").expect("exact version");
+        let error = verify_installed_version(&binary, "v0.99.2").expect_err("mismatch");
+        assert!(error.message.contains("daemon was not refreshed"));
+    }
+
+    #[test]
+    fn update_tool_overrides_must_be_absolute() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = LoadedConfig::load_machine_global_from_dir(temp.path().to_path_buf())
+            .expect("empty config");
+
+        let cli_error = resolve_update_tool(Some(Path::new("curl")), &config, "curl_bin", "curl")
+            .expect_err("relative CLI override");
+        assert!(
+            cli_error
+                .message
+                .contains("--curl-bin must be an absolute path")
+        );
+
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[update]\nshell_bin = \"bash\"\n",
+        )
+        .expect("config");
+        let config = LoadedConfig::load_machine_global_from_dir(temp.path().to_path_buf())
+            .expect("configured update tool");
+        let config_error = resolve_update_tool(None, &config, "shell_bin", "bash")
+            .expect_err("relative configured override");
+        assert!(
+            config_error
+                .message
+                .contains("update.shell_bin must be an absolute path")
+        );
+    }
+
+    #[test]
+    fn explicit_check_does_not_resolve_installer_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_paths = RuntimePaths::current_with_overrides(
+            RuntimeMode::Isolated,
+            Some(temp.path().join("config")),
+            Some(temp.path().join("state")),
+        );
+        let args = UpdateArgs {
+            check: true,
+            to: Some(format!("v{}", installed_version())),
+            dry_run: false,
+            refresh_daemon: false,
+            unattended_fleet: false,
+            install_script_url: None,
+            releases_api_base: None,
+            curl_bin: Some(PathBuf::from("missing-relative-curl")),
+            shell_bin: Some(PathBuf::from("missing-relative-bash")),
+        };
+        let mut output = Vec::new();
+
+        assert_eq!(
+            update_command(
+                &args,
+                RuntimeMode::Isolated,
+                temp.path(),
+                &runtime_paths,
+                false,
+                &mut output,
+            )
+            .expect("read-only check"),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn implicit_non_newer_release_is_a_true_noop() {
+        let args = UpdateArgs {
+            check: false,
+            to: None,
+            dry_run: false,
+            refresh_daemon: false,
+            unattended_fleet: false,
+            install_script_url: None,
+            releases_api_base: None,
+            curl_bin: None,
+            shell_bin: None,
+        };
+        let missing = Path::new("/does/not/exist");
+        let tools = UpdateTools {
+            token: None,
+            curl_bin: missing,
+            shell_bin: missing,
+            install_dir: missing,
+        };
+
+        assert!(
+            !apply_update(
+                &args,
+                "0.100.0",
+                "v0.99.0",
+                false,
+                &tools,
+                false,
+                &mut Vec::new(),
+            )
+            .expect("no-op")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_check_proves_the_configured_command_helper_before_refresh() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir(&config_dir).expect("config dir");
+        let marker = temp.path().join("auth-ran");
+        let helper = temp.path().join("token-helper");
+        write_executable(
+            &helper,
+            &format!(
+                "#!/bin/sh\n/usr/bin/touch {}\nprintf governed-test-token\n",
+                shlex_quote_path(&marker)
+            ),
+        );
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [{}]\n",
+                toml::Value::String(helper.display().to_string())
+            ),
+        )
+        .expect("config");
+        let runtime_paths = RuntimePaths::current_with_overrides(
+            RuntimeMode::Isolated,
+            Some(config_dir),
+            Some(temp.path().join("state")),
+        );
+        let args = UpdateArgs {
+            check: true,
+            to: Some(format!("v{}", installed_version())),
+            dry_run: false,
+            refresh_daemon: false,
+            unattended_fleet: true,
+            install_script_url: None,
+            releases_api_base: None,
+            curl_bin: Some(PathBuf::from("missing-relative-curl")),
+            shell_bin: Some(PathBuf::from("missing-relative-bash")),
+        };
+
+        update_command(
+            &args,
+            RuntimeMode::Isolated,
+            temp.path(),
+            &runtime_paths,
+            false,
+            &mut Vec::new(),
+        )
+        .expect("unattended auth proof");
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn unattended_fleet_requires_self_contained_command_auth() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[github.auth]\nsource = \"env\"\ntoken_env = \"SHIPYARD_TOKEN\"\n",
+        )
+        .expect("env config");
+        let env_config = LoadedConfig::load_machine_global_from_dir(temp.path().to_path_buf())
+            .expect("load env config");
+        let error = validate_unattended_auth(&env_config).expect_err("env auth is stripped");
+        assert!(error.message.contains("source = \"command\""));
+
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[github.auth]\nsource = \"command\"\ntoken_command = [\"/usr/bin/false\"]\n",
+        )
+        .expect("command config");
+        let command_config = LoadedConfig::load_machine_global_from_dir(temp.path().to_path_buf())
+            .expect("load command config");
+        validate_unattended_auth(&command_config).expect("command auth is self-contained");
+    }
+
+    #[cfg(unix)]
+    fn shlex_quote_path(path: &Path) -> String {
+        crate::executor::ssh::shlex_quote(&path.display().to_string())
+    }
+
     #[test]
     fn normalize_tag_prepends_v() {
-        assert_eq!(normalize_tag("0.53.0"), "v0.53.0");
-        assert_eq!(normalize_tag("v0.53.0"), "v0.53.0");
-        assert_eq!(normalize_tag("  v1.2.3 "), "v1.2.3");
+        assert_eq!(normalize_tag("0.53.0").expect("tag"), "v0.53.0");
+        assert_eq!(normalize_tag("v0.53.0").expect("tag"), "v0.53.0");
+        assert_eq!(normalize_tag("  v1.2.3 ").expect("tag"), "v1.2.3");
+        assert!(normalize_tag("main").is_err());
+        assert!(normalize_tag("v1.2.3-rc1").is_err());
     }
 
     #[test]
@@ -608,5 +1216,44 @@ mod tests {
         assert_eq!(json["update_available"], Value::Bool(true));
         assert_eq!(json["event"], Value::from("check"));
         assert_eq!(json["command"], Value::from(UPDATE_EVENT));
+    }
+
+    #[test]
+    fn ordinary_update_does_not_overwrite_a_shadowing_source_binary() {
+        let temp = tempfile::tempdir().expect("temp");
+        let source_binary = temp.path().join("checkout/target/release/shipyard");
+        let custom_install = temp.path().join("custom-install");
+        assert_eq!(
+            update_install_dir(false, &source_binary, None).expect("canonical install"),
+            home_dir().join(".local/bin")
+        );
+        assert_eq!(
+            update_install_dir(true, &source_binary, None).expect("governed install"),
+            source_binary.parent().expect("source parent")
+        );
+        assert_eq!(
+            update_install_dir(false, &source_binary, Some(&custom_install))
+                .expect("custom install"),
+            custom_install
+        );
+        assert!(
+            update_install_dir(false, &source_binary, Some(Path::new("relative/bin"))).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_clients_never_resolve_through_ambient_path() {
+        assert_eq!(
+            canonical_tool_candidates("curl"),
+            vec![PathBuf::from("/usr/bin/curl"), PathBuf::from("/bin/curl")]
+        );
+        assert_eq!(
+            canonical_tool_candidates("bash"),
+            vec![PathBuf::from("/bin/bash"), PathBuf::from("/usr/bin/bash")]
+        );
+        assert!(canonical_tool_candidates("curl").iter().all(|path| {
+            !path.starts_with("/opt/homebrew") && !path.starts_with(home_dir().join(".local"))
+        }));
     }
 }

@@ -7,6 +7,7 @@ set -euo pipefail
 # Environment variables:
 #   SHIPYARD_VERSION          Tag to install, or "latest" (default)
 #   SHIPYARD_INSTALL_DIR      Install directory (default: ~/.local/bin)
+#   SHIPYARD_CURL_BIN         Absolute curl binary selected by the updater
 #   SHIPYARD_DRY_RUN          Print resolved settings and exit
 #   SHIPYARD_SKIP_DOWNLOAD    Reuse an existing binary in install dir
 #   SHIPYARD_SKIP_SMOKE       Skip post-install --version smoke
@@ -17,12 +18,14 @@ REPO="${SHIPYARD_REPO:-danielraffel/Shipyard}"
 INSTALL_DIR="${SHIPYARD_INSTALL_DIR:-${HOME}/.local/bin}"
 REQUESTED_VERSION="${SHIPYARD_VERSION:-latest}"
 GITHUB_TOKEN_VALUE="${SHIPYARD_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+CURL_BIN="${SHIPYARD_CURL_BIN:-curl}"
 
 curl_shipyard() {
     if [ -n "${GITHUB_TOKEN_VALUE}" ]; then
-        curl -H "Authorization: Bearer ${GITHUB_TOKEN_VALUE}" "$@"
+        printf 'Authorization: Bearer %s\n' "${GITHUB_TOKEN_VALUE}" \
+            | "${CURL_BIN}" -H @- "$@"
     else
-        curl "$@"
+        "${CURL_BIN}" "$@"
     fi
 }
 
@@ -199,7 +202,27 @@ RELEASE_URL=""
 RELEASE_URL_IS_API=0
 if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
     echo "Resolving ${VERSION_LABEL} from ${REPO}..."
-    RELEASE_JSON="$(curl_shipyard -sL "https://api.github.com/repos/${REPO}/${API_PATH}")"
+    if ! RELEASE_RESPONSE="$(curl_shipyard -sSL -w '\n%{http_code}' "https://api.github.com/repos/${REPO}/${API_PATH}")"; then
+        echo "GitHub release lookup failed before receiving a complete response." >&2
+        exit 1
+    fi
+    RELEASE_HTTP_CODE=$(printf '%s\n' "${RELEASE_RESPONSE}" | tail -n 1)
+    RELEASE_JSON=$(printf '%s\n' "${RELEASE_RESPONSE}" | sed '$d')
+    case "${RELEASE_HTTP_CODE}" in
+        2??) ;;
+        403|429)
+            if [ -n "${GITHUB_TOKEN_VALUE}" ]; then
+                echo "GitHub release lookup returned HTTP ${RELEASE_HTTP_CODE}; the configured token may lack repository access or be rate-limited." >&2
+            else
+                echo "GitHub release lookup returned HTTP ${RELEASE_HTTP_CODE}; anonymous API access is rate-limited." >&2
+            fi
+            exit 1
+            ;;
+        *)
+            echo "GitHub release lookup returned HTTP ${RELEASE_HTTP_CODE}; this is not a missing platform asset." >&2
+            exit 1
+            ;;
+    esac
     PREFER_API_ASSET_URL=0
     if [ -n "${GITHUB_TOKEN_VALUE}" ] && command -v python3 >/dev/null 2>&1; then
         PREFER_API_ASSET_URL=1

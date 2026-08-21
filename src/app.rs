@@ -28,6 +28,7 @@ mod daemon_cmd;
 mod doctor_cmd;
 mod execution_worker_cmd;
 mod fleet_status_cmd;
+mod fleet_update_cmd;
 mod governance_cmd;
 mod init_cmd;
 mod local_linux_lease_cmd;
@@ -186,7 +187,16 @@ fn dispatch<W: Write, E: Write>(
         Command::Pin { command } => {
             return pin_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
-        Command::Update(args) => return update_command(&args, cli.json, stdout),
+        Command::Update(args) => {
+            return update_command(
+                &args,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths,
+                cli.json,
+                stdout,
+            );
+        }
         Command::Config { command } => {
             return config_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }

@@ -1821,20 +1821,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn installed_runner_version_reads_the_binary_not_directory_presence() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("temp");
         let listener = temp.path().join("bin/Runner.Listener");
         std::fs::create_dir_all(listener.parent().expect("parent")).expect("bin dir");
-        std::fs::write(&listener, "#!/bin/sh\nprintf '2.334.0\\n'\n").expect("listener");
-        let mut permissions = std::fs::metadata(&listener)
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&listener, permissions).expect("chmod");
+        std::os::unix::fs::symlink("/bin/echo", &listener)
+            .expect("link immutable executable fixture");
+        let expected = Command::new("/bin/echo")
+            .arg("--version")
+            .output()
+            .expect("reference version")
+            .stdout;
+        let expected = String::from_utf8(expected)
+            .expect("utf8 reference version")
+            .trim()
+            .to_owned();
         assert_eq!(
             installed_runner_version(temp.path()).as_deref(),
-            Some("2.334.0")
+            Some(expected.as_str())
         );
         assert_ne!(
             installed_runner_version(temp.path()).as_deref(),

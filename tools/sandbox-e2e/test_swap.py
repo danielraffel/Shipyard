@@ -282,7 +282,8 @@ def test_install_script_supports_private_release_repo_token() -> None:
     content = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
 
     assert "SHIPYARD_GITHUB_TOKEN" in content
-    assert "Authorization: Bearer ${GITHUB_TOKEN_VALUE}" in content
+    assert "printf 'Authorization: Bearer %s\\n'" in content
+    assert '"${GITHUB_TOKEN_VALUE}"' in content
     assert "Accept: application/octet-stream" in content
     assert "select_asset_url" in content
     assert "curl_shipyard -sL" in content
@@ -374,9 +375,11 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
     fake_curl.write_text(
         "#!/bin/sh\n"
         "out=''\n"
+        "write_out=0\n"
         "while [ \"$#\" -gt 0 ]; do\n"
         "  case \"$1\" in\n"
         "    -o) out=\"$2\"; shift 2 ;;\n"
+        "    -w) write_out=1; shift 2 ;;\n"
         "    -*) shift ;;\n"
         "    *) shift ;;\n"
         "  esac\n"
@@ -390,7 +393,8 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
         "fi\n"
         "cat <<'JSON'\n"
         "{\"assets\":[{\"name\":\"shipyard-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-linux-arm64\"}]}\n"
-        "JSON\n",
+        "JSON\n"
+        "if [ \"$write_out\" -eq 1 ]; then printf '200\\n'; fi\n",
         encoding="utf-8",
     )
     fake_curl.chmod(0o755)
@@ -402,6 +406,7 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
             "HOME": str(sandbox.home_dir),
             "PATH": f"{sandbox.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
             "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_CURL_BIN": str(fake_curl),
             "SHIPYARD_VERSION": "v9.9.9",
             "SHIPYARD_INSTALL_TEST_UNAME_S": "Linux",
             "SHIPYARD_INSTALL_TEST_UNAME_M": "aarch64",

@@ -618,6 +618,7 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
     let stderr = stdout.try_clone().map_err(|error| io_spawn_error(&error))?;
 
     let mut command = Command::new(&request.binary);
+    command.env("PATH", crate::paths::unattended_tool_path());
     command.arg("--mode").arg(request.mode.as_str());
     if let Some(global_dir) = &request.global_dir_override {
         command.arg("--global-dir").arg(global_dir);

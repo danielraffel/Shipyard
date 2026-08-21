@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -119,6 +121,52 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// A deterministic PATH for unattended Shipyard children.
+///
+/// Non-login SSH and launchd commonly omit Homebrew and `~/.local/bin`, even
+/// though those locations contain the configured `ghapp`, Tart, and Shipyard
+/// binaries. Use only canonical locations: inherited entries may point into a
+/// repository or caller-controlled wrapper directory. Callers no longer need
+/// to hand-assemble PATH before refreshing a daemon.
+#[must_use]
+pub(crate) fn unattended_tool_path() -> OsString {
+    let entries = unattended_tool_entries();
+    env::join_paths(entries).unwrap_or_default()
+}
+
+fn unattended_tool_entries() -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    #[cfg(unix)]
+    {
+        entries.extend([
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            home_dir().join(".local/bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+            PathBuf::from("/usr/sbin"),
+            PathBuf::from("/sbin"),
+        ]);
+    }
+    #[cfg(windows)]
+    {
+        if let Some(system_root) = env::var_os("SystemRoot").map(PathBuf::from) {
+            entries.push(system_root.join("System32"));
+        }
+        if let Some(program_files) = env::var_os("ProgramFiles").map(PathBuf::from) {
+            entries.extend([
+                program_files.join("Git/bin"),
+                program_files.join("Git/usr/bin"),
+                program_files.join("GitHub CLI"),
+            ]);
+        }
+        entries.push(home_dir().join(".local/bin"));
+    }
+    let mut seen = BTreeSet::new();
+    entries.retain(|entry| seen.insert(entry.clone()));
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -126,6 +174,18 @@ mod tests {
     use super::RuntimePaths;
     use crate::identity::RuntimeMode;
     use crate::platform::Platform;
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_path_restores_canonical_non_login_tool_locations() {
+        let path = super::unattended_tool_path();
+        let entries = std::env::split_paths(&path).collect::<Vec<_>>();
+        assert!(entries.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(entries.contains(&super::home_dir().join(".local/bin")));
+        assert!(entries.contains(&PathBuf::from("/usr/bin")));
+        assert_eq!(entries, super::unattended_tool_entries());
+        assert!(!entries.contains(&PathBuf::from("/tmp/repository/bin")));
+    }
 
     #[test]
     fn isolated_macos_paths_do_not_collide_with_shipyard_defaults() {

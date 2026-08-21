@@ -51,6 +51,16 @@ pub struct HostClassConfig {
     /// The `tartci` binary/wrapper to invoke for host-local doctor/fleet
     /// probes. Defaults to `tartci`; override for non-interactive SSH.
     pub tartci_bin: String,
+    /// Absolute Shipyard binary used for unattended fleet rollout. Remote
+    /// classes must configure this explicitly; relying on `command -v` under
+    /// non-login SSH can misdiagnose an installed tool as absent.
+    pub shipyard_bin: Option<String>,
+    /// Runtime mode for the Shipyard daemon on this remote host.
+    pub shipyard_mode: Option<String>,
+    /// Absolute machine-global config root for the remote Shipyard daemon.
+    pub shipyard_global_dir: Option<String>,
+    /// Absolute machine-global state root for the remote Shipyard daemon.
+    pub shipyard_state_dir: Option<String>,
     /// Optional GitHub CLI command exposed to tartci as `TARTCI_GH_CLI`.
     /// When absent, Shipyard preserves the local environment and tartci's
     /// default; set this to an App-authenticated wrapper such as `ghapp` when
@@ -69,8 +79,9 @@ pub struct HostClassConfig {
 ///
 /// # Errors
 /// Returns a human-readable message when a class entry is malformed (not a
-/// table, non-string `ssh`/`tart_bin`/`tartci_bin`/`github_cli`/`tart_home`,
+/// table, non-string `ssh`/`tart_bin`/`tartci_bin`/Shipyard runtime fields/`github_cli`/`tart_home`,
 /// non-integer/negative `cap`, or a `labels` that is not an array of strings).
+#[allow(clippy::too_many_lines)] // Keep each host-class field's fail-closed diagnostic adjacent.
 pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> {
     let Some(value) = data.get("host_class") else {
         return Ok(Vec::new());
@@ -109,6 +120,48 @@ pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> 
             Some(TomlValue::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
             Some(_) => return Err(format!("host_class.{class}.tartci_bin must be a string")),
         };
+        let shipyard_bin = match table.get("shipyard_bin") {
+            None => None,
+            Some(TomlValue::String(s)) if s.trim().is_empty() => None,
+            Some(TomlValue::String(s)) => {
+                let value = s.trim();
+                if !std::path::Path::new(value).is_absolute() {
+                    return Err(format!(
+                        "host_class.{class}.shipyard_bin must be an absolute path"
+                    ));
+                }
+                Some(value.to_owned())
+            }
+            Some(_) => {
+                return Err(format!("host_class.{class}.shipyard_bin must be a string"));
+            }
+        };
+        let shipyard_mode = match table.get("shipyard_mode") {
+            None => None,
+            Some(TomlValue::String(s)) if matches!(s.trim(), "shipyard" | "isolated") => {
+                Some(s.trim().to_owned())
+            }
+            Some(TomlValue::String(_)) => {
+                return Err(format!(
+                    "host_class.{class}.shipyard_mode must be shipyard or isolated"
+                ));
+            }
+            Some(_) => return Err(format!("host_class.{class}.shipyard_mode must be a string")),
+        };
+        let parse_runtime_dir = |key: &str| -> Result<Option<String>, String> {
+            match table.get(key) {
+                None => Ok(None),
+                Some(TomlValue::String(s)) if std::path::Path::new(s.trim()).is_absolute() => {
+                    Ok(Some(s.trim().to_owned()))
+                }
+                Some(TomlValue::String(_)) => {
+                    Err(format!("host_class.{class}.{key} must be an absolute path"))
+                }
+                Some(_) => Err(format!("host_class.{class}.{key} must be a string")),
+            }
+        };
+        let shipyard_global_dir = parse_runtime_dir("shipyard_global_dir")?;
+        let shipyard_state_dir = parse_runtime_dir("shipyard_state_dir")?;
         let github_cli = match table.get("github_cli") {
             None => None,
             Some(TomlValue::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
@@ -137,6 +190,10 @@ pub fn parse_host_classes(data: &Table) -> Result<Vec<HostClassConfig>, String> 
             cap,
             tart_bin,
             tartci_bin,
+            shipyard_bin,
+            shipyard_mode,
+            shipyard_global_dir,
+            shipyard_state_dir,
             github_cli,
             tart_home,
             labels,
@@ -621,6 +678,10 @@ mod tests {
             cap: 2,
             tart_bin: "/opt/homebrew/bin/tart".to_owned(),
             tartci_bin: "/Users/ci/.local/bin/tartci".to_owned(),
+            shipyard_bin: Some("/Users/ci/.local/bin/shipyard".to_owned()),
+            shipyard_mode: Some("shipyard".to_owned()),
+            shipyard_global_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
+            shipyard_state_dir: Some("/Users/ci/Library/Application Support/shipyard".to_owned()),
             github_cli: None,
             tart_home: Some("/Users/ci user/VMs".to_owned()),
             labels: Vec::new(),
