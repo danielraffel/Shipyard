@@ -26,6 +26,8 @@ pub const AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
 /// Stay below the Windows `cmd.exe` command-line ceiling after base64 expansion;
 /// larger selections fail closed to the ordinary full suite.
 pub const MAX_SELECTED_TEST_BYTES: usize = 4 * 1024;
+/// Conservative ceiling below `cmd.exe`'s 8,191 UTF-16-code-unit limit.
+pub const MAX_EXECUTION_COMMAND_UNITS: usize = 8_000;
 
 /// Protected-base execution posture.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -294,6 +296,11 @@ fn bounded_execution_plan(
         1,
     );
     let command = command.replacen(SELECTED_TESTS_DIGEST_PLACEHOLDER, &selected_tests_digest, 1);
+    if command.encode_utf16().count() > MAX_EXECUTION_COMMAND_UNITS {
+        return Err(error(
+            "bounded execution command exceeds the smallest supported shell limit",
+        ));
+    }
     Ok(ExecutionDisposition::Bounded(Box::new(
         AuthoritativeExecutionPlan {
             schema_version: AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION,
@@ -639,6 +646,20 @@ mod tests {
         let input = fixture_input("src/a.rs");
         let receipt = fixture_receipt(&policy, &input);
         assert_eq!(receipt.planned_suite, PlannedSuite::Bounded);
+        assert!(
+            plan_authoritative_execution(&receipt, &input, &policy, true, DIGEST, DIGEST,).is_err()
+        );
+    }
+
+    #[test]
+    fn final_command_includes_template_overhead_in_shell_limit() {
+        let mut policy = fixture_policy(ExecutionMode::Authoritative);
+        policy.execution.as_mut().expect("execution").command = Some(format!(
+            "{} {{selected_tests_b64}} {{selected_tests_digest}}",
+            "x".repeat(MAX_EXECUTION_COMMAND_UNITS)
+        ));
+        let input = fixture_input("src/a.rs");
+        let receipt = fixture_receipt(&policy, &input);
         assert!(
             plan_authoritative_execution(&receipt, &input, &policy, true, DIGEST, DIGEST,).is_err()
         );
