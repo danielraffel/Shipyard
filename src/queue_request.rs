@@ -1834,7 +1834,7 @@ fn write_json_atomic_durable<T: Serialize>(path: &Path, value: &T) -> QueueReque
     temp.as_file().sync_all()?;
     temp.persist(path)
         .map_err(|error| QueueRequestError::Io(error.error))?;
-    fs::File::open(parent)?.sync_all()?;
+    crate::log_retention::sync_parent_directory(path)?;
     Ok(())
 }
 
