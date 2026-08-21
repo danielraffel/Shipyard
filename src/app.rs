@@ -26,6 +26,7 @@ mod command_evidence_cmd;
 mod config_cmd;
 mod daemon_cmd;
 mod doctor_cmd;
+mod execution_worker_cmd;
 mod fleet_release_cmd;
 mod fleet_status_cmd;
 mod governance_cmd;
@@ -75,6 +76,7 @@ use self::command_evidence_cmd::{run_command_evidence, show_command_evidence};
 use self::config_cmd::config_command;
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
+use self::execution_worker_cmd::execution_worker_command;
 use self::fleet_release_cmd::fleet_command;
 use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
@@ -172,6 +174,15 @@ fn dispatch<W: Write, E: Write>(
     let cwd = cli_cwd(&cli);
 
     match cli.command {
+        Command::ExecutionWorker { job_id, generation } => {
+            return execution_worker_command(
+                &job_id,
+                &generation,
+                cli.mode.into(),
+                &runtime_paths.global_dir,
+                &runtime_paths.state_dir,
+            );
+        }
         Command::Paths => {
             handle_paths_command(cli.json, &runtime_paths, stdout)?;
         }
@@ -398,6 +409,7 @@ fn handle_operational_variant<W: Write>(
             handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
         }
         Command::Paths
+        | Command::ExecutionWorker { .. }
         | Command::Pin { .. }
         | Command::Config { .. }
         | Command::Ci { .. }
@@ -631,6 +643,7 @@ fn handle_ship_variant<W: Write>(
         allow_fleet_epoch_drift,
         skip_targets,
         adopt_head,
+        foreground,
     } = command
     else {
         unreachable!("ship variant required")
@@ -656,6 +669,7 @@ fn handle_ship_variant<W: Write>(
             adopt_head,
             steward_handoff: None,
             invocation: ship_cmd::ShipInvocation::Direct,
+            foreground,
         },
         mode,
         cwd,
@@ -743,6 +757,7 @@ fn handle_run_variant<W: Write>(
         skip_targets,
         no_warm,
         allow_tree_drift,
+        foreground,
     } = command
     else {
         unreachable!("run variant required")
@@ -768,6 +783,7 @@ fn handle_run_variant<W: Write>(
             skip_targets,
             warm: WarmPolicy::from_no_warm_flag(no_warm),
             tree_drift: TreeDriftPolicy::from_flag(allow_tree_drift),
+            foreground,
         },
         mode,
         cwd,

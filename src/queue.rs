@@ -421,6 +421,37 @@ impl Queue {
         })
     }
 
+    /// Complete one running job with an explicit fail-closed uncertainty
+    /// result. This is used only after durable worker ownership is proven lost;
+    /// arbitrary validation commands are never replayed automatically.
+    pub fn complete_running_uncertain(
+        &mut self,
+        job_id: &str,
+        reason: &str,
+    ) -> QueueResult<Option<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let Some(job) = jobs
+                .iter_mut()
+                .find(|job| job.id == job_id && job.status == JobStatus::Running)
+            else {
+                return Ok(None);
+            };
+            for target_name in &job.target_names {
+                job.results.entry(target_name.clone()).or_insert_with(|| {
+                    let mut result = stale_recovery_result(target_name);
+                    result.error_message = Some(reason.to_owned());
+                    result.failure_class = Some("UNCERTAIN".to_owned());
+                    result
+                });
+            }
+            job.status = JobStatus::Completed;
+            job.completed_at = Some(Utc::now());
+            let completed = job.clone();
+            let _ = trim_terminal(jobs);
+            Ok(Some(completed))
+        })
+    }
+
     /// Mutate the queue under the short-lived state lock.
     pub fn with_jobs_locked<T>(
         &self,
