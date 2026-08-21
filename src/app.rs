@@ -26,6 +26,7 @@ mod command_evidence_cmd;
 mod config_cmd;
 mod daemon_cmd;
 mod doctor_cmd;
+mod fleet_release_cmd;
 mod fleet_status_cmd;
 mod governance_cmd;
 mod init_cmd;
@@ -73,6 +74,7 @@ use self::command_evidence_cmd::{run_command_evidence, show_command_evidence};
 use self::config_cmd::config_command;
 use self::daemon_cmd::daemon_command;
 use self::doctor_cmd::doctor;
+use self::fleet_release_cmd::fleet_command;
 use self::governance_cmd::governance_command;
 use self::init_cmd::init_command;
 use self::merge_queue_control_cmd::merge_queue_control_command;
@@ -176,6 +178,9 @@ fn dispatch<W: Write, E: Write>(
             return pin_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
         Command::Update(args) => return update_command(&args, cli.json, stdout),
+        Command::Fleet { command } => {
+            return fleet_command(command, &runtime_paths, cli.json, stdout);
+        }
         Command::Config { command } => {
             return config_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
@@ -417,7 +422,8 @@ fn handle_operational_variant<W: Write>(
         | Command::Daemon { .. }
         | Command::MergeQueue { .. }
         | Command::Wait { .. }
-        | Command::Update(_) => unreachable!("command handled by top-level dispatch"),
+        | Command::Update(_)
+        | Command::Fleet { .. } => unreachable!("command handled by top-level dispatch"),
     }
 }
 

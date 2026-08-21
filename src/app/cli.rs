@@ -351,6 +351,12 @@ pub(super) enum Command {
     Rescue(RescueArgs),
     /// Update the locally-installed Shipyard CLI from a published GitHub Release.
     Update(UpdateArgs),
+    /// Coordinate one immutable Shipyard release across a host fleet.
+    Fleet {
+        /// Fleet operation.
+        #[command(subcommand)]
+        command: FleetCommand,
+    },
     /// Merge a PR once all ship-state targets are green.
     #[command(name = "auto-merge")]
     AutoMerge {
@@ -1687,6 +1693,9 @@ pub(super) struct UpdateArgs {
     /// Install a specific tag (e.g. `v0.53.0`) instead of `latest`.
     #[arg(long = "to")]
     pub(super) to: Option<String>,
+    /// Require the staged and installed binary to match this SHA-256 (fleet hook).
+    #[arg(long = "expected-sha256", hide = true)]
+    pub(super) expected_sha256: Option<String>,
     /// Plan the upgrade without applying.
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]
     pub(super) dry_run: bool,
@@ -1702,6 +1711,72 @@ pub(super) struct UpdateArgs {
     /// Override the shell binary used to pipe install.sh (test hook).
     #[arg(long = "shell-bin", hide = true)]
     pub(super) shell_bin: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum FleetCommand {
+    /// Audit, plan, apply, or roll back a fleet-wide Shipyard release.
+    Release {
+        /// Release-rollout operation.
+        #[command(subcommand)]
+        command: FleetReleaseCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum FleetReleaseCommand {
+    /// Probe every host without changing it.
+    Status(FleetReleaseTargetArgs),
+    /// Show the next independently runnable rollout wave.
+    Plan(FleetReleaseTargetArgs),
+    /// Persist the target and converge every currently eligible host.
+    Apply(FleetReleaseApplyArgs),
+    /// Converge toward the exact rollback identity saved by apply.
+    Rollback(FleetReleaseResumeArgs),
+    /// Continue a persisted rollout. Used by the durable reconciler.
+    #[command(hide = true)]
+    Reconcile(FleetReleaseResumeArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub(super) struct FleetReleaseTargetArgs {
+    /// Release tag or version to install.
+    #[arg(long = "to")]
+    pub(super) target: String,
+    /// SHA-256 of the installed Shipyard binary, not the DMG/archive.
+    #[arg(long)]
+    pub(super) sha256: String,
+    /// Fleet host inventory. Defaults to <global-dir>/fleet-hosts.json.
+    #[arg(long = "hosts-file")]
+    pub(super) hosts_file: Option<PathBuf>,
+    /// Durable rollout state. Defaults to <state-dir>/fleet-release/state.json.
+    #[arg(long = "state-file")]
+    pub(super) state_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub(super) struct FleetReleaseApplyArgs {
+    #[command(flatten)]
+    pub(super) target: FleetReleaseTargetArgs,
+    /// Exact prior release tag/version accepted by rollback.
+    #[arg(long = "rollback-to")]
+    pub(super) rollback_target: String,
+    /// SHA-256 of the prior installed Shipyard binary.
+    #[arg(long = "rollback-sha256")]
+    pub(super) rollback_sha256: String,
+    /// Do not install/refresh the controller's periodic offline-host reconciler.
+    #[arg(long = "no-reconciler", action = ArgAction::SetTrue)]
+    pub(super) no_reconciler: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub(super) struct FleetReleaseResumeArgs {
+    /// Fleet host inventory. Defaults to the path saved in rollout state.
+    #[arg(long = "hosts-file")]
+    pub(super) hosts_file: Option<PathBuf>,
+    /// Durable rollout state. Defaults to <state-dir>/fleet-release/state.json.
+    #[arg(long = "state-file")]
+    pub(super) state_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, clap::Args)]
