@@ -269,10 +269,6 @@ where
     F: FnMut(&str, u64, &Path) -> Result<Option<Value>, Box<dyn std::error::Error>>,
     C: FnMut(&QueueAbsentRecoveryRecord) -> Result<(), String>,
 {
-    let canonical_path = fs::canonicalize(registered_repo_path)
-        .map_err(|error| format!("registered repo path is unavailable: {error}"))?;
-    let repo_config = load_recovery_config(mode, &canonical_path, global_dir)?;
-
     let request_store = QueueRequestStore::new(state_dir).map_err(|error| error.to_string())?;
     let mut queue = Queue::new(state_dir).map_err(|error| error.to_string())?;
     let workload_scope = format!("ship:{}:pr-{}", canonical_repository(&state.repo), state.pr);
@@ -282,26 +278,40 @@ where
     let selection_lock = queue
         .acquire_workload_admission_lock(&workload_scope)
         .map_err(|error| error.to_string())?;
-    let envelopes = request_store
-        .list()
-        .map_err(|error| format!("durable work provenance is unreadable: {error}"))?;
     let jobs = queue.get_all().map_err(|error| error.to_string())?;
-    let envelope_by_id = envelopes
-        .iter()
-        .map(|item| (item.job_id.as_str(), item))
-        .collect::<BTreeMap<_, _>>();
     let record_path = recovery_record_path(state_dir, &state.repo, state.pr);
     let existing = load_record(&record_path)?;
     let existing = existing.filter(|record| record_matches_state(record, state));
     if recovery_is_fenced(existing.as_ref()) {
         return Ok(None);
     }
+    // Establish queue absence before touching checkout/config/auth state. A
+    // transiently unavailable registered checkout must not permanently fence
+    // a ship that still has a healthy durable owner.
+    if existing.is_none()
+        && jobs.iter().any(|job| {
+            matches!(job.status, JobStatus::Pending | JobStatus::Running)
+                && job.workload_scope.as_deref() == Some(workload_scope.as_str())
+        })
+    {
+        return Ok(None);
+    }
+    let envelopes = request_store
+        .list()
+        .map_err(|error| format!("durable work provenance is unreadable: {error}"))?;
+    let envelope_by_id = envelopes
+        .iter()
+        .map(|item| (item.job_id.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
     let Some(source) =
         select_recovery_source(&envelopes, &jobs, &envelope_by_id, existing.as_ref(), state)?
     else {
         return Ok(None);
     };
     drop(selection_lock);
+    let canonical_path = fs::canonicalize(registered_repo_path)
+        .map_err(|error| format!("registered repo path is unavailable: {error}"))?;
+    let repo_config = load_recovery_config(mode, &canonical_path, global_dir)?;
     validate_source(&source, state, &canonical_path, &repo_config)?;
     ensure_source_has_no_outcome(state_dir, &source.job_id)?;
     if finalize_claimed_replacement_outcome(state_dir, &record_path, existing.as_ref())? {
@@ -1037,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn healthy_normal_replacement_wins_before_duplicate_envelopes_are_considered() {
+    fn healthy_normal_replacement_wins_before_checkout_or_duplicate_validation() {
         let fixture = Fixture::new();
         let mut queue = Queue::new(&fixture.state_dir).expect("queue");
         let normal_job = crate::ship::submit_ship(
@@ -1047,6 +1057,11 @@ mod tests {
             &fixture.state_dir,
         )
         .expect("normal replacement");
+        fs::rename(
+            &fixture.repo_path,
+            fixture.repo_path.with_extension("temporarily-offline"),
+        )
+        .expect("take registered checkout offline");
 
         let report = fixture.sweep(fixture.live(), |_| Ok(()));
         assert!(report.enqueued.is_empty(), "{report:?}");
