@@ -561,6 +561,49 @@ fn rollback_is_exact_and_swaps_forward_identity_for_recovery() {
 }
 
 #[test]
+fn rollback_preserves_owned_drain_recovery_expectations() {
+    let forward = identity("0.97.0", 'a');
+    let backward = identity("0.96.0", 'b');
+    let mut drained = observation(&forward, true, false, false);
+    drained.participation = Some(false);
+    drained.drain_owned = Some(true);
+    let mut state = RolloutState {
+        schema_version: STATE_SCHEMA,
+        generation: "forward".to_owned(),
+        direction: RolloutDirection::Forward,
+        desired: forward,
+        rollback: Some(backward.clone()),
+        hosts_file: PathBuf::from("hosts.json"),
+        inventory_sha256: "a".repeat(64),
+        canary_host: Some("m3".to_owned()),
+        canary_proven: false,
+        hosts: BTreeMap::from([(
+            "m3".to_owned(),
+            HostReceipt {
+                state: HostState::Offline,
+                observed: drained,
+                expected_participation: Some(true),
+                require_daemon_running: true,
+                updated_at: timestamp(),
+            },
+        )]),
+        reconciler: ReconcilerReceipt {
+            installed: true,
+            loaded: true,
+            detail: "test".to_owned(),
+        },
+        updated_at: timestamp(),
+    };
+
+    activate_rollback(&mut state).expect("rollback");
+
+    assert_eq!(state.desired, backward);
+    assert_eq!(state.hosts["m3"].expected_participation, Some(true));
+    assert!(state.hosts["m3"].require_daemon_running);
+    assert_eq!(state.hosts["m3"].observed.drain_owned, Some(true));
+}
+
+#[test]
 fn legacy_inventory_adds_local_controller_and_rejects_duplicate_names() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("fleet-hosts.json");
