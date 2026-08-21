@@ -733,8 +733,9 @@ impl HostExecutor for ProductionExecutor {
             };
         };
         if !output.status.success() {
+            let transport_failed = !host.local && output.status.code() == Some(255);
             return HostObservation {
-                reachable: true,
+                reachable: !transport_failed,
                 version: None,
                 sha256: None,
                 daemon_running: None,
@@ -756,30 +757,61 @@ impl HostExecutor for ProductionExecutor {
         let binary_matches = before.version.as_deref() == Some(desired.version.as_str())
             && before.sha256.as_deref() == Some(desired.sha256.as_str());
         let daemon_was_running = before.daemon_running == Some(true);
-        let installer_url = format!(
-            "https://raw.githubusercontent.com/danielraffel/Shipyard/v{}/install.sh",
-            env!("CARGO_PKG_VERSION")
-        );
+        let daemon_needs_refresh = daemon_was_running
+            && before.daemon_version.as_deref() != Some(desired.version.as_str());
+        let mutation_required = !binary_matches || daemon_needs_refresh;
+        let installer_source = shell_quote(include_str!("../../install.sh"));
         let script = format!(
             r#"set -eu
 bin="$HOME/.local/bin/shipyard"
-if [ {install} = 1 ]; then
+pool="$HOME/.local/bin/tartci-pool"
+restore_pool=0
+restore_participation() {{
+  if [ "$restore_pool" = 1 ]; then "$pool" on >/dev/null; fi
+}}
+trap restore_participation EXIT
+if [ {mutate} = 1 ]; then
   if pgrep -f '[R]unner.Worker' >/dev/null 2>&1; then
     echo "runner became busy before Shipyard installation; deferring" >&2
     exit 75
   fi
-  curl -fsSL {installer_url} | SHIPYARD_VERSION={version} SHIPYARD_EXPECTED_BINARY_SHA256={sha256} sh
+  if [ {participating} = 1 ]; then
+    "$pool" off >/dev/null
+    restore_pool=1
+    if pgrep -f '[R]unner.Worker' >/dev/null 2>&1; then
+      echo "runner claimed work while entering the release drain; deferring" >&2
+      exit 75
+    fi
+  fi
+  if [ {install} = 1 ]; then
+    printf '%s' {installer_source} | SHIPYARD_VERSION={version} SHIPYARD_EXPECTED_BINARY_SHA256={sha256} bash
+  fi
+  if [ {daemon} = 1 ]; then "$bin" daemon refresh >/dev/null; fi
+  if [ "$restore_pool" = 1 ]; then "$pool" on >/dev/null; restore_pool=0; fi
 fi
-if [ {daemon} = 1 ]; then "$bin" daemon refresh >/dev/null; fi
 "$bin" --version >/dev/null
+trap - EXIT
 "#,
             version = shell_quote(&desired.version),
             sha256 = shell_quote(&desired.sha256),
-            installer_url = shell_quote(&installer_url),
+            installer_source = installer_source,
             install = u8::from(!binary_matches),
-            daemon = u8::from(daemon_was_running),
+            daemon = u8::from(daemon_needs_refresh),
+            mutate = u8::from(mutation_required),
+            participating = u8::from(before.participation == Some(true)),
         );
-        let output = run_host_script(host, &script, 300)?;
+        let output = run_host_script(host, &script, 300);
+        if mutation_required && before.participation == Some(true) {
+            let restore = run_host_script(
+                host,
+                r#"pool="$HOME/.local/bin/tartci-pool"; [ -x "$pool" ] && "$pool" on >/dev/null"#,
+                20,
+            )?;
+            if !restore.status.success() {
+                return Err("failed to restore runner participation after rollout".to_owned());
+            }
+        }
+        let output = output?;
         if output.status.success() {
             Ok(())
         } else {
@@ -997,6 +1029,15 @@ fn load_hosts(path: &Path) -> Result<Vec<FleetHost>, CliFailure> {
                 2,
                 format!("remote fleet host {} requires an ssh alias", host.name),
             ));
+        } else if host
+            .ssh
+            .as_deref()
+            .is_some_and(|ssh| ssh.trim_start().starts_with('-'))
+        {
+            return Err(CliFailure::new(
+                2,
+                format!("remote fleet host {} has an unsafe ssh alias", host.name),
+            ));
         }
     }
     if local_count != 1 {
@@ -1028,10 +1069,17 @@ fn resolve_hosts_file(explicit: Option<&Path>, paths: &RuntimePaths) -> PathBuf 
 }
 
 fn resolve_state_file(explicit: Option<&Path>, paths: &RuntimePaths) -> PathBuf {
-    explicit.map_or_else(
+    let path = explicit.map_or_else(
         || paths.state_dir.join("fleet-release").join("state.json"),
         Path::to_path_buf,
-    )
+    );
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&path))
+            .unwrap_or(path)
+    }
 }
 
 fn read_state(path: &Path) -> Result<RolloutState, CliFailure> {
