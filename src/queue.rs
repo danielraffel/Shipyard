@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::job::{Job, JobKind, JobStatus, TargetResult, TargetStatus};
 use crate::queue_request::{
@@ -160,6 +161,25 @@ impl Queue {
     #[must_use]
     pub fn state_lock_file(&self) -> PathBuf {
         self.state_dir.join("queue.state.lock")
+    }
+
+    /// Acquire the short-lived ownership fence for one logical workload.
+    ///
+    /// Submitters and automatic recovery hold this only across durable
+    /// request + queue admission. It is intentionally distinct from both the
+    /// queue state lock and the long-lived ship execution lock.
+    pub(crate) fn acquire_workload_admission_lock(
+        &self,
+        workload_scope: &str,
+    ) -> QueueResult<WorkloadAdmissionLock> {
+        let digest = format!("{:x}", Sha256::digest(workload_scope.as_bytes()));
+        let path = self
+            .state_dir
+            .join("admission")
+            .join(format!("{}.lock", &digest[..32]));
+        Ok(WorkloadAdmissionLock {
+            _state: StateLock::acquire(path)?,
+        })
     }
 
     /// Add a job, superseding pending jobs for the same workload, branch,
@@ -919,6 +939,12 @@ fn is_terminal_job(status: JobStatus) -> bool {
 #[derive(Debug)]
 struct StateLock {
     file: File,
+}
+
+/// Short-lived, workload-scoped ownership admission fence.
+#[derive(Debug)]
+pub(crate) struct WorkloadAdmissionLock {
+    _state: StateLock,
 }
 
 impl StateLock {

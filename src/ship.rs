@@ -459,15 +459,16 @@ fn submit_ship_with_config(
     state_dir: &Path,
     config: Option<&LoadedConfig>,
 ) -> Result<Job, ShipExecutionError> {
-    // Queue-absence recovery uses this same repository-scoped lock while it
-    // claims and commits a replacement. Hold it across the normal submitter's
-    // running-owner check, durable envelope write, and queue insertion so
-    // neither side can miss the other's pre-commit ownership window.
-    let ship_state = ShipStateStore::new(state_dir.join("ship"))
-        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
-    let _ownership_lock = ship_state
-        .lock_pr_scoped(&request.repo, request.pr)
-        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+    let workload_scope = format!(
+        "ship:{}:pr-{}",
+        canonical_repository(&request.repo),
+        request.pr
+    );
+    // Queue-absence recovery uses this same short-lived workload fence while
+    // it claims and commits a replacement. Hold it across the normal
+    // submitter's running-owner check, durable envelope write, and queue
+    // insertion so neither side can miss the other's pre-commit window.
+    let _ownership_lock = queue.acquire_workload_admission_lock(&workload_scope)?;
     refuse_same_pr_running_ship(queue, state_dir, request)?;
     let target_names = target_names(&request.targets);
     let job = Job::create(
@@ -478,11 +479,7 @@ fn submit_ship_with_config(
         request.priority,
     )
     .with_kind(JobKind::Ship)
-    .with_workload_scope(format!(
-        "ship:{}:pr-{}",
-        canonical_repository(&request.repo),
-        request.pr
-    ));
+    .with_workload_scope(workload_scope);
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_ship_request(job.id.clone(), cwd, request);
     if let Some(config) = config {
@@ -1542,7 +1539,7 @@ fn sweep_absent_queue_envelopes(
         request_store,
     )?);
     request_store.sweep_absent_older_than(&retained_request_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
-    outcome_store.sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
+    outcome_store.sweep_absent_older_than(&retained_request_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
     Ok(())
 }
 

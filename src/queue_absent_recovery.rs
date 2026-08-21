@@ -413,6 +413,10 @@ fn claim_and_enqueue<C>(
 where
     C: FnMut(&QueueAbsentRecoveryRecord) -> Result<(), String>,
 {
+    let workload_scope = source.workload_scope();
+    let _ownership_lock = queue
+        .acquire_workload_admission_lock(&workload_scope)
+        .map_err(|error| error.to_string())?;
     let mut record = existing.unwrap_or_else(|| new_record(state, source));
     if record.status == QueueAbsentRecoveryStatus::Enqueued {
         return Err("prior recovered generation is absent; needs-agent".to_owned());
@@ -727,7 +731,7 @@ mod tests {
 
     use crate::config::LoadedConfig;
     use crate::job::{Priority, ValidationMode};
-    use crate::queue_request::{ExecutionProvenance, QueuedExecutionOwner};
+    use crate::queue_request::{ExecutionProvenance, QueuedExecutionOutcome, QueuedExecutionOwner};
     use crate::ship::ShipExecutionRequest;
 
     const REPO: &str = "Generous-Corp/pulp";
@@ -981,6 +985,19 @@ mod tests {
     fn absent_envelope_sweep_preserves_nonterminal_ship_recovery_authority() {
         let fixture = Fixture::new();
         let request_store = QueueRequestStore::new(&fixture.state_dir).expect("requests");
+        let outcome_store = QueueOutcomeStore::new(&fixture.state_dir).expect("outcomes");
+        let active_state = ShipStateStore::new(fixture.state_dir.join("ship"))
+            .expect("state store")
+            .get_scoped(REPO, 42)
+            .expect("state");
+        outcome_store
+            .save(&QueuedExecutionOutcome::ship(
+                &fixture.source_job_id,
+                42,
+                active_state,
+                false,
+            ))
+            .expect("source outcome");
         let retained = protected_request_job_ids(&fixture.state_dir, &request_store)
             .expect("protected request ids");
         assert_eq!(retained, BTreeSet::from([fixture.source_job_id.clone()]));
@@ -994,6 +1011,18 @@ mod tests {
             request_store
                 .load(&fixture.source_job_id)
                 .expect("load retained source")
+                .is_some()
+        );
+        assert!(
+            outcome_store
+                .sweep_absent_older_than(&retained, Duration::ZERO)
+                .expect("sweep active ship outcomes")
+                .is_empty()
+        );
+        assert!(
+            outcome_store
+                .load(&fixture.source_job_id)
+                .expect("load retained outcome")
                 .is_some()
         );
 
@@ -1010,6 +1039,12 @@ mod tests {
             request_store
                 .sweep_absent_older_than(&retained, Duration::ZERO)
                 .expect("sweep terminal ship requests"),
+            vec![fixture.source_job_id.clone()]
+        );
+        assert_eq!(
+            outcome_store
+                .sweep_absent_older_than(&retained, Duration::ZERO)
+                .expect("sweep terminal ship outcomes"),
             vec![fixture.source_job_id]
         );
     }
