@@ -642,10 +642,11 @@ fn merge_pr(
             cwd,
         )?
     };
+    let mut isolated_branch_cleanup = false;
     if let Some(client) = client.as_ref() {
         verify_live_merge_target(client, cwd, state, "before governance selection")?;
         if delete_branch {
-            require_branch_cleanup_git(client, cwd, global_dir)?;
+            isolated_branch_cleanup = require_branch_cleanup_git(client, cwd, global_dir)?;
         }
     }
     let queue_required = if custom_command {
@@ -806,7 +807,7 @@ fn merge_pr(
         command.args(classic_merge_args(
             state,
             merge_method,
-            delete_branch,
+            delete_branch && !isolated_branch_cleanup,
             admin,
         ));
     }
@@ -816,7 +817,13 @@ fn merge_pr(
         .map_err(|error| format!("failed to run merge command: {error}"))?;
     if output.status.success() {
         if let Some(client) = client.as_ref() {
-            return classify_builtin_merge_success(client, cwd, state);
+            let disposition = classify_builtin_merge_success(client, cwd, state)?;
+            if isolated_branch_cleanup && matches!(&disposition, MergeDisposition::Merged { .. }) {
+                return Ok(MergeDisposition::Merged {
+                    cleanup_warning: delete_pr_head_branch(client, cwd, global_dir, state).err(),
+                });
+            }
+            return Ok(disposition);
         }
         return Ok(MergeDisposition::Merged {
             cleanup_warning: None,
@@ -2418,7 +2425,7 @@ fn require_branch_cleanup_git(
     client: &GhClient,
     cwd: &Path,
     global_dir: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if let Some(git_authority) = branch_cleanup_git_authority(client, cwd, global_dir)? {
         git_authority
             .prepare_privileged_git_command(cwd)
@@ -2427,8 +2434,9 @@ fn require_branch_cleanup_git(
                     "--delete-branch requires trusted isolated Git cleanup before merge: {error}"
                 )
             })?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn delete_head_branch(
@@ -2828,11 +2836,15 @@ mod tests {
             ),
         )
         .expect("machine-global trusted Git config");
-        require_branch_cleanup_git(&client, Path::new("/tmp"), global.path())
-            .expect("machine-global trusted Git authorizes cleanup");
+        assert!(
+            require_branch_cleanup_git(&client, Path::new("/tmp"), global.path())
+                .expect("machine-global trusted Git authorizes cleanup")
+        );
 
-        require_branch_cleanup_git(&GhClient::ambient(), Path::new("/tmp"), global.path())
-            .expect("ambient cleanup retains its existing Git authority");
+        assert!(
+            !require_branch_cleanup_git(&GhClient::ambient(), Path::new("/tmp"), global.path())
+                .expect("ambient cleanup retains its existing Git authority")
+        );
     }
 
     #[test]
@@ -3210,6 +3222,23 @@ mod tests {
                 "sha=b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
             ]
         );
+    }
+
+    #[test]
+    fn classic_merge_can_delegate_branch_cleanup_without_losing_head_guard() {
+        let state = ShipState::new(
+            30,
+            "Generous-Corp/forge",
+            "feature/x",
+            "main",
+            "b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
+            "policy",
+        );
+        let args = classic_merge_args(&state, MergeMethod::Squash, false, false);
+
+        assert!(!args.iter().any(|arg| arg == "--delete-branch"));
+        assert!(args.iter().any(|arg| arg == "--match-head-commit"));
+        assert!(args.iter().any(|arg| arg == &state.head_sha));
     }
 
     // ── short_sha helper ────────────────────────────────────────────────
