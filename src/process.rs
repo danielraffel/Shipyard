@@ -11,6 +11,8 @@ use wait_timeout::ChildExt;
 
 #[cfg(unix)]
 const TERMINATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(windows))]
+const TERMINATION_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// A supervised child process tree.
@@ -112,9 +114,9 @@ impl ProcessTree {
 
     /// Best-effort termination of the complete supervised tree.
     ///
-    /// Unix reaps synchronously behind a bounded signal-command wait. Windows
-    /// requests Job Object termination without entering its unbounded wait;
-    /// pipe readers provide the bounded observation that descendants exited.
+    /// Every platform bounds both the termination request and direct-child
+    /// reaping. A child stuck in an uninterruptible kernel wait must not hold a
+    /// caller's higher-level queue or model lease forever.
     pub(crate) fn terminate(&mut self) {
         if self.terminated {
             return;
@@ -138,7 +140,7 @@ impl ProcessTree {
         {
             let Ok(mut terminator) = termination_command(self.child.id()).spawn() else {
                 let _ = self.child.kill();
-                let _ = self.child.wait();
+                let _ = self.wait_timeout(TERMINATION_REAP_TIMEOUT);
                 return;
             };
             if !matches!(
@@ -146,15 +148,15 @@ impl ProcessTree {
                 Ok(Some(_))
             ) {
                 let _ = terminator.kill();
-                let _ = terminator.wait();
+                let _ = terminator.wait_timeout(TERMINATION_REAP_TIMEOUT);
             }
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            let _ = self.wait_timeout(TERMINATION_REAP_TIMEOUT);
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            let _ = self.wait_timeout(TERMINATION_REAP_TIMEOUT);
         }
     }
 }

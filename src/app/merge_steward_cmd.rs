@@ -30,6 +30,8 @@ use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 use crate::ship_state::{ShipState, ShipStateStore};
 
+pub(super) mod recovery_worker;
+
 pub(super) struct StewardCommandArgs {
     pub(super) repos: Vec<String>,
     pub(super) base: String,
@@ -198,6 +200,7 @@ struct MutationControl {
     cwd: PathBuf,
     mode: RuntimeMode,
     global_dir: PathBuf,
+    state_dir: PathBuf,
 }
 
 struct MutationApplyContext<'a> {
@@ -566,6 +569,7 @@ pub(super) fn admission_clean_command<W: Write>(
         cwd: cwd.to_path_buf(),
         mode,
         global_dir: runtime_paths.global_dir.clone(),
+        state_dir: runtime_paths.state_dir.clone(),
     };
     for (key, pending) in pending {
         if cancellation_recovery::resume_pending_cancellation(
@@ -726,6 +730,7 @@ pub(super) fn steward_command<W: Write>(
             cwd: cwd.to_path_buf(),
             mode,
             global_dir: runtime_paths.global_dir.clone(),
+            state_dir: runtime_paths.state_dir.clone(),
         })
     } else {
         None
@@ -938,8 +943,8 @@ use cancellation_revalidation::{
     acquire_pr_mutation_guard, acquire_run_mutation_guard, attempts_for,
     authoritative_head_still_superseded, current_pull_request_heads, exact_run_still_queued,
     merge_group_pr_number, opted_out_pull_requests, pull_request_is_managed,
-    pull_request_with_required_checks, revalidate_capacity_preemption,
-    revalidate_coalescing_cancellation,
+    pull_request_with_required_checks, pull_request_with_required_checks_before,
+    revalidate_capacity_preemption, revalidate_coalescing_cancellation,
 };
 use cancellation_terminalization::{
     acquire_pending_cancellation_guard, active_runner_targets, clear_pending_cancellation,
@@ -953,8 +958,9 @@ use capacity_cancellation::{
 };
 use ledger::{attempt_key, load_ledger, record_audit, save_ledger};
 use observation::{
-    active_runs, fetch_run_jobs, fetch_run_jobs_before, gh_json, gh_json_timeout,
-    hydrate_required_check_identities, merge_queue_snapshot, observe_repo, parse_job, parse_pr,
+    active_runs, fetch_run_jobs, fetch_run_jobs_before, gh_json, gh_json_before, gh_json_timeout,
+    hydrate_required_check_identities, hydrate_required_check_identities_before,
+    merge_queue_snapshot, merge_queue_snapshot_before, observe_repo, parse_job, parse_pr,
     parse_run, pull_requests, resolve_repos,
 };
 use pr_mutations::mutate_pr;

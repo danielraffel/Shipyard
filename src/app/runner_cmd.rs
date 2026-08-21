@@ -60,6 +60,19 @@ pub(super) fn runner_command<W: Write>(
     let state_dir = &runtime_paths.state_dir;
     let actions = GitHubActions::from_loaded_config(cwd, config);
     match command {
+        RunnerCommand::RecoveryWorker { once, drain, apply } => {
+            super::merge_steward_cmd::recovery_worker::recovery_worker_command(
+                super::merge_steward_cmd::recovery_worker::RecoveryWorkerCommandArgs {
+                    once,
+                    drain,
+                    apply,
+                },
+                cwd,
+                runtime_paths,
+                json,
+                stdout,
+            )
+        }
         RunnerCommand::Status {
             runner_id,
             repo,

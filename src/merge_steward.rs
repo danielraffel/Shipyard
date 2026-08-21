@@ -415,18 +415,25 @@ fn selected_checks<'a>(
         .map(|required| {
             (
                 required.label(),
-                pr.checks
-                    .iter()
-                    .filter(|check| {
-                        check.name.eq_ignore_ascii_case(&required.context)
-                            && required
-                                .app_id
-                                .is_none_or(|app_id| check.app_id == Some(app_id))
-                    })
-                    .max_by_key(|check| check_recency(check)),
+                selected_required_check(&pr.checks, required),
             )
         })
         .collect()
+}
+
+pub(crate) fn selected_required_check<'a>(
+    checks: &'a [StewardCheck],
+    required: &RequiredCheck,
+) -> Option<&'a StewardCheck> {
+    checks
+        .iter()
+        .filter(|check| {
+            check.name.eq_ignore_ascii_case(&required.context)
+                && required
+                    .app_id
+                    .is_none_or(|app_id| check.app_id == Some(app_id))
+        })
+        .max_by_key(|check| check_recency(check))
 }
 
 fn check_recency(check: &StewardCheck) -> (bool, &str, bool) {
@@ -437,7 +444,7 @@ fn check_recency(check: &StewardCheck) -> (bool, &str, bool) {
     )
 }
 
-fn is_transient_conclusion(conclusion: &str) -> bool {
+pub(crate) fn is_transient_conclusion(conclusion: &str) -> bool {
     matches!(
         conclusion,
         "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "STALE"

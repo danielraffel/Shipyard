@@ -1,9 +1,24 @@
 use super::{
-    MutationApplyContext, NEEDS_AGENT_LABEL, ObservedPr, RECOVERY_CONTEXT, StewardDecision,
-    StewardLedger, StewardPolicy, UNMANAGED_LABEL, acquire_pr_mutation_guard, classify_pr,
+    Duration, Instant, MutationApplyContext, NEEDS_AGENT_LABEL, ObservedPr, RECOVERY_CONTEXT,
+    StewardDecision, StewardLedger, StewardPolicy, UNMANAGED_LABEL, acquire_pr_mutation_guard,
+    classify_pr,
     handoff::{add_label, ensure_label, remove_label, run_steward_write},
-    merge_queue_snapshot, pull_request_with_required_checks, record_audit,
+    merge_queue_snapshot_before, pull_request_with_required_checks_before, record_audit,
 };
+use crate::merge_steward::StewardCheck;
+use crate::recovery_worker::{RecoveryFailureFact, RecoveryRequiredCheck};
+use sha2::{Digest, Sha256};
+
+use super::recovery_worker::{
+    RecoveryEnqueueDisposition, RecoveryEnqueueLease, acquire_recovery_publication_lease,
+    enqueue_recovery_request, recovery_publication_is_enabled, with_recovery_clear_fence,
+};
+
+const RECOVERY_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn recovery_revalidation_deadline() -> Instant {
+    Instant::now() + RECOVERY_REVALIDATION_TIMEOUT
+}
 
 pub(super) fn reconcile_management_label(
     context: &MutationApplyContext<'_>,
@@ -19,7 +34,14 @@ pub(super) fn reconcile_management_label(
     if management_label_is_converged(observed, unmanaged) {
         return (None, None);
     }
-    let live = match revalidate_recovery_target(context, observed, policy, decision, ledger) {
+    let live = match revalidate_recovery_target(
+        context,
+        observed,
+        policy,
+        decision,
+        ledger,
+        recovery_revalidation_deadline(),
+    ) {
         Ok(live) => live,
         Err(result) => return result,
     };
@@ -114,31 +136,334 @@ pub(super) fn reconcile_recovery_signal(
         _ => false,
     };
     if signal_is_converged(observed, needs_agent) {
-        return (None, None);
+        return if needs_agent {
+            enqueue_recovery_after_revalidation(context, observed, policy, decision, ledger)
+        } else {
+            fence_converged_recovery_clear(context, observed)
+        };
     }
 
-    let live = match revalidate_recovery_target(context, observed, policy, decision, ledger) {
+    let live = match revalidate_recovery_target(
+        context,
+        observed,
+        policy,
+        decision,
+        ledger,
+        recovery_revalidation_deadline(),
+    ) {
         Ok(live) => live,
         Err(result) => return result,
     };
     if signal_is_converged(&live, needs_agent) {
-        return (None, None);
+        return if needs_agent {
+            enqueue_recovery_after_revalidation(context, &live, policy, decision, ledger)
+        } else {
+            fence_converged_recovery_clear(context, &live)
+        };
     }
 
-    apply_recovery_signal(context, &live, decision, needs_agent, ledger)
+    let (mutation, error) = apply_recovery_signal(context, &live, decision, needs_agent, ledger);
+    if !needs_agent || error.is_some() {
+        return (mutation, error);
+    }
+    let (enqueue_mutation, enqueue_error) =
+        enqueue_recovery_after_revalidation(context, &live, policy, decision, ledger);
+    (combine_mutations(mutation, enqueue_mutation), enqueue_error)
 }
 
-fn revalidate_recovery_target(
+fn enqueue_recovery_after_revalidation(
     context: &MutationApplyContext<'_>,
     observed: &ObservedPr,
     policy: &StewardPolicy,
     decision: &StewardDecision,
     ledger: &StewardLedger,
+) -> (Option<String>, Option<String>) {
+    match recovery_publication_is_enabled(
+        &context.mutation_control.global_dir,
+        &context.mutation_control.state_dir,
+        &context.observation.repo,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return (None, None),
+        Err(error) => return deferred_recovery_request(error.message()),
+    }
+    // Publication and deterministic clear share this exclusive lease. A clear
+    // that acquires first completes before this final live read; a clear that
+    // overlaps the read waits and supersedes any record published afterward.
+    let deadline = recovery_revalidation_deadline();
+    let publication_lease =
+        match acquire_recovery_publication_lease(&context.mutation_control.state_dir) {
+            Ok(lease) => lease,
+            Err(error) => return deferred_recovery_request(error.message()),
+        };
+    let live =
+        match revalidate_recovery_target(context, observed, policy, decision, ledger, deadline) {
+            Ok(live) => live,
+            Err((mutation, None)) => return (mutation, None),
+            Err((mutation, Some(error))) => {
+                let (deferred, _) = deferred_recovery_request(&error);
+                return (combine_mutations(mutation, deferred), None);
+            }
+        };
+    if !signal_is_converged(&live, true) {
+        return (
+            Some("recovery_skipped_after_signal_revalidation".to_owned()),
+            None,
+        );
+    }
+    enqueue_recovery(context, &live, policy, decision, publication_lease)
+}
+
+fn fence_converged_recovery_clear(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+) -> (Option<String>, Option<String>) {
+    // Always fence the durable target, even when no witness exists. Enqueue
+    // persists its record before its witness, and a crash in that gap must not
+    // leave active work behind after deterministic stewardship has converged.
+    match with_recovery_clear_fence(
+        &context.mutation_control.state_dir,
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+        || Ok(()),
+    ) {
+        Ok(()) => (None, None),
+        Err(error) => (None, Some(error)),
+    }
+}
+
+fn enqueue_recovery(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    policy: &StewardPolicy,
+    decision: &StewardDecision,
+    publication_lease: RecoveryEnqueueLease,
+) -> (Option<String>, Option<String>) {
+    let (failure_summary, failure_facts) =
+        match normalized_recovery_facts(decision, policy, &pr.fact.checks) {
+            Ok(Some(facts)) => facts,
+            Ok(None) => return (None, None),
+            Err(error) => {
+                return (
+                    Some(format!(
+                        "recovery_request_deferred:{}",
+                        truncate_description(&error)
+                    )),
+                    None,
+                );
+            }
+        };
+    let mut fingerprint_components = vec![failure_summary.clone()];
+    fingerprint_components.extend(failure_facts.iter().map(failure_fact_component));
+    let failure_fingerprint = digest_components(fingerprint_components.iter().map(String::as_str));
+    let policy_signature = steward_policy_signature(policy);
+    let required_checks = policy
+        .required_checks
+        .iter()
+        .map(|required| RecoveryRequiredCheck {
+            context: required.context.clone(),
+            app_id: required.app_id,
+        })
+        .collect();
+    match enqueue_recovery_request(
+        &context.mutation_control.global_dir,
+        &context.mutation_control.state_dir,
+        publication_lease,
+        &context.observation.repo,
+        pr.fact.number,
+        &context.observation.base,
+        &pr.fact.head_sha,
+        policy.merge_queue,
+        &policy.opt_out_label,
+        &failure_fingerprint,
+        &failure_summary,
+        required_checks,
+        failure_facts,
+        &policy_signature,
+    ) {
+        Ok(RecoveryEnqueueDisposition::Disabled | RecoveryEnqueueDisposition::Existing(_)) => {
+            (None, None)
+        }
+        Ok(RecoveryEnqueueDisposition::Created(id)) => {
+            (Some(format!("recovery_request_created:{id}")), None)
+        }
+        // Model recovery is an optional exception lane. Surface its failure in
+        // the per-PR report, but never make deterministic stewardship unhealthy
+        // or prevent unrelated queue progress.
+        Err(error) => deferred_recovery_request(error.message()),
+    }
+}
+
+fn deferred_recovery_request(error: &str) -> (Option<String>, Option<String>) {
+    (
+        Some(format!(
+            "recovery_request_deferred:{}",
+            truncate_description(error)
+        )),
+        None,
+    )
+}
+
+fn normalized_recovery_facts(
+    decision: &StewardDecision,
+    policy: &StewardPolicy,
+    checks: &[StewardCheck],
+) -> Result<Option<(String, Vec<RecoveryFailureFact>)>, String> {
+    match decision {
+        StewardDecision::NeedsUpdate { merge_state } => Ok(Some((
+            "pull request requires an exact-head update".to_owned(),
+            vec![RecoveryFailureFact::MergeState {
+                state: merge_state.to_ascii_uppercase(),
+            }],
+        ))),
+        StewardDecision::RequiredFailed { contexts } => {
+            let mut normalized = Vec::new();
+            for label in contexts {
+                let matches = policy
+                    .required_checks
+                    .iter()
+                    .filter(|required| required.label() == *label)
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    return Err(format!(
+                        "required-check display label `{label}` does not map to exactly one structured policy identity"
+                    ));
+                }
+                let required = matches[0];
+                let selected = crate::merge_steward::selected_required_check(checks, required)
+                    .ok_or_else(|| {
+                        format!(
+                            "required-check display label `{label}` has no selected current check"
+                        )
+                    })?;
+                if !selected.status.eq_ignore_ascii_case("COMPLETED") {
+                    return Err(format!(
+                        "required-check display label `{label}` selected a non-terminal check"
+                    ));
+                }
+                let conclusion = selected
+                    .conclusion
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "required-check display label `{label}` selected a completed check without a conclusion"
+                        )
+                    })?
+                    .to_ascii_uppercase();
+                if !matches!(
+                    conclusion.as_str(),
+                    "ACTION_REQUIRED"
+                        | "CANCELLED"
+                        | "FAILURE"
+                        | "STALE"
+                        | "STARTUP_FAILURE"
+                        | "TIMED_OUT"
+                ) {
+                    return Err(format!(
+                        "required-check display label `{label}` selected non-failing conclusion `{conclusion}`"
+                    ));
+                }
+                normalized.push(RecoveryFailureFact::RequiredCheck {
+                    context: required.context.clone(),
+                    app_id: required.app_id,
+                    conclusion,
+                    run_id: selected.run_id,
+                });
+            }
+            normalized.sort_by(|left, right| {
+                failure_fact_component(left).cmp(&failure_fact_component(right))
+            });
+            normalized.dedup();
+            Ok(Some((
+                "one or more required checks failed".to_owned(),
+                normalized,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn failure_fact_component(fact: &RecoveryFailureFact) -> String {
+    match fact {
+        RecoveryFailureFact::MergeState { state } => format!("merge_state:{state}"),
+        RecoveryFailureFact::RequiredCheck {
+            context,
+            app_id,
+            conclusion,
+            run_id,
+        } => {
+            let producer =
+                app_id.map_or_else(|| "unbound".to_owned(), |app_id| format!("app_id={app_id}"));
+            let run = run_id.map_or_else(|| "no_run".to_owned(), |run_id| run_id.to_string());
+            format!("required_check:{context}:{producer}:conclusion={conclusion}:run_id={run}")
+        }
+    }
+}
+
+fn steward_policy_signature(policy: &StewardPolicy) -> String {
+    let mut required = policy
+        .required_checks
+        .iter()
+        .map(|check| (check.context.as_str(), check.app_id))
+        .collect::<Vec<_>>();
+    required.sort();
+    let mut components = vec![
+        format!("merge_queue={}", policy.merge_queue),
+        format!("native_auto_merge={}", policy.native_auto_merge),
+        format!("opt_out_label={}", policy.opt_out_label),
+        format!(
+            "managed_label={}",
+            policy.managed_label.as_deref().unwrap_or_default()
+        ),
+        format!("handoff_context={}", policy.handoff_context),
+        format!("max_transient_reruns={}", policy.max_transient_reruns),
+    ];
+    for (context, app_id) in required {
+        components.push("required_check".to_owned());
+        components.push(context.to_owned());
+        match app_id {
+            Some(app_id) => {
+                components.push("app_id_some".to_owned());
+                components.push(app_id.to_string());
+            }
+            None => components.push("app_id_none".to_owned()),
+        }
+    }
+    digest_components(components.iter().map(String::as_str))
+}
+
+fn digest_components<'a>(components: impl IntoIterator<Item = &'a str>) -> String {
+    let mut digest = Sha256::new();
+    for component in components {
+        digest.update(component.len().to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn combine_mutations(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(format!("{left};{right}")),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+pub(super) fn revalidate_recovery_target(
+    context: &MutationApplyContext<'_>,
+    observed: &ObservedPr,
+    policy: &StewardPolicy,
+    decision: &StewardDecision,
+    ledger: &StewardLedger,
+    deadline: Instant,
 ) -> Result<ObservedPr, (Option<String>, Option<String>)> {
-    let positions = match merge_queue_snapshot(
+    let positions = match merge_queue_snapshot_before(
         context.actions,
         &context.observation.repo,
         &context.observation.base,
+        deadline,
     ) {
         Ok((enabled, positions, _, _)) if enabled == policy.merge_queue => positions,
         Ok(_) => {
@@ -149,13 +474,14 @@ fn revalidate_recovery_target(
         }
         Err(error) => return Err((None, Some(error))),
     };
-    let live = match pull_request_with_required_checks(
+    let live = match pull_request_with_required_checks_before(
         context.actions,
         &context.observation.repo,
         observed.fact.number,
         &context.observation.base,
         &positions,
         &policy.required_checks,
+        deadline,
     ) {
         Ok(Some(pr))
             if pr
@@ -207,7 +533,13 @@ fn apply_recovery_signal(
     let result = if needs_agent {
         signal_needs_agent(context, live, decision)
     } else {
-        clear_needs_agent(context, live)
+        with_recovery_clear_fence(
+            &context.mutation_control.state_dir,
+            &context.observation.repo,
+            live.fact.number,
+            &live.fact.head_sha,
+            || clear_needs_agent(context, live),
+        )
     };
     match result {
         Ok(action) => {
@@ -378,7 +710,7 @@ fn truncate_description(value: &str) -> String {
 mod tests {
     use super::super::MANAGED_LABEL;
     use super::*;
-    use crate::merge_steward::{StewardCheck, StewardPullRequest};
+    use crate::merge_steward::{RequiredCheck, StewardCheck, StewardPullRequest};
 
     fn pr(labels: Vec<&str>, recovery_states: Vec<(&str, &str)>) -> ObservedPr {
         ObservedPr {
@@ -459,5 +791,144 @@ mod tests {
             &pr(vec![UNMANAGED_LABEL, MANAGED_LABEL], vec![]),
             false
         ));
+    }
+
+    #[test]
+    fn recovery_facts_are_normalized_without_contributor_prose() {
+        let decision = StewardDecision::RequiredFailed {
+            contexts: vec!["macos".to_owned(), "linux".to_owned(), "macos".to_owned()],
+        };
+        let policy = StewardPolicy {
+            merge_queue: true,
+            native_auto_merge: true,
+            required_checks: vec![
+                RequiredCheck {
+                    context: "linux".to_owned(),
+                    app_id: None,
+                },
+                RequiredCheck {
+                    context: "macos".to_owned(),
+                    app_id: None,
+                },
+            ],
+            opt_out_label: "shipyard:no-auto-merge".to_owned(),
+            managed_label: Some(MANAGED_LABEL.to_owned()),
+            handoff_context: "shipyard/steward-handoff".to_owned(),
+            max_transient_reruns: 1,
+        };
+        let checks = vec![
+            StewardCheck {
+                name: "linux".to_owned(),
+                source: crate::merge_steward::StewardCheckSource::CheckRun,
+                app_id: None,
+                status: "COMPLETED".to_owned(),
+                conclusion: Some("FAILURE".to_owned()),
+                run_id: Some(101),
+                observed_at: Some("2026-08-21T08:00:00Z".to_owned()),
+            },
+            StewardCheck {
+                name: "macos".to_owned(),
+                source: crate::merge_steward::StewardCheckSource::CheckRun,
+                app_id: None,
+                status: "COMPLETED".to_owned(),
+                conclusion: Some("TIMED_OUT".to_owned()),
+                run_id: None,
+                observed_at: Some("2026-08-21T08:00:00Z".to_owned()),
+            },
+        ];
+        let (summary, contexts) = normalized_recovery_facts(&decision, &policy, &checks)
+            .expect("unambiguous policy")
+            .expect("failure facts");
+        assert_eq!(summary, "one or more required checks failed");
+        assert_eq!(
+            contexts,
+            vec![
+                RecoveryFailureFact::RequiredCheck {
+                    context: "linux".to_owned(),
+                    app_id: None,
+                    conclusion: "FAILURE".to_owned(),
+                    run_id: Some(101),
+                },
+                RecoveryFailureFact::RequiredCheck {
+                    context: "macos".to_owned(),
+                    app_id: None,
+                    conclusion: "TIMED_OUT".to_owned(),
+                    run_id: None,
+                }
+            ]
+        );
+
+        let literal = StewardDecision::RequiredFailed {
+            contexts: vec!["lint (app_id=7)".to_owned()],
+        };
+        let literal_policy = StewardPolicy {
+            required_checks: vec![RequiredCheck {
+                context: "lint (app_id=7)".to_owned(),
+                app_id: None,
+            }],
+            ..policy
+        };
+        let literal_checks = [StewardCheck {
+            name: "lint (app_id=7)".to_owned(),
+            source: crate::merge_steward::StewardCheckSource::StatusContext,
+            app_id: None,
+            status: "COMPLETED".to_owned(),
+            conclusion: Some("FAILURE".to_owned()),
+            run_id: None,
+            observed_at: Some("2026-08-21T08:00:00Z".to_owned()),
+        }];
+        let (_, facts) = normalized_recovery_facts(&literal, &literal_policy, &literal_checks)
+            .expect("literal label is unambiguous")
+            .expect("failure facts");
+        assert_eq!(
+            facts,
+            vec![RecoveryFailureFact::RequiredCheck {
+                context: "lint (app_id=7)".to_owned(),
+                app_id: None,
+                conclusion: "FAILURE".to_owned(),
+                run_id: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn recovery_policy_signature_is_order_independent_and_sensitive() {
+        let policy = |checks: Vec<RequiredCheck>, reruns| StewardPolicy {
+            merge_queue: true,
+            native_auto_merge: true,
+            required_checks: checks,
+            opt_out_label: "shipyard:no-auto-merge".to_owned(),
+            managed_label: Some(MANAGED_LABEL.to_owned()),
+            handoff_context: "shipyard/steward-handoff".to_owned(),
+            max_transient_reruns: reruns,
+        };
+        let linux = RequiredCheck {
+            context: "linux".to_owned(),
+            app_id: Some(1),
+        };
+        let macos = RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: None,
+        };
+        let first = steward_policy_signature(&policy(vec![linux.clone(), macos.clone()], 1));
+        let reordered = steward_policy_signature(&policy(vec![macos, linux], 1));
+        let changed = steward_policy_signature(&policy(Vec::new(), 2));
+        let literal_display = steward_policy_signature(&policy(
+            vec![RequiredCheck {
+                context: "lint (app_id=7)".to_owned(),
+                app_id: None,
+            }],
+            1,
+        ));
+        let structured_identity = steward_policy_signature(&policy(
+            vec![RequiredCheck {
+                context: "lint".to_owned(),
+                app_id: Some(7),
+            }],
+            1,
+        ));
+        assert_eq!(first, reordered);
+        assert_ne!(first, changed);
+        assert_ne!(literal_display, structured_identity);
     }
 }

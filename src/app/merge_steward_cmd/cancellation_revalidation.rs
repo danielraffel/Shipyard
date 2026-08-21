@@ -1,9 +1,10 @@
 use super::{
-    BTreeMap, BTreeSet, CapacityPreemptionPolicy, CapacityRevalidation, GitHubActions,
+    BTreeMap, BTreeSet, CapacityPreemptionPolicy, CapacityRevalidation, GitHubActions, Instant,
     MergeQueueMutationGuard, MutationControl, ObservedPr, RepoObservation, RequiredCheck,
     RunCancellation, RunCancellationReason, ShipState, StewardJob, StewardLedger,
     StewardPullRequest, StewardRun, Value, active_runs, attempt_key, coalescing_reason_authorizes,
-    fetch_run_jobs, gh_json, has_successful_status, hydrate_required_check_identities, is_full_sha,
+    fetch_run_jobs, gh_json, gh_json_before, has_successful_status,
+    hydrate_required_check_identities, hydrate_required_check_identities_before, is_full_sha,
     is_safe_capacity_preemption, merge_queue_snapshot, parse_pr, parse_run, plan_run_coalescing,
     pull_requests, queue_front_waits_for_pool, timestamp_old_enough,
 };
@@ -129,19 +130,32 @@ pub(super) fn pull_request(
     expected_base: &str,
     queue_positions: &BTreeMap<u64, u64>,
 ) -> Result<Option<ObservedPr>, String> {
-    let value = gh_json(
-        actions,
-        &[
-            "pr".to_owned(),
-            "view".to_owned(),
-            number.to_string(),
-            "--repo".to_owned(),
-            repo.to_owned(),
-            "--json".to_owned(),
-            "id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
-        ],
-        "capacity-preemption candidate PR",
-    )?;
+    pull_request_with_deadline(actions, repo, number, expected_base, queue_positions, None)
+}
+
+fn pull_request_with_deadline(
+    actions: &GitHubActions,
+    repo: &str,
+    number: u64,
+    expected_base: &str,
+    queue_positions: &BTreeMap<u64, u64>,
+    deadline: Option<Instant>,
+) -> Result<Option<ObservedPr>, String> {
+    let args = [
+        "pr".to_owned(),
+        "view".to_owned(),
+        number.to_string(),
+        "--repo".to_owned(),
+        repo.to_owned(),
+        "--json".to_owned(),
+        "id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup".to_owned(),
+    ];
+    let value = match deadline {
+        Some(deadline) => {
+            gh_json_before(actions, &args, "capacity-preemption candidate PR", deadline)?
+        }
+        None => gh_json(actions, &args, "capacity-preemption candidate PR")?,
+    };
     if value.get("state").and_then(Value::as_str) != Some("OPEN") {
         return Ok(None);
     }
@@ -167,6 +181,36 @@ pub(super) fn pull_request_with_required_checks(
         repo,
         required_checks,
         std::slice::from_mut(&mut pr),
+    )?;
+    Ok(Some(pr))
+}
+
+pub(super) fn pull_request_with_required_checks_before(
+    actions: &GitHubActions,
+    repo: &str,
+    number: u64,
+    expected_base: &str,
+    queue_positions: &BTreeMap<u64, u64>,
+    required_checks: &[RequiredCheck],
+    deadline: Instant,
+) -> Result<Option<ObservedPr>, String> {
+    let Some(mut pr) = pull_request_with_deadline(
+        actions,
+        repo,
+        number,
+        expected_base,
+        queue_positions,
+        Some(deadline),
+    )?
+    else {
+        return Ok(None);
+    };
+    hydrate_required_check_identities_before(
+        actions,
+        repo,
+        required_checks,
+        std::slice::from_mut(&mut pr),
+        deadline,
     )?;
     Ok(Some(pr))
 }

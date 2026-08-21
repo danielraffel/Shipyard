@@ -1,20 +1,26 @@
 //! Shared GitHub CLI command boundary and auth resolution.
 
+mod config;
+
+use config::{GhAuthConfig, GhAuthSource};
+pub use config::{
+    GhAuthPolicy, GhAuthSourceSummary, GhAuthSummary, GhConfigError, GhPrepareError, GhSupervision,
+};
+
 use std::env;
-use std::error::Error;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Formatter};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
 use serde_json::Value;
 
-use crate::config::{ConfigLoadError, LoadedConfig};
+use crate::config::LoadedConfig;
 use crate::identity::RuntimeMode;
+use crate::native_executable::{resolve_native_executable_from_path, validate_native_executable};
 
 const DEFAULT_REFRESH_SKEW_SECONDS: u64 = 60;
 const GH_TOKEN_ENV: &str = "GH_TOKEN";
@@ -122,19 +128,48 @@ impl GhClient {
         auth_policy: GhAuthPolicy,
         auth_timeout: Option<Duration>,
     ) -> Result<Command, GhPrepareError> {
+        let ambient_binary = if auth_policy == GhAuthPolicy::AmbientOnly {
+            Some(match binary_override {
+                Some(path) => validate_native_executable(path).map_err(|error| {
+                    GhPrepareError::InvalidAmbientGhBinary {
+                        path: path.to_path_buf(),
+                        detail: error.to_string(),
+                    }
+                })?,
+                None => self.resolve_ambient_gh_binary()?,
+            })
+        } else {
+            None
+        };
+        let binary = ambient_binary.as_deref().or(binary_override);
         let mut command = match supervision {
-            GhSupervision::Supervised => crate::supervised::gh_supervised(binary_override),
-            GhSupervision::Unsupervised => {
-                binary_override.map_or_else(|| Command::new("gh"), Command::new)
-            }
+            GhSupervision::Supervised => crate::supervised::gh_supervised(binary),
+            GhSupervision::Unsupervised => binary.map_or_else(|| Command::new("gh"), Command::new),
         };
         command.current_dir(cwd);
-        if auth_policy == GhAuthPolicy::Default
-            && let Some(token) = self.resolve_token_with_timeout(cwd, auth_timeout)?
-        {
-            command.env(GH_TOKEN_ENV, token.token);
+        match auth_policy {
+            GhAuthPolicy::Default => {
+                if let Some(token) = self.resolve_token_with_timeout(cwd, auth_timeout)? {
+                    command.env(GH_TOKEN_ENV, token.token);
+                }
+            }
+            GhAuthPolicy::AmbientOnly => {
+                command.env_remove(GH_TOKEN_ENV).env_remove("GITHUB_TOKEN");
+            }
         }
         Ok(command)
+    }
+
+    fn resolve_ambient_gh_binary(&self) -> Result<PathBuf, GhPrepareError> {
+        if let Some(path) = self.auth.ambient_gh_binary.as_deref() {
+            return validate_native_executable(path).map_err(|error| {
+                GhPrepareError::InvalidAmbientGhBinary {
+                    path: path.to_path_buf(),
+                    detail: error.to_string(),
+                }
+            });
+        }
+        resolve_ambient_gh_from_path(env::var_os("PATH").as_deref())
     }
 
     /// Prepare a non-interactive `git` command that uses the same configured
@@ -336,6 +371,12 @@ impl GhClient {
     }
 }
 
+fn resolve_ambient_gh_from_path(path: Option<&std::ffi::OsStr>) -> Result<PathBuf, GhPrepareError> {
+    let executable = format!("gh{}", env::consts::EXE_SUFFIX);
+    resolve_native_executable_from_path(&executable, path)
+        .ok_or(GhPrepareError::AmbientGhBinaryNotFound)
+}
+
 fn run_helper_with_timeout(
     command: &mut Command,
     program: &str,
@@ -405,338 +446,6 @@ fn run_helper_with_timeout(
         stdout: read_output(&mut stdout)?,
         stderr: read_output(&mut stderr)?,
     })
-}
-
-/// Which auth source to apply when preparing a `gh` command.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GhAuthPolicy {
-    /// Use configured Shipyard auth when present.
-    Default,
-    /// Ignore configured Shipyard auth and use ambient `gh` auth.
-    AmbientOnly,
-}
-
-/// Whether the prepared `gh` command should carry Shipyard's supervised marker.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GhSupervision {
-    /// Add `SHIPYARD_PR_RUNNING=1`.
-    Supervised,
-    /// Do not add Shipyard's supervised marker.
-    Unsupervised,
-}
-
-/// Sanitized summary of the effective GitHub auth source.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GhAuthSummary {
-    /// Effective auth source.
-    pub source: GhAuthSourceSummary,
-    /// Optional helper-reported token kind.
-    pub token_kind: Option<String>,
-    /// Optional helper-reported expiry.
-    pub expires_at: Option<DateTime<Utc>>,
-}
-
-/// Sanitized effective auth source.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GhAuthSourceSummary {
-    /// Ambient `gh` auth.
-    GhCli,
-    /// Token read from an environment variable.
-    Env {
-        /// Environment variable name, not the token value.
-        token_env: String,
-    },
-    /// Token read from a command helper.
-    Command,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GhAuthConfig {
-    source: GhAuthSource,
-    refresh_skew_seconds: u64,
-}
-
-impl GhAuthConfig {
-    fn ambient() -> Self {
-        Self {
-            source: GhAuthSource::GhCli,
-            refresh_skew_seconds: DEFAULT_REFRESH_SKEW_SECONDS,
-        }
-    }
-
-    fn from_loaded_config(config: &LoadedConfig) -> Result<Self, GhConfigError> {
-        let Some(value) = config.get("github.auth") else {
-            return Ok(Self::ambient());
-        };
-        let raw = value
-            .clone()
-            .try_into::<RawGithubAuthConfig>()
-            .map_err(|source| GhConfigError::Parse { source })?;
-        raw.into_config()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum GhAuthSource {
-    GhCli,
-    Env {
-        token_env: String,
-    },
-    Command {
-        token_command: Vec<String>,
-        cache_ttl_seconds: Option<u64>,
-    },
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RawGithubAuthConfig {
-    source: Option<String>,
-    token_env: Option<String>,
-    token_command: Option<Vec<String>>,
-    cache_ttl_seconds: Option<u64>,
-    refresh_skew_seconds: Option<u64>,
-}
-
-impl RawGithubAuthConfig {
-    fn into_config(self) -> Result<GhAuthConfig, GhConfigError> {
-        let refresh_skew_seconds = self
-            .refresh_skew_seconds
-            .unwrap_or(DEFAULT_REFRESH_SKEW_SECONDS);
-        validate_seconds("refresh_skew_seconds", refresh_skew_seconds, true)?;
-        if let Some(ttl) = self.cache_ttl_seconds {
-            validate_seconds("cache_ttl_seconds", ttl, false)?;
-        }
-
-        let has_credential_fields = self.token_env.is_some() || self.token_command.is_some();
-        let source = match self.source.as_deref() {
-            Some(source) => source,
-            None if has_credential_fields => {
-                return Err(GhConfigError::Invalid {
-                    message: "`github.auth.source` is required when token settings are present"
-                        .to_owned(),
-                });
-            }
-            None => "gh-cli",
-        };
-
-        let source = match source {
-            "gh-cli" => GhAuthSource::GhCli,
-            "env" => {
-                let token_env = required_nonempty(self.token_env, "github.auth.token_env")?;
-                GhAuthSource::Env { token_env }
-            }
-            "command" => {
-                let token_command =
-                    required_nonempty_vec(self.token_command, "github.auth.token_command")?;
-                GhAuthSource::Command {
-                    token_command,
-                    cache_ttl_seconds: self.cache_ttl_seconds,
-                }
-            }
-            other => {
-                return Err(GhConfigError::Invalid {
-                    message: format!(
-                        "unsupported github.auth.source {other:?}; expected gh-cli, env, or command"
-                    ),
-                });
-            }
-        };
-
-        Ok(GhAuthConfig {
-            source,
-            refresh_skew_seconds,
-        })
-    }
-}
-
-/// Configuration error for `[github.auth]`.
-#[derive(Debug)]
-pub enum GhConfigError {
-    /// Loading Shipyard config failed.
-    Load(ConfigLoadError),
-    /// TOML shape did not match the expected auth schema.
-    Parse {
-        /// Underlying TOML deserialization error.
-        source: toml::de::Error,
-    },
-    /// Auth config was syntactically valid but unsupported.
-    Invalid {
-        /// Human-readable config error.
-        message: String,
-    },
-}
-
-impl Display for GhConfigError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Load(source) => write!(f, "{source}"),
-            Self::Parse { source } => write!(f, "failed to parse github.auth config: {source}"),
-            Self::Invalid { message } => write!(f, "invalid github.auth config: {message}"),
-        }
-    }
-}
-
-impl Error for GhConfigError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Load(source) => Some(source),
-            Self::Parse { source } => Some(source),
-            Self::Invalid { .. } => None,
-        }
-    }
-}
-
-/// Error while preparing a GitHub CLI command.
-#[derive(Debug)]
-pub enum GhPrepareError {
-    /// Configured token environment variable was not available.
-    MissingTokenEnv {
-        /// Environment variable name.
-        name: String,
-    },
-    /// Configured token environment variable was set but empty.
-    EmptyTokenEnv {
-        /// Environment variable name.
-        name: String,
-    },
-    /// Command helper argv was empty.
-    EmptyTokenCommand,
-    /// Command helper failed to start.
-    HelperStart {
-        /// Helper executable.
-        program: String,
-        /// Underlying I/O error.
-        source: std::io::Error,
-    },
-    /// Command helper exceeded the caller's bounded auth budget.
-    HelperTimedOut {
-        /// Helper executable.
-        program: String,
-        /// Timeout in milliseconds.
-        timeout_ms: u128,
-    },
-    /// Command helper exited non-zero.
-    HelperFailed {
-        /// Helper executable.
-        program: String,
-        /// Process exit code when available.
-        status: Option<i32>,
-        /// Helper stderr, trimmed.
-        stderr: String,
-    },
-    /// Command helper stdout was empty.
-    HelperStdoutEmpty,
-    /// Command helper stdout looked like JSON but was malformed.
-    HelperStdoutMalformed,
-    /// Helper returned an expired or too-near-expiry token.
-    TokenExpired,
-    /// Repo placeholder expansion needed a GitHub remote.
-    RepoSlugRequired,
-    /// An explicit repository override was not an exact `OWNER/REPO` slug.
-    InvalidRepoSlug {
-        /// Rejected repository slug.
-        slug: String,
-    },
-    /// Git remote probing failed.
-    RepoProbeFailed {
-        /// Underlying I/O error.
-        source: std::io::Error,
-    },
-    /// Internal token cache lock was poisoned.
-    TokenCachePoisoned,
-}
-
-impl Display for GhPrepareError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingTokenEnv { name } => {
-                write!(f, "configured token env var {name} is not set")
-            }
-            Self::EmptyTokenEnv { name } => {
-                write!(f, "configured token env var {name} is empty")
-            }
-            Self::EmptyTokenCommand => write!(f, "configured token_command is empty"),
-            Self::HelperStart { program, source } => {
-                write!(f, "failed to start token helper {program:?}: {source}")
-            }
-            Self::HelperTimedOut {
-                program,
-                timeout_ms,
-            } => write!(f, "token helper {program:?} timed out after {timeout_ms}ms"),
-            Self::HelperFailed {
-                program,
-                status,
-                stderr,
-            } => {
-                let status = status.map_or_else(|| "signal".to_owned(), |code| code.to_string());
-                if stderr.is_empty() {
-                    write!(f, "token helper {program:?} exited with status {status}")
-                } else {
-                    let stderr = redact_token_like_text(stderr);
-                    write!(
-                        f,
-                        "token helper {program:?} exited with status {status}: {stderr}"
-                    )
-                }
-            }
-            Self::HelperStdoutEmpty => write!(f, "token helper stdout was empty"),
-            Self::HelperStdoutMalformed => write!(f, "token helper stdout was malformed"),
-            Self::TokenExpired => write!(f, "token helper returned an expired token"),
-            Self::RepoSlugRequired => write!(
-                f,
-                "token_command placeholder requires remote.origin.url to be a GitHub remote"
-            ),
-            Self::InvalidRepoSlug { slug } => write!(
-                f,
-                "invalid explicit GitHub repository slug {slug:?}; expected OWNER/REPO"
-            ),
-            Self::RepoProbeFailed { source } => write!(f, "git remote probe failed: {source}"),
-            Self::TokenCachePoisoned => write!(f, "token cache lock was poisoned"),
-        }
-    }
-}
-
-impl Error for GhPrepareError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::HelperStart { source, .. } | Self::RepoProbeFailed { source } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-impl GhPrepareError {
-    /// Whether retrying command preparation may recover without configuration
-    /// or credential changes.
-    #[must_use]
-    pub(crate) fn is_transient(&self) -> bool {
-        match self {
-            Self::HelperTimedOut { .. } => true,
-            Self::HelperStart { source, .. } => matches!(
-                source.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::Interrupted
-                    | std::io::ErrorKind::NotConnected
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::WouldBlock
-            ),
-            Self::HelperFailed { stderr, .. } => helper_failure_is_transient(stderr),
-            Self::MissingTokenEnv { .. }
-            | Self::EmptyTokenEnv { .. }
-            | Self::EmptyTokenCommand
-            | Self::HelperStdoutEmpty
-            | Self::HelperStdoutMalformed
-            | Self::TokenExpired
-            | Self::RepoSlugRequired
-            | Self::InvalidRepoSlug { .. }
-            | Self::RepoProbeFailed { .. }
-            | Self::TokenCachePoisoned => false,
-        }
-    }
 }
 
 fn helper_failure_is_transient(stderr: &str) -> bool {
@@ -1090,47 +799,6 @@ fn pr_merged_head_sha_with_options(
         .map(str::to_owned)
 }
 
-fn required_nonempty(value: Option<String>, key: &str) -> Result<String, GhConfigError> {
-    let value = value.ok_or_else(|| GhConfigError::Invalid {
-        message: format!("`{key}` is required"),
-    })?;
-    if value.trim().is_empty() {
-        return Err(GhConfigError::Invalid {
-            message: format!("`{key}` must not be empty"),
-        });
-    }
-    Ok(value)
-}
-
-fn required_nonempty_vec(
-    value: Option<Vec<String>>,
-    key: &str,
-) -> Result<Vec<String>, GhConfigError> {
-    let value = value.ok_or_else(|| GhConfigError::Invalid {
-        message: format!("`{key}` is required"),
-    })?;
-    if value.is_empty() || value.iter().any(|item| item.trim().is_empty()) {
-        return Err(GhConfigError::Invalid {
-            message: format!("`{key}` must contain non-empty argv entries"),
-        });
-    }
-    Ok(value)
-}
-
-fn validate_seconds(name: &str, value: u64, allow_zero: bool) -> Result<(), GhConfigError> {
-    if !allow_zero && value == 0 {
-        return Err(GhConfigError::Invalid {
-            message: format!("`github.auth.{name}` must be greater than zero"),
-        });
-    }
-    if value > i64::MAX as u64 {
-        return Err(GhConfigError::Invalid {
-            message: format!("`github.auth.{name}` is too large"),
-        });
-    }
-    Ok(())
-}
-
 fn ttl_seconds(value: u64) -> i64 {
     i64::try_from(value).expect("seconds value should be validated before use")
 }
@@ -1168,573 +836,4 @@ fn is_token_char(ch: char) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
-    use std::process::Stdio;
-
-    use tempfile::TempDir;
-
-    use super::*;
-    use crate::config::LocalOverlaySource;
-
-    #[cfg(unix)]
-    fn write_executable(path: &Path, contents: &str) {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::write(path, contents).expect("write script");
-        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("chmod script");
-    }
-
-    fn config_from_toml(input: &str) -> LoadedConfig {
-        LoadedConfig {
-            data: input.parse::<toml::Table>().expect("parse toml"),
-            global_dir: PathBuf::from("/tmp/shipyard-global"),
-            project_dir: None,
-            local_dir: None,
-            local_overlay_source: LocalOverlaySource::None,
-        }
-    }
-
-    fn env_value(command: &Command, key: &str) -> Option<OsString> {
-        command.get_envs().find_map(|(name, value)| {
-            (name == key).then(|| value.map(std::ffi::OsStr::to_owned))?
-        })
-    }
-
-    #[test]
-    fn missing_config_uses_ambient_auth() {
-        let config = config_from_toml("");
-        let client = GhClient::from_loaded_config(&config).expect("client");
-        assert_eq!(client.auth.source, GhAuthSource::GhCli);
-    }
-
-    #[test]
-    fn parses_env_auth_config() {
-        let config = config_from_toml(
-            r#"
-            [github.auth]
-            source = "env"
-            token_env = "SHIPYARD_GITHUB_TOKEN"
-            "#,
-        );
-        let client = GhClient::from_loaded_config(&config).expect("client");
-        assert_eq!(
-            client.auth.source,
-            GhAuthSource::Env {
-                token_env: "SHIPYARD_GITHUB_TOKEN".to_owned()
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_token_settings_without_source() {
-        let config = config_from_toml(
-            r#"
-            [github.auth]
-            token_env = "SHIPYARD_GITHUB_TOKEN"
-            "#,
-        );
-        let error = GhClient::from_loaded_config(&config).expect_err("invalid config");
-        assert!(error.to_string().contains("source"));
-    }
-
-    #[test]
-    fn rejects_empty_command_auth_config() {
-        let config = config_from_toml(
-            r#"
-            [github.auth]
-            source = "command"
-            token_command = []
-            "#,
-        );
-        let error = GhClient::from_loaded_config(&config).expect_err("invalid config");
-        assert!(error.to_string().contains("token_command"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_command_preparation_times_out_token_helper() {
-        let temp = TempDir::new().expect("temp");
-        let helper = temp.path().join("token-helper");
-        write_executable(&helper, "#!/bin/sh\nsleep 5\nprintf token\n");
-        let config = config_from_toml(&format!(
-            r#"
-            [github.auth]
-            source = "command"
-            token_command = ["{}"]
-            "#,
-            helper.display()
-        ));
-        let client = GhClient::from_loaded_config(&config).expect("client");
-        let started = std::time::Instant::now();
-        let error = client
-            .prepare_command_with_auth_timeout(
-                temp.path(),
-                Some(Path::new("/tmp/fake-gh")),
-                GhSupervision::Unsupervised,
-                GhAuthPolicy::Default,
-                Duration::from_millis(20),
-            )
-            .expect_err("helper timeout");
-        assert!(matches!(error, GhPrepareError::HelperTimedOut { .. }));
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn merged_pr_observation_uses_configured_auth_and_explicit_repository() {
-        let temp = TempDir::new().expect("temp");
-        let fake_gh = temp.path().join("gh");
-        let invocation = temp.path().join("invocation");
-        write_executable(
-            &fake_gh,
-            &format!(
-                r#"#!/bin/sh
-printf '%s\n%s' "$GH_TOKEN" "$*" > '{}'
-printf '%s' '{{"state":"MERGED","headRefOid":"abc123"}}'
-"#,
-                invocation.display()
-            ),
-        );
-        let config = config_from_toml(
-            r#"
-            [github.auth]
-            source = "env"
-            token_env = "PATH"
-            "#,
-        );
-        let client = GhClient::from_loaded_config(&config).expect("client");
-
-        let merged = pr_merged_head_sha_with_options(
-            Some(&client),
-            "owner/repo",
-            42,
-            temp.path(),
-            None,
-            Some(&fake_gh),
-            Duration::from_secs(30),
-        );
-
-        assert_eq!(merged.as_deref(), Some("abc123"));
-        let invocation = std::fs::read_to_string(invocation).expect("invocation");
-        let (token, args) = invocation.split_once('\n').expect("token and args");
-        assert!(!token.is_empty());
-        assert_eq!(args, "pr view 42 --repo owner/repo --json state,headRefOid");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn merged_pr_observation_kills_a_hung_github_command() {
-        let temp = TempDir::new().expect("temp");
-        let fake_gh = temp.path().join("gh");
-        write_executable(&fake_gh, "#!/bin/sh\nsleep 5\n");
-        let client = GhClient::ambient();
-        let started = std::time::Instant::now();
-
-        let merged = pr_merged_head_sha_with_options(
-            Some(&client),
-            "owner/repo",
-            42,
-            temp.path(),
-            None,
-            Some(&fake_gh),
-            Duration::from_millis(20),
-        );
-
-        assert_eq!(merged, None);
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn merged_pr_snapshot_never_invokes_external_github_command() {
-        let temp = TempDir::new().expect("temp");
-        let snapshot = temp.path().join("merged.json");
-        std::fs::write(&snapshot, r#"{"state":"MERGED","headRefOid":"abc123"}"#).expect("snapshot");
-
-        let merged = pr_merged_head_sha_with_options(
-            Some(&GhClient::ambient()),
-            "owner/repo",
-            42,
-            temp.path(),
-            Some(&snapshot),
-            Some(Path::new("/definitely/missing/gh-must-not-run")),
-            Duration::from_millis(1),
-        );
-
-        assert_eq!(merged.as_deref(), Some("abc123"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_helper_receives_eof_instead_of_inheriting_caller_stdin() {
-        let temp = TempDir::new().expect("temp");
-        let helper = temp.path().join("token-helper");
-        write_executable(&helper, "#!/bin/sh\nread ignored || true\nprintf token\n");
-        // Execute the just-written fixture through the immutable system shell.
-        // Directly exec'ing a mutable temp script can race macOS/coverage file
-        // instrumentation and fail with ETXTBSY before this stdin invariant is
-        // exercised.
-        let mut command = Command::new("/bin/sh");
-        command.arg(&helper);
-        // A caller-provided pipe would remain open in the parent and make the
-        // helper block on `read` unless the bounded boundary replaces stdin.
-        command.stdin(Stdio::piped());
-
-        // Keep the assertion about EOF, not scheduler latency in the highly
-        // parallel full suite. The helper returns immediately on the good path.
-        let output = run_helper_with_timeout(&mut command, "token-helper", Duration::from_secs(30))
-            .expect("helper should see EOF");
-
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"token");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn successful_bounded_helper_does_not_leave_detached_descendants() {
-        let temp = TempDir::new().expect("temp");
-        let helper = temp.path().join("token-helper");
-        let descendant_pid = temp.path().join("descendant.pid");
-        write_executable(
-            &helper,
-            &format!(
-                "#!/bin/sh\nsleep 120 </dev/null >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > '{}'\nprintf token\n",
-                descendant_pid.display()
-            ),
-        );
-        let mut command = Command::new("/bin/sh");
-        command.arg(&helper);
-
-        // Full macOS CI runs many process-heavy tests concurrently. Keep this
-        // boundary comfortably above scheduler latency while the descendant's
-        // 120-second lifetime still proves cleanup rather than natural exit.
-        let output = run_helper_with_timeout(&mut command, "token-helper", Duration::from_secs(30))
-            .expect("helper succeeds");
-        let pid = std::fs::read_to_string(&descendant_pid).expect("descendant pid");
-        let pid = pid.trim();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut running = true;
-        while running && std::time::Instant::now() < deadline {
-            running = Command::new("kill")
-                .args(["-0", pid])
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            if running {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        if running {
-            let _ = Command::new("kill")
-                .args(["-KILL", pid])
-                .stderr(Stdio::null())
-                .status();
-        }
-
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"token");
-        assert!(!running, "helper descendant {pid} survived success");
-    }
-
-    #[test]
-    fn prepare_command_injects_env_token_and_supervised_marker() {
-        let config = config_from_toml(
-            r#"
-            [github.auth]
-            source = "env"
-            token_env = "PATH"
-            "#,
-        );
-        let expected_path = env::var("PATH").expect("PATH");
-        let client = GhClient::from_loaded_config(&config).expect("client");
-        let command = client
-            .prepare_command(
-                Path::new("/tmp"),
-                Some(Path::new("/tmp/fake-gh")),
-                GhSupervision::Supervised,
-                GhAuthPolicy::Default,
-            )
-            .expect("command");
-
-        assert_eq!(command.get_program(), Path::new("/tmp/fake-gh").as_os_str());
-        assert_eq!(
-            env_value(&command, GH_TOKEN_ENV).as_deref(),
-            Some(OsString::from(expected_path).as_os_str())
-        );
-        assert_eq!(
-            env_value(&command, crate::supervised::SUPERVISED_ENV_VAR).as_deref(),
-            Some(OsString::from(crate::supervised::SUPERVISED_ENV_VALUE).as_os_str())
-        );
-    }
-
-    #[test]
-    fn ambient_only_does_not_inject_configured_token() {
-        let config = config_from_toml(
-            r#"
-            [github.auth]
-            source = "env"
-            token_env = "PATH"
-            "#,
-        );
-        let client = GhClient::from_loaded_config(&config).expect("client");
-        let command = client
-            .prepare_command(
-                Path::new("/tmp"),
-                None,
-                GhSupervision::Unsupervised,
-                GhAuthPolicy::AmbientOnly,
-            )
-            .expect("command");
-        assert_eq!(env_value(&command, GH_TOKEN_ENV), None);
-    }
-
-    #[test]
-    fn parses_plain_helper_stdout_with_ttl() {
-        let now = Utc::now();
-        let token =
-            parse_helper_stdout("ghp_plain\n", now, Some(300), DEFAULT_REFRESH_SKEW_SECONDS)
-                .expect("token");
-        assert_eq!(token.token, "ghp_plain");
-        assert!(
-            token
-                .valid_until
-                .is_some_and(|valid_until| valid_until > now)
-        );
-    }
-
-    #[test]
-    fn parses_json_helper_stdout_with_expiry() {
-        let now = Utc::now();
-        let expires_at = now + chrono::Duration::seconds(600);
-        let stdout = serde_json::json!({
-            "token": "ghs_json",
-            "expires_at": expires_at.to_rfc3339(),
-            "kind": "github-app-installation"
-        })
-        .to_string();
-        let token =
-            parse_helper_stdout(&stdout, now, None, DEFAULT_REFRESH_SKEW_SECONDS).expect("token");
-        assert_eq!(token.token, "ghs_json");
-        assert_eq!(token.kind.as_deref(), Some("github-app-installation"));
-        assert_eq!(token.expires_at, Some(expires_at));
-        assert!(
-            token
-                .valid_until
-                .is_some_and(|valid_until| valid_until < expires_at)
-        );
-    }
-
-    #[test]
-    fn rejects_expired_json_helper_token() {
-        let now = Utc::now();
-        let expires_at = now + chrono::Duration::seconds(30);
-        let stdout = serde_json::json!({
-            "token": "ghs_json",
-            "expires_at": expires_at.to_rfc3339()
-        })
-        .to_string();
-        let error = parse_helper_stdout(&stdout, now, None, DEFAULT_REFRESH_SKEW_SECONDS)
-            .expect_err("expired");
-        assert!(matches!(error, GhPrepareError::TokenExpired));
-    }
-
-    #[test]
-    fn expands_repo_placeholders() {
-        let repo = TempDir::new().expect("tempdir");
-        git(repo.path(), &["init", "--quiet", "--initial-branch=main"]);
-        git(
-            repo.path(),
-            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
-        );
-        let command = vec![
-            "helper".to_owned(),
-            "--repo".to_owned(),
-            "{repo_slug}".to_owned(),
-            "--owner".to_owned(),
-            "{repo_owner}".to_owned(),
-            "--name".to_owned(),
-            "{repo_name}".to_owned(),
-            "--cwd".to_owned(),
-            "{cwd}".to_owned(),
-        ];
-        // The CWD's GitHub remote wins even when a hint is present.
-        let hint = RepoIdentity::from_slug("hintowner/hintrepo");
-        let expanded =
-            expand_token_command(&command, repo.path(), hint.as_ref(), None).expect("expanded");
-        assert_eq!(expanded[2], "owner/repo");
-        assert_eq!(expanded[4], "owner");
-        assert_eq!(expanded[6], "repo");
-        assert_eq!(expanded[8], repo.path().display().to_string());
-
-        let repo_override = RepoIdentity::from_slug("target/other").expect("override");
-        let overridden =
-            expand_token_command(&command, repo.path(), hint.as_ref(), Some(&repo_override))
-                .expect("overridden");
-        assert_eq!(overridden[2], "target/other");
-        assert_eq!(overridden[4], "target");
-        assert_eq!(overridden[6], "other");
-    }
-
-    #[test]
-    fn repo_placeholder_falls_back_to_hint_when_cwd_is_not_a_repo() {
-        // The daemon case: CWD has no GitHub remote, so `{repo_slug}` must come
-        // from the explicit hint (the served `--repo`) instead of erroring.
-        let not_a_repo = TempDir::new().expect("tempdir");
-        let command = vec![
-            "helper".to_owned(),
-            "--repo".to_owned(),
-            "{repo_slug}".to_owned(),
-        ];
-        let hint = RepoIdentity::from_slug("danielraffel/pulp").expect("valid slug");
-        let expanded =
-            expand_token_command(&command, not_a_repo.path(), Some(&hint), None).expect("expanded");
-        assert_eq!(expanded[2], "danielraffel/pulp");
-
-        // Without a hint, it still errors (unchanged behavior).
-        let err = expand_token_command(&command, not_a_repo.path(), None, None);
-        assert!(matches!(err, Err(GhPrepareError::RepoSlugRequired)));
-    }
-
-    #[test]
-    fn repo_identity_from_slug_rejects_malformed() {
-        assert!(RepoIdentity::from_slug("owner/name").is_some());
-        assert!(RepoIdentity::from_slug("nope").is_none());
-        assert!(RepoIdentity::from_slug("owner/").is_none());
-        assert!(RepoIdentity::from_slug("/name").is_none());
-        assert!(RepoIdentity::from_slug("a/b/c").is_none());
-    }
-
-    #[test]
-    fn explicit_repo_override_rejects_malformed_instead_of_falling_back() {
-        let error = GhClient::ambient()
-            .with_repo_override("owner/repo/extra")
-            .expect_err("invalid explicit slug");
-
-        assert!(matches!(
-            error,
-            GhPrepareError::InvalidRepoSlug { slug } if slug == "owner/repo/extra"
-        ));
-    }
-
-    #[test]
-    fn parses_github_remote_urls() {
-        assert_eq!(
-            parse_github_remote_slug("git@github.com:owner/repo.git").as_deref(),
-            Some("owner/repo")
-        );
-        assert_eq!(
-            parse_github_remote_slug("ssh://git@github.com/owner/repo.git").as_deref(),
-            Some("owner/repo")
-        );
-        assert_eq!(
-            parse_github_remote_slug("https://github.com/owner/repo").as_deref(),
-            Some("owner/repo")
-        );
-        assert_eq!(
-            parse_github_remote_slug("https://example.com/owner/repo"),
-            None
-        );
-    }
-
-    #[test]
-    fn detects_graphql_rate_limit_text() {
-        assert!(is_graphql_rate_limited("GraphQL: API rate limit exceeded"));
-        assert!(!is_graphql_rate_limited("REST API rate limit exceeded"));
-    }
-
-    #[test]
-    fn authenticated_git_command_uses_environment_credential_helper() {
-        let cwd = TempDir::new().expect("tempdir");
-        let command = GhClient::ambient()
-            .prepare_git_command(cwd.path())
-            .expect("git command");
-        assert_eq!(
-            command.get_program().to_string_lossy(),
-            crate::supervised::git_supervised()
-                .get_program()
-                .to_string_lossy()
-        );
-        assert_eq!(
-            env_value(&command, "GIT_TERMINAL_PROMPT"),
-            Some(OsString::from("0"))
-        );
-        assert_eq!(
-            env_value(&command, "GIT_CONFIG_VALUE_0"),
-            Some(OsString::from("!gh auth git-credential"))
-        );
-        assert!(
-            command
-                .get_args()
-                .all(|arg| !arg.to_string_lossy().contains("token"))
-        );
-    }
-
-    #[test]
-    fn helper_failure_display_redacts_token_like_stderr() {
-        let error = GhPrepareError::HelperFailed {
-            program: "helper".to_owned(),
-            status: Some(1),
-            stderr: "failed after minting ghs_secret123 and github_pat_abcDEF".to_owned(),
-        };
-
-        let rendered = error.to_string();
-
-        assert!(rendered.contains("<redacted-token>"));
-        assert!(!rendered.contains("ghs_secret123"));
-        assert!(!rendered.contains("github_pat_abcDEF"));
-    }
-
-    #[test]
-    fn classifies_only_recoverable_token_helper_failures_as_transient() {
-        let reset = GhPrepareError::HelperFailed {
-            program: "helper".to_owned(),
-            status: Some(1),
-            stderr: "GitHub API request failed: [Errno 54] Connection reset by peer".to_owned(),
-        };
-        let unauthorized = GhPrepareError::HelperFailed {
-            program: "helper".to_owned(),
-            status: Some(1),
-            stderr: "HTTP 401: bad credentials".to_owned(),
-        };
-        let start_reset = GhPrepareError::HelperStart {
-            program: "helper".to_owned(),
-            source: std::io::Error::from(std::io::ErrorKind::ConnectionReset),
-        };
-        let missing = GhPrepareError::HelperStart {
-            program: "helper".to_owned(),
-            source: std::io::Error::from(std::io::ErrorKind::NotFound),
-        };
-
-        assert!(reset.is_transient());
-        assert!(
-            GhPrepareError::HelperTimedOut {
-                program: "helper".to_owned(),
-                timeout_ms: 1_000,
-            }
-            .is_transient()
-        );
-        assert!(start_reset.is_transient());
-        assert!(!unauthorized.is_transient());
-        assert!(!missing.is_transient());
-        assert!(
-            !GhPrepareError::MissingTokenEnv {
-                name: "TOKEN".to_owned(),
-            }
-            .is_transient()
-        );
-    }
-
-    fn git(cwd: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("git");
-        assert!(status.success(), "git command failed: {args:?}");
-    }
-}
+mod tests;

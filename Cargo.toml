@@ -1,6 +1,6 @@
 [package]
 name = "shipyard"
-version = "0.101.0"
+version = "0.102.0"
 edition = "2024"
 description = "Cross-platform CI coordination for local, SSH, and cloud runners."
 rust-version = "1.92"
@@ -31,7 +31,11 @@ tempfile = "3.23.0"
 toml = "0.8.23"
 wait-timeout = "0.2.1"
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", features = ["user"] }
+
 [target.'cfg(windows)'.dependencies]
+known-folders = "1.4.2"
 process-wrap = { version = "9.1.0", default-features = false, features = ["std", "job-object"] }
 winapi-util = "0.1.11"
 

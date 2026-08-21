@@ -130,6 +130,9 @@ impl CliFailure {
 /// or blocked by something on the PR) so automation can tell a stalled-green PR
 /// from a red one.
 pub(super) const SHIP_EXIT_MERGE_CLIENT_DEFECT: u8 = 8;
+/// Local validation passed, but its durable scoped ship state disappeared, so
+/// deterministic stewardship cannot safely own merge readiness.
+pub(super) const SHIP_EXIT_VALIDATION_STATE_MISSING: u8 = 9;
 
 pub(super) const WAIT_EXIT_TIMEOUT: u8 = 1;
 pub(super) const WAIT_EXIT_RUN_TERMINAL_WRONG: u8 = 4;
@@ -610,9 +613,26 @@ fn handle_runner_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let config = crate::config::LoadedConfig::load_from_cwd(mode, cwd)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    runner_command(command, &config, mode, cwd, runtime_paths, json, stdout)
+    match command {
+        self::cli::RunnerCommand::RecoveryWorker { once, drain, apply } => {
+            self::merge_steward_cmd::recovery_worker::recovery_worker_command(
+                self::merge_steward_cmd::recovery_worker::RecoveryWorkerCommandArgs {
+                    once,
+                    drain,
+                    apply,
+                },
+                cwd,
+                runtime_paths,
+                json,
+                stdout,
+            )
+        }
+        command => {
+            let config = crate::config::LoadedConfig::load_from_cwd(mode, cwd)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            runner_command(command, &config, mode, cwd, runtime_paths, json, stdout)
+        }
+    }
 }
 
 struct AutoMergeInvocation {
@@ -2160,6 +2180,33 @@ mod tests {
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "targets.list");
         assert_eq!(value["targets"].as_array().expect("targets").len(), 0);
+    }
+
+    #[test]
+    fn recovery_worker_dispatch_ignores_malformed_checkout_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join(".shipyard");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(project_dir.join("config.toml"), "not = [valid toml")
+            .expect("malformed checkout config");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--mode",
+            "isolated",
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "runner",
+            "recovery-worker",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::from(1));
+        let error = String::from_utf8(stderr).expect("utf8");
+        assert!(error.contains("requires canonical machine-global paths"));
+        assert!(!error.contains("TOML"));
+        assert!(stdout.is_empty());
     }
 
     #[test]

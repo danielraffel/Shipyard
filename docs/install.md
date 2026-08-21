@@ -152,6 +152,27 @@ token_command = ["/Users/you/Code/shipyard/scripts/shipyard-github-app-token", "
 refresh_skew_seconds = 60
 ```
 
+Some low-volume mutations cannot be performed by a GitHub App installation
+token. When GitHub returns the exact integration-permission denial for one of
+those documented fallbacks, Shipyard removes both `GH_TOKEN` and
+`GITHUB_TOKEN` and invokes a direct native GitHub CLI so its keyring login can
+be used. Script and wrapper candidates named `gh` are skipped, preventing an
+ambient fallback from routing back through an App-token wrapper. Shipyard scans
+`PATH` for the first native `gh` by default; machines that need an explicit
+location can pin it in the same config:
+
+```toml
+[github.auth]
+source = "command"
+token_command = ["/absolute/path/to/shipyard-github-app-token", "--repo", "{repo_slug}"]
+ambient_gh_binary = "/absolute/path/to/gh"
+```
+
+`ambient_gh_binary` must be absolute and resolve to an executable native
+binary, not a shell script or wrapper. It is a per-machine path: update it when
+importing an auth bundle onto a machine whose GitHub CLI is installed
+elsewhere.
+
 For the full quota-extension walkthrough, including GitHub App registration
 fields, repository-count scaling, and validation commands, see
 [`docs/github-app-quota.md`](github-app-quota.md).
@@ -320,7 +341,7 @@ shipyard auth import shipyard-auth.toml --scope local
 ```
 
 `auth export` writes a config-only bundle: `[github.auth]`, required env
-var names, helper command names, and notes. It does not include tokens,
+var names, helper and ambient-CLI paths, and notes. It does not include tokens,
 private keys, Keychain items, 1Password sessions, queue state, daemon
 sockets, or token caches. `auth import` writes only the `[github.auth]`
 section into the selected config layer: `local` (default), `project`, or

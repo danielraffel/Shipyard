@@ -286,24 +286,31 @@ mod tests {
         temp: &tempfile::TempDir,
         first_error: &str,
     ) -> (GitHubActions, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
         let count = temp.path().join("count");
-        let script = temp.path().join("gh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\ncount=0\n[ ! -f '{0}' ] || count=$(cat '{0}')\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{0}'\nif [ \"$count\" -eq 1 ]; then echo '{1}' >&2; exit 1; fi\necho '{{}}'\n",
-                count.display(),
-                first_error
-            ),
-        )
-        .expect("fake gh");
-        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("chmod");
+        let source = format!(
+            r#"
+use std::path::Path;
+
+fn main() {{
+    let path = Path::new({count:?});
+    let previous = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let current = previous + 1;
+    std::fs::write(path, current.to_string()).expect("write invocation count");
+    if current == 1 {{
+        eprintln!({first_error:?});
+        std::process::exit(1);
+    }}
+    println!("{{{{}}}}");
+}}
+"#,
+            count = count.to_string_lossy(),
+        );
+        let binary = crate::test_support::compile_native_test_program(temp.path(), "gh", &source);
         (
-            GitHubActions::new(temp.path()).with_gh_binary_for_tests(script),
+            GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary),
             count,
         )
     }

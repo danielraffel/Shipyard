@@ -56,6 +56,109 @@ observes recovery, it marks the recovery status successful and clears the
 label. A cheap routed agent can consume this durable exception signal without
 polling every healthy PR.
 
+## First-line recovery worker (phase 1)
+
+`shipyard runner recovery-worker` turns that exception signal into a durable,
+bounded triage request. The request identity covers canonical repository, PR,
+target base, exact head SHA, deterministic failure fingerprint, and steward
+policy signature. An identical request is a no-op, policy/config drift fails
+closed, and a retarget, newer head, recovered check, or changed merge state
+supersedes stale work. The default invocation inspects and revalidates the live
+base, head, and complete failed-required-check set (or recorded merge state)
+for at most one pending request without starting a model. Each request carries
+the complete required-check policy snapshot; both policy entries and failed
+facts keep the literal context and optional GitHub App ID in separate fields.
+That makes a newly failed required check supersede stale same-head work while
+advisory failures remain irrelevant. When deterministic stewardship clears the
+recovery signal, it supersedes active receipts and removes only the matching
+exact-head witness under the final completion lease. A newer-head witness
+published during the GitHub-operation gap remains intact, while an in-flight
+old-head advisory result cannot commit afterward.
+`--apply` runs one worker attempt and persists its terminal receipt;
+`--drain --apply` processes only the initial bounded snapshot (at most 32), not
+an unbounded watch loop. Even if normalized evidence or policy changes, a
+repository/PR/exact-head tuple receives at most one model attempt.
+An operational failure before claim consumes no attempt and durably rotates
+that request behind untouched pending work, preventing a broken repository or
+GitHub preflight from starving unrelated requests.
+The steward's final merge-queue, PR, and required-check revalidation uses one
+20-second absolute deadline with bounded output capture. That budget begins
+before it acquires the publication lease, preventing a stalled GitHub process
+from retaining the lease indefinitely.
+
+Configure it only in the trusted machine-global `config.toml` reported by
+`shipyard paths`. Repository `.shipyard/config.toml` and checkout-local
+overlays are intentionally ignored. Alternate runtime modes and explicit
+global/state path overrides are rejected so policy and attempt accounting stay
+machine-global:
+
+```toml
+[merge_steward.recovery_worker]
+enabled = true
+provider = "codex"
+codex_binary = "/Users/you/.local/bin/codex"
+codex_home = "/Users/you/.codex"
+# Defaults to gpt-5.3-codex-spark when omitted.
+first_line_model = "gpt-5.3-codex-spark"
+timeout_seconds = 120
+max_attempts_per_head = 1
+max_log_tail_bytes = 16384
+allowed_repositories = ["Generous-Corp/pulp", "Generous-Corp/forge", "Generous-Corp/vellum"]
+
+[merge_steward.recovery_worker.repo_paths]
+"Generous-Corp/pulp" = "/Volumes/Workshop/Code/pulp"
+"Generous-Corp/forge" = "/Volumes/Workshop/Code/forge"
+"Generous-Corp/vellum" = "/Volumes/Workshop/Code/vellum"
+```
+
+The command is not configurable. Shipyard constructs the exact `codex exec`
+argv, disables all Codex tool surfaces used for shell, browser, app, MCP,
+computer-use, image, and search access, and delivers JSON only on stdin. The
+child runs in scratch rather than a repository checkout, ignores user/project
+rules, and starts from an empty environment with only explicit Codex auth,
+scratch HOME/TMPDIR, a minimal PATH, and Windows system root where required.
+GitHub reads, model execution, and final validation are time-bounded under one
+record deadline; each provenance read scans at most four explicit 100-status
+pages. A machine-global durable lease allows one model call at a time. The
+current label/status provenance predicate is
+sufficient only for advisory triage and must not authorize a future editing or
+GitHub-mutation phase without issuer-bound hardening.
+
+The worker must emit one JSON object and no prose:
+
+```json
+{
+  "schema_version": 1,
+  "verdict": "escalate",
+  "category": "compile",
+  "confidence": "low",
+  "evidence": [],
+  "candidate_paths": [],
+  "focused_tests": []
+}
+```
+
+The schema reserves `bounded_repair`, `escalate`, and `no_change`; categories
+are `compile`, `test`, `conflict`, `security`, `workflow`, `infra`, and
+`unknown`; confidence is `low`, `medium`, or `high`. In evidence-free phase 1,
+both `bounded_repair` and `no_change` are always rejected: every accepted result
+must explicitly escalate, and the category is routing metadata only.
+`evidence`, `candidate_paths`, and `focused_tests` must be empty. Free-form
+summaries, explanations, and causal claims are not part of the schema: the
+worker sees normalized merge/check facts, not logs or repository contents, and
+may return only routing enums. There is deliberately no check-name or
+changed-path heuristic in this evidence-free phase: universal escalation means
+`.env`, agent-instruction, workflow/CI, signing, release, credential, and every
+other surface receives the same fail-closed route even when its check has a
+generic display name.
+
+This result remains advice. Phase 1 never edits a worktree and has no GitHub,
+queue, rerun, merge, release, signing, or publishing authority. Invalid JSON,
+timeout, process failure, provider/quota exhaustion, config drift, and attempts
+already spent are recorded as typed escalation/failure outcomes so the steward
+continues managing unrelated PRs. Autonomous bounded repair is a later phase;
+do not claim or depend on it yet.
+
 For unattended operation, the configured App or workflow token needs Commit
 statuses and Issues read/write. A local read-oriented App that returns the exact
 `Resource not accessible by integration` rejection falls back visibly to

@@ -811,6 +811,19 @@ pub(super) struct WatchLocalArgs {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum RunnerCommand {
+    /// Process durable semantic-recovery requests with the trusted first-line worker.
+    RecoveryWorker {
+        /// Inspect or process at most one pending request (the default).
+        #[arg(long, conflicts_with = "drain")]
+        once: bool,
+        /// Process a bounded snapshot of all currently pending requests.
+        #[arg(long, conflicts_with = "once")]
+        drain: bool,
+        /// Launch the configured worker and persist its terminal receipt.
+        /// Without this flag, only inspect and exact-head-revalidate requests.
+        #[arg(long)]
+        apply: bool,
+    },
     /// One-shot health check. Exit 0 healthy, 1 stuck, 2 offline.
     Status {
         /// Self-hosted runner ID, e.g. 1763. Defaults to `runner.watchdog.runner_id`.
@@ -1969,5 +1982,24 @@ mod tests {
         };
         assert_eq!(context, "merge_group");
         assert_eq!(lane, "linux");
+    }
+
+    #[test]
+    fn recovery_worker_is_dry_run_once_by_default_and_bounds_mode_flags() {
+        let cli = Cli::try_parse_from(["shipyard", "runner", "recovery-worker"])
+            .expect("default recovery worker command");
+        let Command::Runner {
+            command: RunnerCommand::RecoveryWorker { once, drain, apply },
+        } = cli.command
+        else {
+            panic!("expected recovery worker command");
+        };
+        assert!(!once);
+        assert!(!drain);
+        assert!(!apply);
+        assert!(
+            Cli::try_parse_from(["shipyard", "runner", "recovery-worker", "--once", "--drain",])
+                .is_err()
+        );
     }
 }

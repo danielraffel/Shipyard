@@ -36,6 +36,7 @@ use crate::warm_pool::{is_backend_eligible, warm_host_key};
 
 /// Current queued-execution schema.
 pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 1;
+const MAX_SHIP_POST_VALIDATION_DETAIL_BYTES: usize = 1_200;
 
 /// Durable submitter ownership. Running ownership is derived by admitting
 /// only the matching executor class; it is never inferred from optional
@@ -1300,6 +1301,76 @@ impl From<&ContractConfig> for QueuedContract {
     }
 }
 
+/// Typed result of the post-validation merge/readiness phase.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedShipDispositionKind {
+    /// One or more locally supervised validation targets failed.
+    ValidationFailed,
+    /// The pull request merged after validation.
+    Merged,
+    /// Validation passed but the downstream merge request was rejected.
+    GreenNotMerged,
+    /// Validation passed and deterministic merge readiness is still pending.
+    GreenPendingMergeReadiness,
+    /// Validation passed but the scoped state needed for readiness disappeared.
+    GreenValidationStateMissing,
+    /// Validation passed and a required-check failure was classified as flaky.
+    GreenNotMergedFlakyRequired,
+    /// Validation passed but Shipyard's merge client produced an invalid request.
+    GreenNotMergedClientDefect,
+    /// Validation passed for an immutable head that the live PR superseded.
+    GreenNotMergedHeadSuperseded,
+    /// Validation completed, but deterministic post-validation handling failed.
+    PostValidationOperationalFailure,
+}
+
+/// Durable post-validation disposition, kept separate from validation proof.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QueuedShipDisposition {
+    /// Typed merge-readiness/merge result.
+    pub kind: QueuedShipDispositionKind,
+    /// Worker exit code associated with this disposition.
+    pub exit_code: u8,
+    /// Bounded operational or readiness detail, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl QueuedShipDisposition {
+    /// Build a bounded durable post-validation disposition.
+    #[must_use]
+    pub fn new(kind: QueuedShipDispositionKind, exit_code: u8, detail: Option<&str>) -> Self {
+        Self {
+            kind,
+            exit_code,
+            detail: detail.and_then(bounded_ship_post_validation_detail),
+        }
+    }
+}
+
+fn bounded_ship_post_validation_detail(detail: &str) -> Option<String> {
+    let mut sanitized = detail
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if sanitized.len() > MAX_SHIP_POST_VALIDATION_DETAIL_BYTES {
+        let mut boundary = MAX_SHIP_POST_VALIDATION_DETAIL_BYTES;
+        while !sanitized.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        sanitized.truncate(boundary);
+    }
+    let sanitized = sanitized.trim().to_owned();
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
 /// Durable queued execution outcome envelope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
@@ -1324,6 +1395,10 @@ pub enum QueuedExecutionOutcome {
         ship_state: ShipState,
         /// Whether an existing compatible state was reused.
         resumed_existing_state: bool,
+        /// Post-validation merge/readiness result. Legacy and validation-only
+        /// outcomes omit this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_validation: Option<QueuedShipDisposition>,
     },
 }
 
@@ -1351,6 +1426,26 @@ impl QueuedExecutionOutcome {
             pr,
             ship_state,
             resumed_existing_state,
+            post_validation: None,
+        }
+    }
+
+    /// Build a ship outcome with its separately-owned post-validation result.
+    #[must_use]
+    pub fn ship_with_post_validation(
+        job_id: impl Into<String>,
+        pr: u64,
+        ship_state: ShipState,
+        resumed_existing_state: bool,
+        post_validation: QueuedShipDisposition,
+    ) -> Self {
+        Self::Ship {
+            schema_version: QUEUED_EXECUTION_SCHEMA_VERSION,
+            job_id: job_id.into(),
+            pr,
+            ship_state,
+            resumed_existing_state,
+            post_validation: Some(post_validation),
         }
     }
 
@@ -1771,10 +1866,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ExecutionProvenance, HostPoolDemand, JobResourcePlan, QUEUED_EXECUTION_SCHEMA_VERSION,
-        QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
-        QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner, QueuedExecutionRequest,
-        VmSlotDemand, parse_repo_slug,
+        ExecutionProvenance, HostPoolDemand, JobResourcePlan,
+        MAX_SHIP_POST_VALIDATION_DETAIL_BYTES, QUEUED_EXECUTION_SCHEMA_VERSION, QueueOutcomeStore,
+        QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind,
+        QueuedExecutionOutcome, QueuedExecutionOwner, QueuedExecutionRequest,
+        QueuedShipDisposition, QueuedShipDispositionKind, VmSlotDemand, parse_repo_slug,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::{evidence_resource_claim, run_evidence_scope, ship_evidence_scope};
@@ -2169,7 +2265,30 @@ mod tests {
             merge_queue_enqueue_started_at: None,
             abandoned: None,
         };
-        let outcome = QueuedExecutionOutcome::ship("job-ship", request.pr, state, true);
+        let disposition = QueuedShipDisposition::new(
+            QueuedShipDispositionKind::GreenValidationStateMissing,
+            9,
+            Some(&format!("{}\nsecret\0", "x".repeat(2_000))),
+        );
+        assert!(
+            disposition
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.len() <= MAX_SHIP_POST_VALIDATION_DETAIL_BYTES)
+        );
+        assert!(
+            disposition
+                .detail
+                .as_ref()
+                .is_some_and(|detail| !detail.chars().any(char::is_control))
+        );
+        let outcome = QueuedExecutionOutcome::ship_with_post_validation(
+            "job-ship",
+            request.pr,
+            state,
+            true,
+            disposition,
+        );
         outcome_store.save(&outcome).expect("save outcome");
 
         assert_eq!(
