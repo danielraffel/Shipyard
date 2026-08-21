@@ -83,6 +83,8 @@ pub mod metrics;
 mod native_executable;
 /// Structured JSON output helpers.
 pub mod output;
+/// Shadow-only build-once and sharded-test proof invariants.
+pub mod parallel_proof;
 /// Filesystem path resolution for isolated and compatible modes.
 pub mod paths;
 /// Consumer repository Shipyard pin helpers.
