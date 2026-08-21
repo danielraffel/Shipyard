@@ -35,6 +35,23 @@ use crate::warm_pool::{is_backend_eligible, warm_host_key};
 /// Current queued-execution schema.
 pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 1;
 
+/// Durable submitter ownership. Running ownership is derived by admitting
+/// only the matching executor class; it is never inferred from optional
+/// checkout provenance.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedExecutionOwner {
+    /// Request predates explicit ownership. Its signed configuration
+    /// provenance distinguishes legacy daemon submissions from foreground
+    /// submissions without changing the on-disk schema version.
+    #[default]
+    LegacyUnspecified,
+    /// An attached explicit `--foreground` drain owns execution.
+    Foreground,
+    /// The durable daemon supervisor owns execution.
+    Daemon,
+}
+
 /// Fallible queued request/outcome store operation result.
 pub type QueueRequestResult<T> = Result<T, QueueRequestError>;
 
@@ -225,6 +242,9 @@ pub struct QueuedExecutionEnvelope {
     pub cwd: PathBuf,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
+    /// Executor class allowed to transition this request to running.
+    #[serde(default)]
+    pub execution_owner: QueuedExecutionOwner,
     /// Immutable checkout identity captured by the submitting process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ExecutionProvenance>,
@@ -235,6 +255,42 @@ pub struct QueuedExecutionEnvelope {
 }
 
 impl QueuedExecutionEnvelope {
+    /// Whether this request carries the configuration provenance required for
+    /// daemon-owned execution. Foreground requests deliberately omit that
+    /// signature; missing or unreadable envelopes must be treated separately
+    /// as unknown ownership and preserved fail closed.
+    #[must_use]
+    pub fn is_daemon_owned(&self) -> bool {
+        self.execution_owner == QueuedExecutionOwner::Daemon
+    }
+
+    /// Whether the daemon may admit this request, including a request written
+    /// by the pre-ownership daemon. Only daemon submission captured a resolved
+    /// configuration signature in that format.
+    #[must_use]
+    pub fn is_daemon_admissible(&self) -> bool {
+        self.is_daemon_owned()
+            || (self.execution_owner == QueuedExecutionOwner::LegacyUnspecified
+                && self
+                    .provenance
+                    .as_ref()
+                    .and_then(|provenance| provenance.config_signature.as_ref())
+                    .is_some())
+    }
+
+    /// Whether a cooperative foreground drain may execute or recover this
+    /// request, including requests written before explicit ownership existed.
+    #[must_use]
+    pub fn is_foreground_owned(&self) -> bool {
+        matches!(self.execution_owner, QueuedExecutionOwner::Foreground)
+            || (self.execution_owner == QueuedExecutionOwner::LegacyUnspecified
+                && self
+                    .provenance
+                    .as_ref()
+                    .and_then(|provenance| provenance.config_signature.as_ref())
+                    .is_none())
+    }
+
     /// Build a queued `run` request envelope.
     #[must_use]
     pub fn from_run_request(
@@ -250,6 +306,7 @@ impl QueuedExecutionEnvelope {
             kind: QueuedExecutionKind::Run,
             cwd: cwd.clone(),
             created_at: Utc::now(),
+            execution_owner: QueuedExecutionOwner::Foreground,
             provenance: ExecutionProvenance::capture(&cwd, None, &request.sha),
             resource_plan: JobResourcePlan::from_run_request(&cwd, request),
             request: QueuedExecutionRequest::Run(QueuedRunRequest::from(request)),
@@ -271,6 +328,7 @@ impl QueuedExecutionEnvelope {
             kind: QueuedExecutionKind::Ship,
             cwd: cwd.clone(),
             created_at: Utc::now(),
+            execution_owner: QueuedExecutionOwner::Foreground,
             provenance: ExecutionProvenance::capture(&cwd, Some(&request.repo), &request.sha),
             resource_plan: JobResourcePlan::from_ship_request(&cwd, request),
             request: QueuedExecutionRequest::Ship(QueuedShipRequest::from(request)),

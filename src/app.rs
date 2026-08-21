@@ -1936,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_json_marks_running_job_cancelled() {
+    fn cancel_json_requests_running_job_cancellation_without_freeing_capacity() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue
@@ -1971,14 +1971,22 @@ mod tests {
         assert!(stderr.is_empty());
         let value: Value = serde_json::from_slice(&stdout).expect("json");
         assert_eq!(value["command"], "cancel");
-        assert_eq!(value["job"]["status"], "cancelled");
+        assert_eq!(value["job"]["status"], "running");
         assert_eq!(
             value["job"]["cancellation_reason"],
             "controller epoch 7 replaced exact head"
         );
         assert_eq!(
             queue.get(&job.id).expect("get").expect("job").status,
-            crate::job::JobStatus::Cancelled
+            crate::job::JobStatus::Running
+        );
+        assert!(
+            queue
+                .get(&job.id)
+                .expect("get")
+                .expect("job")
+                .cancel_requested_at
+                .is_some()
         );
     }
 

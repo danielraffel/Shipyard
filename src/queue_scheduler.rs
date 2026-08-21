@@ -722,9 +722,18 @@ fn load_resource_plan(
     job_id: &str,
     request_store: &QueueRequestStore,
 ) -> Result<Option<JobResourcePlan>, QueueRequestError> {
-    Ok(request_store
-        .load(job_id)?
-        .map(|envelope| envelope.resource_plan))
+    let Some(envelope) = request_store.load(job_id)? else {
+        return Ok(None);
+    };
+    if envelope.job_id != job_id {
+        return Err(QueueRequestError::InvalidSnapshot {
+            reason: format!(
+                "queued execution request for {job_id} belongs to {}",
+                envelope.job_id
+            ),
+        });
+    }
+    Ok(Some(envelope.resource_plan))
 }
 
 fn same_pr_ship_admission(
@@ -738,7 +747,7 @@ fn same_pr_ship_admission(
         .iter()
         .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
     {
-        let Some(ship_key) = load_ship_key(&job.id, request_store) else {
+        let Some((ship_key, foreground_owned)) = load_ship_key(&job.id, request_store) else {
             continue;
         };
         let group = by_pr.entry(ship_key).or_default();
@@ -748,7 +757,7 @@ fn same_pr_ship_admission(
             // alive. One whose heartbeat has gone stale was abandoned (e.g. the
             // process was killed); set it aside for reaping so it never blocks
             // forever.
-            JobStatus::Running if job.is_stale_running(now, stale_after) => {
+            JobStatus::Running if foreground_owned && job.is_stale_running(now, stale_after) => {
                 group.stale_running.push(job.clone());
             }
             JobStatus::Running => group.running.push(job.clone()),
@@ -820,10 +829,16 @@ struct SamePrShipGroup {
     stale_running: Vec<Job>,
 }
 
-fn load_ship_key(job_id: &str, request_store: &QueueRequestStore) -> Option<(String, u64)> {
+fn load_ship_key(job_id: &str, request_store: &QueueRequestStore) -> Option<((String, u64), bool)> {
     let envelope = request_store.load(job_id).ok().flatten()?;
+    if envelope.job_id != job_id {
+        return None;
+    }
+    let foreground_owned = envelope.is_foreground_owned();
     match envelope.request {
-        QueuedExecutionRequest::Ship(request) => Some((request.repo, request.pr)),
+        QueuedExecutionRequest::Ship(request) => {
+            Some(((request.repo, request.pr), foreground_owned))
+        }
         QueuedExecutionRequest::Run(_) => None,
     }
 }
@@ -1169,6 +1184,7 @@ mod tests {
                 kind: QueuedExecutionKind::Run,
                 cwd: PathBuf::from("/repo"),
                 created_at: Utc::now(),
+                execution_owner: crate::queue_request::QueuedExecutionOwner::LegacyUnspecified,
                 provenance: None,
                 resource_plan,
                 request: QueuedExecutionRequest::Run(QueuedRunRequest {
@@ -1193,6 +1209,7 @@ mod tests {
                 kind: QueuedExecutionKind::Ship,
                 cwd: PathBuf::from("/repo"),
                 created_at: Utc::now(),
+                execution_owner: crate::queue_request::QueuedExecutionOwner::LegacyUnspecified,
                 provenance: None,
                 resource_plan: claim_plan(&[&format!("ship-state:{repo}:pr-{pr}")]),
                 request: QueuedExecutionRequest::Ship(QueuedShipRequest {
@@ -1736,6 +1753,59 @@ mod tests {
                 reason: super::STALE_RUNNING_CANCEL_REASON.to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn request_backed_admit_pass_preserves_stale_daemon_owned_same_pr_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "stale-running", "danielraffel/shipyard", 42);
+        let mut daemon = store.load("stale-running").expect("load").expect("request");
+        daemon.execution_owner = crate::queue_request::QueuedExecutionOwner::Daemon;
+        store.save(&daemon).expect("save daemon owner");
+        save_ship(&store, "pending", "danielraffel/shipyard", 42);
+        let mut stale = job("stale-running", JobStatus::Running, Priority::Normal, -20);
+        stale.started_at =
+            Some(Utc::now() - Duration::seconds(super::DEFAULT_RUNNING_JOB_STALE_SECONDS + 60));
+        let jobs = vec![
+            stale,
+            job("pending", JobStatus::Pending, Priority::Normal, -10),
+        ];
+
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+
+        assert!(pass.plan.admitted.is_empty());
+        assert!(
+            pass.same_pr_ship_admission
+                .stale_running_cancellations
+                .is_empty()
+        );
+        assert_eq!(pass.same_pr_ship_admission.running_conflicts.len(), 1);
+    }
+
+    #[test]
+    fn request_backed_admit_pass_fails_closed_for_mismatched_running_envelope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_plan(&store, "running", claim_plan(&["host:m1"]));
+        let mut mismatched = store.load("running").expect("load").expect("request");
+        mismatched.job_id = "different-job".to_owned();
+        std::fs::write(
+            store.path_for("running"),
+            serde_json::to_vec(&mismatched).expect("encode"),
+        )
+        .expect("write mismatch");
+        save_plan(&store, "pending", claim_plan(&["host:m1"]));
+        let jobs = vec![
+            job("running", JobStatus::Running, Priority::Normal, -20),
+            job("pending", JobStatus::Pending, Priority::Normal, -10),
+        ];
+
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+
+        assert_eq!(pass.plan.admitted, ["pending"]);
+        assert_eq!(pass.running_request_errors.len(), 1);
+        assert_eq!(pass.running_request_errors[0].job_id, "running");
     }
 
     #[test]

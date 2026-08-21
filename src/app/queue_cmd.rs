@@ -215,9 +215,6 @@ pub(super) fn cancel_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let mut queue = open_queue(state_dir)?;
-    let job = queue
-        .get(job_id)?
-        .ok_or_else(|| CliFailure::new(1, format!("Job {job_id} not found")))?;
     let host = std::env::var("WHENCE_HOST")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown-host".to_owned());
@@ -231,10 +228,9 @@ pub(super) fn cancel_command<W: Write>(
         },
         str::to_owned,
     );
-    let cancelled = job
-        .cancel_with_reason(Some(reason))
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    queue.update(&cancelled)?;
+    let cancelled = queue
+        .request_cancel(job_id, Some(reason))?
+        .ok_or_else(|| CliFailure::new(1, format!("Job {job_id} not found")))?;
     if json_mode {
         write_job_envelope(stdout, "cancel", &cancelled)?;
     } else {
