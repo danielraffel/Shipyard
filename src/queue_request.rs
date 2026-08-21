@@ -2305,6 +2305,7 @@ mod tests {
             dispatched_runs: Vec::<DispatchedRun>::new(),
             evidence_snapshot: BTreeMap::new(),
             attempt: 1,
+            source_job_id: Some(envelope.job_id.clone()),
             schema_version: crate::ship_state::SHIP_STATE_SCHEMA_VERSION,
             merge_queue_observed_at: None,
             merge_queue_attempt_started_at: None,

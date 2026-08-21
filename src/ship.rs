@@ -697,6 +697,10 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
             return Err(error);
         }
     };
+    // Bind the durable ship attempt to the exact queue envelope that started
+    // it. A later recovery must never infer ownership from repo/PR/SHA alone:
+    // a fresh attempt may deliberately reuse all of those values.
+    state.source_job_id = Some(job.id.clone());
     if let Err(error) = ship_state.save_scoped_locked(&state, &ship_state_lock) {
         let execution_error = ShipExecutionError::ShipState(error.to_string());
         cancel_refused_job(queue, &job, &execution_error)?;

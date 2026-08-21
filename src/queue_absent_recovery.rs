@@ -61,7 +61,7 @@ pub(crate) fn protected_request_job_ids(
             Ok(Some(envelope))
                 if active_states
                     .iter()
-                    .any(|state| envelope_matches_state(&envelope, state)) =>
+                    .any(|state| envelope_matches_state_identity(&envelope, state)) =>
             {
                 protected.insert(job_id);
             }
@@ -311,7 +311,13 @@ where
     drop(selection_lock);
     let canonical_path = fs::canonicalize(registered_repo_path)
         .map_err(|error| format!("registered repo path is unavailable: {error}"))?;
-    let repo_config = load_recovery_config(mode, &canonical_path, global_dir)?;
+    let source_cwd = source
+        .provenance
+        .as_ref()
+        .ok_or_else(|| "preserved work item has no provenance; needs-agent".to_owned())?
+        .canonical_cwd
+        .clone();
+    let repo_config = load_recovery_config(mode, &source_cwd, global_dir)?;
     validate_source(&source, state, &canonical_path, &repo_config)?;
     ensure_source_has_no_outcome(state_dir, &source.job_id)?;
     if finalize_claimed_replacement_outcome(state_dir, &record_path, existing.as_ref())? {
@@ -352,7 +358,7 @@ where
     }
     ensure_no_worker_receipt(state_dir, state, &envelope_by_id)?;
 
-    let live = fetch_pr(&state.repo, state.pr, &canonical_path)
+    let live = fetch_pr(&state.repo, state.pr, &source_cwd)
         .map_err(|error| format!("GitHub PR verification unavailable: {error}"))?
         .ok_or_else(|| "GitHub PR verification unavailable".to_owned())?;
     validate_live_pr(&live, state)?;
@@ -545,6 +551,11 @@ where
 }
 
 fn envelope_matches_state(envelope: &QueuedExecutionEnvelope, state: &ShipState) -> bool {
+    envelope_matches_state_identity(envelope, state)
+        && state.source_job_id.as_deref() == Some(envelope.job_id.as_str())
+}
+
+fn envelope_matches_state_identity(envelope: &QueuedExecutionEnvelope, state: &ShipState) -> bool {
     matches!((&envelope.kind, &envelope.request),
         (QueuedExecutionKind::Ship, QueuedExecutionRequest::Ship(request))
         if request.pr == state.pr
@@ -574,22 +585,27 @@ fn validate_source(
     let request = envelope
         .to_ship_request()
         .map_err(|error| format!("preserved ship request is malformed; needs-agent: {error}"))?;
-    if envelope.resource_plan != JobResourcePlan::from_ship_request(repo_path, &request) {
-        return Err(
-            "preserved scheduler resource plan disagrees with ship request; needs-agent".to_owned(),
-        );
-    }
     let provenance = envelope
         .provenance
         .as_ref()
         .ok_or_else(|| "preserved work item has no provenance; needs-agent".to_owned())?;
-    if provenance.canonical_cwd != repo_path || envelope.cwd != repo_path {
+    if envelope.resource_plan
+        != JobResourcePlan::from_ship_request(&provenance.canonical_cwd, &request)
+    {
+        return Err(
+            "preserved scheduler resource plan disagrees with ship request; needs-agent".to_owned(),
+        );
+    }
+    if provenance.repo_root != repo_path
+        || envelope.cwd != provenance.canonical_cwd
+        || !provenance.canonical_cwd.starts_with(repo_path)
+    {
         return Err(
             "preserved checkout does not match registered repo path; needs-agent".to_owned(),
         );
     }
     provenance
-        .validate_with_config(repo_path, config)
+        .validate_with_config(&provenance.canonical_cwd, config)
         .map_err(|error| format!("preserved provenance no longer validates; needs-agent: {error}"))
 }
 
@@ -852,6 +868,7 @@ mod tests {
             )
             .expect("config");
             let mut state = ShipState::new(42, REPO, "feature", "main", &actual_sha, "policy");
+            state.source_job_id = Some("lost-source".to_owned());
             state.updated_at = Utc::now() - chrono::Duration::hours(24);
             ShipStateStore::new(state_dir.join("ship"))
                 .expect("state store")
@@ -976,6 +993,58 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn same_head_envelope_from_prior_attempt_is_not_replayed() {
+        let fixture = Fixture::new();
+        let state_store = ShipStateStore::new(fixture.state_dir.join("ship")).expect("state store");
+        let mut state = state_store.get_scoped(REPO, 42).expect("state");
+        state.attempt += 1;
+        state.source_job_id = Some("current-attempt-source".to_owned());
+        state_store.save(&state).expect("fresh attempt state");
+
+        let report = fixture.sweep(fixture.live(), |_| Ok(()));
+        assert!(report.enqueued.is_empty(), "{report:?}");
+        assert!(
+            report
+                .needs_agent
+                .iter()
+                .any(|(_, _, reason)| reason.contains("no exact preserved work item")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn registered_repo_root_accepts_proven_subdirectory_submission() {
+        let fixture = Fixture::new();
+        let subdir = fixture.repo_path.join("tools");
+        fs::create_dir(&subdir).expect("subdirectory");
+        let request_store = QueueRequestStore::new(&fixture.state_dir).expect("request store");
+        let mut envelope = request_store
+            .load(&fixture.source_job_id)
+            .expect("load")
+            .expect("source");
+        envelope.provenance = ExecutionProvenance::capture_with_config(
+            &subdir,
+            Some(REPO),
+            &fixture.request.sha,
+            &fixture.config,
+        );
+        envelope.cwd = envelope
+            .provenance
+            .as_ref()
+            .expect("subdirectory provenance")
+            .canonical_cwd
+            .clone();
+        envelope.resource_plan = JobResourcePlan::from_ship_request(&subdir, &fixture.request);
+        request_store
+            .save(&envelope)
+            .expect("subdirectory envelope");
+
+        let report = fixture.sweep(fixture.live(), |_| Ok(()));
+        assert_eq!(report.enqueued.len(), 1, "{report:?}");
+        assert!(report.needs_agent.is_empty(), "{report:?}");
     }
 
     #[test]
@@ -1148,6 +1217,24 @@ mod tests {
                 .expect("sweep terminal ship outcomes"),
             vec![fixture.source_job_id]
         );
+    }
+
+    #[test]
+    fn legacy_state_without_source_id_preserves_but_cannot_replay_envelope() {
+        let fixture = Fixture::new();
+        let state_store = ShipStateStore::new(fixture.state_dir.join("ship")).expect("state store");
+        let mut state = state_store.get_scoped(REPO, 42).expect("state");
+        state.source_job_id = None;
+        state_store.save(&state).expect("legacy state");
+        let request_store = QueueRequestStore::new(&fixture.state_dir).expect("requests");
+
+        let retained = protected_request_job_ids(&fixture.state_dir, &request_store)
+            .expect("protected request ids");
+        assert_eq!(retained, BTreeSet::from([fixture.source_job_id.clone()]));
+
+        let report = fixture.sweep(fixture.live(), |_| Ok(()));
+        assert!(report.enqueued.is_empty(), "{report:?}");
+        assert!(!report.needs_agent.is_empty(), "{report:?}");
     }
 
     #[test]
