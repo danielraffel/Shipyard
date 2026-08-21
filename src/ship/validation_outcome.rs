@@ -59,6 +59,24 @@ pub(crate) fn persist_terminal_outcome(
     persist_recovered_outcomes(std::slice::from_ref(job), state_dir, &ship_state)
 }
 
+pub(super) fn completed_validation_disposition(job: &Job) -> QueuedShipDisposition {
+    if job.passed() {
+        QueuedShipDisposition::new(
+            QueuedShipDispositionKind::GreenPendingMergeReadiness,
+            0,
+            Some(
+                "local validation completed; deterministic post-validation merge readiness has not completed",
+            ),
+        )
+    } else {
+        QueuedShipDisposition::new(
+            QueuedShipDispositionKind::ValidationFailed,
+            1,
+            Some("one or more locally supervised validation targets failed"),
+        )
+    }
+}
+
 fn recovered_ship_outcome(
     request: &ShipExecutionRequest,
     job: &Job,

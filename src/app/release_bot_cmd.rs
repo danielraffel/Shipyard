@@ -1990,34 +1990,30 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_gh(root: &Path) -> PathBuf {
-        let script = root.join("gh");
-        write_executable(
-            &script,
-            r#"#!/bin/sh
-case "$*" in
-  api\ repos/owner/repo/actions/runners*)
-    printf '%s\n' 'self-hosted' 'macos' 'arm64' 'repo-queue-authority-studio'
-    ;;
-  api\ repos/owner/repo/actions/secrets*)
-    printf '%s\n' '{"secrets":[{"name":"RELEASE_BOT_TOKEN","updated_at":"2026-04-25T09:30:00Z"}]}'
-    ;;
-  api\ repos/owner/other/actions/secrets*)
-    printf '%s\n' '{"secrets":[{"name":"RELEASE_BOT_TOKEN","updated_at":"2026-04-25T08:00:00Z"}]}'
-    ;;
-  run\ list\ --workflow\ auto-release.yml\ --repo\ owner/repo*)
-    printf '%s\n' '[{"databaseId":123,"status":"completed","conclusion":"failure","createdAt":"2026-04-25T10:00:00Z"}]'
-    ;;
-  run\ view\ 123\ --repo\ owner/repo\ --log-failed*)
-    printf '%s\n' 'fatal: Authentication failed'
-    ;;
-  *)
-    printf 'unexpected gh args: %s\n' "$*" >&2
-    exit 2
-    ;;
-esac
+        crate::test_support::compile_native_test_program(
+            root,
+            "gh",
+            r#"
+fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let output = if args.starts_with("api repos/owner/repo/actions/runners") {
+        "self-hosted\nmacos\narm64\nrepo-queue-authority-studio\n"
+    } else if args.starts_with("api repos/owner/repo/actions/secrets") {
+        "{\"secrets\":[{\"name\":\"RELEASE_BOT_TOKEN\",\"updated_at\":\"2026-04-25T09:30:00Z\"}]}\n"
+    } else if args.starts_with("api repos/owner/other/actions/secrets") {
+        "{\"secrets\":[{\"name\":\"RELEASE_BOT_TOKEN\",\"updated_at\":\"2026-04-25T08:00:00Z\"}]}\n"
+    } else if args.starts_with("run list --workflow auto-release.yml --repo owner/repo") {
+        "[{\"databaseId\":123,\"status\":\"completed\",\"conclusion\":\"failure\",\"createdAt\":\"2026-04-25T10:00:00Z\"}]\n"
+    } else if args.starts_with("run view 123 --repo owner/repo --log-failed") {
+        "fatal: Authentication failed\n"
+    } else {
+        eprintln!("unexpected gh args: {args}");
+        std::process::exit(2);
+    };
+    print!("{output}");
+}
 "#,
-        );
-        script
+        )
     }
 
     #[cfg(unix)]

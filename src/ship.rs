@@ -48,7 +48,9 @@ use crate::warm_pool::{
     PoolEntry, WarmPool, compute_expires_at, default_pool_path, is_backend_eligible, warm_host_key,
 };
 
-use validation_outcome::{persist_recovered_outcomes, policy_signature};
+use validation_outcome::{
+    completed_validation_disposition, persist_recovered_outcomes, policy_signature,
+};
 pub(crate) use validation_outcome::{persist_terminal_outcome, validation_proof_state};
 
 const RESUME_ORDER: [&str; 4] = ["setup", "configure", "build", "test"];
@@ -745,13 +747,15 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
     ship_state
         .save_scoped_locked(&state, &ship_state_lock)
         .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+    let post_validation = completed_validation_disposition(&job);
     QueueOutcomeStore::new(state_dir)
         .map_err(QueueRequestError::from)?
-        .save(&QueuedExecutionOutcome::ship(
+        .save(&QueuedExecutionOutcome::ship_with_post_validation(
             job.id.clone(),
             request.pr,
             state.clone(),
             resumed_existing_state,
+            post_validation.clone(),
         ))?;
     queue.update(&job)?;
 
@@ -759,7 +763,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         job,
         ship_state: state,
         resumed_existing_state,
-        post_validation: None,
+        post_validation: Some(post_validation),
     })
 }
 

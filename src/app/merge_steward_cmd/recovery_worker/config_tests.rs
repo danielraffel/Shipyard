@@ -28,22 +28,7 @@ fn config(contents: &str) -> LoadedConfig {
 }
 
 fn valid_policy() -> LoadedConfig {
-    config(
-        r#"
-[merge_steward.recovery_worker]
-enabled = true
-provider = "codex"
-codex_binary = "/usr/local/bin/codex"
-codex_home = "/trusted/codex-home"
-timeout_seconds = 30
-max_attempts_per_head = 1
-max_log_tail_bytes = 4096
-allowed_repositories = ["Generous-Corp/pulp"]
-
-[merge_steward.recovery_worker.repo_paths]
-"Generous-Corp/pulp" = "/Volumes/Workshop/Code/pulp"
-"#,
-    )
+    config(&recovery_test_policy_toml(&recovery_test_repo_path()))
 }
 
 #[test]
@@ -96,35 +81,37 @@ fn policy_defaults_to_spark_and_constructs_exact_tool_disabled_argv() {
     assert_eq!(policy.first_line_model, DEFAULT_FIRST_LINE_MODEL);
     assert_eq!(
         policy.argv(),
-        vec![
-            "/usr/local/bin/codex",
-            "exec",
-            "-c",
-            FORCED_REASONING_CONFIG,
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--strict-config",
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-            "--color",
-            "never",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .chain(
-            DISABLED_CODEX_FEATURES
-                .iter()
-                .copied()
-                .flat_map(|feature| ["--disable".to_owned(), feature.to_owned()])
-        )
-        .chain(
-            ["--model", DEFAULT_FIRST_LINE_MODEL, "-",]
+        std::iter::once(recovery_test_codex_binary().display().to_string())
+            .chain(
+                [
+                    "exec",
+                    "-c",
+                    FORCED_REASONING_CONFIG,
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--strict-config",
+                    "--sandbox",
+                    "read-only",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                ]
                 .into_iter()
-                .map(str::to_owned)
-        )
-        .collect::<Vec<_>>()
+                .map(str::to_owned),
+            )
+            .chain(
+                DISABLED_CODEX_FEATURES
+                    .iter()
+                    .copied()
+                    .flat_map(|feature| ["--disable".to_owned(), feature.to_owned()])
+            )
+            .chain(
+                ["--model", DEFAULT_FIRST_LINE_MODEL, "-"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .collect::<Vec<_>>()
     );
     assert!(policy.allowed_repositories.contains("generous-corp/pulp"));
     assert!(policy.repo_paths.contains_key("generous-corp/pulp"));
@@ -289,6 +276,38 @@ fn policy_rejects_non_codex_provider() {
         );
     let error = RecoveryWorkerPolicy::from_config(&wrong_provider).expect_err("provider rejected");
     assert!(error.message().contains("provider=\"codex\""));
+}
+
+#[test]
+fn policy_rejects_a_script_wrapper_named_codex() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let wrapper = temp
+        .path()
+        .join(if cfg!(windows) { "codex.exe" } else { "codex" });
+    fs::write(&wrapper, "#!/bin/sh\nexit 0\n").expect("wrapper fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&wrapper).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).expect("executable wrapper");
+    }
+    let mut configured = valid_policy();
+    configured
+        .data
+        .get_mut("merge_steward")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|table| table.get_mut("recovery_worker"))
+        .and_then(toml::Value::as_table_mut)
+        .expect("policy")
+        .insert(
+            "codex_binary".to_owned(),
+            toml::Value::String(wrapper.to_string_lossy().into_owned()),
+        );
+
+    let error = RecoveryWorkerPolicy::from_config(&configured).expect_err("wrapper rejected");
+
+    assert!(error.message().contains("script or wrapper"));
 }
 
 #[test]

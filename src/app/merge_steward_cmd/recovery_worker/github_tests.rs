@@ -25,6 +25,7 @@ fn app_bound_request() -> RecoveryRequest {
     .expect("request")
 }
 
+#[cfg(unix)]
 fn unbound_request() -> RecoveryRequest {
     RecoveryRequest::new(
         "Generous-Corp/pulp",

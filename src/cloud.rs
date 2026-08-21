@@ -767,7 +767,10 @@ impl GitHubActions {
     /// Callers must first attempt configured auth and restrict fallback to an
     /// explicit integration-permission rejection.
     pub(crate) fn run_gh_ambient(&self, args: &[String]) -> Result<String, GitHubError> {
-        let client = GhClient::ambient();
+        let client = self
+            .gh
+            .as_ref()
+            .map_err(|error| GitHubError::new(error.clone()))?;
         let output = client
             .prepare_command(
                 &self.cwd,
@@ -776,8 +779,6 @@ impl GitHubActions {
                 GhAuthPolicy::AmbientOnly,
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare ambient gh: {error}")))?
-            .env_remove("GH_TOKEN")
-            .env_remove("GITHUB_TOKEN")
             .args(args)
             .output()
             .map_err(|error| {
@@ -1712,6 +1713,41 @@ cache_ttl_seconds = 300
             local_dir: None,
             local_overlay_source: LocalOverlaySource::None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambient_fallback_preserves_configured_direct_gh_binary() {
+        let temp = TempDir::new().expect("tempdir");
+        let helper = temp.path().join("token-helper");
+        write_executable(&helper, "#!/bin/sh\nprintf ghs_app_token\n");
+        let ambient_gh = temp.path().join("gh");
+        std::os::unix::fs::symlink("/bin/echo", &ambient_gh).expect("native gh fixture");
+        let text = format!(
+            r#"
+[github.auth]
+source = "command"
+token_command = ["{}"]
+cache_ttl_seconds = 300
+ambient_gh_binary = "{}"
+"#,
+            helper.display(),
+            ambient_gh.display()
+        );
+        let config = LoadedConfig {
+            data: text.parse().expect("parse config"),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: LocalOverlaySource::None,
+        };
+        let actions = super::GitHubActions::from_loaded_config(temp.path(), &config);
+
+        let output = actions
+            .run_gh_ambient(&["api".to_owned(), "identity-proof".to_owned()])
+            .expect("configured ambient gh");
+
+        assert_eq!(output.trim(), "api identity-proof");
     }
 
     #[cfg(unix)]

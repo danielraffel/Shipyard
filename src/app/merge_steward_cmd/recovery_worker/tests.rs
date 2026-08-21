@@ -1,6 +1,7 @@
 use super::witness::remove_recovery_witness;
 use super::*;
 use crate::config::LocalOverlaySource;
+#[cfg(unix)]
 use crate::recovery_worker::RecoveryOutput;
 
 fn required_check(context: &str) -> RecoveryFailureFact {
@@ -30,42 +31,11 @@ fn config(contents: &str) -> LoadedConfig {
 }
 
 fn valid_policy() -> LoadedConfig {
-    config(
-        r#"
-[merge_steward.recovery_worker]
-enabled = true
-provider = "codex"
-codex_binary = "/usr/local/bin/codex"
-codex_home = "/trusted/codex-home"
-timeout_seconds = 30
-max_attempts_per_head = 1
-max_log_tail_bytes = 4096
-allowed_repositories = ["Generous-Corp/pulp"]
-
-[merge_steward.recovery_worker.repo_paths]
-"Generous-Corp/pulp" = "/Volumes/Workshop/Code/pulp"
-"#,
-    )
+    config(&recovery_test_policy_toml(&recovery_test_repo_path()))
 }
 
 fn policy_with_repo_path(repo_path: &Path) -> LoadedConfig {
-    config(&format!(
-        r#"
-[merge_steward.recovery_worker]
-enabled = true
-provider = "codex"
-codex_binary = "/usr/local/bin/codex"
-codex_home = "/trusted/codex-home"
-timeout_seconds = 30
-max_attempts_per_head = 1
-max_log_tail_bytes = 4096
-allowed_repositories = ["Generous-Corp/pulp"]
-
-[merge_steward.recovery_worker.repo_paths]
-"Generous-Corp/pulp" = "{}"
-"#,
-        repo_path.display()
-    ))
+    config(&recovery_test_policy_toml(repo_path))
 }
 
 #[test]
@@ -303,61 +273,6 @@ fn bounded_tail_keeps_only_final_bytes() {
             .expect("tail")
             .tail,
         b"6789"
-    );
-}
-
-#[test]
-fn global_model_lease_allows_only_one_process_owner() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let path = temp.path().join("global-model.lock");
-    let first = acquire_global_model_lease(&path)
-        .expect("first lease")
-        .expect("first owner");
-    assert!(
-        acquire_global_model_lease(&path)
-            .expect("contended lease")
-            .is_none()
-    );
-    drop(first);
-    assert!(
-        acquire_global_model_lease(&path)
-            .expect("released lease")
-            .is_some()
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn model_child_retains_global_lease_after_parent_guard_drops() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let path = temp.path().join("global-model.lock");
-    let lease = acquire_global_model_lease(&path)
-        .expect("lease")
-        .expect("uncontended lease");
-    let stdin = lease
-        .worker_stdin(&serde_json::json!({"bounded": "request"}))
-        .expect("inherited locked stdin");
-    let mut child = std::process::Command::new("sh")
-        .args(["-c", "cat >/dev/null; sleep 1"])
-        .stdin(stdin)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("lease-retaining child");
-
-    // Simulate an abrupt supervisor exit: the parent handle closes without an
-    // explicit unlock, while the model's inherited stdin remains open.
-    drop(lease);
-    assert!(
-        acquire_global_model_lease(&path)
-            .expect("contended by child")
-            .is_none()
-    );
-    assert!(child.wait().expect("child exit").success());
-    assert!(
-        acquire_global_model_lease(&path)
-            .expect("released after child exit")
-            .is_some()
     );
 }
 

@@ -18,3 +18,10 @@ fn contended_store_lock_respects_the_caller_deadline() {
     assert!(started.elapsed() < Duration::from_secs(1));
     drop(held);
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_lock_violation_is_classified_as_contention() {
+    let error = std::io::Error::from_raw_os_error(33);
+    assert!(is_file_lock_contended(&error));
+}

@@ -76,6 +76,7 @@ pub mod merge_queue_liveness;
 pub mod merge_steward;
 /// Runner and CI timing metrics store and analysis helpers.
 pub mod metrics;
+mod native_executable;
 /// Structured JSON output helpers.
 pub mod output;
 /// Filesystem path resolution for isolated and compatible modes.
@@ -155,6 +156,8 @@ pub mod workflow_cancellation;
 
 #[cfg(all(test, unix))]
 pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::{LazyLock, Mutex};
 
     /// Serializes tests that create, adopt, signal, or reap Unix process trees.
@@ -164,4 +167,29 @@ pub(crate) mod test_support {
     /// or observe each other's short-lived fixture processes.
     pub(crate) static PROCESS_TREE_TEST_LOCK: LazyLock<Mutex<()>> =
         LazyLock::new(|| Mutex::new(()));
+
+    /// Compile a tiny native fixture when a security boundary deliberately
+    /// rejects script wrappers. The fixture is scoped to the caller's tempdir.
+    pub(crate) fn compile_native_test_program(
+        directory: &Path,
+        output_name: &str,
+        source: &str,
+    ) -> PathBuf {
+        let source_path = directory.join(format!("{output_name}_fixture.rs"));
+        let output_path = directory.join(output_name);
+        std::fs::write(&source_path, source).expect("write native fixture source");
+        let output = Command::new("rustc")
+            .args(["--edition=2024", "--crate-name", "shipyard_native_fixture"])
+            .arg(&source_path)
+            .args(["-C", "debuginfo=0", "-o"])
+            .arg(&output_path)
+            .output()
+            .expect("compile native fixture");
+        assert!(
+            output.status.success(),
+            "native fixture compilation failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output_path
+    }
 }

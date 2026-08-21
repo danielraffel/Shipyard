@@ -135,7 +135,7 @@ pub fn create_pr(
             return match create_pr_rest(&client, cwd, gh_command, branch, base, title, body) {
                 Ok(info) => Ok(info),
                 Err(error) if is_integration_blocked(error.message()) => {
-                    create_pr_with_ambient_gh(cwd, gh_command, branch, base, title, body)
+                    create_pr_with_ambient_gh(&client, cwd, gh_command, branch, base, title, body)
                 }
                 Err(error) => Err(error),
             };
@@ -304,6 +304,7 @@ fn create_pr_rest(
 }
 
 fn create_pr_with_ambient_gh(
+    client: &GhClient,
     cwd: &Path,
     gh_command: Option<&Path>,
     branch: &str,
@@ -314,10 +315,7 @@ fn create_pr_with_ambient_gh(
     eprintln!(
         "shipyard: GitHub App token cannot create this pull request through GraphQL or REST. Falling back to ambient gh auth for PR creation only."
     );
-    let client = GhClient::ambient();
-    let output = gh_with_policy(&client, cwd, gh_command, GhAuthPolicy::AmbientOnly)?
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
+    let output = gh_with_policy(client, cwd, gh_command, GhAuthPolicy::AmbientOnly)?
         .args([
             "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
         ])
@@ -333,7 +331,7 @@ fn create_pr_with_ambient_gh(
     if selector.is_empty() {
         return Err(PrError::new("ambient gh pr create did not print a PR URL"));
     }
-    get_pr_status_with_client(&client, cwd, gh_command, &selector)
+    get_pr_status_with_client(client, cwd, gh_command, &selector)
 }
 
 fn get_pr_status_rest(

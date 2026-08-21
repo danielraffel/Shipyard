@@ -2,6 +2,101 @@ use super::witness::remove_recovery_witness;
 use super::*;
 
 #[test]
+fn global_model_lease_allows_only_one_process_owner() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("global-model.lock");
+    let first = acquire_global_model_lease(&path)
+        .expect("first lease")
+        .expect("first owner");
+    assert!(
+        acquire_global_model_lease(&path)
+            .expect("contended lease")
+            .is_none()
+    );
+    drop(first);
+    assert!(
+        acquire_global_model_lease(&path)
+            .expect("released lease")
+            .is_some()
+    );
+}
+
+#[test]
+fn model_child_retains_global_lease_after_parent_guard_drops() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("global-model.lock");
+    let ready = temp.path().join("child-ready");
+    let release = temp.path().join("child-release");
+    let lease = acquire_global_model_lease(&path)
+        .expect("lease")
+        .expect("uncontended lease");
+    let stdin = lease
+        .worker_stdin(&serde_json::json!({"bounded": "request"}))
+        .expect("inherited lease stdin");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "app::merge_steward_cmd::recovery_worker::lease_tests::global_model_lease_child_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SHIPYARD_MODEL_LEASE_READY", &ready)
+        .env("SHIPYARD_MODEL_LEASE_RELEASE", &release)
+        .stdin(stdin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("lease-retaining child");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+    }
+    assert!(ready.exists(), "lease child did not start");
+
+    // Simulate an abrupt supervisor exit: only the inherited child handle
+    // remains. Both Unix advisory locking and Windows deny-sharing must keep
+    // machine-global capacity unavailable until that handle closes.
+    drop(lease);
+    assert!(
+        acquire_global_model_lease(&path)
+            .expect("contended by child")
+            .is_none()
+    );
+    fs::write(&release, b"release").expect("release child");
+    assert!(child.wait().expect("child exit").success());
+    assert!(
+        acquire_global_model_lease(&path)
+            .expect("released after child exit")
+            .is_some()
+    );
+}
+
+#[test]
+#[ignore = "subprocess helper for model_child_retains_global_lease_after_parent_guard_drops"]
+fn global_model_lease_child_helper() {
+    let ready = std::env::var_os("SHIPYARD_MODEL_LEASE_READY")
+        .map(PathBuf::from)
+        .expect("ready path");
+    let release = std::env::var_os("SHIPYARD_MODEL_LEASE_RELEASE")
+        .map(PathBuf::from)
+        .expect("release path");
+    let mut request = String::new();
+    std::io::stdin()
+        .read_to_string(&mut request)
+        .expect("read request");
+    assert_eq!(request, r#"{"bounded":"request"}"#);
+    fs::write(&ready, b"ready").expect("ready marker");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !release.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(release.exists(), "parent did not release lease child");
+}
+
+#[test]
 fn contended_recovery_lease_respects_the_caller_deadline() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store_root = temp.path().join("store");

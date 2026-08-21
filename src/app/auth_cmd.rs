@@ -198,6 +198,13 @@ fn requirements_table(auth: &Table) -> Table {
             ));
         }
     }
+    if let Some(binary) = auth.get("ambient_gh_binary").and_then(TomlValue::as_str) {
+        commands.push(TomlValue::String(binary.to_owned()));
+        notes.push(TomlValue::String(
+            "The ambient gh binary must be a direct native GitHub CLI executable authenticated with the destination machine keyring; scripts and wrappers are rejected."
+                .to_owned(),
+        ));
+    }
     table.insert("commands".to_owned(), TomlValue::Array(commands));
     table.insert("env_vars".to_owned(), TomlValue::Array(env_vars));
     table.insert("notes".to_owned(), TomlValue::Array(notes));
@@ -244,6 +251,7 @@ fn reject_unknown_auth_keys(auth: &Table) -> Result<(), CliFailure> {
         "token_command",
         "cache_ttl_seconds",
         "refresh_skew_seconds",
+        "ambient_gh_binary",
     ];
     if let Some(key) = auth.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(CliFailure::new(
@@ -393,6 +401,50 @@ mod tests {
                 .is_some_and(|vars| vars
                     .iter()
                     .any(|value| value.as_str() == Some("SHIPYARD_GITHUB_TOKEN")))
+        );
+    }
+
+    #[test]
+    fn export_bundle_preserves_ambient_gh_binary_requirement() {
+        let temp = TempDir::new().expect("tempdir");
+        let binary = if cfg!(windows) {
+            "C:/Program Files/GitHub CLI/gh.exe"
+        } else {
+            "/usr/local/bin/gh"
+        };
+        let config = loaded_config(
+            temp.path(),
+            &format!(
+                r#"
+            [github.auth]
+            source = "env"
+            token_env = "SHIPYARD_GITHUB_TOKEN"
+            ambient_gh_binary = "{binary}"
+            "#
+            ),
+        );
+
+        let bundle = export_bundle(&config);
+        let requirements = bundle
+            .get("requirements")
+            .and_then(TomlValue::as_table)
+            .expect("requirements");
+
+        assert!(
+            requirements
+                .get("commands")
+                .and_then(TomlValue::as_array)
+                .is_some_and(|commands| commands
+                    .iter()
+                    .any(|value| value.as_str() == Some(binary)))
+        );
+        assert!(
+            requirements
+                .get("notes")
+                .and_then(TomlValue::as_array)
+                .is_some_and(|notes| notes.iter().any(|value| value
+                    .as_str()
+                    .is_some_and(|note| note.contains("scripts and wrappers are rejected"))))
         );
     }
 

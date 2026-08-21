@@ -9,6 +9,7 @@ use fs2::FileExt;
 use serde_json::Value;
 
 use super::CliFailure;
+use crate::recovery_worker::is_file_lock_contended;
 
 const RECOVERY_LEASE_TIMEOUT_SECONDS: u64 = 5;
 const RECOVERY_LEASE_POLL_MILLIS: u64 = 10;
@@ -28,9 +29,12 @@ impl RecoveryEnqueueLease {
 
 /// Machine-global model capacity.
 ///
-/// This guard intentionally relies on last-handle close rather than an
-/// explicit unlock. The model inherits a duplicate as stdin, so an abrupt
-/// parent exit cannot release capacity while that child is still alive.
+/// The model inherits a duplicate as stdin, so an abrupt parent exit cannot
+/// release capacity while that child is still alive. Unix keeps the advisory
+/// lock with the inherited open-file description. Windows uses a deny-sharing
+/// file open instead of `LockFileEx`, whose locks are not transferred to an
+/// inheriting process; the sharing restriction lasts until the final duplicate
+/// handle closes.
 pub(super) struct GlobalModelLease(File);
 
 impl GlobalModelLease {
@@ -78,24 +82,34 @@ pub(super) fn acquire_global_model_lease(
             ),
         )
     })?;
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|error| {
-            CliFailure::new(
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if is_file_lock_contended(&error) => return Ok(None),
+        Err(error) => {
+            return Err(CliFailure::new(
                 1,
                 format!(
                     "failed to open global recovery-model lease {}: {error}",
                     path.display()
                 ),
-            )
-        })?;
+            ));
+        }
+    };
+    #[cfg(windows)]
+    {
+        Ok(Some(GlobalModelLease(file)))
+    }
+    #[cfg(not(windows))]
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(GlobalModelLease(file))),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if is_file_lock_contended(&error) => Ok(None),
         Err(error) => Err(CliFailure::new(
             1,
             format!("failed to acquire global recovery-model lease: {error}"),
@@ -159,7 +173,7 @@ fn wait_for_lease(file: File, deadline: Instant, exclusive: bool) -> Result<File
         };
         match result {
             Ok(()) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_file_lock_contended(&error) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     let kind = if exclusive { "exclusive" } else { "shared" };

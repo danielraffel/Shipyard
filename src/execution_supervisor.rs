@@ -25,7 +25,7 @@ use crate::job::{DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus};
 use crate::queue::{Queue, QueueDeferredRequeue, QueueError, QueuePendingCancellation};
 use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
-    QueuedExecutionOwner, QueuedExecutionRequest,
+    QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner, QueuedExecutionRequest,
 };
 use crate::queue_scheduler::{AlreadyMergedCancellation, AlreadyMergedObserver};
 use crate::ship::persist_terminal_outcome;
@@ -265,13 +265,27 @@ impl ExecutionSupervisor {
         let request_store = QueueRequestStore::new(&self.state_dir)?;
         let outcome_store = QueueOutcomeStore::new(&self.state_dir)?;
         for job in queue.get_recent(usize::MAX)? {
-            match request_store.load(&job.id) {
-                Ok(Some(_)) => {}
+            let envelope = match request_store.load(&job.id) {
+                Ok(Some(envelope)) => envelope,
                 Ok(None) => continue,
                 Err(error) if request_error_is_job_local(&error) => continue,
                 Err(error) => return Err(error.into()),
-            }
-            if outcome_store.load(&job.id)?.is_none() {
+            };
+            let outcome = outcome_store.load(&job.id)?;
+            let incomplete_ship = matches!(
+                (&envelope.kind, &outcome),
+                (
+                    QueuedExecutionKind::Ship,
+                    Some(QueuedExecutionOutcome::Ship {
+                        post_validation: None,
+                        ..
+                    })
+                )
+            );
+            let repair_incomplete_ship = incomplete_ship
+                && !self.children.contains_key(&job.id)
+                && matches!(self.observe_receipt(&job.id)?, WorkerObservation::Dead);
+            if outcome.is_none() || repair_incomplete_ship {
                 persist_terminal_outcome(&job, &self.state_dir)
                     .map_err(|error| SupervisorError::Outcome(error.to_string()))?;
             }
@@ -1130,11 +1144,12 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{JobKind, Priority, ValidationMode};
+    use crate::job::{JobKind, Priority, TargetResult, TargetStatus, ValidationMode};
     use crate::queue_request::{
-        JobResourcePlan, QueueOutcomeStore, QueuedExecutionKind, QueuedExecutionRequest,
-        QueuedShipRequest,
+        JobResourcePlan, QueueOutcomeStore, QueuedExecutionKind, QueuedExecutionOutcome,
+        QueuedExecutionRequest, QueuedShipDispositionKind, QueuedShipRequest,
     };
+    use crate::ship_state::ShipState;
     #[cfg(unix)]
     use crate::test_support::PROCESS_TREE_TEST_LOCK;
 
@@ -2084,6 +2099,72 @@ mod tests {
                 .load("repair-outcome")
                 .expect("load")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn daemon_restart_repairs_terminal_ship_missing_post_validation_disposition() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "repair-post-validation", "validated-head");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        let running = queue
+            .start_pending_jobs_for_drain(&lock, &["repair-post-validation".to_owned()])
+            .expect("start")
+            .remove(0);
+        drop(lock);
+        let completed = running
+            .with_result(TargetResult::new(
+                "local",
+                "macos-arm64",
+                TargetStatus::Pass,
+                "local",
+            ))
+            .complete()
+            .expect("complete");
+        queue.update(&completed).expect("persist terminal job");
+        QueueOutcomeStore::new(temp.path())
+            .expect("outcomes")
+            .save(&QueuedExecutionOutcome::ship(
+                completed.id.clone(),
+                438,
+                ShipState::new(
+                    438,
+                    "owner/repo",
+                    "feature/durable",
+                    "main",
+                    "validated-head",
+                    "preliminary-policy",
+                ),
+                false,
+            ))
+            .expect("preliminary outcome without disposition");
+
+        let mut restarted = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        restarted.tick().expect("repair tick");
+
+        let repaired = QueueOutcomeStore::new(temp.path())
+            .expect("outcomes")
+            .load(&completed.id)
+            .expect("load")
+            .expect("repaired outcome");
+        let QueuedExecutionOutcome::Ship {
+            ship_state,
+            post_validation,
+            ..
+        } = repaired
+        else {
+            panic!("expected ship outcome");
+        };
+        assert_eq!(ship_state.evidence_snapshot["local"], "pass");
+        assert_eq!(
+            post_validation.expect("recovered disposition").kind,
+            QueuedShipDispositionKind::PostValidationOperationalFailure
         );
     }
 

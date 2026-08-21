@@ -1,8 +1,5 @@
 use toml::Table;
 
-use super::ResolvedPrContext;
-#[cfg(unix)]
-use super::ShipStewardHandoff;
 use super::provenance::configured_pr_provenance_hook;
 #[cfg(unix)]
 use super::provenance::{apply_requested_steward_handoff_with_actions, run_pr_provenance_hook};
@@ -10,6 +7,8 @@ use super::provenance::{apply_requested_steward_handoff_with_actions, run_pr_pro
 use super::test_support::loaded_config;
 #[cfg(unix)]
 use super::test_support::{fake_gh, loaded_config};
+#[cfg(unix)]
+use super::{ResolvedPrContext, ShipStewardHandoff};
 #[cfg(unix)]
 use crate::cloud::GitHubActions;
 

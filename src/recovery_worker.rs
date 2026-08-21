@@ -8,8 +8,8 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -32,6 +32,20 @@ const MAX_DETAIL_BYTES: usize = 1_200;
 const MAX_PENDING_LIMIT: usize = 1_024;
 const DEFAULT_MAX_ATTEMPTS: u32 = 1;
 const DEFAULT_OPT_OUT_LABEL: &str = "shipyard:no-auto-merge";
+
+pub(crate) fn is_file_lock_contended(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // LockFileEx reports lock and sharing contention as raw Win32 errors;
+        // Rust does not currently normalize either one to WouldBlock.
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    false
+}
 
 /// Durable recovery lifecycle.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -1,8 +1,10 @@
 use super::{
-    CliFailure, File, Path, PathBuf, RecoveryRequest, RecoveryStore, RecoveryWitness, Write,
+    CliFailure, Path, PathBuf, RecoveryRequest, RecoveryStore, RecoveryWitness, Write,
     acquire_recovery_enqueue_lease, fs, recovery_lease_deadline, recovery_store_root,
 };
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::fs::File;
 
 pub(super) fn recovery_witness_path(state_dir: &Path, repo: &str, pr: u64) -> PathBuf {
     let key = format!("{}#{pr}", repo.to_ascii_lowercase());
@@ -196,6 +198,8 @@ fn sync_directory(path: &Path) -> Result<(), CliFailure> {
 }
 
 #[cfg(not(unix))]
+// Keep the fallible signature aligned with the durable Unix implementation.
+#[allow(clippy::unnecessary_wraps)]
 fn sync_directory(_path: &Path) -> Result<(), CliFailure> {
     Ok(())
 }

@@ -1,4 +1,4 @@
-use super::{RecoveryResult, RecoveryStore};
+use super::{RecoveryResult, RecoveryStore, is_file_lock_contended};
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -50,7 +50,7 @@ fn wait_for_store_lock(
         };
         match result {
             Ok(()) => return Ok(RecoveryStoreLock(file)),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if is_file_lock_contended(&error) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     let kind = if exclusive { "exclusive" } else { "shared" };

@@ -523,6 +523,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use super::super::recovery_test_codex_binary;
     use super::*;
     use crate::recovery_worker::{
         RECOVERY_SCHEMA_VERSION, RecoveryCategory, RecoveryConfidence, RecoveryFailureFact,
@@ -530,22 +531,25 @@ mod tests {
     };
 
     fn policy_config(repo_path: &Path, max_log_tail_bytes: usize) -> String {
+        let codex_binary =
+            toml::Value::String(recovery_test_codex_binary().to_string_lossy().into_owned());
+        let codex_home = toml::Value::String("/trusted/codex-home".to_owned());
+        let repo_path = toml::Value::String(repo_path.to_string_lossy().into_owned());
         format!(
             r#"
 [merge_steward.recovery_worker]
 enabled = true
 provider = "codex"
-codex_binary = "/usr/local/bin/codex"
-codex_home = "/trusted/codex-home"
+codex_binary = {codex_binary}
+codex_home = {codex_home}
 timeout_seconds = 30
 max_attempts_per_head = 1
 max_log_tail_bytes = {max_log_tail_bytes}
 allowed_repositories = ["Generous-Corp/pulp"]
 
 [merge_steward.recovery_worker.repo_paths]
-"Generous-Corp/pulp" = "{}"
-"#,
-            repo_path.display()
+"Generous-Corp/pulp" = {repo_path}
+"#
         )
     }
 

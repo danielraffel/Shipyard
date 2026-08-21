@@ -22,10 +22,9 @@ pub(super) fn run_worker_process(
             ),
         )
     })?;
-    // The locked file is both the bounded JSON input and an inherited capacity
-    // handle. Because the parent never explicitly unlocks it, the operating
-    // system keeps the machine-global lease held if Shipyard crashes while the
-    // model process is still alive.
+    // The lease file is both the bounded JSON input and an inherited capacity
+    // handle. Its Unix lock or Windows deny-sharing open survives in the model
+    // process if Shipyard crashes while that process is still alive.
     let stdin = model_lease.worker_stdin(request)?;
 
     let argv = policy.argv();

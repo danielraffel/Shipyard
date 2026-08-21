@@ -1,9 +1,11 @@
 use super::{
-    DateTime, File, MAX_GENERATION_BYTES, RECOVERY_SCHEMA_VERSION, RecoveryError, RecoveryRecord,
+    DateTime, MAX_GENERATION_BYTES, RECOVERY_SCHEMA_VERSION, RecoveryError, RecoveryRecord,
     RecoveryResult, RecoveryStatus, RecoveryStore, Utc, Write, fs, validate_id, validate_signature,
     validate_text,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::fs::File;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -129,6 +131,8 @@ fn sync_claim_directory(path: &std::path::Path) -> RecoveryResult<()> {
 }
 
 #[cfg(not(unix))]
+// Keep the fallible signature aligned with the durable Unix implementation.
+#[allow(clippy::unnecessary_wraps)]
 fn sync_claim_directory(_path: &std::path::Path) -> RecoveryResult<()> {
     Ok(())
 }

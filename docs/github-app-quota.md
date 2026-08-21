@@ -198,10 +198,19 @@ token_command = [
   "{repo_slug}",
 ]
 refresh_skew_seconds = 60
+ambient_gh_binary = "/absolute/path/to/gh"
 ```
 
 Use an absolute helper path. That keeps `shipyard auth export` portable when you
 import the config into another repository.
+
+`ambient_gh_binary` is optional and machine-specific. It supplies the direct
+native GitHub CLI for the narrowly allowed personal-keyring fallback when an
+App is denied a documented low-volume mutation. Shipyard removes ambient token
+variables and rejects script/wrapper paths, so do not point it at a `gh` shim
+that delegates to the App helper. If omitted, Shipyard scans `PATH` and skips
+non-native `gh` wrappers. Update this path after importing the bundle on a
+machine with a different GitHub CLI installation.
 
 You can also use environment variables:
 

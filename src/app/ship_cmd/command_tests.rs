@@ -1,10 +1,11 @@
 use std::process::ExitCode;
 
 #[cfg(unix)]
+use super::test_support::git;
+#[cfg(unix)]
 use super::test_support::{fake_gh, seed_repo_with_local_origin};
 use super::test_support::{
-    git, git_capture, loaded_config, local_and_unreachable_config, seed_repo,
-    unreachable_ssh_config,
+    git_capture, loaded_config, local_and_unreachable_config, seed_repo, unreachable_ssh_config,
 };
 use super::{
     SHIP_EXIT_VALIDATION_STATE_MISSING, ShipCommandArgs, ShipInvocation, finish_background_ship,

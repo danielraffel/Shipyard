@@ -270,10 +270,12 @@ When debugging GitHub behavior:
 - Keep `RELEASE_BOT_TOKEN` separate. `shipyard release-bot setup/status` are
   operator actions and intentionally use ambient `gh` auth.
 - Keep high-volume GitHub inspection on the configured Shipyard auth source.
-  PR creation is the only intentional ambient-auth escape hatch: if a GitHub App
-  installation token is rejected for PR creation by both GraphQL and REST,
-  Shipyard prints an explicit notice and uses ambient `gh` auth for that create
-  operation only.
+  Ambient auth is permitted only for documented low-volume mutations after an
+  exact App integration-permission denial (PR creation after both GraphQL and
+  REST fail, and steward handoff writes). Shipyard removes both GitHub token
+  variables and selects a direct native `gh`, skipping script/wrapper shims.
+  Set `github.auth.ambient_gh_binary` to an absolute native GitHub CLI path when
+  PATH discovery is not appropriate; never point it at a `ghapp` wrapper.
 - Mac-to-Mac portability is config-only. Reprovision env vars, Keychain items,
   1Password sign-in, or App private keys outside Shipyard on the destination
   Mac.

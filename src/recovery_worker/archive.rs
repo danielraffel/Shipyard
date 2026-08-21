@@ -4,7 +4,9 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -193,6 +195,8 @@ fn sync_directory(path: &Path) -> RecoveryResult<()> {
 }
 
 #[cfg(not(unix))]
+// Keep the fallible signature aligned with the durable Unix implementation.
+#[allow(clippy::unnecessary_wraps)]
 fn sync_directory(_path: &Path) -> RecoveryResult<()> {
     Ok(())
 }

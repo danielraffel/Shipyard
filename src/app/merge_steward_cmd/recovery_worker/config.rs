@@ -378,6 +378,12 @@ pub(super) fn validate_codex_binary(path: &std::path::Path) -> Result<(), CliFai
             format!("[{POLICY_KEY}].codex_binary must name the direct codex executable"),
         ));
     }
+    crate::native_executable::validate_native_executable(path).map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("[{POLICY_KEY}].codex_binary must be a direct native executable: {error}"),
+        )
+    })?;
     Ok(())
 }
 

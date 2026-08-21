@@ -5,7 +5,7 @@
 //! model-output validation live in `crate::recovery_worker`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -75,6 +75,65 @@ const DISABLED_CODEX_FEATURES: &[&str] = &[
     "unbounded_connection_retries",
     "workspace_dependencies",
 ];
+
+#[cfg(test)]
+fn recovery_test_codex_binary() -> PathBuf {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let directory = tempfile::Builder::new()
+                .prefix("shipyard-test-codex-")
+                .tempdir()
+                .expect("codex fixture directory")
+                .keep();
+            let path = directory.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+            std::fs::copy(std::env::current_exe().expect("test executable"), &path)
+                .expect("native codex fixture");
+            path
+        })
+        .clone()
+}
+
+#[cfg(test)]
+fn recovery_test_policy_toml(repo_path: &Path) -> String {
+    let codex_binary =
+        toml::Value::String(recovery_test_codex_binary().to_string_lossy().into_owned());
+    let codex_home = toml::Value::String(
+        if cfg!(windows) {
+            PathBuf::from("C:/trusted/codex-home")
+        } else {
+            PathBuf::from("/trusted/codex-home")
+        }
+        .to_string_lossy()
+        .into_owned(),
+    );
+    let repo_path = toml::Value::String(repo_path.to_string_lossy().into_owned());
+    format!(
+        r#"
+[merge_steward.recovery_worker]
+enabled = true
+provider = "codex"
+codex_binary = {codex_binary}
+codex_home = {codex_home}
+timeout_seconds = 30
+max_attempts_per_head = 1
+max_log_tail_bytes = 4096
+allowed_repositories = ["Generous-Corp/pulp"]
+
+[merge_steward.recovery_worker.repo_paths]
+"Generous-Corp/pulp" = {repo_path}
+"#
+    )
+}
+
+#[cfg(test)]
+fn recovery_test_repo_path() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from("C:/Volumes/Workshop/Code/pulp")
+    } else {
+        PathBuf::from("/Volumes/Workshop/Code/pulp")
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::app) struct RecoveryWorkerCommandArgs {

@@ -237,11 +237,13 @@ detail rather than showing a red ✗ that only the rare configured-token user se
 GitHub App installation tokens are the preferred path for high-volume
 inspection because Shipyard injects them into its built-in `gh` subprocesses
 and REST/GraphQL fallback paths. Do not silently fall back to ambient user auth
-for polling, watch, retarget, handoff, or diagnostics. The narrow exception is
-pull-request creation: if GitHub rejects App-token PR creation with `Resource
-not accessible by integration` through both GraphQL and REST, Shipyard may print
-an explicit notice and use ambient `gh` auth for that one low-volume create
-operation.
+for polling, watch, retarget, or diagnostics. Ambient auth is restricted to
+documented low-volume mutations after the exact App integration-permission
+denial: pull-request creation after both GraphQL and REST fail, and steward
+handoff writes. Shipyard removes `GH_TOKEN` and `GITHUB_TOKEN` and selects a
+direct native `gh`, skipping script/wrapper shims. If PATH discovery is not
+appropriate, configure an absolute native `github.auth.ambient_gh_binary`;
+never point it at a `ghapp` wrapper.
 PR merge should stay on the configured token: if GitHub rejects the App token's
 GraphQL merge probe, Shipyard falls back to its REST merge path with the same
 configured token.
