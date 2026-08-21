@@ -1,6 +1,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+use std::process::Stdio;
+
+#[cfg(unix)]
+use std::process::Output;
 
 use tempfile::TempDir;
 
@@ -298,10 +301,7 @@ fn prepare_command_injects_env_token_and_supervised_marker() {
         )
         .expect("command");
 
-    assert_eq!(
-        command.get_program(),
-        native.canonicalize().expect("canonical native executable")
-    );
+    assert_eq!(command.get_program(), native.as_os_str());
     assert_eq!(
         env_value(&command, GH_TOKEN_ENV).as_deref(),
         Some(OsString::from(expected_path).as_os_str())
