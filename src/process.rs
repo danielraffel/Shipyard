@@ -110,16 +110,29 @@ impl ProcessTree {
         }
     }
 
-    /// Best-effort termination and reaping of the complete supervised tree.
+    /// Best-effort termination of the complete supervised tree.
+    ///
+    /// Unix reaps synchronously behind a bounded signal-command wait. Windows
+    /// requests Job Object termination without entering its unbounded wait;
+    /// pipe readers provide the bounded observation that descendants exited.
     pub(crate) fn terminate(&mut self) {
-        if std::mem::replace(&mut self.terminated, true) {
+        if self.terminated {
             return;
         }
         #[cfg(windows)]
         {
             // The wrapper retains the Job Object even if `try_wait` reaped the
-            // direct child, so this still reaches surviving descendants.
-            let _ = self.child.kill();
+            // direct child, so this still reaches surviving descendants. Use
+            // the non-blocking request: synchronous Job termination can wait
+            // indefinitely inside Windows while a descendant retains an I/O
+            // handle, defeating every caller's outer timeout.
+            if self.child.start_kill().is_ok() {
+                self.terminated = true;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.terminated = true;
         }
         #[cfg(unix)]
         {
@@ -247,6 +260,7 @@ mod tests {
     fn windows_job_remains_usable_after_tree_leader_exits() {
         use std::io::Read;
         use std::process::{Command, Stdio};
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -263,9 +277,11 @@ mod tests {
             .stdout(Stdio::piped());
         let mut tree = super::ProcessTree::spawn(&mut command).expect("spawn process tree");
         let mut stdout = tree.take_stdout().expect("root stdout");
-        let reader = std::thread::spawn(move || {
+        let (reader_sender, reader_receiver) = mpsc::sync_channel(1);
+        let _reader = std::thread::spawn(move || {
             let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
+            let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = reader_sender.send(result);
         });
 
         std::fs::write(&release, b"go").expect("release root helper");
@@ -283,22 +299,14 @@ mod tests {
         assert!(root_status.success());
         std::thread::sleep(Duration::from_millis(100));
         assert!(
-            !reader.is_finished(),
+            matches!(reader_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
             "the descendant should still hold the inherited pipe open"
         );
 
         tree.terminate();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !reader.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            reader.is_finished(),
-            "terminating the retained Job Object should stop the descendant"
-        );
-        reader
-            .join()
-            .expect("stdout reader")
+        reader_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("terminating the retained Job Object should close the descendant pipe")
             .expect("read descendant stdout");
     }
 
