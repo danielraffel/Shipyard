@@ -2155,6 +2155,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stop_running_terminates_pid_when_ipc_is_unavailable() {
+        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let daemon_dir = temp.path().join("daemon");
         std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
@@ -2243,6 +2244,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stop_running_does_not_signal_unrecognized_pid_file() {
+        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let daemon_dir = temp.path().join("daemon");
         std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
