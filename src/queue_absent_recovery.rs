@@ -345,12 +345,8 @@ where
     }) {
         return Ok(None);
     }
-    if jobs.iter().any(|job| {
-        job.created_at > source.created_at
-            && envelope_by_id
-                .get(job.id.as_str())
-                .is_some_and(|envelope| envelope_owns_pr(envelope, state))
-    }) {
+    if terminal_newer_owner_has_durable_outcome(state_dir, &jobs, &envelope_by_id, &source, state)?
+    {
         return Ok(None);
     }
     ensure_no_worker_receipt(state_dir, state, &envelope_by_id)?;
@@ -453,6 +449,38 @@ fn active_recovered_owner_is_valid(
         return Err("recovered owner disagrees with current ship source".to_owned());
     }
     Ok(true)
+}
+
+fn terminal_newer_owner_has_durable_outcome(
+    state_dir: &Path,
+    jobs: &[Job],
+    envelopes: &BTreeMap<&str, &QueuedExecutionEnvelope>,
+    source: &QueuedExecutionEnvelope,
+    state: &ShipState,
+) -> Result<bool, String> {
+    let Some(job) = jobs
+        .iter()
+        .filter(|job| {
+            matches!(job.status, JobStatus::Completed | JobStatus::Cancelled)
+                && job.created_at > source.created_at
+                && envelopes
+                    .get(job.id.as_str())
+                    .is_some_and(|envelope| envelope_owns_pr(envelope, state))
+        })
+        .max_by_key(|job| (&job.created_at, &job.id))
+    else {
+        return Ok(false);
+    };
+    if outcome_presence(state_dir, &job.id)? {
+        // The normal supervisor owns reconciliation from this immutable
+        // outcome into ShipState. Recovery must neither duplicate it nor
+        // misclassify the retained terminal queue row as an active owner.
+        return Ok(true);
+    }
+    Err(format!(
+        "newer ship owner {} reached terminal queue status {:?} without a durable outcome; replay refused",
+        job.id, job.status
+    ))
 }
 
 fn ensure_source_has_no_outcome(state_dir: &Path, source_job_id: &str) -> Result<(), String> {
@@ -1307,6 +1335,91 @@ mod tests {
             !recovery_record_path(&fixture.state_dir, REPO, 42).exists(),
             "healthy ownership must not be durably fenced as ambiguous"
         );
+    }
+
+    #[test]
+    fn terminal_newer_owner_without_outcome_routes_needs_agent() {
+        for terminal_status in [JobStatus::Completed, JobStatus::Cancelled] {
+            let fixture = Fixture::new();
+            let mut queue = Queue::new(&fixture.state_dir).expect("queue");
+            let owner = crate::ship::submit_ship(
+                &fixture.request,
+                &mut queue,
+                &fixture.repo_path,
+                &fixture.state_dir,
+            )
+            .expect("normal replacement");
+            let terminal = match terminal_status {
+                JobStatus::Completed => owner
+                    .start()
+                    .expect("start owner")
+                    .complete()
+                    .expect("complete owner"),
+                JobStatus::Cancelled => owner.cancel().expect("cancel owner"),
+                _ => unreachable!("test enumerates terminal states"),
+            };
+            queue.update(&terminal).expect("terminal owner");
+
+            let report = fixture.sweep(fixture.live(), |_| {
+                panic!("a terminal owner without outcome must not replay")
+            });
+            assert!(
+                report.enqueued.is_empty(),
+                "{terminal_status:?}: {report:?}"
+            );
+            assert_eq!(
+                report.needs_agent.len(),
+                1,
+                "{terminal_status:?}: {report:?}"
+            );
+            assert!(
+                report.needs_agent[0]
+                    .2
+                    .contains("without a durable outcome"),
+                "{terminal_status:?}: {report:?}"
+            );
+            assert_eq!(
+                load_record(&recovery_record_path(&fixture.state_dir, REPO, 42))
+                    .expect("record read")
+                    .expect("needs-agent record")
+                    .status,
+                QueueAbsentRecoveryStatus::NeedsAgent
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_newer_owner_with_durable_outcome_is_not_replayed_or_fenced() {
+        let fixture = Fixture::new();
+        let state = ShipStateStore::new(fixture.state_dir.join("ship"))
+            .expect("store")
+            .get_scoped(REPO, 42)
+            .expect("state");
+        let mut queue = Queue::new(&fixture.state_dir).expect("queue");
+        let owner = crate::ship::submit_ship(
+            &fixture.request,
+            &mut queue,
+            &fixture.repo_path,
+            &fixture.state_dir,
+        )
+        .expect("normal replacement")
+        .start()
+        .expect("start owner")
+        .complete()
+        .expect("complete owner");
+        queue.update(&owner).expect("terminal owner");
+        QueueOutcomeStore::new(&fixture.state_dir)
+            .expect("outcomes")
+            .save(&QueuedExecutionOutcome::ship(&owner.id, 42, state, false))
+            .expect("owner outcome");
+
+        let report = fixture.sweep(fixture.live(), |_| {
+            panic!("durably terminal ownership must not replay")
+        });
+        assert!(report.enqueued.is_empty(), "{report:?}");
+        assert!(report.needs_agent.is_empty(), "{report:?}");
+        assert_eq!(report.skipped, 1, "{report:?}");
+        assert!(!recovery_record_path(&fixture.state_dir, REPO, 42).exists());
     }
 
     #[test]
