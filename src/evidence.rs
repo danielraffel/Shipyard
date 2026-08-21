@@ -1126,10 +1126,20 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("evidence");
         let store = EvidenceStore::new(root.clone()).expect("store");
-        let scope = "repo:generous-corp/forge:workload:modular";
-        let branch = "feature/legacy-scoped-evidence";
+        // Keep the fixture path below legacy MAX_PATH on Windows. The legacy
+        // and current encodings still differ because their digest widths differ;
+        // this test is about compatibility migration, not reproducing the
+        // overlong-path failure covered by `scoped_evidence_keys_fit_windows_path_budget`.
+        let scope = "repo:forge";
+        let branch = "legacy-branch";
         let legacy_scope = legacy_collision_safe_component(scope);
         let legacy_branch = legacy_collision_safe_component(branch);
+        assert_ne!(legacy_scope, collision_safe_component(scope));
+        assert_ne!(legacy_branch, collision_safe_component(branch));
+        let legacy_relative = Path::new("scoped")
+            .join(&legacy_scope)
+            .join(format!("{legacy_branch}.json"));
+        assert!(legacy_relative.as_os_str().len() <= 180);
         let legacy_directory = root.join("scoped").join(legacy_scope);
         let mut records = BTreeMap::new();
         let mut legacy = record(branch, "macos", "legacy-sha");
@@ -1146,7 +1156,7 @@ mod tests {
             "legacy-sha"
         );
         assert_eq!(
-            store.get_branch_scoped_prefix("repo:generous-corp/forge", branch)["macos"].sha,
+            store.get_branch_scoped_prefix("repo:forge", branch)["macos"].sha,
             "legacy-sha"
         );
         assert_eq!(
