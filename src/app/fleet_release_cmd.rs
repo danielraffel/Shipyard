@@ -300,7 +300,7 @@ fn apply<W: Write>(
     )?);
     let hosts_file = resolve_hosts_file(args.target.hosts_file.as_deref(), paths);
     let state_file = resolve_state_file(args.target.state_file.as_deref(), paths);
-    let _lock = StateLock::acquire(&fleet_lock_file(paths))?;
+    let _lock = StateLock::acquire(&fleet_lock_file())?;
     let hosts = load_hosts(&hosts_file)?;
     let inventory_sha256 = file_sha256(&hosts_file)?;
     let now = timestamp();
@@ -348,7 +348,7 @@ fn resume<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let state_file = resolve_state_file(args.state_file.as_deref(), paths);
-    let _lock = StateLock::acquire(&fleet_lock_file(paths))?;
+    let _lock = StateLock::acquire(&fleet_lock_file())?;
     let mut state = read_state(&state_file)?;
     if let Some(override_file) = args.hosts_file.as_deref()
         && canonical_or_original(override_file) != canonical_or_original(&state.hosts_file)
@@ -1165,8 +1165,15 @@ fn resolve_state_file(explicit: Option<&Path>, paths: &RuntimePaths) -> PathBuf 
     }
 }
 
-fn fleet_lock_file(paths: &RuntimePaths) -> PathBuf {
-    paths.state_dir.join("fleet-release").join("mutation.lock")
+fn fleet_lock_file() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(
+        || std::env::temp_dir().join("shipyard-fleet-release-mutation.lock"),
+        |home| {
+            PathBuf::from(home)
+                .join(".config/shipyard")
+                .join("fleet-release-mutation.lock")
+        },
+    )
 }
 
 fn read_state(path: &Path) -> Result<RolloutState, CliFailure> {
@@ -1202,8 +1209,22 @@ fn write_state(path: &Path, state: &RolloutState) -> Result<(), CliFailure> {
     let temp = path.with_extension(format!("tmp-{}", std::process::id()));
     let bytes =
         serde_json::to_vec_pretty(state).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    fs::write(&temp, bytes).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    fs::rename(&temp, path).map_err(|error| CliFailure::new(1, error.to_string()))
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    drop(file);
+    fs::rename(&temp, path).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(())
 }
 
 struct StateLock {
