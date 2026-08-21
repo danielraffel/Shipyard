@@ -43,16 +43,38 @@ pub(crate) fn protected_request_job_ids(
         .into_iter()
         .filter(|state| ship_terminal_verdict(state).is_none())
         .collect::<Vec<_>>();
-    let envelopes = request_store.list()?;
-    Ok(envelopes
-        .into_iter()
-        .filter(|envelope| {
-            active_states
-                .iter()
-                .any(|state| envelope_matches_state(envelope, state))
-        })
-        .map(|envelope| envelope.job_id)
-        .collect())
+    let mut protected = BTreeSet::new();
+    for entry in fs::read_dir(request_store.path())? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(job_id) = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        match request_store.load(&job_id) {
+            Ok(Some(envelope))
+                if active_states
+                    .iter()
+                    .any(|state| envelope_matches_state(&envelope, state)) =>
+            {
+                protected.insert(job_id);
+            }
+            Ok(Some(_) | None) => {}
+            // Ordinary retention must remain available when an unrelated
+            // request is malformed. Keep the unreadable file conservatively;
+            // recovery's own strict list() still fails closed on it.
+            Err(_) => {
+                protected.insert(job_id);
+            }
+        }
+    }
+    Ok(protected)
 }
 
 /// Typed durable recovery disposition.
@@ -252,50 +274,39 @@ where
     let repo_config = load_recovery_config(mode, &canonical_path, global_dir)?;
 
     let request_store = QueueRequestStore::new(state_dir).map_err(|error| error.to_string())?;
+    let mut queue = Queue::new(state_dir).map_err(|error| error.to_string())?;
+    let workload_scope = format!("ship:{}:pr-{}", canonical_repository(&state.repo), state.pr);
+    // Close the normal submitter's envelope-before-queue window while choosing
+    // recovery authority. This lock is intentionally released before live
+    // GitHub I/O; claim_and_enqueue fences and rechecks ownership again.
+    let selection_lock = queue
+        .acquire_workload_admission_lock(&workload_scope)
+        .map_err(|error| error.to_string())?;
     let envelopes = request_store
         .list()
         .map_err(|error| format!("durable work provenance is unreadable: {error}"))?;
-    let mut matching = envelopes
+    let jobs = queue.get_all().map_err(|error| error.to_string())?;
+    let envelope_by_id = envelopes
         .iter()
-        .filter(|envelope| envelope_matches_state(envelope, state))
-        .collect::<Vec<_>>();
-    matching.sort_by_key(|envelope| envelope.created_at);
-
+        .map(|item| (item.job_id.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
     let record_path = recovery_record_path(state_dir, &state.repo, state.pr);
     let existing = load_record(&record_path)?;
     let existing = existing.filter(|record| record_matches_state(record, state));
     if recovery_is_fenced(existing.as_ref()) {
         return Ok(None);
     }
-    let source = if let Some(record) = &existing {
-        envelopes
-            .iter()
-            .find(|envelope| envelope.job_id == record.source_job_id)
-            .ok_or_else(|| "claimed durable work item disappeared; needs-agent".to_owned())?
-    } else {
-        match matching.as_slice() {
-            [source] => *source,
-            [] => return Err("no exact preserved work item; needs-agent".to_owned()),
-            _ => {
-                return Err(
-                    "multiple preserved work items make ownership ambiguous; needs-agent"
-                        .to_owned(),
-                );
-            }
-        }
+    let Some(source) =
+        select_recovery_source(&envelopes, &jobs, &envelope_by_id, existing.as_ref(), state)?
+    else {
+        return Ok(None);
     };
-    validate_source(source, state, &canonical_path, &repo_config)?;
+    drop(selection_lock);
+    validate_source(&source, state, &canonical_path, &repo_config)?;
     ensure_source_has_no_outcome(state_dir, &source.job_id)?;
     if finalize_claimed_replacement_outcome(state_dir, &record_path, existing.as_ref())? {
         return Ok(None);
     }
-
-    let mut queue = Queue::new(state_dir).map_err(|error| error.to_string())?;
-    let jobs = queue.get_all().map_err(|error| error.to_string())?;
-    let envelope_by_id = envelopes
-        .iter()
-        .map(|item| (item.job_id.as_str(), item))
-        .collect::<BTreeMap<_, _>>();
     if let Some(record) = existing.as_ref()
         && record.status == QueueAbsentRecoveryStatus::Claimed
         && let Some(job) = jobs.iter().find(|job| job.id == record.replacement_job_id)
@@ -303,7 +314,7 @@ where
         let envelope = envelope_by_id
             .get(job.id.as_str())
             .ok_or_else(|| "claimed replacement has no durable work envelope".to_owned())?;
-        validate_replacement(job, envelope, record, source, state)?;
+        validate_replacement(job, envelope, record, &source, state)?;
         let mut record = record.clone();
         record.status = QueueAbsentRecoveryStatus::Enqueued;
         record.updated_at = Utc::now();
@@ -340,11 +351,55 @@ where
         &mut queue,
         &request_store,
         state,
-        source,
+        &source,
         existing,
         &record_path,
         after_claim,
     )
+}
+
+fn select_recovery_source(
+    envelopes: &[QueuedExecutionEnvelope],
+    jobs: &[Job],
+    envelope_by_id: &BTreeMap<&str, &QueuedExecutionEnvelope>,
+    existing: Option<&QueueAbsentRecoveryRecord>,
+    state: &ShipState,
+) -> Result<Option<QueuedExecutionEnvelope>, String> {
+    // A healthy normal replacement owns the PR. Check it before treating its
+    // freshly persisted envelope as a second ambiguous recovery source.
+    if existing.is_none()
+        && jobs.iter().any(|job| {
+            matches!(job.status, JobStatus::Pending | JobStatus::Running)
+                && envelope_by_id
+                    .get(job.id.as_str())
+                    .is_some_and(|envelope| envelope_owns_pr(envelope, state))
+        })
+    {
+        return Ok(None);
+    }
+    let mut matching = envelopes
+        .iter()
+        .filter(|envelope| envelope_matches_state(envelope, state))
+        .collect::<Vec<_>>();
+    matching.sort_by_key(|envelope| envelope.created_at);
+    let source = if let Some(record) = &existing {
+        envelopes
+            .iter()
+            .find(|envelope| envelope.job_id == record.source_job_id)
+            .ok_or_else(|| "claimed durable work item disappeared; needs-agent".to_owned())?
+    } else {
+        match matching.as_slice() {
+            [source] => *source,
+            [] => return Err("no exact preserved work item; needs-agent".to_owned()),
+            _ => {
+                return Err(
+                    "multiple preserved work items make ownership ambiguous; needs-agent"
+                        .to_owned(),
+                );
+            }
+        }
+    };
+    Ok(Some(source.clone()))
 }
 
 fn ensure_source_has_no_outcome(state_dir: &Path, source_job_id: &str) -> Result<(), String> {
@@ -982,6 +1037,37 @@ mod tests {
     }
 
     #[test]
+    fn healthy_normal_replacement_wins_before_duplicate_envelopes_are_considered() {
+        let fixture = Fixture::new();
+        let mut queue = Queue::new(&fixture.state_dir).expect("queue");
+        let normal_job = crate::ship::submit_ship(
+            &fixture.request,
+            &mut queue,
+            &fixture.repo_path,
+            &fixture.state_dir,
+        )
+        .expect("normal replacement");
+
+        let report = fixture.sweep(fixture.live(), |_| Ok(()));
+        assert!(report.enqueued.is_empty(), "{report:?}");
+        assert!(report.needs_agent.is_empty(), "{report:?}");
+        assert_eq!(
+            Queue::new(&fixture.state_dir)
+                .expect("queue")
+                .get_pending()
+                .expect("pending")
+                .into_iter()
+                .map(|job| job.id)
+                .collect::<Vec<_>>(),
+            vec![normal_job.id]
+        );
+        assert!(
+            !recovery_record_path(&fixture.state_dir, REPO, 42).exists(),
+            "healthy ownership must not be durably fenced as ambiguous"
+        );
+    }
+
+    #[test]
     fn absent_envelope_sweep_preserves_nonterminal_ship_recovery_authority() {
         let fixture = Fixture::new();
         let request_store = QueueRequestStore::new(&fixture.state_dir).expect("requests");
@@ -1047,6 +1133,26 @@ mod tests {
                 .expect("sweep terminal ship outcomes"),
             vec![fixture.source_job_id]
         );
+    }
+
+    #[test]
+    fn absent_envelope_sweep_retains_unreadable_request_without_wedging_cleanup() {
+        let fixture = Fixture::new();
+        let request_store = QueueRequestStore::new(&fixture.state_dir).expect("requests");
+        let corrupt_job_id = "corrupt-orphan";
+        fs::write(request_store.path_for(corrupt_job_id), b"not-json").expect("corrupt request");
+
+        let retained = protected_request_job_ids(&fixture.state_dir, &request_store)
+            .expect("cleanup protection scan");
+        assert!(retained.contains(corrupt_job_id));
+        assert!(retained.contains(&fixture.source_job_id));
+        assert!(
+            request_store
+                .sweep_absent_older_than(&retained, Duration::ZERO)
+                .expect("ordinary cleanup remains available")
+                .is_empty()
+        );
+        assert!(request_store.path_for(corrupt_job_id).exists());
     }
 
     #[test]
