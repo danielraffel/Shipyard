@@ -163,6 +163,13 @@ impl Queue {
         self.with_jobs_locked(|jobs| {
             for queued in jobs.iter_mut() {
                 if queued.id == job.id {
+                    // Terminal queue records are immutable. A live worker may
+                    // hold a stale Running snapshot while a drain owner
+                    // durably cancels it; its next progress write must not
+                    // resurrect the job and erase the cancellation reason.
+                    if is_terminal_job(queued.status) {
+                        continue;
+                    }
                     *queued = job.clone();
                 }
             }
@@ -1450,6 +1457,30 @@ mod tests {
         let final_linux = first.get(&linux_id).expect("get linux").expect("linux job");
         assert_eq!(final_mac.results["mac"].status, TargetStatus::Pass);
         assert_eq!(final_linux.results["linux"].status, TargetStatus::Pass);
+    }
+
+    #[test]
+    fn stale_running_update_cannot_overwrite_a_durable_cancellation() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let pending = job("feature", "abc", &["linux"]);
+        let job_id = pending.id.clone();
+        queue.enqueue(pending.clone()).expect("enqueue");
+        let running = pending.start().expect("start");
+        queue.update(&running).expect("persist running");
+        let cancelled = running
+            .cancel_with_reason(Some(super::ALREADY_MERGED_CANCEL_REASON.to_owned()))
+            .expect("cancel");
+        queue.update(&cancelled).expect("persist cancellation");
+
+        queue.update(&running).expect("stale progress update");
+
+        let durable = queue.get(&job_id).expect("queue").expect("job");
+        assert_eq!(durable.status, JobStatus::Cancelled);
+        assert_eq!(
+            durable.cancellation_reason.as_deref(),
+            Some(super::ALREADY_MERGED_CANCEL_REASON)
+        );
     }
 
     #[test]

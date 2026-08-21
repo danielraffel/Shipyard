@@ -588,16 +588,11 @@ pub fn apply_admit_pass_for_drain(
 ) -> Result<AppliedAdmitPass, QueueError> {
     let cancellations = admit_pass_cancellations(pass);
     let cancelled = queue.cancel_pending_jobs_for_drain(drain_lock, &cancellations)?;
-    let running_cancellations = pass
-        .already_merged_running_cancellations
-        .iter()
-        .map(|cancellation| QueuePendingCancellation {
-            job_id: cancellation.job_id.clone(),
-            reason: crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned(),
-        })
-        .collect::<Vec<_>>();
-    let already_merged_running_cancelled =
-        queue.cancel_running_jobs_for_drain(drain_lock, &running_cancellations)?;
+    let already_merged_running_cancelled = cancel_already_merged_running_for_drain(
+        queue,
+        drain_lock,
+        &pass.already_merged_running_cancellations,
+    )?;
     // Reap stale running same-PR jobs (dead workers). `cancel_stale_running_jobs`
     // re-checks staleness under the state lock with a fresh `now`, so a worker
     // that resumed heartbeating between planning and apply is never reaped.
@@ -636,6 +631,24 @@ pub fn apply_admit_pass_for_drain(
         skipped_starts_due_to_revived_stale_running,
         stale_running_cancelled,
     })
+}
+
+/// Durably cancel running jobs whose pull requests were observed merged at
+/// their exact queued heads. Active workers observe these terminal records and
+/// terminate their supervised process trees through the progress callback.
+pub fn cancel_already_merged_running_for_drain(
+    queue: &mut Queue,
+    drain_lock: &DrainLock,
+    cancellations: &[AlreadyMergedCancellation],
+) -> Result<Vec<Job>, QueueError> {
+    let cancellations = cancellations
+        .iter()
+        .map(|cancellation| QueuePendingCancellation {
+            job_id: cancellation.job_id.clone(),
+            reason: crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned(),
+        })
+        .collect::<Vec<_>>();
+    queue.cancel_running_jobs_for_drain(drain_lock, &cancellations)
 }
 
 fn admit_pass_cancellations(pass: &RequestBackedAdmitPass) -> Vec<QueuePendingCancellation> {

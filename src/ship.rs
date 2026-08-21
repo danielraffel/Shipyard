@@ -36,7 +36,8 @@ use crate::queue_request::{
     QueuedExecutionKind, QueuedExecutionOutcome,
 };
 use crate::queue_scheduler::{
-    VmSlotCapacity, apply_admit_pass_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
+    AlreadyMergedObserver, VmSlotCapacity, apply_admit_pass_for_drain,
+    cancel_already_merged_running_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
 };
 use crate::ship_state::{
     DispatchedRun, ShipState, ShipStatePrLock, ShipStateStore, compute_policy_signature,
@@ -1100,9 +1101,27 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
                 break;
             }
 
-            let (job_id, result) = completion_rx
-                .recv()
-                .expect("active drain worker must report completion");
+            let (job_id, result) = match completion_rx.recv_timeout(DEFAULT_DRAIN_POLL_INTERVAL) {
+                Ok(completion) => completion,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if first_error.is_none()
+                        && let Err(error) = observe_running_merges_for_drain(
+                            queue,
+                            drain_lock,
+                            &request_store,
+                            cwd,
+                            pr_snapshot_file,
+                            &mut already_merged_observer,
+                        )
+                    {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("active drain worker must report completion");
+                }
+            };
             active_workers -= 1;
             let handle_index = handles
                 .iter()
@@ -1129,6 +1148,20 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
         }
         first_error.map_or(Ok(()), Err)
     })
+}
+
+fn observe_running_merges_for_drain(
+    queue: &mut Queue,
+    drain_lock: &crate::queue::DrainLock,
+    request_store: &QueueRequestStore,
+    cwd: &Path,
+    pr_snapshot_file: Option<&Path>,
+    observer: &mut AlreadyMergedObserver,
+) -> Result<Vec<Job>, ShipExecutionError> {
+    let jobs = queue.get_all()?;
+    let cancellations = observer.observe_running(&jobs, request_store, cwd, pr_snapshot_file);
+    cancel_already_merged_running_for_drain(queue, drain_lock, &cancellations)
+        .map_err(ShipExecutionError::from)
 }
 
 fn apply_drain_worker_completion(
@@ -2363,8 +2396,8 @@ mod tests {
         drain_or_wait_run, drain_or_wait_run_with_options, execute_run, execute_run_worker,
         execute_ship, execute_ship_worker, execute_targets_with_options,
         leases_not_covered_by_running_reservations, load_run_outcome, load_ship_outcome,
-        retry_attempt_log_path, run_drain_worker_cycle, submit_run, submit_ship, target_log_path,
-        update_warm_pool_after_run,
+        observe_running_merges_for_drain, retry_attempt_log_path, run_drain_worker_cycle,
+        submit_run, submit_ship, target_log_path, update_warm_pool_after_run,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::EvidenceStore;
@@ -2378,7 +2411,9 @@ mod tests {
     use crate::queue_request::{
         QueueOutcomeStore, QueueRequestStore, QueuedExecutionOutcome, QueuedExecutionRequest,
     };
-    use crate::queue_scheduler::{AdmitPassPlan, RequestBackedAdmitPass, SamePrShipAdmission};
+    use crate::queue_scheduler::{
+        AdmitPassPlan, AlreadyMergedObserver, RequestBackedAdmitPass, SamePrShipAdmission,
+    };
     use crate::ship_state::{AbandonRecord, ShipState, ShipStateStore};
     use crate::warm_pool::{PoolEntry, WarmPool};
 
@@ -3327,6 +3362,46 @@ mod tests {
                 JobStatus::Completed
             );
         }
+    }
+
+    #[test]
+    fn active_drain_observation_cancels_a_running_ship_after_exact_head_merge() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let config = empty_config(temp.path());
+        let request = ship_request(vec![local_target_without_cwd("local", "linux-x64")]);
+        let job = submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit ship");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&job.id))
+            .expect("start ship");
+        let snapshot = temp.path().join("merged-pr.json");
+        std::fs::write(&snapshot, r#"{"state":"MERGED","headRefOid":"abc"}"#)
+            .expect("write merged snapshot");
+        let request_store = QueueRequestStore::new(&state_dir).expect("request store");
+        let mut observer = AlreadyMergedObserver::from_config(&config);
+
+        let cancelled = observe_running_merges_for_drain(
+            &mut queue,
+            &drain_lock,
+            &request_store,
+            temp.path(),
+            Some(&snapshot),
+            &mut observer,
+        )
+        .expect("observe running merge");
+
+        assert_eq!(cancelled.len(), 1);
+        let durable = queue.get(&job.id).expect("queue").expect("job");
+        assert_eq!(durable.status, JobStatus::Cancelled);
+        assert_eq!(
+            durable.cancellation_reason.as_deref(),
+            Some(crate::queue::ALREADY_MERGED_CANCEL_REASON)
+        );
     }
 
     #[test]

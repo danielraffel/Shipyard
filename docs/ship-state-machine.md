@@ -225,11 +225,10 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   queued SHA, every matching pending or running job is cancelled as already
   complete. A running worker observes the durable cancellation on its progress
   callback and terminates its complete supervised process tree before releasing
-  queue/host claims; an open PR, head mismatch, or unavailable observation
-  leaves the job running/pending.
-  These reads use the configured GitHub credential, explicit repository scope,
-  and one 15-second credential-plus-command budget. An unavailable observation,
-  malformed response, or different merged head leaves the job pending.
+  queue/host claims. These reads use the configured GitHub credential, explicit
+  repository scope, and one 15-second credential-plus-command budget. An open
+  PR, malformed or unavailable observation, or different merged head leaves a
+  pending job pending and a running job running.
   A durable `shipyard cancel` observed by a running worker is also an execution
   transition, not merely a queue-state update. The worker's progress callback
   returns `ProgressAction::Terminate`; local and SSH streaming validation then

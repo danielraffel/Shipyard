@@ -443,9 +443,10 @@ reports the same exact head SHA recorded in the durable request. A running
 worker observes the durable `already_merged` cancellation through its progress
 callback and terminates the complete supervised process tree before releasing
 its queue/host claims. The drain batches by `(repository, PR)`, reuses one
-result for duplicate jobs, and throttles re-observation for 30 seconds. GitHub reads must use the effective
-`GhClient`, an explicit `--repo`, and the shared 15-second credential-plus-child
-budget; auth, timeout, malformed JSON, and head drift all fail closed.
+result for duplicate jobs, and throttles re-observation for 30 seconds. GitHub
+reads must use the effective `GhClient`, an explicit `--repo`, and the shared
+15-second credential-plus-child budget; auth, timeout, malformed JSON, and head
+drift all fail closed.
 
 ### Gotchas
 
