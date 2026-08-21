@@ -802,20 +802,20 @@ fn recovery_envelope_matches_job(envelope: &QueuedExecutionEnvelope, job: &Job) 
     {
         return false;
     }
+    // Priority is queue policy, not workload identity: `queue bump` updates the
+    // queued job without rewriting its immutable execution envelope.
     match (&envelope.kind, &envelope.request) {
         (QueuedExecutionKind::Run, QueuedExecutionRequest::Run(request)) => {
             matches!(job.kind, None | Some(JobKind::Run))
                 && request.sha == job.sha
                 && request.branch == job.branch
                 && request.mode == job.mode
-                && request.priority == job.priority
         }
         (QueuedExecutionKind::Ship, QueuedExecutionRequest::Ship(request)) => {
             matches!(job.kind, None | Some(JobKind::Ship))
                 && request.sha == job.sha
                 && request.branch == job.branch
                 && request.mode == job.mode
-                && request.priority == job.priority
         }
         _ => false,
     }
@@ -1559,6 +1559,48 @@ mod tests {
             .expect("legacy envelope");
         queue.enqueue(legacy).expect("legacy");
 
+        let replacement =
+            job("feat/x", "new", &[]).with_workload_scope(run_workload_scope(temp.path()));
+        queue.enqueue(replacement).expect("replacement");
+
+        let legacy = queue.get(&legacy_id).expect("get").expect("legacy job");
+        assert_eq!(legacy.status, JobStatus::Cancelled);
+        assert_eq!(
+            legacy.cancellation_reason.as_deref(),
+            Some(SUPERSEDED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn enqueue_backfills_legacy_scope_after_queue_priority_bump() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let legacy = job("feat/x", "old", &[]);
+        let legacy_id = legacy.id.clone();
+        queue.enqueue(legacy.clone()).expect("legacy");
+
+        let request = RunExecutionRequest {
+            branch: "feat/x".to_owned(),
+            sha: "old".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: Vec::new(),
+        };
+        QueueRequestStore::new(temp.path())
+            .expect("request store")
+            .save(&QueuedExecutionEnvelope::from_run_request(
+                legacy_id.clone(),
+                temp.path(),
+                &request,
+            ))
+            .expect("legacy envelope");
+
+        queue
+            .update(&legacy.with_priority(Priority::High))
+            .expect("priority bump");
         let replacement =
             job("feat/x", "new", &[]).with_workload_scope(run_workload_scope(temp.path()));
         queue.enqueue(replacement).expect("replacement");
