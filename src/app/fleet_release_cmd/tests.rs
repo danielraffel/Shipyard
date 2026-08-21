@@ -581,6 +581,13 @@ fn legacy_inventory_adds_local_controller_and_rejects_duplicate_names() {
 
     fs::write(
         &path,
+        r#"[{"name":"M1","ssh":"-oProxyCommand=touch /tmp/nope"}]"#,
+    )
+    .expect("write unsafe ssh alias");
+    assert!(load_hosts(&path).is_err());
+
+    fs::write(
+        &path,
         r#"{"schema_version":1,"hosts":[{"name":"M1","ssh":"m1"}]}"#,
     )
     .expect("write explicit remote-only inventory");
