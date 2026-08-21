@@ -137,24 +137,11 @@ pub(super) fn run_command<W: Write>(
     if args.tree_drift == TreeDriftPolicy::Allow {
         set_allow_tree_drift(&mut targets);
     }
-    if daemon_owned
-        && targets.iter().any(target_uses_cloud)
-        && !matches!(
-            config.get_str("github.auth.source"),
-            Some("env" | "command")
-        )
-    {
-        return Err(CliFailure::new(
-            2,
-            "daemon-owned cloud validation requires explicit github.auth source env or command; ambient gh auth is forbidden",
-        ));
-    }
-    if daemon_owned && config.get_str("github.auth.source") == Some("env") {
-        return Err(CliFailure::new(
-            2,
-            "daemon-owned run cannot use github.auth.source = env because an existing daemon does not inherit the submitting shell; use source = command or --foreground",
-        ));
-    }
+    validate_daemon_run_auth(
+        daemon_owned,
+        targets.iter().any(target_uses_cloud),
+        config.get_str("github.auth.source"),
+    )?;
 
     let preflight_dispatcher = ExecutorDispatcher::new(None);
     let mut preflight = collect_ship_preflight_with_options(
@@ -306,6 +293,29 @@ fn target_uses_cloud(target: &ResolvedTarget) -> bool {
         | ResolvedBackend::Windows(_)
         | ResolvedBackend::HostPool(_) => false,
     }
+}
+
+fn validate_daemon_run_auth(
+    daemon_owned: bool,
+    uses_cloud: bool,
+    auth_source: Option<&str>,
+) -> Result<(), CliFailure> {
+    if !daemon_owned || !uses_cloud {
+        return Ok(());
+    }
+    if !matches!(auth_source, Some("env" | "command")) {
+        return Err(CliFailure::new(
+            2,
+            "daemon-owned cloud validation requires explicit github.auth source env or command; ambient gh auth is forbidden",
+        ));
+    }
+    if auth_source == Some("env") {
+        return Err(CliFailure::new(
+            2,
+            "daemon-owned run cannot use github.auth.source = env because an existing daemon does not inherit the submitting shell; use source = command or --foreground",
+        ));
+    }
+    Ok(())
 }
 
 fn preflight_failure(error: &ShipPreflightError) -> CliFailure {
@@ -625,6 +635,16 @@ mod tests {
             tree_drift: TreeDriftPolicy::from_flag(allow_tree_drift),
             foreground: true,
         }
+    }
+
+    #[test]
+    fn daemon_run_env_auth_is_rejected_only_for_cloud_targets() {
+        assert!(super::validate_daemon_run_auth(true, false, Some("env")).is_ok());
+        let error = super::validate_daemon_run_auth(true, true, Some("env"))
+            .expect_err("cloud env auth must be rejected");
+        assert_eq!(error.code, 2);
+        assert!(error.message().contains("existing daemon"));
+        assert!(super::validate_daemon_run_auth(true, true, Some("command")).is_ok());
     }
 
     #[test]

@@ -147,8 +147,7 @@ impl Queue {
         self.state_dir.join("queue.state.lock")
     }
 
-    /// Add a job, superseding pending jobs for the same workload, branch,
-    /// target list, and mode.
+    /// Add a job, superseding pending jobs for the same branch, target list, and mode.
     pub fn enqueue(&mut self, job: Job) -> QueueResult<Job> {
         self.with_jobs_locked(|jobs| {
             cancel_superseded_pending(jobs, &job);
@@ -167,29 +166,31 @@ impl Queue {
     /// Replace a queued job matched by id, then trim old completed jobs.
     pub fn update(&mut self, job: &Job) -> QueueResult<()> {
         self.with_jobs_locked(|jobs| {
-            for queued in jobs.iter_mut() {
-                if queued.id == job.id {
-                    if queued.status == JobStatus::Running
-                        && queued.cancel_requested_at.is_some()
-                        && (job.cancel_requested_at != queued.cancel_requested_at
-                            || job.cancellation_reason != queued.cancellation_reason)
-                    {
-                        return Err(QueueError::StateConflict(format!(
-                            "job {} has a newer cancellation request",
-                            job.id
-                        )));
-                    }
-                    if matches!(queued.status, JobStatus::Completed | JobStatus::Cancelled)
-                        && queued.status != job.status
-                    {
-                        return Err(QueueError::StateConflict(format!(
-                            "job {} is already terminal as {:?}",
-                            job.id, queued.status
-                        )));
-                    }
-                    *queued = job.clone();
-                }
+            let Some(queued) = jobs.iter_mut().find(|queued| queued.id == job.id) else {
+                return Err(QueueError::StateConflict(format!(
+                    "job {} is not present in the durable queue",
+                    job.id
+                )));
+            };
+            if queued.status == JobStatus::Running
+                && queued.cancel_requested_at.is_some()
+                && (job.cancel_requested_at != queued.cancel_requested_at
+                    || job.cancellation_reason != queued.cancellation_reason)
+            {
+                return Err(QueueError::StateConflict(format!(
+                    "job {} has a newer cancellation request",
+                    job.id
+                )));
             }
+            if matches!(queued.status, JobStatus::Completed | JobStatus::Cancelled)
+                && queued.status != job.status
+            {
+                return Err(QueueError::StateConflict(format!(
+                    "job {} is already terminal as {:?}",
+                    job.id, queued.status
+                )));
+            }
+            *queued = job.clone();
             let _ = trim_terminal(jobs);
             Ok(())
         })
@@ -554,15 +555,43 @@ impl Queue {
                 return Ok(Some(job.clone()));
             }
             for target_name in &job.target_names {
-                job.results.entry(target_name.clone()).or_insert_with(|| {
-                    let mut result = stale_recovery_result(target_name);
-                    result.error_message = Some(reason.to_owned());
-                    result.failure_class = Some("UNCERTAIN".to_owned());
-                    result
-                });
+                let mut result = stale_recovery_result(target_name);
+                result.error_message = Some(reason.to_owned());
+                result.failure_class = Some("UNCERTAIN".to_owned());
+                job.results.insert(target_name.clone(), result);
             }
             job.status = JobStatus::Completed;
             job.completed_at = Some(Utc::now());
+            let completed = job.clone();
+            let _ = trim_terminal(jobs);
+            Ok(Some(completed))
+        })
+    }
+
+    /// Reclassify the exact completed snapshot produced by an authoritative
+    /// worker when its required post-validation phase fails. The full snapshot
+    /// comparison prevents a stale worker from rewriting a newer disposition.
+    pub fn reclassify_completed_uncertain(
+        &mut self,
+        expected: &Job,
+        reason: &str,
+    ) -> QueueResult<Option<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let Some(job) = jobs
+                .iter_mut()
+                .find(|job| job.id == expected.id && **job == *expected)
+            else {
+                return Ok(None);
+            };
+            if job.status != JobStatus::Completed {
+                return Ok(None);
+            }
+            for target_name in &job.target_names {
+                let mut result = stale_recovery_result(target_name);
+                result.error_message = Some(reason.to_owned());
+                result.failure_class = Some("UNCERTAIN".to_owned());
+                job.results.insert(target_name.clone(), result);
+            }
             let completed = job.clone();
             let _ = trim_terminal(jobs);
             Ok(Some(completed))
@@ -631,8 +660,7 @@ impl Queue {
 
 fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {
     for queued in jobs.iter_mut().filter(|queued| {
-        same_workload_scope(queued, job)
-            && queued.branch == job.branch
+        queued.branch == job.branch
             && queued.status == JobStatus::Pending
             && queued.target_names == job.target_names
             && queued.mode == job.mode
@@ -640,17 +668,6 @@ fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {
         if let Ok(cancelled) = queued.cancel_with_reason(Some(SUPERSEDED_MESSAGE.to_owned())) {
             *queued = cancelled;
         }
-    }
-}
-
-fn same_workload_scope(left: &Job, right: &Job) -> bool {
-    match (&left.workload_scope, &right.workload_scope) {
-        (Some(left), Some(right)) => left == right,
-        // Preserve the legacy queue contract for old callers and persisted
-        // jobs that predate workload scopes. A scoped job never supersedes an
-        // unscoped one because their ownership cannot be proven identical.
-        (None, None) => true,
-        (Some(_), None) | (None, Some(_)) => false,
     }
 }
 
@@ -1132,6 +1149,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn uncertain_completion_overwrites_stale_passing_results() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let pending = queue
+            .enqueue(job("main", "sha", &["mac"]))
+            .expect("enqueue");
+        let mut running = pending.start().expect("start");
+        let mut passed = TargetResult::new("mac", "macos", TargetStatus::Pass, "local");
+        passed.completed_at = Some(Utc::now());
+        running = running.with_result(passed);
+        queue.update(&running).expect("running with stale pass");
+
+        let uncertain = queue
+            .complete_running_uncertain(&running.id, "worker ownership lost")
+            .expect("complete uncertain")
+            .expect("job");
+        let result = uncertain.results.get("mac").expect("target result");
+        assert_eq!(result.status, TargetStatus::Error);
+        assert_eq!(result.failure_class.as_deref(), Some("UNCERTAIN"));
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("worker ownership lost")
+        );
+    }
+
     fn read_queue_json(path: &Path) -> Value {
         serde_json::from_str(&fs::read_to_string(path.join("queue.json")).expect("queue json"))
             .expect("valid json")
@@ -1173,36 +1216,29 @@ mod tests {
     fn supersedence_replaces_pending_same_scope_only() {
         let temp = queue_dir();
         let mut queue = Queue::new(temp.path()).expect("queue");
-        let old = job("feat/x", "old", &["mac"]).with_workload_scope("repo:pulp");
-        let running = job("feat/x", "running", &["mac"])
-            .with_workload_scope("repo:pulp")
-            .start()
-            .expect("start");
-        let narrow = job("feat/x", "narrow", &["linux"]).with_workload_scope("repo:pulp");
+        let old = job("feat/x", "old", &["mac"]);
+        let running = job("feat/x", "running", &["mac"]).start().expect("start");
+        let narrow = job("feat/x", "narrow", &["linux"]);
         let smoke = Job::create(
             "smoke",
             "feat/x",
             vec!["mac".to_owned()],
             ValidationMode::Smoke,
             Priority::Normal,
-        )
-        .with_workload_scope("repo:pulp");
-        let independent = job("feat/x", "independent", &["mac"]).with_workload_scope("repo:forge");
-        let new = job("feat/x", "new", &["mac"]).with_workload_scope("repo:pulp");
+        );
+        let new = job("feat/x", "new", &["mac"]);
 
         queue.enqueue(old).expect("old");
         queue.enqueue(running.clone()).expect("running");
         queue.update(&running).expect("update running");
         queue.enqueue(narrow).expect("narrow");
         queue.enqueue(smoke).expect("smoke");
-        queue.enqueue(independent).expect("independent");
         queue.enqueue(new).expect("new");
 
         let pending = queue.get_pending().expect("pending");
         assert_eq!(queue.running_count().expect("running"), 1);
-        assert_eq!(pending.len(), 4);
+        assert_eq!(pending.len(), 3);
         assert!(pending.iter().any(|job| job.sha == "new"));
-        assert!(pending.iter().any(|job| job.sha == "independent"));
         assert!(pending.iter().any(|job| job.sha == "narrow"));
         assert!(pending.iter().any(|job| job.sha == "smoke"));
         assert!(!pending.iter().any(|job| job.sha == "old"));
@@ -1240,6 +1276,18 @@ mod tests {
             reopened.get(&id).expect("get").expect("job").status,
             JobStatus::Running
         );
+    }
+
+    #[test]
+    fn update_rejects_missing_job_id() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let missing = job("main", "abc", &["mac"]);
+
+        assert!(matches!(
+            queue.update(&missing),
+            Err(super::QueueError::StateConflict(reason)) if reason.contains("not present")
+        ));
     }
 
     #[test]

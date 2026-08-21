@@ -116,6 +116,13 @@ pub(super) fn ship_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let daemon_owned = !args.foreground && cfg!(unix);
+    validate_daemon_ship_submission(
+        daemon_owned,
+        args.merge_command.is_some()
+            || args.merge_result.is_some()
+            || args.pr_snapshot_file.is_some(),
+        config.get_str("github.auth.source"),
+    )?;
     let preflight_dispatcher = ExecutorDispatcher::new(None);
     let targets = prepare_ship_targets(
         config,
@@ -207,23 +214,6 @@ pub(super) fn ship_command<W: Write>(
     }
 
     if daemon_owned {
-        if args.merge_command.is_some()
-            || args.merge_result.is_some()
-            || args.pr_snapshot_file.is_some()
-        {
-            return Err(CliFailure::new(
-                2,
-                "test merge overrides require --foreground",
-            ));
-        }
-        if config.get_str("github.auth.source") != Some("command") {
-            return Err(CliFailure::new(
-                2,
-                "daemon-owned ship requires github.auth.source = command so an existing daemon can refresh credentials; env and ambient gh auth are forbidden",
-            ));
-        }
-    }
-    if daemon_owned {
         ensure_execution_daemon(
             if runtime_paths.mode == RuntimeMode::Isolated.as_str() {
                 RuntimeMode::Isolated
@@ -314,6 +304,29 @@ pub(super) fn ship_command<W: Write>(
         render_human(stdout, pr_context.number, &render_state, &diagnostics)?;
     }
     Ok(render_state.exit_code())
+}
+
+fn validate_daemon_ship_submission(
+    daemon_owned: bool,
+    has_test_merge_override: bool,
+    auth_source: Option<&str>,
+) -> Result<(), CliFailure> {
+    if !daemon_owned {
+        return Ok(());
+    }
+    if has_test_merge_override {
+        return Err(CliFailure::new(
+            2,
+            "test merge overrides require --foreground",
+        ));
+    }
+    if auth_source != Some("command") {
+        return Err(CliFailure::new(
+            2,
+            "daemon-owned ship requires github.auth.source = command so an existing daemon can refresh credentials; env and ambient gh auth are forbidden",
+        ));
+    }
+    Ok(())
 }
 
 fn configured_pr_provenance_hook(
@@ -999,7 +1012,7 @@ pub(super) fn finish_background_ship(
     mode: RuntimeMode,
     global_dir: &Path,
     state_dir: &Path,
-) -> Result<ExitCode, CliFailure> {
+) -> Result<(ExitCode, crate::ship_state::ShipState), CliFailure> {
     let request_store = crate::queue_request::QueueRequestStore::new(state_dir)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let envelope = request_store
@@ -1018,6 +1031,15 @@ pub(super) fn finish_background_ship(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let ship_state = ShipStateStore::new(state_dir.join("ship"))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let terminal_state = ship_state.get(request.pr).ok_or_else(|| {
+        CliFailure::new(
+            1,
+            format!(
+                "validated ship state for PR #{} disappeared before merge",
+                request.pr
+            ),
+        )
+    })?;
     let state = post_run_merge_state(
         request.pr,
         &envelope.cwd,
@@ -1030,7 +1052,7 @@ pub(super) fn finish_background_ship(
         None,
         None,
     )?;
-    Ok(state.exit_code())
+    Ok((state.exit_code(), terminal_state))
 }
 
 /// Green-but-unmerged hand-back for paths with no rollup context to inspect.
@@ -2057,6 +2079,15 @@ esac"#,
         assert!(!super::should_auto_create_base("main", None));
         assert!(super::should_auto_create_base("main", Some(true)));
         assert!(!super::should_auto_create_base("develop/next", Some(false)));
+    }
+
+    #[test]
+    fn daemon_ship_rejects_env_auth_before_remote_resolution() {
+        let error = super::validate_daemon_ship_submission(true, false, Some("env"))
+            .expect_err("env auth must be rejected");
+        assert_eq!(error.code, 2);
+        assert!(error.message().contains("source = command"));
+        assert!(super::validate_daemon_ship_submission(true, false, Some("command")).is_ok());
     }
 
     #[test]

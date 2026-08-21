@@ -20,11 +20,13 @@ use crate::identity::RuntimeMode;
 use crate::job::{DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus};
 use crate::queue::{Queue, QueueDeferredRequeue, QueueError, QueuePendingCancellation};
 use crate::queue_request::{
-    QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionOwner,
+    QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
+    QueuedExecutionOwner, QueuedExecutionRequest,
 };
+use crate::queue_scheduler::{AlreadyMergedCancellation, AlreadyMergedObserver};
 use crate::ship::persist_terminal_outcome;
 
-const MAX_WORKERS: usize = 4;
+const MAX_WORKERS: usize = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkerObservation {
@@ -101,6 +103,7 @@ pub struct ExecutionSupervisor {
     global_dir: PathBuf,
     state_dir: PathBuf,
     children: BTreeMap<String, Child>,
+    merge_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, String)>,
 }
 
 impl ExecutionSupervisor {
@@ -118,12 +121,15 @@ impl ExecutionSupervisor {
             global_dir,
             state_dir,
             children: BTreeMap::new(),
+            merge_observers: BTreeMap::new(),
         }
     }
 
     /// Reconcile worker ownership and admit safe pending jobs.
     pub fn tick(&mut self) -> Result<(), SupervisorError> {
         fs::create_dir_all(self.worker_dir())?;
+        self.observe_merged_ship_jobs()?;
+        self.reconcile_terminal_outcomes()?;
         self.terminate_cancelled_workers()?;
         self.terminate_deferred_workers()?;
         self.reap_owned_children()?;
@@ -131,6 +137,140 @@ impl ExecutionSupervisor {
         let unknown_worker = self.reconcile_running()?;
         if !unknown_worker {
             self.admit_pending()?;
+        }
+        Ok(())
+    }
+
+    fn observe_merged_ship_jobs(&mut self) -> Result<(), SupervisorError> {
+        let request_store = QueueRequestStore::new(&self.state_dir)?;
+        let mut queue = Queue::new(&self.state_dir)?;
+        let mut jobs_by_cwd =
+            BTreeMap::<PathBuf, Vec<(Job, crate::queue_request::ExecutionProvenance)>>::new();
+        for job in queue
+            .get_all()?
+            .into_iter()
+            .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
+        {
+            let Ok(Some(envelope)) = request_store.load(&job.id) else {
+                continue;
+            };
+            if envelope.job_id != job.id || !envelope.is_daemon_admissible() {
+                continue;
+            }
+            let Some(provenance) = envelope.provenance.as_ref() else {
+                continue;
+            };
+            if provenance.config_signature.is_none()
+                || envelope.cwd != provenance.canonical_cwd
+                || provenance.validate(&provenance.canonical_cwd).is_err()
+                || !matches!(envelope.request, QueuedExecutionRequest::Ship(_))
+            {
+                continue;
+            }
+            jobs_by_cwd
+                .entry(provenance.canonical_cwd.clone())
+                .or_default()
+                .push((job, provenance.clone()));
+        }
+        if jobs_by_cwd.is_empty() {
+            self.merge_observers.clear();
+            return Ok(());
+        }
+
+        let active_cwds = jobs_by_cwd.keys().cloned().collect::<BTreeSet<_>>();
+        self.merge_observers
+            .retain(|cwd, _| active_cwds.contains(cwd));
+        let mut pending = Vec::new();
+        let mut running = Vec::new();
+        for (cwd, scoped_entries) in jobs_by_cwd {
+            let Ok(config) = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
+                self.mode,
+                &cwd,
+                self.global_dir.clone(),
+            ) else {
+                continue;
+            };
+            let Some(signature) = scoped_entries.iter().find_map(|(_, provenance)| {
+                provenance
+                    .validate_with_config(&cwd, &config)
+                    .ok()
+                    .and_then(|()| provenance.config_signature.clone())
+            }) else {
+                continue;
+            };
+            if self
+                .merge_observers
+                .get(&cwd)
+                .is_none_or(|(_, cached_signature)| cached_signature != &signature)
+            {
+                self.merge_observers.insert(
+                    cwd.clone(),
+                    (AlreadyMergedObserver::from_config(&config), signature),
+                );
+            }
+            let (observer, trusted_signature) = self
+                .merge_observers
+                .get_mut(&cwd)
+                .expect("observer inserted for active cwd");
+            let scoped_jobs = scoped_entries
+                .into_iter()
+                .filter(|(_, provenance)| {
+                    provenance.config_signature.as_ref() == Some(trusted_signature)
+                })
+                .map(|(job, _)| job)
+                .collect::<Vec<_>>();
+            pending.extend(observer.observe_pending(&scoped_jobs, &request_store, &cwd, None));
+            running.extend(observer.observe_running(&scoped_jobs, &request_store, &cwd, None));
+        }
+        self.apply_merge_cancellations(pending, running)
+    }
+
+    fn apply_merge_cancellations(
+        &self,
+        pending: Vec<AlreadyMergedCancellation>,
+        running: Vec<AlreadyMergedCancellation>,
+    ) -> Result<(), SupervisorError> {
+        let mut queue = Queue::new(&self.state_dir)?;
+        if let Some(lock) = queue.acquire_drain_lock()? {
+            let pending = pending
+                .into_iter()
+                .map(|item| QueuePendingCancellation {
+                    job_id: item.job_id,
+                    reason: crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned(),
+                })
+                .collect::<Vec<_>>();
+            let cancelled = queue.cancel_pending_jobs_for_drain(&lock, &pending)?;
+            for job in &cancelled {
+                let _ = persist_terminal_outcome(job, &self.state_dir);
+            }
+        }
+        for item in running {
+            let _ = queue.request_cancel(
+                &item.job_id,
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Repair typed outcomes from authoritative terminal queue records. Queue
+    /// terminalization wins first; a transient outcome write is retried by the
+    /// next daemon tick instead of leaving wait/watch without a disposition.
+    fn reconcile_terminal_outcomes(&self) -> Result<(), SupervisorError> {
+        let mut queue = Queue::new(&self.state_dir)?;
+        let request_store = QueueRequestStore::new(&self.state_dir)?;
+        let outcome_store = QueueOutcomeStore::new(&self.state_dir)?;
+        for job in queue.get_recent(usize::MAX)? {
+            match request_store.load(&job.id) {
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
+                Err(error) if request_error_is_job_local(&error) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            if outcome_store.load(&job.id)?.is_none() {
+                persist_terminal_outcome(&job, &self.state_dir)
+                    .map_err(|error| SupervisorError::Outcome(error.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -895,28 +1035,11 @@ fn process_liveness(receipt: &WorkerReceipt) -> ProcessLiveness {
     }
     #[cfg(windows)]
     {
-        let script = format!(
-            "$p=Get-CimInstance Win32_Process -Filter \"ProcessId={}\"; if($p){{$p.CommandLine}}",
-            receipt.pid
-        );
-        let Ok(output) = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
-        else {
-            return ProcessLiveness::Unknown;
-        };
-        let command = String::from_utf8_lossy(&output.stdout);
-        if output.status.success()
-            && command.contains("execution-worker")
-            && command.contains(&receipt.job_id)
-            && command.contains(&receipt.generation)
-        {
-            ProcessLiveness::Alive
-        } else if output.status.success() {
-            ProcessLiveness::Dead
-        } else {
-            ProcessLiveness::Unknown
-        }
+        // Daemon ownership is intentionally disabled on Windows in this
+        // bounded slice. Never invoke CIM/PowerShell from cross-platform unit
+        // tests or pretend that process identity can be proven here.
+        let _ = receipt;
+        ProcessLiveness::Unknown
     }
 }
 
@@ -976,7 +1099,10 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::job::{JobKind, Priority, ValidationMode};
-    use crate::queue_request::{JobResourcePlan, QueueOutcomeStore};
+    use crate::queue_request::{
+        JobResourcePlan, QueueOutcomeStore, QueuedExecutionKind, QueuedExecutionRequest,
+        QueuedShipRequest,
+    };
     use std::sync::{LazyLock, Mutex};
 
     static PROCESS_TREE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -1020,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_claims_are_admitted_in_parallel() {
+    fn unrelated_claims_do_not_conflict() {
         let occupied = BTreeSet::from(["repo:a".to_owned()]);
         assert!(admissible(&envelope(&["repo:b"], true), &occupied));
     }
@@ -1032,6 +1158,7 @@ mod tests {
         assert!(!admissible(&envelope(&[], false), &BTreeSet::new()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn pid_reuse_without_exact_worker_identity_is_rejected() {
         let receipt = WorkerReceipt {
@@ -1041,6 +1168,18 @@ mod tests {
             started_at: Utc::now(),
         };
         assert_eq!(process_liveness(&receipt), ProcessLiveness::Dead);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_worker_identity_fails_closed_without_process_probe() {
+        let receipt = WorkerReceipt {
+            job_id: "job".to_owned(),
+            generation: "generation".to_owned(),
+            pid: std::process::id(),
+            started_at: Utc::now(),
+        };
+        assert_eq!(process_liveness(&receipt), ProcessLiveness::Unknown);
     }
 
     fn queued_job(state_dir: &Path, job_id: &str) -> Job {
@@ -1072,6 +1211,74 @@ mod tests {
         request.provenance = None;
         store.save(&request).expect("foreground request");
         job
+    }
+
+    fn queued_ship_job(state_dir: &Path, job_id: &str, sha: &str) -> Job {
+        let mut job = Job::create(
+            sha,
+            "feature/durable",
+            vec!["local".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        )
+        .with_kind(JobKind::Ship);
+        job.id = job_id.to_owned();
+        Queue::new(state_dir)
+            .expect("queue")
+            .enqueue(job.clone())
+            .expect("enqueue");
+        let mut request = envelope(&["repo:owner/repo"], true);
+        request.job_id = job_id.to_owned();
+        request.kind = QueuedExecutionKind::Ship;
+        request.cwd = state_dir.to_path_buf();
+        request.request = QueuedExecutionRequest::Ship(QueuedShipRequest {
+            pr: 438,
+            repo: "owner/repo".to_owned(),
+            branch: "feature/durable".to_owned(),
+            base_branch: "main".to_owned(),
+            sha: sha.to_owned(),
+            commit_subject: "durable execution".to_owned(),
+            pr_url: None,
+            pr_title: None,
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            advisory_targets: BTreeSet::new(),
+            adopt_head: false,
+            targets: Vec::new(),
+        });
+        QueueRequestStore::new(state_dir)
+            .expect("store")
+            .save(&request)
+            .expect("request");
+        job
+    }
+
+    fn merged_cancellations(
+        state_dir: &Path,
+        status: JobStatus,
+        merged_head: Option<&str>,
+    ) -> Vec<AlreadyMergedCancellation> {
+        let jobs = Queue::new(state_dir)
+            .expect("queue")
+            .get_all()
+            .expect("jobs");
+        let store = QueueRequestStore::new(state_dir).expect("requests");
+        let mut observer = AlreadyMergedObserver::from_config(&crate::config::LoadedConfig {
+            data: toml::Table::new(),
+            global_dir: state_dir.join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: crate::config::LocalOverlaySource::None,
+        });
+        let fetch = |_: &str, _: u64| merged_head.map(str::to_owned);
+        match status {
+            JobStatus::Pending => observer.observe_pending_with(&jobs, &store, fetch),
+            JobStatus::Running => observer.observe_running_with(&jobs, &store, fetch),
+            _ => panic!("unsupported status"),
+        }
     }
 
     #[cfg(unix)]
@@ -1274,6 +1481,234 @@ mod tests {
         let mut replacement = supervisor.children.remove("replacement").expect("worker");
         terminate_process_group(replacement.id());
         let _ = replacement.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_merged_head_cancels_running_tree_and_releases_capacity() {
+        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "merged-tree", "exact-head");
+        let mut supervisor = ExecutionSupervisor::new(
+            fake_worker_tree(temp.path()),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor.tick().expect("start worker");
+        let pid_path = temp.path().join("descendant.pid");
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        while !pid_path.exists() && Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        let descendant = fs::read_to_string(&pid_path).expect("descendant pid");
+        queued_job(temp.path(), "replacement");
+        let cancellations =
+            merged_cancellations(temp.path(), JobStatus::Running, Some("exact-head"));
+        assert_eq!(cancellations.len(), 1);
+        supervisor
+            .apply_merge_cancellations(Vec::new(), cancellations)
+            .expect("request exact-head cancellation");
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("merged-tree")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Running,
+            "capacity remains claimed until tree death is proven"
+        );
+        supervisor.tick().expect("terminate exact tree");
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        while process_is_running(descendant.trim()) && Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(!process_is_running(descendant.trim()));
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let cancelled = queue.get("merged-tree").expect("read").expect("job");
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+        assert_eq!(
+            cancelled.cancellation_reason.as_deref(),
+            Some(crate::queue::ALREADY_MERGED_CANCEL_REASON)
+        );
+        assert!(
+            QueueOutcomeStore::new(temp.path())
+                .expect("outcomes")
+                .load("merged-tree")
+                .expect("load")
+                .is_some()
+        );
+        assert_eq!(
+            queue.get("replacement").expect("read").expect("job").status,
+            JobStatus::Running
+        );
+        let mut replacement = supervisor.children.remove("replacement").expect("worker");
+        terminate_process_group(replacement.id());
+        let _ = replacement.wait();
+    }
+
+    #[test]
+    fn exact_head_pending_cancels_but_wrong_head_and_open_do_not() {
+        for (name, observed, expected) in [
+            ("exact", Some("exact-head"), true),
+            ("wrong", Some("different-head"), false),
+            ("open", None, false),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            queued_ship_job(temp.path(), name, "exact-head");
+            let cancellations = merged_cancellations(temp.path(), JobStatus::Pending, observed);
+            assert_eq!(!cancellations.is_empty(), expected, "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poisoned_envelope_cannot_select_auth_helper_before_provenance_fence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "poisoned", "expected-head");
+        let attacker = temp.path().join("attacker");
+        fs::create_dir_all(attacker.join(".shipyard")).expect("attacker config dir");
+        let marker = temp.path().join("helper-ran");
+        fs::write(
+            attacker.join(".shipyard/config.toml"),
+            format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [\"/usr/bin/touch\", \"{}\"]\n",
+                marker.display()
+            ),
+        )
+        .expect("poison config");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut envelope = store.load("poisoned").expect("load").expect("request");
+        envelope.cwd = attacker.clone();
+        let provenance = envelope.provenance.as_mut().expect("provenance");
+        provenance.canonical_cwd = attacker.clone();
+        provenance.repo_root = attacker;
+        store.save(&envelope).expect("poisoned envelope");
+
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .observe_merged_ship_jobs()
+            .expect("safe observation");
+        assert!(!marker.exists(), "untrusted token helper executed");
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("poisoned")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Pending
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_config_cannot_invoke_auth_helper_before_signature_fence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let global = temp.path().join("global");
+        fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&global).expect("global");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        fs::write(repo.join("tracked"), "stable").expect("tracked");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "initial"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ]);
+        let head = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .expect("head")
+                .stdout,
+        )
+        .expect("utf8");
+        let head = head.trim();
+        fs::write(
+            global.join("config.toml"),
+            "[github.auth]\nsource = \"command\"\ntoken_command = [\"/usr/bin/printf\", \"token\"]\n",
+        )
+        .expect("original config");
+        let original = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
+            RuntimeMode::Isolated,
+            &repo,
+            global.clone(),
+        )
+        .expect("load original config");
+        queued_ship_job(temp.path(), "config-drift", head);
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut envelope = store.load("config-drift").expect("load").expect("request");
+        let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
+            &repo,
+            Some("owner/repo"),
+            head,
+            &original,
+        )
+        .expect("provenance");
+        let original_signature = provenance
+            .config_signature
+            .clone()
+            .expect("config signature");
+        envelope.cwd.clone_from(&provenance.canonical_cwd);
+        envelope.provenance = Some(provenance);
+        store.save(&envelope).expect("valid envelope");
+
+        let marker = temp.path().join("changed-helper-ran");
+        fs::write(
+            global.join("config.toml"),
+            format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [\"/usr/bin/touch\", \"{}\"]\n",
+                marker.display()
+            ),
+        )
+        .expect("changed config");
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            global,
+            temp.path().into(),
+        );
+        supervisor.merge_observers.insert(
+            repo.clone(),
+            (
+                AlreadyMergedObserver::from_config(&original),
+                original_signature,
+            ),
+        );
+        supervisor
+            .observe_merged_ship_jobs()
+            .expect("safe observation");
+        assert!(!marker.exists(), "changed token helper executed");
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("config-drift")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Pending
+        );
     }
 
     #[cfg(unix)]
@@ -1545,6 +1980,43 @@ mod tests {
             QueueOutcomeStore::new(temp.path())
                 .expect("outcomes")
                 .load("lost-worker")
+                .expect("load")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn daemon_restart_repairs_missing_terminal_outcome() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_job(temp.path(), "repair-outcome");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["repair-outcome".to_owned()])
+            .expect("start");
+        drop(lock);
+        queue
+            .complete_running_uncertain("repair-outcome", "lost owner")
+            .expect("terminalize");
+        assert!(
+            QueueOutcomeStore::new(temp.path())
+                .expect("outcomes")
+                .load("repair-outcome")
+                .expect("load")
+                .is_none()
+        );
+
+        let mut restarted = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        restarted.tick().expect("repair tick");
+        assert!(
+            QueueOutcomeStore::new(temp.path())
+                .expect("outcomes")
+                .load("repair-outcome")
                 .expect("load")
                 .is_some()
         );

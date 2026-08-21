@@ -9,8 +9,11 @@ use super::{CliFailure, ship_cmd::finish_background_ship};
 use crate::execution_supervisor::verify_worker_authority;
 use crate::identity::RuntimeMode;
 use crate::queue::{Queue, QueueDeferredRequeue};
-use crate::queue_request::{QueueRequestStore, QueuedExecutionKind};
+use crate::queue_request::{
+    QueueOutcomeStore, QueueRequestStore, QueuedExecutionKind, QueuedExecutionOutcome,
+};
 use crate::ship::{ShipExecutionError, execute_started_queued_job, persist_terminal_outcome};
+use crate::ship_state::ShipState;
 
 pub(super) fn execution_worker_command(
     job_id: &str,
@@ -39,12 +42,14 @@ pub(super) fn execution_worker_command(
                     .to_ship_request()
                     .map_err(|error| CliFailure::new(1, error.to_string()))?;
                 let finish = finish_background_ship(&request, &job, mode, global_dir, state_dir)
-                    .and_then(|code| {
-                        // Refresh the typed handoff from the ship state written
-                        // by the merge phase; the validation-time copy predates
-                        // that terminal disposition.
-                        persist_terminal_outcome(&job, state_dir)
-                            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+                    .and_then(|(code, terminal_state)| {
+                        persist_completed_ship_outcome(
+                            state_dir,
+                            job_id,
+                            request.pr,
+                            &job,
+                            terminal_state,
+                        )?;
                         Ok(code)
                     });
                 return match finish {
@@ -104,6 +109,36 @@ pub(super) fn execution_worker_command(
     }
 }
 
+fn persist_completed_ship_outcome(
+    state_dir: &Path,
+    job_id: &str,
+    pr: u64,
+    job: &crate::job::Job,
+    terminal_state: ShipState,
+) -> Result<(), CliFailure> {
+    let outcome_store =
+        QueueOutcomeStore::new(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let resumed_existing_state = outcome_store
+        .load(job_id)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?
+        .and_then(|outcome| match outcome {
+            QueuedExecutionOutcome::Ship {
+                resumed_existing_state,
+                ..
+            } => Some(resumed_existing_state),
+            QueuedExecutionOutcome::Run { .. } => None,
+        })
+        .unwrap_or(false);
+    outcome_store
+        .save(&QueuedExecutionOutcome::ship(
+            job.id.clone(),
+            pr,
+            terminal_state,
+            resumed_existing_state,
+        ))
+        .map_err(|error| CliFailure::new(1, error.to_string()))
+}
+
 fn requeue_scheduler_deferred_job(
     state_dir: &Path,
     job_id: &str,
@@ -151,6 +186,49 @@ fn await_supervisor_cancellation() -> ! {
 mod tests {
     use super::*;
     use crate::job::{Job, JobStatus, Priority, ValidationMode};
+
+    #[test]
+    fn completed_ship_outcome_uses_captured_state_after_active_state_archives() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut job = Job::create(
+            "abc",
+            "main",
+            vec!["local".to_owned()],
+            ValidationMode::Full,
+            Priority::Normal,
+        );
+        job.id = "captured-terminal".to_owned();
+        let old_state = ShipState::new(42, "owner/repo", "main", "main", "old", "policy");
+        QueueOutcomeStore::new(temp.path())
+            .expect("outcomes")
+            .save(&QueuedExecutionOutcome::ship(
+                job.id.clone(),
+                42,
+                old_state,
+                true,
+            ))
+            .expect("old outcome");
+        let captured = ShipState::new(42, "owner/repo", "main", "main", "validated", "policy");
+
+        persist_completed_ship_outcome(temp.path(), &job.id, 42, &job, captured.clone())
+            .expect("persist captured state");
+
+        let outcome = QueueOutcomeStore::new(temp.path())
+            .expect("outcomes")
+            .load(&job.id)
+            .expect("load")
+            .expect("outcome");
+        let QueuedExecutionOutcome::Ship {
+            ship_state,
+            resumed_existing_state,
+            ..
+        } = outcome
+        else {
+            panic!("expected ship outcome");
+        };
+        assert_eq!(ship_state, captured);
+        assert!(resumed_existing_state);
+    }
 
     #[test]
     fn scheduler_deferred_worker_returns_to_pending_without_terminal_outcome() {
