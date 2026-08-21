@@ -69,6 +69,11 @@ literal baseline/family tests. Never substitute caller regexes, caller-selected
 base/head SHAs, `skip-target`, `resume-from`, or diff-cover selectors. A local
 head/tree mismatch hard-fails with no receipt; every later ambiguity selects the
 full suite. The receipt is telemetry and cannot replace full target evidence.
+Schema v2 classifies bounded candidates as mandatory, affected, or extended;
+reviewed high-risk families and `full_required_paths` select full. Medium-risk
+families add only protected-base-declared literal integration/co-failure tests.
+Schema v1 remains accepted as affected-only. Never infer risk from mutable
+head-side policy or use an unknown path to narrow the suite.
 Release-only families under a Debug target require fresh, non-reused,
 same-exact-head evidence no more than 24 hours old from their base-declared
 Release target. The evidence must carry that target's own

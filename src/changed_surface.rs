@@ -12,8 +12,12 @@ use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Changed-surface declaration schema understood by this Shipyard release.
-pub const CHANGED_SURFACE_SCHEMA_VERSION: u32 = 1;
+/// Oldest changed-surface declaration schema understood by this release.
+pub const MIN_CHANGED_SURFACE_SCHEMA_VERSION: u32 = 1;
+/// Newest changed-surface declaration schema understood by this release.
+pub const CHANGED_SURFACE_SCHEMA_VERSION: u32 = 2;
+/// Current exact-head selection receipt schema.
+pub const SELECTION_RECEIPT_SCHEMA_VERSION: u32 = 2;
 /// Maximum age accepted for a required secondary execution proof.
 pub const SECONDARY_PROOF_MAX_AGE_HOURS: i64 = 24;
 
@@ -27,6 +31,12 @@ pub struct TestFamily {
     pub paths: Vec<String>,
     /// Complete literal test names for this family. These are not regexes.
     pub tests: Vec<String>,
+    /// Risk class reviewed for this family. Schema v1 defaults to affected.
+    #[serde(default)]
+    pub risk_class: RiskClass,
+    /// Deterministic one-hop/co-failure neighbors added for medium-risk changes.
+    #[serde(default)]
+    pub extended_tests: Vec<String>,
     /// Build types on which these literal tests are valid.
     pub supported_build_types: Vec<BuildType>,
     /// Required non-advisory target that proves this family when the current
@@ -36,6 +46,19 @@ pub struct TestFamily {
     /// Build type produced by the required secondary target.
     #[serde(default)]
     pub required_secondary_build_type: Option<BuildType>,
+}
+
+/// Reviewed risk class for an affected test family.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskClass {
+    /// Run the mandatory kernel plus the directly affected family.
+    #[default]
+    Low,
+    /// Also run reviewed integration/co-failure neighbors.
+    Medium,
+    /// The family is not eligible for bounded execution.
+    High,
 }
 
 /// Typed build configuration used by selector compatibility policy.
@@ -71,6 +94,9 @@ pub struct ChangedSurfacePolicy {
     /// Paths reviewed as safe to require baseline smoke only (for example docs).
     #[serde(default)]
     pub baseline_only_paths: Vec<String>,
+    /// Reviewed high-risk surfaces that always require the full suite.
+    #[serde(default)]
+    pub full_required_paths: Vec<String>,
     /// Policy/schema paths whose head-side modification forces full-suite fallback.
     #[serde(default)]
     pub policy_paths: Vec<String>,
@@ -250,10 +276,28 @@ pub enum FallbackReason {
     SelectorPolicyChanged,
     /// This head changes test registration/topology.
     TestTopologyChanged,
+    /// A protected-base policy surface requires full validation.
+    FullRequiredSurface,
+    /// An affected family is explicitly classified as high risk.
+    HighRiskFamily,
     /// A changed path is not covered by a family or baseline-only declaration.
     UnmappedChangedPath,
     /// Path evaluation itself was ambiguous or invalid.
     AmbiguousDiff,
+}
+
+/// Risk tier selected for shadow comparison.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionTier {
+    /// Mandatory kernel only.
+    Mandatory,
+    /// Mandatory kernel plus directly affected tests.
+    Affected,
+    /// Affected tests plus reviewed integration/co-failure neighbors.
+    Extended,
+    /// Complete authoritative suite.
+    Full,
 }
 
 /// Planner decision retained in the exact-head receipt.
@@ -352,6 +396,8 @@ pub struct SelectionReceipt {
     pub secondary_proofs: Vec<SecondaryProofReceipt>,
     /// Planned suite for comparison; execution remains full during shadow mode.
     pub planned_suite: PlannedSuite,
+    /// Risk tier represented by `selected_tests` or the conservative fallback.
+    pub selection_tier: SelectionTier,
     /// Authoritative suite executed in this phase.
     pub authoritative_suite: PlannedSuite,
     /// Explicit planner/authoritative-execution outcomes.
@@ -582,24 +628,17 @@ fn plan_with_policy(
     let policy_patterns = std::iter::once(".shipyard/config.toml".to_owned())
         .chain(policy.policy_paths.iter().cloned())
         .collect::<Vec<_>>();
-    if paths_match_any(changed_paths, &policy_patterns)? {
-        return Ok(fallback(
-            receipt,
-            Some(&policy),
-            FallbackReason::SelectorPolicyChanged,
-            None,
-        ));
-    }
-    if paths_match_any(changed_paths, &policy.test_topology_paths)? {
-        return Ok(fallback(
-            receipt,
-            Some(&policy),
-            FallbackReason::TestTopologyChanged,
-            None,
-        ));
-    }
+    let forced_fallback = if paths_match_any(changed_paths, &policy_patterns)? {
+        Some((FallbackReason::SelectorPolicyChanged, None))
+    } else if paths_match_any(changed_paths, &policy.test_topology_paths)? {
+        Some((FallbackReason::TestTopologyChanged, None))
+    } else if paths_match_any(changed_paths, &policy.full_required_paths)? {
+        Some((FallbackReason::FullRequiredSurface, None))
+    } else {
+        None
+    };
 
-    select_policy_families(receipt, &policy, changed_paths, input)
+    select_policy_families(receipt, &policy, changed_paths, input, forced_fallback)
 }
 
 fn select_policy_families(
@@ -607,89 +646,61 @@ fn select_policy_families(
     policy: &ChangedSurfacePolicy,
     changed_paths: &[String],
     input: &ExactHeadInput,
+    mut forced_fallback: Option<(FallbackReason, Option<String>)>,
 ) -> Result<SelectionReceipt, IdentityError> {
-    let mut selected_tests = receipt
-        .baseline_tests
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let mut selected_tests = literal_set(&receipt.baseline_tests);
     let mut selected_families = Vec::new();
     let mut family_coverage = BTreeMap::new();
     let mut secondary = BTreeMap::<(String, BuildType, String), SecondaryProofReceipt>::new();
-    let mut mapped_paths = BTreeSet::new();
+    let mut mapped_paths = forced_full_paths(policy, changed_paths)?;
+    let mut selection_tier = SelectionTier::Mandatory;
+    let globally_forced_full = forced_fallback.is_some();
     for family in &policy.families {
         let affected = matching_paths(changed_paths, &family.paths)?;
-        if affected.is_empty() {
+        let directly_affected = !affected.is_empty();
+        let requires_global_secondary =
+            globally_forced_full && !family.supported_build_types.contains(&policy.build_type);
+        if !directly_affected && !requires_global_secondary {
             continue;
         }
         mapped_paths.extend(affected);
         selected_families.push(family.name.clone());
-        let tests = sorted_unique(&family.tests);
+        let (family_tier, tests) = selected_family_tests(family);
+        selection_tier = selection_tier.max(family_tier);
         family_coverage.insert(family.name.clone(), tests.len());
+        if family_tier == SelectionTier::Full {
+            forced_fallback.get_or_insert_with(|| {
+                (
+                    FallbackReason::HighRiskFamily,
+                    Some(format!("affected high-risk family: {}", family.name)),
+                )
+            });
+        }
         if !family.supported_build_types.contains(&policy.build_type) {
-            let Some(required_target) = &family.required_secondary_target else {
-                return Ok(blocked(
-                    receipt,
-                    policy,
-                    format!(
-                        "family {:?} is incompatible with {:?} and has no required secondary target",
-                        family.name, policy.build_type
-                    ),
-                ));
-            };
-            let Some(required_build_type) = family.required_secondary_build_type else {
-                return Ok(blocked(
-                    receipt,
-                    policy,
-                    format!(
-                        "family {:?} has no typed secondary build requirement",
-                        family.name
-                    ),
-                ));
-            };
-            let Some(proof) =
-                required_secondary_proof(input, policy, required_target, required_build_type)
-            else {
-                return Ok(blocked(
-                    receipt,
-                    policy,
-                    format!(
-                        "family {:?} requires fresh exact-head evidence from target {:?} at {:?}",
-                        family.name, required_target, required_build_type
-                    ),
-                ));
-            };
-            let key = (
-                required_target.clone(),
-                proof.build_type,
-                proof.head_sha.clone(),
-            );
-            let entry = secondary
-                .entry(key)
-                .or_insert_with(|| SecondaryProofReceipt {
-                    target: required_target.clone(),
-                    build_type: proof.build_type,
-                    head_sha: proof.head_sha.clone(),
-                    tree_sha: proof.tree_sha.clone(),
-                    full_execution: proof.full_execution,
-                    completed_at: proof.completed_at,
-                    contract_digest: proof.contract_digest.clone(),
-                    families: Vec::new(),
-                    tests: Vec::new(),
-                });
-            entry.families.push(family.name.clone());
-            entry.tests.extend(tests);
+            if let Err(detail) =
+                record_required_secondary(family, &tests, input, policy, &mut secondary)
+            {
+                return Ok(blocked(receipt, policy, detail));
+            }
             continue;
         }
-        selected_tests.extend(tests);
+        if directly_affected && family_tier != SelectionTier::Full {
+            selected_tests.extend(tests);
+        }
     }
-    let baseline_only = matching_paths(changed_paths, &policy.baseline_only_paths)?;
-    mapped_paths.extend(baseline_only);
-    let unmapped = changed_paths
-        .iter()
-        .filter(|path| !mapped_paths.contains(*path))
-        .cloned()
-        .collect::<Vec<_>>();
+    mapped_paths.extend(matching_paths(changed_paths, &policy.baseline_only_paths)?);
+    if let Some((reason, detail)) = forced_fallback {
+        return Ok(finalize_full_receipt(
+            receipt,
+            policy,
+            selected_families,
+            family_coverage,
+            secondary,
+            reason,
+            detail,
+        ));
+    }
+    let unmapped = unmapped_changed_paths(changed_paths, &mapped_paths);
     if !unmapped.is_empty() {
         return Ok(fallback(
             receipt,
@@ -705,7 +716,101 @@ fn select_policy_families(
         selected_families,
         family_coverage,
         secondary,
+        selection_tier,
     ))
+}
+
+fn record_required_secondary(
+    family: &TestFamily,
+    tests: &[String],
+    input: &ExactHeadInput,
+    policy: &ChangedSurfacePolicy,
+    secondary: &mut BTreeMap<(String, BuildType, String), SecondaryProofReceipt>,
+) -> Result<(), String> {
+    let required_target = family.required_secondary_target.as_ref().ok_or_else(|| {
+        format!(
+            "family {:?} is incompatible with {:?} and has no required secondary target",
+            family.name, policy.build_type
+        )
+    })?;
+    let required_build_type = family.required_secondary_build_type.ok_or_else(|| {
+        format!(
+            "family {:?} has no typed secondary build requirement",
+            family.name
+        )
+    })?;
+    let proof = required_secondary_proof(input, policy, required_target, required_build_type)
+        .ok_or_else(|| {
+            format!(
+                "family {:?} requires fresh exact-head evidence from target {:?} at {:?}",
+                family.name, required_target, required_build_type
+            )
+        })?;
+    let key = (
+        required_target.clone(),
+        proof.build_type,
+        proof.head_sha.clone(),
+    );
+    let entry = secondary
+        .entry(key)
+        .or_insert_with(|| SecondaryProofReceipt {
+            target: required_target.clone(),
+            build_type: proof.build_type,
+            head_sha: proof.head_sha.clone(),
+            tree_sha: proof.tree_sha.clone(),
+            full_execution: proof.full_execution,
+            completed_at: proof.completed_at,
+            contract_digest: proof.contract_digest.clone(),
+            families: Vec::new(),
+            tests: Vec::new(),
+        });
+    entry.families.push(family.name.clone());
+    entry.tests.extend(tests.iter().cloned());
+    Ok(())
+}
+
+fn unmapped_changed_paths(paths: &[String], mapped: &BTreeSet<String>) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| !mapped.contains(*path))
+        .cloned()
+        .collect()
+}
+
+fn forced_full_paths(
+    policy: &ChangedSurfacePolicy,
+    changed_paths: &[String],
+) -> Result<BTreeSet<String>, IdentityError> {
+    let patterns = std::iter::once(".shipyard/config.toml".to_owned())
+        .chain(policy.policy_paths.iter().cloned())
+        .chain(policy.test_topology_paths.iter().cloned())
+        .chain(policy.full_required_paths.iter().cloned())
+        .collect::<Vec<_>>();
+    matching_paths(changed_paths, &patterns)
+}
+
+fn literal_set(tests: &[String]) -> BTreeSet<String> {
+    tests.iter().cloned().collect()
+}
+
+fn selected_family_tests(family: &TestFamily) -> (SelectionTier, Vec<String>) {
+    let tier = match family.risk_class {
+        RiskClass::Low => SelectionTier::Affected,
+        RiskClass::Medium => SelectionTier::Extended,
+        RiskClass::High => SelectionTier::Full,
+    };
+    let tests = family
+        .tests
+        .iter()
+        .chain(
+            (family.risk_class == RiskClass::Medium)
+                .then_some(family.extended_tests.iter())
+                .into_iter()
+                .flatten(),
+        )
+        .cloned()
+        .collect::<Vec<_>>();
+    (tier, sorted_unique(&tests))
 }
 
 fn required_secondary_proof<'a>(
@@ -736,11 +841,38 @@ fn finalize_bounded_receipt(
     selected_families: Vec<String>,
     family_coverage: BTreeMap<String, usize>,
     secondary: BTreeMap<(String, BuildType, String), SecondaryProofReceipt>,
+    selection_tier: SelectionTier,
 ) -> SelectionReceipt {
     receipt.selected_families = selected_families;
     receipt.selected_tests = selected_tests.into_iter().collect();
     receipt.family_coverage = family_coverage;
-    receipt.secondary_proofs = secondary
+    receipt.secondary_proofs = finalized_secondary_proofs(secondary);
+    receipt.selected_count = Some(receipt.selected_tests.len());
+    receipt.planned_suite = PlannedSuite::Bounded;
+    receipt.selection_tier = selection_tier;
+    receipt
+}
+
+fn finalize_full_receipt(
+    mut receipt: SelectionReceipt,
+    policy: &ChangedSurfacePolicy,
+    selected_families: Vec<String>,
+    family_coverage: BTreeMap<String, usize>,
+    secondary: BTreeMap<(String, BuildType, String), SecondaryProofReceipt>,
+    reason: FallbackReason,
+    detail: Option<String>,
+) -> SelectionReceipt {
+    receipt = fallback(receipt, Some(policy), reason, detail);
+    receipt.selected_families = selected_families;
+    receipt.family_coverage = family_coverage;
+    receipt.secondary_proofs = finalized_secondary_proofs(secondary);
+    receipt
+}
+
+fn finalized_secondary_proofs(
+    secondary: BTreeMap<(String, BuildType, String), SecondaryProofReceipt>,
+) -> Vec<SecondaryProofReceipt> {
+    secondary
         .into_values()
         .map(|mut proof| {
             proof.families.sort();
@@ -749,10 +881,7 @@ fn finalize_bounded_receipt(
             proof.tests.dedup();
             proof
         })
-        .collect();
-    receipt.selected_count = Some(receipt.selected_tests.len());
-    receipt.planned_suite = PlannedSuite::Bounded;
-    receipt
+        .collect()
 }
 
 fn validated_policy(
@@ -774,6 +903,7 @@ fn blocked(
     receipt.build_flags.clone_from(&policy.build_flags);
     receipt.baseline_tests = sorted_unique(&policy.baseline_tests);
     receipt.planned_suite = PlannedSuite::Blocked;
+    receipt.selection_tier = SelectionTier::Full;
     receipt.selected_count = None;
     receipt.fallback_reason = None;
     receipt.fallback_detail = Some(detail);
@@ -955,12 +1085,15 @@ fn validate_identity(input: &ExactHeadInput) -> Result<(), IdentityError> {
 }
 
 fn validate_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
-    if policy.schema_version != CHANGED_SURFACE_SCHEMA_VERSION {
+    if !(MIN_CHANGED_SURFACE_SCHEMA_VERSION..=CHANGED_SURFACE_SCHEMA_VERSION)
+        .contains(&policy.schema_version)
+    {
         return Err(format!(
             "unsupported changed-surface schema version {}",
             policy.schema_version
         ));
     }
+    validate_risk_policy(policy)?;
     if policy.full_test_count == 0 {
         return Err("full_test_count must be nonzero".to_owned());
     }
@@ -1026,12 +1159,38 @@ fn validate_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
             policy
                 .families
                 .iter()
-                .flat_map(|family| family.tests.iter()),
+                .flat_map(|family| family.tests.iter().chain(family.extended_tests.iter())),
         )
         .collect::<BTreeSet<_>>()
         .len();
     if declared > policy.full_test_count {
         return Err("declared literal tests exceed full_test_count".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_risk_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
+    if policy.schema_version == 1
+        && (!policy.full_required_paths.is_empty()
+            || policy.families.iter().any(|family| {
+                family.risk_class != RiskClass::Low || !family.extended_tests.is_empty()
+            }))
+    {
+        return Err("risk tiers and full_required_paths require schema_version = 2".to_owned());
+    }
+    validate_patterns(&policy.full_required_paths)?;
+    for family in &policy.families {
+        if family.risk_class == RiskClass::Medium {
+            validate_literal_tests(
+                &format!("family {} extended_tests", family.name),
+                &family.extended_tests,
+            )?;
+        } else if !family.extended_tests.is_empty() {
+            return Err(format!(
+                "family {} extended_tests require risk_class = medium",
+                family.name
+            ));
+        }
     }
     Ok(())
 }
@@ -1064,7 +1223,7 @@ fn validate_patterns(patterns: &[String]) -> Result<(), String> {
 
 fn base_receipt(input: &ExactHeadInput, changed_paths: Vec<String>) -> SelectionReceipt {
     SelectionReceipt {
-        schema_version: CHANGED_SURFACE_SCHEMA_VERSION,
+        schema_version: SELECTION_RECEIPT_SCHEMA_VERSION,
         exact_head_verified: true,
         shadow_only: true,
         repository: input.repository.clone(),
@@ -1087,6 +1246,7 @@ fn base_receipt(input: &ExactHeadInput, changed_paths: Vec<String>) -> Selection
         family_coverage: BTreeMap::new(),
         secondary_proofs: Vec::new(),
         planned_suite: PlannedSuite::Full,
+        selection_tier: SelectionTier::Full,
         authoritative_suite: PlannedSuite::Full,
         outcomes: SelectionOutcomes {
             planner: "planned".to_owned(),
@@ -1117,6 +1277,7 @@ fn fallback(
             .get_or_insert_with(|| policy_digest(policy));
     }
     receipt.planned_suite = PlannedSuite::Full;
+    receipt.selection_tier = SelectionTier::Full;
     receipt.authoritative_suite = PlannedSuite::Full;
     receipt.fallback_reason = Some(reason);
     receipt.fallback_detail = detail;
@@ -1206,6 +1367,7 @@ mod tests {
             build_flags: vec!["-DCMAKE_BUILD_TYPE=Debug".to_owned()],
             baseline_tests: vec!["smoke boots".to_owned(), "smoke config".to_owned()],
             baseline_only_paths: vec!["docs/**".to_owned()],
+            full_required_paths: Vec::new(),
             policy_paths: vec!["schema/changed-surface.json".to_owned()],
             test_topology_paths: vec![
                 "tests/CMakeLists.txt".to_owned(),
@@ -1216,6 +1378,8 @@ mod tests {
                     name: "audio".to_owned(),
                     paths: vec!["src/audio/**".to_owned()],
                     tests: vec!["audio alpha".to_owned(), "audio beta".to_owned()],
+                    risk_class: RiskClass::Low,
+                    extended_tests: Vec::new(),
                     supported_build_types: vec![BuildType::Debug, BuildType::Release],
                     required_secondary_target: None,
                     required_secondary_build_type: None,
@@ -1227,6 +1391,8 @@ mod tests {
                         "include/registry/**".to_owned(),
                     ],
                     tests: vec!["registry one".to_owned(), "registry two".to_owned()],
+                    risk_class: RiskClass::Low,
+                    extended_tests: Vec::new(),
                     supported_build_types: vec![BuildType::Debug, BuildType::Release],
                     required_secondary_target: None,
                     required_secondary_build_type: None,
@@ -1283,6 +1449,7 @@ mod tests {
         assert_eq!(receipt.selected_tests.len(), 6);
         assert_eq!(receipt.family_coverage["audio"], 2);
         assert_eq!(receipt.family_coverage["registry"], 2);
+        assert_eq!(receipt.selection_tier, SelectionTier::Affected);
     }
 
     #[test]
@@ -1292,6 +1459,65 @@ mod tests {
         assert!(receipt.selected_families.is_empty());
         assert_eq!(receipt.selected_tests, receipt.baseline_tests);
         assert_eq!(receipt.selected_count, Some(2));
+        assert_eq!(receipt.selection_tier, SelectionTier::Mandatory);
+    }
+
+    #[test]
+    fn schema_v2_selects_extended_neighbors_only_for_medium_risk() {
+        let mut risk_policy = policy();
+        risk_policy.schema_version = 2;
+        risk_policy.families[0].risk_class = RiskClass::Medium;
+        risk_policy.families[0].extended_tests = vec![
+            "audio integration consumer".to_owned(),
+            "audio prior co-failure".to_owned(),
+        ];
+        let receipt =
+            plan_selection(&input(&["src/audio/processor.rs"]), Ok(risk_policy)).expect("plan");
+        assert_eq!(receipt.planned_suite, PlannedSuite::Bounded);
+        assert_eq!(receipt.selection_tier, SelectionTier::Extended);
+        assert!(
+            receipt
+                .selected_tests
+                .contains(&"audio integration consumer".to_owned())
+        );
+        assert_eq!(receipt.family_coverage["audio"], 4);
+    }
+
+    #[test]
+    fn schema_v2_high_risk_and_full_required_surfaces_fail_closed() {
+        let mut high_risk = policy();
+        high_risk.schema_version = 2;
+        high_risk.families[0].risk_class = RiskClass::High;
+        let receipt = plan_selection(&input(&["src/audio/processor.rs"]), Ok(high_risk))
+            .expect("full fallback");
+        assert_eq!(receipt.selection_tier, SelectionTier::Full);
+        assert_eq!(
+            receipt.fallback_reason,
+            Some(FallbackReason::HighRiskFamily)
+        );
+
+        let mut full_surface = policy();
+        full_surface.schema_version = 2;
+        full_surface.full_required_paths = vec!["src/registry/**".to_owned()];
+        let receipt = plan_selection(&input(&["src/registry/index.rs"]), Ok(full_surface))
+            .expect("full fallback");
+        assert_eq!(receipt.selection_tier, SelectionTier::Full);
+        assert_eq!(
+            receipt.fallback_reason,
+            Some(FallbackReason::FullRequiredSurface)
+        );
+    }
+
+    #[test]
+    fn schema_v1_rejects_v2_risk_fields() {
+        let mut invalid = policy();
+        invalid.full_required_paths = vec!["src/audio/**".to_owned()];
+        assert!(validate_policy(&invalid).is_err());
+
+        invalid.full_required_paths.clear();
+        invalid.families[0].risk_class = RiskClass::Medium;
+        invalid.families[0].extended_tests = vec!["audio neighbor".to_owned()];
+        assert!(validate_policy(&invalid).is_err());
     }
 
     #[test]
@@ -1370,6 +1596,15 @@ mod tests {
         assert_eq!(
             topology.fallback_reason,
             Some(FallbackReason::TestTopologyChanged)
+        );
+        let policy_plus_unmapped = plan_selection(
+            &input(&[".shipyard/config.toml", "unknown/new.rs"]),
+            Ok(policy()),
+        )
+        .expect("policy fallback wins");
+        assert_eq!(
+            policy_plus_unmapped.fallback_reason,
+            Some(FallbackReason::SelectorPolicyChanged)
         );
     }
 
@@ -1506,6 +1741,8 @@ mod tests {
             name: "installed-sdk".to_owned(),
             paths: vec!["sdk/**".to_owned()],
             tests: vec!["agent capability installed SDK".to_owned()],
+            risk_class: RiskClass::Low,
+            extended_tests: Vec::new(),
             supported_build_types: vec![BuildType::Release],
             required_secondary_target: Some("release-installed-sdk".to_owned()),
             required_secondary_build_type: Some(BuildType::Release),
@@ -1551,6 +1788,46 @@ mod tests {
             eligible.secondary_proofs[0].tests,
             ["agent capability installed SDK"]
         );
+
+        let mut high_risk_policy = release_policy.clone();
+        high_risk_policy.schema_version = 2;
+        high_risk_policy.families[2].risk_class = RiskClass::High;
+        let full = plan_selection(&debug, Ok(high_risk_policy.clone()))
+            .expect("full plus secondary proof");
+        assert_eq!(full.planned_suite, PlannedSuite::Full);
+        assert_eq!(full.fallback_reason, Some(FallbackReason::HighRiskFamily));
+        assert_eq!(full.secondary_proofs.len(), 1);
+
+        let mut missing_high_risk_proof = debug.clone();
+        missing_high_risk_proof.secondary_proofs.clear();
+        let blocked = plan_selection(&missing_high_risk_proof, Ok(high_risk_policy))
+            .expect("secondary proof remains mandatory");
+        assert_eq!(blocked.planned_suite, PlannedSuite::Blocked);
+
+        let mut full_surface_policy = release_policy.clone();
+        full_surface_policy.schema_version = 2;
+        full_surface_policy.full_required_paths = vec!["sdk/**".to_owned()];
+        let blocked = plan_selection(&missing_high_risk_proof, Ok(full_surface_policy))
+            .expect("full-required surface still needs secondary proof");
+        assert_eq!(blocked.planned_suite, PlannedSuite::Blocked);
+
+        let mut global_full_policy = release_policy.clone();
+        global_full_policy.schema_version = 2;
+        global_full_policy.full_required_paths = vec!["CMakeLists.txt".to_owned()];
+        let global_input = input(&["CMakeLists.txt"]);
+        let blocked = plan_selection(&global_input, Ok(global_full_policy.clone()))
+            .expect("global full requires every incompatible family proof");
+        assert_eq!(blocked.planned_suite, PlannedSuite::Blocked);
+        let mut proven_global_input = global_input;
+        proven_global_input.secondary_proofs = debug.secondary_proofs.clone();
+        let full = plan_selection(&proven_global_input, Ok(global_full_policy))
+            .expect("global full with secondary proof");
+        assert_eq!(full.planned_suite, PlannedSuite::Full);
+        assert_eq!(
+            full.fallback_reason,
+            Some(FallbackReason::FullRequiredSurface)
+        );
+        assert_eq!(full.secondary_proofs.len(), 1);
 
         debug.secondary_proofs[0].reused = true;
         let reused = plan_selection(&debug, Ok(release_policy.clone())).expect("blocked plan");
