@@ -487,22 +487,50 @@ pub fn drain_or_wait_ship<D: ShipTargetDispatcher + Sync>(
     stores: ShipStores<'_>,
     dispatcher: &D,
 ) -> Result<ShipExecutionOutcome, ShipExecutionError> {
-    drain_or_wait_ship_with_options(
+    drain_or_wait_ship_with_scope(
         request,
         job,
         stores,
         dispatcher,
         CooperativeDrainOptions::default(),
+        DrainScope::Cooperative,
     )
 }
 
+/// Wait for one explicitly requested `shipyard ship --pr` job without
+/// executing or cancelling unrelated queued work. Scheduler resource and
+/// priority decisions still account for the complete queue; only the awaited
+/// job may be mutated by this drain owner.
+pub fn drain_or_wait_ship_awaited_only<D: ShipTargetDispatcher + Sync>(
+    request: &ShipExecutionRequest,
+    #[allow(clippy::needless_pass_by_value)] job: Job,
+    stores: ShipStores<'_>,
+    dispatcher: &D,
+) -> Result<ShipExecutionOutcome, ShipExecutionError> {
+    drain_or_wait_ship_with_scope(
+        request,
+        job,
+        stores,
+        dispatcher,
+        CooperativeDrainOptions::default(),
+        DrainScope::AwaitedOnly,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainScope {
+    Cooperative,
+    AwaitedOnly,
+}
+
 #[allow(clippy::needless_pass_by_value)]
-fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
+fn drain_or_wait_ship_with_scope<D: ShipTargetDispatcher + Sync>(
     request: &ShipExecutionRequest,
     job: Job,
     stores: ShipStores<'_>,
     dispatcher: &D,
     options: CooperativeDrainOptions,
+    drain_scope: DrainScope,
 ) -> Result<ShipExecutionOutcome, ShipExecutionError> {
     let ShipStores {
         queue,
@@ -519,12 +547,14 @@ fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
             return Ok(outcome);
         }
         if let Some(drain_lock) = queue.acquire_drain_lock()? {
-            let recovered = queue.recover_stale_running_jobs_for_drain(&drain_lock)?;
-            persist_recovered_outcomes(&recovered, state_dir, ship_state)?;
+            if drain_scope == DrainScope::Cooperative {
+                let recovered = queue.recover_stale_running_jobs_for_drain(&drain_lock)?;
+                persist_recovered_outcomes(&recovered, state_dir, ship_state)?;
+            }
             if let Some(outcome) = terminal_ship_outcome(queue, state_dir, request, &job.id)? {
                 return Ok(outcome);
             }
-            run_drain_worker_cycle(
+            run_drain_worker_cycle_scoped(
                 queue,
                 &drain_lock,
                 evidence,
@@ -536,6 +566,7 @@ fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
                 &job.id,
                 dispatcher,
                 request.pr_snapshot_file.as_deref(),
+                drain_scope,
             )?;
         }
         wait_or_timeout(&job.id, &mut wait_iterations, options)?;
@@ -1029,6 +1060,38 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
     dispatcher: &D,
     pr_snapshot_file: Option<&Path>,
 ) -> Result<(), ShipExecutionError> {
+    run_drain_worker_cycle_scoped(
+        queue,
+        drain_lock,
+        evidence,
+        ship_state,
+        warm_pool,
+        cwd,
+        state_dir,
+        config,
+        awaited_job_id,
+        dispatcher,
+        pr_snapshot_file,
+        DrainScope::Cooperative,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // One drain loop owns the shared observation cache.
+fn run_drain_worker_cycle_scoped<D: ShipTargetDispatcher + Sync>(
+    queue: &mut Queue,
+    drain_lock: &crate::queue::DrainLock,
+    evidence: &EvidenceStore,
+    ship_state: &ShipStateStore,
+    warm_pool: &WarmPool,
+    cwd: &Path,
+    state_dir: &Path,
+    config: &LoadedConfig,
+    awaited_job_id: &str,
+    dispatcher: &D,
+    pr_snapshot_file: Option<&Path>,
+    drain_scope: DrainScope,
+) -> Result<(), ShipExecutionError> {
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let outcome_store = QueueOutcomeStore::new(state_dir).map_err(QueueRequestError::from)?;
     let _trimmed_job_ids = queue.trim_terminal_jobs_for_drain(drain_lock)?;
@@ -1059,6 +1122,7 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
                     cwd,
                     pr_snapshot_file,
                     &mut already_merged_observer,
+                    drain_scope,
                 ) {
                     Ok(worker_inputs) => worker_inputs,
                     Err(error) => {
@@ -1197,6 +1261,7 @@ fn admit_drain_worker_inputs(
     cwd: &Path,
     pr_snapshot_file: Option<&Path>,
     already_merged_observer: &mut crate::queue_scheduler::AlreadyMergedObserver,
+    scope: DrainScope,
 ) -> Result<Vec<(Job, QueuedExecutionEnvelope)>, ShipExecutionError> {
     let jobs = queue.get_all()?;
     let pools = scheduler_host_pools(&jobs, request_store)?;
@@ -1205,16 +1270,49 @@ fn admit_drain_worker_inputs(
         .map_err(|error| ShipExecutionError::HostPool(error.to_string()))?;
     let leases = scheduler_host_pool_leases(&jobs, request_store, &pools, leases);
     let vm_slots = scheduler_vm_slots(config, &jobs, request_store)?;
+    let now = Utc::now();
+    let mut scheduling_jobs = jobs.clone();
+    if scope == DrainScope::AwaitedOnly {
+        // The shared planner normally frees claims held by stale same-PR
+        // workers because the cooperative apply pass will reap them. A scoped
+        // caller refuses to mutate unrelated jobs, so keep every unrelated
+        // running job live in this in-memory planning snapshot and preserve
+        // its claims. This never alters durable queue state.
+        for job in scheduling_jobs
+            .iter_mut()
+            .filter(|job| job.id != awaited_job_id && job.status == JobStatus::Running)
+        {
+            job.started_at = Some(now);
+        }
+    }
     let mut pass = plan_admit_pass_from_jobs_with_vm_slots(
-        &jobs,
+        &scheduling_jobs,
         request_store,
         &pools,
         &leases,
         &vm_slots,
-        Utc::now(),
+        now,
     );
-    pass.already_merged_cancellations =
-        already_merged_observer.observe_pending(&jobs, request_store, cwd, pr_snapshot_file);
+    let awaited_observation_jobs;
+    let observation_jobs = if scope == DrainScope::AwaitedOnly {
+        awaited_observation_jobs = jobs
+            .iter()
+            .filter(|job| job.id == awaited_job_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        awaited_observation_jobs.as_slice()
+    } else {
+        jobs.as_slice()
+    };
+    pass.already_merged_cancellations = already_merged_observer.observe_pending(
+        observation_jobs,
+        request_store,
+        cwd,
+        pr_snapshot_file,
+    );
+    if scope == DrainScope::AwaitedOnly {
+        restrict_admit_pass_to_awaited(&mut pass, awaited_job_id);
+    }
     cap_admit_pass_workers(&jobs, &mut pass, DEFAULT_DRAIN_MAX_WORKERS);
     let awaited_will_be_cancelled = pass
         .plan
@@ -1245,6 +1343,30 @@ fn admit_drain_worker_inputs(
             Ok((job, envelope))
         })
         .collect()
+}
+
+fn restrict_admit_pass_to_awaited(
+    pass: &mut crate::queue_scheduler::RequestBackedAdmitPass,
+    awaited_job_id: &str,
+) {
+    pass.plan.admitted.retain(|job_id| job_id == awaited_job_id);
+    pass.plan
+        .deferred
+        .retain(|deferred| deferred.job_id == awaited_job_id);
+    pass.plan
+        .orphaned
+        .retain(|orphan| orphan.job_id == awaited_job_id);
+    pass.same_pr_ship_admission
+        .pending_cancellations
+        .retain(|cancellation| cancellation.job_id == awaited_job_id);
+    pass.same_pr_ship_admission
+        .running_conflicts
+        .retain(|conflict| conflict.pending_job_id == awaited_job_id);
+    pass.same_pr_ship_admission
+        .stale_running_cancellations
+        .retain(|cancellation| cancellation.job_id == awaited_job_id);
+    pass.already_merged_cancellations
+        .retain(|cancellation| cancellation.job_id == awaited_job_id);
 }
 
 fn sweep_absent_queue_envelopes(
@@ -2363,8 +2485,9 @@ mod tests {
         CooperativeDrainOptions, RunExecutionRequest, RunStores, ShipExecutionError,
         ShipExecutionRequest, ShipStores, ShipTargetDispatcher, TargetExecOptions,
         TargetExecutionOutcome, WarmPoolUpdate, apply_warm_reuse, cap_admit_pass_workers,
-        drain_or_wait_run, drain_or_wait_run_with_options, execute_run, execute_run_worker,
-        execute_ship, execute_ship_worker, execute_targets_with_options,
+        drain_or_wait_run, drain_or_wait_run_with_options, drain_or_wait_ship_awaited_only,
+        drain_or_wait_ship_with_scope, execute_run, execute_run_worker, execute_ship,
+        execute_ship_worker, execute_targets_with_options,
         leases_not_covered_by_running_reservations, load_run_outcome, load_ship_outcome,
         retry_attempt_log_path, run_drain_worker_cycle, submit_run, submit_ship, target_log_path,
         update_warm_pool_after_run,
@@ -2611,6 +2734,166 @@ mod tests {
             pr_snapshot_file: None,
             targets,
         }
+    }
+
+    #[test]
+    fn awaited_only_ship_progresses_without_touching_unrelated_product_jobs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(state_dir.join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(state_dir.join("ship")).expect("ship state");
+        let warm_pool = WarmPool::new(state_dir.join("warm_pool.json"));
+        let config = empty_config(temp.path());
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let target = local_target_without_cwd("mac", "macos-arm64");
+        let request = |repo: &str, pr: u64, branch: &str, sha: &str| {
+            let mut request = ship_request(vec![target.clone()]);
+            request.repo = repo.to_owned();
+            request.pr = pr;
+            request.branch = branch.to_owned();
+            request.sha = sha.to_owned();
+            request
+        };
+
+        let unrelated_specs = [
+            ("Generous-Corp/pulp", 7718, "feature/pulp", "pulp-sha"),
+            (
+                "Generous-Corp/forge",
+                128,
+                "feature/forge-sequencer",
+                "sequencer-sha",
+            ),
+            ("Generous-Corp/vellum", 96, "feature/vellum", "vellum-sha"),
+        ];
+        let mut untouched = Vec::new();
+        for (repo, pr, branch, sha) in unrelated_specs {
+            let cwd = temp.path().join(format!("unrelated-{pr}"));
+            std::fs::create_dir_all(&cwd).expect("unrelated cwd");
+            let job = submit_ship(
+                &request(repo, pr, branch, sha),
+                &mut queue,
+                &cwd,
+                &state_dir,
+            )
+            .expect("submit unrelated ship");
+            untouched.push(job);
+        }
+
+        let awaited_cwd = temp.path().join("forge-modular");
+        std::fs::create_dir_all(&awaited_cwd).expect("awaited cwd");
+        let awaited_request = request(
+            "Generous-Corp/forge",
+            127,
+            "feature/forge-modular",
+            "modular-sha",
+        );
+        let awaited_job = submit_ship(&awaited_request, &mut queue, &awaited_cwd, &state_dir)
+            .expect("submit awaited ship");
+
+        let outcome = drain_or_wait_ship_awaited_only(
+            &awaited_request,
+            awaited_job,
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: &awaited_cwd,
+                state_dir: &state_dir,
+                config: &config,
+            },
+            &dispatcher,
+        )
+        .expect("awaited-only drain");
+
+        assert_eq!(outcome.job.status, JobStatus::Completed);
+        assert_eq!(dispatcher.seen_count(), 1);
+        for original in untouched {
+            assert_eq!(
+                queue.get(&original.id).expect("queue").expect("job"),
+                original,
+                "awaited-only draining must not mutate unrelated Pulp, Forge Sequencer, or Vellum jobs"
+            );
+        }
+    }
+
+    #[test]
+    fn awaited_only_ship_preserves_unrelated_stale_runner_claims_without_reaping_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(state_dir.join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(state_dir.join("ship")).expect("ship state");
+        let warm_pool = WarmPool::new(state_dir.join("warm_pool.json"));
+        let config = empty_config(temp.path());
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let target = local_target_without_cwd("mac", "macos-arm64");
+
+        let mut unrelated_request = ship_request(vec![target.clone()]);
+        unrelated_request.repo = "Generous-Corp/pulp".to_owned();
+        unrelated_request.pr = 7718;
+        unrelated_request.branch = "feature/shared".to_owned();
+        unrelated_request.sha = "old-sha".to_owned();
+        let unrelated = submit_ship(&unrelated_request, &mut queue, &cwd, &state_dir)
+            .expect("submit unrelated");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        let mut stale = queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&unrelated.id))
+            .expect("start unrelated")
+            .pop()
+            .expect("started unrelated");
+        stale.started_at = Some(Utc::now() - Duration::minutes(10));
+        queue.update(&stale).expect("persist stale running job");
+        drop(drain_lock);
+
+        let mut awaited_request = ship_request(vec![target]);
+        awaited_request.repo = "Generous-Corp/pulp".to_owned();
+        awaited_request.pr = 7719;
+        awaited_request.branch = "feature/shared".to_owned();
+        awaited_request.sha = "new-sha".to_owned();
+        let awaited =
+            submit_ship(&awaited_request, &mut queue, &cwd, &state_dir).expect("submit awaited");
+
+        let error = drain_or_wait_ship_with_scope(
+            &awaited_request,
+            awaited.clone(),
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: &cwd,
+                state_dir: &state_dir,
+                config: &config,
+            },
+            &dispatcher,
+            CooperativeDrainOptions {
+                poll_interval: StdDuration::ZERO,
+                max_wait_iterations: Some(1),
+            },
+            super::DrainScope::AwaitedOnly,
+        )
+        .expect_err("unrelated running claim must keep awaited work deferred");
+
+        assert!(matches!(
+            error,
+            ShipExecutionError::CooperativeWaitTimedOut(_)
+        ));
+        assert_eq!(dispatcher.seen_count(), 0);
+        assert_eq!(
+            queue.get(&unrelated.id).expect("queue").expect("job"),
+            stale
+        );
+        assert_eq!(
+            queue.get(&awaited.id).expect("queue").expect("job").status,
+            JobStatus::Pending
+        );
     }
 
     fn pool_with(entry: PoolEntry) -> (tempfile::TempDir, WarmPool) {
