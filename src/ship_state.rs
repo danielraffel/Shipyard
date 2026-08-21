@@ -267,6 +267,7 @@ impl ShipStateStore {
     pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
         fs::create_dir_all(&path)?;
         fs::create_dir_all(path.join("archive"))?;
+        fs::create_dir_all(path.join("scoped"))?;
         Ok(Self { path })
     }
 
@@ -282,6 +283,15 @@ impl ShipStateStore {
         self.path.join(format!("{pr}.json"))
     }
 
+    /// Return the repository-scoped active state path for a PR.
+    #[must_use]
+    pub fn state_path_scoped(&self, repository: &str, pr: u64) -> PathBuf {
+        self.path
+            .join("scoped")
+            .join(repository_key(repository))
+            .join(format!("{pr}.json"))
+    }
+
     /// Return the archive directory path.
     #[must_use]
     pub fn archive_dir(&self) -> PathBuf {
@@ -291,8 +301,16 @@ impl ShipStateStore {
     /// Load an active state for a PR.
     #[must_use]
     pub fn get(&self, pr: u64) -> Option<ShipState> {
-        let lock = self.lock_pr(pr).ok()?;
-        self.get_locked(pr, &lock)
+        let mut states = self.states_for_pr(pr);
+        (states.len() == 1).then(|| states.pop()).flatten()
+    }
+
+    /// Load one repository-scoped state, migrating a matching legacy state on
+    /// the next scoped save.
+    #[must_use]
+    pub fn get_scoped(&self, repository: &str, pr: u64) -> Option<ShipState> {
+        let lock = self.lock_pr_scoped(repository, pr).ok()?;
+        self.get_locked_scoped(repository, pr, &lock)
     }
 
     /// Acquire the per-PR ship-state lock.
@@ -300,10 +318,58 @@ impl ShipStateStore {
         ShipStatePrLock::acquire(self.lock_path(pr))
     }
 
+    /// Acquire the legacy fence followed by the repository-scoped PR lock.
+    ///
+    /// Holding the legacy fence while taking the scoped lock makes migration
+    /// safe against an older Shipyard binary that still writes `<pr>.json`.
+    pub fn lock_pr_scoped(&self, repository: &str, pr: u64) -> io::Result<ShipStatePrLock> {
+        // Older binaries take this fence exclusively. New binaries share it,
+        // which blocks legacy writers for the full operation while allowing
+        // different repository-scoped locks for Pulp #42 and Forge #42 to run
+        // concurrently.
+        let legacy_lock = ShipStatePrLock::acquire_shared(self.lock_path(pr))?;
+        let scoped_lock = ShipStatePrLock::acquire(self.lock_path_scoped(repository, pr))?;
+        self.migrate_matching_legacy_locked(repository, pr)?;
+        Ok(legacy_lock.combine(scoped_lock))
+    }
+
     /// Load an active state while the caller holds the per-PR lock.
     #[must_use]
     pub fn get_locked(&self, pr: u64, _lock: &ShipStatePrLock) -> Option<ShipState> {
-        self.get_unlocked(pr)
+        self.get(pr)
+    }
+
+    /// Load a scoped state while holding its migration-safe lock.
+    #[must_use]
+    pub fn get_locked_scoped(
+        &self,
+        repository: &str,
+        pr: u64,
+        _lock: &ShipStatePrLock,
+    ) -> Option<ShipState> {
+        if let Some(state) = Self::get_unlocked_path(&self.state_path_scoped(repository, pr)) {
+            return (same_repository(&state.repo, repository) && state.pr == pr).then_some(state);
+        }
+        let legacy = self.get_unlocked(pr)?;
+        (same_repository(&legacy.repo, repository) && legacy.pr == pr).then_some(legacy)
+    }
+
+    /// Mutate one repository-scoped PR state under its migration-safe lock.
+    pub fn with_pr_state_scoped_locked<T>(
+        &self,
+        repository: &str,
+        pr: u64,
+        f: impl FnOnce(&mut Option<ShipState>) -> Result<T, Box<dyn std::error::Error>>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let lock = self.lock_pr_scoped(repository, pr)?;
+        let mut state = self.get_locked_scoped(repository, pr, &lock);
+        let output = f(&mut state)?;
+        if let Some(state) = state {
+            self.save_scoped_locked(&state, &lock)?;
+        } else {
+            self.delete_scoped_locked(repository, pr)?;
+        }
+        Ok(output)
     }
 
     /// Mutate one PR's state while holding that PR's lock.
@@ -312,6 +378,16 @@ impl ShipStateStore {
         pr: u64,
         f: impl FnOnce(&mut Option<ShipState>) -> Result<T, Box<dyn std::error::Error>>,
     ) -> Result<T, Box<dyn std::error::Error>> {
+        let states = self.states_for_pr(pr);
+        if let [state] = states.as_slice() {
+            return self.with_pr_state_scoped_locked(&state.repo, pr, f);
+        }
+        if states.len() > 1 {
+            return Err(format!(
+                "PR #{pr} is ambiguous across repositories; repository is required"
+            )
+            .into());
+        }
         let lock = self.lock_pr(pr)?;
         let mut state = self.get_unlocked(pr);
         let output = f(&mut state)?;
@@ -327,15 +403,18 @@ impl ShipStateStore {
     }
 
     fn get_unlocked(&self, pr: u64) -> Option<ShipState> {
-        let path = self.state_path(pr);
+        Self::get_unlocked_path(&self.state_path(pr))
+    }
+
+    fn get_unlocked_path(path: &Path) -> Option<ShipState> {
         let contents = fs::read_to_string(path).ok()?;
         serde_json::from_str(&contents).ok()
     }
 
     /// Save a state atomically.
     pub fn save(&self, state: &ShipState) -> Result<(), Box<dyn std::error::Error>> {
-        let lock = self.lock_pr(state.pr)?;
-        self.save_locked(state, &lock)
+        let lock = self.lock_pr_scoped(&state.repo, state.pr)?;
+        self.save_scoped_locked(state, &lock)
     }
 
     /// Save a state atomically while the caller holds the per-PR lock.
@@ -351,20 +430,77 @@ impl ShipStateStore {
         Ok(())
     }
 
+    /// Save a state under its repository namespace while holding the matching
+    /// migration-safe scoped lock.
+    pub fn save_scoped_locked(
+        &self,
+        state: &ShipState,
+        _lock: &ShipStatePrLock,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self.state_path_scoped(&state.repo, state.pr);
+        let parent = path.parent().expect("scoped state path has parent");
+        fs::create_dir_all(parent)?;
+        let payload = serde_json::to_string_pretty(state)?;
+        let temp = tempfile::NamedTempFile::new_in(parent)?;
+        fs::write(temp.path(), format!("{payload}\n"))?;
+        temp.persist(&path)?;
+        Ok(())
+    }
+
     /// Delete an active state file.
     pub fn delete(&self, pr: u64) -> Result<(), std::io::Error> {
-        let _lock = self.lock_pr(pr)?;
-        let path = self.state_path(pr);
+        let states = self.states_for_pr(pr);
+        match states.as_slice() {
+            [] => Ok(()),
+            [state] => self.delete_scoped(&state.repo, pr),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("PR #{pr} is ambiguous across repositories; repository is required"),
+            )),
+        }
+    }
+
+    /// Delete one repository-scoped active state file.
+    pub fn delete_scoped(&self, repository: &str, pr: u64) -> Result<(), std::io::Error> {
+        let _lock = self.lock_pr_scoped(repository, pr)?;
+        self.delete_scoped_locked(repository, pr)
+    }
+
+    fn delete_scoped_locked(&self, repository: &str, pr: u64) -> Result<(), std::io::Error> {
+        let path = self.state_path_scoped(repository, pr);
         if path.exists() {
             fs::remove_file(path)?;
+        }
+        let legacy = self.state_path(pr);
+        if Self::get_unlocked_path(&legacy)
+            .is_some_and(|state| same_repository(&state.repo, repository))
+        {
+            fs::remove_file(legacy)?;
         }
         Ok(())
     }
 
     /// Move an active state into the archive directory.
     pub fn archive(&self, pr: u64) -> Result<Option<PathBuf>, std::io::Error> {
-        let lock = self.lock_pr(pr)?;
-        self.archive_locked(pr, &lock)
+        let states = self.states_for_pr(pr);
+        match states.as_slice() {
+            [] => Ok(None),
+            [state] => self.archive_scoped(&state.repo, pr),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("PR #{pr} is ambiguous across repositories; repository is required"),
+            )),
+        }
+    }
+
+    /// Archive one repository-scoped active state.
+    pub fn archive_scoped(
+        &self,
+        repository: &str,
+        pr: u64,
+    ) -> Result<Option<PathBuf>, std::io::Error> {
+        let lock = self.lock_pr_scoped(repository, pr)?;
+        self.archive_scoped_locked(repository, pr, &lock)
     }
 
     /// Move an active state into the archive directory while holding the lock.
@@ -383,9 +519,36 @@ impl ShipStateStore {
         Ok(Some(dest))
     }
 
+    /// Archive a repository-scoped state while holding its scoped lock.
+    pub fn archive_scoped_locked(
+        &self,
+        repository: &str,
+        pr: u64,
+        _lock: &ShipStatePrLock,
+    ) -> Result<Option<PathBuf>, std::io::Error> {
+        let scoped = self.state_path_scoped(repository, pr);
+        let source = if scoped.exists() {
+            scoped
+        } else {
+            let legacy = self.state_path(pr);
+            if !Self::get_unlocked_path(&legacy)
+                .is_some_and(|state| same_repository(&state.repo, repository))
+            {
+                return Ok(None);
+            }
+            legacy
+        };
+        let archive_dir = self.archive_dir().join(repository_key(repository));
+        fs::create_dir_all(&archive_dir)?;
+        let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+        let dest = archive_dir.join(format!("{pr}-{stamp}.json"));
+        fs::rename(source, &dest)?;
+        Ok(Some(dest))
+    }
+
     /// Return active states sorted by PR number.
     pub fn list_active(&self) -> Vec<ShipState> {
-        let mut states = Vec::new();
+        let mut states = BTreeMap::<(String, u64), ShipState>::new();
         if let Ok(entries) = fs::read_dir(&self.path) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -405,25 +568,43 @@ impl ShipStateStore {
                 if let Ok(contents) = fs::read_to_string(&path)
                     && let Ok(state) = serde_json::from_str::<ShipState>(&contents)
                 {
-                    states.push(state);
+                    states.insert((canonical_repository(&state.repo), state.pr), state);
                 }
             }
         }
-        states.sort_by_key(|state| state.pr);
+        let scoped_root = self.path.join("scoped");
+        if let Ok(repositories) = fs::read_dir(scoped_root) {
+            for repository in repositories.flatten() {
+                if !repository.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
+                if let Ok(entries) = fs::read_dir(repository.path()) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+                            continue;
+                        }
+                        if let Some(state) = Self::get_unlocked_path(&path) {
+                            states.insert((canonical_repository(&state.repo), state.pr), state);
+                        }
+                    }
+                }
+            }
+        }
+        let mut states = states.into_values().collect::<Vec<_>>();
+        states.sort_by(|left, right| {
+            left.pr.cmp(&right.pr).then_with(|| {
+                canonical_repository(&left.repo).cmp(&canonical_repository(&right.repo))
+            })
+        });
         states
     }
 
     /// Return archived state file paths sorted by filename.
+    #[must_use]
     pub fn list_archived(&self) -> Vec<PathBuf> {
         let mut archived = Vec::new();
-        if let Ok(entries) = fs::read_dir(self.archive_dir()) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
-                    archived.push(path);
-                }
-            }
-        }
+        collect_json_files(&self.archive_dir(), &mut archived);
         archived.sort();
         archived
     }
@@ -434,7 +615,7 @@ impl ShipStateStore {
         state: &ShipState,
         new_attempt: Option<u32>,
     ) -> Result<ShipState, Box<dyn std::error::Error>> {
-        let lock = self.lock_pr(state.pr)?;
+        let lock = self.lock_pr_scoped(&state.repo, state.pr)?;
         self.archive_and_replace_locked(state, new_attempt, &lock)
     }
 
@@ -445,7 +626,7 @@ impl ShipStateStore {
         new_attempt: Option<u32>,
         lock: &ShipStatePrLock,
     ) -> Result<ShipState, Box<dyn std::error::Error>> {
-        let _ = self.archive_locked(state.pr, lock)?;
+        let _ = self.archive_scoped_locked(&state.repo, state.pr, lock)?;
         let now = Utc::now();
         Ok(ShipState {
             attempt: new_attempt.unwrap_or(state.attempt + 1),
@@ -467,12 +648,52 @@ impl ShipStateStore {
     fn lock_path(&self, pr: u64) -> PathBuf {
         self.path.join(format!("{pr}.lock"))
     }
+
+    fn lock_path_scoped(&self, repository: &str, pr: u64) -> PathBuf {
+        self.path
+            .join("scoped")
+            .join(repository_key(repository))
+            .join(format!("{pr}.lock"))
+    }
+
+    fn states_for_pr(&self, pr: u64) -> Vec<ShipState> {
+        self.list_active()
+            .into_iter()
+            .filter(|state| state.pr == pr)
+            .collect()
+    }
+
+    fn migrate_matching_legacy_locked(&self, repository: &str, pr: u64) -> io::Result<()> {
+        let legacy_path = self.state_path(pr);
+        let Some(legacy) = Self::get_unlocked_path(&legacy_path) else {
+            return Ok(());
+        };
+        if !same_repository(&legacy.repo, repository) {
+            return Ok(());
+        }
+        let scoped_path = self.state_path_scoped(repository, pr);
+        let scoped = Self::get_unlocked_path(&scoped_path);
+        if scoped
+            .as_ref()
+            .is_none_or(|scoped| legacy.updated_at > scoped.updated_at)
+        {
+            let parent = scoped_path.parent().expect("scoped path has parent");
+            fs::create_dir_all(parent)?;
+            let payload = serde_json::to_string_pretty(&legacy)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let temp = tempfile::NamedTempFile::new_in(parent)?;
+            fs::write(temp.path(), format!("{payload}\n"))?;
+            temp.persist(&scoped_path).map_err(|error| error.error)?;
+        }
+        fs::remove_file(legacy_path)?;
+        Ok(())
+    }
 }
 
 /// Held per-PR ship-state lock.
 #[derive(Debug)]
 pub struct ShipStatePrLock {
-    file: File,
+    files: Vec<File>,
 }
 
 impl ShipStatePrLock {
@@ -486,14 +707,74 @@ impl ShipStatePrLock {
             .read(true)
             .write(true)
             .open(path)?;
-        file.lock_exclusive()?;
-        Ok(Self { file })
+        FileExt::lock_exclusive(&file)?;
+        Ok(Self { files: vec![file] })
+    }
+
+    fn acquire_shared(path: PathBuf) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        FileExt::lock_shared(&file)?;
+        Ok(Self { files: vec![file] })
+    }
+
+    fn combine(mut self, mut other: Self) -> Self {
+        self.files.append(&mut other.files);
+        self
     }
 }
 
 impl Drop for ShipStatePrLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        for file in self.files.iter().rev() {
+            let _ = FileExt::unlock(file);
+        }
+    }
+}
+
+fn canonical_repository(repository: &str) -> String {
+    repository.trim().to_ascii_lowercase()
+}
+
+fn same_repository(left: &str, right: &str) -> bool {
+    canonical_repository(left) == canonical_repository(right)
+}
+
+fn repository_key(repository: &str) -> String {
+    let canonical = canonical_repository(repository);
+    let readable = canonical
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect::<String>();
+    let digest = Sha256::digest(canonical.as_bytes());
+    format!("{readable}--{}", hex::encode(digest))
+}
+
+fn collect_json_files(directory: &Path, output: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            collect_json_files(&path, output);
+        } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("json") {
+            output.push(path);
+        }
     }
 }
 
@@ -806,6 +1087,141 @@ mod tests {
             state.get_run("linux").map(|run| run.run_id.as_str()),
             Some("222")
         );
+    }
+
+    #[test]
+    fn same_pr_number_is_isolated_across_pulp_forge_and_vellum() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let identities = [
+            ("Generous-Corp/pulp", "pulp"),
+            ("Generous-Corp/forge", "forge"),
+            ("Generous-Corp/vellum", "vellum"),
+        ];
+
+        for (repository, sha) in identities {
+            store
+                .save(&ShipState::new(
+                    42,
+                    repository,
+                    "feature/shared",
+                    "main",
+                    sha,
+                    "policy",
+                ))
+                .expect("save scoped state");
+        }
+
+        for (repository, sha) in identities {
+            assert_eq!(
+                store
+                    .get_scoped(repository, 42)
+                    .expect("scoped state")
+                    .head_sha,
+                sha
+            );
+        }
+        assert!(
+            store.get(42).is_none(),
+            "number-only lookup must fail closed when repositories collide"
+        );
+        assert_eq!(store.list_active().len(), identities.len());
+    }
+
+    #[test]
+    fn same_pr_number_scoped_locks_do_not_block_other_repositories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(ShipStateStore::new(temp.path().join("ship")).expect("store"));
+        let pulp_lock = store
+            .lock_pr_scoped("Generous-Corp/pulp", 42)
+            .expect("pulp lock");
+        let forge_store = Arc::clone(&store);
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _forge_lock = forge_store
+                .lock_pr_scoped("Generous-Corp/forge", 42)
+                .expect("forge lock");
+            acquired_tx.send(()).expect("acquired");
+        });
+
+        acquired_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("Forge lock must not wait for Pulp's same-number PR");
+        drop(pulp_lock);
+        handle.join().expect("lock thread");
+    }
+
+    #[test]
+    fn scoped_lock_fences_legacy_writer_for_full_operation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(ShipStateStore::new(temp.path().join("ship")).expect("store"));
+        let scoped_lock = store
+            .lock_pr_scoped("Generous-Corp/pulp", 42)
+            .expect("scoped lock");
+        let legacy_store = Arc::clone(&store);
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _legacy_lock = legacy_store.lock_pr(42).expect("legacy lock");
+            acquired_tx.send(()).expect("acquired");
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(StdDuration::from_millis(50))
+                .is_err(),
+            "legacy writer bypassed the scoped operation's compatibility fence"
+        );
+        drop(scoped_lock);
+        acquired_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("legacy writer proceeds after scoped operation");
+        handle.join().expect("lock thread");
+    }
+
+    #[test]
+    fn scoped_lock_migrates_only_matching_legacy_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let legacy = sample_state(91, "legacy");
+        let legacy_lock = store.lock_pr(91).expect("legacy lock");
+        store
+            .save_locked(&legacy, &legacy_lock)
+            .expect("legacy save");
+        drop(legacy_lock);
+
+        assert!(store.get_scoped("Generous-Corp/forge", 91).is_none());
+        assert!(store.state_path(91).exists());
+
+        let migrated = store
+            .get_scoped("DANIELRAFFEL/PULP", 91)
+            .expect("matching legacy state");
+        assert_eq!(migrated.head_sha, "legacy");
+        assert!(!store.state_path(91).exists());
+        assert!(store.state_path_scoped("danielraffel/pulp", 91).exists());
+    }
+
+    #[test]
+    fn scoped_lock_reconciles_newer_legacy_update_under_compatibility_fence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let mut scoped = sample_state(92, "scoped-old");
+        scoped.updated_at = Utc::now() - chrono::Duration::minutes(2);
+        store.save(&scoped).expect("scoped save");
+
+        let mut legacy = scoped.clone();
+        legacy.head_sha = "legacy-new".to_owned();
+        legacy.updated_at = Utc::now();
+        let legacy_lock = store.lock_pr(92).expect("legacy lock");
+        store
+            .save_locked(&legacy, &legacy_lock)
+            .expect("mixed-version legacy save");
+        drop(legacy_lock);
+
+        let active = store
+            .get_scoped("danielraffel/pulp", 92)
+            .expect("newest state remains active");
+        assert_eq!(active.head_sha, "legacy-new");
+        assert!(!store.state_path(92).exists());
     }
 
     #[test]

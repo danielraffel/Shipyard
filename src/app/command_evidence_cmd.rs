@@ -35,8 +35,11 @@ pub(super) fn run_command_evidence<W: Write>(
     let target = resolve_command_target(config, &args.target)?;
     let command = CommandRequest::for_target(&target, args, cwd)?;
     let name = args.name.as_deref().unwrap_or(&target.name);
-    let id = evidence_id(name, &target.name);
+    let workload_scope = crate::evidence::command_evidence_scope(cwd, name);
     let store = CommandEvidenceStore::new(runtime_paths.state_dir.join("command-evidence"))
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let id = store
+        .reserve_bundle_id(&evidence_id(&workload_scope, name, &target.name))
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let log_path = args
         .log_path
@@ -69,6 +72,7 @@ pub(super) fn run_command_evidence<W: Write>(
         schema_version: 1,
         id,
         name: name.to_owned(),
+        workload_scope: Some(workload_scope),
         branch,
         sha,
         target_name: target.name.clone(),
@@ -605,10 +609,12 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn evidence_id(name: &str, target: &str) -> String {
+fn evidence_id(workload_scope: &str, name: &str, target: &str) -> String {
+    let scope_digest = hex_digest(workload_scope.as_bytes());
     format!(
-        "cmd-{}-{}-{}",
+        "cmd-{}-{}-{}-{}",
         Utc::now().format("%Y%m%d-%H%M%S-%3f"),
+        &scope_digest[..12],
         sanitize_component(name),
         sanitize_component(target)
     )

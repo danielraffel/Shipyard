@@ -341,21 +341,21 @@ impl<'a> LivenessContext<'a> {
 }
 
 /// Classify every active ship-state in `store` against `liveness`, returning the
-/// orphaned ones as `(pr, report)` pairs for rendering. Read-only — keeps the
+/// orphaned ones as `(repo, pr, report)` tuples for rendering. Read-only — keeps the
 /// store/snapshot mechanics out of the command layer.
 #[must_use]
 pub fn collect_orphans(
     store: &ShipStateStore,
     liveness: &LivenessContext<'_>,
     now: DateTime<Utc>,
-) -> Vec<(u64, OrphanReport)> {
+) -> Vec<(String, u64, OrphanReport)> {
     store
         .list_active()
         .iter()
         .filter_map(|state| {
             liveness
                 .classify(state, now)
-                .map(|report| (state.pr, report))
+                .map(|report| (state.repo.clone(), state.pr, report))
         })
         .collect()
 }

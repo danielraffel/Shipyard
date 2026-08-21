@@ -94,10 +94,12 @@ pub(super) fn execute_auto_merge(
     cwd: &Path,
     request: &AutoMergeRequest,
 ) -> Result<AutoMergeOutcome, AutoMergeOperationError> {
-    let lock = store
-        .lock_pr(request.pr)
-        .map_err(AutoMergeOperationError::Store)?;
-    let Some(mut state) = store.get_locked(request.pr, &lock) else {
+    let repository = super::branch_cmd::detect_repo_from_remote(cwd, None);
+    let discovered = repository.as_ref().map_or_else(
+        || store.get(request.pr),
+        |repository| store.get_scoped(repository, request.pr),
+    );
+    let Some(discovered) = discovered else {
         return Ok(
             if pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref()) {
                 AutoMergeOutcome::AlreadyMerged
@@ -105,6 +107,12 @@ pub(super) fn execute_auto_merge(
                 AutoMergeOutcome::PrNotFound
             },
         );
+    };
+    let lock = store
+        .lock_pr_scoped(&discovered.repo, request.pr)
+        .map_err(AutoMergeOperationError::Store)?;
+    let Some(mut state) = store.get_locked_scoped(&discovered.repo, request.pr, &lock) else {
+        return Ok(AutoMergeOutcome::PrNotFound);
     };
 
     match ship_terminal_verdict(&state) {
@@ -139,7 +147,7 @@ pub(super) fn execute_auto_merge(
                         || pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref())
                     {
                         store
-                            .archive_locked(request.pr, &lock)
+                            .archive_scoped_locked(&state.repo, request.pr, &lock)
                             .map_err(AutoMergeOperationError::Store)?;
                         return Ok(AutoMergeOutcome::Merged {
                             cleanup_warning: Some(error),
@@ -150,7 +158,7 @@ pub(super) fn execute_auto_merge(
             };
             let cleanup_warning = match merge_disposition {
                 MergeDisposition::Enqueued => {
-                    if let Err(error) = store.save_locked(&state, &lock) {
+                    if let Err(error) = store.save_scoped_locked(&state, &lock) {
                         return Ok(AutoMergeOutcome::MergeFailed {
                             error: format!("failed to persist merge-queue admission: {error}"),
                         });
@@ -160,7 +168,7 @@ pub(super) fn execute_auto_merge(
                 MergeDisposition::Merged { cleanup_warning } => cleanup_warning,
             };
             store
-                .archive_locked(request.pr, &lock)
+                .archive_scoped_locked(&state.repo, request.pr, &lock)
                 .map_err(AutoMergeOperationError::Store)?;
             Ok(AutoMergeOutcome::Merged { cleanup_warning })
         }
@@ -618,7 +626,7 @@ fn merge_pr(
                 state.merge_queue_enqueue_succeeded_at = None;
                 state.merge_queue_enqueue_started_at = Some(admission_started_at);
                 state.touch();
-                if let Err(error) = store.save_locked(state, lock) {
+                if let Err(error) = store.save_scoped_locked(state, lock) {
                     guard.finish("rejected").map_err(|audit_error| {
                         format!(
                             "failed to persist uncertain queue admission: {error}; additionally failed to close pre-network mutation audit: {audit_error}"
@@ -647,9 +655,13 @@ fn merge_pr(
                         state.merge_queue_enqueue_started_at = None;
                         state.merge_queue_enqueue_succeeded_at = None;
                         state.touch();
-                        store.save_locked(state, lock).map_err(|persist_error| {
-                            format!("failed to persist rejected queue admission: {persist_error}")
-                        })?;
+                        store
+                            .save_scoped_locked(state, lock)
+                            .map_err(|persist_error| {
+                                format!(
+                                    "failed to persist rejected queue admission: {persist_error}"
+                                )
+                            })?;
                         (*guard).finish("rejected")?;
                         if terminal_github_error(&error) {
                             return Err(error);
@@ -663,7 +675,7 @@ fn merge_pr(
                     }
                 };
                 state.touch();
-                store.save_locked(state, lock).map_err(|error| {
+                store.save_scoped_locked(state, lock).map_err(|error| {
                     format!("failed to persist successful queue admission: {error}")
                 })?;
                 success_guard.finish("success")?;
@@ -1042,7 +1054,11 @@ pub(super) fn supervise_merge_queue(
     pr: u64,
     delete_branch: bool,
 ) -> AutoMergeOutcome {
-    let Some(mut state) = store.get(pr) else {
+    let repository = super::branch_cmd::detect_repo_from_remote(cwd, None);
+    let Some(mut state) = repository.as_ref().map_or_else(
+        || store.get(pr),
+        |repository| store.get_scoped(repository, pr),
+    ) else {
         return AutoMergeOutcome::PrNotFound;
     };
     let Ok(client) = gh_client(cwd) else {
@@ -1460,9 +1476,9 @@ fn update_queue_state_if_current(
     update: impl FnOnce(&mut ShipState),
 ) -> Result<(), String> {
     let lock = store
-        .lock_pr(local.pr)
+        .lock_pr_scoped(&local.repo, local.pr)
         .map_err(|error| format!("failed to lock ship-state: {error}"))?;
-    let Some(mut current) = store.get_locked(local.pr, &lock) else {
+    let Some(mut current) = store.get_locked_scoped(&local.repo, local.pr, &lock) else {
         return Err("active ship-state disappeared".to_owned());
     };
     if !shas_match(&current.head_sha, &local.head_sha)
@@ -1479,7 +1495,7 @@ fn update_queue_state_if_current(
     update(&mut current);
     current.touch();
     store
-        .save_locked(&current, &lock)
+        .save_scoped_locked(&current, &lock)
         .map_err(|error| format!("failed to save ship-state: {error}"))?;
     *local = current;
     Ok(())
@@ -1520,9 +1536,9 @@ fn archive_queue_state_if_current(
     expected_attempt: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(), String> {
     let lock = store
-        .lock_pr(local.pr)
+        .lock_pr_scoped(&local.repo, local.pr)
         .map_err(|error| format!("failed to lock ship-state: {error}"))?;
-    let Some(current) = store.get_locked(local.pr, &lock) else {
+    let Some(current) = store.get_locked_scoped(&local.repo, local.pr, &lock) else {
         return Err("active ship-state disappeared".to_owned());
     };
     if !shas_match(&current.head_sha, &local.head_sha)
@@ -1537,7 +1553,7 @@ fn archive_queue_state_if_current(
         ));
     }
     store
-        .archive_locked(local.pr, &lock)
+        .archive_scoped_locked(&local.repo, local.pr, &lock)
         .map_err(|error| format!("failed to archive ship-state: {error}"))?;
     Ok(())
 }
@@ -1549,9 +1565,9 @@ fn with_current_queue_state_locked<T>(
     action: impl FnOnce() -> Result<T, String>,
 ) -> Result<Option<T>, String> {
     let lock = store
-        .lock_pr(local.pr)
+        .lock_pr_scoped(&local.repo, local.pr)
         .map_err(|error| format!("failed to lock ship-state: {error}"))?;
-    let Some(current) = store.get_locked(local.pr, &lock) else {
+    let Some(current) = store.get_locked_scoped(&local.repo, local.pr, &lock) else {
         return Ok(None);
     };
     if !shas_match(&current.head_sha, &local.head_sha)
