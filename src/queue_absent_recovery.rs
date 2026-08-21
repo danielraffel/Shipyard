@@ -186,19 +186,14 @@ where
         if ship_terminal_verdict(&state).is_some() {
             continue;
         }
-        let Some(repo_path) = queue_absent_repo_path(config, &state.repo) else {
-            let reason = "registered repo path is missing".to_owned();
-            let _ = persist_needs_agent(&store, state_dir, &state, &reason);
-            report.needs_agent.push((state.repo, state.pr, reason));
-            continue;
-        };
+        let repo_path = queue_absent_repo_path(config, &state.repo);
         match recover_one(
             &store,
             state_dir,
             mode,
             global_dir,
             &state,
-            &repo_path,
+            repo_path.as_deref(),
             &mut fetch_pr,
             &mut after_claim,
         ) {
@@ -217,7 +212,7 @@ fn recover_one<F, C>(
     mode: RuntimeMode,
     global_dir: &Path,
     snapshot: &ShipState,
-    registered_repo_path: &Path,
+    registered_repo_path: Option<&Path>,
     fetch_pr: &mut F,
     after_claim: &mut C,
 ) -> Result<Option<String>, String>
@@ -261,7 +256,7 @@ fn recover_locked<F, C>(
     mode: RuntimeMode,
     global_dir: &Path,
     state: &ShipState,
-    registered_repo_path: &Path,
+    registered_repo_path: Option<&Path>,
     fetch_pr: &mut F,
     after_claim: &mut C,
 ) -> Result<Option<String>, String>
@@ -303,22 +298,14 @@ where
         .iter()
         .map(|item| (item.job_id.as_str(), item))
         .collect::<BTreeMap<_, _>>();
+    if active_recovered_owner_is_valid(existing.as_ref(), &jobs, &envelope_by_id, state)? {
+        return Ok(None);
+    }
     let Some(source) =
         select_recovery_source(&envelopes, &jobs, &envelope_by_id, existing.as_ref(), state)?
     else {
         return Ok(None);
     };
-    drop(selection_lock);
-    let canonical_path = fs::canonicalize(registered_repo_path)
-        .map_err(|error| format!("registered repo path is unavailable: {error}"))?;
-    let source_cwd = source
-        .provenance
-        .as_ref()
-        .ok_or_else(|| "preserved work item has no provenance; needs-agent".to_owned())?
-        .canonical_cwd
-        .clone();
-    let repo_config = load_recovery_config(mode, &source_cwd, global_dir)?;
-    validate_source(&source, state, &canonical_path, &repo_config)?;
     ensure_source_has_no_outcome(state_dir, &source.job_id)?;
     if finalize_claimed_replacement_outcome(state_dir, &record_path, existing.as_ref())? {
         return Ok(None);
@@ -337,7 +324,15 @@ where
         save_record(&record_path, &record)?;
         return Ok(None);
     }
-    if jobs.iter().any(|job| job.id == source.job_id) {
+    if let Some(job) = jobs.iter().find(|job| job.id == source.job_id) {
+        if matches!(job.status, JobStatus::Completed | JobStatus::Cancelled) {
+            let reason = format!(
+                "source reached terminal queue status {:?} without a durable outcome; replay refused",
+                job.status
+            );
+            save_needs_agent(state_dir, state, &reason)?;
+            return Err(reason);
+        }
         return Ok(None);
     }
     if jobs.iter().any(|job| {
@@ -357,6 +352,10 @@ where
         return Ok(None);
     }
     ensure_no_worker_receipt(state_dir, state, &envelope_by_id)?;
+    drop(selection_lock);
+
+    let source_cwd =
+        validate_source_context(mode, global_dir, registered_repo_path, &source, state)?;
 
     let live = fetch_pr(&state.repo, state.pr, &source_cwd)
         .map_err(|error| format!("GitHub PR verification unavailable: {error}"))?
@@ -418,6 +417,42 @@ fn select_recovery_source(
     Ok(Some(source.clone()))
 }
 
+/// Validate an enqueued recovery as the current owner before reconsidering its
+/// preserved source. The worker legitimately moves `ShipState.source_job_id`
+/// from source to replacement when it starts.
+fn active_recovered_owner_is_valid(
+    existing: Option<&QueueAbsentRecoveryRecord>,
+    jobs: &[Job],
+    envelopes: &BTreeMap<&str, &QueuedExecutionEnvelope>,
+    state: &ShipState,
+) -> Result<bool, String> {
+    let Some(record) =
+        existing.filter(|record| record.status == QueueAbsentRecoveryStatus::Enqueued)
+    else {
+        return Ok(false);
+    };
+    let Some(job) = jobs.iter().find(|job| {
+        job.id == record.replacement_job_id
+            && matches!(job.status, JobStatus::Pending | JobStatus::Running)
+    }) else {
+        return Ok(false);
+    };
+    let source = envelopes
+        .get(record.source_job_id.as_str())
+        .ok_or_else(|| "recovered owner lost its preserved source envelope".to_owned())?;
+    let replacement = envelopes
+        .get(record.replacement_job_id.as_str())
+        .ok_or_else(|| "recovered owner has no durable work envelope".to_owned())?;
+    validate_replacement(job, replacement, record, source, state)?;
+    if !matches!(
+        state.source_job_id.as_deref(),
+        Some(job_id) if job_id == record.source_job_id || job_id == record.replacement_job_id
+    ) {
+        return Err("recovered owner disagrees with current ship source".to_owned());
+    }
+    Ok(true)
+}
+
 fn ensure_source_has_no_outcome(state_dir: &Path, source_job_id: &str) -> Result<(), String> {
     if outcome_presence(state_dir, source_job_id)? {
         Err("source has a durable terminal outcome; replay refused".to_owned())
@@ -442,6 +477,28 @@ fn load_recovery_config(
         return Err("registered repo lacks unattended command authentication".to_owned());
     }
     Ok(config)
+}
+
+fn validate_source_context(
+    mode: RuntimeMode,
+    global_dir: &Path,
+    registered_repo_path: Option<&Path>,
+    source: &QueuedExecutionEnvelope,
+    state: &ShipState,
+) -> Result<PathBuf, String> {
+    let registered_repo_path =
+        registered_repo_path.ok_or_else(|| "registered repo path is missing".to_owned())?;
+    let canonical_path = fs::canonicalize(registered_repo_path)
+        .map_err(|error| format!("registered repo path is unavailable: {error}"))?;
+    let source_cwd = source
+        .provenance
+        .as_ref()
+        .ok_or_else(|| "preserved work item has no provenance; needs-agent".to_owned())?
+        .canonical_cwd
+        .clone();
+    let repo_config = load_recovery_config(mode, &source_cwd, global_dir)?;
+    validate_source(source, state, &canonical_path, &repo_config)?;
+    Ok(source_cwd)
 }
 
 fn outcome_presence(state_dir: &Path, job_id: &str) -> Result<bool, String> {
@@ -737,24 +794,6 @@ fn save_needs_agent(state_dir: &Path, state: &ShipState, reason: &str) -> Result
     save_record(&path, &record)
 }
 
-fn persist_needs_agent(
-    store: &ShipStateStore,
-    state_dir: &Path,
-    snapshot: &ShipState,
-    reason: &str,
-) -> Result<(), String> {
-    store
-        .with_pr_state_scoped_locked(&snapshot.repo, snapshot.pr, |current| {
-            if current.as_ref() == Some(snapshot) {
-                save_needs_agent(state_dir, snapshot, reason).map_err(
-                    |error| -> Box<dyn std::error::Error> { std::io::Error::other(error).into() },
-                )?;
-            }
-            Ok(())
-        })
-        .map_err(|error| error.to_string())
-}
-
 fn record_matches_state(record: &QueueAbsentRecoveryRecord, state: &ShipState) -> bool {
     record.pr == state.pr
         && canonical_repository(&record.repo) == canonical_repository(&state.repo)
@@ -996,6 +1035,26 @@ mod tests {
     }
 
     #[test]
+    fn running_recovered_owner_survives_ship_source_handoff() {
+        let fixture = Fixture::new();
+        let first = fixture.sweep(fixture.live(), |_| Ok(()));
+        let replacement_id = first.enqueued[0].2.clone();
+        let state_store = ShipStateStore::new(fixture.state_dir.join("ship")).expect("state store");
+        let mut state = state_store.get_scoped(REPO, 42).expect("state");
+        state.source_job_id = Some(replacement_id.clone());
+        state_store.save(&state).expect("worker source handoff");
+
+        let second = fixture.sweep(fixture.live(), |_| Ok(()));
+        assert!(second.enqueued.is_empty(), "{second:?}");
+        assert!(second.needs_agent.is_empty(), "{second:?}");
+        let record = load_record(&recovery_record_path(&fixture.state_dir, REPO, 42))
+            .expect("record read")
+            .expect("record");
+        assert_eq!(record.status, QueueAbsentRecoveryStatus::Enqueued);
+        assert_eq!(record.replacement_job_id, replacement_id);
+    }
+
+    #[test]
     fn same_head_envelope_from_prior_attempt_is_not_replayed() {
         let fixture = Fixture::new();
         let state_store = ShipStateStore::new(fixture.state_dir.join("ship")).expect("state store");
@@ -1149,6 +1208,46 @@ mod tests {
             !recovery_record_path(&fixture.state_dir, REPO, 42).exists(),
             "healthy ownership must not be durably fenced as ambiguous"
         );
+    }
+
+    #[test]
+    fn missing_repo_registration_does_not_fence_a_healthy_owner() {
+        let fixture = Fixture::new();
+        let mut queue = Queue::new(&fixture.state_dir).expect("queue");
+        let normal_job = crate::ship::submit_ship(
+            &fixture.request,
+            &mut queue,
+            &fixture.repo_path,
+            &fixture.state_dir,
+        )
+        .expect("normal replacement");
+        let mut config = fixture.config.clone();
+        config
+            .data
+            .get_mut("ship_state")
+            .and_then(toml::Value::as_table_mut)
+            .expect("ship_state")
+            .remove("repo_paths");
+
+        let report = recover_queue_absent_ships_with(
+            &fixture.state_dir,
+            RuntimeMode::Shipyard,
+            &fixture.global_dir,
+            &config,
+            |_, _, _| panic!("healthy owner must short-circuit before GitHub"),
+            |_| Ok(()),
+        );
+        assert!(report.enqueued.is_empty(), "{report:?}");
+        assert!(report.needs_agent.is_empty(), "{report:?}");
+        assert_eq!(
+            Queue::new(&fixture.state_dir)
+                .expect("queue")
+                .get_pending()
+                .expect("pending")[0]
+                .id,
+            normal_job.id
+        );
+        assert!(!recovery_record_path(&fixture.state_dir, REPO, 42).exists());
     }
 
     #[test]
@@ -1539,10 +1638,28 @@ mod tests {
             .expect("queue")
             .enqueue(job)
             .expect("terminal source");
+        let first = fixture.sweep(fixture.live(), |_| Ok(()));
+        assert!(first.enqueued.is_empty(), "{first:?}");
+        assert!(!first.needs_agent.is_empty(), "{first:?}");
+        let record_path = recovery_record_path(&fixture.state_dir, REPO, 42);
+        let record = load_record(&record_path)
+            .expect("record read")
+            .expect("terminal fence");
+        assert_eq!(record.status, QueueAbsentRecoveryStatus::NeedsAgent);
+
+        // Model retention trimming the source queue row. The durable recovery
+        // disposition must still prevent a replay after the only queue evidence
+        // disappears.
+        fs::remove_file(Queue::queue_file_at(&fixture.state_dir)).expect("trim queue evidence");
+        let after_trim = fixture.sweep(fixture.live(), |_| {
+            panic!("terminal source must remain fenced after queue retention")
+        });
+        assert!(after_trim.enqueued.is_empty(), "{after_trim:?}");
         assert!(
-            fixture
-                .sweep(fixture.live(), |_| Ok(()))
-                .enqueued
+            Queue::new(&fixture.state_dir)
+                .expect("queue")
+                .get_all()
+                .expect("jobs")
                 .is_empty()
         );
     }
