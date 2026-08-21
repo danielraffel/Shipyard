@@ -761,16 +761,18 @@ fn ensure_private_rust_toolchain(runner_dir: &Path) -> Result<(), CliFailure> {
         "download rustup installer",
     )?;
     verify_sha256(&installer, PINNED_RUSTUP_SHA256, "rustup-init")?;
-    let mut permissions = fs::metadata(&installer)
-        .map_err(|e| CliFailure::new(1, format!("failed to inspect rustup-init: {e}")))?
-        .permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&installer)
+            .map_err(|e| CliFailure::new(1, format!("failed to inspect rustup-init: {e}")))?
+            .permissions();
         permissions.set_mode(0o700);
+        fs::set_permissions(&installer, permissions).map_err(|e| {
+            CliFailure::new(1, format!("failed to make rustup-init executable: {e}"))
+        })?;
     }
-    fs::set_permissions(&installer, permissions)
-        .map_err(|e| CliFailure::new(1, format!("failed to make rustup-init executable: {e}")))?;
     let status = Command::new(&installer)
         .args([
             "-y",
