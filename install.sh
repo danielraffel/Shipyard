@@ -10,6 +10,8 @@ set -euo pipefail
 #   SHIPYARD_DRY_RUN          Print resolved settings and exit
 #   SHIPYARD_SKIP_DOWNLOAD    Reuse an existing binary in install dir
 #   SHIPYARD_SKIP_SMOKE       Skip post-install --version smoke
+#   SHIPYARD_EXPECTED_BINARY_SHA256
+#                             Require these exact staged and installed bytes
 #   SHIPYARD_REPO             Override release repo
 #   SHIPYARD_GITHUB_TOKEN     Optional token for private release repos
 
@@ -17,6 +19,39 @@ REPO="${SHIPYARD_REPO:-danielraffel/Shipyard}"
 INSTALL_DIR="${SHIPYARD_INSTALL_DIR:-${HOME}/.local/bin}"
 REQUESTED_VERSION="${SHIPYARD_VERSION:-latest}"
 GITHUB_TOKEN_VALUE="${SHIPYARD_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+EXPECTED_BINARY_SHA256="${SHIPYARD_EXPECTED_BINARY_SHA256:-}"
+
+binary_sha256() {
+    path="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "${path}" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "${path}" | awk '{print $1}'
+    else
+        openssl dgst -sha256 "${path}" | awk '{print $NF}'
+    fi
+}
+
+verify_expected_binary_sha256() {
+    path="$1"
+    phase="$2"
+    [ -z "${EXPECTED_BINARY_SHA256}" ] && return 0
+    case "${EXPECTED_BINARY_SHA256}" in
+        *[!0-9a-fA-F]*|'')
+            echo "SHIPYARD_EXPECTED_BINARY_SHA256 must be exactly 64 hexadecimal characters." >&2
+            exit 1
+            ;;
+    esac
+    if [ "${#EXPECTED_BINARY_SHA256}" -ne 64 ]; then
+        echo "SHIPYARD_EXPECTED_BINARY_SHA256 must be exactly 64 hexadecimal characters." >&2
+        exit 1
+    fi
+    actual_sha256="$(binary_sha256 "${path}")"
+    if [ "$(printf '%s' "${actual_sha256}" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "${EXPECTED_BINARY_SHA256}" | tr '[:upper:]' '[:lower:]')" ]; then
+        echo "Shipyard ${phase} binary SHA-256 mismatch: expected ${EXPECTED_BINARY_SHA256}, got ${actual_sha256}." >&2
+        exit 1
+    fi
+}
 
 curl_shipyard() {
     if [ -n "${GITHUB_TOKEN_VALUE}" ]; then
@@ -274,9 +309,12 @@ fi
 chmod +x "${STAGED_DEST}"
 
 prepare_macos_binary "${STAGED_DEST}"
+verify_expected_binary_sha256 "${STAGED_DEST}" "prepared"
 smoke_binary_or_repair "${STAGED_DEST}"
+verify_expected_binary_sha256 "${STAGED_DEST}" "smoke-tested"
 mv -f "${STAGED_DEST}" "${DEST}"
 ln -sf "${DEST}" "${INSTALL_DIR}/${ALIAS_NAME}"
+verify_expected_binary_sha256 "${DEST}" "installed"
 smoke_binary_or_repair "${DEST}"
 
 echo ""
