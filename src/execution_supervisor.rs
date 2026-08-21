@@ -5,8 +5,12 @@
 //! stale running job becomes an explicit `UNCERTAIN` terminal outcome.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
+use std::io;
+#[cfg(unix)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -830,6 +834,13 @@ fn terminate_child_tree(child: &mut Child) -> io::Result<bool> {
         #[cfg(windows)]
         return Ok(false);
     }
+    #[cfg_attr(
+        windows,
+        expect(
+            unused_variables,
+            reason = "Windows taskkill confirms the tree without exposing descendant PIDs"
+        )
+    )]
     let Ok(descendants) = signal_process_tree(child.id()) else {
         return Ok(false);
     };
@@ -890,6 +901,13 @@ fn verify_exited_worker_group_dead(process_group: u32) -> io::Result<bool> {
 }
 
 fn terminate_adopted_worker_tree(receipt: &WorkerReceipt) -> bool {
+    #[cfg_attr(
+        windows,
+        expect(
+            unused_variables,
+            reason = "Windows taskkill confirms the tree without exposing descendant PIDs"
+        )
+    )]
     let Ok(descendants) = signal_process_tree(receipt.pid) else {
         return false;
     };
@@ -960,6 +978,13 @@ fn process_id_liveness(pid: u32) -> ProcessLiveness {
     }
 }
 
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "the Unix implementation is fallible and callers share one cross-platform API"
+    )
+)]
 fn worker_generation() -> io::Result<String> {
     #[cfg(unix)]
     {
@@ -1103,8 +1128,10 @@ mod tests {
         JobResourcePlan, QueueOutcomeStore, QueuedExecutionKind, QueuedExecutionRequest,
         QueuedShipRequest,
     };
+    #[cfg(unix)]
     use std::sync::{LazyLock, Mutex};
 
+    #[cfg(unix)]
     static PROCESS_TREE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn envelope(claims: &[&str], provenance: bool) -> QueuedExecutionEnvelope {
