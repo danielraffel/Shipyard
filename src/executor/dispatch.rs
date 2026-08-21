@@ -404,6 +404,7 @@ pub struct ExecutorDispatcher {
     windows: WindowsExecutor,
     cloud: CloudExecutor,
     host_pool_store: Option<HostPoolLeaseStore>,
+    rotated_segments: usize,
 }
 
 impl ExecutorDispatcher {
@@ -425,6 +426,21 @@ impl ExecutorDispatcher {
         )
     }
 
+    /// Construct a dispatcher with state-backed leases and configured log retention.
+    #[must_use]
+    pub fn new_with_state_dir_and_log_retention(
+        prepared_state_store: Option<PreparedStateStore>,
+        state_dir: &std::path::Path,
+        policy: crate::log_retention::LogRetentionPolicy,
+    ) -> Self {
+        let mut dispatcher = Self::new_with_state_dir(prepared_state_store, state_dir);
+        dispatcher.rotated_segments = policy.rotated_segments;
+        dispatcher.local = dispatcher
+            .local
+            .with_rotated_segments(policy.rotated_segments);
+        dispatcher
+    }
+
     /// Construct a dispatcher with an explicit host-pool store.
     #[must_use]
     pub fn new_with_host_pool_store(
@@ -439,6 +455,7 @@ impl ExecutorDispatcher {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ),
             host_pool_store,
+            rotated_segments: crate::log_retention::LogRetentionPolicy::default().rotated_segments,
         }
     }
 
@@ -470,6 +487,7 @@ impl ExecutorDispatcher {
                 ssh_request.branch = request.branch;
                 ssh_request.target = target.clone();
                 ssh_request.contract.clone_from(contract);
+                ssh_request.rotated_segments = self.rotated_segments;
                 ssh_request.resume_from = request.resume_from;
                 ssh_request.mode = mode_label(request.mode);
                 ssh_request.progress_callback = request.progress_callback.take();
@@ -488,6 +506,7 @@ impl ExecutorDispatcher {
                 windows_request.branch = request.branch;
                 windows_request.target = target.clone();
                 windows_request.contract.clone_from(contract);
+                windows_request.rotated_segments = self.rotated_segments;
                 windows_request.resume_from = request.resume_from;
                 windows_request.mode = mode_label(request.mode);
                 windows_request.progress_callback = request.progress_callback.take();

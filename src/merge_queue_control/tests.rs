@@ -5,6 +5,7 @@ use super::{
 };
 use crate::identity::RuntimeMode;
 use crate::ship_state::{ShipState, ShipStateStore};
+use std::io::Write;
 
 fn fixture() -> (
     tempfile::TempDir,
@@ -17,7 +18,7 @@ fn fixture() -> (
     std::fs::create_dir_all(cwd.join(".shipyard")).expect("config dir");
     std::fs::write(
         cwd.join(".shipyard/config.toml"),
-        "[merge_queue]\nmutation_machine = \"studio\"\n",
+        "[merge_queue]\nmutation_machine = \"studio\"\n[log_retention]\nmax_active_file_bytes = 1048576\nrotated_segments = 2\n",
     )
     .expect("config");
     let state_root = temp.path().join("state");
@@ -458,6 +459,7 @@ fn uncertain_mutation_blocks_retry_until_explicit_resolution() {
     assert!(error.contains("is uncertain"));
     resolve_uncertainty(
         state_root,
+        &trusted_global_dir(&cwd),
         &correlation_id,
         "rejected",
         "not present in queue",
@@ -487,6 +489,7 @@ fn revocation_resolution_allows_live_base_and_preserves_enqueue_proof() {
 
     resolve_uncertainty(
         state_root,
+        &trusted_global_dir(&cwd),
         &correlation_id,
         "accepted",
         "PR absent from queue",
@@ -515,6 +518,7 @@ fn identity_drift_skips_state_rewrite_but_allows_audit_resolution() {
     store.save(&advanced).expect("advanced state");
     resolve_uncertainty(
         state_root,
+        &trusted_global_dir(&cwd),
         &correlation_id,
         "rejected",
         "old head not present in queue",
@@ -528,4 +532,41 @@ fn identity_drift_skips_state_rewrite_but_allows_audit_resolution() {
         advanced.merge_queue_enqueue_started_at
     );
     assert!(uncertain_mutations(state_root).expect("audit").is_empty());
+}
+
+#[test]
+fn unresolved_mutation_pins_audit_against_rotation() {
+    let (_temp, cwd, store, state) = fixture();
+    let state_root = store.path().parent().expect("state root");
+    std::fs::write(state_root.join("machine-tag"), "studio\n").expect("tag");
+    store.save(&state).expect("state");
+    let guard = acquire_guard(&store, &cwd, &state, "enqueue pull request").expect("mutation");
+    let correlation_id = guard.correlation_id.clone();
+    let audit_path = state_root.join("merge_queue/mutations.jsonl");
+    let filler = serde_json::json!({
+        "timestamp": chrono::Utc::now(),
+        "correlation_id": "resolved-filler",
+        "phase": "finished",
+        "outcome": "accepted",
+        "padding": "x".repeat(1_100_000),
+    });
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&audit_path)
+            .expect("audit"),
+        "{filler}"
+    )
+    .expect("inflate audit");
+    drop(guard);
+    assert!(!state_root.join("merge_queue/mutations.jsonl.1").exists());
+
+    let uncertain = uncertain_mutations(state_root).expect("rotated audit");
+    let entry = uncertain
+        .iter()
+        .find(|entry| entry["correlation_id"] == correlation_id)
+        .expect("uncertain identity");
+    assert_eq!(entry["repo"], state.repo);
+    assert_eq!(entry["base"], state.base_branch);
+    assert_eq!(entry["pr"], state.pr);
 }

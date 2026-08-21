@@ -26,7 +26,6 @@ use serde_json::Value;
 #[cfg(unix)]
 use chrono::Utc;
 
-#[cfg(unix)]
 use crate::config::LoadedConfig;
 use crate::daemon_ipc::read_daemon_status;
 #[cfg(unix)]
@@ -604,12 +603,34 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
     if read_daemon_status(&request.state_dir).is_some() {
         return Ok(read_pid_file(&daemon_dir.join("daemon.pid")).unwrap_or(0));
     }
-    if let Some(pid) = live_daemon_pid(&daemon_dir) {
-        let _ = terminate_daemon_pid(pid, Duration::from_secs(3));
+    if let Some(pid) = read_pid_file(&daemon_dir.join("daemon.pid"))
+        && pid > 0
+        && pid_alive(pid)
+    {
+        if !process_looks_like_shipyard_daemon(pid) {
+            return Err(DaemonSpawnFailedError(format!(
+                "refusing to replace live process {pid}: daemon identity could not be confirmed"
+            )));
+        }
+        if !terminate_daemon_pid(pid, Duration::from_secs(3)) {
+            return Err(DaemonSpawnFailedError(format!(
+                "refusing to replace daemon process {pid}: termination could not be confirmed"
+            )));
+        }
     }
     cleanup_stale_runtime_files(&daemon_dir).map_err(|error| io_spawn_error(&error))?;
 
     let log_path = daemon_dir.join("daemon.log");
+    let retention_config = request.global_dir_override.clone().map_or_else(
+        || LoadedConfig::load_machine_global(request.mode),
+        LoadedConfig::load_machine_global_from_dir,
+    );
+    let retention_policy = retention_config.map_or_else(
+        |_| crate::log_retention::LogRetentionPolicy::default(),
+        |config| crate::log_retention::LogRetentionPolicy::from_config(&config),
+    );
+    crate::log_retention::rotate_if_oversize(&log_path, retention_policy)
+        .map_err(|error| io_spawn_error(&error))?;
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1441,6 +1462,11 @@ fn process_looks_like_shipyard_daemon(pid: u32) -> bool {
     args.contains("shipyard") && args.contains("daemon") && args.contains("run")
 }
 
+#[cfg(not(unix))]
+fn process_looks_like_shipyard_daemon(_pid: u32) -> bool {
+    false
+}
+
 #[cfg(unix)]
 fn signal_pid(pid: u32, signal: &str) -> bool {
     Command::new("kill")
@@ -1469,11 +1495,6 @@ fn wait_until_pid_stops(pid: u32, timeout: Duration) -> bool {
 fn live_daemon_pid(daemon_dir: &Path) -> Option<u32> {
     let pid = read_pid_file(&daemon_dir.join("daemon.pid"))?;
     (pid > 0 && pid_alive(pid) && process_looks_like_shipyard_daemon(pid)).then_some(pid)
-}
-
-#[cfg(not(unix))]
-fn live_daemon_pid(_daemon_dir: &Path) -> Option<u32> {
-    None
 }
 
 #[cfg(unix)]
@@ -1568,8 +1589,9 @@ mod tests {
     use super::{
         DaemonRunConfig, DaemonRunError, RegistrationSyncState, WebhookRequest,
         archive_closed_pull_request_ship_state, daemon_tunnel_config, handle_webhook_request,
-        load_or_create_webhook_secret, parse_tunnel_enabled, pid_alive, reconcile_healed_event,
-        run_blocking, ship_state_map, should_start_reconcile, start_tunnel_runtime, stop_running,
+        load_or_create_webhook_secret, parse_tunnel_enabled, pid_alive,
+        process_looks_like_shipyard_daemon, reconcile_healed_event, run_blocking, ship_state_map,
+        should_start_reconcile, start_tunnel_runtime, stop_running,
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{read_daemon_ship_state_list, read_daemon_status};
@@ -2187,6 +2209,15 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(pid_path.exists(), "pid file was not written");
+        let identity_deadline = Instant::now() + Duration::from_secs(1);
+        while !process_looks_like_shipyard_daemon(child.id()) && Instant::now() < identity_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_looks_like_shipyard_daemon(child.id()),
+            "daemon identity was not observable"
+        );
 
         assert!(stop_running(temp.path()));
 

@@ -1021,6 +1021,18 @@ audit-log use case. If you add a brand new orchestrated flow,
 extend the scope deliberately rather than blanket-supervising
 everything.
 
+### Log retention operations
+
+Run `shipyard cleanup` first: dry-run is the default and reports each planned
+`compress`/`delete`, every protected active/failure/audit directory, and the
+high/low byte-watermark projection. Apply with `shipyard cleanup --apply` only
+after reviewing that receipt. Use `shipyard cleanup --pin <job-id>` to create
+the indefinite `.shipyard-retain` incident/audit pin under the cleanup lock;
+do not raw-`touch` it while cleanup may run. Failure and unclassified legacy
+evidence is never pressure-deleted. Current Phase 1 rotation is lossless at
+writer reopen boundaries; do not use external `copytruncate` against active
+Shipyard writers. Full continuously-active writer rotation remains Phase 2.
+
 ## GraphQL And GitHub App Fallback Behaviour
 
 Raw queue removal is not a queue-steward operation. Install

@@ -108,13 +108,22 @@ pub(super) fn merge_queue_control_command<W: Write>(
             correlation_id,
             outcome,
             reason,
-        } => resolve_command(state_root, &correlation_id, &outcome, &reason, json, stdout)?,
+        } => resolve_command(
+            state_root,
+            global_dir,
+            &correlation_id,
+            &outcome,
+            &reason,
+            json,
+            stdout,
+        )?,
     }
     Ok(ExitCode::SUCCESS)
 }
 
 fn resolve_command<W: Write>(
     state_root: &Path,
+    global_dir: &Path,
     correlation_id: &str,
     outcome: &str,
     reason: &str,
@@ -126,6 +135,7 @@ fn resolve_command<W: Write>(
     }
     resolve_uncertainty(
         state_root,
+        global_dir,
         correlation_id.trim(),
         outcome.trim(),
         reason.trim(),

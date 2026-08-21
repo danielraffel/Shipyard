@@ -64,6 +64,8 @@ pub mod init_config;
 pub mod job;
 /// Advisory-vs-required lane policy resolution.
 pub mod lane_policy;
+/// Bounded log rotation, terminal classification, and retention primitives.
+pub mod log_retention;
 /// Merge-queue enqueue / poll / eviction supervision engine.
 pub mod merge_queue;
 /// Fleet authority, serialization, hold, and audit controls for queue writes.

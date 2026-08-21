@@ -514,6 +514,7 @@ fn handle_state_command<W: Write>(
         }
         Command::Queue => queue_command(state_dir, json, stdout),
         Command::Cleanup {
+            pin,
             dry_run,
             apply,
             ship_state,
@@ -521,10 +522,11 @@ fn handle_state_command<W: Write>(
             state_dir,
             mode,
             cwd,
-            CleanupCommandOptions {
+            &CleanupCommandOptions {
                 mode: CleanupMode::from_flags(dry_run, apply),
                 scope: CleanupScope::from_flag(ship_state),
                 output: CleanupOutput::from_json(json),
+                pin,
             },
             stdout,
         ),
@@ -2373,10 +2375,15 @@ mod tests {
         std::fs::create_dir_all(&orphan_log).expect("orphan log dir");
         std::fs::create_dir_all(&active_log).expect("active log dir");
         std::fs::write(orphan_log.join("out.log"), "orphan\n").expect("orphan log");
+        std::fs::write(
+            orphan_log.join(".retention.json"),
+            r#"{"schema_version":1,"job_id":"orphan","terminal_at":"2020-01-01T00:00:00Z","failed":false,"reason":"passed"}"#,
+        )
+        .expect("retention manifest");
         std::fs::write(active_log.join("out.log"), "active\n").expect("active log");
         std::fs::write(
             temp.path().join("queue.json"),
-            r#"{"jobs":[{"id":"active"}]}"#,
+            r#"{"jobs":[{"id":"active","status":"running"}]}"#,
         )
         .expect("queue file");
         std::fs::create_dir_all(temp.path().join("bundles")).expect("bundles dir");
@@ -2427,10 +2434,16 @@ mod tests {
         let evidence = temp.path().join("evidence").join("bad.json");
         std::fs::create_dir_all(&orphan_log).expect("orphan log dir");
         std::fs::write(orphan_log.join("out.log"), "orphan\n").expect("orphan log");
+        std::fs::write(
+            orphan_log.join(".retention.json"),
+            r#"{"schema_version":1,"job_id":"orphan","terminal_at":"2020-01-01T00:00:00Z","failed":false,"reason":"passed"}"#,
+        )
+        .expect("retention manifest");
         std::fs::create_dir_all(temp.path().join("bundles")).expect("bundles dir");
         std::fs::write(&bundle, "bundle").expect("bundle");
         std::fs::create_dir_all(temp.path().join("evidence")).expect("evidence dir");
         std::fs::write(&evidence, "{not json").expect("evidence");
+        std::fs::write(temp.path().join("queue.json"), r#"{"jobs":[]}"#).expect("queue");
 
         let cli = Cli::parse_from([
             "shipyard",

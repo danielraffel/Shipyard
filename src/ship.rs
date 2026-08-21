@@ -1549,6 +1549,9 @@ fn persist_recovered_outcomes(
                 ))?;
             }
         }
+        Queue::new(state_dir)
+            .map_err(QueueError::from)?
+            .publish_terminal_manifest_if_current(job)?;
     }
     Ok(())
 }
@@ -1695,7 +1698,11 @@ pub(crate) fn execute_started_queued_job(
     let warm_pool = WarmPool::new(default_pool_path(state_dir));
     let prepared = crate::prepared_state::PreparedStateStore::new(state_dir.join("prepared"))
         .map_err(|error| ShipExecutionError::WorkerSetup(error.to_string()))?;
-    let dispatcher = ExecutorDispatcher::new_with_state_dir(Some(prepared), state_dir);
+    let dispatcher = ExecutorDispatcher::new_with_state_dir_and_log_retention(
+        Some(prepared),
+        state_dir,
+        crate::log_retention::LogRetentionPolicy::from_config(&config),
+    );
     let mut envelope = envelope;
     envelope.cwd = canonical_cwd;
     run_started_worker(

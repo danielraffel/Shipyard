@@ -627,6 +627,13 @@ impl ExecutionSupervisor {
         write_receipt: impl FnOnce(&Path, &WorkerReceipt) -> io::Result<()>,
     ) -> io::Result<()> {
         let generation = worker_generation()?;
+        let retention_policy =
+            crate::config::LoadedConfig::load_machine_global_from_dir(self.global_dir.clone())
+                .map_or_else(
+                    |_| crate::log_retention::LogRetentionPolicy::default(),
+                    |config| crate::log_retention::LogRetentionPolicy::from_config(&config),
+                );
+        crate::log_retention::rotate_if_oversize(&self.log_path(&job.id), retention_policy)?;
         let log = OpenOptions::new()
             .create(true)
             .append(true)

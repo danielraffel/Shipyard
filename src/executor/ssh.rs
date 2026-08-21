@@ -132,6 +132,8 @@ pub struct SshValidationRequest<'a> {
     pub contract: Option<ContractConfig>,
     /// Local log file path.
     pub log_path: PathBuf,
+    /// Number of prior target-log segments preserved on reopen.
+    pub rotated_segments: usize,
     /// Optional stage to resume from.
     pub resume_from: Option<String>,
     /// Validation mode label.
@@ -152,6 +154,7 @@ impl SshValidationRequest<'_> {
             validation,
             contract: None,
             log_path,
+            rotated_segments: crate::log_retention::LogRetentionPolicy::default().rotated_segments,
             resume_from: None,
             mode: "default".to_owned(),
             progress_callback: None,
@@ -493,6 +496,7 @@ impl<O: SshOperations> SshExecutor<O> {
         let mut stream_request = StreamingCommand::shell(String::new());
         stream_request.command = StreamingCommandSpec::Args(argv);
         stream_request.log_path = Some(request.log_path.clone());
+        stream_request.rotated_segments = request.rotated_segments;
         stream_request.timeout = Some(request.target.timeout());
         stream_request.required_contract_markers = required_markers(request.contract.as_ref());
         stream_request.progress_callback = progress_callback;
@@ -1408,6 +1412,7 @@ mod tests {
                 .expect("log")
                 .path()
                 .to_path_buf(),
+            rotated_segments: 4,
             resume_from: None,
             mode: "default".to_owned(),
             progress_callback: None,

@@ -82,6 +82,8 @@ pub struct StreamingCommand<'a> {
     pub log_path: Option<PathBuf>,
     /// Append to the log instead of replacing it.
     pub append: bool,
+    /// Number of prior log segments preserved when replacing the active log.
+    pub rotated_segments: usize,
     /// Optional wall-clock timeout.
     pub timeout: Option<Duration>,
     /// Initial phase.
@@ -107,6 +109,7 @@ impl StreamingCommand<'_> {
             cwd: None,
             log_path: None,
             append: false,
+            rotated_segments: crate::log_retention::LogRetentionPolicy::default().rotated_segments,
             timeout: None,
             phase: None,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
@@ -440,6 +443,9 @@ fn open_log(request: &StreamingCommand<'_>) -> io::Result<Option<std::fs::File>>
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    if !request.append {
+        crate::log_retention::rotate_before_open(path, request.rotated_segments)?;
+    }
     Ok(Some(
         std::fs::OpenOptions::new()
             .create(true)
@@ -624,6 +630,7 @@ mod tests {
             cwd: None,
             log_path: None,
             append: false,
+            rotated_segments: crate::log_retention::LogRetentionPolicy::default().rotated_segments,
             timeout: None,
             phase: None,
             heartbeat_interval: Duration::from_secs(30),
@@ -637,6 +644,23 @@ mod tests {
             run_streaming_command(request).expect_err("missing program"),
             StreamingError::MissingProgram
         ));
+    }
+
+    #[test]
+    fn configured_rotation_segment_count_is_honored() {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("target.log");
+        for value in ["one", "two", "three"] {
+            let mut request = StreamingCommand::shell(format!("printf '{value}'"));
+            request.log_path = Some(log.clone());
+            request.rotated_segments = 1;
+            run_streaming_command(request).expect("stream command");
+        }
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.1", log.display())).expect("prior segment"),
+            "two"
+        );
+        assert!(!std::path::Path::new(&format!("{}.2", log.display())).exists());
     }
 
     #[cfg(not(windows))]
