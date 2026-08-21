@@ -66,8 +66,9 @@ pub enum QueueError {
     Io(io::Error),
     /// Queue JSON serialization failed.
     Json(serde_json::Error),
-    /// A worker attempted to update a queue record that no longer exists.
-    JobNotFound(String),
+    /// A stale writer attempted to overwrite a newer terminal or cancellation
+    /// request state.
+    StateConflict(String),
 }
 
 impl std::fmt::Display for QueueError {
@@ -75,7 +76,7 @@ impl std::fmt::Display for QueueError {
         match self {
             Self::Io(error) => write!(formatter, "queue I/O failed: {error}"),
             Self::Json(error) => write!(formatter, "queue JSON failed: {error}"),
-            Self::JobNotFound(job_id) => write!(formatter, "queue job not found: {job_id}"),
+            Self::StateConflict(reason) => write!(formatter, "queue state conflict: {reason}"),
         }
     }
 }
@@ -85,7 +86,7 @@ impl std::error::Error for QueueError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::JobNotFound(_) => None,
+            Self::StateConflict(_) => None,
         }
     }
 }
@@ -146,7 +147,8 @@ impl Queue {
         self.state_dir.join("queue.state.lock")
     }
 
-    /// Add a job, superseding pending jobs for the same branch, target list, and mode.
+    /// Add a job, superseding pending jobs for the same workload, branch,
+    /// target list, and mode.
     pub fn enqueue(&mut self, job: Job) -> QueueResult<Job> {
         self.with_jobs_locked(|jobs| {
             cancel_superseded_pending(jobs, &job);
@@ -165,68 +167,52 @@ impl Queue {
     /// Replace a queued job matched by id, then trim old completed jobs.
     pub fn update(&mut self, job: &Job) -> QueueResult<()> {
         self.with_jobs_locked(|jobs| {
-            if let Some(queued) = jobs.iter_mut().find(|queued| queued.id == job.id)
-                && !is_terminal_job(queued.status)
-            {
-                *queued = job.clone();
+            for queued in jobs.iter_mut() {
+                if queued.id == job.id {
+                    if queued.status == JobStatus::Running
+                        && queued.cancel_requested_at.is_some()
+                        && (job.cancel_requested_at != queued.cancel_requested_at
+                            || job.cancellation_reason != queued.cancellation_reason)
+                    {
+                        return Err(QueueError::StateConflict(format!(
+                            "job {} has a newer cancellation request",
+                            job.id
+                        )));
+                    }
+                    if matches!(queued.status, JobStatus::Completed | JobStatus::Cancelled)
+                        && queued.status != job.status
+                    {
+                        return Err(QueueError::StateConflict(format!(
+                            "job {} is already terminal as {:?}",
+                            job.id, queued.status
+                        )));
+                    }
+                    *queued = job.clone();
+                }
             }
             let _ = trim_terminal(jobs);
             Ok(())
         })
     }
 
-    /// Commit a worker snapshot unless the durable record is already terminal,
-    /// returning the winning durable value either way. Callers must derive
-    /// outcomes and post-validation actions from this winner, never their
-    /// stale local snapshot.
-    pub fn commit_worker_update(&mut self, job: &Job) -> QueueResult<Job> {
+    /// Atomically request cancellation. Running jobs retain their status and
+    /// claims until their exact owner acknowledges process-tree death.
+    pub fn request_cancel(
+        &mut self,
+        job_id: &str,
+        reason: Option<String>,
+    ) -> QueueResult<Option<Job>> {
         self.with_jobs_locked(|jobs| {
-            for queued in jobs.iter_mut() {
-                if queued.id == job.id {
-                    // Terminal records win every race. A worker can hold a
-                    // stale Running snapshot after the daemon has cancelled
-                    // it; progress/final writes must never resurrect work or
-                    // erase the durable terminal reason.
-                    if is_terminal_job(queued.status) {
-                        return Ok(queued.clone());
-                    }
-                    *queued = job.clone();
-                    let winner = queued.clone();
-                    let _ = trim_terminal(jobs);
-                    return Ok(winner);
-                }
-            }
-            Err(QueueError::JobNotFound(job.id.clone()))
+            let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) else {
+                return Ok(None);
+            };
+            let requested = job
+                .request_cancel_with_reason(reason)
+                .map_err(|error| QueueError::StateConflict(error.to_string()))?;
+            *job = requested.clone();
+            let _ = trim_terminal(jobs);
+            Ok(Some(requested))
         })
-    }
-
-    /// Run durable side-record writes while the current job is fenced, then
-    /// publish the worker's terminal snapshot. If another actor already won
-    /// with a terminal record, the callback is not run and that record wins.
-    /// A callback failure leaves the queue record non-terminal so the worker
-    /// failure path can terminalize it as uncertain.
-    pub fn commit_worker_terminal_after<E>(
-        &self,
-        job: &Job,
-        before_commit: impl FnOnce(&Job) -> Result<(), E>,
-    ) -> Result<Job, E>
-    where
-        E: From<QueueError>,
-    {
-        let _lock = StateLock::acquire(self.state_lock_file()).map_err(QueueError::from)?;
-        let mut jobs = self.read_jobs_from_disk().map_err(E::from)?;
-        let Some(index) = jobs.iter().position(|queued| queued.id == job.id) else {
-            return Err(E::from(QueueError::JobNotFound(job.id.clone())));
-        };
-        if is_terminal_job(jobs[index].status) {
-            return Ok(jobs[index].clone());
-        }
-        before_commit(job)?;
-        jobs[index] = job.clone();
-        let winner = jobs[index].clone();
-        let _ = trim_terminal(&mut jobs);
-        self.save_jobs_to_disk(&jobs).map_err(E::from)?;
-        Ok(winner)
     }
 
     /// Look up a job by id.
@@ -302,6 +288,23 @@ impl Queue {
     ) -> QueueResult<Vec<Job>> {
         self.with_jobs_locked(|jobs| {
             let recovered = recover_stale_running_jobs(jobs);
+            let _ = trim_terminal(jobs);
+            Ok(recovered)
+        })
+    }
+
+    /// Recover only selected running jobs. Foreground drain owners use this to
+    /// avoid terminalizing jobs whose durable envelopes assign ownership to a
+    /// live daemon worker.
+    pub fn recover_selected_running_jobs_for_drain(
+        &mut self,
+        _drain_lock: &DrainLock,
+        job_ids: &[String],
+    ) -> QueueResult<Vec<Job>> {
+        let selected = job_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        self.with_jobs_locked(|jobs| {
+            let recovered =
+                recover_running_jobs_matching(jobs, |job| selected.contains(job.id.as_str()));
             let _ = trim_terminal(jobs);
             Ok(recovered)
         })
@@ -405,37 +408,6 @@ impl Queue {
         })
     }
 
-    /// Cancel selected running jobs. The daemon writes this terminal record
-    /// before it signals the supervised process group, so stale worker
-    /// progress cannot erase the reason or reclaim capacity.
-    pub fn cancel_running_jobs_for_drain(
-        &mut self,
-        _drain_lock: &DrainLock,
-        cancellations: &[QueuePendingCancellation],
-    ) -> QueueResult<Vec<Job>> {
-        self.with_jobs_locked(|jobs| {
-            let mut cancelled_jobs = Vec::new();
-            let mut seen = BTreeSet::new();
-            for cancellation in cancellations {
-                if !seen.insert(cancellation.job_id.as_str()) {
-                    continue;
-                }
-                let Some(job) = jobs
-                    .iter_mut()
-                    .find(|job| job.id == cancellation.job_id && job.status == JobStatus::Running)
-                else {
-                    continue;
-                };
-                if let Ok(cancelled) = job.cancel_with_reason(Some(cancellation.reason.clone())) {
-                    *job = cancelled.clone();
-                    cancelled_jobs.push(cancelled);
-                }
-            }
-            let _ = trim_terminal(jobs);
-            Ok(cancelled_jobs)
-        })
-    }
-
     /// Cancel the given jobs only if, re-checked under the state lock, they are
     /// still `Running` and still stale by heartbeat age. Returns the jobs that
     /// were actually cancelled (terminal `Cancelled`, with `reason`).
@@ -485,6 +457,56 @@ impl Queue {
         _drain_lock: &DrainLock,
         requeues: &[QueueDeferredRequeue],
     ) -> QueueResult<Vec<Job>> {
+        self.requeue_deferred_running_jobs(requeues)
+    }
+
+    /// Return one exactly fenced daemon worker to pending after a transient
+    /// scheduler deferral. The caller must first verify the worker receipt;
+    /// unlike a drain owner, the worker owns only its own job id.
+    pub(crate) fn requeue_deferred_daemon_worker(
+        &mut self,
+        requeue: QueueDeferredRequeue,
+    ) -> QueueResult<Option<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let Some(job) = jobs
+                .iter_mut()
+                .find(|job| job.id == requeue.job_id && job.status == JobStatus::Running)
+            else {
+                return Ok(None);
+            };
+            if job.cancel_requested_at.is_none() {
+                job.scheduler_defer_reason = Some(requeue.reason);
+                job.scheduler_defer_count = job.scheduler_defer_count.saturating_add(1);
+                job.scheduler_defer_until = requeue.defer_until;
+            }
+            Ok(Some(job.clone()))
+        })
+    }
+
+    /// Release a daemon-deferred Running claim only after its supervisor has
+    /// verified that the exact worker tree is dead.
+    pub(crate) fn finalize_deferred_daemon_worker(
+        &mut self,
+        job_id: &str,
+    ) -> QueueResult<Option<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let Some(job) = jobs.iter_mut().find(|job| {
+                job.id == job_id
+                    && job.status == JobStatus::Running
+                    && job.cancel_requested_at.is_none()
+                    && job.scheduler_defer_reason.is_some()
+            }) else {
+                return Ok(None);
+            };
+            job.status = JobStatus::Pending;
+            Ok(Some(job.clone()))
+        })
+    }
+
+    fn requeue_deferred_running_jobs(
+        &mut self,
+        requeues: &[QueueDeferredRequeue],
+    ) -> QueueResult<Vec<Job>> {
         self.with_jobs_locked(|jobs| {
             let mut requeued_jobs = Vec::new();
             let mut seen = BTreeSet::new();
@@ -498,6 +520,10 @@ impl Queue {
                 else {
                     continue;
                 };
+                if job.cancel_requested_at.is_some() {
+                    requeued_jobs.push(job.clone());
+                    continue;
+                }
                 if let Ok(deferred) =
                     job.defer_for_scheduler(requeue.reason.clone(), requeue.defer_until)
                 {
@@ -524,6 +550,9 @@ impl Queue {
             else {
                 return Ok(None);
             };
+            if job.cancel_requested_at.is_some() {
+                return Ok(Some(job.clone()));
+            }
             for target_name in &job.target_names {
                 job.results.entry(target_name.clone()).or_insert_with(|| {
                     let mut result = stale_recovery_result(target_name);
@@ -534,37 +563,6 @@ impl Queue {
             }
             job.status = JobStatus::Completed;
             job.completed_at = Some(Utc::now());
-            let completed = job.clone();
-            let _ = trim_terminal(jobs);
-            Ok(Some(completed))
-        })
-    }
-
-    /// Reclassify the exact completed snapshot produced by an authoritative
-    /// worker when its required post-validation phase fails. The full snapshot
-    /// comparison fences this exceptional terminal correction from stale
-    /// workers and preserves any independently won cancellation.
-    pub fn reclassify_completed_uncertain(
-        &mut self,
-        expected: &Job,
-        reason: &str,
-    ) -> QueueResult<Option<Job>> {
-        self.with_jobs_locked(|jobs| {
-            let Some(job) = jobs
-                .iter_mut()
-                .find(|job| job.id == expected.id && **job == *expected)
-            else {
-                return Ok(None);
-            };
-            if job.status != JobStatus::Completed {
-                return Ok(None);
-            }
-            for target_name in &job.target_names {
-                let mut result = stale_recovery_result(target_name);
-                result.error_message = Some(reason.to_owned());
-                result.failure_class = Some("UNCERTAIN".to_owned());
-                job.results.insert(target_name.clone(), result);
-            }
             let completed = job.clone();
             let _ = trim_terminal(jobs);
             Ok(Some(completed))
@@ -633,7 +631,8 @@ impl Queue {
 
 fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {
     for queued in jobs.iter_mut().filter(|queued| {
-        queued.branch == job.branch
+        same_workload_scope(queued, job)
+            && queued.branch == job.branch
             && queued.status == JobStatus::Pending
             && queued.target_names == job.target_names
             && queued.mode == job.mode
@@ -644,11 +643,29 @@ fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {
     }
 }
 
+fn same_workload_scope(left: &Job, right: &Job) -> bool {
+    match (&left.workload_scope, &right.workload_scope) {
+        (Some(left), Some(right)) => left == right,
+        // Preserve the legacy queue contract for old callers and persisted
+        // jobs that predate workload scopes. A scoped job never supersedes an
+        // unscoped one because their ownership cannot be proven identical.
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
 fn recover_stale_running_jobs(jobs: &mut [Job]) -> Vec<Job> {
+    recover_running_jobs_matching(jobs, |_| true)
+}
+
+fn recover_running_jobs_matching(
+    jobs: &mut [Job],
+    mut selected: impl FnMut(&Job) -> bool,
+) -> Vec<Job> {
     let mut recovered = Vec::new();
     for job in jobs
         .iter_mut()
-        .filter(|job| job.status == JobStatus::Running)
+        .filter(|job| job.status == JobStatus::Running && selected(job))
     {
         for target_name in &job.target_names {
             job.results
@@ -977,7 +994,7 @@ mod tests {
     use crate::job::{Job, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
 
     use super::{
-        KEEP_COMPLETED, ORPHAN_REQUEST_MESSAGE, Queue, QueueDeferredRequeue, QueueError,
+        KEEP_COMPLETED, ORPHAN_REQUEST_MESSAGE, Queue, QueueDeferredRequeue,
         QueuePendingCancellation, ReplaceRetryPolicy, STALE_RECOVERY_MESSAGE,
         STALE_RUNNING_CANCEL_REASON, SUPERSEDED_MESSAGE, WINDOWS_REPLACE_ATTEMPTS,
         retry_replace_with_strategy, scaled_delay,
@@ -1001,85 +1018,6 @@ mod tests {
         job = job.start().expect("start").complete().expect("complete");
         job.completed_at = Some(Utc::now() - chrono::Duration::seconds(seconds_ago));
         job
-    }
-
-    #[test]
-    fn stale_running_update_cannot_overwrite_terminal_cancellation() {
-        let temp = queue_dir();
-        let mut queue = Queue::new(temp.path()).expect("queue");
-        let pending = job("main", "abc", &["local"]);
-        queue.enqueue(pending.clone()).expect("enqueue");
-        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
-        let running = queue
-            .start_pending_jobs_for_drain(&lock, std::slice::from_ref(&pending.id))
-            .expect("start")
-            .remove(0);
-        let cancelled = queue
-            .cancel_running_jobs_for_drain(
-                &lock,
-                &[QueuePendingCancellation {
-                    job_id: running.id.clone(),
-                    reason: "exact head merged".to_owned(),
-                }],
-            )
-            .expect("cancel")
-            .remove(0);
-        assert_eq!(cancelled.status, JobStatus::Cancelled);
-
-        queue.update(&running).expect("stale worker update");
-        let durable = queue.get(&running.id).expect("read").expect("durable job");
-        assert_eq!(durable.status, JobStatus::Cancelled);
-        assert_eq!(
-            durable.cancellation_reason.as_deref(),
-            Some("exact head merged")
-        );
-    }
-
-    #[test]
-    fn failed_side_record_write_does_not_publish_terminal_success() {
-        let temp = queue_dir();
-        let mut queue = Queue::new(temp.path()).expect("queue");
-        let running = job("main", "abc", &["local"]).start().expect("running");
-        queue.enqueue(running.clone()).expect("enqueue");
-        let completed = running.complete().expect("completed snapshot");
-
-        let result = queue.commit_worker_terminal_after(&completed, |_| {
-            Err::<(), QueueError>(QueueError::Io(io::Error::other(
-                "injected side-record failure",
-            )))
-        });
-        assert!(result.is_err());
-        assert_eq!(
-            queue.get(&running.id).expect("read").expect("job").status,
-            JobStatus::Running
-        );
-    }
-
-    #[test]
-    fn authoritative_post_validation_failure_becomes_uncertain() {
-        let temp = queue_dir();
-        let mut queue = Queue::new(temp.path()).expect("queue");
-        let completed = job("main", "abc", &["local"])
-            .start()
-            .expect("running")
-            .complete()
-            .expect("complete");
-        queue.enqueue(completed.clone()).expect("enqueue");
-
-        let uncertain = queue
-            .reclassify_completed_uncertain(&completed, "merge phase failed")
-            .expect("reclassify")
-            .expect("exact snapshot");
-        assert!(uncertain.results.values().all(|result| {
-            result.failure_class.as_deref() == Some("UNCERTAIN")
-                && result.error_message.as_deref() == Some("merge phase failed")
-        }));
-        assert!(
-            queue
-                .reclassify_completed_uncertain(&completed, "stale retry")
-                .expect("stale retry")
-                .is_none()
-        );
     }
 
     fn running_aged(branch: &str, sha: &str, started_secs_ago: i64) -> Job {
@@ -1152,6 +1090,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cancellation_request_wins_stale_completion_and_keeps_claims_until_ack() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let pending = queue
+            .enqueue(job("main", "sha", &["mac"]))
+            .expect("enqueue");
+        let running = pending.start().expect("start");
+        queue.update(&running).expect("running");
+        let requested = queue
+            .request_cancel(&running.id, Some("operator cancel".to_owned()))
+            .expect("request")
+            .expect("job");
+        assert_eq!(requested.status, JobStatus::Running);
+        let stale_completion = running.complete().expect("stale completion");
+
+        assert!(matches!(
+            queue.update(&stale_completion),
+            Err(super::QueueError::StateConflict(_))
+        ));
+        let stale_terminal_cancel = running
+            .cancel_with_reason(Some("worker-side stale cancel".to_owned()))
+            .expect("stale cancel");
+        assert!(matches!(
+            queue.update(&stale_terminal_cancel),
+            Err(super::QueueError::StateConflict(_))
+        ));
+        assert_eq!(
+            queue.get(&running.id).expect("read").expect("job").status,
+            JobStatus::Running
+        );
+        let preserved = queue
+            .complete_running_uncertain(&running.id, "must not become uncertain")
+            .expect("preserve")
+            .expect("job");
+        assert_eq!(preserved.status, JobStatus::Running);
+        assert_eq!(
+            preserved.cancellation_reason.as_deref(),
+            Some("operator cancel")
+        );
+    }
+
     fn read_queue_json(path: &Path) -> Value {
         serde_json::from_str(&fs::read_to_string(path.join("queue.json")).expect("queue json"))
             .expect("valid json")
@@ -1193,29 +1173,36 @@ mod tests {
     fn supersedence_replaces_pending_same_scope_only() {
         let temp = queue_dir();
         let mut queue = Queue::new(temp.path()).expect("queue");
-        let old = job("feat/x", "old", &["mac"]);
-        let running = job("feat/x", "running", &["mac"]).start().expect("start");
-        let narrow = job("feat/x", "narrow", &["linux"]);
+        let old = job("feat/x", "old", &["mac"]).with_workload_scope("repo:pulp");
+        let running = job("feat/x", "running", &["mac"])
+            .with_workload_scope("repo:pulp")
+            .start()
+            .expect("start");
+        let narrow = job("feat/x", "narrow", &["linux"]).with_workload_scope("repo:pulp");
         let smoke = Job::create(
             "smoke",
             "feat/x",
             vec!["mac".to_owned()],
             ValidationMode::Smoke,
             Priority::Normal,
-        );
-        let new = job("feat/x", "new", &["mac"]);
+        )
+        .with_workload_scope("repo:pulp");
+        let independent = job("feat/x", "independent", &["mac"]).with_workload_scope("repo:forge");
+        let new = job("feat/x", "new", &["mac"]).with_workload_scope("repo:pulp");
 
         queue.enqueue(old).expect("old");
         queue.enqueue(running.clone()).expect("running");
         queue.update(&running).expect("update running");
         queue.enqueue(narrow).expect("narrow");
         queue.enqueue(smoke).expect("smoke");
+        queue.enqueue(independent).expect("independent");
         queue.enqueue(new).expect("new");
 
         let pending = queue.get_pending().expect("pending");
         assert_eq!(queue.running_count().expect("running"), 1);
-        assert_eq!(pending.len(), 3);
+        assert_eq!(pending.len(), 4);
         assert!(pending.iter().any(|job| job.sha == "new"));
+        assert!(pending.iter().any(|job| job.sha == "independent"));
         assert!(pending.iter().any(|job| job.sha == "narrow"));
         assert!(pending.iter().any(|job| job.sha == "smoke"));
         assert!(!pending.iter().any(|job| job.sha == "old"));

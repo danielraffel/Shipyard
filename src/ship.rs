@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 
 use crate::capacity::{gather_configured_host_capacities, total_free};
 use crate::config::LoadedConfig;
-use crate::evidence::{EvidenceRecord, EvidenceStore};
+use crate::evidence::{EvidenceRecord, EvidenceStore, run_evidence_scope, ship_evidence_scope};
 use crate::executor::dispatch::{
     DispatchValidationRequest, ExecutorDispatcher, ResolvedBackend, ResolvedHostPoolConfig,
     ResolvedHostPoolMember, ResolvedTarget,
@@ -34,7 +34,7 @@ use crate::job::{
 use crate::queue::{Queue, QueueDeferredRequeue, QueueError, STALE_RUNNING_CANCEL_REASON};
 use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
-    QueuedExecutionKind, QueuedExecutionOutcome,
+    QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner,
 };
 use crate::queue_scheduler::{
     VmSlotCapacity, apply_admit_pass_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
@@ -459,23 +459,18 @@ fn submit_ship_with_config(
         request.mode,
         request.priority,
     )
-    .with_kind(JobKind::Ship);
+    .with_kind(JobKind::Ship)
+    .with_workload_scope(format!("ship:{}:pr-{}", request.repo, request.pr));
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_ship_request(job.id.clone(), cwd, request);
     if let Some(config) = config {
-        let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
+        envelope.execution_owner = QueuedExecutionOwner::Daemon;
+        envelope.provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
             cwd,
             Some(&request.repo),
             &request.sha,
             config,
-        )
-        .ok_or_else(|| {
-            ShipExecutionError::QueueRequest(QueueRequestError::InvalidSnapshot {
-                reason: "exact unattended ship provenance changed before enqueue".to_owned(),
-            })
-        })?;
-        envelope.cwd.clone_from(&provenance.canonical_cwd);
-        envelope.provenance = Some(provenance);
+        );
     }
     request_store.save(&envelope)?;
     if let Err(error) = queue.enqueue(job.clone()) {
@@ -526,22 +521,50 @@ pub fn drain_or_wait_ship<D: ShipTargetDispatcher + Sync>(
     stores: ShipStores<'_>,
     dispatcher: &D,
 ) -> Result<ShipExecutionOutcome, ShipExecutionError> {
-    drain_or_wait_ship_with_options(
+    drain_or_wait_ship_with_scope(
         request,
         job,
         stores,
         dispatcher,
         CooperativeDrainOptions::default(),
+        DrainScope::Cooperative,
     )
 }
 
+/// Wait for one explicitly requested `shipyard ship --pr` job without
+/// executing or cancelling unrelated queued work. Scheduler resource and
+/// priority decisions still account for the complete queue; only the awaited
+/// job may be mutated by this drain owner.
+pub fn drain_or_wait_ship_awaited_only<D: ShipTargetDispatcher + Sync>(
+    request: &ShipExecutionRequest,
+    #[allow(clippy::needless_pass_by_value)] job: Job,
+    stores: ShipStores<'_>,
+    dispatcher: &D,
+) -> Result<ShipExecutionOutcome, ShipExecutionError> {
+    drain_or_wait_ship_with_scope(
+        request,
+        job,
+        stores,
+        dispatcher,
+        CooperativeDrainOptions::default(),
+        DrainScope::AwaitedOnly,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainScope {
+    Cooperative,
+    AwaitedOnly,
+}
+
 #[allow(clippy::needless_pass_by_value)]
-fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
+fn drain_or_wait_ship_with_scope<D: ShipTargetDispatcher + Sync>(
     request: &ShipExecutionRequest,
     job: Job,
     stores: ShipStores<'_>,
     dispatcher: &D,
     options: CooperativeDrainOptions,
+    drain_scope: DrainScope,
 ) -> Result<ShipExecutionOutcome, ShipExecutionError> {
     let ShipStores {
         queue,
@@ -558,12 +581,15 @@ fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
             return Ok(outcome);
         }
         if let Some(drain_lock) = queue.acquire_drain_lock()? {
-            let recovered = queue.recover_stale_running_jobs_for_drain(&drain_lock)?;
-            persist_recovered_outcomes(&recovered, state_dir, ship_state)?;
+            if drain_scope == DrainScope::Cooperative {
+                let recovered =
+                    recover_foreground_running_jobs_for_drain(queue, &drain_lock, state_dir)?;
+                persist_recovered_outcomes(&recovered, state_dir, ship_state)?;
+            }
             if let Some(outcome) = terminal_ship_outcome(queue, state_dir, request, &job.id)? {
                 return Ok(outcome);
             }
-            run_drain_worker_cycle(
+            run_drain_worker_cycle_scoped(
                 queue,
                 &drain_lock,
                 evidence,
@@ -575,6 +601,7 @@ fn drain_or_wait_ship_with_options<D: ShipTargetDispatcher + Sync>(
                 &job.id,
                 dispatcher,
                 request.pr_snapshot_file.as_deref(),
+                drain_scope,
             )?;
         }
         wait_or_timeout(&job.id, &mut wait_iterations, options)?;
@@ -591,6 +618,7 @@ pub fn execute_ship_worker<D: ShipTargetDispatcher>(
     execute_ship_worker_with_options(request, job, stores, dispatcher, false)
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
     request: &ShipExecutionRequest,
     mut job: Job,
@@ -609,7 +637,13 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
     } = stores;
     let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
     let transient_retry = crate::ship_retry::transient_local_retry_policy(config);
-    if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
+    if let Some(requested) = durable_cancelled_job(queue, &job)? {
+        let cancelled =
+            if requested.status == JobStatus::Cancelled || defer_host_pool_lease_unavailable {
+                requested
+            } else {
+                requested.cancel_with_reason(requested.cancellation_reason.clone())?
+            };
         return Ok(ShipExecutionOutcome {
             job: cancelled,
             ship_state: unsaved_ship_state(request, &job.target_names),
@@ -617,10 +651,10 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         });
     }
     let ship_state_lock = ship_state
-        .lock_pr(request.pr)
+        .lock_pr_scoped(&request.repo, request.pr)
         .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
     let resumed_existing_state = ship_state
-        .get_locked(request.pr, &ship_state_lock)
+        .get_locked_scoped(&request.repo, request.pr, &ship_state_lock)
         .is_some();
     let mut state = match load_or_create_state(
         request,
@@ -634,7 +668,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
             return Err(error);
         }
     };
-    if let Err(error) = ship_state.save_locked(&state, &ship_state_lock) {
+    if let Err(error) = ship_state.save_scoped_locked(&state, &ship_state_lock) {
         let execution_error = ShipExecutionError::ShipState(error.to_string());
         cancel_refused_job(queue, &job, &execution_error)?;
         return Err(execution_error);
@@ -657,51 +691,53 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         },
     )?
     .into_completed()?;
-    if job.status == JobStatus::Cancelled {
-        QueueOutcomeStore::new(state_dir)
-            .map_err(QueueRequestError::from)?
-            .save(&QueuedExecutionOutcome::ship(
-                job.id.clone(),
-                request.pr,
-                state.clone(),
-                resumed_existing_state,
-            ))?;
-        return Ok(ship_execution_outcome(job, state, resumed_existing_state));
+    if job.cancel_requested_at.is_some() {
+        if !defer_host_pool_lease_unavailable && job.status != JobStatus::Cancelled {
+            job = job.cancel_with_reason(job.cancellation_reason.clone())?;
+        }
+        if !defer_host_pool_lease_unavailable {
+            queue.update(&job)?;
+            QueueOutcomeStore::new(state_dir)
+                .map_err(QueueRequestError::from)?
+                .save(&QueuedExecutionOutcome::ship(
+                    job.id.clone(),
+                    request.pr,
+                    state.clone(),
+                    resumed_existing_state,
+                ))?;
+        }
+        return Ok(ShipExecutionOutcome {
+            job,
+            ship_state: state,
+            resumed_existing_state,
+        });
     }
     job = job.complete()?;
-    job = queue.commit_worker_terminal_after(&job, |candidate| {
-        record_evidence(evidence, request, candidate)?;
-        update_ship_state_from_job(&mut state, request, candidate);
-        ship_state
-            .save_locked(&state, &ship_state_lock)
-            .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
-        QueueOutcomeStore::new(state_dir)
-            .map_err(QueueRequestError::from)?
-            .save(&QueuedExecutionOutcome::ship(
-                candidate.id.clone(),
-                request.pr,
-                state.clone(),
-                resumed_existing_state,
-            ))?;
-        Ok::<(), ShipExecutionError>(())
-    })?;
-    if job.status == JobStatus::Cancelled {
-        persist_terminal_outcome(&job, state_dir)?;
-        return Ok(ship_execution_outcome(job, state, resumed_existing_state));
-    }
-    Ok(ship_execution_outcome(job, state, resumed_existing_state))
-}
+    record_evidence(
+        evidence,
+        &ship_evidence_scope(&request.repo, cwd),
+        request,
+        &job,
+    )?;
+    update_ship_state_from_job(&mut state, request, &job);
+    ship_state
+        .save_scoped_locked(&state, &ship_state_lock)
+        .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
+    QueueOutcomeStore::new(state_dir)
+        .map_err(QueueRequestError::from)?
+        .save(&QueuedExecutionOutcome::ship(
+            job.id.clone(),
+            request.pr,
+            state.clone(),
+            resumed_existing_state,
+        ))?;
+    queue.update(&job)?;
 
-fn ship_execution_outcome(
-    job: Job,
-    ship_state: ShipState,
-    resumed_existing_state: bool,
-) -> ShipExecutionOutcome {
-    ShipExecutionOutcome {
+    Ok(ShipExecutionOutcome {
         job,
-        ship_state,
+        ship_state: state,
         resumed_existing_state,
-    }
+    })
 }
 
 /// Execute configured targets for `shipyard run` without PR/ship-state mutation.
@@ -770,23 +806,18 @@ fn submit_run_with_config(
         request.mode,
         request.priority,
     )
-    .with_kind(JobKind::Run);
+    .with_kind(JobKind::Run)
+    .with_workload_scope(run_workload_scope(cwd));
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_run_request(job.id.clone(), cwd, request);
     if let Some(config) = config {
-        let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
+        envelope.execution_owner = QueuedExecutionOwner::Daemon;
+        envelope.provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
             cwd,
             None,
             &request.sha,
             config,
-        )
-        .ok_or_else(|| {
-            ShipExecutionError::QueueRequest(QueueRequestError::InvalidSnapshot {
-                reason: "exact unattended run provenance changed before enqueue".to_owned(),
-            })
-        })?;
-        envelope.cwd.clone_from(&provenance.canonical_cwd);
-        envelope.provenance = Some(provenance);
+        );
     }
     request_store.save(&envelope)?;
     if let Err(error) = queue.enqueue(job.clone()) {
@@ -861,7 +892,8 @@ fn drain_or_wait_run_with_options<D: ShipTargetDispatcher + Sync>(
         if let Some(drain_lock) = queue.acquire_drain_lock()? {
             let ship_state = ShipStateStore::new(state_dir.join("ship"))
                 .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
-            let recovered = queue.recover_stale_running_jobs_for_drain(&drain_lock)?;
+            let recovered =
+                recover_foreground_running_jobs_for_drain(queue, &drain_lock, state_dir)?;
             persist_recovered_outcomes(&recovered, state_dir, &ship_state)?;
             if let Some(outcome) = terminal_run_outcome(queue, state_dir, &job.id)? {
                 return Ok(outcome);
@@ -911,7 +943,13 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
     } = stores;
     let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
     let transient_retry = crate::ship_retry::transient_local_retry_policy(config);
-    if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
+    if let Some(requested) = durable_cancelled_job(queue, &job)? {
+        let cancelled =
+            if requested.status == JobStatus::Cancelled || defer_host_pool_lease_unavailable {
+                requested
+            } else {
+                requested.cancel_with_reason(requested.cancellation_reason.clone())?
+            };
         return Ok(RunExecutionOutcome { job: cancelled });
     }
     let shim = ShipExecutionRequest {
@@ -949,24 +987,24 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         },
     )?
     .into_completed()?;
-    if job.status == JobStatus::Cancelled {
-        QueueOutcomeStore::new(state_dir)
-            .map_err(QueueRequestError::from)?
-            .save(&QueuedExecutionOutcome::run(job.id.clone()))?;
+    if job.cancel_requested_at.is_some() {
+        if !defer_host_pool_lease_unavailable && job.status != JobStatus::Cancelled {
+            job = job.cancel_with_reason(job.cancellation_reason.clone())?;
+        }
+        if !defer_host_pool_lease_unavailable {
+            queue.update(&job)?;
+            QueueOutcomeStore::new(state_dir)
+                .map_err(QueueRequestError::from)?
+                .save(&QueuedExecutionOutcome::run(job.id.clone()))?;
+        }
         return Ok(RunExecutionOutcome { job });
     }
     job = job.complete()?;
-    job = queue.commit_worker_terminal_after(&job, |candidate| {
-        record_evidence(evidence, &shim, candidate)?;
-        QueueOutcomeStore::new(state_dir)
-            .map_err(QueueRequestError::from)?
-            .save(&QueuedExecutionOutcome::run(candidate.id.clone()))?;
-        Ok::<(), ShipExecutionError>(())
-    })?;
-    if job.status == JobStatus::Cancelled {
-        persist_terminal_outcome(&job, state_dir)?;
-        return Ok(RunExecutionOutcome { job });
-    }
+    record_evidence(evidence, &run_evidence_scope(cwd), &shim, &job)?;
+    QueueOutcomeStore::new(state_dir)
+        .map_err(QueueRequestError::from)?
+        .save(&QueuedExecutionOutcome::run(job.id.clone()))?;
+    queue.update(&job)?;
     Ok(RunExecutionOutcome { job })
 }
 
@@ -984,10 +1022,10 @@ fn durable_cancelled_job(queue: &mut Queue, job: &Job) -> Result<Option<Job>, Sh
     let Some(durable) = queue.get(&job.id)? else {
         return Ok(None);
     };
-    if durable.status == JobStatus::Cancelled {
-        Ok(Some(durable))
-    } else {
-        Ok(None)
+    match durable.status {
+        JobStatus::Cancelled => Ok(Some(durable)),
+        JobStatus::Running if durable.cancel_requested_at.is_some() => Ok(Some(durable)),
+        JobStatus::Pending | JobStatus::Running | JobStatus::Completed => Ok(None),
     }
 }
 
@@ -1112,6 +1150,38 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
     dispatcher: &D,
     pr_snapshot_file: Option<&Path>,
 ) -> Result<(), ShipExecutionError> {
+    run_drain_worker_cycle_scoped(
+        queue,
+        drain_lock,
+        evidence,
+        ship_state,
+        warm_pool,
+        cwd,
+        state_dir,
+        config,
+        awaited_job_id,
+        dispatcher,
+        pr_snapshot_file,
+        DrainScope::Cooperative,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // One drain loop owns the shared observation cache.
+fn run_drain_worker_cycle_scoped<D: ShipTargetDispatcher + Sync>(
+    queue: &mut Queue,
+    drain_lock: &crate::queue::DrainLock,
+    evidence: &EvidenceStore,
+    ship_state: &ShipStateStore,
+    warm_pool: &WarmPool,
+    cwd: &Path,
+    state_dir: &Path,
+    config: &LoadedConfig,
+    awaited_job_id: &str,
+    dispatcher: &D,
+    pr_snapshot_file: Option<&Path>,
+    drain_scope: DrainScope,
+) -> Result<(), ShipExecutionError> {
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let outcome_store = QueueOutcomeStore::new(state_dir).map_err(QueueRequestError::from)?;
     let _trimmed_job_ids = queue.trim_terminal_jobs_for_drain(drain_lock)?;
@@ -1142,6 +1212,7 @@ fn run_drain_worker_cycle<D: ShipTargetDispatcher + Sync>(
                     cwd,
                     pr_snapshot_file,
                     &mut already_merged_observer,
+                    drain_scope,
                 ) {
                     Ok(worker_inputs) => worker_inputs,
                     Err(error) => {
@@ -1239,10 +1310,21 @@ fn apply_drain_worker_completion(
                     defer_until: Some(defer_until(Utc::now())),
                 }],
             );
-            if let Err(error) = requeue_result
-                && first_error.is_none()
-            {
-                *first_error = Some(error.into());
+            match requeue_result {
+                Err(error) if first_error.is_none() => *first_error = Some(error.into()),
+                Ok(requeued) => {
+                    for job in requeued
+                        .iter()
+                        .filter(|job| job.status == JobStatus::Cancelled)
+                    {
+                        if let Err(error) = persist_terminal_outcome(job, queue.state_dir())
+                            && first_error.is_none()
+                        {
+                            *first_error = Some(error);
+                        }
+                    }
+                }
+                Err(_) => {}
             }
         }
         Err(error) if first_error.is_none() => *first_error = Some(error),
@@ -1280,6 +1362,7 @@ fn admit_drain_worker_inputs(
     cwd: &Path,
     pr_snapshot_file: Option<&Path>,
     already_merged_observer: &mut crate::queue_scheduler::AlreadyMergedObserver,
+    scope: DrainScope,
 ) -> Result<Vec<(Job, QueuedExecutionEnvelope)>, ShipExecutionError> {
     let jobs = queue.get_all()?;
     let pools = scheduler_host_pools(&jobs, request_store)?;
@@ -1288,16 +1371,62 @@ fn admit_drain_worker_inputs(
         .map_err(|error| ShipExecutionError::HostPool(error.to_string()))?;
     let leases = scheduler_host_pool_leases(&jobs, request_store, &pools, leases);
     let vm_slots = scheduler_vm_slots(config, &jobs, request_store)?;
+    let now = Utc::now();
+    let mut scheduling_jobs = jobs.clone();
+    scheduling_jobs.retain(|job| {
+        job.status != JobStatus::Pending
+            || matches!(
+                request_store.load(&job.id),
+                Ok(Some(envelope))
+                    if envelope.job_id == job.id && envelope.is_foreground_owned()
+            )
+    });
+    if scope == DrainScope::AwaitedOnly {
+        // The shared planner normally frees claims held by stale same-PR
+        // workers because the cooperative apply pass will reap them. A scoped
+        // caller refuses to mutate unrelated jobs, so keep every unrelated
+        // running job live in this in-memory planning snapshot and preserve
+        // its claims. This never alters durable queue state.
+        for job in scheduling_jobs
+            .iter_mut()
+            .filter(|job| job.id != awaited_job_id && job.status == JobStatus::Running)
+        {
+            job.started_at = Some(now);
+        }
+    }
     let mut pass = plan_admit_pass_from_jobs_with_vm_slots(
-        &jobs,
+        &scheduling_jobs,
         request_store,
         &pools,
         &leases,
         &vm_slots,
-        Utc::now(),
+        now,
     );
-    pass.already_merged_cancellations =
-        already_merged_observer.observe_pending(&jobs, request_store, cwd, pr_snapshot_file);
+    let awaited_observation_jobs;
+    let observation_jobs = if scope == DrainScope::AwaitedOnly {
+        awaited_observation_jobs = jobs
+            .iter()
+            .filter(|job| {
+                job.id == awaited_job_id
+                    && scheduling_jobs
+                        .iter()
+                        .any(|scheduled| scheduled.id == job.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        awaited_observation_jobs.as_slice()
+    } else {
+        scheduling_jobs.as_slice()
+    };
+    pass.already_merged_cancellations = already_merged_observer.observe_pending(
+        observation_jobs,
+        request_store,
+        cwd,
+        pr_snapshot_file,
+    );
+    if scope == DrainScope::AwaitedOnly {
+        restrict_admit_pass_to_awaited(&mut pass, awaited_job_id);
+    }
     cap_admit_pass_workers(&jobs, &mut pass, DEFAULT_DRAIN_MAX_WORKERS);
     let awaited_will_be_cancelled = pass
         .plan
@@ -1328,6 +1457,30 @@ fn admit_drain_worker_inputs(
             Ok((job, envelope))
         })
         .collect()
+}
+
+fn restrict_admit_pass_to_awaited(
+    pass: &mut crate::queue_scheduler::RequestBackedAdmitPass,
+    awaited_job_id: &str,
+) {
+    pass.plan.admitted.retain(|job_id| job_id == awaited_job_id);
+    pass.plan
+        .deferred
+        .retain(|deferred| deferred.job_id == awaited_job_id);
+    pass.plan
+        .orphaned
+        .retain(|orphan| orphan.job_id == awaited_job_id);
+    pass.same_pr_ship_admission
+        .pending_cancellations
+        .retain(|cancellation| cancellation.job_id == awaited_job_id);
+    pass.same_pr_ship_admission
+        .running_conflicts
+        .retain(|conflict| conflict.pending_job_id == awaited_job_id);
+    pass.same_pr_ship_admission
+        .stale_running_cancellations
+        .retain(|cancellation| cancellation.job_id == awaited_job_id);
+    pass.already_merged_cancellations
+        .retain(|cancellation| cancellation.job_id == awaited_job_id);
 }
 
 fn sweep_absent_queue_envelopes(
@@ -1364,7 +1517,7 @@ fn persist_recovered_outcomes(
             }
             QueuedExecutionKind::Ship => {
                 let request = envelope.to_ship_request()?;
-                let existing = ship_state.get(request.pr);
+                let existing = ship_state.get_scoped(&request.repo, request.pr);
                 let resumed_existing_state = existing.is_some();
                 let state =
                     existing.unwrap_or_else(|| unsaved_ship_state(&request, &job.target_names));
@@ -1476,21 +1629,33 @@ pub(crate) fn execute_started_queued_job(
     let envelope = request_store
         .load(job_id)?
         .ok_or_else(|| ShipExecutionError::MissingQueuedJob(job_id.to_owned()))?;
+    if envelope.job_id != job_id {
+        return Err(ShipExecutionError::QueueRequest(
+            QueueRequestError::InvalidSnapshot {
+                reason: format!(
+                    "queued execution request for {job_id} belongs to {}",
+                    envelope.job_id
+                ),
+            },
+        ));
+    }
     let provenance = envelope.provenance.as_ref().ok_or_else(|| {
         ShipExecutionError::QueueRequest(QueueRequestError::InvalidSnapshot {
             reason: "legacy request lacks unattended-execution provenance".to_owned(),
         })
     })?;
-    let canonical_cwd = provenance.canonical_cwd.clone();
     let config =
-        LoadedConfig::load_from_cwd_with_global_dir(mode, &canonical_cwd, global_dir.to_path_buf())
+        LoadedConfig::load_from_cwd_with_global_dir(mode, &envelope.cwd, global_dir.to_path_buf())
             .map_err(|error| ShipExecutionError::WorkerSetup(error.to_string()))?;
-    provenance.validate_with_config(&canonical_cwd, &config)?;
+    provenance.validate_with_config(&envelope.cwd, &config)?;
     if matches!(envelope.kind, QueuedExecutionKind::Ship)
-        && config.get_str("github.auth.source") != Some("command")
+        && !matches!(
+            config.get_str("github.auth.source"),
+            Some("env" | "command")
+        )
     {
         return Err(ShipExecutionError::WorkerSetup(
-            "daemon-owned ship requires github.auth.source = command; env and ambient gh auth are forbidden"
+            "daemon-owned ship requires explicit github.auth source env or command; ambient gh auth is forbidden"
                 .to_owned(),
         ));
     }
@@ -1513,8 +1678,6 @@ pub(crate) fn execute_started_queued_job(
     let prepared = crate::prepared_state::PreparedStateStore::new(state_dir.join("prepared"))
         .map_err(|error| ShipExecutionError::WorkerSetup(error.to_string()))?;
     let dispatcher = ExecutorDispatcher::new_with_state_dir(Some(prepared), state_dir);
-    let mut envelope = envelope;
-    envelope.cwd = canonical_cwd;
     run_started_worker(
         job,
         envelope.clone(),
@@ -1535,6 +1698,31 @@ pub(crate) fn execute_started_queued_job(
 
 fn defer_until(now: DateTime<Utc>) -> DateTime<Utc> {
     now + chrono::Duration::seconds(5)
+}
+
+fn recover_foreground_running_jobs_for_drain(
+    queue: &mut Queue,
+    drain_lock: &crate::queue::DrainLock,
+    state_dir: &Path,
+) -> Result<Vec<Job>, ShipExecutionError> {
+    let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
+    let recoverable = queue
+        .get_running()?
+        .into_iter()
+        .filter_map(|job| match request_store.load(&job.id) {
+            Ok(Some(envelope)) if envelope.job_id == job.id && envelope.is_foreground_owned() => {
+                Some(job.id)
+            }
+            // Missing, corrupt, or daemon-owned envelopes are unknown or
+            // externally owned. A foreground drain must preserve them; the
+            // scheduler will also block new admission while their claims are
+            // unknowable.
+            Ok(Some(_) | None) | Err(_) => None,
+        })
+        .collect::<Vec<_>>();
+    queue
+        .recover_selected_running_jobs_for_drain(drain_lock, &recoverable)
+        .map_err(ShipExecutionError::from)
 }
 
 fn scheduler_host_pools(
@@ -1712,6 +1900,17 @@ fn refuse_same_pr_running_ship(
         let Some(envelope) = request_store.load(&running.id)? else {
             continue;
         };
+        if envelope.job_id != running.id {
+            return Err(ShipExecutionError::QueueRequest(
+                QueueRequestError::InvalidSnapshot {
+                    reason: format!(
+                        "running queued execution request for {} belongs to {}",
+                        running.id, envelope.job_id
+                    ),
+                },
+            ));
+        }
+        let daemon_owned = envelope.is_daemon_admissible();
         let QueuedExecutionEnvelope {
             request: crate::queue_request::QueuedExecutionRequest::Ship(existing),
             ..
@@ -1721,6 +1920,17 @@ fn refuse_same_pr_running_ship(
         };
         if existing.repo != request.repo || existing.pr != request.pr {
             continue;
+        }
+
+        // Daemon-owned work is reconciled exclusively by the durable
+        // supervisor, which can prove an exact live worker receipt. A
+        // foreground submitter must never reap it on heartbeat age alone.
+        if daemon_owned {
+            return Err(ShipExecutionError::SamePrShipRunning {
+                repo: request.repo.clone(),
+                pr: request.pr,
+                running_job_id: running.id,
+            });
         }
 
         // A same-PR ship is already running. If its worker has gone silent past
@@ -2050,8 +2260,8 @@ fn load_or_create_state(
 ) -> Result<ShipState, ShipExecutionError> {
     let policy = policy_signature(&request.targets, target_names, request.mode);
     let existing = lock.map_or_else(
-        || store.get(request.pr),
-        |lock| store.get_locked(request.pr, lock),
+        || store.get_scoped(&request.repo, request.pr),
+        |lock| store.get_locked_scoped(&request.repo, request.pr, lock),
     );
     if let Some(mut existing) = existing {
         validate_existing_state(
@@ -2176,6 +2386,11 @@ fn target_names(targets: &[ResolvedTarget]) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn run_workload_scope(cwd: &Path) -> String {
+    let identity = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    format!("run:{}", identity.to_string_lossy())
+}
+
 fn target_log_path(state_dir: &Path, job_id: &str, target: &str) -> PathBuf {
     state_dir
         .join("logs")
@@ -2264,6 +2479,7 @@ fn annotate_retry_history(mut result: TargetResult, prior_transient: &[String]) 
 
 fn record_evidence(
     evidence: &EvidenceStore,
+    workload_scope: &str,
     request: &ShipExecutionRequest,
     job: &Job,
 ) -> Result<(), ShipExecutionError> {
@@ -2275,7 +2491,7 @@ fn record_evidence(
     for result in job.results.values() {
         let target = targets.get(result.target_name.as_str()).copied();
         evidence
-            .record(&evidence_record(request, result, target))
+            .record_scoped(workload_scope, &evidence_record(request, result, target))
             .map_err(|error| ShipExecutionError::Evidence(error.to_string()))?;
     }
     Ok(())
@@ -2289,6 +2505,7 @@ fn evidence_record(
     EvidenceRecord {
         sha: request.sha.clone(),
         branch: request.branch.clone(),
+        workload_scope: None,
         target_name: result.target_name.clone(),
         validation_build_type: target.and_then(|target| target.validation_build_type.clone()),
         platform: result.platform.clone(),
@@ -2516,14 +2733,16 @@ mod tests {
     use toml::Table;
 
     use super::{
-        CooperativeDrainOptions, RunExecutionRequest, RunStores, ShipExecutionError,
-        ShipExecutionRequest, ShipStores, ShipTargetDispatcher, TargetExecOptions,
-        TargetExecutionOutcome, WarmPoolUpdate, apply_warm_reuse, cap_admit_pass_workers,
-        drain_or_wait_run, drain_or_wait_run_with_options, execute_run, execute_run_worker,
-        execute_ship, execute_ship_worker, execute_targets_with_options,
+        CooperativeDrainOptions, QueueRequestError, QueuedExecutionOwner, RunExecutionRequest,
+        RunStores, RuntimeMode, ShipExecutionError, ShipExecutionRequest, ShipStores,
+        ShipTargetDispatcher, TargetExecOptions, TargetExecutionOutcome, WarmPoolUpdate,
+        apply_warm_reuse, cap_admit_pass_workers, drain_or_wait_run,
+        drain_or_wait_run_with_options, drain_or_wait_ship_awaited_only,
+        drain_or_wait_ship_with_scope, execute_run, execute_run_worker, execute_ship,
+        execute_ship_worker, execute_targets_with_options,
         leases_not_covered_by_running_reservations, load_run_outcome, load_ship_outcome,
-        retry_attempt_log_path, run_drain_worker_cycle, submit_run, submit_ship, target_log_path,
-        update_warm_pool_after_run,
+        recover_foreground_running_jobs_for_drain, retry_attempt_log_path, run_drain_worker_cycle,
+        submit_run, submit_ship, target_log_path, update_warm_pool_after_run,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::EvidenceStore;
@@ -2767,6 +2986,166 @@ mod tests {
             pr_snapshot_file: None,
             targets,
         }
+    }
+
+    #[test]
+    fn awaited_only_ship_progresses_without_touching_unrelated_product_jobs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(state_dir.join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(state_dir.join("ship")).expect("ship state");
+        let warm_pool = WarmPool::new(state_dir.join("warm_pool.json"));
+        let config = empty_config(temp.path());
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let target = local_target_without_cwd("mac", "macos-arm64");
+        let request = |repo: &str, pr: u64, branch: &str, sha: &str| {
+            let mut request = ship_request(vec![target.clone()]);
+            request.repo = repo.to_owned();
+            request.pr = pr;
+            request.branch = branch.to_owned();
+            request.sha = sha.to_owned();
+            request
+        };
+
+        let unrelated_specs = [
+            ("Generous-Corp/pulp", 7718, "feature/pulp", "pulp-sha"),
+            (
+                "Generous-Corp/forge",
+                128,
+                "feature/forge-sequencer",
+                "sequencer-sha",
+            ),
+            ("Generous-Corp/vellum", 96, "feature/vellum", "vellum-sha"),
+        ];
+        let mut untouched = Vec::new();
+        for (repo, pr, branch, sha) in unrelated_specs {
+            let cwd = temp.path().join(format!("unrelated-{pr}"));
+            std::fs::create_dir_all(&cwd).expect("unrelated cwd");
+            let job = submit_ship(
+                &request(repo, pr, branch, sha),
+                &mut queue,
+                &cwd,
+                &state_dir,
+            )
+            .expect("submit unrelated ship");
+            untouched.push(job);
+        }
+
+        let awaited_cwd = temp.path().join("forge-modular");
+        std::fs::create_dir_all(&awaited_cwd).expect("awaited cwd");
+        let awaited_request = request(
+            "Generous-Corp/forge",
+            127,
+            "feature/forge-modular",
+            "modular-sha",
+        );
+        let awaited_job = submit_ship(&awaited_request, &mut queue, &awaited_cwd, &state_dir)
+            .expect("submit awaited ship");
+
+        let outcome = drain_or_wait_ship_awaited_only(
+            &awaited_request,
+            awaited_job,
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: &awaited_cwd,
+                state_dir: &state_dir,
+                config: &config,
+            },
+            &dispatcher,
+        )
+        .expect("awaited-only drain");
+
+        assert_eq!(outcome.job.status, JobStatus::Completed);
+        assert_eq!(dispatcher.seen_count(), 1);
+        for original in untouched {
+            assert_eq!(
+                queue.get(&original.id).expect("queue").expect("job"),
+                original,
+                "awaited-only draining must not mutate unrelated Pulp, Forge Sequencer, or Vellum jobs"
+            );
+        }
+    }
+
+    #[test]
+    fn awaited_only_ship_preserves_unrelated_stale_runner_claims_without_reaping_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let evidence = EvidenceStore::new(state_dir.join("evidence")).expect("evidence");
+        let ship_state = ShipStateStore::new(state_dir.join("ship")).expect("ship state");
+        let warm_pool = WarmPool::new(state_dir.join("warm_pool.json"));
+        let config = empty_config(temp.path());
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+        let target = local_target_without_cwd("mac", "macos-arm64");
+
+        let mut unrelated_request = ship_request(vec![target.clone()]);
+        unrelated_request.repo = "Generous-Corp/pulp".to_owned();
+        unrelated_request.pr = 7718;
+        unrelated_request.branch = "feature/shared".to_owned();
+        unrelated_request.sha = "old-sha".to_owned();
+        let unrelated = submit_ship(&unrelated_request, &mut queue, &cwd, &state_dir)
+            .expect("submit unrelated");
+        let drain_lock = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        let mut stale = queue
+            .start_pending_jobs_for_drain(&drain_lock, std::slice::from_ref(&unrelated.id))
+            .expect("start unrelated")
+            .pop()
+            .expect("started unrelated");
+        stale.started_at = Some(Utc::now() - Duration::minutes(10));
+        queue.update(&stale).expect("persist stale running job");
+        drop(drain_lock);
+
+        let mut awaited_request = ship_request(vec![target]);
+        awaited_request.repo = "Generous-Corp/pulp".to_owned();
+        awaited_request.pr = 7719;
+        awaited_request.branch = "feature/shared".to_owned();
+        awaited_request.sha = "new-sha".to_owned();
+        let awaited =
+            submit_ship(&awaited_request, &mut queue, &cwd, &state_dir).expect("submit awaited");
+
+        let error = drain_or_wait_ship_with_scope(
+            &awaited_request,
+            awaited.clone(),
+            ShipStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                ship_state: &ship_state,
+                warm_pool: &warm_pool,
+                cwd: &cwd,
+                state_dir: &state_dir,
+                config: &config,
+            },
+            &dispatcher,
+            CooperativeDrainOptions {
+                poll_interval: StdDuration::ZERO,
+                max_wait_iterations: Some(1),
+            },
+            super::DrainScope::AwaitedOnly,
+        )
+        .expect_err("unrelated running claim must keep awaited work deferred");
+
+        assert!(matches!(
+            error,
+            ShipExecutionError::CooperativeWaitTimedOut(_)
+        ));
+        assert_eq!(dispatcher.seen_count(), 0);
+        assert_eq!(
+            queue.get(&unrelated.id).expect("queue").expect("job"),
+            stale
+        );
+        assert_eq!(
+            queue.get(&awaited.id).expect("queue").expect("job").status,
+            JobStatus::Pending
+        );
     }
 
     fn pool_with(entry: PoolEntry) -> (tempfile::TempDir, WarmPool) {
@@ -3152,7 +3531,11 @@ mod tests {
             crate::job::JobStatus::Completed
         );
         let evidence_record = evidence
-            .get_target("feature/test", "ubuntu")
+            .get_target_scoped(
+                &crate::evidence::repository_evidence_scope(&request.repo),
+                "feature/test",
+                "ubuntu",
+            )
             .expect("evidence");
         assert_eq!(evidence_record.status, "pass");
         assert_eq!(evidence_record.host.as_deref(), Some("vm"));
@@ -3347,6 +3730,157 @@ mod tests {
                 .load(&outcome.job.id)
                 .expect("load outcome"),
             Some(QueuedExecutionOutcome::run(outcome.job.id))
+        );
+    }
+
+    #[test]
+    fn foreground_recovery_preserves_daemon_owned_running_jobs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![ssh_target()],
+        };
+        let daemon_job =
+            submit_run(&request, &mut queue, temp.path(), &state_dir).expect("daemon submit");
+        let mut foreground_request = request.clone();
+        foreground_request.branch = "feature/foreground".to_owned();
+        let foreground_job = submit_run(&foreground_request, &mut queue, temp.path(), &state_dir)
+            .expect("foreground submit");
+        let mut mismatched_request = request.clone();
+        mismatched_request.branch = "feature/mismatched".to_owned();
+        let mismatched_job = submit_run(&mismatched_request, &mut queue, temp.path(), &state_dir)
+            .expect("mismatched submit");
+        let store = QueueRequestStore::new(&state_dir).expect("store");
+        let mut daemon_envelope = store
+            .load(&daemon_job.id)
+            .expect("load")
+            .expect("daemon envelope");
+        daemon_envelope.execution_owner = QueuedExecutionOwner::Daemon;
+        store.save(&daemon_envelope).expect("mark daemon owned");
+        let mut mismatched_envelope = store
+            .load(&mismatched_job.id)
+            .expect("load")
+            .expect("mismatched envelope");
+        mismatched_envelope.job_id = "different-job".to_owned();
+        std::fs::write(
+            store.path_for(&mismatched_job.id),
+            serde_json::to_vec(&mismatched_envelope).expect("serialize"),
+        )
+        .expect("swap mismatched envelope");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(
+                &lock,
+                &[
+                    daemon_job.id.clone(),
+                    foreground_job.id.clone(),
+                    mismatched_job.id.clone(),
+                ],
+            )
+            .expect("start jobs");
+
+        let recovered = recover_foreground_running_jobs_for_drain(&mut queue, &lock, &state_dir)
+            .expect("recover foreground ownership");
+
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
+            [foreground_job.id.as_str()]
+        );
+        assert_eq!(
+            queue
+                .get(&daemon_job.id)
+                .expect("read")
+                .expect("daemon job")
+                .status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            queue
+                .get(&foreground_job.id)
+                .expect("read")
+                .expect("foreground job")
+                .status,
+            JobStatus::Completed
+        );
+        assert_eq!(
+            queue
+                .get(&mismatched_job.id)
+                .expect("read")
+                .expect("mismatched job")
+                .status,
+            JobStatus::Running
+        );
+    }
+
+    #[test]
+    fn foreground_drain_never_admits_daemon_owned_pending_job() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let daemon_request = RunExecutionRequest {
+            branch: "feature/daemon".to_owned(),
+            sha: "daemon".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::High,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![ssh_target()],
+        };
+        let mut foreground_request = daemon_request.clone();
+        foreground_request.branch = "feature/foreground".to_owned();
+        foreground_request.sha = "foreground".to_owned();
+        foreground_request.priority = Priority::Normal;
+        let daemon_job = submit_run(&daemon_request, &mut queue, temp.path(), &state_dir)
+            .expect("daemon submit");
+        let foreground_job = submit_run(&foreground_request, &mut queue, temp.path(), &state_dir)
+            .expect("foreground submit");
+        let store = QueueRequestStore::new(&state_dir).expect("store");
+        let mut daemon_envelope = store
+            .load(&daemon_job.id)
+            .expect("load")
+            .expect("daemon envelope");
+        daemon_envelope.execution_owner = QueuedExecutionOwner::Daemon;
+        store.save(&daemon_envelope).expect("mark daemon owned");
+        let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
+        let warm_pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let dispatcher = SyncDispatcher::new(TargetStatus::Pass);
+
+        let outcome = drain_or_wait_run(
+            &foreground_request,
+            foreground_job,
+            RunStores {
+                queue: &mut queue,
+                evidence: &evidence,
+                warm_pool: &warm_pool,
+                cwd: temp.path(),
+                state_dir: &state_dir,
+                config: &empty_config(temp.path()),
+            },
+            &dispatcher,
+        )
+        .expect("foreground drain");
+
+        assert!(outcome.job.passed());
+        assert_eq!(dispatcher.seen_count(), 1);
+        assert_eq!(
+            queue
+                .get(&daemon_job.id)
+                .expect("read")
+                .expect("daemon job")
+                .status,
+            JobStatus::Pending
         );
     }
 
@@ -3655,11 +4189,6 @@ mod tests {
     #[test]
     fn drain_does_not_start_replacements_when_admission_cancels_the_awaited_job() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // Admission also checks whether queued PRs merged while waiting. Keep
-        // this scheduler test hermetic: an ambient `gh pr view` can block on
-        // host auth/network and obscures the same-PR cancellation invariant.
-        let open_pr_snapshot = temp.path().join("open-pr.json");
-        std::fs::write(&open_pr_snapshot, r#"{"state":"OPEN"}"#).expect("open PR snapshot");
         let state_dir = temp.path().join("state");
         let mut queue = Queue::new(&state_dir).expect("queue");
         let evidence = EvidenceStore::new(temp.path().join("evidence")).expect("evidence");
@@ -3698,7 +4227,7 @@ mod tests {
             &config,
             &old.id,
             &dispatcher,
-            Some(&open_pr_snapshot),
+            None,
         )
         .expect("drain cycle");
 
@@ -4343,6 +4872,136 @@ mod tests {
             reaped.cancellation_reason.as_deref(),
             Some(crate::queue::STALE_RUNNING_CANCEL_REASON)
         );
+    }
+
+    #[test]
+    fn submit_ship_never_reaps_stale_daemon_owned_same_pr_running() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let request = ship_request(vec![target.clone()]);
+        let running_job =
+            submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit existing");
+        let store = QueueRequestStore::new(&state_dir).expect("store");
+        let mut envelope = store.load(&running_job.id).expect("load").expect("request");
+        envelope.execution_owner = QueuedExecutionOwner::Daemon;
+        store.save(&envelope).expect("save daemon owner");
+        let drain = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        queue
+            .start_pending_jobs_for_drain(&drain, std::slice::from_ref(&running_job.id))
+            .expect("start");
+        let mut aged = queue.get(&running_job.id).expect("get").expect("running");
+        aged.started_at = Some(
+            Utc::now() - Duration::seconds(crate::job::DEFAULT_RUNNING_JOB_STALE_SECONDS + 60),
+        );
+        queue.update(&aged).expect("age running job");
+
+        let error = submit_ship(
+            &ship_request(vec![target]),
+            &mut queue,
+            temp.path(),
+            &state_dir,
+        )
+        .expect_err("daemon-owned running job remains fenced");
+
+        assert!(matches!(
+            error,
+            ShipExecutionError::SamePrShipRunning { .. }
+        ));
+        assert_eq!(
+            queue
+                .get(&running_job.id)
+                .expect("get")
+                .expect("running")
+                .status,
+            JobStatus::Running
+        );
+    }
+
+    #[test]
+    fn submit_ship_fails_closed_for_mismatched_running_envelope() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let request = ship_request(vec![target.clone()]);
+        let running =
+            submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("submit existing");
+        let store = QueueRequestStore::new(&state_dir).expect("store");
+        let mut envelope = store.load(&running.id).expect("load").expect("request");
+        envelope.job_id = "different-job".to_owned();
+        std::fs::write(
+            store.path_for(&running.id),
+            serde_json::to_vec(&envelope).expect("encode"),
+        )
+        .expect("write mismatch");
+        let drain = queue
+            .acquire_drain_lock()
+            .expect("drain lock")
+            .expect("available");
+        queue
+            .start_pending_jobs_for_drain(&drain, std::slice::from_ref(&running.id))
+            .expect("start");
+
+        let error = submit_ship(
+            &ship_request(vec![target]),
+            &mut queue,
+            temp.path(),
+            &state_dir,
+        )
+        .expect_err("mismatched running ownership is unknown");
+
+        assert!(matches!(
+            error,
+            ShipExecutionError::QueueRequest(QueueRequestError::InvalidSnapshot { .. })
+        ));
+        assert_eq!(
+            queue.get(&running.id).expect("get").expect("job").status,
+            JobStatus::Running
+        );
+    }
+
+    #[test]
+    fn daemon_worker_refuses_mismatched_embedded_job_id_before_execution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let request = RunExecutionRequest {
+            branch: "feature/run".to_owned(),
+            sha: "abc".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: vec![ssh_target()],
+        };
+        let job = submit_run(&request, &mut queue, temp.path(), &state_dir).expect("submit");
+        let store = QueueRequestStore::new(&state_dir).expect("store");
+        let mut envelope = store.load(&job.id).expect("load").expect("request");
+        envelope.job_id = "different-job".to_owned();
+        std::fs::write(
+            store.path_for(&job.id),
+            serde_json::to_vec(&envelope).expect("encode"),
+        )
+        .expect("write mismatch");
+
+        let error = super::execute_started_queued_job(
+            &job.id,
+            RuntimeMode::Isolated,
+            temp.path(),
+            &state_dir,
+        )
+        .expect_err("mismatched worker envelope");
+
+        assert!(matches!(
+            error,
+            ShipExecutionError::QueueRequest(QueueRequestError::InvalidSnapshot { .. })
+        ));
     }
 
     #[test]
