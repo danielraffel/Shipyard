@@ -12,6 +12,13 @@ use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod execution;
+pub use execution::{
+    AuthoritativeExecutionPlan, ChangedSurfaceExecutionPolicy, ExecutionDisposition, ExecutionMode,
+    ExecutionPlanError, FullExecutionReason, materialize_selected_tests,
+    plan_authoritative_execution,
+};
+
 /// Oldest changed-surface declaration schema understood by this release.
 pub const MIN_CHANGED_SURFACE_SCHEMA_VERSION: u32 = 1;
 /// Newest changed-surface declaration schema understood by this release.
@@ -104,6 +111,9 @@ pub struct ChangedSurfacePolicy {
     pub test_topology_paths: Vec<String>,
     /// Complete reviewed family declarations.
     pub families: Vec<TestFamily>,
+    /// Optional protected-base promotion policy. Absence remains shadow-only.
+    #[serde(default)]
+    pub execution: Option<ChangedSurfaceExecutionPolicy>,
     /// Expected target-validation digests computed from the authenticated base.
     #[serde(skip)]
     pub secondary_contract_digests: BTreeMap<String, String>,
@@ -1094,6 +1104,9 @@ fn validate_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
         ));
     }
     validate_risk_policy(policy)?;
+    if let Some(execution) = &policy.execution {
+        execution.validate(policy.schema_version)?;
+    }
     if policy.full_test_count == 0 {
         return Err("full_test_count must be nonzero".to_owned());
     }
@@ -1326,7 +1339,7 @@ fn sorted_unique(values: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn policy_digest(policy: &ChangedSurfacePolicy) -> String {
+pub(crate) fn policy_digest(policy: &ChangedSurfacePolicy) -> String {
     let bytes = serde_json::to_vec(policy).expect("policy serialization should not fail");
     hex::encode(Sha256::digest(bytes))
 }
@@ -1398,6 +1411,7 @@ mod tests {
                     required_secondary_build_type: None,
                 },
             ],
+            execution: None,
             secondary_contract_digests: BTreeMap::new(),
         }
     }

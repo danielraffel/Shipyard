@@ -591,6 +591,7 @@ mod tests {
                 required_secondary_target: Some("release-sdk".to_owned()),
                 required_secondary_build_type: Some(BuildType::Release),
             }],
+            execution: None,
             secondary_contract_digests: BTreeMap::from([(
                 "release-sdk".to_owned(),
                 "contract".to_owned(),
