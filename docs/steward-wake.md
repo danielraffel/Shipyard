@@ -9,7 +9,10 @@ no model session needs to remain alive.
 The worker discovers and caches each repository's GitHub default branch for
 the daemon lifetime; it does not assume that every repository uses `main`.
 Discovery runs in a bounded background resolver so slow GitHub auth or API
-responses cannot pause the daemon's webhook and reconciliation loop.
+responses cannot pause the daemon's webhook and reconciliation loop. The cache
+expires every 30 minutes so a default-branch rename is adopted without a daemon
+restart. Steward subprocesses have a 15-minute process-tree deadline so one
+hung repository cannot occupy the authority lane indefinitely.
 
 Only the host whose runner tag matches the trusted machine-global
 `merge_queue.mutation_machine` starts the worker. Other Shipyard daemons remain

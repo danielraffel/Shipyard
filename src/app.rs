@@ -593,8 +593,12 @@ fn handle_runner_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let config = crate::config::LoadedConfig::load_from_cwd(mode, cwd)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let config = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
+        mode,
+        cwd,
+        runtime_paths.global_dir.clone(),
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
     runner_command(command, &config, mode, cwd, runtime_paths, json, stdout)
 }
 
