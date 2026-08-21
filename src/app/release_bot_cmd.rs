@@ -1271,9 +1271,9 @@ fn seed_release_bot_ship_state(
     head: &str,
 ) -> Result<(), String> {
     let lock = store
-        .lock_pr(pr)
+        .lock_pr_scoped(repo, pr)
         .map_err(|error| format!("failed to lock release-bot ship-state: {error}"))?;
-    let mut state = if let Some(existing) = store.get_locked(pr, &lock) {
+    let mut state = if let Some(existing) = store.get_locked_scoped(repo, pr, &lock) {
         if existing.repo != repo || existing.base_branch != base || existing.head_sha != head {
             return Err(format!(
                 "existing ship-state for release-bot PR #{pr} does not match {repo} {base} {head}"
@@ -1288,7 +1288,7 @@ fn seed_release_bot_ship_state(
         .insert("release-bot-required-checks".to_owned(), "pass".to_owned());
     state.touch();
     store
-        .save_locked(&state, &lock)
+        .save_scoped_locked(&state, &lock)
         .map_err(|error| format!("failed to persist release-bot ship-state: {error}"))
 }
 
@@ -1304,9 +1304,14 @@ fn supervise_release_bot_admission(
         match outcome {
             AutoMergeOutcome::AlreadyMerged | AutoMergeOutcome::Merged { .. } => return Ok(()),
             AutoMergeOutcome::Enqueued => {
-                let state = store.get(request.pr).ok_or_else(|| {
-                    format!("release-bot ship-state disappeared for PR #{}", request.pr)
-                })?;
+                let repository = super::branch_cmd::detect_repo_from_remote(cwd, None);
+                let state = repository
+                    .as_ref()
+                    .and_then(|repo| store.get_scoped(repo, request.pr))
+                    .or_else(|| store.get(request.pr))
+                    .ok_or_else(|| {
+                        format!("release-bot ship-state disappeared for PR #{}", request.pr)
+                    })?;
                 if state.merge_queue_enqueue_succeeded_at.is_some()
                     || state.merge_queue_observed_at.is_some()
                 {
@@ -1886,7 +1891,7 @@ mod tests {
             .insert("initial".to_owned(), "pass".to_owned());
         store.save(&initial).expect("initial state");
 
-        let lock = store.lock_pr(pr).expect("writer lock");
+        let lock = store.lock_pr_scoped("owner/repo", pr).expect("writer lock");
         let worker_store = store.clone();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1911,12 +1916,14 @@ mod tests {
             "release-bot seed bypassed the existing PR-state lock"
         );
 
-        let mut concurrent = store.get_locked(pr, &lock).expect("state");
+        let mut concurrent = store
+            .get_locked_scoped("owner/repo", pr, &lock)
+            .expect("state");
         concurrent
             .evidence_snapshot
             .insert("concurrent-provenance".to_owned(), "pass".to_owned());
         store
-            .save_locked(&concurrent, &lock)
+            .save_scoped_locked(&concurrent, &lock)
             .expect("concurrent update");
         drop(lock);
         done_rx
@@ -1925,7 +1932,7 @@ mod tests {
             .expect("seed succeeded");
         worker.join().expect("worker");
 
-        let saved = store.get(pr).expect("saved state");
+        let saved = store.get_scoped("owner/repo", pr).expect("saved state");
         assert_eq!(saved.evidence_snapshot["initial"], "pass");
         assert_eq!(saved.evidence_snapshot["concurrent-provenance"], "pass");
         assert_eq!(

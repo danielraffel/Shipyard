@@ -385,7 +385,11 @@ fn add_lane<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let Some(state) = store.get(args.pr) else {
+    let repository = detect_repo_slug(cwd);
+    let Some(state) = repository.as_ref().map_or_else(
+        || store.get(args.pr),
+        |repo| store.get_scoped(repo, args.pr),
+    ) else {
         return error(
             stdout,
             format!(
@@ -463,7 +467,7 @@ fn add_lane<W: Write>(
         true,
     )?;
     store
-        .with_pr_state_locked(args.pr, |current| {
+        .with_pr_state_scoped_locked(&state.repo, args.pr, |current| {
             let state = current
                 .as_mut()
                 .ok_or_else(|| format!("No in-flight ship state for PR #{}", args.pr))?;
@@ -505,7 +509,11 @@ fn retarget<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let Some(state) = store.get(args.pr) else {
+    let repository = detect_repo_slug(cwd);
+    let Some(state) = repository.as_ref().map_or_else(
+        || store.get(args.pr),
+        |repo| store.get_scoped(repo, args.pr),
+    ) else {
         return error(
             stdout,
             format!(
@@ -562,6 +570,7 @@ fn retarget<W: Write>(
 }
 
 struct RetargetContext {
+    state_repo: String,
     workflow_key: String,
     plan: CloudDispatchPlan,
     dispatch_repo: String,
@@ -609,6 +618,7 @@ fn retarget_context(
         &plan,
     )?;
     Ok(RetargetContext {
+        state_repo: state.repo.clone(),
         workflow_key,
         plan,
         dispatch_repo,
@@ -864,7 +874,7 @@ fn apply_retarget<W: Write>(
     )?;
     request
         .store
-        .with_pr_state_locked(request.args.pr, |current| {
+        .with_pr_state_scoped_locked(&request.context.state_repo, request.args.pr, |current| {
             let state = current
                 .as_mut()
                 .ok_or_else(|| format!("No in-flight ship state for PR #{}", request.args.pr))?;
@@ -2248,6 +2258,7 @@ mod tests {
 
     fn retarget_context_fixture() -> RetargetContext {
         RetargetContext {
+            state_repo: "danielraffel/pulp".to_owned(),
             workflow_key: "ci".to_owned(),
             plan: dispatch_plan(),
             dispatch_repo: "danielraffel/pulp".to_owned(),

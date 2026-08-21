@@ -277,9 +277,13 @@ fn cleanup_ship_state(
     let closed_prs = gather_closed_prs(&store, cwd, &gh_client)?;
     let mut deleted_active = Vec::new();
     for state in store.list_active() {
-        if closed_prs.contains(&state.pr) && state.updated_at <= active_cutoff {
+        if closed_prs
+            .iter()
+            .any(|(repo, pr)| repo.eq_ignore_ascii_case(&state.repo) && *pr == state.pr)
+            && state.updated_at <= active_cutoff
+        {
             store
-                .delete(state.pr)
+                .delete_scoped(&state.repo, state.pr)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             deleted_active.push(state.pr);
         }
@@ -323,11 +327,18 @@ fn gather_closed_prs(
     store: &ShipStateStore,
     cwd: &Path,
     gh_client: &GhClient,
-) -> Result<Vec<u64>, CliFailure> {
+) -> Result<Vec<(String, u64)>, CliFailure> {
+    let repository = super::branch_cmd::detect_repo_from_remote(cwd, None);
     let mut closed = Vec::new();
     for state in store.list_active() {
+        if repository
+            .as_ref()
+            .is_none_or(|repository| !repository.eq_ignore_ascii_case(&state.repo))
+        {
+            continue;
+        }
         if pr_is_closed(state.pr, cwd, gh_client)? {
-            closed.push(state.pr);
+            closed.push((state.repo, state.pr));
         }
     }
     Ok(closed)

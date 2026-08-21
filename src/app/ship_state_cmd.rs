@@ -85,11 +85,13 @@ pub(super) fn ship_state_list<W: Write>(
 
 pub(super) fn ship_state_show<W: Write>(
     store: &ShipStateStore,
+    repository: Option<&str>,
     pr: u64,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(state) = store.get(pr) else {
+    let Some(state) = repository.map_or_else(|| store.get(pr), |repo| store.get_scoped(repo, pr))
+    else {
         return Err(format!("No ship state for PR #{pr}").into());
     };
 
@@ -152,14 +154,16 @@ pub(super) fn ship_state_show<W: Write>(
 
 pub(super) fn ship_state_discard<W: Write>(
     store: &ShipStateStore,
+    repository: Option<&str>,
     pr: u64,
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if store.get(pr).is_none() {
+    let Some(state) = repository.map_or_else(|| store.get(pr), |repo| store.get_scoped(repo, pr))
+    else {
         return Err(format!("No ship state for PR #{pr}").into());
-    }
-    let archived = store.archive(pr)?;
+    };
+    let archived = store.archive_scoped(&state.repo, pr)?;
     if json {
         let mut data = BTreeMap::new();
         data.insert("pr".to_owned(), Value::from(pr));
@@ -185,13 +189,23 @@ pub(super) fn ship_state_reconcile<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    ship_state_reconcile_with(store, pr, reconcile_all, json, stdout, |state| {
-        fetch_status_check_rollup_with_cwd(mode, cwd, &state.repo, state.pr)
-    })
+    let repository = (mode == RuntimeMode::Shipyard)
+        .then(|| super::branch_cmd::detect_repo_from_remote(cwd, None))
+        .flatten();
+    ship_state_reconcile_with(
+        store,
+        repository.as_deref(),
+        pr,
+        reconcile_all,
+        json,
+        stdout,
+        |state| fetch_status_check_rollup_with_cwd(mode, cwd, &state.repo, state.pr),
+    )
 }
 
 fn ship_state_reconcile_with<W: Write, F>(
     store: &ShipStateStore,
+    repository: Option<&str>,
     pr: Option<u64>,
     reconcile_all: bool,
     json: bool,
@@ -204,7 +218,10 @@ where
     let targets = if reconcile_all {
         store.list_active()
     } else if let Some(pr) = pr {
-        store.get(pr).into_iter().collect()
+        repository
+            .map_or_else(|| store.get(pr), |repo| store.get_scoped(repo, pr))
+            .into_iter()
+            .collect()
     } else {
         Vec::new()
     };
@@ -228,7 +245,7 @@ where
         match fetch(&state) {
             Ok(rollup) => {
                 let mut changes = Vec::new();
-                store.with_pr_state_locked(state.pr, |current| {
+                store.with_pr_state_scoped_locked(&state.repo, state.pr, |current| {
                     let Some(current_state) = current.as_ref() else {
                         return Ok(());
                     };
@@ -479,7 +496,7 @@ mod tests {
         store.save(&state).expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_show(&store, 7, false, &mut out).expect("show should render");
+        ship_state_show(&store, None, 7, false, &mut out).expect("show should render");
 
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("PR #7  attempt 1"));
@@ -501,7 +518,7 @@ mod tests {
         store.save(&state).expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_show(&store, 12, true, &mut out).expect("show should render");
+        ship_state_show(&store, None, 12, true, &mut out).expect("show should render");
 
         let payload: Value = serde_json::from_slice(&out).expect("json payload");
         assert_eq!(payload["command"], "ship-state:show");
@@ -517,10 +534,43 @@ mod tests {
         let store = store(&temp);
         let mut out = Vec::new();
 
-        let err = ship_state_show(&store, 404, false, &mut out).expect_err("missing state");
+        let err = ship_state_show(&store, None, 404, false, &mut out).expect_err("missing state");
 
         assert_eq!(err.to_string(), "No ship state for PR #404");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn show_scoped_selects_current_repository_when_pr_numbers_collide() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = store(&temp);
+        store
+            .save(&ShipState::new(
+                7,
+                "owner/pulp",
+                "pulp",
+                "main",
+                "p",
+                "policy",
+            ))
+            .expect("pulp state");
+        store
+            .save(&ShipState::new(
+                7,
+                "owner/forge",
+                "forge",
+                "main",
+                "f",
+                "policy",
+            ))
+            .expect("forge state");
+        let mut out = Vec::new();
+
+        ship_state_show(&store, Some("OWNER/FORGE"), 7, true, &mut out).expect("scoped show");
+
+        let value: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(value["repo"], "owner/forge");
+        assert_eq!(value["head_sha"], "f");
     }
 
     #[test]
@@ -535,7 +585,7 @@ mod tests {
             .expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_discard(&store, 33, true, &mut out).expect("discard should render");
+        ship_state_discard(&store, None, 33, true, &mut out).expect("discard should render");
 
         let payload: Value = serde_json::from_slice(&out).expect("json payload");
         assert_eq!(payload["command"], "ship-state:discard");
@@ -559,7 +609,7 @@ mod tests {
             .expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_discard(&store, 34, false, &mut out).expect("discard should render");
+        ship_state_discard(&store, None, 34, false, &mut out).expect("discard should render");
 
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
@@ -574,7 +624,7 @@ mod tests {
         let store = store(&temp);
         let mut out = Vec::new();
 
-        let err = ship_state_discard(&store, 404, true, &mut out).expect_err("missing state");
+        let err = ship_state_discard(&store, None, 404, true, &mut out).expect_err("missing state");
 
         assert_eq!(err.to_string(), "No ship state for PR #404");
         assert!(out.is_empty());
@@ -592,7 +642,7 @@ mod tests {
         store.save(&state).expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_reconcile_with(&store, Some(42), false, true, &mut out, |_| {
+        ship_state_reconcile_with(&store, None, Some(42), false, true, &mut out, |_| {
             Ok(vec![serde_json::json!({
                 "name": "Build / macos",
                 "state": "COMPLETED",
@@ -626,7 +676,7 @@ mod tests {
             .expect("state should save");
         let mut out = Vec::new();
 
-        ship_state_reconcile_with(&store, None, true, false, &mut out, |state| {
+        ship_state_reconcile_with(&store, None, None, true, false, &mut out, |state| {
             Err(ReconcileFetchError::Command(format!(
                 "gh failed for PR #{}",
                 state.pr
@@ -645,14 +695,9 @@ mod tests {
         let store = store(&temp);
         let mut out = Vec::new();
 
-        ship_state_reconcile_with(
-            &store,
-            Some(404),
-            false,
-            false,
-            &mut out,
-            |_| Ok(Vec::new()),
-        )
+        ship_state_reconcile_with(&store, None, Some(404), false, false, &mut out, |_| {
+            Ok(Vec::new())
+        })
         .expect("reconcile should render");
 
         assert_eq!(
