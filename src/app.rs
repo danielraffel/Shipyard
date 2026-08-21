@@ -1115,6 +1115,7 @@ mod tests {
         thread::spawn(move || {
             run_blocking(DaemonRunConfig {
                 mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
                 state_dir,
                 repos,
             })

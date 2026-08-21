@@ -64,6 +64,8 @@ const WEBHOOK_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 pub struct DaemonRunConfig {
     /// Runtime mode used to decide production-vs-sandbox side effects.
     pub mode: RuntimeMode,
+    /// Machine-global policy directory resolved by the CLI.
+    pub global_dir: PathBuf,
     /// Root state directory for the selected runtime mode.
     pub state_dir: PathBuf,
     /// Repos that the daemon should advertise in status.
@@ -183,8 +185,13 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     )?;
     let repos = normalize_repos(config.repos);
     let registrar_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut steward_wake =
-        StewardWakeRuntime::for_authority(&repos, &config.state_dir, &registrar_cwd, config.mode);
+    let mut steward_wake = StewardWakeRuntime::for_authority(
+        &repos,
+        &config.state_dir,
+        &config.global_dir,
+        &registrar_cwd,
+        config.mode,
+    );
     let registrar = Arc::new(Mutex::new(Registrar::new_with_context(
         config.mode,
         &config.state_dir,
@@ -2086,6 +2093,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             run_blocking(DaemonRunConfig {
                 mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
                 state_dir,
                 repos: vec!["owner/repo".to_owned()],
             })
@@ -2120,6 +2128,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             run_blocking(DaemonRunConfig {
                 mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
                 state_dir,
                 repos: vec!["owner/repo".to_owned()],
             })
@@ -2133,6 +2142,7 @@ mod tests {
 
         let error = run_blocking(DaemonRunConfig {
             mode: RuntimeMode::Isolated,
+            global_dir: other_state_dir.clone(),
             state_dir: other_state_dir,
             repos: vec!["owner/repo".to_owned()],
         })
@@ -2266,6 +2276,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             run_blocking(DaemonRunConfig {
                 mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
                 state_dir,
                 repos: vec!["owner/repo".to_owned()],
             })

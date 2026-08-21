@@ -143,6 +143,7 @@ fn daemon_run_with_repos(
 ) -> Result<ExitCode, CliFailure> {
     match run_blocking(DaemonRunConfig {
         mode,
+        global_dir: runtime_paths.global_dir.clone(),
         state_dir: runtime_paths.state_dir.clone(),
         repos,
     }) {
@@ -410,6 +411,7 @@ mod tests {
         std::thread::spawn(move || {
             run_blocking(DaemonRunConfig {
                 mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
                 state_dir,
                 repos,
             })

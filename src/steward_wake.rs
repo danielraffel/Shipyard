@@ -20,7 +20,6 @@ use serde_json::{Value, json};
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::merge_queue_control::authority_status;
-use crate::paths::RuntimePaths;
 use crate::process::ProcessTree;
 
 const EVENT_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -61,14 +60,14 @@ impl StewardWakeRuntime {
     pub fn for_authority(
         repos: &[String],
         state_dir: &Path,
+        global_dir: &Path,
         cwd: &Path,
         mode: RuntimeMode,
     ) -> Option<Self> {
         if cfg!(test) || mode != RuntimeMode::Shipyard || repos.is_empty() {
             return None;
         }
-        let global_dir = RuntimePaths::current(mode).global_dir;
-        let authority = authority_status(state_dir, cwd, mode, &global_dir).ok()?;
+        let authority = authority_status(state_dir, cwd, mode, global_dir).ok()?;
         if authority.get("authority_matches").and_then(Value::as_bool) != Some(true) {
             return None;
         }
@@ -80,7 +79,7 @@ impl StewardWakeRuntime {
             binary,
             cwd: cwd.to_path_buf(),
             state_dir: state_dir.to_path_buf(),
-            global_dir,
+            global_dir: global_dir.to_path_buf(),
             mode,
         })
     }
@@ -300,6 +299,7 @@ fn resolve_default_branch(repo: &str, cwd: &Path, mode: RuntimeMode) -> Result<S
 struct StewardWakeScheduler {
     repos: BTreeSet<String>,
     pending: BTreeSet<String>,
+    retry_at: BTreeMap<String, Instant>,
     ready_at: Option<Instant>,
     next_reconcile_at: Instant,
 }
@@ -310,6 +310,7 @@ impl StewardWakeScheduler {
         Self {
             repos,
             pending: BTreeSet::new(),
+            retry_at: BTreeMap::new(),
             ready_at: None,
             // A daemon start/rejoin always gets one authoritative catch-up.
             next_reconcile_at: now,
@@ -321,6 +322,7 @@ impl StewardWakeScheduler {
             return;
         };
         if self.repos.contains(&repo) {
+            self.retry_at.remove(&repo);
             self.pending.insert(repo);
             self.ready_at.get_or_insert(now + EVENT_DEBOUNCE);
         }
@@ -331,11 +333,22 @@ impl StewardWakeScheduler {
             return;
         }
         self.pending.extend(self.repos.iter().cloned());
+        self.retry_at.clear();
         self.ready_at.get_or_insert(now);
         self.next_reconcile_at = now + RECONCILE_INTERVAL;
     }
 
     fn take_ready(&mut self, now: Instant) -> Option<String> {
+        let retries = self
+            .retry_at
+            .iter()
+            .filter_map(|(repo, retry_at)| (*retry_at <= now).then_some(repo.clone()))
+            .collect::<Vec<_>>();
+        for repo in retries {
+            self.retry_at.remove(&repo);
+            self.pending.insert(repo);
+            self.ready_at = Some(self.ready_at.map_or(now, |ready_at| ready_at.min(now)));
+        }
         if self.ready_at.is_none_or(|ready_at| now < ready_at) {
             return None;
         }
@@ -353,8 +366,8 @@ impl StewardWakeScheduler {
     }
 
     fn worker_failed(&mut self, repo: String, now: Instant) {
-        self.pending.insert(repo);
-        self.ready_at = Some(now + FAILURE_RETRY_DELAY);
+        self.retry_at.insert(repo, now + FAILURE_RETRY_DELAY);
+        self.ready_at = (!self.pending.is_empty()).then_some(now);
     }
 }
 
@@ -489,6 +502,25 @@ mod tests {
                 .take_ready(now + super::FAILURE_RETRY_DELAY)
                 .as_deref(),
             Some("owner/repo")
+        );
+    }
+
+    #[test]
+    fn failed_repo_does_not_starve_an_already_ready_peer() {
+        let now = Instant::now();
+        let mut scheduler =
+            StewardWakeScheduler::new(&["owner/a".to_owned(), "owner/b".to_owned()], now);
+        scheduler.schedule_periodic(now);
+        assert_eq!(scheduler.take_ready(now).as_deref(), Some("owner/a"));
+        scheduler.worker_failed("owner/a".to_owned(), now);
+        assert_eq!(scheduler.take_ready(now).as_deref(), Some("owner/b"));
+        scheduler.worker_finished(now);
+        assert_eq!(scheduler.take_ready(now), None);
+        assert_eq!(
+            scheduler
+                .take_ready(now + super::FAILURE_RETRY_DELAY)
+                .as_deref(),
+            Some("owner/a")
         );
     }
 

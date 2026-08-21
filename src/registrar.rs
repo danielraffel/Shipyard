@@ -423,14 +423,21 @@ fn find_existing_hook(
     url: &str,
 ) -> Result<Option<u64>, RegistrarError> {
     let endpoint = format!("repos/{repo}/hooks?per_page=100");
-    let output = run_gh(client, cwd, gh_binary, &["api", &endpoint], None)?;
+    let output = run_gh(
+        client,
+        cwd,
+        gh_binary,
+        &["api", "--paginate", "--slurp", &endpoint],
+        None,
+    )?;
     if output.status != 0 {
         return Err(classify_gh_failure("list", output.combined_output()));
     }
-    let hooks = serde_json::from_str::<Vec<serde_json::Value>>(&output.stdout)
+    let pages = serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&output.stdout)
         .map_err(|_| RegistrarError::MissingHookId(output.stdout.clone()))?;
-    let mut matching = hooks
+    let mut matching = pages
         .iter()
+        .flatten()
         .filter(|hook| {
             hook.pointer("/config/url")
                 .and_then(serde_json::Value::as_str)
@@ -751,7 +758,7 @@ mod tests {
         let second_body = read_json_log(temp.path(), "stdin-3");
         let third_args = read_log(temp.path(), "args-4");
 
-        assert!(list_args.contains("repos/owner/repo/hooks?per_page=100"));
+        assert!(list_args.contains("api --paginate --slurp repos/owner/repo/hooks?per_page=100"));
         assert!(first_args.contains("-X POST"));
         assert!(first_args.contains("repos/owner/repo/hooks"));
         assert_eq!(first_body["name"], "web");
@@ -1035,12 +1042,12 @@ mod tests {
         };
         let list_response = match mode {
             GhStubMode::ExistingHook => {
-                r#"[{"id":667647843,"config":{"url":"https://example.test/webhook"}}]"#
+                r#"[[{"id":667647843,"config":{"url":"https://example.test/webhook"}}]]"#
             }
             GhStubMode::DuplicateHooks => {
-                r#"[{"id":1,"config":{"url":"https://example.test/webhook"}},{"id":2,"config":{"url":"https://example.test/webhook"}}]"#
+                r#"[[{"id":1,"config":{"url":"https://example.test/webhook"}}],[{"id":2,"config":{"url":"https://example.test/webhook"}}]]"#
             }
-            _ => "[]",
+            _ => "[[]]",
         };
         let script = format!(
             r#"#!/bin/sh
