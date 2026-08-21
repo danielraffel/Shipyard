@@ -36,6 +36,16 @@ pub(super) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum Command {
+    /// Internal daemon-owned queue worker.
+    #[command(name = "execution-worker", hide = true)]
+    ExecutionWorker {
+        /// Exact durable queue job identifier.
+        #[arg(long)]
+        job_id: String,
+        /// Unique worker generation used to reject stale PID receipts.
+        #[arg(long)]
+        generation: String,
+    },
     /// Print the resolved runtime paths for the selected mode.
     Paths,
     /// Show or bump a consumer repo's Shipyard version pin.
@@ -250,6 +260,9 @@ pub(super) enum Command {
         /// Suppress the staged working-tree drift guard.
         #[arg(long = "allow-tree-drift")]
         allow_tree_drift: bool,
+        /// Execute in this terminal for debugging instead of daemon ownership.
+        #[arg(long)]
+        foreground: bool,
     },
     /// Run configured validation targets for a PR, creating one when omitted.
     Ship {
@@ -290,6 +303,9 @@ pub(super) enum Command {
         /// SHA drift (Shipyard #346).
         #[arg(long = "adopt-head")]
         adopt_head: bool,
+        /// Execute in this terminal for debugging instead of daemon ownership.
+        #[arg(long)]
+        foreground: bool,
     },
     /// One-shot push-a-PR: skill-sync, version-bump, then ship.
     Pr {

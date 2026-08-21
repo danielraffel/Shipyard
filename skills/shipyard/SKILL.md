@@ -425,7 +425,37 @@ the default `0`, execution is byte-identical to no retry. Composes with
 `classify_local_failures` (a relabelled-`INFRA` failure becomes retry-eligible).
 Full behavior: `docs/local-mac-pool.md` § Same-backend transient retry.
 
-## Durable Queue: killed-worker recovery (stale-running reaping)
+## Durable Queue: daemon-owned execution
+
+When local validation is required, normal `shipyard run`, `shipyard ship`, and
+`shipyard pr` submissions persist their resolved request and exact
+checkout/configuration provenance, ensure the matching-version daemon is live,
+and return after the daemon accepts durable ownership. (`shipyard pr` may
+instead complete an enabled terminal steward handoff before local validation.)
+Ending the submitting terminal, agent session, or model allocation must not
+terminate the validation worker. Use `--foreground` only for explicit
+interactive debugging where terminal lifetime should own execution.
+On platforms where daemon IPC is unavailable, these commands retain foreground
+execution instead of pretending the job has durable daemon ownership.
+
+Each worker runs in a separate process group with an unpredictable generation
+receipt. A restarted daemon adopts only a live process whose PID, job id, and
+generation all match the durable receipt. A `Running` job without that exact
+live identity becomes terminal `UNCERTAIN`; Shipyard never blindly replays work
+that may already have produced side effects. Pending work is replay-safe only
+when its canonical cwd, repository root/origin, HEAD, tree signature, and
+resolved layered configuration still match. Legacy or malformed pending
+requests are cancelled with an explicit reason and cannot block unrelated
+valid jobs. `shipyard cancel` terminates the complete daemon-owned process
+group, including descendants.
+
+Daemon-owned GitHub work requires an explicit `[github.auth]` source of `env`
+or `command`; ambient interactive `gh` auth is intentionally rejected. A
+running daemon from another Shipyard version must be refreshed before a new
+job is persisted. Adding a new repository to a same-version daemon refreshes
+its registration set while exact live workers remain independently owned.
+
+## Legacy Queue Recovery: killed-worker stale-running reaping
 
 A `shipyard ship` / `shipyard pr` worker that is killed (SIGTERM, crash,
 `kill <pid>`) leaves its job `status: running` in the durable queue
@@ -436,7 +466,8 @@ the queue job intact, and the startup reaper
 (`recover_stale_running_jobs_for_drain`) only fires on daemon restart, so a
 long-lived daemon never recovered. The only fix was hand-editing `queue.json`.
 
-As of v0.68.0 the queue auto-recovers: a `Running` job whose freshest heartbeat
+For foreground and pre-daemon-owned jobs, the v0.68.0 queue recovery remains:
+a `Running` job whose freshest heartbeat
 is older than `DEFAULT_RUNNING_JOB_STALE_SECONDS` (180s) is treated as a dead
 worker and reaped to `Cancelled` — at ship-submit time
 (`refuse_same_pr_running_ship` reaps the stale job, then proceeds) and on every

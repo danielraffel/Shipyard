@@ -16,7 +16,7 @@ mutate GitHub, runners, queues, fleet services, or cleanup state.
 
 | Task | Command |
 |------|---------|
-| Validate current branch | `shipyard run --json` |
+| Validate current branch | `shipyard run --json` (queues to daemon and returns after durable acceptance) |
 | Validate specific targets | `shipyard run --targets mac,ubuntu --json` |
 | Iterate on one platform's CI failure | `shipyard run --skip-target <others>` (see [Iterating on a single-platform failure](#iterating-on-a-single-platform-failure)) |
 | Fast smoke check | `shipyard run --smoke --json` |
@@ -24,7 +24,8 @@ mutate GitHub, runners, queues, fleet services, or cleanup state.
 | Start the live-mode webhook daemon | `shipyard daemon start` |
 | Inspect the daemon | `shipyard daemon status --json` |
 | Stop the daemon | `shipyard daemon stop` |
-| Full ship (PR + validate + merge) | `shipyard ship --json` |
+| Full ship (PR + validate + merge) | `shipyard ship --json` (queues to daemon and returns after durable acceptance) |
+| Debug validation in this terminal | `shipyard run --foreground` / `shipyard ship --foreground` |
 | Ship to develop instead of main | `shipyard ship --base develop --json` |
 | Resume an interrupted ship | `shipyard ship --resume --json` (auto when state exists) |
 | Force-restart a stale ship | `shipyard ship --no-resume --json` |

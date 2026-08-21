@@ -1169,6 +1169,7 @@ mod tests {
                 kind: QueuedExecutionKind::Run,
                 cwd: PathBuf::from("/repo"),
                 created_at: Utc::now(),
+                provenance: None,
                 resource_plan,
                 request: QueuedExecutionRequest::Run(QueuedRunRequest {
                     branch: "main".to_owned(),
@@ -1192,6 +1193,7 @@ mod tests {
                 kind: QueuedExecutionKind::Ship,
                 cwd: PathBuf::from("/repo"),
                 created_at: Utc::now(),
+                provenance: None,
                 resource_plan: claim_plan(&[&format!("ship-state:{repo}:pr-{pr}")]),
                 request: QueuedExecutionRequest::Ship(QueuedShipRequest {
                     pr,
