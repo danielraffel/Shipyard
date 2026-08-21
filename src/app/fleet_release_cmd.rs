@@ -114,6 +114,7 @@ struct HostObservation {
     daemon_running: Option<bool>,
     daemon_version: Option<String>,
     participation: Option<bool>,
+    drain_owned: Option<bool>,
     busy: Option<bool>,
     detail: String,
 }
@@ -127,6 +128,7 @@ impl HostObservation {
             || self.sha256.is_none()
             || self.daemon_running.is_none()
             || self.participation.is_none()
+            || self.drain_owned.is_none()
             || self.busy.is_none()
         {
             return HostState::Unobservable;
@@ -413,10 +415,7 @@ fn reconcile_once<E: HostExecutor>(
         let expected_participation = prior_expectations
             .get(name)
             .and_then(|(participation, _)| *participation);
-        if expected_participation == Some(true)
-            && observation.participation == Some(false)
-            && observation.reachable
-            && observation.busy == Some(false)
+        if owns_recoverable_drain(expected_participation, observation)
             && let Some(host) = hosts.iter().find(|host| host.name == *name)
             && executor.restore_participation(host).is_ok()
         {
@@ -623,10 +622,7 @@ fn apply_host<E: HostExecutor>(
     // immediately before mutation because its runner can claim work while
     // another host is being inspected.
     let mut authorization = executor.probe(host);
-    if participation_before == Some(true)
-        && authorization.participation == Some(false)
-        && authorization.reachable
-        && authorization.busy == Some(false)
+    if owns_recoverable_drain(participation_before, &authorization)
         && executor.restore_participation(host).is_ok()
     {
         authorization = executor.probe(host);
@@ -655,10 +651,7 @@ fn apply_host<E: HostExecutor>(
     let install_error = executor.install(host, desired, &authorization).err();
     let mut after = executor.probe(host);
     if install_error.is_some()
-        && participation_before == Some(true)
-        && after.participation == Some(false)
-        && after.reachable
-        && after.busy == Some(false)
+        && owns_recoverable_drain(participation_before, &after)
         && executor.restore_participation(host).is_ok()
     {
         after = executor.probe(host);
@@ -788,6 +781,7 @@ impl HostExecutor for ProductionExecutor {
                 daemon_running: None,
                 daemon_version: None,
                 participation: None,
+                drain_owned: None,
                 busy: None,
                 detail: output
                     .err()
@@ -803,6 +797,7 @@ impl HostExecutor for ProductionExecutor {
                 daemon_running: None,
                 daemon_version: None,
                 participation: None,
+                drain_owned: None,
                 busy: None,
                 detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             };
@@ -827,11 +822,12 @@ impl HostExecutor for ProductionExecutor {
             r#"set -eu
 bin="$HOME/.local/bin/shipyard"
 pool="$HOME/.local/bin/tartci-pool"
+drain_marker="$HOME/.config/shipyard/fleet-release-drain-owned"
 SHIPYARD_FLEET_MUTATION=1
 export SHIPYARD_FLEET_MUTATION
 restore_pool=0
 restore_participation() {{
-  if [ "$restore_pool" = 1 ]; then "$pool" on >/dev/null; fi
+  if [ "$restore_pool" = 1 ]; then "$pool" on >/dev/null && rm -f "$drain_marker"; fi
 }}
 trap restore_participation EXIT
 if [ {mutate} = 1 ]; then
@@ -840,8 +836,10 @@ if [ {mutate} = 1 ]; then
     exit 75
   fi
   if [ {participating} = 1 ]; then
-    "$pool" off >/dev/null
+    mkdir -p "$(dirname "$drain_marker")"
+    printf '%s\n' {version} > "$drain_marker"
     restore_pool=1
+    "$pool" off >/dev/null
     if pgrep -f '[R]unner.Worker' >/dev/null 2>&1; then
       echo "runner claimed work while entering the release drain; deferring" >&2
       exit 75
@@ -851,7 +849,7 @@ if [ {mutate} = 1 ]; then
     printf '%s' {installer_source} | SHIPYARD_VERSION={version} SHIPYARD_EXPECTED_BINARY_SHA256={sha256} bash
   fi
   if [ {daemon} = 1 ]; then "$bin" daemon refresh >/dev/null; fi
-  if [ "$restore_pool" = 1 ]; then "$pool" on >/dev/null; restore_pool=0; fi
+  if [ "$restore_pool" = 1 ]; then "$pool" on >/dev/null; rm -f "$drain_marker"; restore_pool=0; fi
 fi
 "$bin" --version >/dev/null
 trap - EXIT
@@ -864,18 +862,7 @@ trap - EXIT
             mutate = u8::from(mutation_required),
             participating = u8::from(before.participation == Some(true)),
         );
-        let output = run_host_script(host, &script, 300);
-        if command_completed(&output) && mutation_required && before.participation == Some(true) {
-            let restore = run_host_script(
-                host,
-                r#"pool="$HOME/.local/bin/tartci-pool"; [ -x "$pool" ] && "$pool" on >/dev/null"#,
-                20,
-            )?;
-            if !restore.status.success() {
-                return Err("failed to restore runner participation after rollout".to_owned());
-            }
-        }
-        let output = output?;
+        let output = run_host_script(host, &script, 300)?;
         if output.status.success() {
             Ok(())
         } else {
@@ -891,7 +878,7 @@ trap - EXIT
     fn restore_participation(&self, host: &FleetHost) -> Result<(), String> {
         let output = run_host_script(
             host,
-            r#"pool="$HOME/.local/bin/tartci-pool"; [ -x "$pool" ] && "$pool" on >/dev/null"#,
+            r#"pool="$HOME/.local/bin/tartci-pool"; marker="$HOME/.config/shipyard/fleet-release-drain-owned"; [ -f "$marker" ] && [ -x "$pool" ] && "$pool" on >/dev/null && rm -f "$marker""#,
             20,
         )?;
         if output.status.success() {
@@ -902,8 +889,15 @@ trap - EXIT
     }
 }
 
-fn command_completed(output: &Result<std::process::Output, String>) -> bool {
-    output.is_ok()
+fn owns_recoverable_drain(
+    expected_participation: Option<bool>,
+    observation: &HostObservation,
+) -> bool {
+    expected_participation == Some(true)
+        && observation.participation == Some(false)
+        && observation.drain_owned == Some(true)
+        && observation.reachable
+        && observation.busy == Some(false)
 }
 
 const PROBE_SCRIPT: &str = r#"set -u
@@ -936,6 +930,7 @@ if [ -x "$pool" ]; then
   first=$("$pool" status 2>/dev/null | head -1 || true)
   case "$first" in *"participate flag: true"*) participation=true;; *"participate flag: false"*) participation=false;; esac
 fi
+if [ -f "$HOME/.config/shipyard/fleet-release-drain-owned" ]; then drain_owned=true; else drain_owned=false; fi
 busy=false
 if pgrep -f 'Runner.Worker spawnclient' >/dev/null 2>&1; then busy=true; fi
 if ps -axww -o command= 2>/dev/null \
@@ -943,8 +938,8 @@ if ps -axww -o command= 2>/dev/null \
   | grep -v '[g]rep -E' >/dev/null 2>&1; then busy=true; fi
 if ps -axww -o command= 2>/dev/null \
   | grep '[S]HIPYARD_FLEET_MUTATION=1' >/dev/null 2>&1; then busy=true; fi
-printf 'version=%s\nsha256=%s\ndaemon_running=%s\ndaemon_version=%s\nparticipation=%s\nbusy=%s\n' \
-  "$version" "$sha" "$daemon_running" "$daemon_version" "$participation" "$busy"
+printf 'version=%s\nsha256=%s\ndaemon_running=%s\ndaemon_version=%s\nparticipation=%s\ndrain_owned=%s\nbusy=%s\n' \
+  "$version" "$sha" "$daemon_running" "$daemon_version" "$participation" "$drain_owned" "$busy"
 "#;
 
 fn run_host_script(
@@ -1049,6 +1044,7 @@ fn parse_probe(raw: &str) -> HostObservation {
         daemon_running: bool_value("daemon_running"),
         daemon_version: string_value("daemon_version"),
         participation: bool_value("participation"),
+        drain_owned: bool_value("drain_owned"),
         busy: bool_value("busy"),
         detail: "probe completed".to_owned(),
     }

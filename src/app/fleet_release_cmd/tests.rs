@@ -50,6 +50,7 @@ fn observation(
             }
         }),
         participation: reachable.then_some(true),
+        drain_owned: reachable.then_some(false),
         busy: reachable.then_some(busy),
         detail: "fixture".to_owned(),
     }
@@ -598,13 +599,13 @@ fn legacy_inventory_adds_local_controller_and_rejects_duplicate_names() {
 fn probe_parser_requires_daemon_and_participation_observability() {
     let desired = identity("0.97.0", 'a');
     let parsed = parse_probe(&format!(
-        "version=0.97.0\nsha256={}\ndaemon_running=true\ndaemon_version=0.97.0\nparticipation=true\nbusy=false\n",
+        "version=0.97.0\nsha256={}\ndaemon_running=true\ndaemon_version=0.97.0\nparticipation=true\ndrain_owned=false\nbusy=false\n",
         desired.sha256
     ));
     assert_eq!(parsed.disposition(&desired), HostState::Converged);
 
     let incomplete = parse_probe(&format!(
-        "version=0.97.0\nsha256={}\ndaemon_running=\ndaemon_version=\nparticipation=unknown\nbusy=false\n",
+        "version=0.97.0\nsha256={}\ndaemon_running=\ndaemon_version=\nparticipation=unknown\ndrain_owned=false\nbusy=false\n",
         desired.sha256
     ));
     assert_eq!(incomplete.disposition(&desired), HostState::Unobservable);
@@ -621,7 +622,7 @@ fn probe_supports_macos_and_linux_digest_tools() {
 fn missing_binary_is_pending_and_bootstrappable_when_host_is_otherwise_observable() {
     let desired = identity("0.97.0", 'a');
     let parsed = parse_probe(
-        "version=missing\nsha256=missing\ndaemon_running=false\ndaemon_version=\nparticipation=true\nbusy=false\n",
+        "version=missing\nsha256=missing\ndaemon_running=false\ndaemon_version=\nparticipation=true\ndrain_owned=false\nbusy=false\n",
     );
     assert_eq!(parsed.disposition(&desired), HostState::Pending);
 }
@@ -650,6 +651,15 @@ fn state_lock_refuses_a_competing_reconciler() {
 
 #[test]
 fn timeout_or_lost_ssh_never_authorizes_immediate_participation_restore() {
-    let timeout = Err("host command timed out after 300s".to_owned());
-    assert!(!command_completed(&timeout));
+    let desired = identity("0.97.0", 'a');
+    let mut still_mutating = observation(&desired, true, true, false);
+    still_mutating.participation = Some(false);
+    still_mutating.drain_owned = Some(true);
+    assert!(!owns_recoverable_drain(Some(true), &still_mutating));
+
+    still_mutating.busy = Some(false);
+    assert!(owns_recoverable_drain(Some(true), &still_mutating));
+
+    still_mutating.drain_owned = Some(false);
+    assert!(!owns_recoverable_drain(Some(true), &still_mutating));
 }
