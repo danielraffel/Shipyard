@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde_json::{Value, json};
 
+use crate::config::LoadedConfig;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::merge_queue_control::authority_status;
@@ -163,7 +164,7 @@ impl StewardWakeRuntime {
         if let Some(base) = self.default_branches.get(repo) {
             return Ok(base.clone());
         }
-        let base = resolve_default_branch(repo, &self.cwd, self.mode)?;
+        let base = resolve_default_branch(repo, &self.cwd, &self.global_dir, self.mode)?;
         self.default_branches.insert(repo.to_owned(), base.clone());
         Ok(base)
     }
@@ -224,8 +225,15 @@ fn steward_args(
     ]
 }
 
-fn resolve_default_branch(repo: &str, cwd: &Path, mode: RuntimeMode) -> Result<String, String> {
-    let client = GhClient::from_cwd(mode, cwd)
+fn resolve_default_branch(
+    repo: &str,
+    cwd: &Path,
+    global_dir: &Path,
+    mode: RuntimeMode,
+) -> Result<String, String> {
+    let config = LoadedConfig::load_from_cwd_with_global_dir(mode, cwd, global_dir.to_path_buf())
+        .map_err(|error| format!("could not load GitHub auth for {repo}: {error}"))?;
+    let client = GhClient::from_loaded_config(&config)
         .map_err(|error| format!("could not load GitHub auth for {repo}: {error}"))?
         .with_repo_hint(repo);
     let mut command = client
@@ -353,6 +361,9 @@ impl StewardWakeScheduler {
             return None;
         }
         let repo = self.pending.pop_first();
+        if let Some(repo) = &repo {
+            self.retry_at.remove(repo);
+        }
         if self.pending.is_empty() {
             self.ready_at = None;
         }
@@ -522,6 +533,19 @@ mod tests {
                 .as_deref(),
             Some("owner/a")
         );
+    }
+
+    #[test]
+    fn immediate_follow_up_consumes_stale_retry_for_same_repo() {
+        let now = Instant::now();
+        let mut scheduler = StewardWakeScheduler::new(&["owner/repo".to_owned()], now);
+        scheduler.schedule_periodic(now);
+        assert_eq!(scheduler.take_ready(now).as_deref(), Some("owner/repo"));
+        scheduler.pending.insert("owner/repo".to_owned());
+        scheduler.worker_failed("owner/repo".to_owned(), now);
+        assert_eq!(scheduler.take_ready(now).as_deref(), Some("owner/repo"));
+        scheduler.worker_finished(now);
+        assert_eq!(scheduler.take_ready(now + super::FAILURE_RETRY_DELAY), None);
     }
 
     #[test]
