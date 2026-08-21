@@ -1129,10 +1129,7 @@ mod tests {
         QueuedShipRequest,
     };
     #[cfg(unix)]
-    use std::sync::{LazyLock, Mutex};
-
-    #[cfg(unix)]
-    static PROCESS_TREE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    use crate::test_support::PROCESS_TREE_TEST_LOCK;
 
     fn envelope(claims: &[&str], provenance: bool) -> QueuedExecutionEnvelope {
         use crate::job::{Priority, ValidationMode};
