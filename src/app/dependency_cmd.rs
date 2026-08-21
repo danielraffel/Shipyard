@@ -94,12 +94,11 @@ fn pulp_update<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    if no_pr {
-        let repo_root = repo_root(cwd)?;
-        return pulp_update_checkout(&repo_root, runtime_paths, json, stdout);
-    }
     let local_git = trusted_local_git_client(runtime_paths)?;
     let repo_root = trusted_repo_root(&local_git, cwd)?;
+    if no_pr {
+        return pulp_update_checkout(&repo_root, runtime_paths, json, stdout);
+    }
     pulp_update_pr(&repo_root, runtime_paths, &local_git, json, stdout)
 }
 
@@ -331,7 +330,8 @@ fn pulp_verify<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let repo_root = repo_root(cwd)?;
+    let local_git = trusted_local_git_client(runtime_paths)?;
+    let repo_root = trusted_repo_root(&local_git, cwd)?;
     let config = PulpDependencyConfig::load_tracked(&repo_root).map_err(failure)?;
     config.validate_lock_location(&repo_root).map_err(failure)?;
     let lock = PulpDependencyLock::read_if_present(&config.lock_path(&repo_root))

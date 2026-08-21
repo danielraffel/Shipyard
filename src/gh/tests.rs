@@ -429,6 +429,41 @@ fn privileged_git_uses_the_exact_configured_native_binary() {
 
 #[cfg(unix)]
 #[test]
+fn authenticated_git_can_take_its_binary_only_from_a_separate_authority() {
+    let temp = TempDir::new().expect("tempdir");
+    let native_env = Path::new("/usr/bin/env");
+    let primary = GhClient::from_loaded_config(&config_from_toml(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["/bin/echo", "ghs_primary_token"]
+            "#,
+    ))
+    .expect("primary auth client");
+    let binary_authority = GhClient::from_loaded_config(&config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["/bin/echo", "ghs_unrelated_token"]
+            privileged_git_binary = "{}"
+            "#,
+        native_env.display()
+    )))
+    .expect("binary authority client");
+
+    let output = primary
+        .prepare_git_command_with_binary_authority(temp.path(), &binary_authority)
+        .expect("separated Git command")
+        .output()
+        .expect("Git environment");
+    assert!(output.status.success());
+    let environment = String::from_utf8(output.stdout).expect("environment UTF-8");
+    assert!(environment.contains("GH_TOKEN=ghs_primary_token"));
+    assert!(!environment.contains("ghs_unrelated_token"));
+}
+
+#[cfg(unix)]
+#[test]
 fn privileged_token_children_receive_only_allowlisted_environment() {
     let temp = TempDir::new().expect("tempdir");
     let native_env = Path::new("/usr/bin/env");

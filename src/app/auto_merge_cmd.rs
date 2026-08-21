@@ -12,6 +12,7 @@ use super::{
     CliFailure,
     cli::{MergeMethod, MergeResult},
 };
+use crate::config::LoadedConfig;
 use crate::gh::{GhAuthPolicy, GhAuthSourceSummary, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::merge_queue::{
@@ -644,7 +645,7 @@ fn merge_pr(
     if let Some(client) = client.as_ref() {
         verify_live_merge_target(client, cwd, state, "before governance selection")?;
         if delete_branch {
-            require_branch_cleanup_git(client, cwd)?;
+            require_branch_cleanup_git(client, cwd, global_dir)?;
         }
     }
     let queue_required = if custom_command {
@@ -681,6 +682,7 @@ fn merge_pr(
                             .as_ref()
                             .expect("built-in merge should have gh client"),
                         cwd,
+                        global_dir,
                         state,
                     )
                     .err()
@@ -856,7 +858,7 @@ fn merge_pr(
             &state.head_sha,
             &state.base_branch,
             merge_method,
-            delete_branch,
+            delete_branch.then_some(global_dir),
         )?;
         return classify_builtin_merge_success(client, cwd, state);
     }
@@ -1305,7 +1307,7 @@ pub(super) fn supervise_merge_queue(
                 }
                 if observation.merged {
                     let cleanup_warning = if delete_branch {
-                        delete_pr_head_branch(&client, cwd, &state).err()
+                        delete_pr_head_branch(&client, cwd, global_dir, &state).err()
                     } else {
                         None
                     };
@@ -2316,7 +2318,7 @@ fn merge_pr_rest(
     expected_head_sha: &str,
     expected_base: &str,
     merge_method: MergeMethod,
-    delete_branch: bool,
+    cleanup_global_dir: Option<&Path>,
 ) -> Result<(), String> {
     let repo = repo_slug_for_rest(cwd)?;
     let info = pr_head_info_rest(client, &repo, pr, cwd)?;
@@ -2356,26 +2358,69 @@ fn merge_pr_rest(
         Err(error) => return Err(error),
     }
 
-    if delete_branch && let Some(head_repo) = info.head_repo.as_deref() {
-        let _ = delete_head_branch(client, cwd, head_repo, &info.head_ref, expected_head_sha);
+    if let (Some(global_dir), Some(head_repo)) = (cleanup_global_dir, info.head_repo.as_deref()) {
+        let _ = delete_head_branch(
+            client,
+            cwd,
+            global_dir,
+            head_repo,
+            &info.head_ref,
+            expected_head_sha,
+        );
     }
     Ok(())
 }
 
-fn delete_pr_head_branch(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<(), String> {
+fn delete_pr_head_branch(
+    client: &GhClient,
+    cwd: &Path,
+    global_dir: &Path,
+    state: &ShipState,
+) -> Result<(), String> {
     let info = pr_head_info_rest(client, &state.repo, state.pr, cwd)?;
     let Some(head_repo) = info.head_repo.as_deref() else {
         return Ok(());
     };
-    delete_head_branch(client, cwd, head_repo, &info.head_ref, &state.head_sha)
+    delete_head_branch(
+        client,
+        cwd,
+        global_dir,
+        head_repo,
+        &info.head_ref,
+        &state.head_sha,
+    )
 }
 
-fn require_branch_cleanup_git(client: &GhClient, cwd: &Path) -> Result<(), String> {
-    let auth = client
+fn branch_cleanup_git_authority(
+    client: &GhClient,
+    cwd: &Path,
+    global_dir: &Path,
+) -> Result<Option<GhClient>, String> {
+    let primary_auth = client
         .auth_summary(cwd, GhAuthPolicy::Default)
         .map_err(|error| format!("failed to inspect Git auth for branch cleanup: {error}"))?;
-    if !matches!(auth.source, GhAuthSourceSummary::GhCli) {
-        client
+    if matches!(primary_auth.source, GhAuthSourceSummary::GhCli) {
+        return Ok(None);
+    }
+
+    // A repository may configure the GitHub identity used for ordinary API
+    // calls, but it may never choose the native Git executable that receives
+    // that credential. Reload only the machine-global layer for the cleanup
+    // Git binary; the primary client retains ownership of its credential.
+    let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+        .map_err(|error| format!("failed to load trusted branch-cleanup config: {error}"))?;
+    GhClient::from_loaded_config(&config)
+        .map(Some)
+        .map_err(|error| format!("failed to load trusted branch-cleanup Git config: {error}"))
+}
+
+fn require_branch_cleanup_git(
+    client: &GhClient,
+    cwd: &Path,
+    global_dir: &Path,
+) -> Result<(), String> {
+    if let Some(git_authority) = branch_cleanup_git_authority(client, cwd, global_dir)? {
+        git_authority
             .prepare_privileged_git_command(cwd)
             .map_err(|error| {
                 format!(
@@ -2389,23 +2434,20 @@ fn require_branch_cleanup_git(client: &GhClient, cwd: &Path) -> Result<(), Strin
 fn delete_head_branch(
     client: &GhClient,
     cwd: &Path,
+    global_dir: &Path,
     repo: &str,
     head_ref: &str,
     expected_sha: &str,
 ) -> Result<(), String> {
-    let auth = client
-        .auth_summary(cwd, GhAuthPolicy::Default)
-        .map_err(|error| format!("failed to inspect Git auth for branch cleanup: {error}"))?;
-    let isolated = if matches!(auth.source, GhAuthSourceSummary::GhCli) {
-        None
-    } else {
+    let git_authority = branch_cleanup_git_authority(client, cwd, global_dir)?;
+    let isolated = if let Some(git_authority) = git_authority.as_ref() {
         let parent = tempfile::tempdir()
             .map_err(|error| format!("failed to create isolated Git cleanup root: {error}"))?;
         let repository = parent.path().join("repository");
         std::fs::create_dir(&repository).map_err(|error| {
             format!("failed to create isolated Git cleanup repository: {error}")
         })?;
-        let output = client
+        let output = git_authority
             .prepare_privileged_git_command(&repository)
             .map_err(|error| format!("failed to prepare trusted Git cleanup: {error}"))?
             .args(["init", "--quiet", "--bare"])
@@ -2418,13 +2460,19 @@ fn delete_head_branch(
             ));
         }
         Some((parent, repository))
+    } else {
+        None
     };
     let git_cwd = isolated
         .as_ref()
         .map_or(cwd, |(_, repository)| repository.as_path());
-    let output = client
-        .prepare_git_command(git_cwd)
-        .map_err(|error| format!("failed to prepare authenticated git cleanup: {error}"))?
+    let mut command = if let Some(git_authority) = git_authority.as_ref() {
+        client.prepare_git_command_with_binary_authority(git_cwd, git_authority)
+    } else {
+        client.prepare_git_command(git_cwd)
+    }
+    .map_err(|error| format!("failed to prepare authenticated git cleanup: {error}"))?;
+    let output = command
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -2733,26 +2781,57 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn app_branch_cleanup_requires_trusted_git_before_merge() {
-        let config = crate::config::LoadedConfig {
-            data: r#"
+    fn app_branch_cleanup_uses_only_machine_global_trusted_git_before_merge() {
+        let global = tempfile::tempdir().expect("global config");
+        std::fs::write(
+            global.path().join("config.toml"),
+            r#"
                 [github.auth]
                 source = "command"
                 token_command = ["/bin/echo", "ghs_app_token"]
-                "#
+                "#,
+        )
+        .expect("machine-global config without trusted Git");
+        let native = std::env::current_exe().expect("native test executable");
+        let config = crate::config::LoadedConfig {
+            data: format!(
+                r#"
+                [github.auth]
+                source = "command"
+                token_command = ["/bin/echo", "ghs_app_token"]
+                privileged_git_binary = {}
+                "#,
+                toml::Value::String(native.display().to_string())
+            )
             .parse::<toml::Table>()
             .expect("config TOML"),
-            global_dir: PathBuf::from("/tmp/shipyard-global"),
+            global_dir: global.path().to_path_buf(),
             project_dir: None,
             local_dir: None,
             local_overlay_source: crate::config::LocalOverlaySource::None,
         };
         let client = GhClient::from_loaded_config(&config).expect("App client");
-        let error = require_branch_cleanup_git(&client, Path::new("/tmp"))
-            .expect_err("missing privileged Git must fail before merge");
+        let error = require_branch_cleanup_git(&client, Path::new("/tmp"), global.path())
+            .expect_err("a layered privileged Git override must not authorize cleanup");
         assert!(error.contains("--delete-branch requires trusted isolated Git cleanup"));
 
-        require_branch_cleanup_git(&GhClient::ambient(), Path::new("/tmp"))
+        std::fs::write(
+            global.path().join("config.toml"),
+            format!(
+                r#"
+                [github.auth]
+                source = "command"
+                token_command = ["/bin/echo", "ghs_app_token"]
+                privileged_git_binary = {}
+                "#,
+                toml::Value::String(native.display().to_string())
+            ),
+        )
+        .expect("machine-global trusted Git config");
+        require_branch_cleanup_git(&client, Path::new("/tmp"), global.path())
+            .expect("machine-global trusted Git authorizes cleanup");
+
+        require_branch_cleanup_git(&GhClient::ambient(), Path::new("/tmp"), global.path())
             .expect("ambient cleanup retains its existing Git authority");
     }
 

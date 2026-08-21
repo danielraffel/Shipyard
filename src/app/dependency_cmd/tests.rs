@@ -5,7 +5,8 @@ use super::github::{
     BuildAttestationContext, attestation_inventory_has_initiator,
     build_attestation_policy_rejected, build_attestation_verify_args, build_verifier_records,
     parse_build_attestation, parse_release_attestation, release_assets_from_pages,
-    release_attestation_policy_rejected, release_candidates_from_pages, verifier_record_contract,
+    release_attestation_policy_rejected, release_candidates_from_pages,
+    release_verifier_record_contract, verifier_record_contract,
 };
 use super::*;
 use base64::Engine as _;
@@ -388,6 +389,62 @@ fn verifier_schema_drift_is_an_output_contract_failure() {
 }
 
 #[test]
+fn inner_release_schema_drift_is_operational_contract_failure() {
+    let mut missing_database_id = release_record()["verificationResult"]["statement"].clone();
+    missing_database_id["predicate"]
+        .as_object_mut()
+        .expect("predicate")
+        .remove("databaseId");
+
+    let mut wrong_repository_type = release_record()["verificationResult"]["statement"].clone();
+    wrong_repository_type["predicate"]["repository"] = Value::from(17);
+
+    let mut missing_subject_digest = release_record()["verificationResult"]["statement"].clone();
+    missing_subject_digest["subject"][1]["digest"]
+        .as_object_mut()
+        .expect("asset digest")
+        .remove("sha256");
+
+    for statement in [
+        missing_database_id,
+        wrong_repository_type,
+        missing_subject_digest,
+    ] {
+        let error = release_verifier_record_contract(&verified_record(&statement))
+            .expect_err("inner schema drift must abort rather than reject a candidate");
+        assert!(!error.is_empty());
+    }
+}
+
+#[test]
+fn signed_release_identity_mismatch_remains_a_candidate_rejection() {
+    let mut statement = release_record()["verificationResult"]["statement"].clone();
+    statement["predicate"]["repository"] = Value::from("attacker/pulp");
+    let record = verified_record(&statement);
+
+    release_verifier_record_contract(&record).expect("identity mismatch retains valid schema");
+    assert!(
+        parse_release_attestation(&record, &config(), &release(), &tag())
+            .expect_err("signed identity mismatch must reject the candidate")
+            .contains("repository/tag mismatch")
+    );
+}
+
+#[test]
+fn malformed_inner_build_record_aborts_the_whole_verifier_result() {
+    let mut statement = build_record()["verificationResult"]["statement"].clone();
+    statement["predicate"]["runDetails"]["metadata"]
+        .as_object_mut()
+        .expect("metadata")
+        .remove("invocationId");
+    let malformed = verified_record(&statement);
+
+    let error = build_verifier_records(&Value::Array(vec![build_record(), malformed]))
+        .expect_err("one malformed record must not be dropped by identity filtering");
+    assert!(error.contains("invocationId"));
+}
+
+#[test]
 fn successful_empty_build_verifier_output_is_contract_drift() {
     let error = build_verifier_records(&Value::Array(Vec::new()))
         .expect_err("successful empty output must abort qualification");
@@ -634,4 +691,30 @@ fn dependency_mutations_require_github_app_installation_auth() {
         expires_at: None,
     };
     validate_github_app_auth(&app).expect("GitHub App authority");
+}
+
+#[cfg(unix)]
+#[test]
+fn proof_bearing_repo_root_uses_the_configured_trusted_git() {
+    let config = LoadedConfig {
+        data: r#"
+            [github.auth]
+            privileged_git_binary = "/usr/bin/false"
+            "#
+        .parse::<toml::Table>()
+        .expect("trusted Git config"),
+        global_dir: PathBuf::from("/tmp/shipyard-global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: crate::config::LocalOverlaySource::None,
+    };
+    let client = GhClient::from_loaded_config(&config).expect("trusted Git client");
+
+    let error = trusted_repo_root(&client, Path::new("/tmp"))
+        .expect_err("configured failing Git must control root discovery");
+    assert!(
+        error
+            .message
+            .contains("trusted git rev-parse --show-toplevel")
+    );
 }

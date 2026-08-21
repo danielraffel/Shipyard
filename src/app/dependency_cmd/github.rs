@@ -245,7 +245,7 @@ pub(super) fn release_attestation(
             "GitHub release verifier returned invalid JSON: {error}"
         )))
     })?;
-    verifier_record_contract(&value).map_err(|error| {
+    release_verifier_record_contract(&value).map_err(|error| {
         AttestationFailure::operational(failure(format!(
             "GitHub release verifier output contract changed: {error}"
         )))
@@ -288,12 +288,15 @@ pub(super) fn parse_release_attestation(
     let mut saw_release_identity = false;
     let mut assets = BTreeMap::new();
     for subject in subjects {
-        if subject.get("uri").and_then(Value::as_str) == Some(expected_uri.as_str()) {
-            if subject.pointer("/digest/sha1").and_then(Value::as_str) != Some(tag.ref_sha.as_str())
-            {
-                return Err("release attestation tag object digest mismatch".to_owned());
+        if let Some(uri) = subject.get("uri").and_then(Value::as_str) {
+            if uri == expected_uri {
+                if subject.pointer("/digest/sha1").and_then(Value::as_str)
+                    != Some(tag.ref_sha.as_str())
+                {
+                    return Err("release attestation tag object digest mismatch".to_owned());
+                }
+                saw_release_identity = true;
             }
-            saw_release_identity = true;
             continue;
         }
         let name = subject
@@ -395,7 +398,7 @@ pub(super) fn build_verifier_records(value: &Value) -> Result<&[Value], String> 
         return Err("successful result contains no verification records".to_owned());
     }
     for record in records {
-        verifier_record_contract(record)?;
+        build_verifier_record_contract(record)?;
     }
     Ok(records)
 }
@@ -433,9 +436,7 @@ pub(super) fn parse_build_attestation(
     value: &Value,
     context: &BuildAttestationContext<'_>,
 ) -> Result<BuildAttestationReceipt, String> {
-    let records = value
-        .as_array()
-        .ok_or_else(|| "build attestation verification did not return an array".to_owned())?;
+    let records = build_verifier_records(value)?;
     let expected_digest = release_asset_sha256(context.asset)?;
     let workflow_path = context
         .config
@@ -443,18 +444,22 @@ pub(super) fn parse_build_attestation(
         .strip_prefix(&format!("github.com/{}/", context.config.repository))
         .ok_or_else(|| "signer workflow is outside the configured repository".to_owned())?;
 
-    let mut matches: Vec<_> = records
-        .iter()
-        .filter_map(|record| {
-            matching_build_receipt(record, context, expected_digest, workflow_path)
-        })
-        .filter(|receipt| {
-            context.expected_receipt.is_none_or(|expected| {
-                receipt.statement_sha256 == expected.statement_sha256
-                    && receipt.invocation_uri == expected.invocation_uri
-            })
-        })
-        .collect();
+    let mut matches = Vec::new();
+    for record in records {
+        let Some(receipt) =
+            matching_build_receipt(record, context, expected_digest, workflow_path)?
+        else {
+            continue;
+        };
+        if context.expected_receipt.is_none_or(|expected| {
+            receipt.statement_sha256 == expected.statement_sha256
+                && receipt.invocation_uri == expected.invocation_uri
+        }) {
+            matches.push(receipt);
+        }
+    }
+    // Sorting makes selection stable when GitHub returns more than one valid
+    // proof for the same immutable asset identity.
     matches.sort_by(|left, right| {
         left.statement_sha256
             .cmp(&right.statement_sha256)
@@ -485,10 +490,10 @@ fn matching_build_receipt(
     context: &BuildAttestationContext<'_>,
     expected_digest: &str,
     workflow_path: &str,
-) -> Option<BuildAttestationReceipt> {
-    let (statement_sha256, statement) = verified_statement(record).ok()?;
-    if string_at(statement, "/predicateType").ok()? != "https://slsa.dev/provenance/v1" {
-        return None;
+) -> Result<Option<BuildAttestationReceipt>, String> {
+    let (statement_sha256, statement) = verified_statement(record)?;
+    if string_at(statement, "/predicateType")? != "https://slsa.dev/provenance/v1" {
+        return Ok(None);
     }
     let config = context.config;
     let release = context.release;
@@ -498,58 +503,51 @@ fn matching_build_receipt(
     let expected_repository = format!("https://github.com/{}", config.repository);
     let expected_builder = format!("https://{}@{expected_ref}", config.signer_workflow);
     let dependency_uri = format!("git+{expected_repository}@{expected_ref}");
-    let subject_matches = array_at(statement, "/subject").is_ok_and(|subjects| {
-        subjects.iter().any(|subject| {
-            subject.get("name").and_then(Value::as_str) == Some(asset.name.as_str())
-                && subject.pointer("/digest/sha256").and_then(Value::as_str)
-                    == Some(expected_digest)
-        })
-    });
+    let mut subject_matches = false;
+    for subject in array_at(statement, "/subject")? {
+        let name = string_at(subject, "/name")?;
+        let digest = string_at(subject, "/digest/sha256")?;
+        if name == asset.name && digest == expected_digest {
+            subject_matches = true;
+        }
+    }
     if !subject_matches
-        || statement
-            .pointer("/predicate/buildDefinition/externalParameters/workflow/repository")
-            .and_then(Value::as_str)
-            != Some(expected_repository.as_str())
-        || statement
-            .pointer("/predicate/buildDefinition/externalParameters/workflow/ref")
-            .and_then(Value::as_str)
-            != Some(expected_ref.as_str())
-        || statement
-            .pointer("/predicate/buildDefinition/externalParameters/workflow/path")
-            .and_then(Value::as_str)
-            != Some(workflow_path)
-        || statement
-            .pointer("/predicate/runDetails/builder/id")
-            .and_then(Value::as_str)
-            != Some(expected_builder.as_str())
+        || string_at(
+            statement,
+            "/predicate/buildDefinition/externalParameters/workflow/repository",
+        )? != expected_repository
+        || string_at(
+            statement,
+            "/predicate/buildDefinition/externalParameters/workflow/ref",
+        )? != expected_ref
+        || string_at(
+            statement,
+            "/predicate/buildDefinition/externalParameters/workflow/path",
+        )? != workflow_path
+        || string_at(statement, "/predicate/runDetails/builder/id")? != expected_builder
     {
-        return None;
+        return Ok(None);
     }
-    let dependency_matches = statement
-        .pointer("/predicate/buildDefinition/resolvedDependencies")
-        .and_then(Value::as_array)
-        .is_some_and(|dependencies| {
-            dependencies.iter().any(|dependency| {
-                dependency.get("uri").and_then(Value::as_str) == Some(dependency_uri.as_str())
-                    && dependency
-                        .pointer("/digest/gitCommit")
-                        .and_then(Value::as_str)
-                        == Some(tag.commit_sha.as_str())
-            })
-        });
+    let mut dependency_matches = false;
+    for dependency in array_at(statement, "/predicate/buildDefinition/resolvedDependencies")? {
+        let uri = string_at(dependency, "/uri")?;
+        let digest = string_at(dependency, "/digest/gitCommit")?;
+        if uri == dependency_uri && digest == tag.commit_sha {
+            dependency_matches = true;
+        }
+    }
     if !dependency_matches {
-        return None;
+        return Ok(None);
     }
-    let invocation_uri = statement
-        .pointer("/predicate/runDetails/metadata/invocationId")
-        .and_then(Value::as_str)
-        .filter(|value| {
-            value.starts_with(&format!(
-                "https://github.com/{}/actions/runs/",
-                config.repository
-            )) && value.contains("/attempts/")
-        })?;
-    Some(BuildAttestationReceipt {
+    let invocation_uri = string_at(statement, "/predicate/runDetails/metadata/invocationId")?;
+    if !invocation_uri.starts_with(&format!(
+        "https://github.com/{}/actions/runs/",
+        config.repository
+    )) || !invocation_uri.contains("/attempts/")
+    {
+        return Ok(None);
+    }
+    Ok(Some(BuildAttestationReceipt {
         asset: asset.name.clone(),
         subject_sha256: expected_digest.to_owned(),
         predicate_type: "https://slsa.dev/provenance/v1".to_owned(),
@@ -559,7 +557,99 @@ fn matching_build_receipt(
         source_commit: tag.commit_sha.clone(),
         statement_sha256,
         invocation_uri: invocation_uri.to_owned(),
-    })
+    }))
+}
+
+// The verifier's top-level success is not enough: its decoded statement is an
+// external schema boundary. Validate every field whose absence or type would
+// otherwise be indistinguishable from a signed identity mismatch. Callers map
+// these contract failures to Operational, which prevents latest-qualified
+// polling from silently falling back to an older release during schema drift.
+pub(super) fn release_verifier_record_contract(value: &Value) -> Result<(), String> {
+    verifier_record_contract(value)?;
+    let (_, statement) = verified_statement(value)?;
+    string_at(statement, "/predicateType")?;
+    object_at(statement, "/predicate")?;
+    string_at(statement, "/predicate/repository")?;
+    string_at(statement, "/predicate/tag")?;
+    value_as_u64(
+        statement
+            .pointer("/predicate/databaseId")
+            .ok_or_else(|| "release attestation has no databaseId".to_owned())?,
+    )?;
+    let subjects = array_at(statement, "/subject")?;
+    for (index, subject) in subjects.iter().enumerate() {
+        if !subject.is_object() {
+            return Err(format!("release subject {index} is not an object"));
+        }
+        object_at(subject, "/digest")?;
+        let mut identified = false;
+        if subject.get("uri").is_some() {
+            string_at(subject, "/uri")?;
+            string_at(subject, "/digest/sha1")?;
+            identified = true;
+        }
+        if subject.get("name").is_some() {
+            string_at(subject, "/name")?;
+            string_at(subject, "/digest/sha256")?;
+            identified = true;
+        }
+        if !identified {
+            return Err(format!(
+                "release subject {index} has neither a uri nor a name"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_verifier_record_contract(value: &Value) -> Result<(), String> {
+    verifier_record_contract(value)?;
+    let (_, statement) = verified_statement(value)?;
+    string_at(statement, "/predicateType")?;
+    for (index, subject) in array_at(statement, "/subject")?.iter().enumerate() {
+        if !subject.is_object() {
+            return Err(format!("build subject {index} is not an object"));
+        }
+        string_at(subject, "/name")?;
+        string_at(subject, "/digest/sha256")?;
+    }
+    object_at(statement, "/predicate")?;
+    object_at(statement, "/predicate/buildDefinition")?;
+    object_at(statement, "/predicate/buildDefinition/externalParameters")?;
+    object_at(
+        statement,
+        "/predicate/buildDefinition/externalParameters/workflow",
+    )?;
+    string_at(
+        statement,
+        "/predicate/buildDefinition/externalParameters/workflow/repository",
+    )?;
+    string_at(
+        statement,
+        "/predicate/buildDefinition/externalParameters/workflow/ref",
+    )?;
+    string_at(
+        statement,
+        "/predicate/buildDefinition/externalParameters/workflow/path",
+    )?;
+    for (index, dependency) in
+        array_at(statement, "/predicate/buildDefinition/resolvedDependencies")?
+            .iter()
+            .enumerate()
+    {
+        if !dependency.is_object() {
+            return Err(format!("build dependency {index} is not an object"));
+        }
+        string_at(dependency, "/uri")?;
+        string_at(dependency, "/digest/gitCommit")?;
+    }
+    object_at(statement, "/predicate/runDetails")?;
+    object_at(statement, "/predicate/runDetails/builder")?;
+    string_at(statement, "/predicate/runDetails/builder/id")?;
+    object_at(statement, "/predicate/runDetails/metadata")?;
+    string_at(statement, "/predicate/runDetails/metadata/invocationId")?;
+    Ok(())
 }
 
 fn verified_statement(value: &Value) -> Result<(String, &Value), String> {

@@ -238,9 +238,19 @@ impl GhClient {
     /// placed in argv or a remote URL. Token-bearing commands use direct native
     /// executables so a repository-controlled PATH shim cannot receive it.
     pub fn prepare_git_command(&self, cwd: &Path) -> Result<Command, GhPrepareError> {
+        self.prepare_git_command_with_binary_authority(cwd, self)
+    }
+
+    /// Prepare authenticated Git while sourcing the privileged executable
+    /// from a separate trusted configuration boundary.
+    pub(crate) fn prepare_git_command_with_binary_authority(
+        &self,
+        cwd: &Path,
+        binary_authority: &Self,
+    ) -> Result<Command, GhPrepareError> {
         let token = self.resolve_token(cwd)?;
         let mut command = if token.is_some() {
-            self.prepare_privileged_git_command(cwd)?
+            binary_authority.prepare_privileged_git_command(cwd)?
         } else {
             let mut command = crate::supervised::git_supervised();
             command.current_dir(cwd);
