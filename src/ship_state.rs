@@ -357,6 +357,9 @@ impl ShipStateStore {
         if let Some(state) = Self::get_unlocked_path(&self.state_path_scoped(repository, pr)) {
             return (same_repository(&state.repo, repository) && state.pr == pr).then_some(state);
         }
+        if self.collision_marker_path(pr).exists() {
+            return None;
+        }
         let legacy = self.get_unlocked(pr)?;
         (same_repository(&legacy.repo, repository) && legacy.pr == pr).then_some(legacy)
     }
@@ -569,6 +572,7 @@ impl ShipStateStore {
                 }
                 if let Ok(contents) = fs::read_to_string(&path)
                     && let Ok(state) = serde_json::from_str::<ShipState>(&contents)
+                    && !self.collision_marker_path(state.pr).exists()
                 {
                     insert_newest_state(&mut states, state);
                 }
@@ -662,6 +666,10 @@ impl ShipStateStore {
         self.path.join(format!("{pr}.compat.lock"))
     }
 
+    fn collision_marker_path(&self, pr: u64) -> PathBuf {
+        self.path.join(format!("{pr}.scoped-collision"))
+    }
+
     fn remove_matching_legacy(&self, repository: &str, pr: u64) -> io::Result<()> {
         let legacy = self.state_path(pr);
         if Self::get_unlocked_path(&legacy)
@@ -708,6 +716,9 @@ impl ShipStateStore {
     }
 
     fn legacy_is_preserved(&self, legacy: &ShipState) -> bool {
+        if self.collision_marker_path(legacy.pr).exists() {
+            return true;
+        }
         Self::get_unlocked_path(&self.state_path_scoped(&legacy.repo, legacy.pr))
             .is_some_and(|scoped| scoped.updated_at >= legacy.updated_at)
     }
@@ -729,6 +740,9 @@ impl ShipStateStore {
     }
 
     fn migrate_unrepresented_legacy(&self, pr: u64) -> io::Result<()> {
+        if self.collision_marker_path(pr).exists() {
+            return Ok(());
+        }
         let Some(legacy) = self.get_unlocked(pr) else {
             return Ok(());
         };
@@ -764,19 +778,44 @@ impl ShipStateStore {
         self.ensure_legacy_is_preserved(pr)?;
         let scoped = self.scoped_states_for_pr(pr);
         let legacy_path = self.state_path(pr);
-        if let [state] = scoped.as_slice() {
-            let payload = serde_json::to_string_pretty(state)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            let temp = tempfile::NamedTempFile::new_in(&self.path)?;
-            fs::write(temp.path(), format!("{payload}\n"))?;
-            temp.persist(&legacy_path).map_err(|error| error.error)?;
-        } else if legacy_path.exists() {
-            fs::remove_file(legacy_path)?;
+        let collision_marker = self.collision_marker_path(pr);
+        match scoped.as_slice() {
+            [state] => {
+                let payload = serde_json::to_string_pretty(state)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let temp = tempfile::NamedTempFile::new_in(&self.path)?;
+                fs::write(temp.path(), format!("{payload}\n"))?;
+                temp.persist(&legacy_path).map_err(|error| error.error)?;
+                if collision_marker.exists() {
+                    fs::remove_file(collision_marker)?;
+                }
+            }
+            [] => {
+                if legacy_path.exists() {
+                    fs::remove_file(legacy_path)?;
+                }
+                if collision_marker.exists() {
+                    fs::remove_file(collision_marker)?;
+                }
+            }
+            _ => {
+                // Persist the fence before removing the ambiguous mirror. An
+                // older binary can recreate `<pr>.json` after its lock is
+                // released, but new binaries must never import that record
+                // over repository-scoped runs and evidence.
+                fs::write(&collision_marker, b"repository-scoped\n")?;
+                if legacy_path.exists() {
+                    fs::remove_file(legacy_path)?;
+                }
+            }
         }
         Ok(())
     }
 
     fn migrate_matching_legacy_locked(&self, repository: &str, pr: u64) -> io::Result<()> {
+        if self.collision_marker_path(pr).exists() {
+            return Ok(());
+        }
         let legacy_path = self.state_path(pr);
         let Some(legacy) = Self::get_unlocked_path(&legacy_path) else {
             return Ok(());
@@ -957,6 +996,7 @@ mod tests {
 
     use super::{
         AbandonRecord, DispatchedRun, ShipState, ShipStateStore, compute_policy_signature,
+        same_repository,
     };
 
     fn sample_state(pr: u64, sha: &str) -> ShipState {
@@ -1296,6 +1336,89 @@ mod tests {
         assert!(
             !store.state_path(42).exists(),
             "legacy mirror must not select one repository after a concurrent collision"
+        );
+        assert!(store.collision_marker_path(42).exists());
+    }
+
+    #[test]
+    fn collision_fence_rejects_a_recreated_legacy_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let mut pulp = ShipState::new(
+            42,
+            "Generous-Corp/pulp",
+            "feature/shared",
+            "main",
+            "pulp-scoped",
+            "policy",
+        );
+        pulp.update_evidence("mac", "pass");
+        store.save(&pulp).expect("save Pulp state");
+        store
+            .save(&ShipState::new(
+                42,
+                "Generous-Corp/forge",
+                "feature/shared",
+                "main",
+                "forge-scoped",
+                "policy",
+            ))
+            .expect("save Forge state");
+
+        let mut recreated = ShipState::new(
+            42,
+            "Generous-Corp/pulp",
+            "feature/shared",
+            "main",
+            "pulp-legacy-recreated",
+            "policy",
+        );
+        recreated.updated_at = Utc::now() + chrono::Duration::minutes(1);
+        let legacy_lock = store.lock_pr(42).expect("legacy writer lock");
+        store
+            .save_locked(&recreated, &legacy_lock)
+            .expect("old binary recreates legacy state");
+        drop(legacy_lock);
+
+        let active = store
+            .get_scoped("Generous-Corp/pulp", 42)
+            .expect("scoped Pulp state");
+        assert_eq!(active.head_sha, "pulp-scoped");
+        assert_eq!(
+            active.evidence_snapshot.get("mac").map(String::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            store
+                .list_active()
+                .into_iter()
+                .find(|state| same_repository(&state.repo, "Generous-Corp/pulp"))
+                .expect("listed Pulp state")
+                .head_sha,
+            "pulp-scoped"
+        );
+
+        fs::remove_file(store.state_path_scoped("Generous-Corp/pulp", 42))
+            .expect("simulate missing scoped state");
+        assert!(
+            store.get_scoped("Generous-Corp/pulp", 42).is_none(),
+            "collision fence must reject a recreated legacy fallback"
+        );
+
+        store.save(&active).expect("resave scoped state");
+        assert!(!store.state_path(42).exists());
+        assert!(store.collision_marker_path(42).exists());
+
+        store
+            .archive_scoped("Generous-Corp/forge", 42)
+            .expect("archive Forge state");
+        assert!(!store.collision_marker_path(42).exists());
+        assert_eq!(
+            store
+                .get(42)
+                .expect("unambiguous compatibility state")
+                .head_sha,
+            "pulp-scoped"
         );
     }
 

@@ -31,7 +31,10 @@ unambiguously — they are test vocabulary, not runtime observables.
 The repository key is a filesystem-safe encoding of the canonical owner/name.
 Older `<state_dir>/ship/<pr>.json` records are compatibility mirrors that a
 scoped operation migrates without allowing one repository to claim another
-repository's matching PR number. The active file is archived to
+repository's matching PR number. When two repositories share a PR number, a
+durable `<pr>.scoped-collision` fence makes newer binaries ignore any legacy
+mirror recreated by an older process until the number is unambiguous again.
+The active file is archived to
 `<state_dir>/ship/archive/<repository-key>/<pr>-<utc>.json` on one of:
 
 - `shipyard ship` success (`merge_pr` returned a merged PR)
