@@ -483,14 +483,25 @@ continuously-active-writer Phase 2 boundary.
   archived ship-state only after GitHub reports the PR merged
 - **Trigger:** `shipyard ship` or the one-shot `shipyard auto-merge <pr>`
 - **Stack boundary:** at each merge or enqueue mutation boundary, Shipyard
-  queries formal `PullRequest.stack` and `stackEntry` metadata. The initial
-  integration refuses a stacked PR before mutation because GitHub requires the
-  asynchronous merge API and exposes a separate durable request UUID/lifecycle.
-  If the classic boundary inspection itself exhausts GraphQL, Shipyard preserves
-  its exact-head REST fallback; GitHub's classic REST endpoint cannot merge a
-  formal stack. Observe-only pilots validate each layer and merge with
-  `gh stack merge <pr> --merge`; T15 remains the unstacked merge-queue state
-  machine until that lifecycle is modeled.
+  queries the protected base's top-level `stacked_pr_mode` together with formal
+  `PullRequest.headRefOid`, `stack`, and `stackEntry` metadata. Accepted values
+  are `off`, `observe`, and the reserved `apply`; missing means `off`. Detection
+  runs in every mode. `off` preserves the existing refusal. `observe` refuses
+  the same mutation and emits deterministic `stacked-pr-plan=<json>` telemetry
+  bound to the full head SHA plus repository, PR, stack number/size/position,
+  and stack base. Its receipt explicitly records `github_mutation=false` and
+  `required_checks_suppressed=false`; it is not merge evidence. `apply` is
+  structurally rejected as `apply_unavailable` (NO-GO) until the asynchronous
+  request UUID/lifecycle is durably modeled. A trusted machine-global top-level
+  `stacked_pr_mode = "off"` forces the conservative behavior; other global
+  values are invalid because fleet policy may not broaden repository policy.
+  Invalid policy, incomplete metadata, or a stack observation whose head does
+  not match the exact validated head fails before mutation. Unstacked PRs retain
+  T15 unchanged in every mode. If classic-boundary inspection itself exhausts
+  GraphQL, Shipyard preserves its exact-head REST fallback; GitHub's classic
+  REST endpoint cannot merge a formal stack. Observe-only pilots validate each
+  layer and merge with `gh stack merge <pr> --merge`; T15 remains the unstacked
+  merge-queue state machine until that lifecycle is modeled.
 - **Externals:** the configured `GhClient` reads the live branch merge-queue
   object plus evaluated rules, then performs sparse GraphQL queue/PR polls and
   calls `enqueuePullRequest(expectedHeadOid: <validated-sha>)`.

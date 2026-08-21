@@ -772,15 +772,23 @@ merge queue, Shipyard does not issue a direct merge. It enqueues with GitHub's
 server-atomic `expectedHeadOid` set to the exact validated head SHA, then
 `shipyard ship` waits for the queue result.
 Formal GitHub stacked pull requests are detected at each merge or enqueue
-mutation boundary, including the runner steward. The initial integration
-refuses them because GitHub requires
-its asynchronous merge API; Shipyard must not route one through the classic or
-GraphQL unstacked mutation. If that final classic-boundary read exhausts
-GraphQL, Shipyard preserves its exact-head REST fallback because GitHub's
-classic endpoint cannot merge a formal stack.
-For an observe-only pilot, validate every layer and use
-`gh stack merge <pr> --merge`. Do not add Shipyard mutation support until the
-asynchronous request UUID and completion lifecycle are modeled durably.
+mutation boundary, including the runner steward, regardless of the protected
+base's top-level `stacked_pr_mode = "off" | "observe" | "apply"`. Missing
+configuration defaults to `off`, which preserves the existing refusal.
+`observe` still refuses mutation but adds a deterministic exact-head
+`stacked-pr-plan=<json>` receipt with repository, PR, stack number, size,
+position, and stack base. It never changes or suppresses required checks and
+does not count as validation evidence. `apply` is a parsed reserved value, not
+an enabled mutation path: it returns an explicit `apply_unavailable` NO-GO.
+Only `off` is accepted in trusted machine-global config, where it overrides a
+repository's broader mode as the conservative fleet switch. Invalid values,
+partial metadata, and head drift fail closed. Ordinary unstacked auto-merge is
+unchanged in every mode. If the final classic-boundary read exhausts GraphQL,
+Shipyard preserves its exact-head REST fallback because GitHub's classic
+endpoint cannot merge a formal stack. For an observe-only pilot, validate every
+layer and use `gh stack merge <pr> --merge`; do not add Shipyard mutation support
+until the asynchronous request UUID and completion lifecycle are modeled
+durably.
 On private repositories whose plan cannot expose evaluated rules, Shipyard
 continues to classic exact-head merge only when the authoritative live
 `mergeQueue` object is null and GitHub returns its exact private-free

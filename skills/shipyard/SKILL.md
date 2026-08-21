@@ -87,11 +87,23 @@ not redirected into a known-incompatible full Debug run.
 See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard
-inspects `PullRequest.stack` and `stackEntry` at each merge or enqueue mutation
-boundary, including `shipyard runner steward`, and refuses its unstacked
-mutation path when either identifies a stack. Validate each layer, then use
-`gh stack merge <pr> --merge` until
-Shipyard durably models the asynchronous request UUID and result polling. A
+reads the protected base's top-level `stacked_pr_mode = "off" | "observe" |
+"apply"` together with `PullRequest.headRefOid`, `stack`, and `stackEntry` at
+each merge or enqueue mutation boundary, including `shipyard runner steward`.
+The default is `off`; detection remains active and refuses the unstacked path.
+`observe` emits a deterministic `stacked-pr-plan=<json>` receipt bound to the
+full PR head, repository, PR, stack number/size/position, and stack base. The
+receipt always says `github_mutation=false` and
+`required_checks_suppressed=false`: it is telemetry after normal validation,
+not evidence and not a check waiver. `apply` parses so configuration drift is
+visible, but is structurally unavailable (NO-GO) until Shipyard durably models
+GitHub's asynchronous request UUID and result polling. A trusted machine-global
+top-level `stacked_pr_mode = "off"` is the conservative fleet override; global
+`observe`/`apply` is rejected so a machine cannot broaden repository policy.
+Invalid values, unreadable policy, partial stack metadata, or an observed head
+different from the validated head fail closed before GitHub mutation. Ordinary
+unstacked PRs retain the existing merge path in all three modes. Validate each
+stack layer, then use `gh stack merge <pr> --merge` for the manual pilot. A
 classic-boundary GraphQL exhaustion retains the exact-head REST fallback because
 GitHub requires the asynchronous endpoint for formal stacks; queue admission
 and re-enqueue inspections remain fail-closed.

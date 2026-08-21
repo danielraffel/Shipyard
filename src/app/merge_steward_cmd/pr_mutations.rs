@@ -73,27 +73,45 @@ pub(super) fn enqueue_pull_request(
         Err(error) => return (None, Some(error)),
     };
     match inspect_pull_request_stack(context, pr) {
-        Ok(Some(stack)) => {
-            let message = crate::stacked_pr::unsupported_message(pr.fact.number, &stack);
+        Ok(inspection) => {
+            let message = crate::stacked_pr::ensure_unstacked(
+                &context.observation.repo,
+                pr.fact.number,
+                &pr.fact.head_sha,
+                &inspection,
+            )
+            .err();
+            let Some(message) = message else {
+                // The exact-head observation proved this is an ordinary PR.
+                // Continue through the unchanged enqueue path below.
+                return enqueue_unstacked_pull_request(context, pr, ledger, guard);
+            };
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
-            return (
+            (
                 None,
                 Some(audit_error.map_or(message.clone(), |error| {
                     format!("{message}; mutation audit also failed: {error}")
                 })),
-            );
+            )
         }
-        Ok(None) => {}
         Err(error) => {
             let audit_error = guard.finish("stack_inspection_failed").err();
-            return (
+            (
                 None,
                 Some(audit_error.map_or(error.clone(), |audit_error| {
                     format!("{error}; mutation audit also failed: {audit_error}")
                 })),
-            );
+            )
         }
     }
+}
+
+fn enqueue_unstacked_pull_request(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    ledger: &mut StewardLedger,
+    guard: crate::merge_queue_control::MergeQueueMutationGuard,
+) -> (Option<String>, Option<String>) {
     let query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
     let result = context.actions.run_gh(&[
         "api".to_owned(),
@@ -166,13 +184,32 @@ pub(super) fn enqueue_pull_request(
 fn inspect_pull_request_stack(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
-) -> Result<Option<crate::stacked_pr::StackInfo>, String> {
-    let args = crate::stacked_pr::query_args(&context.observation.repo, pr.fact.number)?;
+) -> Result<crate::stacked_pr::StackInspection, String> {
+    let membership_args =
+        crate::stacked_pr::membership_query_args(&context.observation.repo, pr.fact.number)?;
+    let membership_raw = context
+        .actions
+        .run_gh(&membership_args)
+        .map_err(|error| format!("failed to discover pull request stack base: {error}"))?;
+    let initial_stack = crate::stacked_pr::parse_membership_json(&membership_raw)?;
+    let policy_ref =
+        crate::stacked_pr::rollout_policy_ref(&context.observation.base, initial_stack.as_ref())?;
+    let args = crate::stacked_pr::inspection_query_args(
+        &context.observation.repo,
+        &policy_ref,
+        pr.fact.number,
+    )?;
     let raw = context
         .actions
         .run_gh(&args)
         .map_err(|error| format!("failed to inspect pull request stack: {error}"))?;
-    crate::stacked_pr::parse_json(&raw)
+    let mut inspection = crate::stacked_pr::parse_json(&raw)?;
+    crate::stacked_pr::validate_policy_ref(&context.observation.base, &policy_ref, &inspection)?;
+    crate::stacked_pr::apply_trusted_global_override(
+        &mut inspection,
+        &context.mutation_control.global_dir,
+    )?;
+    Ok(inspection)
 }
 
 #[allow(clippy::too_many_lines)]
