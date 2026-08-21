@@ -1350,6 +1350,25 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn wait_for_live_descendant(pid_path: &Path) -> String {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            if let Ok(pid) = fs::read_to_string(pid_path) {
+                let pid = pid.trim();
+                if pid.parse::<u32>().is_ok_and(|pid| pid > 0) && process_is_running(pid) {
+                    return pid.to_owned();
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture descendant did not publish a live nonzero PID at {}",
+                pid_path.display()
+            );
+            thread::sleep(StdDuration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn daemon_restart_adopts_exact_live_worker_without_replay() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1448,16 +1467,7 @@ mod tests {
         );
         supervisor.tick().expect("start worker");
         let pid_path = temp.path().join("descendant.pid");
-        let deadline = Instant::now() + StdDuration::from_secs(15);
-        while !pid_path.exists() && Instant::now() < deadline {
-            thread::sleep(StdDuration::from_millis(10));
-        }
-        let descendant = fs::read_to_string(&pid_path).expect("descendant pid");
-        let deadline = Instant::now() + StdDuration::from_secs(15);
-        while !process_is_running(descendant.trim()) && Instant::now() < deadline {
-            thread::sleep(StdDuration::from_millis(10));
-        }
-        assert!(process_is_running(descendant.trim()));
+        let descendant = wait_for_live_descendant(&pid_path);
 
         let mut queue = Queue::new(temp.path()).expect("queue");
         let cancelled = queue
@@ -1521,11 +1531,7 @@ mod tests {
         );
         supervisor.tick().expect("start worker");
         let pid_path = temp.path().join("descendant.pid");
-        let deadline = Instant::now() + StdDuration::from_secs(15);
-        while !pid_path.exists() && Instant::now() < deadline {
-            thread::sleep(StdDuration::from_millis(10));
-        }
-        let descendant = fs::read_to_string(&pid_path).expect("descendant pid");
+        let descendant = wait_for_live_descendant(&pid_path);
         queued_job(temp.path(), "replacement");
         let cancellations =
             merged_cancellations(temp.path(), JobStatus::Running, Some("exact-head"));
@@ -1750,16 +1756,7 @@ mod tests {
         );
         original.tick().expect("start worker");
         let pid_path = temp.path().join("descendant.pid");
-        let deadline = Instant::now() + StdDuration::from_secs(15);
-        while !pid_path.exists() && Instant::now() < deadline {
-            thread::sleep(StdDuration::from_millis(10));
-        }
-        let descendant = fs::read_to_string(&pid_path).expect("descendant pid");
-        let deadline = Instant::now() + StdDuration::from_secs(15);
-        while !process_is_running(descendant.trim()) && Instant::now() < deadline {
-            thread::sleep(StdDuration::from_millis(10));
-        }
-        assert!(process_is_running(descendant.trim()));
+        let descendant = wait_for_live_descendant(&pid_path);
         drop(original);
 
         let mut queue = Queue::new(temp.path()).expect("queue");
