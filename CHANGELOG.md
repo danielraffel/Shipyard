@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01010"></a>
+## [0.101.0] - 2026-08-21
+
+- feat(supervisor): retain and rotate governed job logs ([#449](https://github.com/danielraffel/Shipyard/pull/449))
+
 <a id="v01000"></a>
 ## [0.100.0] - 2026-08-21
 
@@ -949,6 +954,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.101.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.101.0
 [0.100.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.100.0
 [0.99.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.99.0
 [0.98.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.98.0
