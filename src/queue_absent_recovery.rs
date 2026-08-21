@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::LoadedConfig;
 use crate::evidence::canonical_repository;
-use crate::execution_supervisor::WorkerReceipt;
+use crate::execution_supervisor::{WorkerReceipt, retire_worker_receipt_if_proven_dead};
 use crate::gh::GhClient;
 use crate::identity::RuntimeMode;
 use crate::job::{Job, JobKind, JobStatus};
@@ -764,6 +764,11 @@ fn ensure_no_worker_receipt(
             return Err("worker receipt has no readable work provenance".to_owned());
         };
         if envelope_owns_pr(envelope, state) {
+            if retire_worker_receipt_if_proven_dead(&path, &receipt)
+                .map_err(|error| format!("worker receipt liveness is unavailable: {error}"))?
+            {
+                continue;
+            }
             return Err("worker receipt still owns this ship work".to_owned());
         }
     }
@@ -1785,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_kill_switch_and_existing_worker_receipt_are_no_ops() {
+    fn disabled_kill_switch_is_a_no_op() {
         let fixture = Fixture::new();
         let disabled = LoadedConfig {
             data: toml::Table::new(),
@@ -1803,28 +1808,32 @@ mod tests {
             |_| Ok(()),
         );
         assert_eq!(off, QueueAbsentRecoveryReport::default());
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn provably_dead_worker_receipt_is_retired_before_recovery_fence() {
+        let fixture = Fixture::new();
         let worker_dir = fixture.state_dir.join("queue-workers");
         fs::create_dir_all(&worker_dir).expect("worker dir");
+        let receipt_path = worker_dir.join(format!("{}.json", fixture.source_job_id));
         fs::write(
-            worker_dir.join(format!("{}.json", fixture.source_job_id)),
+            &receipt_path,
             serde_json::to_vec(&WorkerReceipt {
                 job_id: fixture.source_job_id.clone(),
-                generation: "live-generation".to_owned(),
+                generation: "exited-after-supervisor-reap".to_owned(),
+                // This live PID cannot match the exact worker generation, so
+                // it deterministically models a stale/PID-reused receipt.
                 pid: std::process::id(),
                 started_at: Utc::now(),
             })
             .expect("receipt json"),
         )
         .expect("receipt");
-        let blocked = fixture.sweep(fixture.live(), |_| Ok(()));
-        assert!(blocked.enqueued.is_empty());
-        assert!(
-            blocked
-                .needs_agent
-                .iter()
-                .any(|(_, _, detail)| detail.contains("worker receipt"))
-        );
+        let recovered = fixture.sweep(fixture.live(), |_| Ok(()));
+        assert_eq!(recovered.enqueued.len(), 1, "{recovered:?}");
+        assert!(recovered.needs_agent.is_empty(), "{recovered:?}");
+        assert!(!receipt_path.exists());
     }
 
     #[test]

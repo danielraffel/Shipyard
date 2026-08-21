@@ -1165,6 +1165,31 @@ fn process_liveness(receipt: &WorkerReceipt) -> ProcessLiveness {
     }
 }
 
+/// Remove one unchanged receipt only when its exact process generation is
+/// proven dead. A live/unprobeable process or a concurrently replaced receipt
+/// remains fail-closed.
+pub(crate) fn retire_worker_receipt_if_proven_dead(
+    path: &Path,
+    expected: &WorkerReceipt,
+) -> io::Result<bool> {
+    if process_liveness(expected) != ProcessLiveness::Dead {
+        return Ok(false);
+    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let Ok(observed) = serde_json::from_slice::<WorkerReceipt>(&bytes) else {
+        return Ok(false);
+    };
+    if observed != *expected {
+        return Ok(false);
+    }
+    remove_if_present(path)?;
+    Ok(true)
+}
+
 /// Verify that this exact process was fenced by the daemon before executing.
 pub fn verify_worker_authority(state_dir: &Path, job_id: &str, generation: &str) -> io::Result<()> {
     let path = state_dir
@@ -1290,6 +1315,31 @@ mod tests {
             started_at: Utc::now(),
         };
         assert_eq!(process_liveness(&receipt), ProcessLiveness::Dead);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_receipt_retirement_preserves_concurrently_replaced_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("worker.json");
+        let expected = WorkerReceipt {
+            job_id: "job".to_owned(),
+            generation: "dead-generation".to_owned(),
+            pid: std::process::id(),
+            started_at: Utc::now(),
+        };
+        let replacement = WorkerReceipt {
+            generation: "replacement-generation".to_owned(),
+            ..expected.clone()
+        };
+        write_json_atomic(&path, &replacement).expect("replacement receipt");
+
+        assert!(!retire_worker_receipt_if_proven_dead(&path, &expected).expect("retire attempt"));
+        assert_eq!(
+            serde_json::from_slice::<WorkerReceipt>(&fs::read(path).expect("retained receipt"))
+                .expect("receipt json"),
+            replacement
+        );
     }
 
     #[cfg(windows)]
