@@ -536,7 +536,13 @@ impl ExecutionProvenance {
 }
 
 fn config_signature(config: &LoadedConfig) -> Option<String> {
-    let serialized = toml::to_string(&config.data).ok()?;
+    // Queue snapshots already persist the resolved repository environment in
+    // each target. Excluding the mutable machine-global source table lets a
+    // delayed worker execute that immutable snapshot while every other policy
+    // change remains fenced by this signature.
+    let mut signed = config.data.clone();
+    signed.remove("repository_environment");
+    let serialized = toml::to_string(&signed).ok()?;
     Some(hex::encode(Sha256::digest(serialized.as_bytes())))
 }
 
@@ -2035,6 +2041,18 @@ mod tests {
         provenance
             .validate_with_config(&repo, &original)
             .expect("unchanged config");
+
+        std::fs::write(
+            global.join("config.toml"),
+            "[queue]\nmax_workers = 2\n[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = \"/new/sdk\"\n",
+        )
+        .expect("repository environment drift");
+        let repository_environment_changed =
+            LoadedConfig::load(Some(global.clone()), None, None, LocalOverlaySource::None)
+                .expect("changed repository environment");
+        provenance
+            .validate_with_config(&repo, &repository_environment_changed)
+            .expect("queued snapshot owns resolved repository environment");
 
         std::fs::write(global.join("config.toml"), "[queue]\nmax_workers = 3\n")
             .expect("config drift");

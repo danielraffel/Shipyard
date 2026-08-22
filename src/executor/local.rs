@@ -363,7 +363,13 @@ impl LocalExecutor {
             .iter()
             .map(|stage| (stage.stage.clone(), stage.command.clone()))
             .collect::<Vec<_>>();
-        let config_hash = hash_stage_commands(&stage_pairs);
+        let mut prepared_state_inputs = stage_pairs.clone();
+        prepared_state_inputs.extend(validation.environment.iter().map(|(name, value)| {
+            // The NUL-prefixed namespace cannot collide with configured stage
+            // names and keeps resolved values out of the persisted record.
+            (format!("\0environment:{name}"), value.clone())
+        }));
+        let config_hash = hash_stage_commands(&prepared_state_inputs);
         let store = validation
             .prepared_state_enabled
             .then_some(self.prepared_state_store.as_ref())
@@ -1257,6 +1263,20 @@ mod tests {
         let second_log = std::fs::read_to_string(temp.path().join("second.log")).expect("log");
         assert!(second_log.contains("prepared-state-reuse: skipped"));
         assert!(second_log.contains("setup, build, test"));
+
+        let mut changed_environment = LocalValidationConfig {
+            stages,
+            prepared_state_enabled: true,
+            ..LocalValidationConfig::default()
+        };
+        changed_environment
+            .environment
+            .insert("PULP_SDK_DIR".to_owned(), "/new/sdk".to_owned());
+        let third_log_path = temp.path().join("third.log");
+        let third = executor.validate(request(third_log_path.clone(), changed_environment));
+        assert_eq!(third.status, TargetStatus::Pass);
+        let third_log = std::fs::read_to_string(third_log_path).expect("log");
+        assert!(!third_log.contains("prepared-state-reuse: skipped"));
     }
 
     #[test]

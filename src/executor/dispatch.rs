@@ -1192,6 +1192,7 @@ fn resolved_local(
     validation_table: &Table,
 ) -> Result<ResolvedTarget, DispatchError> {
     let contract = parse_contract(name, validation_table.get("contract"))?;
+    let machine_environment = strict_string_array(validation_table, "machine_environment", name)?;
     let target = LocalTargetConfig {
         name: name.to_owned(),
         platform: platform.to_owned(),
@@ -1204,7 +1205,7 @@ fn resolved_local(
         contract,
         prepared_state_enabled: prepared_state_enabled(validation_table),
         allow_tree_drift: bool_value(validation_table, "_allow_tree_drift").unwrap_or(false),
-        machine_environment: string_array(validation_table, "machine_environment"),
+        machine_environment,
         environment: BTreeMap::new(),
     };
     Ok(ResolvedTarget {
@@ -1781,6 +1782,33 @@ fn string_array(table: &Table, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn strict_string_array(
+    table: &Table,
+    key: &str,
+    target: &str,
+) -> Result<Vec<String>, DispatchError> {
+    let Some(value) = table.get(key) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| DispatchError::InvalidValidationConfig {
+            target: target.to_owned(),
+            reason: format!("{key} must be an array of strings"),
+        })?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                DispatchError::InvalidValidationConfig {
+                    target: target.to_owned(),
+                    reason: format!("{key} must contain only strings"),
+                }
+            })
+        })
+        .collect()
+}
+
 fn table_at<'a>(data: &'a Table, dotted_key: &str) -> Option<&'a Table> {
     let mut current = data;
     let mut parts = dotted_key.split('.').peekable();
@@ -2343,6 +2371,47 @@ backend = "local"
                 error,
                 DispatchError::InvalidMachineEnvironment { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn malformed_machine_environment_request_fails_before_environment_lookup() {
+        for declaration in [
+            "machine_environment = \"PULP_SDK_DIR\"",
+            "machine_environment = [\"PULP_SDK_DIR\", 7]",
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let global = temp.path().join("global");
+            let project = temp.path().join("repo/.shipyard");
+            std::fs::create_dir_all(&global).expect("global dir");
+            std::fs::create_dir_all(&project).expect("project dir");
+            initialize_repository(
+                project.parent().expect("repo root"),
+                "git@github.com:Generous-Corp/forge.git",
+            );
+            std::fs::write(
+                global.join("config.toml"),
+                "[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = \"/sdk\"\n",
+            )
+            .expect("global config");
+            std::fs::write(
+                project.join("config.toml"),
+                format!(
+                    "[project]\nname = \"forge\"\nrepository = \"Generous-Corp/forge\"\n[validation.default]\ncommand = \"true\"\n{declaration}\n[targets.mac]\nbackend = \"local\"\n"
+                ),
+            )
+            .expect("project config");
+            let config =
+                LoadedConfig::load(Some(global), Some(project), None, LocalOverlaySource::None)
+                    .expect("loaded config");
+
+            let error = resolve_targets(&config, ValidationMode::Full)
+                .expect_err("malformed request must fail closed");
+            assert!(matches!(
+                error,
+                DispatchError::InvalidValidationConfig { .. }
+            ));
+            assert!(error.to_string().contains("machine_environment"));
         }
     }
 
