@@ -64,17 +64,24 @@ does not authorize unpacking. Before extraction, `verify_archive_layout`
 decodes the `tar.zst` without writing files and requires every archive member to
 match the manifest's complete sorted layout. It rejects traversal, absolute or
 non-portable paths, links and special files, duplicates, undeclared or missing
-members, omitted parent-directory records, hidden post-archive data, and
-type/mode/size/digest mismatches. `extract_verified_archive` then repeats that
-validation into a private sibling staging directory, rechecks the encoded
-object for mutation, holds an OS-backed parent extraction lease, and atomically
-renames the complete tree into a previously absent destination. A failed,
-partial, or competing layout never becomes a consumable destination.
+members, hidden post-archive data, directory payloads, and type/mode/size/digest
+mismatches. Schema 2 requires explicit parent-directory records; schema-1
+manifests remain readable so an upgrade cannot strand an in-flight immutable
+artifact. `extract_verified_archive` then repeats validation into a private
+sibling staging directory, rechecks the encoded object for mutation, holds an
+OS-backed parent extraction lease, and atomically renames the complete tree
+into a previously absent destination. Its caller supplies the free-space
+reserve policy; Shipyard checks the overflow-safe sum of declared unpacked file
+sizes before staging and rechecks the remaining byte budget and reserve during
+extraction so concurrent disk use fails closed and discards private staging. A
+failed, partial, or competing layout never becomes a consumable destination.
 
 The host declares the store root. Do not assume `/Volumes/Workshop` or a home
 directory: a machine with a nearly-full external volume may correctly choose a
 root-volume staging directory, while other machines may be root-only. Apply a
-free-space watermark to the remaining transfer bytes before starting.
+free-space watermark to both the remaining encoded transfer bytes and the
+declared unpacked extraction bytes before starting, and preserve that watermark
+through extraction.
 
 ## Promotion boundary
 

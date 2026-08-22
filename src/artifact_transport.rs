@@ -16,7 +16,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 /// Current on-disk/wire manifest schema.
-pub const MANIFEST_SCHEMA: u32 = 1;
+pub const MANIFEST_SCHEMA: u32 = 2;
+const LEGACY_MANIFEST_SCHEMA: u32 = 1;
 /// Default chunk size for newly-created manifests.
 pub const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const MIN_CHUNK_SIZE: u64 = 64 * 1024;
@@ -186,7 +187,7 @@ pub struct ManifestAuthority {
 impl ArtifactManifest {
     /// Validate structure, identity bindings, chunk coverage, and layout digest.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.schema != MANIFEST_SCHEMA {
+        if !matches!(self.schema, LEGACY_MANIFEST_SCHEMA | MANIFEST_SCHEMA) {
             return Err(Error::Invalid(format!(
                 "unsupported manifest schema {}",
                 self.schema
@@ -246,26 +247,28 @@ impl ArtifactManifest {
                 }
             }
         }
-        let by_path: HashMap<&str, &LayoutEntry> = self
-            .entries
-            .iter()
-            .map(|entry| (entry.path(), entry))
-            .collect();
-        for entry in &self.entries {
-            let mut parent = Path::new(entry.path()).parent();
-            while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
-                let parent_path = path.to_str().ok_or_else(|| {
-                    Error::Invalid("layout parent path must be portable UTF-8".into())
-                })?;
-                if !matches!(
-                    by_path.get(parent_path),
-                    Some(LayoutEntry::Directory { .. })
-                ) {
-                    return Err(Error::Invalid(format!(
-                        "layout omits parent directory {parent_path}"
-                    )));
+        if self.schema >= MANIFEST_SCHEMA {
+            let by_path: HashMap<&str, &LayoutEntry> = self
+                .entries
+                .iter()
+                .map(|entry| (entry.path(), entry))
+                .collect();
+            for entry in &self.entries {
+                let mut parent = Path::new(entry.path()).parent();
+                while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+                    let parent_path = path.to_str().ok_or_else(|| {
+                        Error::Invalid("layout parent path must be portable UTF-8".into())
+                    })?;
+                    if !matches!(
+                        by_path.get(parent_path),
+                        Some(LayoutEntry::Directory { .. })
+                    ) {
+                        return Err(Error::Invalid(format!(
+                            "layout omits parent directory {parent_path}"
+                        )));
+                    }
+                    parent = path.parent();
                 }
-                parent = path.parent();
             }
         }
         let encoded = serde_json::to_vec(&self.entries)?;
@@ -310,6 +313,18 @@ impl ArtifactManifest {
             ));
         }
         Ok(())
+    }
+
+    fn unpacked_file_size_bytes(&self) -> Result<u64, Error> {
+        self.entries.iter().try_fold(0_u64, |total, entry| {
+            let size = match entry {
+                LayoutEntry::Directory { .. } => 0,
+                LayoutEntry::File { size_bytes, .. } => *size_bytes,
+            };
+            total
+                .checked_add(size)
+                .ok_or_else(|| Error::Invalid("unpacked artifact size overflows u64".into()))
+        })
     }
 
     fn validate_caches(&self) -> Result<(), Error> {
@@ -1030,6 +1045,7 @@ pub fn extract_verified_archive(
     path: &Path,
     manifest: &ArtifactManifest,
     destination: &Path,
+    space_policy: SpacePolicy,
 ) -> Result<(), Error> {
     verify_archive_layout(path, manifest)?;
     if !destination.is_absolute() {
@@ -1073,10 +1089,20 @@ pub fn extract_verified_archive(
             "artifact extraction destination already exists".into(),
         ));
     }
+    let unpacked_size = manifest.unpacked_file_size_bytes()?;
+    space_policy.check_path(parent, unpacked_size, 0)?;
     let staging = tempfile::Builder::new()
         .prefix(".shipyard-artifact-")
         .tempdir_in(parent)?;
-    scan_archive(path, manifest, Some(staging.path()))?;
+    let mut extraction = ExtractionContext {
+        root: staging.path(),
+        space_policy,
+        remaining_bytes: unpacked_size,
+    };
+    scan_archive(path, manifest, Some(&mut extraction))?;
+    extraction
+        .space_policy
+        .check_path(extraction.root, extraction.remaining_bytes, 0)?;
     // A mutable source cannot become trusted by changing between the proof and
     // extraction pass. The private staging tree is discarded on mismatch.
     verify_encoded_artifact(path, manifest)?;
@@ -1111,7 +1137,7 @@ fn verify_encoded_artifact(path: &Path, manifest: &ArtifactManifest) -> Result<(
 fn scan_archive(
     path: &Path,
     manifest: &ArtifactManifest,
-    extraction_root: Option<&Path>,
+    mut extraction: Option<&mut ExtractionContext<'_>>,
 ) -> Result<(), Error> {
     let file = File::open(path)?;
     let decoder = zstd::stream::read::Decoder::new(file)
@@ -1163,7 +1189,7 @@ fn scan_archive(
             entry_type,
             mode,
             expected_entry,
-            extraction_root,
+            extraction.as_deref_mut(),
             &mut directory_modes,
         )?;
     }
@@ -1185,13 +1211,19 @@ fn scan_archive(
     Ok(())
 }
 
+struct ExtractionContext<'a> {
+    root: &'a Path,
+    space_policy: SpacePolicy,
+    remaining_bytes: u64,
+}
+
 fn scan_layout_entry<R: Read>(
     entry: &mut tar::Entry<'_, R>,
     path: &str,
     entry_type: tar::EntryType,
     mode: u32,
     expected: &LayoutEntry,
-    extraction_root: Option<&Path>,
+    extraction: Option<&mut ExtractionContext<'_>>,
     directory_modes: &mut Vec<(PathBuf, u32)>,
 ) -> Result<(), Error> {
     match expected {
@@ -1199,13 +1231,13 @@ fn scan_layout_entry<R: Read>(
             mode: expected_mode,
             ..
         } => {
-            if !entry_type.is_dir() || mode != *expected_mode {
+            if !entry_type.is_dir() || mode != *expected_mode || entry.size() != 0 {
                 return Err(Error::Invalid(format!(
-                    "archive directory type or mode mismatch for {path}"
+                    "archive directory type, mode, or size mismatch for {path}"
                 )));
             }
-            if let Some(root) = extraction_root {
-                let output = root.join(path);
+            if let Some(extraction) = extraction {
+                let output = extraction.root.join(path);
                 fs::create_dir_all(&output)?;
                 directory_modes.push((output, *expected_mode));
             }
@@ -1225,8 +1257,13 @@ fn scan_layout_entry<R: Read>(
                 )));
             }
             let mut hasher = Sha256::new();
-            let copied = if let Some(root) = extraction_root {
-                let output = root.join(path);
+            let copied = if let Some(extraction) = extraction {
+                extraction.space_policy.check_path(
+                    extraction.root,
+                    extraction.remaining_bytes,
+                    0,
+                )?;
+                let output = extraction.root.join(path);
                 if let Some(parent) = output.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -1237,6 +1274,15 @@ fn scan_layout_entry<R: Read>(
                 let copied = copy_and_hash(entry, &mut output_file, &mut hasher)?;
                 output_file.sync_all()?;
                 set_portable_permissions(&output, *expected_mode)?;
+                extraction.remaining_bytes = extraction
+                    .remaining_bytes
+                    .checked_sub(*size_bytes)
+                    .ok_or_else(|| Error::Invalid("unpacked byte budget underflows".into()))?;
+                extraction.space_policy.check_path(
+                    extraction.root,
+                    extraction.remaining_bytes,
+                    0,
+                )?;
                 copied
             } else {
                 copy_and_hash(entry, &mut std::io::sink(), &mut hasher)?
@@ -1584,6 +1630,7 @@ mod tests {
 
     enum TestArchiveEntry<'a> {
         Directory(&'a str, u32),
+        DirectoryPayload(&'a str, u32, &'a [u8]),
         File(&'a str, u32, &'a [u8]),
         Symlink(&'a str, &'a str),
     }
@@ -1601,6 +1648,14 @@ mod tests {
                     builder
                         .append_data(&mut header, *path, std::io::empty())
                         .unwrap();
+                }
+                TestArchiveEntry::DirectoryPayload(path, mode, bytes) => {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_mode(*mode);
+                    header.set_size(bytes.len() as u64);
+                    header.set_cksum();
+                    builder.append_data(&mut header, *path, *bytes).unwrap();
                 }
                 TestArchiveEntry::File(path, mode, bytes) => {
                     let mut header = tar::Header::new_gnu();
@@ -1633,6 +1688,12 @@ mod tests {
         manifest.layout_sha256 = digest(&serde_json::to_vec(&entries).unwrap());
         manifest.entries = entries;
         manifest
+    }
+
+    fn test_space_policy() -> SpacePolicy {
+        SpacePolicy {
+            minimum_free_bytes: 0,
+        }
     }
 
     fn replace_first_tar_path(bytes: &[u8], path: &str) -> Vec<u8> {
@@ -1682,6 +1743,30 @@ mod tests {
         let mut manifest = fixture(&bytes);
         manifest.chunks[1].offset += 1;
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn manifest_schema_two_requires_parents_but_schema_one_remains_readable() {
+        let tool = b"tool";
+        let bytes = test_archive(&[TestArchiveEntry::File("bin/tool", 0o755, tool)]);
+        let entries = vec![LayoutEntry::File {
+            path: "bin/tool".into(),
+            mode: 0o755,
+            size_bytes: tool.len() as u64,
+            sha256: digest(tool),
+        }];
+        let mut manifest = archive_manifest(&bytes, entries);
+        assert!(manifest.validate().is_err());
+        manifest.schema = LEGACY_MANIFEST_SCHEMA;
+        manifest.validate().unwrap();
+        manifest.canonical_sha256().unwrap();
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("legacy.tar.zst");
+        fs::write(&archive, bytes).unwrap();
+        verify_archive_layout(&archive, &manifest).unwrap();
+        let destination = temp.path().join("legacy");
+        extract_verified_archive(&archive, &manifest, &destination, test_space_policy()).unwrap();
+        assert_eq!(fs::read(destination.join("bin/tool")).unwrap(), tool);
     }
 
     #[test]
@@ -1945,12 +2030,58 @@ mod tests {
             .open(temp.path().join(".shipyard-artifact-extract.lease"))
             .unwrap();
         FileExt::try_lock_exclusive(&competing_lock).unwrap();
-        assert!(extract_verified_archive(&archive, &manifest, &destination).is_err());
+        assert!(
+            extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
+                .is_err()
+        );
         assert!(!destination.exists());
         FileExt::unlock(&competing_lock).unwrap();
-        extract_verified_archive(&archive, &manifest, &destination).unwrap();
+        extract_verified_archive(&archive, &manifest, &destination, test_space_policy()).unwrap();
         assert_eq!(fs::read(destination.join("bin/tool")).unwrap(), tool);
-        assert!(extract_verified_archive(&archive, &manifest, &destination).is_err());
+        assert!(
+            extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn extraction_rejects_directory_payloads_and_insufficient_space() {
+        let payload = b"hidden payload";
+        let bytes = test_archive(&[TestArchiveEntry::DirectoryPayload("bin", 0o755, payload)]);
+        let manifest = archive_manifest(
+            &bytes,
+            vec![LayoutEntry::Directory {
+                path: "bin".into(),
+                mode: 0o755,
+            }],
+        );
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("directory-payload.tar.zst");
+        fs::write(&archive, &bytes).unwrap();
+        assert!(verify_archive_layout(&archive, &manifest).is_err());
+
+        let tool = b"verified tool";
+        let bytes = test_archive(&[TestArchiveEntry::File("tool", 0o755, tool)]);
+        let manifest = archive_manifest(
+            &bytes,
+            vec![LayoutEntry::File {
+                path: "tool".into(),
+                mode: 0o755,
+                size_bytes: tool.len() as u64,
+                sha256: digest(tool),
+            }],
+        );
+        let archive = temp.path().join("space.tar.zst");
+        fs::write(&archive, &bytes).unwrap();
+        let destination = temp.path().join("space-failed");
+        let unavailable = SpacePolicy {
+            minimum_free_bytes: available_space(temp.path()).unwrap(),
+        };
+        assert!(matches!(
+            extract_verified_archive(&archive, &manifest, &destination, unavailable),
+            Err(Error::InsufficientSpace { .. })
+        ));
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -2080,7 +2211,10 @@ mod tests {
             let destination = temp
                 .path()
                 .join(format!("failed-{}", manifest.layout_sha256));
-            assert!(extract_verified_archive(&archive, &manifest, &destination).is_err());
+            assert!(
+                extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
+                    .is_err()
+            );
             assert!(!destination.exists());
         }
     }
