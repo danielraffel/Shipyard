@@ -1099,26 +1099,47 @@ pub fn extract_verified_archive(
         space_policy,
         remaining_bytes: unpacked_size,
     };
-    scan_archive(path, manifest, Some(&mut extraction))?;
+    let directory_modes = scan_archive(path, manifest, Some(&mut extraction))?;
     extraction
         .space_policy
         .check_path(extraction.root, extraction.remaining_bytes, 0)?;
     // A mutable source cannot become trusted by changing between the proof and
     // extraction pass. The private staging tree is discarded on mismatch.
     verify_encoded_artifact(path, manifest)?;
-    let staging_path = staging.keep();
-    if destination.exists() {
-        fs::remove_dir_all(&staging_path)?;
-        return Err(Error::Invalid(
-            "artifact extraction destination appeared before publication".into(),
-        ));
-    }
-    if let Err(error) = fs::rename(&staging_path, destination) {
-        let _ = fs::remove_dir_all(&staging_path);
-        return Err(error.into());
-    }
+    publish_staging_no_replace(staging, destination, directory_modes)?;
     sync_directory(parent)?;
     Ok(())
+}
+
+fn publish_staging_no_replace(
+    staging: tempfile::TempDir,
+    destination: &Path,
+    mut directory_modes: Vec<(PathBuf, u32)>,
+) -> Result<(), Error> {
+    if let Err(error) = apply_directory_modes(&mut directory_modes) {
+        restore_directory_modes_for_cleanup(&mut directory_modes);
+        return Err(error);
+    }
+    let staging_path = staging.keep();
+    if let Err(error) = rename_no_replace(&staging_path, destination) {
+        restore_directory_modes_for_cleanup(&mut directory_modes);
+        let _ = fs::remove_dir_all(&staging_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), Error> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE)
+        .map_err(|error| Error::Io(error.into()))
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), Error> {
+    // Windows rename already fails when the destination exists.
+    fs::rename(source, destination).map_err(Error::Io)
 }
 
 fn verify_encoded_artifact(path: &Path, manifest: &ArtifactManifest) -> Result<(), Error> {
@@ -1138,7 +1159,7 @@ fn scan_archive(
     path: &Path,
     manifest: &ArtifactManifest,
     mut extraction: Option<&mut ExtractionContext<'_>>,
-) -> Result<(), Error> {
+) -> Result<Vec<(PathBuf, u32)>, Error> {
     let file = File::open(path)?;
     let decoder = zstd::stream::read::Decoder::new(file)
         .map_err(|error| Error::Invalid(format!("invalid zstd artifact: {error}")))?;
@@ -1153,10 +1174,16 @@ fn scan_archive(
     for entry in archive
         .entries()
         .map_err(|error| Error::Invalid(format!("invalid tar artifact: {error}")))?
+        .raw(true)
     {
         let mut entry =
             entry.map_err(|error| Error::Invalid(format!("invalid tar entry: {error}")))?;
         let entry_type = entry.header().entry_type();
+        if !entry_type.is_dir() && entry_type != tar::EntryType::Regular {
+            return Err(Error::Invalid(
+                "archive contains links, special files, or extension records".into(),
+            ));
+        }
         let entry_path = entry
             .path()
             .map_err(|error| Error::Invalid(format!("invalid tar path: {error}")))?;
@@ -1203,12 +1230,23 @@ fn scan_archive(
             "archive layout is incomplete; missing {missing}"
         )));
     }
+    reject_trailing_archive_data(archive.into_inner())?;
+    Ok(directory_modes)
+}
+
+fn apply_directory_modes(directory_modes: &mut [(PathBuf, u32)]) -> Result<(), Error> {
     directory_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
     for (path, mode) in directory_modes {
-        set_portable_permissions(&path, mode)?;
+        set_portable_permissions(path, *mode)?;
     }
-    reject_trailing_archive_data(archive.into_inner())?;
     Ok(())
+}
+
+fn restore_directory_modes_for_cleanup(directory_modes: &mut [(PathBuf, u32)]) {
+    directory_modes.sort_by_key(|(path, _)| path.components().count());
+    for (path, _) in directory_modes {
+        let _ = set_portable_permissions(path, 0o700);
+    }
 }
 
 struct ExtractionContext<'a> {
@@ -1631,6 +1669,7 @@ mod tests {
     enum TestArchiveEntry<'a> {
         Directory(&'a str, u32),
         DirectoryPayload(&'a str, u32, &'a [u8]),
+        PaxExtension(&'a [u8]),
         File(&'a str, u32, &'a [u8]),
         Symlink(&'a str, &'a str),
     }
@@ -1656,6 +1695,14 @@ mod tests {
                     header.set_size(bytes.len() as u64);
                     header.set_cksum();
                     builder.append_data(&mut header, *path, *bytes).unwrap();
+                }
+                TestArchiveEntry::PaxExtension(bytes) => {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::XHeader);
+                    header.set_mode(0o644);
+                    header.set_size(bytes.len() as u64);
+                    header.set_cksum();
+                    builder.append_data(&mut header, "pax", *bytes).unwrap();
                 }
                 TestArchiveEntry::File(path, mode, bytes) => {
                     let mut header = tar::Header::new_gnu();
@@ -2082,6 +2129,50 @@ mod tests {
             Err(Error::InsufficientSpace { .. })
         ));
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn archive_rejects_raw_extension_records_before_their_payload_is_read() {
+        let extension = b"17 path=hidden\n";
+        let bytes = test_archive(&[
+            TestArchiveEntry::PaxExtension(extension),
+            TestArchiveEntry::File("safe", 0o644, b"x"),
+        ]);
+        let manifest = archive_manifest(
+            &bytes,
+            vec![LayoutEntry::File {
+                path: "safe".into(),
+                mode: 0o644,
+                size_bytes: 1,
+                sha256: digest(b"x"),
+            }],
+        );
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("extension.tar.zst");
+        fs::write(&archive, bytes).unwrap();
+        assert!(verify_archive_layout(&archive, &manifest).is_err());
+    }
+
+    #[test]
+    fn staging_publication_is_no_replace_and_restores_cleanup_permissions() {
+        let temp = TempDir::new().unwrap();
+        let staging = tempfile::Builder::new()
+            .prefix("staging-")
+            .tempdir_in(temp.path())
+            .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let restricted = staging.path().join("restricted");
+        fs::create_dir(&restricted).unwrap();
+        fs::write(restricted.join("payload"), b"payload").unwrap();
+        let destination = temp.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("sentinel"), b"keep").unwrap();
+
+        assert!(
+            publish_staging_no_replace(staging, &destination, vec![(restricted, 0o000)]).is_err()
+        );
+        assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"keep");
+        assert!(!staging_path.exists());
     }
 
     #[test]
