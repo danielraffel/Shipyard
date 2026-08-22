@@ -1097,9 +1097,10 @@ returns the full result, and persists comparison evidence; `authoritative`
 requires a separate graduation review. Repository and local overlay config
 cannot activate either mode. Authoritative activation also requires the exact
 reviewed shadow policy digest in trusted machine-global config.
-Schema-v3 `--resume-from test` is a hard refusal: it would skip the combined
-selected build/test transaction and could test stale warm artifacts. Restart
-from `build` or start a fresh validation.
+When any changed-surface target is configured, `--resume-from test` is refused
+before target observation, activation persistence, or substitution. It could
+skip producer builds and test stale warm artifacts; restart from `build` or
+start a fresh validation.
 
 For a prospective `shipyard pr` push, selected execution is transport-only and
 remains machine-global default-off. Shipyard accepts exactly one non-delete

@@ -133,17 +133,31 @@ pub(super) fn apply_changed_surface_execution(
         return Ok(());
     };
 
+    if let Some(target_name) = selected_resume_refusal_target(
+        config,
+        resume_from,
+        targets.iter().map(|target| target.name.as_str()),
+    ) {
+        let reason = "resume-from test cannot prove a changed-surface build/test transaction; restart from build or start a fresh validation";
+        persist_fallback_diagnostic(
+            &result_dir(state_dir, repo, pr, "unresolved", target_name),
+            &FallbackDiagnostic {
+                schema_version: 1,
+                repository: repo,
+                pull_request: pr,
+                target: target_name,
+                machine_mode: machine.mode,
+                category: "blocked",
+                diagnostic: reason.to_owned(),
+            },
+        )?;
+        return Err(CliFailure::new(2, reason));
+    }
+
     for target in targets {
         // This merged-layer check is only a negative performance prefilter.
         // Authorization is always reparsed from the authenticated base below.
-        if config
-            .get("targets")
-            .and_then(toml::Value::as_table)
-            .and_then(|targets| targets.get(&target.name))
-            .and_then(toml::Value::as_table)
-            .and_then(|target| target.get("changed_surface_selection"))
-            .is_none()
-        {
+        if !target_declares_changed_surface_selection(config, &target.name) {
             continue;
         }
         let ResolvedValidation::Local(validation) = &target.validation else {
@@ -301,21 +315,6 @@ pub(super) fn apply_changed_surface_execution(
                 },
             )?;
             continue;
-        }
-        if let Some(reason) = selected_resume_block_reason(&plan.stage, resume_from) {
-            persist_fallback_diagnostic(
-                &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
-                &FallbackDiagnostic {
-                    schema_version: 1,
-                    repository: repo,
-                    pull_request: pr,
-                    target: &target.name,
-                    machine_mode: machine.mode,
-                    category: "blocked",
-                    diagnostic: reason.to_owned(),
-                },
-            )?;
-            return Err(CliFailure::new(2, reason));
         }
         let original_test = validation
             .stages
@@ -524,13 +523,28 @@ fn bounded_diagnostic(value: &str) -> String {
     value.chars().take(MAX_DIAGNOSTIC_CHARS).collect()
 }
 
-fn selected_resume_block_reason(
-    plan_stage: &str,
+fn target_declares_changed_surface_selection(config: &LoadedConfig, target: &str) -> bool {
+    config
+        .get("targets")
+        .and_then(toml::Value::as_table)
+        .and_then(|targets| targets.get(target))
+        .and_then(toml::Value::as_table)
+        .and_then(|target| target.get("changed_surface_selection"))
+        .is_some()
+}
+
+fn selected_resume_refusal_target<'a>(
+    config: &LoadedConfig,
     resume_from: Option<&str>,
-) -> Option<&'static str> {
-    (plan_stage == "build_and_test" && resume_from == Some("test")).then_some(
-        "resume-from test would skip the selected build-and-test transaction; restart from build or start a fresh validation",
-    )
+    target_names: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    (resume_from == Some("test"))
+        .then(|| {
+            target_names
+                .into_iter()
+                .find(|target| target_declares_changed_surface_selection(config, target))
+        })
+        .flatten()
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -541,7 +555,8 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic, path_component,
-        persist_fallback_diagnostic, selected_resume_block_reason, shell_quote,
+        persist_fallback_diagnostic, selected_resume_refusal_target, shell_quote,
+        target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::fs;
@@ -660,15 +675,35 @@ mod tests {
     }
 
     #[test]
-    fn resume_after_build_is_hard_refused_for_combined_selected_transaction() {
-        let reason = selected_resume_block_reason("build_and_test", Some("test"))
-            .expect("test-only resume must be refused");
-        assert!(reason.contains("restart from build"));
+    fn changed_surface_target_detection_is_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "[targets.mac.changed_surface_selection]\npolicy = '.shipyard/policy.toml'\n",
+        )
+        .unwrap();
+        let config = LoadedConfig::load(
+            Some(temp.path().to_path_buf()),
+            None,
+            None,
+            LocalOverlaySource::None,
+        )
+        .unwrap();
+        assert!(target_declares_changed_surface_selection(&config, "mac"));
+        assert!(!target_declares_changed_surface_selection(&config, "linux"));
+
+        let mixed_targets = ["linux", "mac"];
         assert_eq!(
-            selected_resume_block_reason("build_and_test", Some("build")),
+            selected_resume_refusal_target(&config, Some("test"), mixed_targets.iter().copied()),
+            Some("mac")
+        );
+        assert_eq!(
+            selected_resume_refusal_target(&config, Some("build"), mixed_targets.iter().copied()),
             None
         );
-        assert_eq!(selected_resume_block_reason("build_and_test", None), None);
-        assert_eq!(selected_resume_block_reason("test", Some("test")), None);
+        assert_eq!(
+            selected_resume_refusal_target(&config, Some("test"), ["linux"].iter().copied()),
+            None
+        );
     }
 }
