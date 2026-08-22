@@ -99,39 +99,24 @@ jobs:
           canary_root="/tmp/shipyard-sandbox-m3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           lease_dir="/tmp/shipyard-sandbox-m3-lease"
           umask 077
-          mkdir "$lease_dir"
           mkdir -p "$canary_root/global" "$canary_root/state"
           candidate="$canary_root/shipyard-candidate"
           cp "$SHIPYARD_BINARY_FOR_TEST" "$candidate"
           chmod 700 "$candidate"
-          guardian="$canary_root/sandbox-daemon-guardian.sh"
-          cp "$GITHUB_WORKSPACE/scripts/sandbox_daemon_guardian.sh" "$guardian"
+          guardian="$canary_root/sandbox-daemon-guardian.py"
+          cp "$GITHUB_WORKSPACE/scripts/sandbox_daemon_guardian.py" "$guardian"
           chmod 700 "$guardian"
           candidate_hash="$(shasum -a 256 "$candidate" | awk '{print $1}')"
           installed_hash="$(shasum -a 256 "$installed" | awk '{print $1}')"
           candidate_status="$($candidate --version)"
           installed_status="$($installed --version)"
-          installed_argv="$(pgrep -f 'shipyard.*daemon run' | xargs -r ps -o command= -p 2>/dev/null || true)"
-          "$installed" --json daemon status > "$canary_root/pre-daemon-status.json"
-          jq -S '[(.configured_repos // .registered_repos // [])[]] | sort' \
-            "$canary_root/pre-daemon-status.json" > "$canary_root/pre-configured-repos.json"
-          "$installed" --json status > "$canary_root/pre-worker-status.json"
-          production_pid="$(tr -d '[:space:]' < "$HOME/Library/Application Support/shipyard/daemon/daemon.pid")"
-          printf '%s\n' "$production_pid" > "$canary_root/pre-production.pid"
-          production_command="$(ps -p "$production_pid" -o command=)"
-          printf '%s\n' "$production_command" | grep -F -- "$installed"
-          printf '%s\n' "$production_command" | grep -F -- "--mode shipyard"
-          printf '%s\n' "$production_command" | grep -F -- "daemon run"
-          ps -p "$production_pid" -o command= > "$canary_root/pre-command.txt"
-          lsof -a -p "$production_pid" -d cwd -Fn > "$canary_root/pre-cwd.txt"
-          ps eww -p "$production_pid" -o command= | shasum -a 256 > "$canary_root/pre-env.sha256"
           record="$canary_root/bootstrap.json"
           jq -n \
             --arg candidate "$candidate" --arg candidate_hash "$candidate_hash" \
             --arg candidate_status "$candidate_status" \
             --arg installed "$installed" --arg installed_hash "$installed_hash" \
-            --arg installed_status "$installed_status" --arg installed_argv "$installed_argv" \
-            '{candidate:$candidate,candidate_sha256:$candidate_hash,candidate_status:$candidate_status,installed:$installed,installed_sha256:$installed_hash,installed_status:$installed_status,installed_argv:$installed_argv}' \
+            --arg installed_status "$installed_status" \
+            '{candidate:$candidate,candidate_sha256:$candidate_hash,candidate_status:$candidate_status,installed:$installed,installed_sha256:$installed_hash,installed_status:$installed_status}' \
             > "$record"
           guardian_label="com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
           guardian_plist="$canary_root/guardian.plist"
@@ -143,25 +128,40 @@ jobs:
             <key>RunAtLoad</key><true/>
             <key>KeepAlive</key><false/>
             <key>ProgramArguments</key><array>
-              <string>/bin/bash</string><string>$guardian</string><string>$$</string>
-              <string>$candidate</string><string>$canary_root/global</string>
-              <string>$canary_root/state</string><string>$canary_root/done</string>
-              <string>$canary_root/guardian-receipt.json</string><string>$lease_dir</string>
-              <string>$guardian_label</string>
+              <string>/usr/bin/python3</string><string>$guardian</string>
+              <string>--owner-pid</string><string>$$</string>
+              <string>--installed</string><string>$installed</string>
+              <string>--candidate</string><string>$candidate</string>
+              <string>--global-dir</string><string>$canary_root/global</string>
+              <string>--state-dir</string><string>$canary_root/state</string>
+              <string>--canary-root</string><string>$canary_root</string>
+              <string>--done-file</string><string>$canary_root/done</string>
+              <string>--ready-receipt</string><string>$canary_root/ready.json</string>
+              <string>--final-receipt</string><string>$canary_root/guardian-receipt.json</string>
+              <string>--lease-dir</string><string>$lease_dir</string>
+              <string>--production-pid-file</string><string>$HOME/Library/Application Support/shipyard/daemon/daemon.pid</string>
             </array>
+            <key>StandardOutPath</key><string>$canary_root/guardian.log</string>
+            <key>StandardErrorPath</key><string>$canary_root/guardian.log</string>
           </dict></plist>
           PLIST
           plutil -lint "$guardian_plist"
           launchctl bootstrap "gui/$(id -u)" "$guardian_plist"
-          /usr/bin/env -u RUNNER_TRACKING_ID "$candidate" --mode isolated \
-            --global-dir "$canary_root/global" --state-dir "$canary_root/state" daemon start
+          deadline=$((SECONDS + 30))
+          while [ ! -s "$canary_root/ready.json" ] && [ ! -s "$canary_root/guardian-receipt.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+          if [ -s "$canary_root/guardian-receipt.json" ]; then
+            cat "$canary_root/guardian-receipt.json" >&2
+            exit 1
+          fi
+          jq -e '.phase == "ready" and (.candidate_pid | numbers)' "$canary_root/ready.json"
+          test "$(jq -r .candidate_sha256 "$canary_root/ready.json")" = "$candidate_hash"
+          test "$(jq -r .installed_sha256 "$canary_root/ready.json")" = "$installed_hash"
           "$candidate" --mode isolated --global-dir "$canary_root/global" \
             --state-dir "$canary_root/state" --json daemon status > "$canary_root/candidate-status.json"
           jq -e '.running == true and .tunnel.backend == "inactive" and ((.configured_repos // []) == []) and ((.registered_repos // []) == [])' \
             "$canary_root/candidate-status.json"
-          candidate_pid="$(pgrep -f "^${candidate//\//\\/} .*daemon run" | head -1)"
+          candidate_pid="$(jq -r .candidate_pid "$canary_root/ready.json")"
           test -n "$candidate_pid"
-          printf '%s\n' "$candidate_pid" > "$canary_root/candidate.pid"
           ps -p "$candidate_pid" -o command= | grep -F -- "$candidate"
           if ps eww -p "$candidate_pid" -o command= | grep -q 'RUNNER_TRACKING_ID='; then
             echo "candidate daemon inherited Actions orphan tracking" >&2
@@ -173,7 +173,16 @@ jobs:
             cat "$RUNNER_TEMP/candidate-lock-holders.txt" >&2
             exit 1
           fi
-          .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
+          test "$(shasum -a 256 "$candidate" | awk '{print $1}')" = "$candidate_hash"
+          SHIPYARD_BINARY_FOR_TEST="$candidate" \
+            .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
+          audited_hash="$(shasum -a 256 "$candidate" | awk '{print $1}')"
+          test "$audited_hash" = "$candidate_hash"
+          jq -n --arg candidate "$candidate" --arg candidate_hash "$audited_hash" \
+            --arg real_home "$HOME" \
+            '{schema_version:1,candidate:$candidate,candidate_sha256:$candidate_hash,real_home:$real_home,sandbox_passed:true}' \
+            > "$canary_root/sandbox-proof.json.tmp"
+          mv "$canary_root/sandbox-proof.json.tmp" "$canary_root/sandbox-proof.json"
           touch "$canary_root/done"
 
       - name: Verify M3 guardian and production daemon invariants
@@ -183,30 +192,30 @@ jobs:
           installed="$HOME/.local/bin/shipyard"
           test -x "$installed"
           canary_root="/tmp/shipyard-sandbox-m3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          deadline=$((SECONDS + 15))
+          lease_dir="/tmp/shipyard-sandbox-m3-lease"
+          deadline=$((SECONDS + 45))
           while [ ! -s "$canary_root/guardian-receipt.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
-          jq -e '.candidate_stopped == true' "$canary_root/guardian-receipt.json"
-          candidate_pid="$(tr -d '[:space:]' < "$canary_root/candidate.pid")"
+          jq -e '.candidate_stopped == true and .production_quiesced == true and .production_restored == true and .old_lifetime_lock_owned == true and .lease_removed == true and .mode == "shipyard" and (.active_runs == []) and .failure == null' "$canary_root/guardian-receipt.json"
+          jq -e '.sandbox_passed == true and .real_home == env.HOME' "$canary_root/sandbox-proof.json"
+          test "$(jq -r .candidate_sha256 "$canary_root/sandbox-proof.json")" = "$(jq -r .candidate_sha256 "$canary_root/ready.json")"
+          test "$(shasum -a 256 "$installed" | awk '{print $1}')" = "$(jq -r .installed_sha256 "$canary_root/guardian-receipt.json")"
+          test ! -e "$lease_dir"
+          candidate_pid="$(jq -r .candidate_pid "$canary_root/ready.json")"
           if kill -0 "$candidate_pid" 2>/dev/null; then
             echo "candidate daemon survived guardian cleanup" >&2
             exit 1
           fi
-          "$installed" --json daemon status > "$canary_root/post-daemon-status.json"
-          jq -S '[(.configured_repos // .registered_repos // [])[]] | sort' "$canary_root/post-daemon-status.json" > "$canary_root/post-configured-repos.json"
-          cmp "$canary_root/pre-configured-repos.json" "$canary_root/post-configured-repos.json"
           production_pid="$(tr -d '[:space:]' < "$HOME/Library/Application Support/shipyard/daemon/daemon.pid")"
-          printf '%s\n' "$production_pid" > "$canary_root/post-production.pid"
-          cmp "$canary_root/pre-production.pid" "$canary_root/post-production.pid"
-          ps -p "$production_pid" -o command= > "$canary_root/post-command.txt"
-          lsof -a -p "$production_pid" -d cwd -Fn > "$canary_root/post-cwd.txt"
-          ps eww -p "$production_pid" -o command= | shasum -a 256 > "$canary_root/post-env.sha256"
-          cmp "$canary_root/pre-command.txt" "$canary_root/post-command.txt"
-          cmp "$canary_root/pre-cwd.txt" "$canary_root/post-cwd.txt"
-          cmp "$canary_root/pre-env.sha256" "$canary_root/post-env.sha256"
-          "$installed" --json status > "$canary_root/post-worker-status.json"
-          jq -S '[.active_runs[]?.id] | sort' "$canary_root/pre-worker-status.json" > "$canary_root/pre-worker-ids.json"
-          jq -S '[.active_runs[]?.id] | sort' "$canary_root/post-worker-status.json" > "$canary_root/post-worker-ids.json"
-          cmp "$canary_root/pre-worker-ids.json" "$canary_root/post-worker-ids.json"
+          test "$production_pid" = "$(jq -r .restored_production_pid "$canary_root/guardian-receipt.json")"
+          test "$production_pid" != "$(jq -r .old_production_pid "$canary_root/guardian-receipt.json")"
+          ps -p "$production_pid" -o command= | grep -F -- "$installed"
+          ps -p "$production_pid" -o command= | grep -F -- "--mode shipyard"
+          ps -p "$production_pid" -o command= | grep -F -- "daemon run"
+          deadline=$((SECONDS + 10))
+          while [ "$(ps -p "$production_pid" -o ppid= | tr -d '[:space:]')" != "1" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+          test "$(ps -p "$production_pid" -o ppid= | tr -d '[:space:]')" = "1"
+          "$installed" --json daemon status | jq -e '.running == true'
+          launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
 
       - name: Upload sandbox tempdir on failure
         if: failure()
@@ -217,6 +226,7 @@ jobs:
           # TMPDIR/platform defaults. GitHub macOS runners use
           # /private/var/folders/... rather than /tmp, so cover both.
           path: |
+            /tmp/shipyard-sandbox-m3-${{ github.run_id }}-${{ github.run_attempt }}/**
             /tmp/shipyard-sandbox-e2e.*/**
             /private/var/folders/**/shipyard-sandbox-e2e.*/**
             /var/folders/**/shipyard-sandbox-e2e.*/**

@@ -214,7 +214,7 @@ class CiMatrixTests(unittest.TestCase):
         self.assertIn('test "$(hostname)" = "Daniels-Mac-Studio.local"', workflow)
         self.assertIn('test "$($installed runner tag)" = "studio"', workflow)
 
-    def test_sandbox_m3_candidate_is_isolated_and_production_is_unchanged(self) -> None:
+    def test_sandbox_m3_candidate_is_exact_and_production_is_restored(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(
             encoding="utf-8"
@@ -224,13 +224,14 @@ class CiMatrixTests(unittest.TestCase):
         self.assertIn('--global-dir "$canary_root/global"', workflow)
         self.assertIn('--state-dir "$canary_root/state"', workflow)
         self.assertIn('.tunnel.backend == "inactive"', workflow)
-        self.assertIn('cmp "$canary_root/pre-configured-repos.json"', workflow)
-        self.assertIn('cmp "$canary_root/pre-command.txt"', workflow)
-        self.assertIn('cmp "$canary_root/pre-cwd.txt"', workflow)
-        self.assertIn('cmp "$canary_root/pre-env.sha256"', workflow)
-        self.assertIn('cmp "$canary_root/pre-production.pid"', workflow)
+        self.assertIn('SHIPYARD_BINARY_FOR_TEST="$candidate"', workflow)
+        self.assertIn('candidate_sha256:$candidate_hash', workflow)
+        self.assertIn('sandbox_passed:true', workflow)
+        self.assertIn('.real_home == env.HOME', workflow)
+        self.assertIn('.mode == "shipyard"', workflow)
+        self.assertIn('(.active_runs == [])', workflow)
+        self.assertIn('.restored_production_pid', workflow)
         self.assertIn('grep -F -- "--mode shipyard"', workflow)
-        self.assertNotIn('"$installed" daemon stop', workflow)
 
     def test_sandbox_candidate_has_host_owned_cleanup_guardian(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -240,10 +241,10 @@ class CiMatrixTests(unittest.TestCase):
         self.assertIn('launchctl bootstrap "gui/$(id -u)" "$guardian_plist"', workflow)
         self.assertIn("<key>KeepAlive</key><false/>", workflow)
         self.assertIn(
-            'cp "$GITHUB_WORKSPACE/scripts/sandbox_daemon_guardian.sh" "$guardian"',
+            'cp "$GITHUB_WORKSPACE/scripts/sandbox_daemon_guardian.py" "$guardian"',
             workflow,
         )
-        self.assertIn('<string>$guardian_label</string>', workflow)
+        self.assertIn('<string>--owner-pid</string><string>$$</string>', workflow)
         self.assertIn('if kill -0 "$candidate_pid"', workflow)
         self.assertIn("name: Verify M3 guardian and production daemon invariants", workflow)
         self.assertEqual(workflow.count("inherited Actions orphan tracking"), 1)
@@ -253,6 +254,10 @@ class CiMatrixTests(unittest.TestCase):
         self.assertNotIn(
             '"$candidate" daemon refresh --repo Generous-Corp/pulp', workflow
         )
+        self.assertNotIn('mkdir "$lease_dir"', workflow)
+        self.assertIn(".production_quiesced == true", workflow)
+        self.assertIn(".production_restored == true", workflow)
+        self.assertIn(".lease_removed == true", workflow)
 
 
 if __name__ == "__main__":
