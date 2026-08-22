@@ -226,6 +226,48 @@ def _exclusive_lock_is_contended(path: Path) -> bool:
         return False
 
 
+def _wait_for_idle_writer_domain(
+    path: Path,
+    production_pid: int,
+    *,
+    timeout: float = 10.0,
+    poll_interval: float = 0.1,
+    stable_observations: int = 3,
+) -> None:
+    """Distinguish a transient production mutation from a lifetime lock.
+
+    Corrected daemons acquire the writer-domain lock only around mutations, so
+    finalization can legitimately race a short critical section.  A pre-cutover
+    daemon's lifetime lock never opens a lock-free observation window.  Foreign
+    descriptors remain an immediate ownership failure rather than being hidden
+    by the retry window.
+    """
+    deadline = time.monotonic() + timeout
+    stable = 0
+    last_holders: tuple[int, ...] = ()
+    while True:
+        holders = _lock_holders(path)
+        last_holders = holders
+        foreign_holders = tuple(pid for pid in holders if pid != production_pid)
+        if foreign_holders:
+            raise GuardianError(
+                "foreign process entered the production writer domain: "
+                f"{foreign_holders!r}"
+            )
+        if not _exclusive_lock_is_contended(path):
+            stable += 1
+            if stable >= stable_observations:
+                return
+        else:
+            stable = 0
+        if time.monotonic() >= deadline:
+            raise GuardianError(
+                "corrected daemon retained the writer-domain lock through the "
+                f"bounded idle wait: {last_holders!r}"
+            )
+        time.sleep(poll_interval)
+
+
 def _select_transition(
     production_pid: int, holders: tuple[int, ...], contended: bool
 ) -> str:
@@ -697,14 +739,23 @@ class Guardian:
             raise GuardianError("preserved configured repository authority differs")
         if _active_runs(current, self.installed) != self.worker_ids:
             raise GuardianError("preserved active worker ownership differs")
-        holders = _lock_holders(self.lock_path)
-        if holders not in ((), (snapshot.pid,)) or _exclusive_lock_is_contended(
-            self.lock_path
-        ):
+        _wait_for_idle_writer_domain(self.lock_path, snapshot.pid)
+        if _sha256(self.installed) != self.installed_hash:
+            raise GuardianError("installed production binary changed during idle wait")
+        final_pid = int(self.production_pid_file.read_text(encoding="utf-8").strip())
+        if final_pid != snapshot.pid:
+            raise GuardianError("corrected production pid changed during idle wait")
+        current = snapshot_process(final_pid)
+        self.assert_process_identity(current, require_same_pid=True)
+        if _configured_repos(current, self.installed) != self.configured_repos:
             raise GuardianError(
-                f"corrected daemon acquired an idle lifetime lock: {holders!r}"
+                "preserved configured repository authority changed during idle wait"
             )
-        self.restored_pid = current_pid
+        if _active_runs(current, self.installed) != self.worker_ids:
+            raise GuardianError(
+                "preserved active worker ownership changed during idle wait"
+            )
+        self.restored_pid = final_pid
         self.final_production_start_time = current.start_time
         self.production_preserved = True
         self.production_identity_verified = True
