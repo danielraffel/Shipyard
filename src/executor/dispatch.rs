@@ -3133,6 +3133,28 @@ backend = "local"
         assert_eq!(target.validation_build_type.as_deref(), Some("release"));
         let release_digest = crate::queue_request::validation_contract_digest(&target)
             .expect("typed validation digest");
+
+        let ResolvedValidation::Local(local) = &mut target.validation else {
+            panic!("expected local validation")
+        };
+        local.machine_environment = vec!["PULP_SDK_DIR".to_owned()];
+        local
+            .environment
+            .insert("PULP_SDK_DIR".to_owned(), "/m1/sdk".to_owned());
+        let m1_digest = crate::queue_request::validation_contract_digest(&target)
+            .expect("typed validation digest");
+        let ResolvedValidation::Local(local) = &mut target.validation else {
+            unreachable!()
+        };
+        local.environment.insert(
+            "PULP_SDK_DIR".to_owned(),
+            "/m3/different-sdk-path".to_owned(),
+        );
+        let m3_digest = crate::queue_request::validation_contract_digest(&target)
+            .expect("typed validation digest");
+        assert_eq!(m1_digest, m3_digest);
+        assert_ne!(release_digest, m1_digest);
+
         target.validation_build_type = Some("debug".to_owned());
         let debug_digest = crate::queue_request::validation_contract_digest(&target)
             .expect("typed validation digest");

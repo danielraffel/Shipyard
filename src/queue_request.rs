@@ -1243,7 +1243,14 @@ impl From<&ResolvedValidation> for QueuedValidationSnapshot {
 #[must_use]
 pub fn validation_contract_digest(target: &ResolvedTarget) -> Option<String> {
     let build_type = target.validation_build_type.as_deref()?;
-    let validation = QueuedValidationSnapshot::from(&target.validation);
+    let mut validation = QueuedValidationSnapshot::from(&target.validation);
+    if let QueuedValidationSnapshot::Local(local) = &mut validation {
+        // Contract identity is portable across eligible hosts: requested
+        // variable names are policy, while resolved absolute values are a
+        // machine-local execution snapshot. Prepared-state reuse binds the
+        // values separately at execution time.
+        local.environment.clear();
+    }
     let payload = serde_json::to_vec(&(build_type, validation)).ok()?;
     Some(format!("{:x}", Sha256::digest(payload)))
 }
