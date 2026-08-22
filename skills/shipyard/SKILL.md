@@ -252,6 +252,19 @@ When fixing GitHub importer bugs, keep Actions list endpoints absolute
 query parameters. `gh api -f` defaults to POST, which can turn a valid list
 endpoint into a misleading 404.
 
+## Trusted Project Environment
+
+For a non-secret machine path that every fresh worktree of one project needs,
+prefer the trusted project-environment contract over a copied
+`.shipyard.local` file. The tracked validation declares
+`machine_environment = ["NAME"]` plus an exact `[project].repository` slug;
+each host supplies `[repository_environment."OWNER/REPO"] NAME = "/host/path"`
+in the machine-global `config.toml` reported by `shipyard paths`. Shipyard
+rejects missing, malformed, aliased, or case-confused identities before
+execution, ignores tracked attempts to supply values, and snapshots resolved
+values only under its protected machine state for daemon-owned work. Never use
+this table for credentials or signing material.
+
 ## GitHub Auth And Quota
 
 Shipyard's operational GitHub calls can be configured with `[github.auth]`.

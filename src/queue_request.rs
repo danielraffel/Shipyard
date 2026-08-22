@@ -128,6 +128,7 @@ impl QueueRequestStore {
     pub fn new(state_dir: impl Into<PathBuf>) -> io::Result<Self> {
         let path = state_dir.into().join("queue").join("requests");
         fs::create_dir_all(&path)?;
+        protect_request_directory(&path)?;
         Ok(Self { path })
     }
 
@@ -1254,6 +1255,12 @@ pub struct QueuedLocalValidation {
     pub prepared_state_enabled: bool,
     /// Suppress staged working-tree drift detection.
     pub allow_tree_drift: bool,
+    /// Names requested from the trusted machine-global project environment.
+    #[serde(default)]
+    pub machine_environment: Vec<String>,
+    /// Resolved trusted values snapshotted for daemon-owned execution.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 impl From<&LocalValidationConfig> for QueuedLocalValidation {
@@ -1264,6 +1271,8 @@ impl From<&LocalValidationConfig> for QueuedLocalValidation {
             contract: validation.contract.as_ref().map(QueuedContract::from),
             prepared_state_enabled: validation.prepared_state_enabled,
             allow_tree_drift: validation.allow_tree_drift,
+            machine_environment: validation.machine_environment.clone(),
+            environment: validation.environment.clone(),
         }
     }
 }
@@ -1633,6 +1642,8 @@ fn restore_validation(validation: &QueuedValidationSnapshot) -> ResolvedValidati
                 contract: validation.contract.as_ref().map(restore_contract),
                 prepared_state_enabled: validation.prepared_state_enabled,
                 allow_tree_drift: validation.allow_tree_drift,
+                machine_environment: validation.machine_environment.clone(),
+                environment: validation.environment.clone(),
             })
         }
         QueuedValidationSnapshot::Ssh {
@@ -1804,6 +1815,18 @@ fn normalized_path_claim(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(unix)]
+fn protect_request_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn protect_request_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> QueueRequestResult<()> {
@@ -2049,6 +2072,11 @@ mod tests {
                 contract: None,
                 prepared_state_enabled: true,
                 allow_tree_drift: false,
+                machine_environment: vec!["PULP_SDK_DIR".to_owned()],
+                environment: BTreeMap::from([(
+                    "PULP_SDK_DIR".to_owned(),
+                    "/machine/pulp-sdk".to_owned(),
+                )]),
             }),
             failure_parser: Some("auto".to_owned()),
         }
@@ -2194,6 +2222,32 @@ mod tests {
         assert_eq!(loaded.kind, QueuedExecutionKind::Run);
         assert!(matches!(loaded.request, QueuedExecutionRequest::Run(_)));
         assert_eq!(loaded.to_run_request().expect("restore run"), run_request());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_store_keeps_snapshots_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-private", "/work/repo", &run_request());
+
+        store.save_durable(&envelope).expect("save durable");
+
+        let directory_mode = std::fs::metadata(store.path())
+            .expect("request directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let request_mode = std::fs::metadata(store.path_for("job-private"))
+            .expect("request metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(request_mode, 0o600);
     }
 
     #[test]

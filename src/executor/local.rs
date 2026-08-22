@@ -179,6 +179,10 @@ pub struct LocalValidationConfig {
     pub prepared_state_enabled: bool,
     /// Suppress staged working-tree drift detection.
     pub allow_tree_drift: bool,
+    /// Names requested from the trusted machine-global project environment.
+    pub machine_environment: Vec<String>,
+    /// Resolved trusted environment values applied to every validation stage.
+    pub environment: BTreeMap<String, String>,
 }
 
 /// Request for one local validation run.
@@ -264,6 +268,7 @@ impl LocalExecutor {
         );
         let context = LocalRunContext {
             target: &request.target,
+            environment: &request.validation.environment,
             log_path: &request.log_path,
             started_at,
             start_time,
@@ -318,6 +323,7 @@ impl LocalExecutor {
     ) -> TargetResult {
         let mut request = StreamingCommand::shell(command);
         request.cwd.clone_from(&context.target.cwd);
+        request.environment.clone_from(context.environment);
         request.log_path = Some(context.log_path.to_path_buf());
         request.rotated_segments = self.rotated_segments;
         request.timeout = Some(context.target.timeout());
@@ -451,6 +457,7 @@ impl LocalExecutor {
             let stage_run = {
                 let mut request = StreamingCommand::shell(command);
                 request.cwd.clone_from(&context.target.cwd);
+                request.environment.clone_from(context.environment);
                 request.log_path = Some(context.log_path.to_path_buf());
                 request.append = true;
                 request.timeout = Some(context.target.timeout());
@@ -567,6 +574,7 @@ struct RunIdentity<'a> {
 
 struct LocalRunContext<'a> {
     target: &'a LocalTargetConfig,
+    environment: &'a BTreeMap<String, String>,
     log_path: &'a Path,
     started_at: DateTime<Utc>,
     start_time: Instant,
@@ -1042,6 +1050,27 @@ mod tests {
         );
         assert!(result.contract_markers_missing.is_empty());
         assert!(result.contract_violation.is_none());
+    }
+
+    #[test]
+    fn local_validation_applies_explicit_environment_to_every_stage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let validation = LocalValidationConfig {
+            stages: stage_map(&[
+                ("configure", "test \"$SHIPYARD_TEST_MACHINE_ENV\" = exact"),
+                ("test", "test \"$SHIPYARD_TEST_MACHINE_ENV\" = exact"),
+            ]),
+            environment: BTreeMap::from([(
+                "SHIPYARD_TEST_MACHINE_ENV".to_owned(),
+                "exact".to_owned(),
+            )]),
+            ..LocalValidationConfig::default()
+        };
+
+        let result =
+            LocalExecutor::default().validate(request(temp.path().join("run.log"), validation));
+
+        assert_eq!(result.status, TargetStatus::Pass);
     }
 
     #[test]
