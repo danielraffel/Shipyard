@@ -696,19 +696,9 @@ fn observe_hook_implementation(
 ) -> Option<(String, String)> {
     let hooks_dir = git(cwd, &["config", "--path", "core.hooksPath"])?;
     let hooks_path = Path::new(&hooks_dir);
-    if hooks_path.is_absolute()
-        || hooks_path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::RootDir
-            )
-        })
-    {
-        return None;
-    }
     let hook_path = hooks_path.join("pre-push");
-    let hook = hook_path.to_str()?.trim_start_matches("./").to_owned();
-    if hook.is_empty() || !policy_covers_hook(policy, &hook) {
+    let hook = repository_relative_git_path(&hook_path)?;
+    if !policy_covers_hook(policy, &hook) {
         return None;
     }
     let metadata = fs::symlink_metadata(cwd.join(&hook)).ok()?;
@@ -729,6 +719,22 @@ fn observe_hook_implementation(
     let current = fs::read(cwd.join(&hook)).ok()?;
     let protected = git_bytes(cwd, &["show", &format!("{protected_base_sha}:{hook}")])?;
     (current == protected).then(|| (hook, sha256(&protected)))
+}
+
+/// Convert a repository-relative filesystem path to Git's platform-neutral
+/// forward-slash spelling while rejecting paths that could escape the checkout.
+fn repository_relative_git_path(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => parts.push(part.to_str()?),
+            std::path::Component::Prefix(_)
+            | std::path::Component::ParentDir
+            | std::path::Component::RootDir => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 fn verify_hook_implementation(cwd: &Path, prospective: &ProspectivePush) -> Result<(), CliFailure> {

@@ -325,6 +325,19 @@ fn hook_must_be_covered_by_protected_policy_or_topology() {
 }
 
 #[test]
+fn repository_hook_paths_use_git_spelling_and_cannot_escape() {
+    assert_eq!(
+        repository_relative_git_path(Path::new("./.githooks/pre-push")),
+        Some(".githooks/pre-push".to_owned())
+    );
+    assert_eq!(repository_relative_git_path(Path::new("../pre-push")), None);
+    assert_eq!(
+        repository_relative_git_path(Path::new("/tmp/pre-push")),
+        None
+    );
+}
+
+#[test]
 fn protected_base_hook_bytes_are_authenticated_before_and_after_push() {
     let temp = tempfile::tempdir().expect("temp");
     let checkout = temp.path().join("checkout");
