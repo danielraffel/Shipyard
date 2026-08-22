@@ -5,7 +5,6 @@
 //! stale running job becomes an explicit `UNCERTAIN` terminal outcome.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -17,6 +16,7 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{Duration, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
@@ -57,6 +57,31 @@ pub struct WorkerReceipt {
     pub pid: u32,
     /// Worker launch timestamp.
     pub started_at: chrono::DateTime<Utc>,
+}
+
+/// Cross-process ownership transaction for worker receipt publication,
+/// replacement, validation, and deletion.
+pub(crate) struct WorkerReceiptOwnershipGuard(File);
+
+impl Drop for WorkerReceiptOwnershipGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
+pub(crate) fn acquire_worker_receipt_ownership_lock(
+    state_dir: &Path,
+) -> io::Result<WorkerReceiptOwnershipGuard> {
+    let worker_dir = state_dir.join("queue-workers");
+    fs::create_dir_all(&worker_dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(worker_dir.join(".ownership.lock"))?;
+    FileExt::lock_exclusive(&file)?;
+    Ok(WorkerReceiptOwnershipGuard(file))
 }
 
 /// Errors surfaced by one supervisor tick.
@@ -390,7 +415,7 @@ impl ExecutionSupervisor {
                 }
             }
             self.children.remove(&job_id);
-            remove_if_present(&self.receipt_path(&job_id))?;
+            self.remove_receipt_if_present(&job_id)?;
         }
         Ok(())
     }
@@ -444,7 +469,7 @@ impl ExecutionSupervisor {
             )? {
                 persist_terminal_outcome(&completed, &self.state_dir)
                     .map_err(|error| SupervisorError::Outcome(error.to_string()))?;
-                remove_if_present(&self.receipt_path(&job.id))?;
+                self.remove_receipt_if_present(&job.id)?;
             }
         }
         Ok(unknown_worker)
@@ -462,7 +487,7 @@ impl ExecutionSupervisor {
             if let Some(mut child) = self.children.remove(job_id) {
                 if terminate_child_tree(&mut child)? {
                     self.acknowledge_cancelled_job(&mut queue, job_id)?;
-                    remove_if_present(&self.receipt_path(job_id))?;
+                    self.remove_receipt_if_present(job_id)?;
                 } else {
                     self.children.insert(job_id.clone(), child);
                 }
@@ -472,7 +497,7 @@ impl ExecutionSupervisor {
                 && terminate_adopted_worker_tree(&receipt)
             {
                 self.acknowledge_cancelled_job(&mut queue, job_id)?;
-                remove_if_present(&self.receipt_path(job_id))?;
+                self.remove_receipt_if_present(job_id)?;
             }
         }
 
@@ -486,7 +511,7 @@ impl ExecutionSupervisor {
         for job_id in &cancelled {
             if let Some(mut child) = self.children.remove(job_id) {
                 if terminate_child_tree(&mut child)? {
-                    remove_if_present(&self.receipt_path(job_id))?;
+                    self.remove_receipt_if_present(job_id)?;
                 } else {
                     self.children.insert(job_id.clone(), child);
                 }
@@ -494,7 +519,7 @@ impl ExecutionSupervisor {
             }
             if let WorkerObservation::Alive(receipt) = self.observe_receipt(job_id)? {
                 terminate_process_group(receipt.pid);
-                remove_if_present(&self.receipt_path(job_id))?;
+                self.remove_receipt_if_present(job_id)?;
             }
         }
         Ok(())
@@ -524,7 +549,7 @@ impl ExecutionSupervisor {
             if tree_dead {
                 let finalized = queue.finalize_deferred_daemon_worker(&job_id)?;
                 if finalized.is_some() {
-                    remove_if_present(&self.receipt_path(&job_id))?;
+                    self.remove_receipt_if_present(&job_id)?;
                 } else if queue.get(&job_id)?.is_some_and(|job| {
                     job.status == JobStatus::Running && job.cancel_requested_at.is_some()
                 }) {
@@ -533,7 +558,7 @@ impl ExecutionSupervisor {
                         .get(&job_id)?
                         .is_none_or(|job| job.status != JobStatus::Running)
                     {
-                        remove_if_present(&self.receipt_path(&job_id))?;
+                        self.remove_receipt_if_present(&job_id)?;
                     }
                 }
             }
@@ -590,9 +615,7 @@ impl ExecutionSupervisor {
             if running.contains(job_id) || self.children.contains_key(job_id) {
                 continue;
             }
-            if self.observe_receipt(job_id)? == WorkerObservation::Dead {
-                remove_if_present(&path)?;
-            }
+            let _ = self.observe_receipt(job_id)?;
         }
         Ok(())
     }
@@ -750,6 +773,7 @@ impl ExecutionSupervisor {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        let _receipt_lock = acquire_worker_receipt_ownership_lock(&self.state_dir)?;
         let mut child = command.spawn()?;
         let receipt = WorkerReceipt {
             job_id: job.id.clone(),
@@ -792,6 +816,7 @@ impl ExecutionSupervisor {
         job_id: &str,
         probe: impl FnOnce(&WorkerReceipt) -> ProcessLiveness,
     ) -> io::Result<WorkerObservation> {
+        let _receipt_lock = acquire_worker_receipt_ownership_lock(&self.state_dir)?;
         let path = self.receipt_path(job_id);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -823,6 +848,10 @@ impl ExecutionSupervisor {
     }
     fn receipt_path(&self, job_id: &str) -> PathBuf {
         self.worker_dir().join(format!("{job_id}.json"))
+    }
+    fn remove_receipt_if_present(&self, job_id: &str) -> io::Result<()> {
+        let _receipt_lock = acquire_worker_receipt_ownership_lock(&self.state_dir)?;
+        remove_if_present(&self.receipt_path(job_id))
     }
     fn log_path(&self, job_id: &str) -> PathBuf {
         self.worker_dir().join(format!("{job_id}.log"))
@@ -1171,10 +1200,21 @@ fn process_liveness(receipt: &WorkerReceipt) -> ProcessLiveness {
 pub(crate) fn retire_worker_receipt_if_proven_dead(
     path: &Path,
     expected: &WorkerReceipt,
+    ownership: &WorkerReceiptOwnershipGuard,
+) -> io::Result<bool> {
+    retire_worker_receipt_if_proven_dead_with(path, expected, ownership, || {})
+}
+
+fn retire_worker_receipt_if_proven_dead_with(
+    path: &Path,
+    expected: &WorkerReceipt,
+    _ownership: &WorkerReceiptOwnershipGuard,
+    after_dead_probe: impl FnOnce(),
 ) -> io::Result<bool> {
     if process_liveness(expected) != ProcessLiveness::Dead {
         return Ok(false);
     }
+    after_dead_probe();
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
@@ -1319,9 +1359,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dead_receipt_retirement_preserves_concurrently_replaced_identity() {
+    fn dead_receipt_retirement_serializes_concurrent_replacement() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("worker.json");
+        let ownership = acquire_worker_receipt_ownership_lock(temp.path()).expect("ownership");
+        let path = temp.path().join("queue-workers/worker.json");
         let expected = WorkerReceipt {
             job_id: "job".to_owned(),
             generation: "dead-generation".to_owned(),
@@ -1332,9 +1373,38 @@ mod tests {
             generation: "replacement-generation".to_owned(),
             ..expected.clone()
         };
-        write_json_atomic(&path, &replacement).expect("replacement receipt");
+        write_json_atomic(&path, &expected).expect("expected receipt");
 
-        assert!(!retire_worker_receipt_if_proven_dead(&path, &expected).expect("retire attempt"));
+        let (replace_tx, replace_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let state_dir = temp.path().to_path_buf();
+        let replacement_path = path.clone();
+        let replacement_writer = replacement.clone();
+        let writer = thread::spawn(move || {
+            replace_rx.recv().expect("replacement boundary");
+            let _ownership =
+                acquire_worker_receipt_ownership_lock(&state_dir).expect("writer ownership");
+            write_json_atomic(&replacement_path, &replacement_writer).expect("replacement receipt");
+            published_tx.send(()).expect("published");
+        });
+
+        assert!(
+            retire_worker_receipt_if_proven_dead_with(&path, &expected, &ownership, || {
+                replace_tx.send(()).expect("release replacement");
+                assert!(
+                    published_rx
+                        .recv_timeout(StdDuration::from_millis(50))
+                        .is_err(),
+                    "replacement writer escaped the ownership transaction"
+                );
+            })
+            .expect("retire attempt")
+        );
+        drop(ownership);
+        published_rx
+            .recv_timeout(StdDuration::from_secs(2))
+            .expect("replacement publishes after retirement unlock");
+        writer.join().expect("replacement writer");
         assert_eq!(
             serde_json::from_slice::<WorkerReceipt>(&fs::read(path).expect("retained receipt"))
                 .expect("receipt json"),

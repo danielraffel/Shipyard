@@ -13,7 +13,10 @@ use sha2::{Digest, Sha256};
 
 use crate::config::LoadedConfig;
 use crate::evidence::canonical_repository;
-use crate::execution_supervisor::{WorkerReceipt, retire_worker_receipt_if_proven_dead};
+use crate::execution_supervisor::{
+    WorkerReceipt, WorkerReceiptOwnershipGuard, acquire_worker_receipt_ownership_lock,
+    retire_worker_receipt_if_proven_dead,
+};
 use crate::gh::GhClient;
 use crate::identity::RuntimeMode;
 use crate::job::{Job, JobKind, JobStatus};
@@ -349,7 +352,7 @@ where
     {
         return Ok(None);
     }
-    ensure_no_worker_receipt(state_dir, state, &envelope_by_id)?;
+    ensure_no_worker_receipt(state_dir, state)?;
     drop(selection_lock);
 
     let source_cwd =
@@ -362,11 +365,14 @@ where
 
     claim_and_enqueue(
         &mut queue,
-        &request_store,
+        &RecoveryClaimStorage {
+            request_store: &request_store,
+            state_dir,
+            record_path: &record_path,
+        },
         state,
         &source,
         existing,
-        &record_path,
         after_claim,
     )
 }
@@ -559,13 +565,18 @@ fn finalize_claimed_replacement_outcome(
     Ok(true)
 }
 
+struct RecoveryClaimStorage<'a> {
+    request_store: &'a QueueRequestStore,
+    state_dir: &'a Path,
+    record_path: &'a Path,
+}
+
 fn claim_and_enqueue<C>(
     queue: &mut Queue,
-    request_store: &QueueRequestStore,
+    storage: &RecoveryClaimStorage<'_>,
     state: &ShipState,
     source: &QueuedExecutionEnvelope,
     existing: Option<QueueAbsentRecoveryRecord>,
-    record_path: &Path,
     after_claim: &mut C,
 ) -> Result<Option<String>, String>
 where
@@ -579,7 +590,7 @@ where
     if record.status == QueueAbsentRecoveryStatus::Enqueued {
         return Err("prior recovered generation is absent; needs-agent".to_owned());
     }
-    save_record(record_path, &record)?;
+    save_record(storage.record_path, &record)?;
     after_claim(&record)?;
 
     let QueuedExecutionRequest::Ship(request) = &source.request else {
@@ -601,12 +612,22 @@ where
         .job_id
         .clone_from(&record.replacement_job_id);
     replacement_envelope.created_at = record.updated_at;
-    request_store
+    storage
+        .request_store
         .save_durable(&replacement_envelope)
         .map_err(|error| error.to_string())?;
+    let receipt_ownership = acquire_worker_receipt_ownership_lock(storage.state_dir)
+        .map_err(|error| format!("worker receipt ownership lock is unavailable: {error}"))?;
+    ensure_no_worker_receipt_locked(
+        storage.state_dir,
+        state,
+        &[source.job_id.as_str(), record.replacement_job_id.as_str()],
+        &receipt_ownership,
+    )?;
     let enqueue = queue
         .enqueue_recovery_if_unowned(replacement, source.created_at)
         .map_err(|error| error.to_string())?;
+    drop(receipt_ownership);
     let existed = enqueue == RecoveryEnqueue::Existing;
     match enqueue {
         RecoveryEnqueue::Inserted | RecoveryEnqueue::Existing => {}
@@ -616,7 +637,7 @@ where
                 "newer durable owner {owner_id} won recovery admission"
             ));
             record.updated_at = Utc::now();
-            save_record(record_path, &record)?;
+            save_record(storage.record_path, &record)?;
             return Ok(None);
         }
     }
@@ -625,7 +646,8 @@ where
             .get(&record.replacement_job_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "existing replacement disappeared during validation".to_owned())?;
-        let envelope = request_store
+        let envelope = storage
+            .request_store
             .load(&record.replacement_job_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "existing replacement has no durable work envelope".to_owned())?;
@@ -633,7 +655,7 @@ where
     }
     record.status = QueueAbsentRecoveryStatus::Enqueued;
     record.updated_at = Utc::now();
-    save_record(record_path, &record)?;
+    save_record(storage.record_path, &record)?;
     Ok(Some(record.replacement_job_id))
 }
 
@@ -743,11 +765,26 @@ fn validate_live_pr(value: &Value, state: &ShipState) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_no_worker_receipt(
+fn ensure_no_worker_receipt(state_dir: &Path, state: &ShipState) -> Result<(), String> {
+    let ownership = acquire_worker_receipt_ownership_lock(state_dir)
+        .map_err(|error| format!("worker receipt ownership lock is unavailable: {error}"))?;
+    ensure_no_worker_receipt_locked(state_dir, state, &[], &ownership)
+}
+
+fn ensure_no_worker_receipt_locked(
     state_dir: &Path,
     state: &ShipState,
-    envelopes: &BTreeMap<&str, &QueuedExecutionEnvelope>,
+    exact_owner_ids: &[&str],
+    ownership: &WorkerReceiptOwnershipGuard,
 ) -> Result<(), String> {
+    let envelopes = QueueRequestStore::new(state_dir)
+        .map_err(|error| error.to_string())?
+        .list()
+        .map_err(|error| format!("durable work provenance is unreadable: {error}"))?;
+    let envelopes = envelopes
+        .iter()
+        .map(|envelope| (envelope.job_id.as_str(), envelope))
+        .collect::<BTreeMap<_, _>>();
     let path = state_dir.join("queue-workers");
     if !path.exists() {
         return Ok(());
@@ -760,16 +797,20 @@ fn ensure_no_worker_receipt(
         let raw = fs::read_to_string(&path).map_err(|error| error.to_string())?;
         let receipt: WorkerReceipt = serde_json::from_str(&raw)
             .map_err(|_| "malformed worker receipt makes ownership ambiguous".to_owned())?;
-        let Some(envelope) = envelopes.get(receipt.job_id.as_str()) else {
-            return Err("worker receipt has no readable work provenance".to_owned());
-        };
-        if envelope_owns_pr(envelope, state) {
-            if retire_worker_receipt_if_proven_dead(&path, &receipt)
+        let exact_owner = exact_owner_ids.contains(&receipt.job_id.as_str());
+        let owns_pr = envelopes
+            .get(receipt.job_id.as_str())
+            .is_some_and(|envelope| envelope_owns_pr(envelope, state));
+        if exact_owner || owns_pr {
+            if retire_worker_receipt_if_proven_dead(&path, &receipt, ownership)
                 .map_err(|error| format!("worker receipt liveness is unavailable: {error}"))?
             {
                 continue;
             }
             return Err("worker receipt still owns this ship work".to_owned());
+        }
+        if !envelopes.contains_key(receipt.job_id.as_str()) {
+            return Err("worker receipt has no readable work provenance".to_owned());
         }
     }
     Ok(())
@@ -1944,6 +1985,80 @@ mod tests {
         assert_eq!(recovered.enqueued.len(), 1, "{recovered:?}");
         assert!(recovered.needs_agent.is_empty(), "{recovered:?}");
         assert!(!receipt_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_published_at_final_admission_blocks_recovery_enqueue() {
+        let fixture = Fixture::new();
+        let generation = "published-after-live-validation";
+        let mut worker = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "while :; do sleep 1; done",
+                "execution-worker",
+                fixture.source_job_id.as_str(),
+                generation,
+            ])
+            .spawn()
+            .expect("live worker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let output = Command::new("/bin/ps")
+                .args(["-p", &worker.id().to_string(), "-o", "command="])
+                .output()
+                .expect("ps");
+            let command = String::from_utf8_lossy(&output.stdout);
+            if output.status.success()
+                && command.contains("execution-worker")
+                && command.contains(&fixture.source_job_id)
+                && command.contains(generation)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker identity never became observable: {command}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let receipt_path = fixture
+            .state_dir
+            .join("queue-workers")
+            .join(format!("{}.json", fixture.source_job_id));
+        let source_job_id = fixture.source_job_id.clone();
+        let published_path = receipt_path.clone();
+        let pid = worker.id();
+        let report = fixture.sweep(fixture.live(), move |_| {
+            fs::create_dir_all(published_path.parent().expect("worker dir"))
+                .map_err(|error| error.to_string())?;
+            fs::write(
+                &published_path,
+                serde_json::to_vec(&WorkerReceipt {
+                    job_id: source_job_id.clone(),
+                    generation: generation.to_owned(),
+                    pid,
+                    started_at: Utc::now(),
+                })
+                .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
+        });
+
+        assert!(report.enqueued.is_empty(), "{report:?}");
+        assert_eq!(report.needs_agent.len(), 1, "{report:?}");
+        assert!(receipt_path.exists(), "live receipt must not be deleted");
+        assert!(
+            Queue::new(&fixture.state_dir)
+                .expect("queue")
+                .get_all()
+                .expect("jobs")
+                .is_empty(),
+            "recovery must not create a second owner"
+        );
+        worker.kill().expect("stop worker");
+        worker.wait().expect("wait worker");
     }
 
     #[test]
