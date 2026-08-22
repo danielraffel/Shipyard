@@ -5,7 +5,6 @@
 //! stale running job becomes an explicit `UNCERTAIN` terminal outcome.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -17,6 +16,7 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{Duration, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
@@ -57,6 +57,31 @@ pub struct WorkerReceipt {
     pub pid: u32,
     /// Worker launch timestamp.
     pub started_at: chrono::DateTime<Utc>,
+}
+
+/// Cross-process ownership transaction for worker receipt publication,
+/// replacement, validation, and deletion.
+pub(crate) struct WorkerReceiptOwnershipGuard(File);
+
+impl Drop for WorkerReceiptOwnershipGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
+pub(crate) fn acquire_worker_receipt_ownership_lock(
+    state_dir: &Path,
+) -> io::Result<WorkerReceiptOwnershipGuard> {
+    let worker_dir = state_dir.join("queue-workers");
+    fs::create_dir_all(&worker_dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(worker_dir.join(".ownership.lock"))?;
+    FileExt::lock_exclusive(&file)?;
+    Ok(WorkerReceiptOwnershipGuard(file))
 }
 
 /// Errors surfaced by one supervisor tick.
@@ -108,6 +133,16 @@ pub struct ExecutionSupervisor {
     state_dir: PathBuf,
     children: BTreeMap<String, Child>,
     merge_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, String)>,
+    next_queue_absent_recovery: std::time::Instant,
+    queue_absent_recovery_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct QueueAbsentRecoveryFlight(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for QueueAbsentRecoveryFlight {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl ExecutionSupervisor {
@@ -126,6 +161,10 @@ impl ExecutionSupervisor {
             state_dir,
             children: BTreeMap::new(),
             merge_observers: BTreeMap::new(),
+            next_queue_absent_recovery: std::time::Instant::now(),
+            queue_absent_recovery_in_flight: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
         }
     }
 
@@ -136,12 +175,63 @@ impl ExecutionSupervisor {
         self.reconcile_terminal_outcomes()?;
         self.terminate_cancelled_workers()?;
         self.terminate_deferred_workers()?;
+        // Drop exited children from the in-memory ownership map before queue-
+        // absence recovery checks receipts. Otherwise a stale child-map entry
+        // preserves its dead receipt during the recovery preflight and can
+        // turn already-dead ownership into a durable needs-agent fence.
         self.reap_owned_children()?;
+        self.recover_queue_absent()?;
         self.sweep_terminal_receipts()?;
         let unknown_worker = self.reconcile_running()?;
         if !unknown_worker {
             self.admit_pending()?;
         }
+        Ok(())
+    }
+
+    fn recover_queue_absent(&mut self) -> Result<(), SupervisorError> {
+        let now = std::time::Instant::now();
+        if now < self.next_queue_absent_recovery {
+            return Ok(());
+        }
+        if self
+            .queue_absent_recovery_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        // Recovery treats any receipt for the ship as unresolved ownership.
+        // Remove receipts whose exact process generation is already proven
+        // dead before the detached sweep can turn that transient evidence into
+        // a durable needs-agent fence. Live, malformed, and otherwise unknown
+        // receipts remain in place and continue to block replay fail-closed.
+        self.sweep_terminal_receipts()?;
+
+        self.next_queue_absent_recovery = now + StdDuration::from_mins(1);
+        if self
+            .queue_absent_recovery_in_flight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let in_flight = std::sync::Arc::clone(&self.queue_absent_recovery_in_flight);
+        let state_dir = self.state_dir.clone();
+        let global_dir = self.global_dir.clone();
+        let mode = self.mode;
+        thread::spawn(move || {
+            let _flight = QueueAbsentRecoveryFlight(in_flight);
+            if let Ok(config) =
+                crate::config::LoadedConfig::load_machine_global_from_dir(global_dir.clone())
+            {
+                let _ = crate::queue_absent_recovery::recover_queue_absent_ships(
+                    &state_dir,
+                    mode,
+                    &global_dir,
+                    &config,
+                );
+            }
+        });
         Ok(())
     }
 
@@ -325,7 +415,7 @@ impl ExecutionSupervisor {
                 }
             }
             self.children.remove(&job_id);
-            remove_if_present(&self.receipt_path(&job_id))?;
+            self.remove_receipt_if_present(&job_id)?;
         }
         Ok(())
     }
@@ -379,7 +469,7 @@ impl ExecutionSupervisor {
             )? {
                 persist_terminal_outcome(&completed, &self.state_dir)
                     .map_err(|error| SupervisorError::Outcome(error.to_string()))?;
-                remove_if_present(&self.receipt_path(&job.id))?;
+                self.remove_receipt_if_present(&job.id)?;
             }
         }
         Ok(unknown_worker)
@@ -397,7 +487,7 @@ impl ExecutionSupervisor {
             if let Some(mut child) = self.children.remove(job_id) {
                 if terminate_child_tree(&mut child)? {
                     self.acknowledge_cancelled_job(&mut queue, job_id)?;
-                    remove_if_present(&self.receipt_path(job_id))?;
+                    self.remove_receipt_if_present(job_id)?;
                 } else {
                     self.children.insert(job_id.clone(), child);
                 }
@@ -407,7 +497,7 @@ impl ExecutionSupervisor {
                 && terminate_adopted_worker_tree(&receipt)
             {
                 self.acknowledge_cancelled_job(&mut queue, job_id)?;
-                remove_if_present(&self.receipt_path(job_id))?;
+                self.remove_receipt_if_present(job_id)?;
             }
         }
 
@@ -421,7 +511,7 @@ impl ExecutionSupervisor {
         for job_id in &cancelled {
             if let Some(mut child) = self.children.remove(job_id) {
                 if terminate_child_tree(&mut child)? {
-                    remove_if_present(&self.receipt_path(job_id))?;
+                    self.remove_receipt_if_present(job_id)?;
                 } else {
                     self.children.insert(job_id.clone(), child);
                 }
@@ -429,7 +519,7 @@ impl ExecutionSupervisor {
             }
             if let WorkerObservation::Alive(receipt) = self.observe_receipt(job_id)? {
                 terminate_process_group(receipt.pid);
-                remove_if_present(&self.receipt_path(job_id))?;
+                self.remove_receipt_if_present(job_id)?;
             }
         }
         Ok(())
@@ -459,7 +549,7 @@ impl ExecutionSupervisor {
             if tree_dead {
                 let finalized = queue.finalize_deferred_daemon_worker(&job_id)?;
                 if finalized.is_some() {
-                    remove_if_present(&self.receipt_path(&job_id))?;
+                    self.remove_receipt_if_present(&job_id)?;
                 } else if queue.get(&job_id)?.is_some_and(|job| {
                     job.status == JobStatus::Running && job.cancel_requested_at.is_some()
                 }) {
@@ -468,7 +558,7 @@ impl ExecutionSupervisor {
                         .get(&job_id)?
                         .is_none_or(|job| job.status != JobStatus::Running)
                     {
-                        remove_if_present(&self.receipt_path(&job_id))?;
+                        self.remove_receipt_if_present(&job_id)?;
                     }
                 }
             }
@@ -496,6 +586,17 @@ impl ExecutionSupervisor {
     }
 
     fn sweep_terminal_receipts(&self) -> Result<(), SupervisorError> {
+        // Queue-absence recovery validates orphan receipts as durable evidence
+        // that the prior worker no longer owns this ship. The recovery runs in
+        // a detached thread so GitHub I/O cannot stall the daemon; do not erase
+        // that evidence from the same tick while the validation is in flight.
+        // The next tick resumes bounded cleanup after the flight guard drops.
+        if self
+            .queue_absent_recovery_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         let mut queue = Queue::new(&self.state_dir)?;
         let running = queue
             .get_running()?
@@ -514,9 +615,7 @@ impl ExecutionSupervisor {
             if running.contains(job_id) || self.children.contains_key(job_id) {
                 continue;
             }
-            if self.observe_receipt(job_id)? == WorkerObservation::Dead {
-                remove_if_present(&path)?;
-            }
+            let _ = self.observe_receipt(job_id)?;
         }
         Ok(())
     }
@@ -674,6 +773,7 @@ impl ExecutionSupervisor {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        let _receipt_lock = acquire_worker_receipt_ownership_lock(&self.state_dir)?;
         let mut child = command.spawn()?;
         let receipt = WorkerReceipt {
             job_id: job.id.clone(),
@@ -716,6 +816,7 @@ impl ExecutionSupervisor {
         job_id: &str,
         probe: impl FnOnce(&WorkerReceipt) -> ProcessLiveness,
     ) -> io::Result<WorkerObservation> {
+        let _receipt_lock = acquire_worker_receipt_ownership_lock(&self.state_dir)?;
         let path = self.receipt_path(job_id);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -747,6 +848,10 @@ impl ExecutionSupervisor {
     }
     fn receipt_path(&self, job_id: &str) -> PathBuf {
         self.worker_dir().join(format!("{job_id}.json"))
+    }
+    fn remove_receipt_if_present(&self, job_id: &str) -> io::Result<()> {
+        let _receipt_lock = acquire_worker_receipt_ownership_lock(&self.state_dir)?;
+        remove_if_present(&self.receipt_path(job_id))
     }
     fn log_path(&self, job_id: &str) -> PathBuf {
         self.worker_dir().join(format!("{job_id}.log"))
@@ -1089,6 +1194,42 @@ fn process_liveness(receipt: &WorkerReceipt) -> ProcessLiveness {
     }
 }
 
+/// Remove one unchanged receipt only when its exact process generation is
+/// proven dead. A live/unprobeable process or a concurrently replaced receipt
+/// remains fail-closed.
+pub(crate) fn retire_worker_receipt_if_proven_dead(
+    path: &Path,
+    expected: &WorkerReceipt,
+    ownership: &WorkerReceiptOwnershipGuard,
+) -> io::Result<bool> {
+    retire_worker_receipt_if_proven_dead_with(path, expected, ownership, || {})
+}
+
+fn retire_worker_receipt_if_proven_dead_with(
+    path: &Path,
+    expected: &WorkerReceipt,
+    _ownership: &WorkerReceiptOwnershipGuard,
+    after_dead_probe: impl FnOnce(),
+) -> io::Result<bool> {
+    if process_liveness(expected) != ProcessLiveness::Dead {
+        return Ok(false);
+    }
+    after_dead_probe();
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let Ok(observed) = serde_json::from_slice::<WorkerReceipt>(&bytes) else {
+        return Ok(false);
+    };
+    if observed != *expected {
+        return Ok(false);
+    }
+    remove_if_present(path)?;
+    Ok(true)
+}
+
 /// Verify that this exact process was fenced by the daemon before executing.
 pub fn verify_worker_authority(state_dir: &Path, job_id: &str, generation: &str) -> io::Result<()> {
     let path = state_dir
@@ -1214,6 +1355,61 @@ mod tests {
             started_at: Utc::now(),
         };
         assert_eq!(process_liveness(&receipt), ProcessLiveness::Dead);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_receipt_retirement_serializes_concurrent_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ownership = acquire_worker_receipt_ownership_lock(temp.path()).expect("ownership");
+        let path = temp.path().join("queue-workers/worker.json");
+        let expected = WorkerReceipt {
+            job_id: "job".to_owned(),
+            generation: "dead-generation".to_owned(),
+            pid: std::process::id(),
+            started_at: Utc::now(),
+        };
+        let replacement = WorkerReceipt {
+            generation: "replacement-generation".to_owned(),
+            ..expected.clone()
+        };
+        write_json_atomic(&path, &expected).expect("expected receipt");
+
+        let (replace_tx, replace_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let state_dir = temp.path().to_path_buf();
+        let replacement_path = path.clone();
+        let replacement_writer = replacement.clone();
+        let writer = thread::spawn(move || {
+            replace_rx.recv().expect("replacement boundary");
+            let _ownership =
+                acquire_worker_receipt_ownership_lock(&state_dir).expect("writer ownership");
+            write_json_atomic(&replacement_path, &replacement_writer).expect("replacement receipt");
+            published_tx.send(()).expect("published");
+        });
+
+        assert!(
+            retire_worker_receipt_if_proven_dead_with(&path, &expected, &ownership, || {
+                replace_tx.send(()).expect("release replacement");
+                assert!(
+                    published_rx
+                        .recv_timeout(StdDuration::from_millis(50))
+                        .is_err(),
+                    "replacement writer escaped the ownership transaction"
+                );
+            })
+            .expect("retire attempt")
+        );
+        drop(ownership);
+        published_rx
+            .recv_timeout(StdDuration::from_secs(2))
+            .expect("replacement publishes after retirement unlock");
+        writer.join().expect("replacement writer");
+        assert_eq!(
+            serde_json::from_slice::<WorkerReceipt>(&fs::read(path).expect("retained receipt"))
+                .expect("receipt json"),
+            replacement
+        );
     }
 
     #[cfg(windows)]
@@ -1473,6 +1669,111 @@ mod tests {
         let _ = child.wait();
         restarted.tick().expect("cleanup tick");
         assert!(!restarted.receipt_path("post-validation").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_absent_recovery_reaps_stale_child_before_receipt_preflight() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        fs::create_dir_all(supervisor.worker_dir()).expect("worker dir");
+
+        let mut exited_child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("exited child");
+        exited_child.wait().expect("wait for child");
+        supervisor
+            .children
+            .insert("dead-owner".to_owned(), exited_child);
+
+        let dead_receipt_path = supervisor.receipt_path("dead-owner");
+        write_json_atomic(
+            &dead_receipt_path,
+            &WorkerReceipt {
+                job_id: "dead-owner".to_owned(),
+                generation: "fabricated-generation".to_owned(),
+                // A live PID with the wrong exact worker identity is hostile
+                // PID-reuse input and must be proven dead for this receipt.
+                pid: std::process::id(),
+                started_at: Utc::now(),
+            },
+        )
+        .expect("dead receipt");
+
+        let unknown_receipt_path = supervisor.receipt_path("unknown-owner");
+        fs::write(&unknown_receipt_path, b"not-json").expect("unknown receipt");
+
+        // This is the ordering used by tick: clear stale in-memory ownership,
+        // then remove only receipts whose exact generation is proven dead.
+        supervisor.reap_owned_children().expect("reap stale child");
+        supervisor
+            .recover_queue_absent()
+            .expect("recovery preflight");
+
+        assert!(!supervisor.children.contains_key("dead-owner"));
+        assert!(
+            !dead_receipt_path.exists(),
+            "a provably dead receipt must be removed before detached recovery"
+        );
+        assert!(
+            unknown_receipt_path.exists(),
+            "ambiguous receipt ownership must remain fail-closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_absent_recovery_flight_preserves_orphan_worker_ownership_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        fs::create_dir_all(supervisor.worker_dir()).expect("worker dir");
+        let receipt_path = supervisor.receipt_path("preserved-owner");
+        write_json_atomic(
+            &receipt_path,
+            &WorkerReceipt {
+                job_id: "preserved-owner".to_owned(),
+                generation: "preserved-generation".to_owned(),
+                // The test process is live but cannot match this fabricated
+                // worker identity, so the normal receipt sweep proves it dead.
+                pid: std::process::id(),
+                started_at: Utc::now(),
+            },
+        )
+        .expect("receipt");
+
+        supervisor
+            .queue_absent_recovery_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        supervisor
+            .sweep_terminal_receipts()
+            .expect("concurrent sweep");
+
+        assert!(
+            receipt_path.exists(),
+            "a queue-absence recovery must retain the orphan ownership evidence it validates"
+        );
+
+        supervisor
+            .queue_absent_recovery_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        supervisor
+            .sweep_terminal_receipts()
+            .expect("post-recovery sweep");
+        assert!(
+            !receipt_path.exists(),
+            "ordinary terminal receipt cleanup resumes after recovery exits"
+        );
     }
 
     #[cfg(unix)]

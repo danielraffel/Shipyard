@@ -153,6 +153,17 @@ impl QueueRequestStore {
         write_json_atomic(&self.path_for(&envelope.job_id), envelope)
     }
 
+    /// Store one request envelope and fsync both file and containing directory
+    /// before a dependent queue commit.
+    pub fn save_durable(&self, envelope: &QueuedExecutionEnvelope) -> QueueRequestResult<()> {
+        if envelope.schema_version != QUEUED_EXECUTION_SCHEMA_VERSION {
+            return Err(QueueRequestError::UnsupportedSchema {
+                version: envelope.schema_version,
+            });
+        }
+        write_json_atomic_durable(&self.path_for(&envelope.job_id), envelope)
+    }
+
     /// Load one request envelope.
     pub fn load(&self, job_id: &str) -> QueueRequestResult<Option<QueuedExecutionEnvelope>> {
         read_versioned_json(&self.path_for(job_id))
@@ -161,6 +172,25 @@ impl QueueRequestStore {
     /// Delete one request envelope, if present.
     pub fn delete(&self, job_id: &str) -> QueueRequestResult<bool> {
         delete_if_present(&self.path_for(job_id))
+    }
+
+    /// Load every durable request envelope. Any malformed entry fails the
+    /// whole scan closed; recovery must never silently route around unknown
+    /// ownership.
+    pub fn list(&self) -> QueueRequestResult<Vec<QueuedExecutionEnvelope>> {
+        let mut envelopes: Vec<QueuedExecutionEnvelope> = Vec::new();
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(envelope) = read_versioned_json(&path)? {
+                envelopes.push(envelope);
+            }
+        }
+        envelopes.sort_by_key(|envelope| envelope.created_at);
+        Ok(envelopes)
     }
 
     /// Delete request envelopes whose job id is no longer present in the queue
@@ -1791,6 +1821,23 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> QueueRequestResult
     Ok(())
 }
 
+fn write_json_atomic_durable<T: Serialize>(path: &Path, value: &T) -> QueueRequestResult<()> {
+    let Some(parent) = path.parent() else {
+        return Err(QueueRequestError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "queue request path has no parent",
+        )));
+    };
+    fs::create_dir_all(parent)?;
+    let temp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(temp.as_file(), value)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| QueueRequestError::Io(error.error))?;
+    crate::log_retention::sync_parent_directory(path)?;
+    Ok(())
+}
+
 fn read_versioned_json<T>(path: &Path) -> QueueRequestResult<Option<T>>
 where
     T: for<'de> Deserialize<'de>,
@@ -2258,6 +2305,7 @@ mod tests {
             dispatched_runs: Vec::<DispatchedRun>::new(),
             evidence_snapshot: BTreeMap::new(),
             attempt: 1,
+            source_job_id: Some(envelope.job_id.clone()),
             schema_version: crate::ship_state::SHIP_STATE_SCHEMA_VERSION,
             merge_queue_observed_at: None,
             merge_queue_attempt_started_at: None,

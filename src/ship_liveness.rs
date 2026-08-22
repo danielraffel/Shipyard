@@ -29,7 +29,8 @@
 //! - [`OrphanEvidence::TimeFallback`] — the queue could not be consulted; the
 //!   pure `updated_at` staleness heuristic is used, also time-gated.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -131,6 +132,33 @@ pub fn orphan_stale_after(config: &LoadedConfig) -> Duration {
 struct ShipStateConfig {
     orphan_stale_minutes: Option<i64>,
     auto_resume: bool,
+    queue_absent_recovery: bool,
+    repo_paths: BTreeMap<String, PathBuf>,
+}
+
+/// Whether exact queue-absence recovery is enabled. Missing or malformed
+/// configuration is always disabled.
+#[must_use]
+pub fn queue_absent_recovery_enabled(config: &LoadedConfig) -> bool {
+    config
+        .get("ship_state")
+        .and_then(|value| value.clone().try_into().ok())
+        .is_some_and(|cfg: ShipStateConfig| cfg.queue_absent_recovery)
+}
+
+/// Resolve the explicitly registered checkout for a repository. Recovery
+/// never guesses a checkout from the daemon's current directory.
+#[must_use]
+pub fn queue_absent_repo_path(config: &LoadedConfig, repo: &str) -> Option<PathBuf> {
+    let canonical = canonical_repository(repo);
+    config
+        .get("ship_state")
+        .and_then(|value| value.clone().try_into().ok())
+        .and_then(|cfg: ShipStateConfig| {
+            cfg.repo_paths.into_iter().find_map(|(registered, path)| {
+                (canonical_repository(&registered) == canonical).then_some(path)
+            })
+        })
 }
 
 /// Whether the daemon's opt-in orphan auto-resume sweep is enabled

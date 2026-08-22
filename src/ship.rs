@@ -37,8 +37,9 @@ use crate::job::{
 };
 use crate::queue::{Queue, QueueDeferredRequeue, QueueError, STALE_RUNNING_CANCEL_REASON};
 use crate::queue_request::{
-    QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
-    QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner, QueuedShipDisposition,
+    QueueOutcomeStore, QueueRequestError, QueueRequestResult, QueueRequestStore,
+    QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner,
+    QueuedShipDisposition,
 };
 use crate::queue_scheduler::{
     VmSlotCapacity, apply_admit_pass_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
@@ -459,6 +460,37 @@ fn submit_ship_with_config(
     state_dir: &Path,
     config: Option<&LoadedConfig>,
 ) -> Result<Job, ShipExecutionError> {
+    submit_ship_with_config_and_persist(
+        request,
+        queue,
+        cwd,
+        state_dir,
+        config,
+        save_submission_envelope,
+    )
+}
+
+fn submit_ship_with_config_and_persist<P>(
+    request: &ShipExecutionRequest,
+    queue: &mut Queue,
+    cwd: &Path,
+    state_dir: &Path,
+    config: Option<&LoadedConfig>,
+    persist: P,
+) -> Result<Job, ShipExecutionError>
+where
+    P: FnOnce(&QueueRequestStore, &QueuedExecutionEnvelope, bool) -> QueueRequestResult<()>,
+{
+    let workload_scope = format!(
+        "ship:{}:pr-{}",
+        canonical_repository(&request.repo),
+        request.pr
+    );
+    // Queue-absence recovery uses this same short-lived workload fence while
+    // it claims and commits a replacement. Hold it across the normal
+    // submitter's running-owner check, durable envelope write, and queue
+    // insertion so neither side can miss the other's pre-commit window.
+    let _ownership_lock = queue.acquire_workload_admission_lock(&workload_scope)?;
     refuse_same_pr_running_ship(queue, state_dir, request)?;
     let target_names = target_names(&request.targets);
     let job = Job::create(
@@ -469,13 +501,10 @@ fn submit_ship_with_config(
         request.priority,
     )
     .with_kind(JobKind::Ship)
-    .with_workload_scope(format!(
-        "ship:{}:pr-{}",
-        canonical_repository(&request.repo),
-        request.pr
-    ));
+    .with_workload_scope(workload_scope);
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_ship_request(job.id.clone(), cwd, request);
+    let daemon_owned = config.is_some();
     if let Some(config) = config {
         envelope.execution_owner = QueuedExecutionOwner::Daemon;
         let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
@@ -492,12 +521,24 @@ fn submit_ship_with_config(
         envelope.cwd.clone_from(&provenance.canonical_cwd);
         envelope.provenance = Some(provenance);
     }
-    request_store.save(&envelope)?;
+    persist(&request_store, &envelope, daemon_owned)?;
     if let Err(error) = queue.enqueue(job.clone()) {
         let _ = request_store.delete(&job.id);
         return Err(error.into());
     }
     Ok(job)
+}
+
+fn save_submission_envelope(
+    request_store: &QueueRequestStore,
+    envelope: &QueuedExecutionEnvelope,
+    durable: bool,
+) -> QueueRequestResult<()> {
+    if durable {
+        request_store.save_durable(envelope)
+    } else {
+        request_store.save(envelope)
+    }
 }
 
 /// Load a completed `shipyard ship` outcome through the durable outcome store.
@@ -691,6 +732,10 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
             return Err(error);
         }
     };
+    // Bind the durable ship attempt to the exact queue envelope that started
+    // it. A later recovery must never infer ownership from repo/PR/SHA alone:
+    // a fresh attempt may deliberately reuse all of those values.
+    state.source_job_id = Some(job.id.clone());
     if let Err(error) = ship_state.save_scoped_locked(&state, &ship_state_lock) {
         let execution_error = ShipExecutionError::ShipState(error.to_string());
         cancel_refused_job(queue, &job, &execution_error)?;
@@ -837,6 +882,7 @@ fn submit_run_with_config(
     .with_workload_scope(crate::queue_request::run_workload_scope(cwd));
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_run_request(job.id.clone(), cwd, request);
+    let daemon_owned = config.is_some();
     if let Some(config) = config {
         envelope.execution_owner = QueuedExecutionOwner::Daemon;
         let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
@@ -853,7 +899,7 @@ fn submit_run_with_config(
         envelope.cwd.clone_from(&provenance.canonical_cwd);
         envelope.provenance = Some(provenance);
     }
-    request_store.save(&envelope)?;
+    save_submission_envelope(&request_store, &envelope, daemon_owned)?;
     if let Err(error) = queue.enqueue(job.clone()) {
         let _ = request_store.delete(&job.id);
         return Err(error.into());
@@ -1220,7 +1266,7 @@ fn run_drain_worker_cycle_scoped<D: ShipTargetDispatcher + Sync>(
     let outcome_store = QueueOutcomeStore::new(state_dir).map_err(QueueRequestError::from)?;
     let _trimmed_job_ids = queue.trim_terminal_jobs_for_drain(drain_lock)?;
     let jobs = queue.get_all()?;
-    sweep_absent_queue_envelopes(&jobs, &request_store, &outcome_store)?;
+    sweep_absent_queue_envelopes(state_dir, &jobs, &request_store, &outcome_store)?;
     let queue_state_dir = queue.state_dir().to_path_buf();
     let mut already_merged_observer =
         crate::queue_scheduler::AlreadyMergedObserver::from_config(config);
@@ -1518,6 +1564,7 @@ fn restrict_admit_pass_to_awaited(
 }
 
 fn sweep_absent_queue_envelopes(
+    state_dir: &Path,
     jobs: &[Job],
     request_store: &QueueRequestStore,
     outcome_store: &QueueOutcomeStore,
@@ -1526,8 +1573,13 @@ fn sweep_absent_queue_envelopes(
         .iter()
         .map(|job| job.id.clone())
         .collect::<BTreeSet<_>>();
-    request_store.sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
-    outcome_store.sweep_absent_older_than(&active_job_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
+    let mut retained_request_ids = active_job_ids.clone();
+    retained_request_ids.extend(crate::queue_absent_recovery::protected_request_job_ids(
+        state_dir,
+        request_store,
+    )?);
+    request_store.sweep_absent_older_than(&retained_request_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
+    outcome_store.sweep_absent_older_than(&retained_request_ids, QUEUE_ENVELOPE_SWEEP_GRACE)?;
     Ok(())
 }
 
@@ -4794,6 +4846,92 @@ mod tests {
                 ..
             } if running_job_id == running_job.id
         ));
+    }
+
+    #[test]
+    fn daemon_ship_durable_envelope_failure_prevents_queue_admission() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo dir");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "shipyard@example.invalid"],
+            vec!["config", "user.name", "Shipyard Test"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/danielraffel/pulp.git",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .expect("git setup")
+                    .success()
+            );
+        }
+        std::fs::write(repo.join("tracked"), "fixture\n").expect("tracked file");
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "tracked"])
+                .current_dir(&repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-qm", "fixture"])
+                .current_dir(&repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .expect("git head");
+        assert!(head.status.success());
+
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let mut request = ship_request(vec![ssh_target()]);
+        request.sha = String::from_utf8(head.stdout)
+            .expect("utf8 head")
+            .trim()
+            .to_owned();
+        let config = empty_config(&repo);
+        let persistence_attempted = std::cell::Cell::new(false);
+        let error = super::submit_ship_with_config_and_persist(
+            &request,
+            &mut queue,
+            &repo,
+            &state_dir,
+            Some(&config),
+            |_, envelope, durable| {
+                assert!(durable, "daemon-owned envelopes require fsync durability");
+                assert_eq!(envelope.execution_owner, QueuedExecutionOwner::Daemon);
+                persistence_attempted.set(true);
+                Err(QueueRequestError::Io(std::io::Error::other(
+                    "injected durable persistence failure",
+                )))
+            },
+        )
+        .expect_err("durable envelope failure must abort submission");
+
+        assert!(persistence_attempted.get());
+        assert!(matches!(
+            error,
+            ShipExecutionError::QueueRequest(QueueRequestError::Io(_))
+        ));
+        assert!(
+            queue.get_all().expect("queue jobs").is_empty(),
+            "queue admission must happen only after the durable envelope commits"
+        );
     }
 
     #[test]

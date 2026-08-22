@@ -100,6 +100,8 @@ mod process;
 pub mod profile_apply;
 /// Durable queue write helpers and retry policy.
 pub mod queue;
+/// Crash-safe, opt-in recovery of exact ship work missing from the queue.
+pub mod queue_absent_recovery;
 /// Stable read-only GitHub queue snapshots, state hashing, and delta tracking.
 pub mod queue_observer;
 /// Durable queued execution request and outcome stores.

@@ -12,9 +12,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
-use crate::job::{Job, JobStatus, TargetResult, TargetStatus};
-use crate::queue_request::QueueRequestStore;
+use crate::job::{Job, JobKind, JobStatus, TargetResult, TargetStatus};
+use crate::queue_request::{
+    QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest,
+};
 
 /// Number of completed jobs retained in the durable queue.
 pub const KEEP_COMPLETED: usize = 25;
@@ -58,6 +61,18 @@ pub struct QueueDeferredRequeue {
     pub reason: String,
     /// Earliest retry time for the scheduler.
     pub defer_until: Option<DateTime<Utc>>,
+}
+
+/// Result of an idempotent recovery enqueue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryEnqueue {
+    /// The exact recovery job was inserted.
+    Inserted,
+    /// The exact job was already present (for example after a crash following
+    /// the queue commit but before the recovery receipt commit).
+    Existing,
+    /// Another queue job already owns the workload.
+    OwnedBy(String),
 }
 
 /// Durable queue operation error.
@@ -148,6 +163,25 @@ impl Queue {
         self.state_dir.join("queue.state.lock")
     }
 
+    /// Acquire the short-lived ownership fence for one logical workload.
+    ///
+    /// Submitters and automatic recovery hold this only across durable
+    /// request + queue admission. It is intentionally distinct from both the
+    /// queue state lock and the long-lived ship execution lock.
+    pub(crate) fn acquire_workload_admission_lock(
+        &self,
+        workload_scope: &str,
+    ) -> QueueResult<WorkloadAdmissionLock> {
+        let digest = format!("{:x}", Sha256::digest(workload_scope.as_bytes()));
+        let path = self
+            .state_dir
+            .join("admission")
+            .join(format!("{}.lock", &digest[..32]));
+        Ok(WorkloadAdmissionLock {
+            _state: StateLock::acquire(path)?,
+        })
+    }
+
     /// Add a job, superseding pending jobs for the same workload, branch,
     /// target list, and mode.
     pub fn enqueue(&mut self, job: Job) -> QueueResult<Job> {
@@ -159,6 +193,35 @@ impl Queue {
             Ok(())
         })?;
         Ok(job)
+    }
+
+    /// Insert an exact recovery job only while its workload has no other
+    /// durable owner. The check and insert share the queue state
+    /// lock, closing the new-submitter race without creating a second
+    /// scheduler.
+    pub fn enqueue_recovery_if_unowned(
+        &mut self,
+        job: Job,
+        ownership_cutoff: DateTime<Utc>,
+    ) -> QueueResult<RecoveryEnqueue> {
+        let request_store = QueueRequestStore::new(&self.state_dir).ok();
+        self.with_jobs_locked_strict(|jobs| {
+            backfill_recovery_owner_scopes(jobs, request_store.as_ref());
+            if jobs.iter().any(|queued| queued.id == job.id) {
+                return Ok(RecoveryEnqueue::Existing);
+            }
+            if let Some(owner) = jobs.iter().find(|queued| {
+                let can_still_own =
+                    matches!(queued.status, JobStatus::Pending | JobStatus::Running)
+                        || queued.created_at > ownership_cutoff;
+                can_still_own
+                    && (same_workload_scope(queued, &job) || queued.workload_scope.is_none())
+            }) {
+                return Ok(RecoveryEnqueue::OwnedBy(owner.id.clone()));
+            }
+            jobs.push(job);
+            Ok(RecoveryEnqueue::Inserted)
+        })
     }
 
     /// Return the highest-priority pending job, preserving FIFO within each priority.
@@ -297,6 +360,16 @@ impl Queue {
     /// Return all durable jobs in queue storage order.
     pub fn get_all(&mut self) -> QueueResult<Vec<Job>> {
         self.read_jobs_locked()
+    }
+
+    /// Return all durable jobs without treating malformed queue state as empty.
+    ///
+    /// Ordinary queue inspection preserves the historical tolerant read used
+    /// for startup and status display. Recovery decisions must instead fail
+    /// closed: an unreadable live owner is not proof that work is absent.
+    pub(crate) fn get_all_strict(&mut self) -> QueueResult<Vec<Job>> {
+        let _lock = StateLock::acquire(self.state_lock_file())?;
+        self.read_jobs_from_disk_strict()
     }
 
     /// Count pending jobs.
@@ -658,6 +731,20 @@ impl Queue {
         Ok(output)
     }
 
+    /// Mutate recovery-owned queue state only after a strict read under the
+    /// same lock. This prevents a malformed payload that appears after the
+    /// recovery selection pass from being replaced as if it were empty.
+    fn with_jobs_locked_strict<T>(
+        &self,
+        f: impl FnOnce(&mut Vec<Job>) -> QueueResult<T>,
+    ) -> QueueResult<T> {
+        let _lock = StateLock::acquire(self.state_lock_file())?;
+        let mut jobs = self.read_jobs_from_disk_strict()?;
+        let output = f(&mut jobs)?;
+        self.save_jobs_to_disk(&jobs)?;
+        Ok(output)
+    }
+
     fn read_jobs_locked(&self) -> QueueResult<Vec<Job>> {
         let _lock = StateLock::acquire(self.state_lock_file())?;
         self.read_jobs_from_disk()
@@ -671,6 +758,16 @@ impl Queue {
             Err(error) => return Err(error.into()),
         };
         Ok(parse_jobs_payload(&raw))
+    }
+
+    fn read_jobs_from_disk_strict(&self) -> QueueResult<Vec<Job>> {
+        let queue_file = self.queue_file();
+        let raw = match fs::read_to_string(&queue_file) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        parse_jobs_payload_strict(&raw)
     }
 
     fn save_jobs_to_disk(&self, jobs: &[Job]) -> QueueResult<()> {
@@ -717,7 +814,58 @@ fn backfill_pending_workload_scopes(jobs: &mut [Job], request_store: Option<&Que
         let Ok(Some(envelope)) = request_store.load(&job.id) else {
             continue;
         };
-        job.workload_scope = Some(envelope.workload_scope());
+        if recovery_envelope_matches_job(&envelope, job) {
+            job.workload_scope = Some(envelope.workload_scope());
+        }
+    }
+}
+
+fn recovery_envelope_matches_job(envelope: &QueuedExecutionEnvelope, job: &Job) -> bool {
+    if envelope.job_id != job.id {
+        return false;
+    }
+    let request_targets = match &envelope.request {
+        QueuedExecutionRequest::Run(request) => &request.targets,
+        QueuedExecutionRequest::Ship(request) => &request.targets,
+    };
+    if envelope.resource_plan.targets != job.target_names
+        || request_targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .ne(job.target_names.iter().map(String::as_str))
+    {
+        return false;
+    }
+    // Priority is queue policy, not workload identity: `queue bump` updates the
+    // queued job without rewriting its immutable execution envelope.
+    match (&envelope.kind, &envelope.request) {
+        (QueuedExecutionKind::Run, QueuedExecutionRequest::Run(request)) => {
+            matches!(job.kind, None | Some(JobKind::Run))
+                && request.sha == job.sha
+                && request.branch == job.branch
+                && request.mode == job.mode
+        }
+        (QueuedExecutionKind::Ship, QueuedExecutionRequest::Ship(request)) => {
+            matches!(job.kind, None | Some(JobKind::Ship))
+                && request.sha == job.sha
+                && request.branch == job.branch
+                && request.mode == job.mode
+        }
+        _ => false,
+    }
+}
+
+fn backfill_recovery_owner_scopes(jobs: &mut [Job], request_store: Option<&QueueRequestStore>) {
+    let Some(request_store) = request_store else {
+        return;
+    };
+    for job in jobs.iter_mut().filter(|job| job.workload_scope.is_none()) {
+        let Ok(Some(envelope)) = request_store.load(&job.id) else {
+            continue;
+        };
+        if recovery_envelope_matches_job(&envelope, job) {
+            job.workload_scope = Some(envelope.workload_scope());
+        }
     }
 }
 
@@ -825,6 +973,12 @@ fn is_terminal_job(status: JobStatus) -> bool {
 #[derive(Debug)]
 struct StateLock {
     file: File,
+}
+
+/// Short-lived, workload-scoped ownership admission fence.
+#[derive(Debug)]
+pub(crate) struct WorkloadAdmissionLock {
+    _state: StateLock,
 }
 
 impl StateLock {
@@ -1022,6 +1176,14 @@ fn parse_jobs_payload(raw: &str) -> Vec<Job> {
     parsed_jobs
 }
 
+fn parse_jobs_payload_strict(raw: &str) -> QueueResult<Vec<Job>> {
+    let parsed: Value = serde_json::from_str(raw)?;
+    let jobs = parsed.get("jobs").ok_or_else(|| {
+        QueueError::StateConflict("durable queue payload is missing its jobs array".to_owned())
+    })?;
+    serde_json::from_value(jobs.clone()).map_err(QueueError::Json)
+}
+
 fn compare_pending_jobs(left: &Job, right: &Job) -> Ordering {
     right
         .priority
@@ -1094,7 +1256,7 @@ mod tests {
 
     use super::{
         KEEP_COMPLETED, ORPHAN_REQUEST_MESSAGE, Queue, QueueDeferredRequeue,
-        QueuePendingCancellation, ReplaceRetryPolicy, STALE_RECOVERY_MESSAGE,
+        QueuePendingCancellation, RecoveryEnqueue, ReplaceRetryPolicy, STALE_RECOVERY_MESSAGE,
         STALE_RUNNING_CANCEL_REASON, SUPERSEDED_MESSAGE, WINDOWS_REPLACE_ATTEMPTS,
         retry_replace_with_strategy, scaled_delay,
     };
@@ -1344,10 +1506,80 @@ mod tests {
     }
 
     #[test]
+    fn recovery_enqueue_ignores_older_terminal_owner_but_fences_newer_terminal_owner() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let mut older = completed_from(
+            job("feat/x", "old", &["mac"]).with_workload_scope("repo:pulp"),
+            60,
+        );
+        older.created_at = Utc::now() - chrono::Duration::minutes(2);
+        let recovery = job("feat/x", "recovery", &["mac"]).with_workload_scope("repo:pulp");
+        queue.enqueue(older).expect("older terminal");
+        assert_eq!(
+            queue
+                .enqueue_recovery_if_unowned(recovery.clone(), recovery.created_at)
+                .expect("recovery enqueue"),
+            RecoveryEnqueue::Inserted
+        );
+
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let mut recovery = job("feat/x", "recovery", &["mac"]).with_workload_scope("repo:pulp");
+        recovery.created_at = Utc::now() - chrono::Duration::minutes(2);
+        let newer = completed_from(
+            job("feat/x", "newer", &["mac"]).with_workload_scope("repo:pulp"),
+            0,
+        );
+        let newer_id = newer.id.clone();
+        queue.enqueue(newer).expect("newer terminal");
+        assert_eq!(
+            queue
+                .enqueue_recovery_if_unowned(recovery.clone(), recovery.created_at)
+                .expect("recovery enqueue"),
+            RecoveryEnqueue::OwnedBy(newer_id)
+        );
+    }
+
+    #[test]
+    fn recovery_enqueue_fails_closed_on_unknown_active_unscoped_owner() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let unknown = job("unknown", "unknown", &["mac"]);
+        let unknown_id = unknown.id.clone();
+        let mismatched_request = RunExecutionRequest {
+            branch: "unrelated".to_owned(),
+            sha: "different".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: Vec::new(),
+        };
+        QueueRequestStore::new(temp.path())
+            .expect("request store")
+            .save(&QueuedExecutionEnvelope::from_run_request(
+                unknown_id.clone(),
+                temp.path(),
+                &mismatched_request,
+            ))
+            .expect("mismatched envelope");
+        queue.enqueue(unknown).expect("unknown owner");
+        let recovery = job("feat/x", "recovery", &["mac"]).with_workload_scope("repo:pulp");
+        assert_eq!(
+            queue
+                .enqueue_recovery_if_unowned(recovery.clone(), recovery.created_at)
+                .expect("recovery enqueue"),
+            RecoveryEnqueue::OwnedBy(unknown_id)
+        );
+    }
+
+    #[test]
     fn enqueue_backfills_legacy_pending_run_scope_from_its_durable_envelope() {
         let temp = queue_dir();
         let mut queue = Queue::new(temp.path()).expect("queue");
-        let legacy = job("feat/x", "old", &["mac"]);
+        let legacy = job("feat/x", "old", &[]);
         let legacy_id = legacy.id.clone();
         let request = RunExecutionRequest {
             branch: "feat/x".to_owned(),
@@ -1370,7 +1602,49 @@ mod tests {
         queue.enqueue(legacy).expect("legacy");
 
         let replacement =
-            job("feat/x", "new", &["mac"]).with_workload_scope(run_workload_scope(temp.path()));
+            job("feat/x", "new", &[]).with_workload_scope(run_workload_scope(temp.path()));
+        queue.enqueue(replacement).expect("replacement");
+
+        let legacy = queue.get(&legacy_id).expect("get").expect("legacy job");
+        assert_eq!(legacy.status, JobStatus::Cancelled);
+        assert_eq!(
+            legacy.cancellation_reason.as_deref(),
+            Some(SUPERSEDED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn enqueue_backfills_legacy_scope_after_queue_priority_bump() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let legacy = job("feat/x", "old", &[]);
+        let legacy_id = legacy.id.clone();
+        queue.enqueue(legacy.clone()).expect("legacy");
+
+        let request = RunExecutionRequest {
+            branch: "feat/x".to_owned(),
+            sha: "old".to_owned(),
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            targets: Vec::new(),
+        };
+        QueueRequestStore::new(temp.path())
+            .expect("request store")
+            .save(&QueuedExecutionEnvelope::from_run_request(
+                legacy_id.clone(),
+                temp.path(),
+                &request,
+            ))
+            .expect("legacy envelope");
+
+        queue
+            .update(&legacy.with_priority(Priority::High))
+            .expect("priority bump");
+        let replacement =
+            job("feat/x", "new", &[]).with_workload_scope(run_workload_scope(temp.path()));
         queue.enqueue(replacement).expect("replacement");
 
         let legacy = queue.get(&legacy_id).expect("get").expect("legacy job");
@@ -1883,6 +2157,27 @@ mod tests {
             let mut queue = Queue::new(temp.path()).expect("queue");
             assert_eq!(queue.pending_count().expect("pending"), 0);
         }
+    }
+
+    #[test]
+    fn strict_queue_read_distinguishes_missing_valid_and_corrupt_state() {
+        let temp = queue_dir();
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        assert!(queue.get_all_strict().expect("missing queue").is_empty());
+
+        let expected = job("main", "abc", &["mac"]);
+        queue.enqueue(expected.clone()).expect("enqueue");
+        assert_eq!(queue.get_all_strict().expect("valid queue"), vec![expected]);
+
+        fs::write(
+            queue.queue_file(),
+            r#"{"jobs":[{"id":"truncated-live-owner"}]}"#,
+        )
+        .expect("corrupt queue");
+        assert!(matches!(
+            queue.get_all_strict(),
+            Err(super::QueueError::Json(_))
+        ));
     }
 
     #[test]

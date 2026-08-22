@@ -108,6 +108,13 @@ pub struct ShipState {
     /// Attempt number for this PR ship.
     #[serde(default = "default_attempt")]
     pub attempt: u32,
+    /// Queue job that owns the current ship attempt.
+    ///
+    /// Queue-absence recovery requires this exact identity; older state files
+    /// without it fail closed instead of adopting a same-head envelope from a
+    /// prior attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_job_id: Option<String>,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Last update timestamp.
@@ -166,6 +173,7 @@ impl ShipState {
             dispatched_runs: Vec::new(),
             evidence_snapshot: BTreeMap::new(),
             attempt: default_attempt(),
+            source_job_id: None,
             created_at: now,
             updated_at: now,
             merge_queue_observed_at: None,
@@ -636,6 +644,7 @@ impl ShipStateStore {
         let now = Utc::now();
         Ok(ShipState {
             attempt: new_attempt.unwrap_or(state.attempt + 1),
+            source_job_id: None,
             dispatched_runs: Vec::new(),
             evidence_snapshot: BTreeMap::new(),
             created_at: now,
