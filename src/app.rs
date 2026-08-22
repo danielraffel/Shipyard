@@ -148,6 +148,15 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
+    let mode = cli.mode.into();
+    let _writer_domain_lease =
+        match crate::writer_domain_lease::acquire_production_writer_domain_lease(mode) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = writeln!(stderr, "{error}");
+                return ExitCode::from(crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_EXIT_CODE);
+            }
+        };
     run_with(cli, &mut stdout, &mut stderr)
 }
 

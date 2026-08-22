@@ -60,6 +60,16 @@ cargo llvm-cov --locked --summary-only --fail-under-lines 75
 python3 -m pytest tools/sandbox-e2e/ -q
 ```
 
+The sandbox gate serializes its protected-path snapshot and contamination
+assertion against legitimate production Shipyard writes with the host-global
+writer-domain lease under the production state directory. Production commands
+hold shared leases for their lifetime; this gate holds the exclusive lease.
+`sandbox_writer_domain_overlap` is a bounded, proven-overlap deferral/failure:
+wait for the active writer or audit and rerun. Do not allowlist the reported
+protected path. During a mixed-version rollout, drain legacy Shipyard
+processes—or first prove exact-binary fleet convergence—because older binaries
+do not participate in the shared writer domain.
+
 For a release that changes merge-queue behavior, add these fleet gates:
 
 1. Set and verify a distinct runner tag on every machine.
