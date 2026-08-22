@@ -79,13 +79,13 @@ jobs:
       - name: Run sandbox E2E
         # M3's ephemeral Tart runners use Shipyard-studio-NN. Keep the target,
         # provider, and host identity conjunctive so an explicit local selector
-        # for M1/M5 cannot unexpectedly refresh that machine's production daemon.
+        # for M1/M5 cannot unexpectedly run this host-specific canary.
         if: ${{ !(matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-')) }}
         env:
           SHIPYARD_BINARY_FOR_TEST: ${{ github.workspace }}/target/release/shipyard
         run: .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
 
-      - name: Refresh M3 daemon to exact candidate and run focused Sandbox
+      - name: Run exact isolated M3 candidate and focused Sandbox
         if: ${{ matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
         env:
           SHIPYARD_BINARY_FOR_TEST: ${{ github.workspace }}/target/release/shipyard
