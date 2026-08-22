@@ -100,6 +100,10 @@ jobs:
           candidate_status="$($candidate --version)"
           installed_status="$($installed --version)"
           installed_argv="$(pgrep -f 'shipyard.*daemon run' | xargs -r ps -o command= -p 2>/dev/null || true)"
+          "$installed" --json daemon status > "$RUNNER_TEMP/pre-refresh-daemon-status.json"
+          jq -S '[(.registered_repos // [])[]] | sort' \
+            "$RUNNER_TEMP/pre-refresh-daemon-status.json" \
+            > "$RUNNER_TEMP/pre-refresh-registered-repos.json"
           "$installed" --json status > "$RUNNER_TEMP/pre-refresh-worker-status.json"
           record="$RUNNER_TEMP/shipyard-sandbox-bootstrap.json"
           jq -n \
@@ -111,7 +115,7 @@ jobs:
             > "$record"
           "$candidate" daemon refresh --repo Generous-Corp/pulp
           "$candidate" --json daemon status > "$RUNNER_TEMP/candidate-daemon-status.json"
-          jq -e '.running == true and (.registered_repos | index("Generous-Corp/pulp")) != null' \
+          jq -e '.running == true and ((.registered_repos // []) | sort == ["Generous-Corp/pulp"])' \
             "$RUNNER_TEMP/candidate-daemon-status.json"
           candidate_pid="$(pgrep -f "^${candidate//\//\\/} .*daemon run" | head -1)"
           test -n "$candidate_pid"
@@ -130,10 +134,25 @@ jobs:
           set -euo pipefail
           installed="$HOME/.local/bin/shipyard"
           test -x "$installed"
-          "$installed" daemon refresh --repo Generous-Corp/pulp
+          test -s "$RUNNER_TEMP/pre-refresh-registered-repos.json"
+          # Stop the candidate first so an empty saved list cannot implicitly
+          # inherit its temporary Pulp-only registration. Rebuild the explicit
+          # argv from the durable pre-refresh snapshot without eval or word splitting.
+          "$installed" daemon stop
+          restore_args=(daemon refresh)
+          while IFS= read -r repo; do
+            if [ -n "$repo" ]; then
+              restore_args+=(--repo "$repo")
+            fi
+          done < <(jq -r '.[]' "$RUNNER_TEMP/pre-refresh-registered-repos.json")
+          "$installed" "${restore_args[@]}"
           "$installed" --json daemon status > "$RUNNER_TEMP/restored-daemon-status.json"
-          jq -e '.running == true and (.registered_repos | index("Generous-Corp/pulp")) != null' \
-            "$RUNNER_TEMP/restored-daemon-status.json"
+          jq -e '.running == true' "$RUNNER_TEMP/restored-daemon-status.json"
+          jq -S '[(.registered_repos // [])[]] | sort' \
+            "$RUNNER_TEMP/restored-daemon-status.json" \
+            > "$RUNNER_TEMP/restored-registered-repos.json"
+          cmp "$RUNNER_TEMP/pre-refresh-registered-repos.json" \
+            "$RUNNER_TEMP/restored-registered-repos.json"
           installed_path="$(cd "$(dirname "$installed")" && pwd -P)/$(basename "$installed")"
           restored_pid="$(pgrep -f "^${installed_path//\//\\/} .*daemon run" | head -1)"
           test -n "$restored_pid"
