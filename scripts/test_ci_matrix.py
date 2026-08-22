@@ -168,6 +168,30 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual(rows["linux-arm64"]["provider"], "github-hosted")
         self.assertEqual(rows["windows"]["provider"], "github-hosted")
 
+    def test_sandbox_local_macos_requires_explicit_m3_canary_capability(self) -> None:
+        matrix = ci_matrix.workflow_matrix(
+            "sandbox-e2e", {"REQUESTED_PROVIDER": "local"}
+        )
+        rows = {row["key"]: row for row in matrix["include"]}
+        self.assertEqual(
+            json.loads(rows["macos-arm64"]["runs_on_json"]),
+            ["self-hosted", "local-mac", "shipyard-sandbox-m3"],
+        )
+
+    def test_sandbox_local_override_cannot_escape_m3_capability(self) -> None:
+        matrix = ci_matrix.workflow_matrix(
+            "sandbox-e2e",
+            {
+                "REQUESTED_PROVIDER": "local",
+                "LOCAL_MACOS_ARM64_RUNS_ON_JSON": '["self-hosted","studio"]',
+            },
+        )
+        rows = {row["key"]: row for row in matrix["include"]}
+        self.assertEqual(
+            json.loads(rows["macos-arm64"]["runs_on_json"]),
+            ["self-hosted", "studio", "shipyard-sandbox-m3"],
+        )
+
     def test_workflows_do_not_implicitly_route_macos_to_local_runner(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow_dir = root / ".github" / "workflows"
@@ -184,42 +208,47 @@ class CiMatrixTests(unittest.TestCase):
             "matrix.key == 'macos-arm64' && matrix.provider == 'local' && "
             "startsWith(runner.name, 'Shipyard-studio-')"
         )
-        self.assertEqual(workflow.count(predicate), 4)
+        self.assertEqual(workflow.count(predicate), 3)
         self.assertNotIn("startsWith(runner.name, 'pulp-studio')", workflow)
+        self.assertIn('test "$RUNNER_NAME" = "Shipyard-studio-02"', workflow)
+        self.assertIn('test "$(hostname)" = "Daniels-Mac-Studio.local"', workflow)
+        self.assertIn('test "$($installed runner tag)" = "studio"', workflow)
 
-    def test_sandbox_m3_restore_replays_exact_prior_repo_set(self) -> None:
+    def test_sandbox_m3_candidate_is_isolated_and_production_is_unchanged(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("pre-refresh-registered-repos.json", workflow)
-        self.assertIn('restore_args=(daemon refresh)', workflow)
-        self.assertIn('restore_args+=(--repo "$repo")', workflow)
-        self.assertIn('"$installed" daemon stop', workflow)
-        self.assertIn(
-            'cmp "$RUNNER_TEMP/pre-refresh-registered-repos.json"', workflow
-        )
-        self.assertNotIn(
-            '"$installed" daemon refresh --repo Generous-Corp/pulp', workflow
-        )
+        self.assertIn('canary_root="/tmp/shipyard-sandbox-m3-', workflow)
+        self.assertIn('"$candidate" --mode isolated', workflow)
+        self.assertIn('--global-dir "$canary_root/global"', workflow)
+        self.assertIn('--state-dir "$canary_root/state"', workflow)
+        self.assertIn('.tunnel.backend == "inactive"', workflow)
+        self.assertIn('cmp "$canary_root/pre-configured-repos.json"', workflow)
+        self.assertIn('cmp "$canary_root/pre-command.txt"', workflow)
+        self.assertIn('cmp "$canary_root/pre-cwd.txt"', workflow)
+        self.assertIn('cmp "$canary_root/pre-env.sha256"', workflow)
+        self.assertIn('cmp "$canary_root/pre-production.pid"', workflow)
+        self.assertIn('grep -F -- "--mode shipyard"', workflow)
+        self.assertNotIn('"$installed" daemon stop', workflow)
 
-    def test_sandbox_daemons_escape_actions_cleanup_without_webhook_canary(self) -> None:
+    def test_sandbox_candidate_has_host_owned_cleanup_guardian(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('"$installed" daemon stop', workflow)
+        self.assertIn('launchctl bootstrap "gui/$(id -u)" "$guardian_plist"', workflow)
+        self.assertIn("<key>KeepAlive</key><false/>", workflow)
         self.assertIn(
-            '/usr/bin/env -u RUNNER_TRACKING_ID "$candidate" daemon start', workflow
-        )
-        self.assertIn(
-            '/usr/bin/env -u RUNNER_TRACKING_ID "$installed" "${restore_args[@]}"',
+            'cp "$GITHUB_WORKSPACE/scripts/sandbox_daemon_guardian.sh" "$guardian"',
             workflow,
         )
-        self.assertIn("name: Verify restored M3 daemon ownership", workflow)
-        self.assertEqual(workflow.count("inherited Actions orphan tracking"), 2)
+        self.assertIn('<string>$guardian_label</string>', workflow)
+        self.assertIn('if kill -0 "$candidate_pid"', workflow)
+        self.assertIn("name: Verify M3 guardian and production daemon invariants", workflow)
+        self.assertEqual(workflow.count("inherited Actions orphan tracking"), 1)
         self.assertIn(
-            "'.running == true and ((.registered_repos // []) == [])'", workflow
+            "((.configured_repos // []) == [])", workflow
         )
         self.assertNotIn(
             '"$candidate" daemon refresh --repo Generous-Corp/pulp', workflow

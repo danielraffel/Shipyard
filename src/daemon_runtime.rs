@@ -196,6 +196,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
 
     let status_provider = daemon_status_provider(
         Arc::clone(&registrar),
+        repos.clone(),
         Arc::clone(&registration_error),
         Arc::clone(&execution_error),
         Arc::clone(&last_event_at),
@@ -302,6 +303,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
 #[cfg(unix)]
 fn daemon_status_provider(
     registrar: Arc<Mutex<Registrar>>,
+    configured_repos: Vec<String>,
     registration_error: Arc<Mutex<Option<String>>>,
     execution_error: Arc<Mutex<Option<String>>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
@@ -318,6 +320,7 @@ fn daemon_status_provider(
             subscribers: 0,
             last_event_at: last_event_at.lock().ok().and_then(|guard| *guard),
             registered_repos: registered_repos_snapshot(&registrar),
+            configured_repos: configured_repos.clone(),
             rate_limit: None,
             last_error: registration_error
                 .lock()

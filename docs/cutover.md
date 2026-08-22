@@ -154,6 +154,32 @@ build-health-only and does not upload an unsigned artifact.
 
 ## Webhook And Funnel Validation
 
+### Recover missing local webhook provenance
+
+Do not edit `daemon/registrations.json` or delete a remote hook to repair a
+missing local registration. Starting with the registrar reconciliation change,
+an explicit refresh first lists every remote hook page and adopts exactly one
+`web` hook whose callback URL exactly matches Shipyard's current callback. It
+creates a hook only when no exact match exists and fails closed without remote
+mutation when more than one exact match exists.
+
+For the M3 Pulp/Forge daemon, after installing the reconciliating binary, use
+the complete configured authority explicitly:
+
+```sh
+shipyard daemon refresh \
+  --repo Generous-Corp/forge \
+  --repo Generous-Corp/pulp
+shipyard --json daemon status
+```
+
+The terminal status must report both repositories under `configured_repos`.
+`registered_repos` is only the subset whose remote hook registration has
+succeeded; it is not the configured watch authority. If refresh reports
+ambiguous exact hooks, stop and resolve the named remote hook IDs with a human
+who has repository-hook administration authority. Do not choose or delete one
+automatically.
+
 Non-mutating preflight is safe anytime:
 
 ```sh

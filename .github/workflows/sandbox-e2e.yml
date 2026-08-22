@@ -91,21 +91,41 @@ jobs:
           SHIPYARD_BINARY_FOR_TEST: ${{ github.workspace }}/target/release/shipyard
         run: |
           set -euo pipefail
-          candidate="$(cd "$(dirname "$SHIPYARD_BINARY_FOR_TEST")" && pwd -P)/$(basename "$SHIPYARD_BINARY_FOR_TEST")"
+          test "$RUNNER_NAME" = "Shipyard-studio-02"
+          test "$(hostname)" = "Daniels-Mac-Studio.local"
           installed="$HOME/.local/bin/shipyard"
-          test -x "$candidate"
           test -x "$installed"
+          test "$($installed runner tag)" = "studio"
+          canary_root="/tmp/shipyard-sandbox-m3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          lease_dir="/tmp/shipyard-sandbox-m3-lease"
+          umask 077
+          mkdir "$lease_dir"
+          mkdir -p "$canary_root/global" "$canary_root/state"
+          candidate="$canary_root/shipyard-candidate"
+          cp "$SHIPYARD_BINARY_FOR_TEST" "$candidate"
+          chmod 700 "$candidate"
+          guardian="$canary_root/sandbox-daemon-guardian.sh"
+          cp "$GITHUB_WORKSPACE/scripts/sandbox_daemon_guardian.sh" "$guardian"
+          chmod 700 "$guardian"
           candidate_hash="$(shasum -a 256 "$candidate" | awk '{print $1}')"
           installed_hash="$(shasum -a 256 "$installed" | awk '{print $1}')"
           candidate_status="$($candidate --version)"
           installed_status="$($installed --version)"
           installed_argv="$(pgrep -f 'shipyard.*daemon run' | xargs -r ps -o command= -p 2>/dev/null || true)"
-          "$installed" --json daemon status > "$RUNNER_TEMP/pre-refresh-daemon-status.json"
-          jq -S '[(.registered_repos // [])[]] | sort' \
-            "$RUNNER_TEMP/pre-refresh-daemon-status.json" \
-            > "$RUNNER_TEMP/pre-refresh-registered-repos.json"
-          "$installed" --json status > "$RUNNER_TEMP/pre-refresh-worker-status.json"
-          record="$RUNNER_TEMP/shipyard-sandbox-bootstrap.json"
+          "$installed" --json daemon status > "$canary_root/pre-daemon-status.json"
+          jq -S '[(.configured_repos // .registered_repos // [])[]] | sort' \
+            "$canary_root/pre-daemon-status.json" > "$canary_root/pre-configured-repos.json"
+          "$installed" --json status > "$canary_root/pre-worker-status.json"
+          production_pid="$(tr -d '[:space:]' < "$HOME/Library/Application Support/shipyard/daemon/daemon.pid")"
+          printf '%s\n' "$production_pid" > "$canary_root/pre-production.pid"
+          production_command="$(ps -p "$production_pid" -o command=)"
+          printf '%s\n' "$production_command" | grep -F -- "$installed"
+          printf '%s\n' "$production_command" | grep -F -- "--mode shipyard"
+          printf '%s\n' "$production_command" | grep -F -- "daemon run"
+          ps -p "$production_pid" -o command= > "$canary_root/pre-command.txt"
+          lsof -a -p "$production_pid" -d cwd -Fn > "$canary_root/pre-cwd.txt"
+          ps eww -p "$production_pid" -o command= | shasum -a 256 > "$canary_root/pre-env.sha256"
+          record="$canary_root/bootstrap.json"
           jq -n \
             --arg candidate "$candidate" --arg candidate_hash "$candidate_hash" \
             --arg candidate_status "$candidate_status" \
@@ -113,82 +133,80 @@ jobs:
             --arg installed_status "$installed_status" --arg installed_argv "$installed_argv" \
             '{candidate:$candidate,candidate_sha256:$candidate_hash,candidate_status:$candidate_status,installed:$installed,installed_sha256:$installed_hash,installed_status:$installed_status,installed_argv:$installed_argv}' \
             > "$record"
-          # Candidate proof exercises the daemon binary and writer-domain IPC,
-          # not production webhook registration. Stop the installed daemon first
-          # so a no-repo candidate cannot inherit its registrations. Removing the
-          # Actions tracking marker keeps the detached daemon out of runner orphan
-          # cleanup; the restore step stops it explicitly.
-          "$installed" daemon stop
-          /usr/bin/env -u RUNNER_TRACKING_ID "$candidate" daemon start
-          "$candidate" --json daemon status > "$RUNNER_TEMP/candidate-daemon-status.json"
-          jq -e '.running == true and ((.registered_repos // []) == [])' \
-            "$RUNNER_TEMP/candidate-daemon-status.json"
+          guardian_label="com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          guardian_plist="$canary_root/guardian.plist"
+          cat > "$guardian_plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>$guardian_label</string>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><false/>
+            <key>ProgramArguments</key><array>
+              <string>/bin/bash</string><string>$guardian</string><string>$$</string>
+              <string>$candidate</string><string>$canary_root/global</string>
+              <string>$canary_root/state</string><string>$canary_root/done</string>
+              <string>$canary_root/guardian-receipt.json</string><string>$lease_dir</string>
+              <string>$guardian_label</string>
+            </array>
+          </dict></plist>
+          PLIST
+          plutil -lint "$guardian_plist"
+          launchctl bootstrap "gui/$(id -u)" "$guardian_plist"
+          /usr/bin/env -u RUNNER_TRACKING_ID "$candidate" --mode isolated \
+            --global-dir "$canary_root/global" --state-dir "$canary_root/state" daemon start
+          "$candidate" --mode isolated --global-dir "$canary_root/global" \
+            --state-dir "$canary_root/state" --json daemon status > "$canary_root/candidate-status.json"
+          jq -e '.running == true and .tunnel.backend == "inactive" and ((.configured_repos // []) == []) and ((.registered_repos // []) == [])' \
+            "$canary_root/candidate-status.json"
           candidate_pid="$(pgrep -f "^${candidate//\//\\/} .*daemon run" | head -1)"
           test -n "$candidate_pid"
+          printf '%s\n' "$candidate_pid" > "$canary_root/candidate.pid"
           ps -p "$candidate_pid" -o command= | grep -F -- "$candidate"
           if ps eww -p "$candidate_pid" -o command= | grep -q 'RUNNER_TRACKING_ID='; then
             echo "candidate daemon inherited Actions orphan tracking" >&2
             exit 1
           fi
-          state_dir="$($candidate --json paths | jq -r .state_dir)"
+          state_dir="$($candidate --mode isolated --global-dir "$canary_root/global" --state-dir "$canary_root/state" --json paths | jq -r .state_dir)"
           if lsof "$state_dir/.sandbox-writer-domain.lock" > "$RUNNER_TEMP/candidate-lock-holders.txt" 2>&1; then
             echo "candidate daemon retains an idle writer-domain lock" >&2
             cat "$RUNNER_TEMP/candidate-lock-holders.txt" >&2
             exit 1
           fi
           .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
+          touch "$canary_root/done"
 
-      - name: Restore installed M3 daemon
+      - name: Verify M3 guardian and production daemon invariants
         if: ${{ always() && matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
         run: |
           set -euo pipefail
           installed="$HOME/.local/bin/shipyard"
           test -x "$installed"
-          test -s "$RUNNER_TEMP/pre-refresh-registered-repos.json"
-          # Stop the candidate first so an empty saved list cannot implicitly
-          # inherit its temporary Pulp-only registration. Rebuild the explicit
-          # argv from the durable pre-refresh snapshot without eval or word splitting.
-          "$installed" daemon stop
-          restore_args=(daemon refresh)
-          while IFS= read -r repo; do
-            if [ -n "$repo" ]; then
-              restore_args+=(--repo "$repo")
-            fi
-          done < <(jq -r '.[]' "$RUNNER_TEMP/pre-refresh-registered-repos.json")
-          /usr/bin/env -u RUNNER_TRACKING_ID "$installed" "${restore_args[@]}"
-
-      - name: Verify restored M3 daemon ownership
-        if: ${{ always() && matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
-        run: |
-          set -euo pipefail
-          installed="$HOME/.local/bin/shipyard"
-          test -x "$installed"
-          test -s "$RUNNER_TEMP/pre-refresh-registered-repos.json"
-          test -s "$RUNNER_TEMP/pre-refresh-worker-status.json"
-          # A separate step means the restoring shell is already gone. The delay
-          # also crosses `daemon refresh`'s optimistic startup window.
-          sleep 2
-          "$installed" --json daemon status > "$RUNNER_TEMP/restored-daemon-status.json"
-          jq -e '.running == true' "$RUNNER_TEMP/restored-daemon-status.json"
-          jq -S '[(.registered_repos // [])[]] | sort' \
-            "$RUNNER_TEMP/restored-daemon-status.json" \
-            > "$RUNNER_TEMP/restored-registered-repos.json"
-          cmp "$RUNNER_TEMP/pre-refresh-registered-repos.json" \
-            "$RUNNER_TEMP/restored-registered-repos.json"
-          installed_path="$(cd "$(dirname "$installed")" && pwd -P)/$(basename "$installed")"
-          restored_pid="$(pgrep -f "^${installed_path//\//\\/} .*daemon run" | head -1)"
-          test -n "$restored_pid"
-          ps -p "$restored_pid" -o command= | grep -F -- "$installed_path"
-          if ps eww -p "$restored_pid" -o command= | grep -q 'RUNNER_TRACKING_ID='; then
-            echo "restored daemon inherited Actions orphan tracking" >&2
+          canary_root="/tmp/shipyard-sandbox-m3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          deadline=$((SECONDS + 15))
+          while [ ! -s "$canary_root/guardian-receipt.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+          jq -e '.candidate_stopped == true' "$canary_root/guardian-receipt.json"
+          candidate_pid="$(tr -d '[:space:]' < "$canary_root/candidate.pid")"
+          if kill -0 "$candidate_pid" 2>/dev/null; then
+            echo "candidate daemon survived guardian cleanup" >&2
             exit 1
           fi
-          "$installed" --json status > "$RUNNER_TEMP/restored-worker-status.json"
-          jq -S '[.active_runs[]?.id] | sort' "$RUNNER_TEMP/pre-refresh-worker-status.json" \
-            > "$RUNNER_TEMP/pre-refresh-worker-ids.json"
-          jq -S '[.active_runs[]?.id] | sort' "$RUNNER_TEMP/restored-worker-status.json" \
-            > "$RUNNER_TEMP/restored-worker-ids.json"
-          cmp "$RUNNER_TEMP/pre-refresh-worker-ids.json" "$RUNNER_TEMP/restored-worker-ids.json"
+          "$installed" --json daemon status > "$canary_root/post-daemon-status.json"
+          jq -S '[(.configured_repos // .registered_repos // [])[]] | sort' "$canary_root/post-daemon-status.json" > "$canary_root/post-configured-repos.json"
+          cmp "$canary_root/pre-configured-repos.json" "$canary_root/post-configured-repos.json"
+          production_pid="$(tr -d '[:space:]' < "$HOME/Library/Application Support/shipyard/daemon/daemon.pid")"
+          printf '%s\n' "$production_pid" > "$canary_root/post-production.pid"
+          cmp "$canary_root/pre-production.pid" "$canary_root/post-production.pid"
+          ps -p "$production_pid" -o command= > "$canary_root/post-command.txt"
+          lsof -a -p "$production_pid" -d cwd -Fn > "$canary_root/post-cwd.txt"
+          ps eww -p "$production_pid" -o command= | shasum -a 256 > "$canary_root/post-env.sha256"
+          cmp "$canary_root/pre-command.txt" "$canary_root/post-command.txt"
+          cmp "$canary_root/pre-cwd.txt" "$canary_root/post-cwd.txt"
+          cmp "$canary_root/pre-env.sha256" "$canary_root/post-env.sha256"
+          "$installed" --json status > "$canary_root/post-worker-status.json"
+          jq -S '[.active_runs[]?.id] | sort' "$canary_root/pre-worker-status.json" > "$canary_root/pre-worker-ids.json"
+          jq -S '[.active_runs[]?.id] | sort' "$canary_root/post-worker-status.json" > "$canary_root/post-worker-ids.json"
+          cmp "$canary_root/pre-worker-ids.json" "$canary_root/post-worker-ids.json"
 
       - name: Upload sandbox tempdir on failure
         if: failure()

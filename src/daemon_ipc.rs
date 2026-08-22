@@ -96,6 +96,9 @@ pub struct IpcState {
     pub last_event_at: Option<f64>,
     /// Registered repo slugs.
     pub registered_repos: Vec<String>,
+    /// Repositories the daemon is configured to watch, independent of whether
+    /// webhook registration has currently succeeded.
+    pub configured_repos: Vec<String>,
     /// Rate-limit snapshot if known.
     pub rate_limit: Option<Value>,
     /// Last recoverable daemon warning/error, if any. Doubles as the
@@ -433,6 +436,7 @@ fn status_frame(state: &IpcState) -> Value {
         "subscribers": state.subscribers,
         "last_event_at": state.last_event_at,
         "registered_repos": state.registered_repos,
+        "configured_repos": state.configured_repos,
         "rate_limit": state.rate_limit,
         "last_error": state.last_error,
         "shipyard_version": env!("CARGO_PKG_VERSION"),
@@ -597,6 +601,7 @@ mod tests {
             subscribers: 0,
             last_event_at: None,
             registered_repos: vec!["org/repo".to_owned()],
+            configured_repos: vec!["org/repo".to_owned(), "org/pending".to_owned()],
             rate_limit: None,
             last_error: None,
         }
@@ -713,6 +718,7 @@ mod tests {
         assert_eq!(lines[1]["type"], "status");
         assert_eq!(lines[1]["tunnel"]["backend"], "tailscale");
         assert_eq!(lines[1]["registered_repos"][0], "org/repo");
+        assert_eq!(lines[1]["configured_repos"][1], "org/pending");
     }
 
     #[cfg(unix)]
@@ -732,6 +738,7 @@ mod tests {
 
         assert_eq!(status["type"], "status");
         assert_eq!(status["registered_repos"][0], "org/repo");
+        assert_eq!(status["configured_repos"][1], "org/pending");
     }
 
     #[cfg(unix)]
