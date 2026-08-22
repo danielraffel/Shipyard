@@ -1100,8 +1100,9 @@ reviewed shadow policy digest in trusted machine-global config.
 For `--resume-from test`, Shipyard authenticates all eligible target plans in a
 read-only preflight and refuses schema-v3 execution before activation
 persistence or substitution. It could skip producer builds and test stale warm
-artifacts; schema v2 remains safely resumable. Restart schema v3 from `build`
-or start a fresh validation.
+artifacts. If every plan is schema v2 or ineligible, it preserves the original
+stages and resumes the ordinary test stage without a second observation or
+activation. Restart schema v3 from `build` or start a fresh validation.
 
 For a prospective `shipyard pr` push, selected execution is transport-only and
 remains machine-global default-off. Shipyard accepts exactly one non-delete

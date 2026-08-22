@@ -223,8 +223,10 @@ Schema v3 requires both exact `build` and `test` stages and the literal
 and hard-refuses an authenticated schema-v3 transaction before any activation
 is persisted or stage is substituted, because resuming after `build` must
 never turn a substituted test stage—or stale warm artifacts—into passing
-selected evidence. Schema v2 retains its safe test-only resume behavior.
-Restart from `build` or start a fresh validation. The
+selected evidence. If every authenticated plan is schema v2 or ineligible,
+Shipyard preserves the original stages and resumes the ordinary test stage; it
+does not observe again or activate changed-surface selection in that invocation.
+Restart schema v3 from `build` or start a fresh validation. The
 plan binds the exact PR head/tree, protected base, changed paths, selector
 policy, original validation contract, protected workflow, selection receipt,
 and expanded command. Shipyard persists that activation without overwrite and

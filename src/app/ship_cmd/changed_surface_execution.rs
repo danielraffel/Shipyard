@@ -186,6 +186,9 @@ pub(super) fn apply_changed_surface_execution(
                 return Err(CliFailure::new(2, reason));
             }
         }
+        // Schema v2 safely resumes the original test stage. Do not observe a
+        // second time or activate a newly changed plan after this preflight.
+        return Ok(());
     }
 
     for target in targets {

@@ -289,6 +289,21 @@ impl EvidenceStore {
         Ok(Self { path })
     }
 
+    /// Open an existing evidence store without creating or repairing it.
+    ///
+    /// Observation paths use this constructor so a missing store remains a
+    /// read-only absence rather than entering the writer domain.
+    pub fn open_existing(path: PathBuf) -> Result<Self, std::io::Error> {
+        if path.is_dir() {
+            Ok(Self { path })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("evidence store does not exist: {}", path.display()),
+            ))
+        }
+    }
+
     /// Backing path of the store.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -1072,6 +1087,17 @@ mod tests {
             reopened.get_target("main", "mac").expect("record").sha,
             "abc"
         );
+    }
+
+    #[test]
+    fn opening_missing_store_for_observation_does_not_create_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("missing-evidence");
+
+        let error = EvidenceStore::open_existing(path.clone()).expect_err("missing store");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!path.exists());
     }
 
     #[test]
