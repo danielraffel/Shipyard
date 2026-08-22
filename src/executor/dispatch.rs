@@ -1017,12 +1017,6 @@ fn valid_environment_name(name: &str) -> bool {
 }
 
 fn sensitive_environment_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    let semantic_stem = upper
-        .rsplit_once('_')
-        .filter(|(_, suffix)| matches!(*suffix, "DIR" | "FILE" | "HOME" | "PATH" | "ROOT"))
-        .map_or(upper.as_str(), |(stem, _)| stem);
-    let compact_stem = semantic_stem.replace('_', "");
     const COMPACT_SECRET_MARKERS: [&str; 12] = [
         "ACCESSKEY",
         "ACCESSTOKEN",
@@ -1037,6 +1031,12 @@ fn sensitive_environment_name(name: &str) -> bool {
         "SIGNINGKEY",
         "TLSCERT",
     ];
+    let upper = name.to_ascii_uppercase();
+    let semantic_stem = upper
+        .rsplit_once('_')
+        .filter(|(_, suffix)| matches!(*suffix, "DIR" | "FILE" | "HOME" | "PATH" | "ROOT"))
+        .map_or(upper.as_str(), |(stem, _)| stem);
+    let compact_stem = semantic_stem.replace('_', "");
     COMPACT_SECRET_MARKERS
         .iter()
         .any(|marker| compact_stem.contains(marker))
