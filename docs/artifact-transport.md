@@ -31,6 +31,14 @@ caller supplied. Remote roots deliberately accept only a narrow portable
 character set because classic rsync still passes the remote path through a
 remote shell.
 
+Before constructing that command, the receiver acquires an exclusive OS-backed
+lease for the exact digest and transfer session. The same lease value must stay
+alive through the receiver-pull process and is consumed by publication. A
+crashed process releases the kernel lock automatically; its lock file remains
+so a pathname unlink cannot split later contenders across different lock
+inodes. Publication first moves the partial to a sealed path while ownership is
+held, so a second cooperating receiver cannot append during verification.
+
 macOS `/usr/bin/rsync` (openrsync) does not provide `--append-verify`. Therefore
 plain `--partial` is not considered resumable proof, and blind `--append` is
 forbidden. Shipyard hashes each complete prefix chunk, truncates an incomplete
@@ -39,9 +47,12 @@ After transfer, it rechecks every chunk, total size, final SHA-256, manifest
 authority, and producer fence.
 
 Verified objects move from `<root>/.incoming` to `<root>/objects` with a
-same-root atomic rename. The partial is retained after validation failure for
-diagnosis or a later authenticated resume. An existing immutable object is
-reused only after its size and digest match; it is never overwritten.
+same-root, atomic create-if-absent hard link. There is no existence-check/rename
+window: one concurrent publisher wins, and every loser verifies the immutable
+winner before reuse. Validation failure restores the resumable partial;
+post-verification publication failure retains the sealed bytes for diagnosis or
+retry. An existing immutable object is reused only after its size and digest
+match; it is never overwritten.
 
 The host declares the store root. Do not assume `/Volumes/Workshop` or a home
 directory: a machine with a nearly-full external volume may correctly choose a
