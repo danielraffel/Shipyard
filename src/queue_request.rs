@@ -1841,6 +1841,7 @@ fn protect_request_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep one fallible cross-platform protection contract.
 fn protect_request_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }

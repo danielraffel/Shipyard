@@ -1016,6 +1016,7 @@ fn sync_directory(path: &Path) -> Result<(), Error> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep one fallible cross-platform durability contract.
 fn sync_directory(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
