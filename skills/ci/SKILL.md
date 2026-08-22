@@ -1042,6 +1042,14 @@ Full docs: [`docs/targets.md`](../../docs/targets.md) and
 
 SSH-backed targets deliver code via `git bundle`. On the first run the bundle is full (every object reachable from the target SHA, ~443 MB for Pulp-sized repos). On every subsequent run Shipyard probes the remote for its current HEAD over SSH (`git rev-parse HEAD`), verifies that the local clone has that commit as an ancestor, and emits `git bundle create <bundle> <target> ^<remote_head>` — a delta bundle that is typically kilobytes instead of megabytes. Any failure in the probe, ancestry check, or delta create silently falls back to the full-bundle path so the behavior on cold/corrupt remotes is unchanged. Each run logs a `bundle_mode=delta|full bundle_bytes=<N>` line to the per-target log so operators can confirm the optimisation is active.
 
+Source delivery is not build-artifact delivery. The default-off artifact proof
+core uses typed exact-head/toolchain/cache-generation manifests, authenticated
+chunk resume, and same-root atomic publication. It has no dispatch or live
+sharding behavior. Do not copy a full repository, build tree, Skia/Dawn cache,
+or other heavyweight cache to feed a shard; prefer an exact cache-generation
+reference, basis-aware Git objects, then a compressed immutable artifact. See
+[`docs/artifact-transport.md`](../../docs/artifact-transport.md).
+
 ## Exact-head changed-surface shadow planning
 
 Use `changed-surface-plan` only for a target that declares

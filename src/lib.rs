@@ -4,6 +4,8 @@
 
 /// CLI entrypoint and command dispatch.
 pub mod app;
+/// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.
+pub mod artifact_transport;
 /// Classify a "Shipyard validated green but GitHub refused the merge" wedge and
 /// decide whether a red required check is a flaky leg the operator can recover.
 pub mod auto_rescue;
