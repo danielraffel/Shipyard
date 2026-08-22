@@ -4,7 +4,9 @@ Shipyard's fail-closed planner computes a bounded candidate suite while the
 existing full target suite remains authoritative by default. Schema v2 adds
 reviewed mandatory, affected, extended, and full risk tiers without changing a
 validation command unless an independently trusted machine-global canary is
-enabled. Test identities are never passed as a regex.
+enabled. Schema v3 additionally binds the reviewed `CMake` producer targets
+needed to materialize those tests and permits atomic build-and-test selection.
+Test identities are never passed as a regex.
 
 ## Configuration
 
@@ -20,7 +22,7 @@ platform = "macos-arm64"
 validation_build_type = "debug"
 
 [targets.mac.changed_surface_selection]
-schema_version = 2
+schema_version = 3
 full_test_count = 20091
 build_type = "debug"
 build_flags = ["-DCMAKE_BUILD_TYPE=Debug"]
@@ -28,6 +30,7 @@ baseline_tests = [
   "smoke: CLI starts",
   "smoke: plugin registry loads",
 ]
+baseline_build_targets = ["pulp-smoke", "pulp-cli"]
 baseline_only_paths = ["docs/**"]
 full_required_paths = ["CMakeLists.txt", "cmake/**", "security/**"]
 policy_paths = [
@@ -47,6 +50,7 @@ tests = [
   "capability registry exact contract",
   "capability registry no-exceptions contract",
 ]
+build_targets = ["pulp-capability-tests"]
 supported_build_types = ["debug", "release"]
 risk_class = "low"
 
@@ -57,6 +61,7 @@ tests = [
   "audio runtime smoke",
   "audio runtime RT safety",
 ]
+build_targets = ["pulp-audio-tests"]
 supported_build_types = ["debug", "release"]
 risk_class = "medium"
 extended_tests = [
@@ -68,6 +73,7 @@ extended_tests = [
 name = "installed-sdk"
 paths = ["tools/cli/**", "include/pulp/capability/**"]
 tests = ["agent capability installed SDK"]
+build_targets = ["pulp-installed-sdk-tests"]
 supported_build_types = ["release"]
 required_secondary_target = "release-installed-sdk"
 required_secondary_build_type = "release"
@@ -91,6 +97,14 @@ These paths are for known global-risk surfaces; unknown or unmapped paths
 already fail closed to full and must not be listed merely to suppress mapping
 work. The receipt records `selection_tier` as `mandatory`, `affected`,
 `extended`, or `full`.
+
+Schema v3 requires a nonempty canonical `baseline_build_targets` list and a
+nonempty `build_targets` list for every family. The bounded receipt contains the
+ordered union and its digest. The repository adapter must independently prove
+from the configure-produced `CMake` File API codemodel that every selected
+native test executable is produced by an allowed target. Missing targets,
+ambiguous artifacts, or codemodel drift refuse bounded execution; no caller can
+inject a target beginning with `-` or a shell fragment.
 
 `tests` and `extended_tests` are literal reviewed test identities, not regexes. Every family must
 have at least one path and one test, the baseline must be nonempty, family names
@@ -187,7 +201,7 @@ An authenticated protected-base target may declare an execution template:
 ```toml
 [targets.mac.changed_surface_selection.execution]
 mode = "authoritative"
-stage = "test"
+stage = "build_and_test"
 command = "python3 tools/scripts/run_changed_surface_tests.py --selection-receipt-b64 {selection_receipt_b64} --selection-receipt-sha256 {selection_receipt_digest}"
 ```
 
@@ -195,13 +209,16 @@ This declaration is permission, not activation. Shipyard loads
 `changed_surface_execution.mode` from machine-global config only. Missing or
 `off` leaves every target command unchanged. `shadow_compare` snapshots the
 protected command into the durable queue request with a trusted result
-directory and tells the repository adapter to run selected then full; the full
+directory and tells the repository adapter to run the selected-target build
+and selected tests, then the original full build and tests; the full path's
 result remains authoritative. `authoritative` omits the full comparison and is
 reserved for a separately reviewed graduation after comparison evidence. It
 also requires machine-global `accepted_shadow_policy_digest` to match the exact
 protected policy digest; changing only `mode` cannot bypass shadow review.
 
-Only a staged local POSIX target with an exact `test` stage is eligible. The
+Schema v2 accepts only a staged local POSIX target with an exact `test` stage.
+Schema v3 requires both exact `build` and `test` stages and the literal
+`build_and_test` declaration; Shipyard substitutes both or neither. The
 plan binds the exact PR head/tree, protected base, changed paths, selector
 policy, original validation contract, protected workflow, selection receipt,
 and expanded command. Shipyard persists that activation without overwrite and

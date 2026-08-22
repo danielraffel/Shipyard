@@ -121,6 +121,13 @@ writing selected-vs-full receipts. Do not use `authoritative` without reviewed
 graduation evidence and a machine-global `accepted_shadow_policy_digest` that
 exactly matches the protected plan.
 
+Schema v3 also binds nonempty baseline and per-family `CMake` producer-target
+lists. It may replace only the exact protected `build` and `test` stages as one
+`build_and_test` transaction. In `shadow_compare`, the repository adapter must
+build selected targets and run selected tests first, then execute the original
+full build and test path as authority. Missing or ambiguous target projection,
+or a partial-stage substitution, fails closed.
+
 Prospective pre-push selection is only a transport optimization and is also
 machine-global default-off. Shipyard permits one non-delete branch update and
 authenticates the actual `core.hooksPath/pre-push` against the protected base:
@@ -131,7 +138,7 @@ nonce, and receipt identity; the hook must bind the exact head, tree, changed
 paths, selected tests, and hook digest. Any ambiguity or identity drift falls
 back to the full authoritative validation contract.
 
-The selector library also understands a schema-v2, protected-base
+The selector library also understands schema-v2/v3 protected-base
 `execution` declaration for a future controlled promotion. It remains inert
 unless orchestration explicitly supplies the exact planner input again, the
 unaltered validation and workflow contract digests, a proven POSIX command

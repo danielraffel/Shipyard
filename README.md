@@ -35,9 +35,10 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   every required platform has passing evidence **for the exact HEAD SHA** —
   not the most-recent run, not the branch tip, the SHA.
 - **Fail-closed test-selection shadowing.** A target can declare mandatory
-  baseline smoke plus complete changed-surface families. Shipyard authenticates
-  PR/protected-base provenance and emits an exact-head receipt while the full
-  suite remains authoritative; ambiguity always falls back to full.
+  baseline smoke plus complete changed-surface families and their reviewed
+  build targets. Shipyard authenticates PR/protected-base provenance and emits
+  an exact-head receipt while the full build/test path remains authoritative;
+  ambiguity always falls back to full.
 - **Parallel-agent-aware queue.** Multiple agents in multiple worktrees
   share one machine-global queue with priorities, FIFO scheduling, and
   automatic deduplication.
