@@ -1159,6 +1159,10 @@ pub(super) enum RunnerCommand {
         /// Label that opts a PR out of stewardship.
         #[arg(long = "opt-out-label", default_value = "shipyard:no-auto-merge")]
         opt_out_label: String,
+        /// Label that blocks stewardship authority while PR provenance is
+        /// unresolved. Repeat to recognize additional repository vocabularies.
+        #[arg(long = "provenance-blocking-label", default_value = "5·unresolved")]
+        provenance_blocking_labels: Vec<String>,
         /// Maximum reruns of the same transiently-failed run on one exact head.
         #[arg(long = "max-transient-reruns", default_value_t = 1)]
         max_transient_reruns: u32,

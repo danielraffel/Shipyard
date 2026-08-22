@@ -21,6 +21,7 @@ fn required_workflow_capacity_reason_is_rejected_before_github_reads_or_writes()
             "steward:skip",
             MANAGED_LABEL,
             HANDOFF_CONTEXT,
+            &[],
         ),
         Ok(None)
     ));
@@ -107,6 +108,7 @@ esac
         mutation_control: &control,
         managed_label: MANAGED_LABEL,
         handoff_context: HANDOFF_CONTEXT,
+        provenance_blocking_labels: &[],
     };
     let mut ledger = StewardLedger::default();
 
@@ -204,6 +206,7 @@ esac
         mutation_control: &control,
         managed_label: MANAGED_LABEL,
         handoff_context: HANDOFF_CONTEXT,
+        provenance_blocking_labels: &[],
     };
     let mut ledger = StewardLedger::default();
 

@@ -848,6 +848,12 @@ explicitly advisory Pulp workflows; required workflows and unknown repositories
 are disabled because GitHub cannot bind a cancellation to an atomic job-state
 snapshot.
 
+The case-insensitive `5·unresolved` label is a fail-closed provenance blocker
+by default. A matching current PR reports `provenance_blocked` and receives no
+mutation. Repeat `--provenance-blocking-label <label>` for another repository
+vocabulary; live revalidation must observe the blocker absent before authority
+returns.
+
 Stewardship is opt-in per immutable head. Prefer making the receipt atomic with
 PR creation: set `[merge_steward].auto_handoff = true` on the protected base
 branch and run `shipyard pr`, optionally adding `--workstream-id ID

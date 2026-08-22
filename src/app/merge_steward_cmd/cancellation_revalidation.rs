@@ -19,6 +19,7 @@ pub(super) fn revalidate_capacity_preemption(
     opt_out_label: &str,
     managed_label: &str,
     handoff_context: &str,
+    provenance_blocking_labels: &[String],
 ) -> Result<Option<CapacityRevalidation>, String> {
     let front_enqueued_at = match live_queue_front(actions, &observation.repo, &observation.base)? {
         Some((live_front, enqueued_at))
@@ -73,9 +74,11 @@ pub(super) fn revalidate_capacity_preemption(
         &observation.repo,
         &observation.base,
         opt_out_label,
+        provenance_blocking_labels,
     )?;
     all_current_heads.insert(candidate_pr.fact.number, candidate_pr.fact.head_sha.clone());
     if pull_request_opted_out(&candidate_pr, opt_out_label)
+        || pull_request_provenance_blocked(&candidate_pr, provenance_blocking_labels)
         || !managed_ownership_still_valid(
             observation,
             &candidate_pr,
@@ -115,11 +118,12 @@ pub(super) fn live_current_pull_request_state(
     repo: &str,
     base: &str,
     opt_out_label: &str,
+    provenance_blocking_labels: &[String],
 ) -> Result<(BTreeMap<u64, String>, BTreeSet<u64>), String> {
     let prs = pull_requests(actions, repo, base, &BTreeMap::new())?;
     Ok((
         current_pull_request_heads(&prs),
-        opted_out_pull_requests(&prs, opt_out_label),
+        authority_excluded_pull_requests(&prs, opt_out_label, provenance_blocking_labels),
     ))
 }
 
@@ -235,6 +239,32 @@ pub(super) fn pull_request_opted_out(pr: &ObservedPr, opt_out_label: &str) -> bo
         .any(|label| label.eq_ignore_ascii_case(opt_out_label))
 }
 
+pub(super) fn pull_request_provenance_blocked(
+    pr: &ObservedPr,
+    provenance_blocking_labels: &[String],
+) -> bool {
+    provenance_blocking_labels.iter().any(|blocker| {
+        pr.fact
+            .labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case(blocker))
+    })
+}
+
+pub(super) fn authority_excluded_pull_requests(
+    prs: &[ObservedPr],
+    opt_out_label: &str,
+    provenance_blocking_labels: &[String],
+) -> BTreeSet<u64> {
+    prs.iter()
+        .filter(|pr| {
+            pull_request_opted_out(pr, opt_out_label)
+                || pull_request_provenance_blocked(pr, provenance_blocking_labels)
+        })
+        .map(|pr| pr.fact.number)
+        .collect()
+}
+
 pub(super) fn pull_request_is_managed(
     pr: &ObservedPr,
     managed_label: &str,
@@ -314,6 +344,7 @@ pub(super) fn live_queue_front(
         .and_then(|(number, _)| Some((heads.get(number)?.clone(), enqueued.get(number)?.clone()))))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn revalidate_coalescing_cancellation(
     actions: &GitHubActions,
     observation: &RepoObservation,
@@ -322,6 +353,7 @@ pub(super) fn revalidate_coalescing_cancellation(
     opt_out_label: &str,
     managed_label: &str,
     handoff_context: &str,
+    provenance_blocking_labels: &[String],
 ) -> Result<bool, String> {
     if !coalescing_reason_authorizes(cancellation.reason) || !is_full_sha(&observed.head_sha) {
         return Ok(false);
@@ -343,6 +375,7 @@ pub(super) fn revalidate_coalescing_cancellation(
         return Ok(false);
     };
     if pull_request_opted_out(&candidate_pr, opt_out_label)
+        || pull_request_provenance_blocked(&candidate_pr, provenance_blocking_labels)
         || !managed_ownership_still_valid(
             observation,
             &candidate_pr,
@@ -402,6 +435,7 @@ pub(super) fn exact_run_still_queued(
             == Some(pr_number))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn authoritative_head_still_superseded(
     actions: &GitHubActions,
     observation: &RepoObservation,
@@ -410,6 +444,7 @@ pub(super) fn authoritative_head_still_superseded(
     opt_out_label: &str,
     managed_label: &str,
     handoff_context: &str,
+    provenance_blocking_labels: &[String],
 ) -> Result<bool, String> {
     let Some(pr_number) = observed
         .pull_request_number
@@ -428,6 +463,7 @@ pub(super) fn authoritative_head_still_superseded(
         return Ok(false);
     };
     if pull_request_opted_out(&candidate_pr, opt_out_label)
+        || pull_request_provenance_blocked(&candidate_pr, provenance_blocking_labels)
         || !managed_ownership_still_valid(
             observation,
             &candidate_pr,
