@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01081"></a>
+## [0.108.1] - 2026-08-22
+
+- fix: serialize sandbox audits with production writers ([#457](https://github.com/danielraffel/Shipyard/pull/457))
+
 <a id="v01080"></a>
 ## [0.108.0] - 2026-08-22
 
@@ -989,6 +994,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.108.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.108.1
 [0.108.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.108.0
 [0.107.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.107.0
 [0.106.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.106.0
