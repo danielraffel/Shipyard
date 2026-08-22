@@ -37,8 +37,9 @@ use crate::job::{
 };
 use crate::queue::{Queue, QueueDeferredRequeue, QueueError, STALE_RUNNING_CANCEL_REASON};
 use crate::queue_request::{
-    QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
-    QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner, QueuedShipDisposition,
+    QueueOutcomeStore, QueueRequestError, QueueRequestResult, QueueRequestStore,
+    QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner,
+    QueuedShipDisposition,
 };
 use crate::queue_scheduler::{
     VmSlotCapacity, apply_admit_pass_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
@@ -459,6 +460,27 @@ fn submit_ship_with_config(
     state_dir: &Path,
     config: Option<&LoadedConfig>,
 ) -> Result<Job, ShipExecutionError> {
+    submit_ship_with_config_and_persist(
+        request,
+        queue,
+        cwd,
+        state_dir,
+        config,
+        save_submission_envelope,
+    )
+}
+
+fn submit_ship_with_config_and_persist<P>(
+    request: &ShipExecutionRequest,
+    queue: &mut Queue,
+    cwd: &Path,
+    state_dir: &Path,
+    config: Option<&LoadedConfig>,
+    persist: P,
+) -> Result<Job, ShipExecutionError>
+where
+    P: FnOnce(&QueueRequestStore, &QueuedExecutionEnvelope, bool) -> QueueRequestResult<()>,
+{
     let workload_scope = format!(
         "ship:{}:pr-{}",
         canonical_repository(&request.repo),
@@ -482,6 +504,7 @@ fn submit_ship_with_config(
     .with_workload_scope(workload_scope);
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_ship_request(job.id.clone(), cwd, request);
+    let daemon_owned = config.is_some();
     if let Some(config) = config {
         envelope.execution_owner = QueuedExecutionOwner::Daemon;
         let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
@@ -498,12 +521,24 @@ fn submit_ship_with_config(
         envelope.cwd.clone_from(&provenance.canonical_cwd);
         envelope.provenance = Some(provenance);
     }
-    request_store.save(&envelope)?;
+    persist(&request_store, &envelope, daemon_owned)?;
     if let Err(error) = queue.enqueue(job.clone()) {
         let _ = request_store.delete(&job.id);
         return Err(error.into());
     }
     Ok(job)
+}
+
+fn save_submission_envelope(
+    request_store: &QueueRequestStore,
+    envelope: &QueuedExecutionEnvelope,
+    durable: bool,
+) -> QueueRequestResult<()> {
+    if durable {
+        request_store.save_durable(envelope)
+    } else {
+        request_store.save(envelope)
+    }
 }
 
 /// Load a completed `shipyard ship` outcome through the durable outcome store.
@@ -847,6 +882,7 @@ fn submit_run_with_config(
     .with_workload_scope(crate::queue_request::run_workload_scope(cwd));
     let request_store = QueueRequestStore::new(state_dir).map_err(QueueRequestError::from)?;
     let mut envelope = QueuedExecutionEnvelope::from_run_request(job.id.clone(), cwd, request);
+    let daemon_owned = config.is_some();
     if let Some(config) = config {
         envelope.execution_owner = QueuedExecutionOwner::Daemon;
         let provenance = crate::queue_request::ExecutionProvenance::capture_with_config(
@@ -863,7 +899,7 @@ fn submit_run_with_config(
         envelope.cwd.clone_from(&provenance.canonical_cwd);
         envelope.provenance = Some(provenance);
     }
-    request_store.save(&envelope)?;
+    save_submission_envelope(&request_store, &envelope, daemon_owned)?;
     if let Err(error) = queue.enqueue(job.clone()) {
         let _ = request_store.delete(&job.id);
         return Err(error.into());
@@ -4810,6 +4846,92 @@ mod tests {
                 ..
             } if running_job_id == running_job.id
         ));
+    }
+
+    #[test]
+    fn daemon_ship_durable_envelope_failure_prevents_queue_admission() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo dir");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "shipyard@example.invalid"],
+            vec!["config", "user.name", "Shipyard Test"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/danielraffel/pulp.git",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .expect("git setup")
+                    .success()
+            );
+        }
+        std::fs::write(repo.join("tracked"), "fixture\n").expect("tracked file");
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "tracked"])
+                .current_dir(&repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-qm", "fixture"])
+                .current_dir(&repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .expect("git head");
+        assert!(head.status.success());
+
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let mut request = ship_request(vec![ssh_target()]);
+        request.sha = String::from_utf8(head.stdout)
+            .expect("utf8 head")
+            .trim()
+            .to_owned();
+        let config = empty_config(&repo);
+        let persistence_attempted = std::cell::Cell::new(false);
+        let error = super::submit_ship_with_config_and_persist(
+            &request,
+            &mut queue,
+            &repo,
+            &state_dir,
+            Some(&config),
+            |_, envelope, durable| {
+                assert!(durable, "daemon-owned envelopes require fsync durability");
+                assert_eq!(envelope.execution_owner, QueuedExecutionOwner::Daemon);
+                persistence_attempted.set(true);
+                Err(QueueRequestError::Io(std::io::Error::other(
+                    "injected durable persistence failure",
+                )))
+            },
+        )
+        .expect_err("durable envelope failure must abort submission");
+
+        assert!(persistence_attempted.get());
+        assert!(matches!(
+            error,
+            ShipExecutionError::QueueRequest(QueueRequestError::Io(_))
+        ));
+        assert!(
+            queue.get_all().expect("queue jobs").is_empty(),
+            "queue admission must happen only after the durable envelope commits"
+        );
     }
 
     #[test]
