@@ -1073,6 +1073,18 @@ substitute full Debug for a Release-only installed-SDK
 family or treat historical Release evidence as sufficient. See
 [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
+Schema v2 has a default-off promotion contract for controlled local POSIX
+canaries. A bounded command is eligible only after Shipyard re-derives the
+exact receipt from protected-base policy and binds it to the original target
+validation digest, workflow digest, clean head/tree identity, proven POSIX
+transport, and a trusted machine-global enable bit. Any mismatch, unsupported
+transport, unknown/high-risk path, or disabled switch keeps the configured full
+test stage. The payload is size-limited canonical URL-safe base64 plus SHA-256;
+test names are never interpolated into a regex or shell expression. The
+library contract alone does not activate selection: the queue/orchestration
+layer must still snapshot and substitute the immutable plan before bounded
+results can become authoritative.
+
 ## Cross-PR evidence reuse
 
 When PR B rebases onto PR A's merged SHA and B's diff doesn't touch any

@@ -86,6 +86,18 @@ fresh, non-resumed execution of the full contract the plan is policy-blocked,
 not redirected into a known-incompatible full Debug run.
 See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
+The selector library also understands a schema-v2, protected-base
+`execution` declaration for a future controlled promotion. It remains inert
+unless orchestration explicitly supplies the exact planner input again, the
+unaltered validation and workflow contract digests, a proven POSIX command
+transport, and a trusted machine-global enable bit. Shadow policy, an unset
+machine switch, unsupported transports, full/high-risk plans, stale identity,
+or any malformed digest retain the ordinary full suite. The bounded command
+contains only a size-limited authenticated receipt payload; it never embeds a
+regex or caller-selected test expression. Defining this policy is not itself
+activation: until the ship/queue path durably snapshots and substitutes the
+plan, full validation remains authoritative.
+
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard
 reads the protected base's top-level `stacked_pr_mode = "off" | "observe" |
 "apply"` together with `PullRequest.headRefOid`, `stack`, and `stackEntry` at
