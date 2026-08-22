@@ -28,6 +28,11 @@ shipyard merge-queue status    # local mutation authority hold
 shipyard merge-queue hold --reason "incident"
 shipyard merge-queue resume
 
+# Immutable Pulp dependency pins (opt-in tracked policy)
+shipyard dependency pulp show             # local policy + exact lock
+shipyard dependency pulp update           # qualify latest/stable/fixed and open an App-authored PR
+shipyard dependency pulp verify           # fresh, cache-bypassing CI verification
+
 # Monitor
 shipyard status                # dashboard: queue + targets + evidence
 shipyard queue-observe         # one read-only queue/PR snapshot; emit on change
@@ -183,6 +188,11 @@ allowed_repositories = [
 "Generous-Corp/forge" = "/Volumes/Workshop/Code/forge"
 "Generous-Corp/vellum" = "/Volumes/Workshop/Code/vellum"
 ```
+
+Pulp dependency channels require an explicit tracked `[dependencies.pulp]`
+declaration; there is no floating-ref or unrelated-repository default. See
+[Pulp dependency channels](dependency-channels.md) for the active-first-party,
+production, and frozen templates and the consumer build-authority boundary.
 
 The model command is not configurable. Shipyard constructs the complete
 ephemeral/read-only `codex exec` argv, disables Codex shell, browser, app, MCP,

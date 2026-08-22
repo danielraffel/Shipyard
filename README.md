@@ -51,6 +51,12 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   `shipyard merge-queue hold --reason "..."`, and audit every attempted
   queue write in machine-global state. Other machines fail before GitHub is
   contacted.
+- **Qualified immutable dependency pins.** Opted-in first-party repositories
+  can follow the latest qualified Pulp release, while production and frozen
+  repositories select explicit stable or fixed identities. Shipyard verifies
+  release and build attestations, materializes exact digests, and opens the pin
+  PR with GitHub App authority. See
+  [Pulp dependency channels](docs/dependency-channels.md).
 - **22 ecosystem detectors.** `shipyard init` recognises CMake, Swift,
   Xcode, Rust, Go, Node (pnpm/bun/yarn/npm), Python (uv/poetry/pip),
   Gradle, Maven, .NET, Flutter, Dart, Deno, Ruby, Elixir, PHP.

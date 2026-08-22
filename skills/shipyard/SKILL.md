@@ -1468,6 +1468,49 @@ branch-protection warning; do not collapse HTTP 404/not-found into an
 `actions:write` scope hint unless the raw error also indicates auth or
 permission trouble.
 
+## Immutable Pulp dependency pins
+
+Repositories opt in through a reviewed `[dependencies.pulp]` table; there is no
+implicit channel for unrelated users. Use the `latest-qualified` template for
+active first-party repositories, an explicit reviewed `stable_tag` for
+production, or an exact `fixed_tag` plus peeled `fixed_commit` for frozen or
+reviewed downgrade cases. Floating refs such as `main` are never valid. Full
+templates and the lock schema are in `docs/dependency-channels.md`.
+
+Run `shipyard dependency pulp update` to select and qualify a release. It must
+use trusted machine-global GitHub App command auth for GitHub reads, the HTTPS
+push, and REST PR creation. Do not bypass its draft/prerelease, complete asset
+set, checksum manifest, immutable-release attestation, SLSA workflow/tag/commit,
+same-version rewrite, or downgrade guards. Cached qualification receipts are
+only a large-download optimization and are keyed by the complete immutable
+release identity. Reuse them only to reproduce an existing tracked proof;
+untracked candidates require fresh verification, and latest-qualified scans
+every GitHub release page plus every candidate's paginated asset inventory.
+Only deterministic rejection may advance to an older release; operational
+failures abort. Build qualification binds the exact source tag ref and peeled
+commit in the GitHub-issued certificate, not only in workflow-authored predicate
+fields. The writer pins the exact validated App-helper token.
+It also resolves the exact App bot identity. Privileged commit/push operations
+require the machine-global trusted absolute `privileged_gh_binary` and
+`privileged_git_binary`. Token-bearing Git runs only in a Shipyard-initialized
+isolated repository, ignores inherited/system/global Git configuration, and
+releases its credential only to exact HTTPS `github.com`; hooks and other
+helpers remain disabled. Privileged `gh` and Git children use a minimal
+allowlisted environment, excluding inherited loader, proxy, CA, trace, and
+tool-routing overrides. App-authenticated `--delete-branch` must preflight its
+trusted Git path before any merge mutation. Verify the exact lock-only commit and recheck the
+consumer base SHA before publication. Branch
+identity includes the base SHA and complete lock digest; first push uses an
+absence lease, and reuse
+requires the exact commit/tree and App-authored PR envelope. Never adopt an
+orphan or foreign branch. Verification retains the exact recorded attestation
+when multiple valid proofs exist.
+
+Consumer CI must independently run `shipyard dependency pulp verify`, which
+bypasses the cache. The consumer build remains responsible for verifying the
+exact SDK bytes it consumes and matching extracted `sdk-provenance.json` source
+and distribution eligibility to the lock.
+
 ## Cutover Discipline
 
 Release/cutover is a human decision, not an implementation side effect. Before
