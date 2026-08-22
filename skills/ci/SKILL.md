@@ -1097,10 +1097,11 @@ returns the full result, and persists comparison evidence; `authoritative`
 requires a separate graduation review. Repository and local overlay config
 cannot activate either mode. Authoritative activation also requires the exact
 reviewed shadow policy digest in trusted machine-global config.
-When any changed-surface target is configured, `--resume-from test` is refused
-before target observation, activation persistence, or substitution. It could
-skip producer builds and test stale warm artifacts; restart from `build` or
-start a fresh validation.
+For `--resume-from test`, Shipyard authenticates all eligible target plans in a
+read-only preflight and refuses schema-v3 execution before activation
+persistence or substitution. It could skip producer builds and test stale warm
+artifacts; schema v2 remains safely resumable. Restart schema v3 from `build`
+or start a fresh validation.
 
 For a prospective `shipyard pr` push, selected execution is transport-only and
 remains machine-global default-off. Shipyard accepts exactly one non-delete

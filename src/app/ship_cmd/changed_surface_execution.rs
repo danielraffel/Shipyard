@@ -133,25 +133,59 @@ pub(super) fn apply_changed_surface_execution(
         return Ok(());
     };
 
-    if let Some(target_name) = selected_resume_refusal_target(
-        config,
-        resume_from,
-        targets.iter().map(|target| target.name.as_str()),
-    ) {
-        let reason = "resume-from test cannot prove a changed-surface build/test transaction; restart from build or start a fresh validation";
-        persist_fallback_diagnostic(
-            &result_dir(state_dir, repo, pr, "unresolved", target_name),
-            &FallbackDiagnostic {
-                schema_version: 1,
-                repository: repo,
-                pull_request: pr,
-                target: target_name,
-                machine_mode: machine.mode,
-                category: "blocked",
-                diagnostic: reason.to_owned(),
-            },
-        )?;
-        return Err(CliFailure::new(2, reason));
+    if resume_from == Some("test") {
+        // This pass is deliberately read-only. A later schema-v3 target must
+        // refuse the whole invocation before an earlier schema-v2 target can
+        // persist activation evidence or mutate its stages. Merged config is
+        // only a negative prefilter; the protected-base policy and exact-head
+        // receipt remain the authority.
+        for target in targets.iter() {
+            if !target_declares_changed_surface_selection(config, &target.name) {
+                continue;
+            }
+            let ResolvedValidation::Local(validation) = &target.validation else {
+                continue;
+            };
+            if validation.command.is_some() || !validation.stages.contains_key("test") {
+                continue;
+            }
+            let Some(contract_digest) = validation_contract_digest(target) else {
+                continue;
+            };
+            let Ok(observation) = observe_changed_surface_plan(
+                &ChangedSurfacePlanArgs {
+                    target: target.name.clone(),
+                    pr,
+                    repo: (!repo.is_empty()).then(|| repo.to_owned()),
+                },
+                config,
+                cwd,
+                state_dir,
+            ) else {
+                continue;
+            };
+            let Ok(policy) = observation.policy.as_ref() else {
+                continue;
+            };
+            let Ok(ExecutionDisposition::Bounded(plan)) = plan_authoritative_execution(
+                &observation.receipt,
+                &observation.input,
+                policy,
+                true,
+                ExecutionCommandTransport::PosixShell,
+                &contract_digest,
+                &observation.workflow_digest,
+            ) else {
+                continue;
+            };
+            let would_activate = machine.permits_authoritative(&plan.policy_digest)
+                && (plan.stage != "build_and_test" || validation.stages.contains_key("build"));
+            if let Some(reason) =
+                selected_resume_block_reason(&plan.stage, resume_from, would_activate)
+            {
+                return Err(CliFailure::new(2, reason));
+            }
+        }
     }
 
     for target in targets {
@@ -533,18 +567,14 @@ fn target_declares_changed_surface_selection(config: &LoadedConfig, target: &str
         .is_some()
 }
 
-fn selected_resume_refusal_target<'a>(
-    config: &LoadedConfig,
+fn selected_resume_block_reason(
+    plan_stage: &str,
     resume_from: Option<&str>,
-    target_names: impl IntoIterator<Item = &'a str>,
-) -> Option<&'a str> {
-    (resume_from == Some("test"))
-        .then(|| {
-            target_names
-                .into_iter()
-                .find(|target| target_declares_changed_surface_selection(config, target))
-        })
-        .flatten()
+    would_activate: bool,
+) -> Option<&'static str> {
+    (plan_stage == "build_and_test" && resume_from == Some("test") && would_activate).then_some(
+        "resume-from test cannot prove a changed-surface build/test transaction; restart from build or start a fresh validation",
+    )
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -555,7 +585,7 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic, path_component,
-        persist_fallback_diagnostic, selected_resume_refusal_target, shell_quote,
+        persist_fallback_diagnostic, selected_resume_block_reason, shell_quote,
         target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
@@ -692,17 +722,22 @@ mod tests {
         assert!(target_declares_changed_surface_selection(&config, "mac"));
         assert!(!target_declares_changed_surface_selection(&config, "linux"));
 
-        let mixed_targets = ["linux", "mac"];
         assert_eq!(
-            selected_resume_refusal_target(&config, Some("test"), mixed_targets.iter().copied()),
-            Some("mac")
+            selected_resume_block_reason("build_and_test", Some("test"), true),
+            Some(
+                "resume-from test cannot prove a changed-surface build/test transaction; restart from build or start a fresh validation"
+            )
         );
         assert_eq!(
-            selected_resume_refusal_target(&config, Some("build"), mixed_targets.iter().copied()),
+            selected_resume_block_reason("test", Some("test"), true),
             None
         );
         assert_eq!(
-            selected_resume_refusal_target(&config, Some("test"), ["linux"].iter().copied()),
+            selected_resume_block_reason("build_and_test", Some("build"), true),
+            None
+        );
+        assert_eq!(
+            selected_resume_block_reason("build_and_test", Some("test"), false),
             None
         );
     }
