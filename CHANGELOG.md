@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01082"></a>
+## [0.108.2] - 2026-08-22
+
+- fix/sandbox writer critical section 20260822 ([#459](https://github.com/danielraffel/Shipyard/pull/459))
+
 <a id="v01081"></a>
 ## [0.108.1] - 2026-08-22
 
@@ -994,6 +999,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.108.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.108.2
 [0.108.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.108.1
 [0.108.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.108.0
 [0.107.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.107.0
