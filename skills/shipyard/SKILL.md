@@ -31,6 +31,25 @@ go/no-go for that operation.
    execution. Its untrusted job VM has no virtual NIC; only the trusted
    controller talks to GitHub. Timer activation remains an operator decision.
 
+## Sandbox writer-domain lease
+
+The sandbox E2E contamination audit and production Shipyard share one
+host-global OS lock at `.sandbox-writer-domain.lock` under the production state
+directory reported by `shipyard paths`. Every production Rust CLI process holds
+a shared lease for its lifetime. Each sandbox fixture takes the exclusive lease
+before snapshotting protected paths and retains it through the final
+contamination assertion. Do not add filename-, PID-, queue-ID-, log-, or
+evidence-path exemptions: a protected write is either excluded by the lease or
+it remains contamination.
+
+The audit waits up to five seconds for existing writers. A production process
+that arrives during an audit waits one second, then exits `75` with the stable
+`sandbox_writer_domain_overlap` classification. That result proves overlap:
+defer and retry after the other side finishes; do not convert it into a pass or
+a code/test failure. During a mixed-version rollout, legacy binaries do not own
+the shared lease. Drain them or finish exact-binary fleet convergence before
+treating a sandbox contamination result as attributable to the isolated child.
+
 ## Merge-queue ownership
 
 When GitHub's live branch queue or evaluated rules require a merge queue,

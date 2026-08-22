@@ -159,6 +159,8 @@ pub mod watch;
 pub mod webhook;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;
+/// Host-global production-writer coordination for sandbox E2E isolation.
+mod writer_domain_lease;
 
 #[cfg(all(test, unix))]
 pub(crate) mod test_support {

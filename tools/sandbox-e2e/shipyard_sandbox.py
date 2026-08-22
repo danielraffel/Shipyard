@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import re
@@ -14,12 +13,20 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import BinaryIO, Mapping, Sequence
+
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+else:
+    import fcntl
 
 
 BINARY_NAME = "shipyard.exe" if sys.platform == "win32" else "shipyard"
 PYTHON_BINARY_NAME = "shipyard-py"
-QUEUE_TEMP_RE = re.compile(r"^\.queue-(\d+)-\d+-\d+\.json\.tmp$")
+WRITER_DOMAIN_OVERLAP_CLASSIFICATION = "sandbox_writer_domain_overlap"
+WRITER_DOMAIN_LOCK_NAME = ".sandbox-writer-domain.lock"
+WRITER_DOMAIN_ACQUIRE_TIMEOUT_SECONDS = 5.0
 
 PROTECTED_PATHS: tuple[Path, ...] = (
     Path.home() / "Library" / "Application Support" / "shipyard",
@@ -114,147 +121,123 @@ def _snapshot_paths(root: Path) -> set[Path]:
         return set()
 
 
-def _queued_job_ids(root: Path) -> set[str]:
-    try:
-        payload = json.loads((root / "queue.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return set()
-    jobs = payload.get("jobs")
-    if not isinstance(jobs, list):
-        return set()
-    return {
-        job_id
-        for job in jobs
-        if isinstance(job, dict)
-        and isinstance((job_id := job.get("id")), str)
-        and job_id
-    }
-
-
-class _DarwinProcBsdInfo(ctypes.Structure):
-    _fields_ = [
-        ("pbi_flags", ctypes.c_uint32),
-        ("pbi_status", ctypes.c_uint32),
-        ("pbi_xstatus", ctypes.c_uint32),
-        ("pbi_pid", ctypes.c_uint32),
-        ("pbi_ppid", ctypes.c_uint32),
-        ("pbi_uid", ctypes.c_uint32),
-        ("pbi_gid", ctypes.c_uint32),
-        ("pbi_ruid", ctypes.c_uint32),
-        ("pbi_rgid", ctypes.c_uint32),
-        ("pbi_svuid", ctypes.c_uint32),
-        ("pbi_svgid", ctypes.c_uint32),
-        ("rfu_1", ctypes.c_uint32),
-        ("pbi_comm", ctypes.c_char * 16),
-        ("pbi_name", ctypes.c_char * 32),
-        ("pbi_nfiles", ctypes.c_uint32),
-        ("pbi_pgid", ctypes.c_uint32),
-        ("pbi_pjobc", ctypes.c_uint32),
-        ("e_tdev", ctypes.c_uint32),
-        ("e_tpgid", ctypes.c_uint32),
-        ("pbi_nice", ctypes.c_int32),
-        ("pbi_start_tvsec", ctypes.c_uint64),
-        ("pbi_start_tvusec", ctypes.c_uint64),
-    ]
-
-
-def _darwin_process_start_identity(pid: int) -> str | None:
-    try:
-        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    except OSError:
-        return None
-    libproc.proc_pidinfo.argtypes = [
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_uint64,
-        ctypes.c_void_p,
-        ctypes.c_int,
-    ]
-    libproc.proc_pidinfo.restype = ctypes.c_int
-    info = _DarwinProcBsdInfo()
-    size = ctypes.sizeof(info)
-    written = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
-    if written != size:
-        return None
-    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
-
-
-def _linux_process_start_identity(pid: int) -> str | None:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    # The executable name is parenthesized and may contain spaces. Fields after
-    # the final ')' begin at field 3; starttime is field 22 (index 19 here).
-    fields = stat[stat.rfind(")") + 2 :].split()
-    if len(fields) <= 19 or not fields[19].isdigit():
-        return None
-    return f"linux:{fields[19]}"
-
-
-def _process_start_identity(pid: int) -> str | None:
+def production_writer_domain_lock_path(home: Path | None = None) -> Path:
+    """Return the Rust CLI's host-global production writer-domain lock path."""
+    root = home or Path.home()
     if sys.platform == "darwin":
-        return _darwin_process_start_identity(pid)
-    if sys.platform.startswith("linux"):
-        return _linux_process_start_identity(pid)
-    return None
+        state_dir = root / "Library" / "Application Support" / "shipyard"
+    elif sys.platform == "win32":
+        state_dir = root / "AppData" / "Local" / "shipyard"
+    else:
+        state_dir = root / ".local" / "state" / "shipyard"
+    return state_dir / WRITER_DOMAIN_LOCK_NAME
 
 
-def _active_process_identities() -> dict[int, str]:
-    if os.name != "posix":
-        return {}
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid="],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    identities: dict[int, str] = {}
-    for field in result.stdout.split():
-        if not field.isdigit():
-            continue
-        pid = int(field)
-        identity = _process_start_identity(pid)
-        if identity is not None:
-            identities[pid] = identity
-    return identities
+class WriterDomainOverlap(RuntimeError):
+    """A proven production-writer/sandbox-audit lease overlap."""
 
 
-def _is_queue_temp_from_pre_existing_process(
-    path: Path, pre_existing_process_identities: Mapping[int, str]
-) -> bool:
-    match = QUEUE_TEMP_RE.fullmatch(path.name)
-    if match is None:
+if os.name == "nt":
+    class _Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_void_p),
+            ("InternalHigh", ctypes.c_void_p),
+            ("Offset", ctypes.c_uint32),
+            ("OffsetHigh", ctypes.c_uint32),
+            ("hEvent", ctypes.c_void_p),
+        ]
+
+
+def _try_writer_domain_lock(file: BinaryIO, *, exclusive: bool) -> bool:
+    if os.name != "nt":
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(file.fileno(), operation | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    handle = msvcrt.get_osfhandle(file.fileno())
+    overlapped = _Overlapped()
+    flags = 0x00000001  # LOCKFILE_FAIL_IMMEDIATELY
+    if exclusive:
+        flags |= 0x00000002  # LOCKFILE_EXCLUSIVE_LOCK
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    locked = kernel32.LockFileEx(
+        ctypes.c_void_p(handle),
+        ctypes.c_uint32(flags),
+        ctypes.c_uint32(0),
+        ctypes.c_uint32(1),
+        ctypes.c_uint32(0),
+        ctypes.byref(overlapped),
+    )
+    if locked:
+        return True
+    error = ctypes.get_last_error()
+    if error in (32, 33):
         return False
-    pid = int(match.group(1))
-    prior_identity = pre_existing_process_identities.get(pid)
-    return (
-        prior_identity is not None
-        and _process_start_identity(pid) == prior_identity
-    )
+    raise OSError(error, "LockFileEx failed")
 
 
-def _is_outcome_for_pre_existing_job(
-    path: Path, pre_existing_queue_job_ids: set[str]
-) -> bool:
-    return (
-        path.suffix == ".json"
-        and path.parent.name == "outcomes"
-        and path.parent.parent.name == "queue"
-        and path.stem in pre_existing_queue_job_ids
+def _unlock_writer_domain(file: BinaryIO) -> None:
+    if os.name != "nt":
+        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+        return
+    handle = msvcrt.get_osfhandle(file.fileno())
+    overlapped = _Overlapped()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    unlocked = kernel32.UnlockFileEx(
+        ctypes.c_void_p(handle),
+        ctypes.c_uint32(0),
+        ctypes.c_uint32(1),
+        ctypes.c_uint32(0),
+        ctypes.byref(overlapped),
     )
+    if not unlocked:
+        error = ctypes.get_last_error()
+        raise OSError(error, "UnlockFileEx failed")
+
+
+class WriterDomainLease:
+    """A bounded OS-backed shared or exclusive host writer-domain lease."""
+
+    def __init__(self, path: Path, *, exclusive: bool) -> None:
+        self.path = path
+        self.exclusive = exclusive
+        self._file: BinaryIO | None = None
+
+    def acquire(self, timeout: float = WRITER_DOMAIN_ACQUIRE_TIMEOUT_SECONDS) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        file = self.path.open("a+b")
+        if os.name != "nt":
+            os.chmod(self.path, 0o600)
+        deadline = time.monotonic() + timeout
+        while not _try_writer_domain_lock(file, exclusive=self.exclusive):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                file.close()
+                kind = "exclusive sandbox audit" if self.exclusive else "production writer"
+                raise WriterDomainOverlap(
+                    f"{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: {kind} could not acquire "
+                    f"{self.path} within {timeout:.3f}s"
+                )
+            time.sleep(min(0.025, remaining))
+        self._file = file
+
+    def release(self) -> None:
+        if self._file is None:
+            return
+        try:
+            _unlock_writer_domain(self._file)
+        finally:
+            self._file.close()
+            self._file = None
 
 
 def _find_newer(
     root: Path,
     sentinel_mtime: float,
     pre_existing: set[Path],
-    pre_existing_process_identities: Mapping[int, str] | None = None,
-    pre_existing_queue_job_ids: set[str] | None = None,
 ) -> list[Path]:
     if not root.exists():
         return []
@@ -271,23 +254,6 @@ def _find_newer(
         except OSError:
             continue
         if stat.st_mtime > sentinel_mtime:
-            # A pooled macOS runner can host another legitimate Shipyard process
-            # while this sandbox runs. Its atomic queue temp file is not evidence
-            # that the isolated child escaped. Only exempt writers that already
-            # existed when the sandbox started; a child created by this sandbox
-            # remains attributable and must still fail the contamination check.
-            if _is_queue_temp_from_pre_existing_process(
-                path, pre_existing_process_identities or {}
-            ):
-                continue
-            # A queued job that predates the sandbox may finish while the test
-            # runs. The drain can be a child spawned after our process snapshot,
-            # so the durable job id is the stable ownership boundary for its new
-            # outcome file. Jobs created by the sandbox are absent from this set.
-            if _is_outcome_for_pre_existing_job(
-                path, pre_existing_queue_job_ids or set()
-            ):
-                continue
             offenders.append(path)
     return offenders
 
@@ -388,8 +354,7 @@ class Sandbox:
         self.root: Path | None = None
         self._sentinel_mtime: float | None = None
         self._pre_existing: dict[Path, set[Path]] = {}
-        self._pre_existing_process_identities: dict[int, str] = {}
-        self._pre_existing_queue_job_ids: dict[Path, set[str]] = {}
+        self._writer_domain_lease: WriterDomainLease | None = None
 
     @property
     def bin_dir(self) -> Path:
@@ -414,11 +379,15 @@ class Sandbox:
         self.bin_dir.mkdir(parents=True)
         self.home_dir.mkdir(parents=True)
         self.work_dir.mkdir(parents=True)
+        lease = WriterDomainLease(production_writer_domain_lock_path(), exclusive=True)
+        try:
+            lease.acquire()
+        except Exception:
+            shutil.rmtree(self.root, ignore_errors=True)
+            self.root = None
+            raise
+        self._writer_domain_lease = lease
         self._pre_existing = {path: _snapshot_paths(path) for path in PROTECTED_PATHS}
-        self._pre_existing_process_identities = _active_process_identities()
-        self._pre_existing_queue_job_ids = {
-            path: _queued_job_ids(path) for path in PROTECTED_PATHS
-        }
         sentinel = self.root / ".sentinel"
         sentinel.write_text("sandbox-start\n", encoding="utf-8")
         now = time.time()
@@ -431,9 +400,14 @@ class Sandbox:
         try:
             self.assert_no_contamination()
         finally:
-            if not self.keep:
-                shutil.rmtree(self.root, ignore_errors=True)
-            self.root = None
+            try:
+                if not self.keep:
+                    shutil.rmtree(self.root, ignore_errors=True)
+                self.root = None
+            finally:
+                if self._writer_domain_lease is not None:
+                    self._writer_domain_lease.release()
+                    self._writer_domain_lease = None
 
     def __enter__(self) -> "Sandbox":
         self.setup()
@@ -508,8 +482,6 @@ class Sandbox:
                     path,
                     self._sentinel_mtime,
                     self._pre_existing.get(path, set()),
-                    self._pre_existing_process_identities,
-                    self._pre_existing_queue_job_ids.get(path, set()),
                 )
             )
         report = ContaminationReport(tuple(sorted(offenders)), self._sentinel_mtime)
