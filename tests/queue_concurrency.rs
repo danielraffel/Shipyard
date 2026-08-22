@@ -105,10 +105,13 @@ fn repo_neutral_submit_preserves_independent_workloads_with_common_branch_and_ta
     let state_dir = temp.path().join("state");
     let mut queue = Queue::new(&state_dir).expect("queue");
     let workloads = [
-        ("Generous-Corp/pulp", 7718, "pulp"),
+        // Reuse PR 127 across repositories so repository identity is the only
+        // thing preventing these otherwise equivalent submissions from
+        // superseding one another.
+        ("Generous-Corp/pulp", 127, "pulp"),
         ("Generous-Corp/forge", 127, "forge-modular"),
         ("Generous-Corp/forge", 128, "forge-sequencer"),
-        ("Generous-Corp/vellum", 96, "vellum"),
+        ("Generous-Corp/vellum", 127, "vellum"),
     ];
 
     let submitted = workloads
