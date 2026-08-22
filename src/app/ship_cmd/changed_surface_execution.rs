@@ -302,7 +302,7 @@ pub(super) fn apply_changed_surface_execution(
             )?;
             continue;
         }
-        if resume_bypasses_selected_transaction(&plan.stage, resume_from) {
+        if let Some(reason) = selected_resume_block_reason(&plan.stage, resume_from) {
             persist_fallback_diagnostic(
                 &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
                 &FallbackDiagnostic {
@@ -311,12 +311,11 @@ pub(super) fn apply_changed_surface_execution(
                     pull_request: pr,
                     target: &target.name,
                     machine_mode: machine.mode,
-                    category: "resume_bypasses_selected_transaction",
-                    diagnostic: "resume-from test would skip the selected build-and-test transaction; preserving the original validation stages"
-                        .to_owned(),
+                    category: "blocked",
+                    diagnostic: reason.to_owned(),
                 },
             )?;
-            continue;
+            return Err(CliFailure::new(2, reason));
         }
         let original_test = validation
             .stages
@@ -525,8 +524,13 @@ fn bounded_diagnostic(value: &str) -> String {
     value.chars().take(MAX_DIAGNOSTIC_CHARS).collect()
 }
 
-fn resume_bypasses_selected_transaction(plan_stage: &str, resume_from: Option<&str>) -> bool {
-    plan_stage == "build_and_test" && resume_from == Some("test")
+fn selected_resume_block_reason(
+    plan_stage: &str,
+    resume_from: Option<&str>,
+) -> Option<&'static str> {
+    (plan_stage == "build_and_test" && resume_from == Some("test")).then_some(
+        "resume-from test would skip the selected build-and-test transaction; restart from build or start a fresh validation",
+    )
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -537,7 +541,7 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic, path_component,
-        persist_fallback_diagnostic, resume_bypasses_selected_transaction, shell_quote,
+        persist_fallback_diagnostic, selected_resume_block_reason, shell_quote,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::fs;
@@ -656,19 +660,15 @@ mod tests {
     }
 
     #[test]
-    fn resume_after_build_cannot_activate_combined_selected_transaction() {
-        assert!(resume_bypasses_selected_transaction(
-            "build_and_test",
-            Some("test")
-        ));
-        assert!(!resume_bypasses_selected_transaction(
-            "build_and_test",
-            Some("build")
-        ));
-        assert!(!resume_bypasses_selected_transaction(
-            "build_and_test",
+    fn resume_after_build_is_hard_refused_for_combined_selected_transaction() {
+        let reason = selected_resume_block_reason("build_and_test", Some("test"))
+            .expect("test-only resume must be refused");
+        assert!(reason.contains("restart from build"));
+        assert_eq!(
+            selected_resume_block_reason("build_and_test", Some("build")),
             None
-        ));
-        assert!(!resume_bypasses_selected_transaction("test", Some("test")));
+        );
+        assert_eq!(selected_resume_block_reason("build_and_test", None), None);
+        assert_eq!(selected_resume_block_reason("test", Some("test")), None);
     }
 }
