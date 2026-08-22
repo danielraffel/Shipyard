@@ -231,7 +231,10 @@ def _select_transition(
 ) -> str:
     if holders == (production_pid,) and contended:
         return LEGACY_TRANSITION
-    if not holders and not contended:
+    # The corrected daemon may retain an open descriptor for mutation-scoped
+    # use without retaining an advisory lock. lsof reports that descriptor as
+    # a holder, so contention—not descriptor presence—is the lock authority.
+    if holders in ((), (production_pid,)) and not contended:
         return CORRECTED_TRANSITION
     raise GuardianError(
         "ambiguous production writer-domain state: "
@@ -563,7 +566,8 @@ class Guardian:
                 f"guard={self.mutation_guard_path}, output={self.mutation_probe_output}"
             )
         holders = _lock_holders(self.lock_path)
-        if snapshot.pid in holders or not _exclusive_lock_is_contended(self.lock_path):
+        audit_holders = tuple(pid for pid in holders if pid != snapshot.pid)
+        if not audit_holders or not _exclusive_lock_is_contended(self.lock_path):
             raise GuardianError(
                 f"exclusive audit was not proven against corrected daemon: {holders!r}"
             )
@@ -694,7 +698,9 @@ class Guardian:
         if _active_runs(current, self.installed) != self.worker_ids:
             raise GuardianError("preserved active worker ownership differs")
         holders = _lock_holders(self.lock_path)
-        if holders or _exclusive_lock_is_contended(self.lock_path):
+        if holders not in ((), (snapshot.pid,)) or _exclusive_lock_is_contended(
+            self.lock_path
+        ):
             raise GuardianError(
                 f"corrected daemon acquired an idle lifetime lock: {holders!r}"
             )
