@@ -8,6 +8,7 @@
 use fs2::{FileExt, available_space};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
@@ -22,6 +23,12 @@ const LEGACY_MANIFEST_SCHEMA: u32 = 1;
 pub const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 const MIN_CHUNK_SIZE: u64 = 64 * 1024;
 const MAX_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+const MAX_LAYOUT_ENTRIES: usize = 100_000;
+const MAX_LAYOUT_PATH_BYTES: usize = 1024;
+const MAX_LAYOUT_PATH_DEPTH: usize = 64;
+const MAX_LAYOUT_PREFIXES: usize = 250_000;
+const ENTRY_ALLOCATION_RESERVE_BYTES: u64 = 64 * 1024;
+const MAX_ZSTD_WINDOW_LOG: u32 = 25;
 
 /// Artifact transport validation or publication failure.
 #[derive(Debug)]
@@ -36,6 +43,19 @@ pub enum Error {
     Io(std::io::Error),
     /// Canonical manifest serialization failed.
     Json(serde_json::Error),
+}
+
+/// Durability state after an archive has been atomically published.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "callers must distinguish durable publication from a pending parent sync"]
+pub enum PublicationOutcome {
+    /// The destination and its parent-directory entry are durable.
+    Durable,
+    /// The destination is visible and complete, but syncing its parent failed.
+    PublishedParentSyncPending {
+        destination: PathBuf,
+        message: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -230,9 +250,44 @@ impl ArtifactManifest {
         if self.entries.is_empty() {
             return Err(Error::Invalid("artifact layout must not be empty".into()));
         }
+        if self.entries.len() > MAX_LAYOUT_ENTRIES {
+            return Err(Error::Invalid(
+                "artifact layout exceeds the supported entry count".into(),
+            ));
+        }
         let mut previous = None;
+        let mut portable_paths: HashMap<(usize, String), (usize, String)> =
+            HashMap::with_capacity(self.entries.len());
+        let mut next_prefix_id = 1_usize;
         for entry in &self.entries {
             validate_relative_path(entry.path())?;
+            let mut parent_id = 0_usize;
+            for component in entry.path().split('/') {
+                validate_portable_component(component)?;
+                let key = (parent_id, component.to_ascii_lowercase());
+                match portable_paths.entry(key) {
+                    Entry::Occupied(existing) => {
+                        let (prefix_id, spelling) = existing.get();
+                        if spelling != component {
+                            return Err(Error::Invalid(
+                                "layout paths must remain unique on case-insensitive filesystems"
+                                    .into(),
+                            ));
+                        }
+                        parent_id = *prefix_id;
+                    }
+                    Entry::Vacant(vacant) => {
+                        if next_prefix_id > MAX_LAYOUT_PREFIXES {
+                            return Err(Error::Invalid(
+                                "artifact layout exceeds the supported path-prefix count".into(),
+                            ));
+                        }
+                        vacant.insert((next_prefix_id, component.to_owned()));
+                        parent_id = next_prefix_id;
+                        next_prefix_id += 1;
+                    }
+                }
+            }
             if previous.is_some_and(|value: &str| value >= entry.path()) {
                 return Err(Error::Invalid(
                     "layout entries must be sorted and unique".into(),
@@ -315,16 +370,42 @@ impl ArtifactManifest {
         Ok(())
     }
 
-    fn unpacked_file_size_bytes(&self) -> Result<u64, Error> {
-        self.entries.iter().try_fold(0_u64, |total, entry| {
-            let size = match entry {
-                LayoutEntry::Directory { .. } => 0,
-                LayoutEntry::File { size_bytes, .. } => *size_bytes,
+    fn unpacked_allocation_budget_bytes(&self) -> Result<u64, Error> {
+        let mut directories: HashSet<&str> = HashSet::new();
+        for entry in &self.entries {
+            let mut parent = match entry {
+                LayoutEntry::Directory { path, .. } => Some(path.as_str()),
+                LayoutEntry::File { path, .. } => path.rsplit_once('/').map(|(parent, _)| parent),
             };
-            total
-                .checked_add(size)
-                .ok_or_else(|| Error::Invalid("unpacked artifact size overflows u64".into()))
-        })
+            while let Some(path) = parent.filter(|path| !path.is_empty()) {
+                directories.insert(path);
+                parent = path.rsplit_once('/').map(|(parent, _)| parent);
+            }
+        }
+        let metadata = u64::try_from(directories.len())
+            .map_err(|_| Error::Invalid("layout entry count overflows u64".into()))?
+            .checked_add(
+                u64::try_from(
+                    self.entries
+                        .iter()
+                        .filter(|entry| matches!(entry, LayoutEntry::File { .. }))
+                        .count(),
+                )
+                .map_err(|_| Error::Invalid("layout entry count overflows u64".into()))?,
+            )
+            .and_then(|count| count.checked_mul(ENTRY_ALLOCATION_RESERVE_BYTES))
+            .ok_or_else(|| Error::Invalid("unpacked allocation budget overflows u64".into()))?;
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                LayoutEntry::File { size_bytes, .. } => Some(*size_bytes),
+                LayoutEntry::Directory { .. } => None,
+            })
+            .try_fold(metadata, |total, size| {
+                total.checked_add(size).ok_or_else(|| {
+                    Error::Invalid("unpacked allocation budget overflows u64".into())
+                })
+            })
     }
 
     fn validate_caches(&self) -> Result<(), Error> {
@@ -1098,7 +1179,7 @@ pub fn extract_verified_archive(
     manifest: &ArtifactManifest,
     destination: &Path,
     space_policy: SpacePolicy,
-) -> Result<(), Error> {
+) -> Result<PublicationOutcome, Error> {
     verify_archive_layout(path, manifest)?;
     if !destination.is_absolute() {
         return Err(Error::Invalid(
@@ -1141,15 +1222,17 @@ pub fn extract_verified_archive(
             "artifact extraction destination already exists".into(),
         ));
     }
-    let unpacked_size = manifest.unpacked_file_size_bytes()?;
-    space_policy.check_path(parent, unpacked_size, 0)?;
+    let allocation_budget = manifest.unpacked_allocation_budget_bytes()?;
+    space_policy.check_path(parent, allocation_budget, 0)?;
     let staging = tempfile::Builder::new()
         .prefix(".shipyard-artifact-")
         .tempdir_in(parent)?;
+    let mut space_probe = |probe_path: &Path| available_space(probe_path).map_err(Error::Io);
     let mut extraction = ExtractionContext {
         root: staging.path(),
         space_policy,
-        remaining_bytes: unpacked_size,
+        remaining_bytes: allocation_budget,
+        space_probe: &mut space_probe,
     };
     let directory_modes = scan_archive(path, manifest, Some(&mut extraction))?;
     extraction
@@ -1159,8 +1242,21 @@ pub fn extract_verified_archive(
     // extraction pass. The private staging tree is discarded on mismatch.
     verify_encoded_artifact(path, manifest)?;
     publish_staging_no_replace(staging, destination, directory_modes)?;
-    sync_directory(parent)?;
-    Ok(())
+    Ok(publication_outcome(destination, parent, sync_directory))
+}
+
+fn publication_outcome(
+    destination: &Path,
+    parent: &Path,
+    sync: impl FnOnce(&Path) -> Result<(), Error>,
+) -> PublicationOutcome {
+    match sync(parent) {
+        Ok(()) => PublicationOutcome::Durable,
+        Err(error) => PublicationOutcome::PublishedParentSyncPending {
+            destination: destination.to_path_buf(),
+            message: error.to_string(),
+        },
+    }
 }
 
 fn publish_staging_no_replace(
@@ -1190,8 +1286,7 @@ fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), Error> {
 
 #[cfg(windows)]
 fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), Error> {
-    // Windows rename already fails when the destination exists.
-    fs::rename(source, destination).map_err(Error::Io)
+    atomicwrites::move_atomic(source, destination).map_err(Error::Io)
 }
 
 fn verify_encoded_artifact(path: &Path, manifest: &ArtifactManifest) -> Result<(), Error> {
@@ -1213,8 +1308,11 @@ fn scan_archive(
     mut extraction: Option<&mut ExtractionContext<'_>>,
 ) -> Result<Vec<(PathBuf, u32)>, Error> {
     let file = File::open(path)?;
-    let decoder = zstd::stream::read::Decoder::new(file)
+    let mut decoder = zstd::stream::read::Decoder::new(file)
         .map_err(|error| Error::Invalid(format!("invalid zstd artifact: {error}")))?;
+    decoder
+        .window_log_max(MAX_ZSTD_WINDOW_LOG)
+        .map_err(|error| Error::Invalid(format!("invalid zstd artifact window: {error}")))?;
     let mut archive = tar::Archive::new(decoder);
     let expected: HashMap<&str, &LayoutEntry> = manifest
         .entries
@@ -1305,6 +1403,42 @@ struct ExtractionContext<'a> {
     root: &'a Path,
     space_policy: SpacePolicy,
     remaining_bytes: u64,
+    space_probe: &'a mut dyn FnMut(&Path) -> Result<u64, Error>,
+}
+
+impl ExtractionContext<'_> {
+    fn check_space(&mut self) -> Result<(), Error> {
+        self.space_policy
+            .check((self.space_probe)(self.root)?, self.remaining_bytes, 0)
+    }
+
+    fn ensure_directories(&mut self, relative: &Path) -> Result<(), Error> {
+        let mut output = self.root.to_path_buf();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(Error::Invalid(
+                    "extraction directory path is not normalized".into(),
+                ));
+            };
+            output.push(component);
+            if output.exists() {
+                if !output.is_dir() {
+                    return Err(Error::Invalid(
+                        "artifact extraction path collides with a non-directory".into(),
+                    ));
+                }
+                continue;
+            }
+            self.check_space()?;
+            fs::create_dir(&output)?;
+            self.remaining_bytes = self
+                .remaining_bytes
+                .checked_sub(ENTRY_ALLOCATION_RESERVE_BYTES)
+                .ok_or_else(|| Error::Invalid("unpacked byte budget underflows".into()))?;
+            self.check_space()?;
+        }
+        Ok(())
+    }
 }
 
 fn scan_layout_entry<R: Read>(
@@ -1327,9 +1461,11 @@ fn scan_layout_entry<R: Read>(
                 )));
             }
             if let Some(extraction) = extraction {
+                extraction.check_space()?;
                 let output = extraction.root.join(path);
-                fs::create_dir_all(&output)?;
+                extraction.ensure_directories(Path::new(path))?;
                 directory_modes.push((output, *expected_mode));
+                extraction.check_space()?;
             }
         }
         LayoutEntry::File {
@@ -1348,14 +1484,13 @@ fn scan_layout_entry<R: Read>(
             }
             let mut hasher = Sha256::new();
             let copied = if let Some(extraction) = extraction {
-                extraction.space_policy.check_path(
-                    extraction.root,
-                    extraction.remaining_bytes,
-                    0,
-                )?;
+                extraction.check_space()?;
                 let output = extraction.root.join(path);
                 if let Some(parent) = output.parent() {
-                    fs::create_dir_all(parent)?;
+                    let relative_parent = parent.strip_prefix(extraction.root).map_err(|_| {
+                        Error::Invalid("artifact extraction parent escaped staging".into())
+                    })?;
+                    extraction.ensure_directories(relative_parent)?;
                 }
                 let mut output_file = OpenOptions::new()
                     .create_new(true)
@@ -1366,13 +1501,15 @@ fn scan_layout_entry<R: Read>(
                 set_portable_permissions(&output, *expected_mode)?;
                 extraction.remaining_bytes = extraction
                     .remaining_bytes
-                    .checked_sub(*size_bytes)
+                    .checked_sub(
+                        size_bytes
+                            .checked_add(ENTRY_ALLOCATION_RESERVE_BYTES)
+                            .ok_or_else(|| {
+                                Error::Invalid("unpacked byte budget overflows".into())
+                            })?,
+                    )
                     .ok_or_else(|| Error::Invalid("unpacked byte budget underflows".into()))?;
-                extraction.space_policy.check_path(
-                    extraction.root,
-                    extraction.remaining_bytes,
-                    0,
-                )?;
+                extraction.check_space()?;
                 copied
             } else {
                 copy_and_hash(entry, &mut std::io::sink(), &mut hasher)?
@@ -1529,6 +1666,8 @@ fn validate_mode(mode: u32) -> Result<(), Error> {
 
 fn validate_relative_path(value: &str) -> Result<(), Error> {
     if value.is_empty()
+        || value.len() > MAX_LAYOUT_PATH_BYTES
+        || value.split('/').count() > MAX_LAYOUT_PATH_DEPTH
         || value.contains('\\')
         || value.contains('\0')
         || value
@@ -1539,7 +1678,7 @@ fn validate_relative_path(value: &str) -> Result<(), Error> {
             .any(|piece| piece.is_empty() || matches!(piece, "." | ".."))
     {
         return Err(Error::Invalid(
-            "layout path is empty or non-portable".into(),
+            "layout path is empty, oversized, too deep, or non-portable".into(),
         ));
     }
     let path = Path::new(value);
@@ -1550,6 +1689,29 @@ fn validate_relative_path(value: &str) -> Result<(), Error> {
     {
         return Err(Error::Invalid(
             "layout path must be normalized and relative".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_portable_component(component: &str) -> Result<(), Error> {
+    if component.ends_with('.') {
+        return Err(Error::Invalid(
+            "layout path component has a Windows-normalized trailing period".into(),
+        ));
+    }
+    let stem = component.split('.').next().unwrap_or(component);
+    let upper = stem.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+        || upper.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        });
+    if reserved {
+        return Err(Error::Invalid(
+            "layout path component is a reserved Windows device name".into(),
         ));
     }
     Ok(())
@@ -1823,18 +1985,21 @@ mod tests {
     #[test]
     fn rejects_hostile_layout_and_chunk_gap() {
         let bytes = vec![1; TEST_CHUNK_SIZE + 2];
-        for hostile in [
-            "../escape",
-            "/absolute",
-            "dir\\file",
-            "a/../b",
-            "C:/windows",
-            "a//b",
-            "space bad",
-        ] {
+        let hostile_paths = [
+            "../escape".into(),
+            "/absolute".into(),
+            "dir\\file".into(),
+            "a/../b".into(),
+            "C:/windows".into(),
+            "a//b".into(),
+            "space bad".into(),
+            "a/".repeat(MAX_LAYOUT_PATH_DEPTH),
+            "a".repeat(MAX_LAYOUT_PATH_BYTES + 1),
+        ];
+        for hostile in hostile_paths {
             let mut manifest = fixture(&bytes);
             if let LayoutEntry::File { path, .. } = &mut manifest.entries[1] {
-                *path = hostile.into();
+                *path = hostile.clone();
             }
             manifest.layout_sha256 = digest(&serde_json::to_vec(&manifest.entries).unwrap());
             assert!(manifest.validate().is_err(), "accepted {hostile}");
@@ -1842,6 +2007,43 @@ mod tests {
         let mut manifest = fixture(&bytes);
         manifest.chunks[1].offset += 1;
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_paths_that_alias_on_case_insensitive_filesystems() {
+        let bytes = vec![1; TEST_CHUNK_SIZE + 2];
+        for paths in [["A", "a"], ["A/x", "a/y"]] {
+            let entries = paths
+                .into_iter()
+                .map(|path| LayoutEntry::File {
+                    path: path.into(),
+                    mode: 0o644,
+                    size_bytes: 1,
+                    sha256: digest(b"a"),
+                })
+                .collect();
+            let mut manifest = archive_manifest(&bytes, entries);
+            manifest.schema = LEGACY_MANIFEST_SCHEMA;
+            assert!(
+                matches!(manifest.validate(), Err(Error::Invalid(message)) if message.contains("case-insensitive"))
+            );
+        }
+
+        for path in ["CON", "nul.txt", "COM1.log", "LPT9", "trailing."] {
+            let manifest = archive_manifest(
+                &bytes,
+                vec![LayoutEntry::File {
+                    path: path.into(),
+                    mode: 0o644,
+                    size_bytes: 1,
+                    sha256: digest(b"a"),
+                }],
+            );
+            assert!(manifest.validate().is_err(), "accepted {path}");
+        }
+        for path in ["conduit", "com10", "auxiliary.txt"] {
+            assert!(validate_portable_component(path).is_ok(), "rejected {path}");
+        }
     }
 
     #[test]
@@ -1864,7 +2066,11 @@ mod tests {
         fs::write(&archive, bytes).unwrap();
         verify_archive_layout(&archive, &manifest).unwrap();
         let destination = temp.path().join("legacy");
-        extract_verified_archive(&archive, &manifest, &destination, test_space_policy()).unwrap();
+        assert_eq!(
+            extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
+                .unwrap(),
+            PublicationOutcome::Durable
+        );
         assert_eq!(fs::read(destination.join("bin/tool")).unwrap(), tool);
     }
 
@@ -2166,7 +2372,11 @@ mod tests {
         );
         assert!(!destination.exists());
         FileExt::unlock(&competing_lock).unwrap();
-        extract_verified_archive(&archive, &manifest, &destination, test_space_policy()).unwrap();
+        assert_eq!(
+            extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
+                .unwrap(),
+            PublicationOutcome::Durable
+        );
         assert_eq!(fs::read(destination.join("bin/tool")).unwrap(), tool);
         assert!(
             extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
@@ -2256,6 +2466,83 @@ mod tests {
         );
         assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"keep");
         assert!(!staging_path.exists());
+
+        let staging = tempfile::Builder::new()
+            .prefix("staging-empty-race-")
+            .tempdir_in(temp.path())
+            .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        fs::write(staging.path().join("payload"), b"payload").unwrap();
+        let empty_destination = temp.path().join("empty-destination");
+        fs::create_dir(&empty_destination).unwrap();
+        assert!(publish_staging_no_replace(staging, &empty_destination, vec![]).is_err());
+        assert!(empty_destination.read_dir().unwrap().next().is_none());
+        assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn publication_reports_visible_but_unsynced_destination_distinctly() {
+        let temp = TempDir::new().unwrap();
+        let destination = temp.path().join("published");
+        let outcome = publication_outcome(&destination, temp.path(), |_| {
+            Err(Error::Io(std::io::Error::other("injected sync failure")))
+        });
+        assert!(matches!(
+            outcome,
+            PublicationOutcome::PublishedParentSyncPending { destination: reported, message }
+                if reported == destination && message.contains("injected sync failure")
+        ));
+    }
+
+    #[test]
+    fn allocation_budget_reserves_space_for_files_and_directories() {
+        let bytes = vec![1; TEST_CHUNK_SIZE + 2];
+        let manifest = archive_manifest(
+            &bytes,
+            vec![
+                LayoutEntry::Directory {
+                    path: "bin".into(),
+                    mode: 0o755,
+                },
+                LayoutEntry::File {
+                    path: "bin/tool".into(),
+                    mode: 0o755,
+                    size_bytes: 4,
+                    sha256: digest(b"tool"),
+                },
+            ],
+        );
+        assert_eq!(
+            manifest.unpacked_allocation_budget_bytes().unwrap(),
+            4 + 2 * ENTRY_ALLOCATION_RESERVE_BYTES
+        );
+    }
+
+    #[test]
+    fn directory_creation_rechecks_the_live_space_watermark() {
+        let temp = TempDir::new().unwrap();
+        let mut observations = [
+            2 * ENTRY_ALLOCATION_RESERVE_BYTES,
+            ENTRY_ALLOCATION_RESERVE_BYTES - 1,
+        ]
+        .into_iter();
+        let mut probe = |_path: &Path| {
+            observations
+                .next()
+                .ok_or_else(|| Error::Invalid("unexpected extra space probe".into()))
+        };
+        let mut extraction = ExtractionContext {
+            root: temp.path(),
+            space_policy: test_space_policy(),
+            remaining_bytes: 2 * ENTRY_ALLOCATION_RESERVE_BYTES,
+            space_probe: &mut probe,
+        };
+        assert!(matches!(
+            extraction.ensure_directories(Path::new("one/two")),
+            Err(Error::InsufficientSpace { .. })
+        ));
+        assert!(temp.path().join("one").is_dir());
+        assert!(!temp.path().join("one/two").exists());
     }
 
     #[test]

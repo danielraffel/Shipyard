@@ -69,20 +69,29 @@ match the manifest's complete sorted layout. Raw tar iteration rejects extension
 records before their payloads can be buffered, and also rejects traversal,
 absolute or non-portable paths, links and special files, duplicates, undeclared
 or missing members, hidden post-archive data, directory payloads, and
-type/mode/size/digest mismatches. Schema 2 requires explicit parent-directory records; schema-1
-manifests remain readable so an upgrade cannot strand an in-flight immutable
-artifact. `extract_verified_archive` then repeats validation into a private
+type/mode/size/digest mismatches. Portable identity is ASCII case-folded at
+every component prefix, and Windows device aliases and trailing-period names
+are rejected, so authenticated paths cannot collapse together on default APFS
+or Windows filesystems. The entry count and zstd decoder window are bounded.
+Schema 2 requires explicit parent-directory records; schema-1 manifests remain
+readable so an upgrade cannot strand an in-flight immutable artifact.
+`extract_verified_archive` then repeats validation into a private
 sibling staging directory, rechecks the encoded object for mutation, holds an
 OS-backed parent extraction lease, and atomically renames the complete tree
 into a previously absent destination. Its caller supplies the free-space
-reserve policy; Shipyard checks the overflow-safe sum of declared unpacked file
-sizes before staging and rechecks the remaining byte budget and reserve during
-extraction so concurrent disk use fails closed and discards private staging.
+reserve policy; Shipyard checks the overflow-safe sum of declared file bytes
+plus conservative per-file and per-directory allocation reserves before
+staging, then rechecks live space before and after every allocation (including
+schema-1 implicit parents). Concurrent disk use therefore fails closed and
+discards private staging.
 Restrictive directory modes are deferred until every fallible verification has
 finished; atomic no-replace publication cannot overwrite a destination created
 by another process, and restores traversable staging permissions before cleanup
-if publication loses that race. A failed, partial, or competing layout never
-becomes a consumable destination.
+if publication loses that race. Extraction returns an explicit durability
+outcome after the rename commit point: a parent-sync failure means the complete
+destination is already visible and must be reconciled, not blindly retried as
+an unpublished failure. A failed, partial, or competing layout never becomes a
+consumable destination.
 
 The host declares the store root. Do not assume `/Volumes/Workshop` or a home
 directory: a machine with a nearly-full external volume may correctly choose a

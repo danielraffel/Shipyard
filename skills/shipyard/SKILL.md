@@ -556,7 +556,12 @@ manifests, exact source/toolchain/cache generations, authenticated chunk-prefix
 resume with opaque manifest/session-bound plans, space watermarks, same-root
 atomic publication, and safe exact-layout `tar.zst` extraction. Archive
 consumption rejects traversal, links, duplicates, undeclared/missing members,
+case-insensitive/Windows path aliases, unbounded decoder or layout metadata,
 and type/mode/size/digest drift before atomically exposing an extracted tree.
+Extraction reserves allocation overhead, rechecks live space around every
+directory/file allocation, and reports a distinct published-but-parent-sync-
+pending outcome after the atomic commit point; never blindly retry that outcome
+as though no destination exists.
 The proof does not select a host or dispatch a shard. A roaming/offline worker
 is additive only and must be excluded or reassigned without blocking the
 minimum completion set.
