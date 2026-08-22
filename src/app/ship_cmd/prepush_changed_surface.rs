@@ -116,6 +116,7 @@ struct VerifiedSnapshot<'a> {
 }
 
 pub(super) struct ProspectivePush {
+    _writer_domain: Option<crate::writer_domain_lease::ProductionWriterDomainLease>,
     receipt: ProspectiveReceipt,
     receipt_path: PathBuf,
     receipt_digest: String,
@@ -336,6 +337,11 @@ fn persist_prospective(
     let transactions = state_dir
         .join("changed-surface-prepush")
         .join("transactions");
+    // The supervised Git hook writes into this transaction asynchronously
+    // from the parent command, so its complete prospective-push transaction is
+    // the smallest safe mutation critical section.
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&transactions)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(&transactions)
         .map_err(|error| CliFailure::new(1, format!("create pre-push state: {error}")))?;
     if let Err(error) = reap_abandoned_transactions(&transactions, ABANDONED_TRANSACTION_RETENTION)
@@ -377,6 +383,7 @@ fn persist_prospective(
     let receipt_path = transaction_dir.join("prospective-receipt.json");
     create_immutable(&receipt_path, &payload)?;
     Ok(ProspectivePush {
+        _writer_domain: writer_domain,
         receipt,
         receipt_path,
         receipt_digest,
@@ -455,6 +462,7 @@ fn remove_transaction(prospective: &ProspectivePush) -> std::io::Result<()> {
         .receipt_path
         .parent()
         .ok_or_else(|| std::io::Error::other("receipt has no transaction directory"))?;
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(transaction_dir)?;
     fs::remove_dir_all(transaction_dir)
 }
 
@@ -918,6 +926,8 @@ fn create_immutable(path: &Path, payload: &[u8]) -> Result<(), CliFailure> {
 }
 
 fn create_immutable_idempotent(path: &Path, payload: &[u8]) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let parent = path
         .parent()
         .ok_or_else(|| CliFailure::new(1, "snapshot path has no parent"))?;

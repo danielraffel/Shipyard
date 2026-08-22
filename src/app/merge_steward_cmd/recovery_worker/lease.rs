@@ -35,11 +35,16 @@ impl RecoveryEnqueueLease {
 /// file open instead of `LockFileEx`, whose locks are not transferred to an
 /// inheriting process; the sharing restriction lasts until the final duplicate
 /// handle closes.
-pub(super) struct GlobalModelLease(File);
+pub(super) struct GlobalModelLease {
+    file: File,
+    path: PathBuf,
+}
 
 impl GlobalModelLease {
     pub(super) fn worker_stdin(&self, request: &Value) -> Result<Stdio, CliFailure> {
-        let mut input = self.0.try_clone().map_err(|error| {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let mut input = self.file.try_clone().map_err(|error| {
             CliFailure::new(
                 1,
                 format!("failed to duplicate global model lease: {error}"),
@@ -70,6 +75,8 @@ impl GlobalModelLease {
 pub(super) fn acquire_global_model_lease(
     path: &Path,
 ) -> Result<Option<GlobalModelLease>, CliFailure> {
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let parent = path
         .parent()
         .ok_or_else(|| CliFailure::new(1, "global recovery-model lease path has no parent"))?;
@@ -102,13 +109,20 @@ pub(super) fn acquire_global_model_lease(
             ));
         }
     };
+    drop(writer_domain);
     #[cfg(windows)]
     {
-        Ok(Some(GlobalModelLease(file)))
+        Ok(Some(GlobalModelLease {
+            file,
+            path: path.to_path_buf(),
+        }))
     }
     #[cfg(not(windows))]
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(GlobalModelLease(file))),
+        Ok(()) => Ok(Some(GlobalModelLease {
+            file,
+            path: path.to_path_buf(),
+        })),
         Err(error) if is_file_lock_contended(&error) => Ok(None),
         Err(error) => Err(CliFailure::new(
             1,
@@ -126,6 +140,8 @@ pub(in crate::app::merge_steward_cmd) fn acquire_recovery_enqueue_lease(
     deadline: Instant,
 ) -> Result<RecoveryEnqueueLease, CliFailure> {
     let path = store_root.join("enqueue-witness.lock");
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -141,6 +157,7 @@ pub(in crate::app::merge_steward_cmd) fn acquire_recovery_enqueue_lease(
                 ),
             )
         })?;
+    drop(writer_domain);
     Ok(RecoveryEnqueueLease {
         _file: wait_for_lease(file, deadline, true)?,
         store_root: store_root.to_path_buf(),

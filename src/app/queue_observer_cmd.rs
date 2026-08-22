@@ -191,6 +191,9 @@ fn observer_actions(
 }
 
 fn acquire_observer_lock(state_path: &Path) -> Result<fs::File, CliFailure> {
+    let lock_path = observer_lock_path(state_path);
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if let Some(parent) = state_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -204,8 +207,9 @@ fn acquire_observer_lock(state_path: &Path) -> Result<fs::File, CliFailure> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(observer_lock_path(state_path))
+        .open(lock_path)
         .map_err(|error| CliFailure::new(1, format!("open observer lock: {error}")))?;
+    drop(writer_domain);
     lock.try_lock_exclusive().map_err(|error| {
         CliFailure::new(
             1,
@@ -255,6 +259,8 @@ fn resolve_output_path(path: &Path) -> Result<PathBuf, CliFailure> {
                     ),
                 )
             })?;
+            let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
             fs::create_dir_all(parent).map_err(|error| {
                 CliFailure::new(
                     1,

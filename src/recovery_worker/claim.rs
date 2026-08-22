@@ -21,6 +21,7 @@ struct DurableRecoveryClaim {
 
 impl RecoveryStore {
     pub(super) fn persist_claim_unlocked(&self, record: &RecoveryRecord) -> RecoveryResult<()> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.root)?;
         let claim = claim_from_running_record(record)?;
         let payload = serde_json::to_vec_pretty(&claim)?;
         let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;

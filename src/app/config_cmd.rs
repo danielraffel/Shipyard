@@ -239,6 +239,8 @@ fn active_profile(config: &LoadedConfig) -> Option<String> {
 }
 
 fn rewrite_profile_in_config(config_path: &Path, profile_name: &str) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(config_path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let contents =
         fs::read_to_string(config_path).map_err(|error| CliFailure::new(1, error.to_string()))?;
     let mut table = contents

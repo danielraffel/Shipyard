@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -128,16 +128,7 @@ fn pin_log_directory<W: Write>(
     if Path::new(job_id).file_name().and_then(|name| name.to_str()) != Some(job_id) {
         return Err(CliFailure::new(2, "cleanup --pin requires a plain job id"));
     }
-    fs::create_dir_all(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(state_dir.join("cleanup.lock"))
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    lock.lock_exclusive()
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let _cleanup_guard = acquire_cleanup_lock(state_dir)?;
     let logs = state_dir.join("logs");
     reject_log_symlinks(&logs)?;
     let job = logs.join(job_id);
@@ -157,6 +148,8 @@ fn pin_log_directory<W: Write>(
         ));
     }
     let marker = job.join(AUDIT_PIN_FILE);
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&marker)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -177,6 +170,7 @@ fn pin_log_directory<W: Write>(
         Err(error) => return Err(CliFailure::new(1, error.to_string())),
     }
     sync_parent_directory(&marker).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    drop(writer_domain);
     if output == CleanupOutput::Json {
         write_json_envelope(
             stdout,
@@ -193,6 +187,24 @@ fn pin_log_directory<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn acquire_cleanup_lock(state_dir: &Path) -> Result<File, CliFailure> {
+    let lock_path = state_dir.join("cleanup.lock");
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    fs::create_dir_all(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    drop(writer_domain);
+    lock.lock_exclusive()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(lock)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -242,20 +254,14 @@ fn cleanup_retention(
     dry_run: bool,
     policy: LogRetentionPolicy,
 ) -> Result<CleanupResult, CliFailure> {
-    let _cleanup_guard = if dry_run {
+    let _cleanup_guard = (!dry_run)
+        .then(|| acquire_cleanup_lock(state_dir))
+        .transpose()?;
+    let _writer_domain = if dry_run {
         None
     } else {
-        fs::create_dir_all(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(state_dir.join("cleanup.lock"))
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        lock.lock_exclusive()
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        Some(lock)
+        crate::writer_domain_lease::acquire_for_protected_path(state_dir)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?
     };
     let mut items = Vec::new();
     let mut protected_items = Vec::new();

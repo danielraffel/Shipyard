@@ -183,6 +183,8 @@ impl IpcServer {
 
     /// Start the listener thread and bind the socket.
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let writer_domain =
+            crate::writer_domain_lease::acquire_for_protected_path(&self.socket_path)?;
         std::fs::create_dir_all(
             self.socket_path
                 .parent()
@@ -230,8 +232,13 @@ impl IpcServer {
                 }
             }
 
-            let _ = std::fs::remove_file(socket_path);
+            if let Ok(_writer_domain) =
+                crate::writer_domain_lease::acquire_for_protected_path(&socket_path)
+            {
+                let _ = std::fs::remove_file(socket_path);
+            }
         }));
+        drop(writer_domain);
 
         Ok(())
     }
@@ -248,6 +255,8 @@ impl IpcServer {
             let _ = thread.join();
         }
         if self.socket_path.exists() || self.socket_path.is_symlink() {
+            let _writer_domain =
+                crate::writer_domain_lease::acquire_for_protected_path(&self.socket_path)?;
             let _ = std::fs::remove_file(&self.socket_path);
         }
         Ok(())

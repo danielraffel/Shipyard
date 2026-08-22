@@ -348,16 +348,24 @@ impl LocalExecutor {
         >,
     ) -> TargetResult {
         if let Some(parent) = context.log_path.parent()
-            && let Err(error) = fs::create_dir_all(parent)
+            && let Err(error) = crate::writer_domain_lease::ensure_protected_dir_all(parent)
         {
             return io_error_result(context, &error.to_string());
         }
         if let Err(error) =
             crate::log_retention::rotate_before_open(context.log_path, self.rotated_segments)
-                .and_then(|_| fs::write(context.log_path, ""))
         {
             return io_error_result(context, &error.to_string());
         }
+        let writer_domain =
+            match crate::writer_domain_lease::acquire_for_protected_path(context.log_path) {
+                Ok(lease) => lease,
+                Err(error) => return io_error_result(context, &error.to_string()),
+            };
+        if let Err(error) = fs::write(context.log_path, "") {
+            return io_error_result(context, &error.to_string());
+        }
+        drop(writer_domain);
 
         let stage_pairs = stages
             .iter()
@@ -790,6 +798,7 @@ fn error_result(
 }
 
 fn append_log(path: &Path, text: &str) -> std::io::Result<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

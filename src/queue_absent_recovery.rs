@@ -912,6 +912,8 @@ fn load_record(path: &Path) -> Result<Option<QueueAbsentRecoveryRecord>, String>
 }
 
 fn save_record(path: &Path, record: &QueueAbsentRecoveryRecord) -> Result<(), String> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| error.to_string())?;
     let parent = path
         .parent()
         .ok_or_else(|| "recovery claim path has no parent".to_owned())?;

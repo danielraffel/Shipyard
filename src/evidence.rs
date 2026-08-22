@@ -169,7 +169,7 @@ pub struct CommandEvidenceStore {
 impl CommandEvidenceStore {
     /// Open a command-evidence store at the given path.
     pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
-        fs::create_dir_all(&path)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path)?;
         Ok(Self { path })
     }
 
@@ -198,6 +198,7 @@ impl CommandEvidenceStore {
     /// artifacts. Directory creation is the cross-process uniqueness fence;
     /// a numeric suffix is used only when the preferred id is already owned.
     pub fn reserve_bundle_id(&self, preferred_id: &str) -> Result<String, std::io::Error> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let preferred_id = sanitize_component(preferred_id);
         for suffix in 0_u64.. {
             let candidate = if suffix == 0 {
@@ -220,6 +221,7 @@ impl CommandEvidenceStore {
         evidence: &CommandEvidenceRecord,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let bundle_dir = self.bundle_dir(&evidence.id);
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&bundle_dir)?;
         fs::create_dir_all(&bundle_dir)?;
         let payload = serde_json::to_string_pretty(evidence)?;
         let temp = tempfile::NamedTempFile::new_in(&bundle_dir)?;
@@ -283,7 +285,7 @@ pub struct EvidenceStore {
 impl EvidenceStore {
     /// Open an evidence store at the given path.
     pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
-        fs::create_dir_all(&path)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path)?;
         Ok(Self { path })
     }
 
@@ -700,6 +702,7 @@ impl EvidenceStore {
         branch_key: &str,
         records: &BTreeMap<String, EvidenceRecord>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let payload = serde_json::to_string_pretty(records)?;
         let temp = tempfile::NamedTempFile::new_in(&self.path)?;
         fs::write(temp.path(), format!("{payload}\n"))?;
@@ -712,6 +715,7 @@ impl EvidenceStore {
         branch_key: &str,
         records: &BTreeMap<String, EvidenceRecord>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(directory)?;
         fs::create_dir_all(directory)?;
         let payload = serde_json::to_string_pretty(records)?;
         let temp = tempfile::NamedTempFile::new_in(directory)?;
@@ -728,6 +732,7 @@ struct StoreLock {
 
 impl StoreLock {
     fn acquire(path: PathBuf) -> io::Result<Self> {
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -737,6 +742,7 @@ impl StoreLock {
             .read(true)
             .write(true)
             .open(path)?;
+        drop(writer_domain);
         file.lock_exclusive()?;
         Ok(Self { file })
     }

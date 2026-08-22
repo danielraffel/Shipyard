@@ -124,6 +124,7 @@ impl WarmPool {
     }
 
     fn save_entries_unlocked(&self, entries: &[PoolEntry]) -> Result<(), std::io::Error> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -226,6 +227,7 @@ struct StoreLock {
 
 impl StoreLock {
     fn acquire(path: PathBuf) -> io::Result<Self> {
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -235,6 +237,7 @@ impl StoreLock {
             .read(true)
             .write(true)
             .open(path)?;
+        drop(writer_domain);
         file.lock_exclusive()?;
         Ok(Self { file })
     }

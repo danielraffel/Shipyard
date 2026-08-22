@@ -129,7 +129,7 @@ impl Queue {
     /// Open a queue rooted at `state_dir`.
     pub fn new(state_dir: impl Into<PathBuf>) -> io::Result<Self> {
         let state_dir = state_dir.into();
-        fs::create_dir_all(&state_dir)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&state_dir)?;
         Ok(Self { state_dir })
     }
 
@@ -392,7 +392,7 @@ impl Queue {
 
     /// Try to acquire exclusive drain ownership.
     pub fn acquire_drain_lock(&self) -> QueueResult<Option<DrainLock>> {
-        DrainLock::acquire(self.lock_file()).map_err(QueueError::Io)
+        DrainLock::acquire(&self.lock_file()).map_err(QueueError::Io)
     }
 
     /// Recover stale running jobs. The caller must hold the drain lock.
@@ -771,6 +771,8 @@ impl Queue {
     }
 
     fn save_jobs_to_disk(&self, jobs: &[Job]) -> QueueResult<()> {
+        let _writer_domain =
+            crate::writer_domain_lease::acquire_for_protected_path(&self.state_dir)?;
         fs::create_dir_all(&self.state_dir)?;
         self.sweep_legacy_tmp();
 
@@ -983,6 +985,7 @@ pub(crate) struct WorkloadAdmissionLock {
 
 impl StateLock {
     fn acquire(path: PathBuf) -> io::Result<Self> {
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -992,6 +995,7 @@ impl StateLock {
             .read(true)
             .write(true)
             .open(path)?;
+        drop(writer_domain);
         file.lock_exclusive()?;
         Ok(Self { file })
     }
@@ -1010,7 +1014,8 @@ pub struct DrainLock {
 }
 
 impl DrainLock {
-    fn acquire(path: PathBuf) -> io::Result<Option<Self>> {
+    fn acquire(path: &Path) -> io::Result<Option<Self>> {
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1021,8 +1026,10 @@ impl DrainLock {
             .read(true)
             .write(true)
             .open(path)?;
+        drop(writer_domain);
         match file.try_lock_exclusive() {
             Ok(()) => {
+                let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
                 file.set_len(0)?;
                 writeln!(file, "{}", process::id())?;
                 file.sync_all()?;

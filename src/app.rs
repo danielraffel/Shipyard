@@ -148,15 +148,6 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
-    let mode = cli.mode.into();
-    let _writer_domain_lease =
-        match crate::writer_domain_lease::acquire_production_writer_domain_lease(mode) {
-            Ok(lease) => lease,
-            Err(error) => {
-                let _ = writeln!(stderr, "{error}");
-                return ExitCode::from(crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_EXIT_CODE);
-            }
-        };
     run_with(cli, &mut stdout, &mut stderr)
 }
 
@@ -165,9 +156,23 @@ fn run_with<W: Write, E: Write>(cli: Cli, stdout: &mut W, stderr: &mut E) -> Exi
         Ok(code) => code,
         Err(error) => {
             if !error.message.is_empty() {
-                let _ = writeln!(stderr, "{}", error.message);
+                match crate::writer_domain_lease::acquire_for_protected_stdio() {
+                    Ok(_writer_domain) => {
+                        let _ = writeln!(stderr, "{}", error.message);
+                    }
+                    Err(_) => {
+                        return ExitCode::from(
+                            crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_EXIT_CODE,
+                        );
+                    }
+                }
             }
-            ExitCode::from(error.code)
+            let code = if crate::writer_domain_lease::is_writer_domain_overlap(&error.message) {
+                crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_EXIT_CODE
+            } else {
+                error.code
+            };
+            ExitCode::from(code)
         }
     }
 }

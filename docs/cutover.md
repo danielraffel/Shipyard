@@ -62,13 +62,31 @@ python3 -m pytest tools/sandbox-e2e/ -q
 
 The sandbox gate serializes its protected-path snapshot and contamination
 assertion against legitimate production Shipyard writes with the host-global
-writer-domain lease under the production state directory. Production commands
-hold shared leases for their lifetime; this gate holds the exclusive lease.
+writer-domain lease under the production state directory. Each protected
+filesystem mutation holds a shared lease only for its critical section; an idle
+daemon, a read-only command, and a session-independent worker between writes do
+not own it. This gate holds the exclusive lease from snapshot through assertion.
+A fair-entry turnstile prevents a stream of short writers from starving the
+audit while still allowing unrelated work to continue.
 `sandbox_writer_domain_overlap` is a bounded, proven-overlap deferral/failure:
 wait for the active writer or audit and rerun. Do not allowlist the reported
-protected path. During a mixed-version rollout, drain legacy Shipyard
-processes—or first prove exact-binary fleet convergence—because older binaries
-do not participate in the shared writer domain.
+protected path or delete either lock file. During a mixed-version rollout,
+restart every v0.108.1 daemon because it retains the obsolete lifetime lease;
+also drain pre-v0.108.1 processes, which do not participate in the domain.
+Prove exact-binary fleet convergence before treating a sandbox result as
+authoritative.
+
+The protected production-writer inventory covers queue requests/outcomes and
+supervisor receipts; ship, merge-queue, recovery, registrar, warm-pool,
+host-pool, cloud, metrics, evidence, and selector state; machine-global config,
+auth, target, pin, install, and runner-recovery paths; and daemon plus
+local/SSH/Windows streamed logs. Repository/worktree mutations and remote-host
+files are outside the audited home roots. Recovery-model HOME/TMP scratch is
+kept in an identity-keyed OS temporary directory because the opaque child may
+outlive its launching session; only validated receipts enter durable state.
+The default-off `artifact_transport::ArtifactStore` remains explicitly outside
+this inventory because no production path constructs it; any future production
+activation under an audited root must join this writer domain before wiring.
 
 For a release that changes merge-queue behavior, add these fleet gates:
 

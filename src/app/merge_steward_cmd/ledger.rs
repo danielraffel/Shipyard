@@ -57,6 +57,8 @@ pub(super) fn load_ledger(path: &Path) -> Result<StewardLedger, CliFailure> {
 }
 
 pub(super) fn save_ledger(path: &Path, ledger: &StewardLedger) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

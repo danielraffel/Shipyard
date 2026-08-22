@@ -398,7 +398,7 @@ impl RecoveryStore {
             ));
         }
         let root = root.into();
-        fs::create_dir_all(&root)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&root)?;
         Ok(Self {
             root,
             max_attempts,

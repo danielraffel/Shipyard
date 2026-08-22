@@ -664,6 +664,12 @@ fn invoke_install_script(
         Stdio::inherit()
     };
 
+    // The installer is an external process, so retain the shared writer-domain
+    // lease through its complete install transaction. The network fetch above
+    // remains outside the critical section.
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(install_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+
     let env_tag = target_tag.strip_prefix('v').unwrap_or(target_tag);
     let mut sh_command = Command::new(shell_bin);
     sh_command

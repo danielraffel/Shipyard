@@ -494,11 +494,17 @@ impl<O: WindowsOperations> WindowsExecutor<O> {
             started_at,
             start_time,
         };
+        let writer_domain =
+            match crate::writer_domain_lease::acquire_for_protected_path(&request.log_path) {
+                Ok(lease) => lease,
+                Err(error) => return windows_error_result(&context, &error.to_string()),
+            };
         if let Some(parent) = request.log_path.parent()
             && let Err(error) = fs::create_dir_all(parent)
         {
             return windows_error_result(&context, &error.to_string());
         }
+        drop(writer_domain);
 
         let Some(host) = request
             .target
@@ -1598,13 +1604,14 @@ fn bootstrap_bundle_upload_log(
     remote_bundle: &str,
 ) -> std::io::Result<()> {
     if let Some(parent) = context.log_path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(parent)?;
     }
     crate::log_retention::rotate_before_open(context.log_path, request.rotated_segments)?;
     crate::log_retention::rotate_before_open(
         &bundle_apply_stderr_path(context.log_path),
         request.rotated_segments,
     )?;
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(context.log_path)?;
     let mut text = String::new();
     let _ = writeln!(text, "# shipyard ssh-windows lane log");
     let _ = writeln!(text, "target: {}", context.target.name);
@@ -1643,6 +1650,7 @@ fn upload_failure_class_hint(failure_class: &str) -> &'static str {
 }
 
 fn append_log(path: &Path, text: &str) -> std::io::Result<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

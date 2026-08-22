@@ -92,7 +92,7 @@ pub struct PreparedStateStore {
 impl PreparedStateStore {
     /// Open a prepared-state store at `path`.
     pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
-        fs::create_dir_all(&path)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path)?;
         Ok(Self { path })
     }
 
@@ -113,6 +113,7 @@ impl PreparedStateStore {
     /// Save a record atomically.
     pub fn save(&self, record: &PreparedStateRecord) -> Result<(), Box<dyn std::error::Error>> {
         let path = self.record_path(&record.sha, &record.target, &record.mode);
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)?;
         let parent = path.parent().expect("record path has parent");
         fs::create_dir_all(parent)?;
         let payload = serde_json::to_string_pretty(record)?;
@@ -125,6 +126,7 @@ impl PreparedStateStore {
     /// Delete one record. Missing files are ignored.
     pub fn delete(&self, sha: &str, target: &str, mode: &str) -> Result<(), std::io::Error> {
         let path = self.record_path(sha, target, mode);
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)?;
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -138,6 +140,7 @@ impl PreparedStateStore {
         if !sha_dir.exists() {
             return Ok(0);
         }
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&sha_dir)?;
         let deleted = remove_json_files(&sha_dir)?;
         let _ = fs::remove_dir(&sha_dir);
         Ok(deleted)
@@ -148,6 +151,7 @@ impl PreparedStateStore {
         if !self.path.exists() {
             return Ok(0);
         }
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let keep_dir = sanitize(keep_sha);
         let mut deleted = 0;
         for entry in fs::read_dir(&self.path)? {

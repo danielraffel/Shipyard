@@ -277,6 +277,8 @@ impl Registrar {
     }
 
     fn save(&self) -> Result<(), RegistrarError> {
+        let _writer_domain =
+            crate::writer_domain_lease::acquire_for_protected_path(&self.state_path)?;
         if let Some(parent) = self.state_path.parent() {
             fs::create_dir_all(parent)?;
         }

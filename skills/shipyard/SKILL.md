@@ -35,20 +35,29 @@ go/no-go for that operation.
 
 The sandbox E2E contamination audit and production Shipyard share one
 host-global OS lock at `.sandbox-writer-domain.lock` under the production state
-directory reported by `shipyard paths`. Every production Rust CLI process holds
-a shared lease for its lifetime. Each sandbox fixture takes the exclusive lease
-before snapshotting protected paths and retains it through the final
-contamination assertion. Do not add filename-, PID-, queue-ID-, log-, or
-evidence-path exemptions: a protected write is either excluded by the lease or
-it remains contamination.
+directory reported by `shipyard paths`, plus a fair-entry
+`.sandbox-writer-domain.turnstile.lock`. Production acquires a shared lease only
+around each protected filesystem mutation; streamed logs reacquire per append,
+while an external child that can write a protected transaction keeps the lease
+for that bounded transaction. Idle daemons, read-only commands, and durable
+workers between writes own no lease. Each sandbox fixture keeps both exclusive
+locks from before snapshotting through the final contamination assertion. Do
+not add filename-, PID-, queue-ID-, log-, or evidence-path exemptions: a
+protected write is either fenced by the lease or it remains contamination.
 
-The audit waits up to five seconds for existing writers. A production process
-that arrives during an audit waits one second, then exits `75` with the stable
-`sandbox_writer_domain_overlap` classification. That result proves overlap:
-defer and retry after the other side finishes; do not convert it into a pass or
-a code/test failure. During a mixed-version rollout, legacy binaries do not own
-the shared lease. Drain them or finish exact-binary fleet convergence before
-treating a sandbox contamination result as attributable to the isolated child.
+The audit waits up to five seconds for an active mutation. A production
+mutation arriving during an audit waits up to 30 seconds, then propagates exit
+`75` with the stable `sandbox_writer_domain_overlap` classification. That result
+proves overlap: defer and retry after the other side finishes; do not convert it
+into a pass or code/test failure. During rollout, restart every v0.108.1 daemon
+because it holds the obsolete process-lifetime lease. Pre-v0.108.1 binaries do
+not participate at all; drain them and prove exact-binary fleet convergence
+before trusting the audit.
+
+Opaque recovery-model HOME/TMP scratch lives outside durable Shipyard state in
+an identity-keyed OS temporary directory, so a session-independent model child
+cannot contaminate the audit. Only its validated durable receipts are published
+under the protected state root.
 
 ## Merge-queue ownership
 

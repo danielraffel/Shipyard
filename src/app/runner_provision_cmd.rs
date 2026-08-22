@@ -128,6 +128,8 @@ pub(super) fn tag_command<W: Write>(
         let tag = tag.trim().to_owned();
         validate_machine_tag(&tag).map_err(|reason| CliFailure::new(2, reason))?;
         let path = machine_tag_path(state_dir);
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| CliFailure::new(1, format!("failed to create state dir: {e}")))?;

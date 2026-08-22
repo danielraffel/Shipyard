@@ -158,7 +158,7 @@ pub fn resolve_repos(state_dir: &Path, explicit_repos: &[String]) -> Vec<String>
 #[allow(clippy::too_many_lines)]
 pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let daemon_dir = config.state_dir.join("daemon");
-    fs::create_dir_all(&daemon_dir)?;
+    crate::writer_domain_lease::ensure_protected_dir_all(&daemon_dir)?;
 
     if read_daemon_status(&config.state_dir).is_some() {
         return Err(DaemonRunError::AlreadyRunning);
@@ -598,7 +598,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
 /// becomes reachable before reporting success.
 pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedError> {
     let daemon_dir = request.state_dir.join("daemon");
-    fs::create_dir_all(&daemon_dir).map_err(|error| io_spawn_error(&error))?;
+    crate::writer_domain_lease::ensure_protected_dir_all(&daemon_dir)
+        .map_err(|error| io_spawn_error(&error))?;
 
     if read_daemon_status(&request.state_dir).is_some() {
         return Ok(read_pid_file(&daemon_dir.join("daemon.pid")).unwrap_or(0));
@@ -631,11 +632,14 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
     );
     crate::log_retention::rotate_if_oversize(&log_path, retention_policy)
         .map_err(|error| io_spawn_error(&error))?;
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&log_path)
+        .map_err(|error| io_spawn_error(&error))?;
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .map_err(|error| io_spawn_error(&error))?;
+    drop(writer_domain);
     let stderr = stdout.try_clone().map_err(|error| io_spawn_error(&error))?;
 
     let mut command = Command::new(&request.binary);
@@ -648,6 +652,10 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
         command.arg("--state-dir").arg(state_dir);
     }
     command.arg("daemon").arg("run");
+    command.env(
+        crate::writer_domain_lease::PROTECTED_STDIO_PATH_ENV,
+        &log_path,
+    );
     for repo in normalize_repos(request.repos.clone()) {
         command.arg("--repo").arg(repo);
     }
@@ -711,7 +719,7 @@ pub fn stop_running(state_dir: &Path) -> bool {
             if read_daemon_status(state_dir).is_none() && !socket_path.exists() {
                 #[cfg(unix)]
                 if pid == Some(std::process::id()) {
-                    let _ = fs::remove_file(&pid_path);
+                    let _ = remove_protected_file(&pid_path);
                     return true;
                 }
                 #[cfg(unix)]
@@ -719,7 +727,7 @@ pub fn stop_running(state_dir: &Path) -> bool {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
-                let _ = fs::remove_file(&pid_path);
+                let _ = remove_protected_file(&pid_path);
                 return true;
             }
             thread::sleep(Duration::from_millis(100));
@@ -1235,6 +1243,7 @@ fn load_or_create_webhook_secret(state_dir: &Path) -> Result<String, DaemonRunEr
     let mut random = [0_u8; 32];
     fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
     let secret = base64::engine::general_purpose::STANDARD.encode(random);
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1313,7 +1322,9 @@ fn register_webhooks(
     for repo in repos {
         if let Err(error) = registrar.ensure_registered(repo, public_url, secret) {
             let message = registration_error_message(repo, &error);
-            eprintln!("shipyard daemon: failed to register webhook for {repo}: {message}");
+            if let Ok(_writer_domain) = crate::writer_domain_lease::acquire_for_protected_stdio() {
+                eprintln!("shipyard daemon: failed to register webhook for {repo}: {message}");
+            }
             if first_error.is_none() {
                 first_error = Some(message);
             }
@@ -1346,7 +1357,9 @@ fn unregister_webhooks(registrar: &Arc<Mutex<Registrar>>) {
     let Ok(mut registrar) = registrar.lock() else {
         return;
     };
-    if let Err(error) = registrar.unregister_all() {
+    if let Err(error) = registrar.unregister_all()
+        && let Ok(_writer_domain) = crate::writer_domain_lease::acquire_for_protected_stdio()
+    {
         eprintln!("shipyard daemon: failed to unregister webhooks: {error}");
     }
 }
@@ -1382,6 +1395,7 @@ fn send_stop_request(socket_path: &Path) -> std::io::Result<()> {
 }
 
 fn cleanup_stale_runtime_files(daemon_dir: &Path) -> std::io::Result<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(daemon_dir)?;
     for name in ["daemon.pid", "daemon.sock"] {
         let path = daemon_dir.join(name);
         if path.exists() || path.is_symlink() {
@@ -1393,6 +1407,15 @@ fn cleanup_stale_runtime_files(daemon_dir: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn remove_protected_file(path: &Path) -> std::io::Result<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn normalize_repos(mut repos: Vec<String>) -> Vec<String> {
@@ -1541,6 +1564,7 @@ struct PidFileGuard {
 #[cfg(unix)]
 impl PidFileGuard {
     fn acquire(path: &Path) -> Result<Self, DaemonRunError> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
         let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
         writeln!(file, "{}", std::process::id())?;
         Ok(Self {
@@ -1552,7 +1576,7 @@ impl PidFileGuard {
 #[cfg(unix)]
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = remove_protected_file(&self.path);
     }
 }
 

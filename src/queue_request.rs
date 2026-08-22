@@ -128,8 +128,7 @@ impl QueueRequestStore {
     /// Open a request store rooted at `<state_dir>/queue/requests`.
     pub fn new(state_dir: impl Into<PathBuf>) -> io::Result<Self> {
         let path = state_dir.into().join("queue").join("requests");
-        fs::create_dir_all(&path)?;
-        protect_request_directory(&path)?;
+        ensure_request_directory(&path)?;
         Ok(Self { path })
     }
 
@@ -218,7 +217,7 @@ impl QueueOutcomeStore {
     /// Open an outcome store rooted at `<state_dir>/queue/outcomes`.
     pub fn new(state_dir: impl Into<PathBuf>) -> io::Result<Self> {
         let path = state_dir.into().join("queue").join("outcomes");
-        fs::create_dir_all(&path)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path)?;
         Ok(Self { path })
     }
 
@@ -1846,7 +1845,26 @@ fn protect_request_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn ensure_request_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    let protected = {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata().is_ok_and(|metadata| {
+            metadata.is_dir() && metadata.permissions().mode() & 0o777 == 0o700
+        })
+    };
+    #[cfg(not(unix))]
+    let protected = path.is_dir();
+    if protected {
+        return Ok(());
+    }
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
+    fs::create_dir_all(path)?;
+    protect_request_directory(path)
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> QueueRequestResult<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     let Some(parent) = path.parent() else {
         return Err(QueueRequestError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1862,6 +1880,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> QueueRequestResult
 }
 
 fn write_json_atomic_durable<T: Serialize>(path: &Path, value: &T) -> QueueRequestResult<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     let Some(parent) = path.parent() else {
         return Err(QueueRequestError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1957,6 +1976,7 @@ fn target_has_trusted_environment(target: &QueuedResolvedTarget) -> bool {
 }
 
 fn delete_if_present(path: &Path) -> QueueRequestResult<bool> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -1969,6 +1989,7 @@ fn sweep_absent_older_than(
     active_job_ids: &BTreeSet<String>,
     grace: Duration,
 ) -> QueueRequestResult<Vec<String>> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(dir)?;
     let mut removed = Vec::new();
     let now = SystemTime::now();
     for entry in fs::read_dir(dir)? {

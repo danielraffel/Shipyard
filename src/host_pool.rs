@@ -365,16 +365,18 @@ impl HostPoolLeaseStore {
         &self,
         f: impl FnOnce(&File) -> HostPoolLeaseResult<T>,
     ) -> HostPoolLeaseResult<T> {
+        let lock_path = lock_path_for(&self.path);
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let lock_path = lock_path_for(&self.path);
         let lock = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
             .open(lock_path)?;
+        drop(writer_domain);
         lock.lock_exclusive()?;
         let result = f(&lock);
         let unlock_result = lock.unlock();
@@ -396,6 +398,7 @@ impl HostPoolLeaseStore {
     }
 
     fn save_leases(&self, leases: &[HostPoolLease]) -> HostPoolLeaseResult<()> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
