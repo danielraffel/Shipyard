@@ -50,7 +50,7 @@ pub(super) fn mutate_pr(
     }
     let pr = &live_pr;
     match decision {
-        StewardDecision::ArmMergeQueue => enqueue_pull_request(context, pr, ledger),
+        StewardDecision::ArmMergeQueue => enqueue_pull_request(context, pr, policy, ledger),
         StewardDecision::RerunTransient { run_ids } => {
             mutate_transient_reruns(context, pr, policy, run_ids, ledger)
         }
@@ -61,6 +61,7 @@ pub(super) fn mutate_pr(
 pub(super) fn enqueue_pull_request(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
+    policy: &StewardPolicy,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
     let guard = match acquire_pr_mutation_guard(
@@ -84,7 +85,7 @@ pub(super) fn enqueue_pull_request(
             let Some(message) = message else {
                 // The exact-head observation proved this is an ordinary PR.
                 // Continue through the unchanged enqueue path below.
-                return enqueue_unstacked_pull_request(context, pr, ledger, guard);
+                return enqueue_unstacked_pull_request(context, pr, policy, ledger, guard);
             };
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
             (
@@ -109,9 +110,34 @@ pub(super) fn enqueue_pull_request(
 fn enqueue_unstacked_pull_request(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
+    policy: &StewardPolicy,
     ledger: &mut StewardLedger,
     guard: crate::merge_queue_control::MergeQueueMutationGuard,
 ) -> (Option<String>, Option<String>) {
+    let pr = match final_enqueue_revalidation(context, pr, policy, ledger) {
+        Ok(Some(pr)) => pr,
+        Ok(None) => {
+            return match guard.finish("skipped_after_final_live_revalidation") {
+                Ok(()) => (
+                    Some("skipped_after_final_live_revalidation".to_owned()),
+                    None,
+                ),
+                Err(error) => (
+                    Some("skipped_after_final_live_revalidation".to_owned()),
+                    Some(format!("enqueue skip mutation audit failed: {error}")),
+                ),
+            };
+        }
+        Err(error) => {
+            let audit_error = guard.finish("final_live_revalidation_failed").err();
+            return (
+                None,
+                Some(audit_error.map_or(error.clone(), |audit_error| {
+                    format!("{error}; mutation audit also failed: {audit_error}")
+                })),
+            );
+        }
+    };
     let query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
     let result = context.actions.run_gh(&[
         "api".to_owned(),
@@ -178,6 +204,49 @@ fn enqueue_unstacked_pull_request(
                 (None, Some(message))
             }
         }
+    }
+}
+
+fn final_enqueue_revalidation(
+    context: &MutationApplyContext<'_>,
+    observed: &ObservedPr,
+    policy: &StewardPolicy,
+    ledger: &StewardLedger,
+) -> Result<Option<ObservedPr>, String> {
+    let (enabled, queue_positions, _, _) = merge_queue_snapshot(
+        context.actions,
+        &context.observation.repo,
+        &context.observation.base,
+    )?;
+    if enabled != policy.merge_queue {
+        return Ok(None);
+    }
+    let Some(live) = pull_request_with_required_checks(
+        context.actions,
+        &context.observation.repo,
+        observed.fact.number,
+        &context.observation.base,
+        &queue_positions,
+        &policy.required_checks,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !live
+        .fact
+        .head_sha
+        .eq_ignore_ascii_case(&observed.fact.head_sha)
+    {
+        return Ok(None);
+    }
+    let attempts = attempts_for(ledger, &context.observation.repo, &live.fact);
+    if matches!(
+        classify_pr(&live.fact, policy, &attempts),
+        StewardDecision::ArmMergeQueue
+    ) {
+        Ok(Some(live))
+    } else {
+        Ok(None)
     }
 }
 

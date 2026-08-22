@@ -195,7 +195,7 @@ machine_environment = ["PULP_SDK_DIR", "FORGE_MODULAR_TOOLCHAIN_ROOT"]
 configure = "cmake -S . -B build -DCMAKE_PREFIX_PATH=\"$PULP_SDK_DIR\""
 ```
 
-Each host then supplies the values in its trusted machine-global
+Each host then supplies absolute paths valid on that host in its trusted machine-global
 `config.toml` (the path printed by `shipyard paths`):
 
 ```toml
@@ -207,8 +207,8 @@ FORGE_MODULAR_TOOLCHAIN_ROOT = "/path/on/this/host/pulp-source"
 Shipyard reads this table only from the machine-global layer and requires the
 declared repository slug to match the canonical GitHub `origin` byte-for-byte.
 A tracked config or checkout-local overlay cannot supply or override the
-values. Missing values, non-string values, invalid environment names, and
-malformed machine config fail before validation starts. Resolved values are
+values. Relative paths, missing values, non-string values, invalid environment
+names, and malformed machine config fail before validation starts. Resolved values are
 snapshotted into daemon-owned queue requests under Shipyard's protected machine
 state directory so a submitting shell or agent session can exit without
 dropping them.

@@ -208,6 +208,69 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn enqueue_final_revalidation_refuses_blocker_added_during_stack_inspection() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let count = temp.path().join("pr-view-count");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    current=0
+    test ! -f '{}' || current=$(cat '{}')
+    current=$((current + 1))
+    printf '%s' "$current" > '{}'
+    if test "$current" -eq 1; then
+      printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}'
+    else
+      printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"5·UnReSoLvEd"}}],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}'
+    fi ;;
+  *"stackConfig"*) printf '%s' '{{"data":{{"repository":{{"stackConfig":{{"text":"stacked_pr_mode = \"observe\"\n"}},"pullRequest":{{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":null,"stackEntry":null}}}}}}}}' ;;
+  *"stackEntry"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":null,"stackEntry":null}}}}}}}}' ;;
+  *"enqueuePullRequest"*) echo "mutation must not run" >&2; exit 90 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            log.display(),
+            count.display(),
+            count.display(),
+            count.display()
+        ),
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let policy = queue_policy();
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+    let (mutation, error) = mutate_pr(
+        &context,
+        &pr,
+        &policy,
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+    );
+
+    assert_eq!(
+        mutation.as_deref(),
+        Some("skipped_after_final_live_revalidation")
+    );
+    assert!(error.is_none(), "{error:?}");
+    let calls = fs::read_to_string(log).expect("calls");
+    assert_eq!(calls.matches("pr view 42").count(), 2, "{calls}");
+    assert!(calls.contains("stackConfig"), "{calls}");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
 fn steward_refuses_formal_stack_before_enqueue_mutation() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
@@ -236,7 +299,8 @@ esac
     let ledger_path = temp.path().join("ledger.json");
     let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
 
-    let (mutation, error) = enqueue_pull_request(&context, &pr, &mut ledger);
+    let policy = queue_policy();
+    let (mutation, error) = enqueue_pull_request(&context, &pr, &policy, &mut ledger);
 
     assert!(mutation.is_none());
     assert!(

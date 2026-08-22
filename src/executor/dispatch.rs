@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration as StdDuration;
@@ -982,6 +982,12 @@ fn populate_target_environment(
                         reason: format!("requested {name} contains a NUL byte"),
                     });
                 }
+                if !Path::new(value).is_absolute() {
+                    return Err(DispatchError::InvalidMachineEnvironment {
+                        repository: repository.to_owned(),
+                        reason: format!("requested {name} must be an absolute path on this host"),
+                    });
+                }
                 validation
                     .environment
                     .insert(name.clone(), value.to_owned());
@@ -1012,7 +1018,29 @@ fn valid_environment_name(name: &str) -> bool {
 
 fn sensitive_environment_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper.contains("PRIVATE_KEY")
+    let semantic_stem = upper
+        .rsplit_once('_')
+        .filter(|(_, suffix)| matches!(*suffix, "DIR" | "FILE" | "HOME" | "PATH" | "ROOT"))
+        .map_or(upper.as_str(), |(stem, _)| stem);
+    let compact_stem = semantic_stem.replace('_', "");
+    const COMPACT_SECRET_MARKERS: [&str; 12] = [
+        "ACCESSKEY",
+        "ACCESSTOKEN",
+        "APIKEY",
+        "AUTHTOKEN",
+        "BEARERTOKEN",
+        "CLIENTSECRET",
+        "GITHUBTOKEN",
+        "PRIVATEKEY",
+        "SECRETKEY",
+        "SESSIONCOOKIE",
+        "SIGNINGKEY",
+        "TLSCERT",
+    ];
+    COMPACT_SECRET_MARKERS
+        .iter()
+        .any(|marker| compact_stem.contains(marker))
+        || upper.contains("PRIVATE_KEY")
         || upper.split('_').any(|part| {
             matches!(
                 part,
@@ -2273,6 +2301,17 @@ mod tests {
         assert!(status.success());
     }
 
+    fn native_absolute_machine_path(leaf: &str) -> String {
+        #[cfg(windows)]
+        {
+            format!("C:/shipyard/{leaf}")
+        }
+        #[cfg(not(windows))]
+        {
+            format!("/shipyard/{leaf}")
+        }
+    }
+
     #[test]
     fn trusted_machine_project_environment_is_injected_into_local_validation() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2284,12 +2323,13 @@ mod tests {
             project.parent().expect("repo root"),
             "git@github.com:Generous-Corp/forge.git",
         );
+        let sdk_path = native_absolute_machine_path("pulp-sdk");
+        let toolchain_path = native_absolute_machine_path("pulp-source");
         std::fs::write(
             global.join("config.toml"),
-            r#"[repository_environment."Generous-Corp/forge"]
-PULP_SDK_DIR = "/machine/pulp-sdk"
-FORGE_MODULAR_TOOLCHAIN_ROOT = "/machine/pulp-source"
-"#,
+            format!(
+                "[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = {sdk_path:?}\nFORGE_MODULAR_TOOLCHAIN_ROOT = {toolchain_path:?}\n"
+            ),
         )
         .expect("global config");
         std::fs::write(
@@ -2320,14 +2360,14 @@ backend = "local"
                 .environment
                 .get("PULP_SDK_DIR")
                 .map(String::as_str),
-            Some("/machine/pulp-sdk")
+            Some(sdk_path.as_str())
         );
         assert_eq!(
             validation
                 .environment
                 .get("FORGE_MODULAR_TOOLCHAIN_ROOT")
                 .map(String::as_str),
-            Some("/machine/pulp-source")
+            Some(toolchain_path.as_str())
         );
     }
 
@@ -2342,9 +2382,12 @@ backend = "local"
             project.parent().expect("repo root"),
             "https://github.com/Generous-Corp/forge.git",
         );
+        let trusted_sdk = native_absolute_machine_path("trusted-sdk");
         std::fs::write(
             global.join("config.toml"),
-            "[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = \"/trusted/sdk\"\n",
+            format!(
+                "[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = {trusted_sdk:?}\n"
+            ),
         )
         .expect("global config");
         std::fs::write(
@@ -2372,7 +2415,7 @@ backend = "local"
         let ResolvedValidation::Local(validation) = target.validation else {
             panic!("expected local validation");
         };
-        assert_eq!(validation.environment["PULP_SDK_DIR"], "/trusted/sdk");
+        assert_eq!(validation.environment["PULP_SDK_DIR"], trusted_sdk);
     }
 
     #[test]
@@ -2380,6 +2423,7 @@ backend = "local"
         for global_toml in [
             "[repository_environment.\"Generous-Corp/other\"]\nPULP_SDK_DIR = \"/sdk\"\n",
             "[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = 7\n",
+            "[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = \"relative/sdk\"\n",
         ] {
             let temp = tempfile::tempdir().expect("tempdir");
             let global = temp.path().join("global");
@@ -2493,6 +2537,12 @@ backend = "local"
             "SESSION_COOKIE",
             "TLS_CERT_PATH",
             "CREDENTIALS_FILE",
+            "SIGNINGKEY_FILE",
+            "PRIVATEKEY_PATH",
+            "ACCESSKEY_FILE",
+            "APIKEY_PATH",
+            "CLIENTSECRET_PATH",
+            "GITHUBTOKEN_FILE",
         ] {
             assert!(
                 super::sensitive_environment_name(name),

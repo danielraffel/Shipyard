@@ -35,7 +35,8 @@ use crate::ship_state::ShipState;
 use crate::warm_pool::{is_backend_eligible, warm_host_key};
 
 /// Current queued-execution schema.
-pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 1;
+pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 2;
+const LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 1;
 const MAX_SHIP_POST_VALIDATION_DETAIL_BYTES: usize = 1_200;
 
 /// Durable submitter ownership. Running ownership is derived by admitting
@@ -167,7 +168,9 @@ impl QueueRequestStore {
 
     /// Load one request envelope.
     pub fn load(&self, job_id: &str) -> QueueRequestResult<Option<QueuedExecutionEnvelope>> {
-        read_versioned_json(&self.path_for(job_id))
+        read_versioned_json(&self.path_for(job_id))?
+            .map(upgrade_legacy_request)
+            .transpose()
     }
 
     /// Delete one request envelope, if present.
@@ -187,7 +190,7 @@ impl QueueRequestStore {
                 continue;
             }
             if let Some(envelope) = read_versioned_json(&path)? {
-                envelopes.push(envelope);
+                envelopes.push(upgrade_legacy_request(envelope)?);
             }
         }
         envelopes.sort_by_key(|envelope| envelope.created_at);
@@ -1878,6 +1881,16 @@ fn read_versioned_json<T>(path: &Path) -> QueueRequestResult<Option<T>>
 where
     T: for<'de> Deserialize<'de>,
 {
+    read_versioned_json_through(path, QUEUED_EXECUTION_SCHEMA_VERSION)
+}
+
+fn read_versioned_json_through<T>(
+    path: &Path,
+    maximum_supported_version: u32,
+) -> QueueRequestResult<Option<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1891,10 +1904,55 @@ where
         .transpose()
         .map_err(|_| QueueRequestError::UnsupportedSchema { version: u32::MAX })?
         .unwrap_or_default();
-    if version != QUEUED_EXECUTION_SCHEMA_VERSION {
+    if !(LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION..=maximum_supported_version).contains(&version) {
         return Err(QueueRequestError::UnsupportedSchema { version });
     }
     Ok(Some(serde_json::from_value(value)?))
+}
+
+fn upgrade_legacy_request(
+    mut envelope: QueuedExecutionEnvelope,
+) -> QueueRequestResult<QueuedExecutionEnvelope> {
+    if envelope.schema_version == QUEUED_EXECUTION_SCHEMA_VERSION {
+        return Ok(envelope);
+    }
+    if envelope.schema_version != LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION {
+        return Err(QueueRequestError::UnsupportedSchema {
+            version: envelope.schema_version,
+        });
+    }
+    let targets = match &envelope.request {
+        QueuedExecutionRequest::Run(request) => &request.targets,
+        QueuedExecutionRequest::Ship(request) => &request.targets,
+    };
+    if targets.iter().any(target_has_trusted_environment) {
+        return Err(invalid_snapshot(
+            "legacy v1 request contains v2 trusted-environment fields",
+        ));
+    }
+    envelope.schema_version = QUEUED_EXECUTION_SCHEMA_VERSION;
+    Ok(envelope)
+}
+
+fn target_has_trusted_environment(target: &QueuedResolvedTarget) -> bool {
+    if matches!(
+        &target.validation,
+        QueuedValidationSnapshot::Local(validation)
+            if !validation.machine_environment.is_empty() || !validation.environment.is_empty()
+    ) {
+        return true;
+    }
+    match &target.backend {
+        QueuedBackendSnapshot::HostPool(pool) => pool
+            .members
+            .iter()
+            .any(|member| target_has_trusted_environment(&member.target)),
+        QueuedBackendSnapshot::Fallback(chain) => chain
+            .backends
+            .iter()
+            .any(|backend| target_has_trusted_environment(&backend.target)),
+        _ => false,
+    }
 }
 
 fn delete_if_present(path: &Path) -> QueueRequestResult<bool> {
@@ -2247,6 +2305,82 @@ mod tests {
         assert_eq!(loaded.kind, QueuedExecutionKind::Run);
         assert!(matches!(loaded.request, QueuedExecutionRequest::Run(_)));
         assert_eq!(loaded.to_run_request().expect("restore run"), run_request());
+    }
+
+    #[test]
+    fn current_reader_safely_upgrades_a_legacy_v1_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-v1", "/work/repo", &run_request());
+        let mut value = serde_json::to_value(envelope).expect("serialize request");
+        value["schema_version"] = json!(1);
+        let validation = value
+            .pointer_mut("/request/targets/0/validation")
+            .and_then(Value::as_object_mut)
+            .expect("local validation snapshot");
+        validation.remove("machine_environment");
+        validation.remove("environment");
+        std::fs::write(
+            store.path_for("job-v1"),
+            serde_json::to_vec_pretty(&value).expect("encode v1"),
+        )
+        .expect("write v1");
+
+        let loaded = store.load("job-v1").expect("load v1").expect("present");
+
+        assert_eq!(loaded.schema_version, QUEUED_EXECUTION_SCHEMA_VERSION);
+        let request = loaded.to_run_request().expect("restore v1");
+        let ResolvedValidation::Local(validation) = &request.targets[0].validation else {
+            panic!("expected local validation");
+        };
+        assert!(validation.machine_environment.is_empty());
+        assert!(validation.environment.is_empty());
+    }
+
+    #[test]
+    fn downgraded_v1_request_cannot_smuggle_v2_trusted_environment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope = QueuedExecutionEnvelope::from_run_request(
+            "job-downgraded",
+            "/work/repo",
+            &run_request(),
+        );
+        let mut value = serde_json::to_value(envelope).expect("serialize request");
+        value["schema_version"] = json!(1);
+        std::fs::write(
+            store.path_for("job-downgraded"),
+            serde_json::to_vec_pretty(&value).expect("encode downgraded v1"),
+        )
+        .expect("write downgraded v1");
+
+        let error = store
+            .load("job-downgraded")
+            .expect_err("v1 must not carry v2 trusted environment");
+
+        assert!(matches!(error, QueueRequestError::InvalidSnapshot { .. }));
+        assert!(error.to_string().contains("v2 trusted-environment"));
+    }
+
+    #[test]
+    fn legacy_v1_reader_rejects_current_v2_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-v2", "/work/repo", &run_request());
+        store.save(&envelope).expect("save v2");
+
+        let error = super::read_versioned_json_through::<QueuedExecutionEnvelope>(
+            &store.path_for("job-v2"),
+            1,
+        )
+        .expect_err("v1 reader must reject v2");
+
+        assert!(matches!(
+            error,
+            QueueRequestError::UnsupportedSchema { version: 2 }
+        ));
     }
 
     #[cfg(unix)]

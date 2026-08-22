@@ -962,7 +962,7 @@ fn portable_absolute_path(path: &Path) -> Result<String, Error> {
     let value = path
         .to_str()
         .ok_or_else(|| Error::Invalid("remote store root must be UTF-8".into()))?;
-    if !path.is_absolute()
+    if !value.starts_with('/')
         || value.contains('\\')
         || value
             .bytes()
@@ -1232,8 +1232,12 @@ mod tests {
             resume,
             timeout_seconds: 30,
         };
+        #[cfg(windows)]
+        let absolute_rsync = r"C:\Shipyard\rsync.exe";
+        #[cfg(not(windows))]
+        let absolute_rsync = "/usr/bin/rsync";
         let command = receiver_pull_command(&request(
-            "/usr/bin/rsync",
+            absolute_rsync,
             "m1-lan",
             "/var/lib/shipyard/artifacts",
             ResumePlan::Append {
@@ -1242,12 +1246,12 @@ mod tests {
             },
         ))
         .unwrap();
-        assert_eq!(command.program, Path::new("/usr/bin/rsync"));
+        assert_eq!(command.program, Path::new(absolute_rsync));
         assert!(command.args.iter().any(|arg| arg == "--append"));
         for hostile in ["-oProxyCommand=bad", "host;bad", "host name"] {
             assert!(
                 receiver_pull_command(&request(
-                    "/usr/bin/rsync",
+                    absolute_rsync,
                     hostile,
                     "/safe",
                     ResumePlan::Restart,
@@ -1260,7 +1264,7 @@ mod tests {
         );
         assert!(
             receiver_pull_command(&request(
-                "/usr/bin/rsync",
+                absolute_rsync,
                 "m1",
                 "/safe;bad",
                 ResumePlan::Restart,
@@ -1269,7 +1273,7 @@ mod tests {
         );
         assert!(
             receiver_pull_command(&request(
-                "/usr/bin/rsync",
+                absolute_rsync,
                 "m1",
                 "/safe",
                 ResumePlan::Append {
