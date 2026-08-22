@@ -1082,8 +1082,9 @@ reviewed shadow policy digest in trusted machine-global config.
 For a prospective `shipyard pr` push, selected execution is transport-only and
 remains machine-global default-off. Shipyard accepts exactly one non-delete
 branch update and authenticates the configured `core.hooksPath/pre-push` as a
-protected-base-tracked, executable regular file whose bytes remain identical
-before and after the push. The private result path, nonce, and prospective
+protected-base-tracked regular file with the platform-valid Git tree mode
+(executable on POSIX) whose bytes remain identical before and after the push.
+The private result path, nonce, and prospective
 receipt identity are supplied by Shipyard; the hook result must bind the exact
 head, tree, changed paths, selected tests, and hook digest. Any missing,
 ambiguous, changed, symlinked, or mismatched input falls back to the full

@@ -1,5 +1,6 @@
 use super::*;
 use crate::changed_surface::{BuildType, RiskClass, TestFamily};
+#[cfg(unix)]
 use crate::pr::push_branch_with_env;
 use chrono::TimeZone as _;
 #[cfg(unix)]
@@ -334,6 +335,16 @@ fn repository_hook_paths_use_git_spelling_and_cannot_escape() {
     assert_eq!(
         repository_relative_git_path(Path::new("/tmp/pre-push")),
         None
+    );
+}
+
+#[test]
+fn protected_hook_tree_mode_matches_platform_execution_semantics() {
+    assert!(protected_hook_mode_is_accepted("100755 blob abcdef"));
+    assert!(!protected_hook_mode_is_accepted("120000 blob abcdef"));
+    assert_eq!(
+        protected_hook_mode_is_accepted("100644 blob abcdef"),
+        cfg!(windows)
     );
 }
 

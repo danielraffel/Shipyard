@@ -96,8 +96,9 @@ exactly matches the protected plan.
 Prospective pre-push selection is only a transport optimization and is also
 machine-global default-off. Shipyard permits one non-delete branch update and
 authenticates the actual `core.hooksPath/pre-push` against the protected base:
-it must be a tracked executable regular file, not a symlink, and its bytes must
-remain unchanged across the push. Shipyard owns the private result directory,
+it must be a tracked regular file with the platform-valid Git tree mode
+(executable on POSIX), not a symlink, and its bytes must remain unchanged
+across the push. Shipyard owns the private result directory,
 nonce, and receipt identity; the hook must bind the exact head, tree, changed
 paths, selected tests, and hook digest. Any ambiguity or identity drift falls
 back to the full authoritative validation contract.

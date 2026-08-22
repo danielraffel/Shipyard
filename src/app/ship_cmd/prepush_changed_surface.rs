@@ -713,12 +713,22 @@ fn observe_hook_implementation(
         }
     }
     let protected_mode = git(cwd, &["ls-tree", protected_base_sha, "--", &hook])?;
-    if !protected_mode.starts_with("100755 blob ") {
+    if !protected_hook_mode_is_accepted(&protected_mode) {
         return None;
     }
     let current = fs::read(cwd.join(&hook)).ok()?;
     let protected = git_bytes(cwd, &["show", &format!("{protected_base_sha}:{hook}")])?;
     (current == protected).then(|| (hook, sha256(&protected)))
+}
+
+fn protected_hook_mode_is_accepted(mode: &str) -> bool {
+    if mode.starts_with("100755 blob ") {
+        return true;
+    }
+    // Git for Windows does not preserve POSIX executable bits, and executes
+    // hooks through its compatibility shell. Still require a regular blob;
+    // symlinks, submodules, and every other tree mode remain rejected.
+    cfg!(windows) && mode.starts_with("100644 blob ")
 }
 
 /// Convert a repository-relative filesystem path to Git's platform-neutral
