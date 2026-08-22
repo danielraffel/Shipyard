@@ -229,6 +229,7 @@ pub(super) fn ship_command<W: Write>(
         &runtime_paths.state_dir,
         &repo,
         Some(pr_context.number),
+        args.resume_from.as_deref(),
         &mut targets,
     )?;
 

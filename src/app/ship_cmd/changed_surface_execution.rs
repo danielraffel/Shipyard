@@ -122,6 +122,7 @@ pub(super) fn apply_changed_surface_execution(
     state_dir: &Path,
     repo: &str,
     pr: Option<u64>,
+    resume_from: Option<&str>,
     targets: &mut [ResolvedTarget],
 ) -> Result<(), CliFailure> {
     let machine = MachinePolicy::from_global(config)?;
@@ -301,18 +302,45 @@ pub(super) fn apply_changed_surface_execution(
             )?;
             continue;
         }
+        if resume_bypasses_selected_transaction(&plan.stage, resume_from) {
+            persist_fallback_diagnostic(
+                &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
+                &FallbackDiagnostic {
+                    schema_version: 1,
+                    repository: repo,
+                    pull_request: pr,
+                    target: &target.name,
+                    machine_mode: machine.mode,
+                    category: "resume_bypasses_selected_transaction",
+                    diagnostic: "resume-from test would skip the selected build-and-test transaction; preserving the original validation stages"
+                        .to_owned(),
+                },
+            )?;
+            continue;
+        }
         let original_test = validation
             .stages
             .get("test")
             .expect("checked local test stage")
             .clone();
         let original_build = if plan.stage == "build_and_test" {
-            Some(validation.stages.get("build").cloned().ok_or_else(|| {
-                CliFailure::new(
-                    1,
-                    "selected build-and-test requires a canonical build stage",
-                )
-            })?)
+            let Some(build) = validation.stages.get("build").cloned() else {
+                persist_fallback_diagnostic(
+                    &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
+                    &FallbackDiagnostic {
+                        schema_version: 1,
+                        repository: repo,
+                        pull_request: pr,
+                        target: &target.name,
+                        machine_mode: machine.mode,
+                        category: "full_fallback",
+                        diagnostic: "selected build-and-test requires a canonical build stage; preserving the original validation stages"
+                            .to_owned(),
+                    },
+                )?;
+                continue;
+            };
+            Some(build)
         } else {
             None
         };
@@ -497,6 +525,10 @@ fn bounded_diagnostic(value: &str) -> String {
     value.chars().take(MAX_DIAGNOSTIC_CHARS).collect()
 }
 
+fn resume_bypasses_selected_transaction(plan_stage: &str, resume_from: Option<&str>) -> bool {
+    plan_stage == "build_and_test" && resume_from == Some("test")
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -505,7 +537,7 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic, path_component,
-        persist_fallback_diagnostic, shell_quote,
+        persist_fallback_diagnostic, resume_bypasses_selected_transaction, shell_quote,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::fs;
@@ -621,5 +653,22 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn resume_after_build_cannot_activate_combined_selected_transaction() {
+        assert!(resume_bypasses_selected_transaction(
+            "build_and_test",
+            Some("test")
+        ));
+        assert!(!resume_bypasses_selected_transaction(
+            "build_and_test",
+            Some("build")
+        ));
+        assert!(!resume_bypasses_selected_transaction(
+            "build_and_test",
+            None
+        ));
+        assert!(!resume_bypasses_selected_transaction("test", Some("test")));
     }
 }
