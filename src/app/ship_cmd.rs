@@ -32,7 +32,7 @@ use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
 use crate::lane_policy::{LanePolicy, resolve_lane_policy};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
-use crate::pr::{PrInfo, create_pr, find_pr_for_branch, get_pr_status, push_branch};
+use crate::pr::{PrInfo, create_pr, find_pr_for_branch, get_pr_status, push_branch_with_env};
 use crate::pr_text::{compose_pr_body_with_policy, compose_pr_title};
 use crate::preflight::{
     EXIT_BACKEND_UNREACHABLE, EXIT_FLEET_EPOCH_DRIFT, EXIT_HOST_UNHEALTHY, ShipPreflightError,
@@ -92,6 +92,7 @@ pub(super) struct ShipStewardHandoff {
 }
 
 mod changed_surface_execution;
+mod prepush_changed_surface;
 mod provenance;
 use changed_surface_execution::apply_changed_surface_execution;
 use provenance::{AppliedStewardHandoff, apply_requested_steward_handoff, run_pr_provenance_hook};
@@ -133,7 +134,72 @@ pub(super) fn ship_command<W: Write>(
         maybe_auto_create_base_branch(cwd, &args.base, config, args.gh_command.as_deref());
     }
     let lane_policy = resolve_lane_policy(config, cwd);
-    let pr_context = resolve_pr_context(config, &args, cwd, &branch, &lane_policy)?;
+    let prepush_enabled = args.pr.is_none() && prepush_changed_surface::shadow_enabled(config)?;
+    let prepush_base = if prepush_enabled {
+        match find_pr_for_branch(config, cwd, args.gh_command.as_deref(), &branch) {
+            Ok(Some(info)) => Some(info.base),
+            Ok(None) => Some(args.base.clone()),
+            Err(error) => {
+                eprintln!(
+                    "warning: existing PR base unavailable; declining pre-push changed-surface optimization: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut prospective_push = if prepush_enabled {
+        prepush_base.as_deref().map_or(Ok(None), |base| {
+            prepush_changed_surface::prepare(
+                config,
+                cwd,
+                &runtime_paths.state_dir,
+                &repo,
+                base,
+                &branch,
+                &targets,
+            )
+        })?
+    } else {
+        None
+    };
+    let pr_context = resolve_pr_context(
+        config,
+        &args,
+        cwd,
+        &branch,
+        &lane_policy,
+        prospective_push.as_mut(),
+    )?;
+    if let Some(prospective) = prospective_push.as_ref()
+        && let Err(error) = prepush_changed_surface::verify_after_push(
+            prospective,
+            config,
+            cwd,
+            &runtime_paths.state_dir,
+            &repo,
+            pr_context.number,
+            &branch,
+        )
+    {
+        // A pre-push optimization can never prevent or weaken the ordinary
+        // downstream full path. Identity/result ambiguity merely declines its
+        // future dedupe hint.
+        if json_mode {
+            eprintln!(
+                "warning: pre-push changed-surface receipt not reusable: {}",
+                error.message
+            );
+        } else {
+            writeln!(
+                stdout,
+                "warning: pre-push changed-surface receipt not reusable: {}",
+                error.message
+            )
+            .map_err(|write_error| CliFailure::new(1, write_error.to_string()))?;
+        }
+    }
     if args.invocation == ShipInvocation::PrCommand {
         run_pr_provenance_hook(
             config,
@@ -574,6 +640,7 @@ fn resolve_pr_context(
     cwd: &Path,
     branch: &str,
     lane_policy: &LanePolicy,
+    prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
 ) -> Result<ResolvedPrContext, CliFailure> {
     if let Some(number) = args.pr {
         if let Some(path) = args.pr_snapshot_file.as_deref() {
@@ -608,7 +675,17 @@ fn resolve_pr_context(
         });
     }
 
-    push_branch(cwd, branch).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let environment = prospective_push
+        .as_deref()
+        .map_or_else(Vec::new, |push| push.environment().to_vec());
+    push_branch_with_env(cwd, branch, environment)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if let Some(push) = prospective_push {
+        // This private state transition is the pass authority. The hook result
+        // is identity telemetry only; untrusted test descendants cannot turn a
+        // nonzero/aborted git push into this parent-observed state.
+        push.mark_supervised_push_succeeded();
+    }
     let info = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), branch)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .map_or_else(
@@ -624,6 +701,12 @@ fn resolve_pr_context(
             },
             Ok::<PrInfo, CliFailure>,
         )?;
+    if info.branch != branch {
+        return Err(CliFailure::new(
+            1,
+            "authenticated pull-request head ref differs from the supervised branch",
+        ));
+    }
     Ok(ResolvedPrContext {
         number: info.number,
         base_branch: info.base,
