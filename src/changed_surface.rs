@@ -22,9 +22,9 @@ pub use execution::{
 /// Oldest changed-surface declaration schema understood by this release.
 pub const MIN_CHANGED_SURFACE_SCHEMA_VERSION: u32 = 1;
 /// Newest changed-surface declaration schema understood by this release.
-pub const CHANGED_SURFACE_SCHEMA_VERSION: u32 = 2;
+pub const CHANGED_SURFACE_SCHEMA_VERSION: u32 = 3;
 /// Current exact-head selection receipt schema.
-pub const SELECTION_RECEIPT_SCHEMA_VERSION: u32 = 2;
+pub const SELECTION_RECEIPT_SCHEMA_VERSION: u32 = 3;
 /// Maximum age accepted for a required secondary execution proof.
 pub const SECONDARY_PROOF_MAX_AGE_HOURS: i64 = 24;
 
@@ -38,6 +38,9 @@ pub struct TestFamily {
     pub paths: Vec<String>,
     /// Complete literal test names for this family. These are not regexes.
     pub tests: Vec<String>,
+    /// `CMake` producer targets needed to materialize this family's tests.
+    #[serde(default)]
+    pub build_targets: Vec<String>,
     /// Risk class reviewed for this family. Schema v1 defaults to affected.
     #[serde(default)]
     pub risk_class: RiskClass,
@@ -98,6 +101,9 @@ pub struct ChangedSurfacePolicy {
     pub build_flags: Vec<String>,
     /// Literal tests that run for every eligible bounded selection.
     pub baseline_tests: Vec<String>,
+    /// `CMake` producer targets needed by the mandatory baseline tests.
+    #[serde(default)]
+    pub baseline_build_targets: Vec<String>,
     /// Paths reviewed as safe to require baseline smoke only (for example docs).
     #[serde(default)]
     pub baseline_only_paths: Vec<String>,
@@ -398,6 +404,8 @@ pub struct SelectionReceipt {
     pub selected_families: Vec<String>,
     /// Literal bounded test names (baseline union complete affected families).
     pub selected_tests: Vec<String>,
+    /// Protected-base `CMake` target union needed by the selected tests.
+    pub selected_build_targets: Vec<String>,
     /// Mandatory baseline tests included in every eligible bound.
     pub baseline_tests: Vec<String>,
     /// Test counts by affected family.
@@ -615,6 +623,7 @@ fn plan_with_policy(
     receipt.build_type = Some(policy.build_type);
     receipt.build_flags.clone_from(&policy.build_flags);
     receipt.baseline_tests = sorted_unique(&policy.baseline_tests);
+    receipt.selected_build_targets = sorted_unique(&policy.baseline_build_targets);
 
     if input.base_tracked_paths_status == ObservationStatus::Incomplete
         || input.base_tracked_paths.is_empty()
@@ -659,6 +668,7 @@ fn select_policy_families(
     mut forced_fallback: Option<(FallbackReason, Option<String>)>,
 ) -> Result<SelectionReceipt, IdentityError> {
     let mut selected_tests = literal_set(&receipt.baseline_tests);
+    let mut selected_build_targets = literal_set(&receipt.selected_build_targets);
     let mut selected_families = Vec::new();
     let mut family_coverage = BTreeMap::new();
     let mut secondary = BTreeMap::<(String, BuildType, String), SecondaryProofReceipt>::new();
@@ -696,6 +706,7 @@ fn select_policy_families(
         }
         if directly_affected && family_tier != SelectionTier::Full {
             selected_tests.extend(tests);
+            selected_build_targets.extend(family.build_targets.iter().cloned());
         }
     }
     mapped_paths.extend(matching_paths(changed_paths, &policy.baseline_only_paths)?);
@@ -723,6 +734,7 @@ fn select_policy_families(
     Ok(finalize_bounded_receipt(
         receipt,
         selected_tests,
+        selected_build_targets,
         selected_families,
         family_coverage,
         secondary,
@@ -848,6 +860,7 @@ fn required_secondary_proof<'a>(
 fn finalize_bounded_receipt(
     mut receipt: SelectionReceipt,
     selected_tests: BTreeSet<String>,
+    selected_build_targets: BTreeSet<String>,
     selected_families: Vec<String>,
     family_coverage: BTreeMap<String, usize>,
     secondary: BTreeMap<(String, BuildType, String), SecondaryProofReceipt>,
@@ -855,6 +868,7 @@ fn finalize_bounded_receipt(
 ) -> SelectionReceipt {
     receipt.selected_families = selected_families;
     receipt.selected_tests = selected_tests.into_iter().collect();
+    receipt.selected_build_targets = selected_build_targets.into_iter().collect();
     receipt.family_coverage = family_coverage;
     receipt.secondary_proofs = finalized_secondary_proofs(secondary);
     receipt.selected_count = Some(receipt.selected_tests.len());
@@ -1111,6 +1125,9 @@ fn validate_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
         return Err("full_test_count must be nonzero".to_owned());
     }
     validate_literal_tests("baseline_tests", &policy.baseline_tests)?;
+    if policy.schema_version >= 3 {
+        validate_build_targets("baseline_build_targets", &policy.baseline_build_targets)?;
+    }
     if policy.families.is_empty() {
         return Err("at least one test family is required".to_owned());
     }
@@ -1124,6 +1141,12 @@ fn validate_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
         }
         validate_patterns(&family.paths)?;
         validate_literal_tests(&format!("family {} tests", family.name), &family.tests)?;
+        if policy.schema_version >= 3 {
+            validate_build_targets(
+                &format!("family {} build_targets", family.name),
+                &family.build_targets,
+            )?;
+        }
         if family.supported_build_types.is_empty() {
             return Err(format!(
                 "family {} supported_build_types must be nonempty",
@@ -1218,6 +1241,21 @@ fn validate_literal_tests(label: &str, tests: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_build_targets(label: &str, targets: &[String]) -> Result<(), String> {
+    validate_literal_tests(label, targets)?;
+    if targets.iter().any(|target| {
+        target.starts_with('-')
+            || !target.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'+' | b'-' | b':')
+            })
+    }) {
+        return Err(format!(
+            "{label} must contain only canonical CMake target names"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_patterns(patterns: &[String]) -> Result<(), String> {
     for pattern in patterns {
         if pattern.trim().is_empty()
@@ -1255,6 +1293,7 @@ fn base_receipt(input: &ExactHeadInput, changed_paths: Vec<String>) -> Selection
         changed_paths,
         selected_families: Vec::new(),
         selected_tests: Vec::new(),
+        selected_build_targets: Vec::new(),
         baseline_tests: Vec::new(),
         family_coverage: BTreeMap::new(),
         secondary_proofs: Vec::new(),
@@ -1379,6 +1418,7 @@ mod tests {
             build_type: BuildType::Debug,
             build_flags: vec!["-DCMAKE_BUILD_TYPE=Debug".to_owned()],
             baseline_tests: vec!["smoke boots".to_owned(), "smoke config".to_owned()],
+            baseline_build_targets: Vec::new(),
             baseline_only_paths: vec!["docs/**".to_owned()],
             full_required_paths: Vec::new(),
             policy_paths: vec!["schema/changed-surface.json".to_owned()],
@@ -1391,6 +1431,7 @@ mod tests {
                     name: "audio".to_owned(),
                     paths: vec!["src/audio/**".to_owned()],
                     tests: vec!["audio alpha".to_owned(), "audio beta".to_owned()],
+                    build_targets: Vec::new(),
                     risk_class: RiskClass::Low,
                     extended_tests: Vec::new(),
                     supported_build_types: vec![BuildType::Debug, BuildType::Release],
@@ -1404,6 +1445,7 @@ mod tests {
                         "include/registry/**".to_owned(),
                     ],
                     tests: vec!["registry one".to_owned(), "registry two".to_owned()],
+                    build_targets: Vec::new(),
                     risk_class: RiskClass::Low,
                     extended_tests: Vec::new(),
                     supported_build_types: vec![BuildType::Debug, BuildType::Release],
@@ -1755,6 +1797,7 @@ mod tests {
             name: "installed-sdk".to_owned(),
             paths: vec!["sdk/**".to_owned()],
             tests: vec!["agent capability installed SDK".to_owned()],
+            build_targets: Vec::new(),
             risk_class: RiskClass::Low,
             extended_tests: Vec::new(),
             supported_build_types: vec![BuildType::Release],

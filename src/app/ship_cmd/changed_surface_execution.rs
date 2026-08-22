@@ -93,7 +93,11 @@ struct ActivationReceipt<'a> {
     schema_version: u32,
     machine_mode: MachineMode,
     plan: &'a crate::changed_surface::AuthoritativeExecutionPlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_build_command_sha256: Option<String>,
     original_test_command_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    substituted_build_command_sha256: Option<String>,
     substituted_test_command_sha256: String,
 }
 
@@ -297,11 +301,21 @@ pub(super) fn apply_changed_surface_execution(
             )?;
             continue;
         }
-        let original = validation
+        let original_test = validation
             .stages
             .get("test")
             .expect("checked local test stage")
             .clone();
+        let original_build = if plan.stage == "build_and_test" {
+            Some(validation.stages.get("build").cloned().ok_or_else(|| {
+                CliFailure::new(
+                    1,
+                    "selected build-and-test requires a canonical build stage",
+                )
+            })?)
+        } else {
+            None
+        };
         let result_dir = result_dir(state_dir, repo, pr, &plan.head_sha, &target.name);
         let compare = if machine.mode == MachineMode::ShadowCompare {
             "1"
@@ -317,17 +331,34 @@ pub(super) fn apply_changed_surface_execution(
         persist_activation(
             &result_dir,
             &ActivationReceipt {
-                schema_version: 1,
+                schema_version: u32::from(plan.stage == "build_and_test") + 1,
                 machine_mode: machine.mode,
                 plan: &plan,
-                original_test_command_sha256: sha256(original.as_bytes()),
-                substituted_test_command_sha256: sha256(substituted.as_bytes()),
+                original_build_command_sha256: original_build
+                    .as_ref()
+                    .map(|command| sha256(command.as_bytes())),
+                original_test_command_sha256: sha256(original_test.as_bytes()),
+                substituted_build_command_sha256: (plan.stage == "build_and_test")
+                    .then(|| sha256(substituted.as_bytes())),
+                substituted_test_command_sha256: sha256(
+                    if plan.stage == "build_and_test" {
+                        ":"
+                    } else {
+                        &substituted
+                    }
+                    .as_bytes(),
+                ),
             },
         )?;
         let ResolvedValidation::Local(validation) = &mut target.validation else {
             unreachable!();
         };
-        validation.stages.insert("test".to_owned(), substituted);
+        if plan.stage == "build_and_test" {
+            validation.stages.insert("build".to_owned(), substituted);
+            validation.stages.insert("test".to_owned(), ":".to_owned());
+        } else {
+            validation.stages.insert("test".to_owned(), substituted);
+        }
     }
     Ok(())
 }
