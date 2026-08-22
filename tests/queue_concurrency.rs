@@ -45,6 +45,8 @@ fn local_target(name: &str, cwd: impl Into<PathBuf>) -> ResolvedTarget {
             contract: None,
             prepared_state_enabled: true,
             allow_tree_drift: false,
+            machine_environment: Vec::new(),
+            environment: BTreeMap::new(),
         }),
         failure_parser: None,
     }

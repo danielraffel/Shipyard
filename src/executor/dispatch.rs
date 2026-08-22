@@ -279,6 +279,14 @@ pub enum DispatchError {
         /// Human-readable reason.
         reason: String,
     },
+    /// A tracked validation requested a machine-global repository environment
+    /// entry that is absent or malformed.
+    InvalidMachineEnvironment {
+        /// Repository slug from `[project].repository`.
+        repository: String,
+        /// Human-readable fail-closed reason.
+        reason: String,
+    },
     /// The target uses an unknown backend.
     UnsupportedBackend {
         /// Target name.
@@ -312,6 +320,12 @@ impl Display for DispatchError {
                 write!(
                     formatter,
                     "invalid validation for target {target:?}: {reason}"
+                )
+            }
+            Self::InvalidMachineEnvironment { repository, reason } => {
+                write!(
+                    formatter,
+                    "invalid trusted machine environment for repository {repository:?}: {reason}"
                 )
             }
             Self::ProfileTargetMissing {
@@ -789,7 +803,214 @@ pub fn resolve_targets(
     config: &LoadedConfig,
     mode: ValidationMode,
 ) -> Result<Vec<ResolvedTarget>, DispatchError> {
-    resolve_targets_from_table(&config.data, mode)
+    let mut targets = resolve_targets_from_table(&config.data, mode)?;
+    apply_trusted_project_environment(config, &mut targets)?;
+    Ok(targets)
+}
+
+fn apply_trusted_project_environment(
+    config: &LoadedConfig,
+    targets: &mut [ResolvedTarget],
+) -> Result<(), DispatchError> {
+    if !targets.iter().any(target_requests_machine_environment) {
+        return Ok(());
+    }
+
+    let repository = config
+        .get_str("project.repository")
+        .filter(|slug| valid_repository_slug(slug))
+        .ok_or_else(|| DispatchError::InvalidMachineEnvironment {
+            repository: "<unset>".to_owned(),
+            reason: "[project].repository must be an exact OWNER/REPO slug when validation requests machine_environment".to_owned(),
+        })?;
+    verify_checkout_repository(config, repository)?;
+    let machine =
+        LoadedConfig::load_machine_global_from_dir(config.global_dir.clone()).map_err(|error| {
+            DispatchError::InvalidMachineEnvironment {
+                repository: repository.to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+    let values = machine
+        .data
+        .get("repository_environment")
+        .and_then(Value::as_table)
+        .and_then(|repositories| repositories.get(repository))
+        .and_then(Value::as_table)
+        .ok_or_else(|| DispatchError::InvalidMachineEnvironment {
+            repository: repository.to_owned(),
+            reason: format!(
+                "trusted machine-global config has no [repository_environment.\"{repository}\"] table"
+            ),
+        })?;
+
+    for target in targets {
+        populate_target_environment(target, repository, values)?;
+    }
+    Ok(())
+}
+
+fn verify_checkout_repository(
+    config: &LoadedConfig,
+    repository: &str,
+) -> Result<(), DispatchError> {
+    let repo_root = config
+        .project_dir
+        .as_ref()
+        .and_then(|project_dir| project_dir.parent())
+        .ok_or_else(|| DispatchError::InvalidMachineEnvironment {
+            repository: repository.to_owned(),
+            reason: "tracked .shipyard directory has no repository root".to_owned(),
+        })?;
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|error| DispatchError::InvalidMachineEnvironment {
+            repository: repository.to_owned(),
+            reason: format!("could not inspect checkout origin: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(DispatchError::InvalidMachineEnvironment {
+            repository: repository.to_owned(),
+            reason: "checkout has no readable origin remote".to_owned(),
+        });
+    }
+    let origin = String::from_utf8_lossy(&output.stdout);
+    let observed = github_repository_slug(origin.trim()).ok_or_else(|| {
+        DispatchError::InvalidMachineEnvironment {
+            repository: repository.to_owned(),
+            reason: format!(
+                "checkout origin is not an exact github.com repository URL: {origin:?}"
+            ),
+        }
+    })?;
+    if observed != repository {
+        return Err(DispatchError::InvalidMachineEnvironment {
+            repository: repository.to_owned(),
+            reason: format!(
+                "checkout origin resolves to {observed:?}; repository keys are case-sensitive and may not alias"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn github_repository_slug(remote: &str) -> Option<&str> {
+    let slug = remote
+        .strip_prefix("git@github.com:")
+        .or_else(|| remote.strip_prefix("https://github.com/"))
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))?;
+    let slug = slug.strip_suffix(".git").unwrap_or(slug);
+    valid_repository_slug(slug).then_some(slug)
+}
+
+fn valid_repository_slug(slug: &str) -> bool {
+    let mut parts = slug.split('/');
+    let Some(owner) = parts.next() else {
+        return false;
+    };
+    let Some(repo) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !owner.is_empty()
+        && !repo.is_empty()
+        && owner.chars().chain(repo.chars()).all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+fn target_requests_machine_environment(target: &ResolvedTarget) -> bool {
+    match (&target.backend, &target.validation) {
+        (ResolvedBackend::Local(_), ResolvedValidation::Local(validation)) => {
+            !validation.machine_environment.is_empty()
+        }
+        (ResolvedBackend::HostPool(pool), ResolvedValidation::HostPool) => pool
+            .members
+            .iter()
+            .any(|member| target_requests_machine_environment(&member.target)),
+        (ResolvedBackend::Fallback(chain), ResolvedValidation::Fallback) => chain
+            .backends
+            .iter()
+            .any(|backend| target_requests_machine_environment(&backend.target)),
+        _ => false,
+    }
+}
+
+fn populate_target_environment(
+    target: &mut ResolvedTarget,
+    repository: &str,
+    values: &Table,
+) -> Result<(), DispatchError> {
+    match (&mut target.backend, &mut target.validation) {
+        (ResolvedBackend::Local(_), ResolvedValidation::Local(validation)) => {
+            for name in &validation.machine_environment {
+                if !valid_environment_name(name) {
+                    return Err(DispatchError::InvalidMachineEnvironment {
+                        repository: repository.to_owned(),
+                        reason: format!("invalid environment variable name {name:?}"),
+                    });
+                }
+                if sensitive_environment_name(name) {
+                    return Err(DispatchError::InvalidMachineEnvironment {
+                        repository: repository.to_owned(),
+                        reason: format!(
+                            "requested {name} looks secret-bearing; use a dedicated Shipyard credential mechanism"
+                        ),
+                    });
+                }
+                let value = values.get(name).and_then(Value::as_str).ok_or_else(|| {
+                    DispatchError::InvalidMachineEnvironment {
+                        repository: repository.to_owned(),
+                        reason: format!(
+                            "requested {name} is missing or not a string in trusted machine-global config"
+                        ),
+                    }
+                })?;
+                if value.contains('\0') {
+                    return Err(DispatchError::InvalidMachineEnvironment {
+                        repository: repository.to_owned(),
+                        reason: format!("requested {name} contains a NUL byte"),
+                    });
+                }
+                validation
+                    .environment
+                    .insert(name.clone(), value.to_owned());
+            }
+        }
+        (ResolvedBackend::HostPool(pool), ResolvedValidation::HostPool) => {
+            for member in &mut pool.members {
+                populate_target_environment(&mut member.target, repository, values)?;
+            }
+        }
+        (ResolvedBackend::Fallback(chain), ResolvedValidation::Fallback) => {
+            for backend in &mut chain.backends {
+                populate_target_environment(&mut backend.target, repository, values)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn sensitive_environment_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.contains("PRIVATE_KEY")
+        || upper.split('_').any(|part| {
+            matches!(
+                part,
+                "TOKEN" | "SECRET" | "PASSWORD" | "PASSPHRASE" | "CREDENTIAL"
+            )
+        })
 }
 
 /// Resolve every configured target from a merged TOML table.
@@ -983,6 +1204,8 @@ fn resolved_local(
         contract,
         prepared_state_enabled: prepared_state_enabled(validation_table),
         allow_tree_drift: bool_value(validation_table, "_allow_tree_drift").unwrap_or(false),
+        machine_environment: string_array(validation_table, "machine_environment"),
+        environment: BTreeMap::new(),
     };
     Ok(ResolvedTarget {
         name: name.to_owned(),
@@ -1959,9 +2182,10 @@ mod tests {
     use toml::Table;
 
     use super::{
-        DispatchError, ResolvedBackend, ResolvedValidation, resolve_targets_for_stage,
-        resolve_targets_from_table,
+        DispatchError, ResolvedBackend, ResolvedValidation, resolve_targets,
+        resolve_targets_for_stage, resolve_targets_from_table,
     };
+    use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::executor::ssh::SshValidation;
     use crate::executor::ssh_windows::WindowsValidation;
     use crate::host_pool::{HostPoolLeaseRequest, HostPoolLeaseStore, default_lease_path};
@@ -1969,6 +2193,198 @@ mod tests {
 
     fn table(input: &str) -> Table {
         input.parse::<Table>().expect("valid TOML")
+    }
+
+    fn initialize_repository(root: &std::path::Path, remote: &str) {
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["remote", "add", "origin", remote])
+            .current_dir(root)
+            .status()
+            .expect("git remote");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn trusted_machine_project_environment_is_injected_into_local_validation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        let project = temp.path().join("repo/.shipyard");
+        std::fs::create_dir_all(&global).expect("global dir");
+        std::fs::create_dir_all(&project).expect("project dir");
+        initialize_repository(
+            project.parent().expect("repo root"),
+            "git@github.com:Generous-Corp/forge.git",
+        );
+        std::fs::write(
+            global.join("config.toml"),
+            r#"[repository_environment."Generous-Corp/forge"]
+PULP_SDK_DIR = "/machine/pulp-sdk"
+FORGE_MODULAR_TOOLCHAIN_ROOT = "/machine/pulp-source"
+"#,
+        )
+        .expect("global config");
+        std::fs::write(
+            project.join("config.toml"),
+            r#"[project]
+name = "forge"
+repository = "Generous-Corp/forge"
+[validation.default]
+command = "true"
+machine_environment = ["PULP_SDK_DIR", "FORGE_MODULAR_TOOLCHAIN_ROOT"]
+[targets.mac]
+backend = "local"
+"#,
+        )
+        .expect("project config");
+        let config =
+            LoadedConfig::load(Some(global), Some(project), None, LocalOverlaySource::None)
+                .expect("loaded config");
+
+        let target = resolve_targets(&config, ValidationMode::Full)
+            .expect("resolved target")
+            .remove(0);
+        let ResolvedValidation::Local(validation) = target.validation else {
+            panic!("expected local validation");
+        };
+        assert_eq!(
+            validation
+                .environment
+                .get("PULP_SDK_DIR")
+                .map(String::as_str),
+            Some("/machine/pulp-sdk")
+        );
+        assert_eq!(
+            validation
+                .environment
+                .get("FORGE_MODULAR_TOOLCHAIN_ROOT")
+                .map(String::as_str),
+            Some("/machine/pulp-source")
+        );
+    }
+
+    #[test]
+    fn project_cannot_supply_or_override_trusted_machine_environment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        let project = temp.path().join("repo/.shipyard");
+        std::fs::create_dir_all(&global).expect("global dir");
+        std::fs::create_dir_all(&project).expect("project dir");
+        initialize_repository(
+            project.parent().expect("repo root"),
+            "https://github.com/Generous-Corp/forge.git",
+        );
+        std::fs::write(
+            global.join("config.toml"),
+            "[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = \"/trusted/sdk\"\n",
+        )
+        .expect("global config");
+        std::fs::write(
+            project.join("config.toml"),
+            r#"[project]
+name = "forge"
+repository = "Generous-Corp/forge"
+[repository_environment."Generous-Corp/forge"]
+PULP_SDK_DIR = "/untrusted/sdk"
+[validation.default]
+command = "true"
+machine_environment = ["PULP_SDK_DIR"]
+[targets.mac]
+backend = "local"
+"#,
+        )
+        .expect("project config");
+        let config =
+            LoadedConfig::load(Some(global), Some(project), None, LocalOverlaySource::None)
+                .expect("loaded config");
+
+        let target = resolve_targets(&config, ValidationMode::Full)
+            .expect("resolved target")
+            .remove(0);
+        let ResolvedValidation::Local(validation) = target.validation else {
+            panic!("expected local validation");
+        };
+        assert_eq!(validation.environment["PULP_SDK_DIR"], "/trusted/sdk");
+    }
+
+    #[test]
+    fn missing_or_malformed_trusted_machine_environment_fails_before_execution() {
+        for global_toml in [
+            "[repository_environment.\"Generous-Corp/other\"]\nPULP_SDK_DIR = \"/sdk\"\n",
+            "[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = 7\n",
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let global = temp.path().join("global");
+            let project = temp.path().join("repo/.shipyard");
+            std::fs::create_dir_all(&global).expect("global dir");
+            std::fs::create_dir_all(&project).expect("project dir");
+            initialize_repository(
+                project.parent().expect("repo root"),
+                "git@github.com:Generous-Corp/forge.git",
+            );
+            std::fs::write(global.join("config.toml"), global_toml).expect("global config");
+            std::fs::write(
+                project.join("config.toml"),
+                "[project]\nname = \"forge\"\nrepository = \"Generous-Corp/forge\"\n[validation.default]\ncommand = \"true\"\nmachine_environment = [\"PULP_SDK_DIR\"]\n[targets.mac]\nbackend = \"local\"\n",
+            )
+            .expect("project config");
+            let config =
+                LoadedConfig::load(Some(global), Some(project), None, LocalOverlaySource::None)
+                    .expect("loaded config");
+
+            let error = resolve_targets(&config, ValidationMode::Full)
+                .expect_err("invalid machine environment must fail closed");
+            assert!(matches!(
+                error,
+                DispatchError::InvalidMachineEnvironment { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn repository_environment_rejects_case_or_alias_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        let project = temp.path().join("repo/.shipyard");
+        std::fs::create_dir_all(&global).expect("global dir");
+        std::fs::create_dir_all(&project).expect("project dir");
+        initialize_repository(
+            project.parent().expect("repo root"),
+            "git@github.com:generous-corp/forge.git",
+        );
+        std::fs::write(
+            global.join("config.toml"),
+            "[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = \"/trusted/sdk\"\n",
+        )
+        .expect("global config");
+        std::fs::write(
+            project.join("config.toml"),
+            "[project]\nname = \"forge\"\nrepository = \"Generous-Corp/forge\"\n[validation.default]\ncommand = \"true\"\nmachine_environment = [\"PULP_SDK_DIR\"]\n[targets.mac]\nbackend = \"local\"\n",
+        )
+        .expect("project config");
+        let config =
+            LoadedConfig::load(Some(global), Some(project), None, LocalOverlaySource::None)
+                .expect("loaded config");
+
+        let error = resolve_targets(&config, ValidationMode::Full)
+            .expect_err("case-confused repository identity must fail closed");
+        assert!(error.to_string().contains("case-sensitive"));
+    }
+
+    #[test]
+    fn repository_environment_names_exclude_secret_bearing_inputs() {
+        assert!(super::sensitive_environment_name("GITHUB_TOKEN"));
+        assert!(super::sensitive_environment_name("SIGNING_PRIVATE_KEY"));
+        assert!(super::sensitive_environment_name("API_PASSWORD"));
+        assert!(!super::sensitive_environment_name("PULP_SDK_DIR"));
+        assert!(!super::sensitive_environment_name(
+            "FORGE_MODULAR_TOOLCHAIN_ROOT"
+        ));
     }
 
     fn toml_string(value: impl AsRef<str>) -> String {

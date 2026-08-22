@@ -1,6 +1,6 @@
 //! Shared subprocess streaming helpers for validation executors.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -78,6 +78,8 @@ pub struct StreamingCommand<'a> {
     pub command: StreamingCommandSpec,
     /// Optional working directory.
     pub cwd: Option<PathBuf>,
+    /// Explicit environment entries applied to the child process.
+    pub environment: BTreeMap<String, String>,
     /// Optional log file path.
     pub log_path: Option<PathBuf>,
     /// Append to the log instead of replacing it.
@@ -107,6 +109,7 @@ impl StreamingCommand<'_> {
         Self {
             command: StreamingCommandSpec::Shell(command.into()),
             cwd: None,
+            environment: std::collections::BTreeMap::new(),
             log_path: None,
             append: false,
             rotated_segments: crate::log_retention::LogRetentionPolicy::default().rotated_segments,
@@ -409,6 +412,7 @@ fn spawn_command(request: &StreamingCommand<'_>) -> Result<ProcessTree, Streamin
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }
+    command.envs(&request.environment);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     Ok(ProcessTree::spawn(&mut command)?)
 }
@@ -628,6 +632,7 @@ mod tests {
         let request = StreamingCommand {
             command: StreamingCommandSpec::Args(Vec::new()),
             cwd: None,
+            environment: std::collections::BTreeMap::new(),
             log_path: None,
             append: false,
             rotated_segments: crate::log_retention::LogRetentionPolicy::default().rotated_segments,
