@@ -2,13 +2,13 @@ use super::{
     CancellationReport, CapacityApplyContext, DateTime, GitHubActions, MergeQueueMutationGuard,
     MutationApplyContext, MutationControl, ObservedPr, PREEMPT_AFTER_SECS, Path, PrReport,
     QueueFrontPressure, RepoObservation, RepoReport, RequiredCheck, RunCancellation,
-    RunCancellationReason, StewardCommandArgs, StewardLedger, StewardPolicy, StewardRun, Utc,
-    acquire_run_mutation_guard, apply_capacity_preemption, attempts_for,
+    RunCancellationReason, StewardCommandArgs, StewardDecision, StewardLedger, StewardPolicy,
+    StewardRun, Utc, acquire_run_mutation_guard, apply_capacity_preemption, attempts_for,
     authoritative_head_still_superseded, classify_pr, coalescing_reason_authorizes,
     current_pull_request_heads, exact_run_still_queued, merge_group_pr_number, mutate_pr,
     opted_out_pull_requests, plan_capacity_preemptions, plan_run_coalescing,
-    pull_request_is_managed, reconcile_management_label, reconcile_recovery_signal, record_audit,
-    revalidate_coalescing_cancellation,
+    pull_request_is_managed, pull_request_provenance_blocked, reconcile_management_label,
+    reconcile_recovery_signal, record_audit, revalidate_coalescing_cancellation,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -26,6 +26,7 @@ pub(super) fn apply_repo_plan(
         native_auto_merge: observation.allow_auto_merge,
         required_checks: observation.required_checks.clone(),
         opt_out_label: args.opt_out_label.clone(),
+        provenance_blocking_labels: args.provenance_blocking_labels.clone(),
         managed_label: Some(args.managed_label.clone()),
         handoff_context: args.handoff_context.clone(),
         max_transient_reruns: args.max_transient_reruns,
@@ -49,6 +50,7 @@ pub(super) fn apply_repo_plan(
             &args.opt_out_label,
             &args.managed_label,
             &args.handoff_context,
+            &args.provenance_blocking_labels,
         );
         planned_cancellations.extend(plan_run_coalescing(
             &observation.runs,
@@ -83,6 +85,7 @@ pub(super) fn apply_repo_plan(
                 &args.opt_out_label,
                 &args.managed_label,
                 &args.handoff_context,
+                &args.provenance_blocking_labels,
                 ledger_path,
                 ledger,
                 mutation_control.expect("apply mode requires mutation control"),
@@ -151,6 +154,15 @@ pub(super) fn apply_pr_plans(
         .map(|pr| {
             let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
             let decision = classify_pr(&pr.fact, policy, &attempts);
+            if matches!(decision, StewardDecision::ProvenanceBlocked { .. }) {
+                return PrReport {
+                    number: pr.fact.number,
+                    head_sha: pr.fact.head_sha.clone(),
+                    decision,
+                    mutation: None,
+                    error: None,
+                };
+            }
             let (mut mutation, mut error) = (None, None);
             if args.apply {
                 let (management_mutation, management_error) = reconcile_management_label(
@@ -239,6 +251,7 @@ pub(super) fn plan_repo_capacity_preemptions(
         &args.opt_out_label,
         &args.managed_label,
         &args.handoff_context,
+        &args.provenance_blocking_labels,
     );
     plan_capacity_preemptions(
         &observation.runs,
@@ -255,6 +268,7 @@ fn excluded_pull_requests(
     opt_out_label: &str,
     managed_label: &str,
     handoff_context: &str,
+    provenance_blocking_labels: &[String],
 ) -> std::collections::BTreeSet<u64> {
     let mut excluded = opted_out_pull_requests(&observation.prs, opt_out_label);
     excluded.extend(
@@ -262,6 +276,13 @@ fn excluded_pull_requests(
             .prs
             .iter()
             .filter(|pr| !pull_request_is_managed(pr, managed_label, handoff_context))
+            .map(|pr| pr.fact.number),
+    );
+    excluded.extend(
+        observation
+            .prs
+            .iter()
+            .filter(|pr| pull_request_provenance_blocked(pr, provenance_blocking_labels))
             .map(|pr| pr.fact.number),
     );
     excluded
@@ -322,6 +343,7 @@ pub(super) fn apply_run_cancellation(
     opt_out_label: &str,
     managed_label: &str,
     handoff_context: &str,
+    provenance_blocking_labels: &[String],
     ledger_path: &Path,
     ledger: &mut StewardLedger,
     mutation_control: &MutationControl,
@@ -340,6 +362,7 @@ pub(super) fn apply_run_cancellation(
                 mutation_control,
                 managed_label,
                 handoff_context,
+                provenance_blocking_labels,
             },
             opt_out_label,
             ledger,
@@ -366,6 +389,7 @@ pub(super) fn apply_run_cancellation(
         opt_out_label,
         managed_label,
         handoff_context,
+        provenance_blocking_labels,
         ledger,
         mutation_control,
     )
@@ -380,6 +404,7 @@ fn apply_superseded_run_cancellation(
     opt_out_label: &str,
     managed_label: &str,
     handoff_context: &str,
+    provenance_blocking_labels: &[String],
     ledger: &mut StewardLedger,
     mutation_control: &MutationControl,
 ) -> (Option<String>, Option<String>) {
@@ -391,6 +416,7 @@ fn apply_superseded_run_cancellation(
         opt_out_label,
         managed_label,
         handoff_context,
+        provenance_blocking_labels,
     ) {
         Ok(false) => (Some("skipped_after_live_revalidation".to_owned()), None),
         Ok(true) => match acquire_final_cancellation_guard(
@@ -401,6 +427,7 @@ fn apply_superseded_run_cancellation(
             opt_out_label,
             managed_label,
             handoff_context,
+            provenance_blocking_labels,
             mutation_control,
         ) {
             Ok(guard) => {
@@ -421,6 +448,7 @@ fn acquire_final_cancellation_guard(
     opt_out_label: &str,
     managed_label: &str,
     handoff_context: &str,
+    provenance_blocking_labels: &[String],
     mutation_control: &MutationControl,
 ) -> Result<MergeQueueMutationGuard, (Option<String>, Option<String>)> {
     let guard = acquire_run_mutation_guard(
@@ -438,6 +466,7 @@ fn acquire_final_cancellation_guard(
         opt_out_label,
         managed_label,
         handoff_context,
+        provenance_blocking_labels,
     ) {
         Ok(false) => {
             return Err(finish_guard_skip(
@@ -462,6 +491,7 @@ fn acquire_final_cancellation_guard(
         opt_out_label,
         managed_label,
         handoff_context,
+        provenance_blocking_labels,
     ) {
         Ok(false) => {
             return Err(finish_guard_skip(

@@ -177,6 +177,49 @@ Profiles work at both levels:
 Switch profiles globally or per-project. `shipyard status` always shows
 which profile is active and exactly where each target will run.
 
+## Trusted per-project machine environment
+
+A tracked repository may name non-secret machine inputs that every fresh
+worktree needs, while each machine supplies its own absolute values. This keeps
+host paths out of git and avoids copying `.shipyard.local` into every worktree.
+
+The repository opts in by name:
+
+```toml
+[project]
+name = "forge"
+repository = "Generous-Corp/forge"
+
+[validation.default]
+machine_environment = ["PULP_SDK_DIR", "FORGE_MODULAR_TOOLCHAIN_ROOT"]
+configure = "cmake -S . -B build -DCMAKE_PREFIX_PATH=\"$PULP_SDK_DIR\""
+```
+
+Each host then supplies absolute paths valid on that host in its trusted machine-global
+`config.toml` (the path printed by `shipyard paths`):
+
+```toml
+[repository_environment."Generous-Corp/forge"]
+PULP_SDK_DIR = "/path/on/this/host/pulp-sdk"
+FORGE_MODULAR_TOOLCHAIN_ROOT = "/path/on/this/host/pulp-source"
+```
+
+Shipyard reads this table only from the machine-global layer and requires the
+declared repository slug to match the canonical GitHub `origin` byte-for-byte.
+A tracked config or checkout-local overlay cannot supply or override the
+values. Relative paths, missing values, non-string values, invalid environment
+names, and malformed machine config fail before validation starts. Resolved values are
+snapshotted into daemon-owned queue requests under Shipyard's protected machine
+state directory so a submitting shell or agent session can exit without
+dropping them.
+
+This surface accepts non-secret machine paths only. Requested names must end in
+`_DIR`, `_FILE`, `_HOME`, `_PATH`, or `_ROOT`; common key, auth, cookie,
+credential, signing, certificate, session, password, secret, and token names
+are rejected even when they have a path-like suffix. Use Shipyard's dedicated
+credential mechanisms for secrets. Changing a machine mapping affects new
+requests; already-queued requests retain their exact submitted snapshot.
+
 ## tartci routing profiles
 
 For local VM fleets, Shipyard can integrate with

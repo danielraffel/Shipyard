@@ -91,6 +91,11 @@ pub struct StewardPolicy {
     pub required_checks: Vec<RequiredCheck>,
     /// Label that opts a PR out of stewardship.
     pub opt_out_label: String,
+    /// Labels that denote unresolved or otherwise non-authoritative PR
+    /// provenance. A matching label denies all steward queue, rerun, and
+    /// cancellation authority until a later live observation proves it was
+    /// removed.
+    pub provenance_blocking_labels: Vec<String>,
     /// Label that explicitly hands a PR to the steward. `None` preserves the
     /// legacy classify-all behavior for library callers; the CLI always sets
     /// this to a concrete label.
@@ -223,6 +228,13 @@ pub enum StewardDecision {
     },
     /// PR explicitly opted out.
     OptedOut,
+    /// Current PR metadata says its provenance is unresolved. The steward may
+    /// observe the PR, but it receives no mutation authority.
+    ProvenanceBlocked {
+        /// Configured blocker labels observed on the current PR, normalized to
+        /// the configured spelling for deterministic reports.
+        labels: Vec<String>,
+    },
     /// Draft PRs are never armed.
     Draft,
     /// Head SHA was malformed; mutation is forbidden.
@@ -274,11 +286,10 @@ pub fn classify_pr(
     policy: &StewardPolicy,
     transient_attempts: &BTreeMap<u64, u32>,
 ) -> StewardDecision {
-    if pr
-        .labels
-        .iter()
-        .any(|label| label.eq_ignore_ascii_case(&policy.opt_out_label))
-    {
+    if let Some(decision) = classify_provenance(pr, policy) {
+        return decision;
+    }
+    if has_pr_label(pr, &policy.opt_out_label) {
         return StewardDecision::OptedOut;
     }
     if let Some(decision) = classify_management(pr, policy) {
@@ -377,6 +388,38 @@ pub fn classify_pr(
             reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
         }
     }
+}
+
+fn has_pr_label(pr: &StewardPullRequest, expected: &str) -> bool {
+    pr.labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(expected))
+}
+
+fn classify_provenance(pr: &StewardPullRequest, policy: &StewardPolicy) -> Option<StewardDecision> {
+    let labels = matching_provenance_blockers(pr, policy);
+    (!labels.is_empty()).then_some(StewardDecision::ProvenanceBlocked { labels })
+}
+
+/// Configured provenance blockers currently attached to a PR.
+///
+/// GitHub label names are case-insensitive. Returning configured spellings
+/// keeps JSON decisions stable even if a hostile or legacy client varies case.
+#[must_use]
+pub fn matching_provenance_blockers(
+    pr: &StewardPullRequest,
+    policy: &StewardPolicy,
+) -> Vec<String> {
+    policy
+        .provenance_blocking_labels
+        .iter()
+        .filter(|blocker| {
+            pr.labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case(blocker))
+        })
+        .cloned()
+        .collect()
 }
 
 fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Option<StewardDecision> {

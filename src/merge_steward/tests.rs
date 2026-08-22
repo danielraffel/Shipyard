@@ -35,6 +35,7 @@ fn queue_policy() -> StewardPolicy {
             app_id: None,
         }],
         opt_out_label: "shipyard:no-auto-merge".to_owned(),
+        provenance_blocking_labels: vec!["5·unresolved".to_owned()],
         managed_label: None,
         handoff_context: "shipyard/steward-handoff".to_owned(),
         max_transient_reruns: 1,
@@ -101,6 +102,66 @@ fn queued_entry_is_authority_even_when_auto_merge_request_is_null() {
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
         StewardDecision::Queued { position: 11 }
     );
+}
+
+#[test]
+fn provenance_blocker_is_case_insensitive_and_precedes_queue_authority() {
+    let mut pr = green_pr();
+    pr.queue_position = Some(11);
+    pr.labels.push("5·UnReSoLvEd".to_owned());
+    let decision = classify_pr(&pr, &queue_policy(), &BTreeMap::new());
+    assert_eq!(
+        decision,
+        StewardDecision::ProvenanceBlocked {
+            labels: vec!["5·unresolved".to_owned()],
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&decision).expect("serialize"),
+        serde_json::json!({
+            "action": "provenance_blocked",
+            "labels": ["5·unresolved"]
+        })
+    );
+}
+
+#[test]
+fn provenance_blocker_precedes_opt_out_with_exact_json() {
+    let mut pr = green_pr();
+    pr.labels
+        .extend(["STEWARD:SKIP".to_owned(), "5·Unresolved".to_owned()]);
+    let decision = classify_pr(&pr, &queue_policy(), &BTreeMap::new());
+    assert_eq!(
+        serde_json::to_value(decision).expect("serialize"),
+        serde_json::json!({
+            "action": "provenance_blocked",
+            "labels": ["5·unresolved"]
+        })
+    );
+}
+
+#[test]
+fn only_a_current_observation_without_the_blocker_regains_authority() {
+    let policy = queue_policy();
+    let mut pr = green_pr();
+    pr.labels.push("5·unresolved".to_owned());
+    assert!(matches!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::ProvenanceBlocked { .. }
+    ));
+
+    pr.labels.clear();
+    assert_eq!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    );
+
+    pr.head_sha = sha('b');
+    pr.labels.push("5·UNRESOLVED".to_owned());
+    assert!(matches!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::ProvenanceBlocked { .. }
+    ));
 }
 
 #[test]

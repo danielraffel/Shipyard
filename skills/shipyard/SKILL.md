@@ -252,6 +252,21 @@ When fixing GitHub importer bugs, keep Actions list endpoints absolute
 query parameters. `gh api -f` defaults to POST, which can turn a valid list
 endpoint into a misleading 404.
 
+## Trusted Project Environment
+
+For a non-secret machine path that every fresh worktree of one project needs,
+prefer the trusted project-environment contract over a copied
+`.shipyard.local` file. The tracked validation declares
+`machine_environment = ["NAME"]` plus an exact `[project].repository` slug;
+names must end in `_DIR`, `_FILE`, `_HOME`, `_PATH`, or `_ROOT`, and
+secret-like names remain rejected even with one of those suffixes. Each host
+supplies `[repository_environment."OWNER/REPO"] NAME = "/absolute/host/path"`
+in the machine-global `config.toml` reported by `shipyard paths`. Shipyard
+rejects missing, malformed, aliased, or case-confused identities before
+execution, ignores tracked attempts to supply values, and snapshots resolved
+values only under its protected machine state for daemon-owned work. Never use
+this table for credentials or signing material.
+
 ## GitHub Auth And Quota
 
 Shipyard's operational GitHub calls can be configured with `[github.auth]`.
@@ -493,6 +508,14 @@ single-worker. On Windows and other platforms where the Unix process-group
 contract is unavailable, these commands retain foreground execution instead of
 pretending the job has durable daemon ownership. Parallel proof, sharding, and
 multi-worker admission are separate work and are not implied by this feature.
+
+The separate artifact transport proof is also default-off. It validates typed
+manifests, exact source/toolchain/cache generations, authenticated chunk-prefix
+resume, space watermarks, and same-root atomic publication, but it does not
+select a host or dispatch a shard. A roaming/offline worker is additive only and
+must be excluded or reassigned without blocking the minimum completion set.
+Follow [`docs/artifact-transport.md`](../../docs/artifact-transport.md) before
+integrating it with a scheduler.
 
 Each worker runs in a separate process group with an unpredictable generation
 receipt. A restarted daemon adopts only a live process whose PID, job id, and
@@ -847,6 +870,14 @@ cannot reset the budget. The built-in capacity preemption preset applies only to
 explicitly advisory Pulp workflows; required workflows and unknown repositories
 are disabled because GitHub cannot bind a cancellation to an atomic job-state
 snapshot.
+
+The case-insensitive `5·unresolved` label is a fail-closed provenance blocker
+by default. A matching current PR reports `provenance_blocked` and receives no
+mutation. Repeat `--provenance-blocking-label <label>` for another repository
+vocabulary; live revalidation must observe the blocker absent before authority
+returns. This decision precedes opt-out, and both same-process and restarted
+force-cancel terminalization re-read the current PR's blocker, opt-out, and
+exact-head management authority before making the final POST.
 
 Stewardship is opt-in per immutable head. Prefer making the receipt atomic with
 PR creation: set `[merge_steward].auto_handoff = true` on the protected base

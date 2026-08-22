@@ -32,10 +32,12 @@ use crate::ship_state::{ShipState, ShipStateStore};
 
 pub(super) mod recovery_worker;
 
+#[derive(Clone)]
 pub(super) struct StewardCommandArgs {
     pub(super) repos: Vec<String>,
     pub(super) base: String,
     pub(super) opt_out_label: String,
+    pub(super) provenance_blocking_labels: Vec<String>,
     pub(super) managed_label: String,
     pub(super) handoff_context: String,
     pub(super) max_transient_reruns: u32,
@@ -141,6 +143,8 @@ struct PendingCancellation {
     mutation_kind: PendingMutationKind,
     reason: String,
     opt_out_label: String,
+    #[serde(default = "default_provenance_blocking_labels")]
+    provenance_blocking_labels: Vec<String>,
     #[serde(default = "default_managed_label")]
     managed_label: String,
     #[serde(default = "default_handoff_context")]
@@ -153,6 +157,10 @@ fn default_managed_label() -> String {
 
 fn default_handoff_context() -> String {
     HANDOFF_CONTEXT.to_owned()
+}
+
+fn default_provenance_blocking_labels() -> Vec<String> {
+    vec![DEFAULT_PROVENANCE_BLOCKING_LABEL.to_owned()]
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +226,7 @@ struct CapacityApplyContext<'a> {
     mutation_control: &'a MutationControl,
     managed_label: &'a str,
     handoff_context: &'a str,
+    provenance_blocking_labels: &'a [String],
 }
 
 const CANCEL_TERMINAL_WAIT: Duration = Duration::from_secs(15);
@@ -225,6 +234,7 @@ const CANCEL_TERMINAL_POLL: Duration = Duration::from_secs(2);
 const PREEMPT_AFTER_SECS: i64 = 900;
 pub(super) const HANDOFF_CONTEXT: &str = "shipyard/steward-handoff";
 pub(super) const MANAGED_LABEL: &str = "shipyard:managed";
+pub(super) const DEFAULT_PROVENANCE_BLOCKING_LABEL: &str = "5·unresolved";
 pub(super) const UNMANAGED_LABEL: &str = "shipyard:unmanaged";
 pub(super) const RECOVERY_CONTEXT: &str = "shipyard/steward-recovery";
 pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
@@ -635,6 +645,7 @@ pub(super) fn admission_clean_command<W: Write>(
             "shipyard:no-auto-merge",
             MANAGED_LABEL,
             HANDOFF_CONTEXT,
+            &default_provenance_blocking_labels(),
             &ledger_path,
             &mut ledger,
             &mutation_control,
@@ -705,7 +716,8 @@ pub(super) fn steward_command<W: Write>(
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let repos = resolve_repos(args.repos.clone(), cwd)?;
+    let (normalized_args, repos) = normalized_steward_args(args, cwd)?;
+    let args = &normalized_args;
     let ledger_path = args
         .ledger
         .clone()
@@ -808,6 +820,40 @@ pub(super) fn steward_command<W: Write>(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn normalized_steward_args(
+    args: &StewardCommandArgs,
+    cwd: &Path,
+) -> Result<(StewardCommandArgs, Vec<String>), CliFailure> {
+    let mut normalized = args.clone();
+    normalized.provenance_blocking_labels =
+        normalize_provenance_blocking_labels(&args.provenance_blocking_labels)?;
+    let repos = resolve_repos(normalized.repos.clone(), cwd)?;
+    Ok((normalized, repos))
+}
+
+fn normalize_provenance_blocking_labels(labels: &[String]) -> Result<Vec<String>, CliFailure> {
+    if labels.is_empty() || labels.len() > 100 {
+        return Err(CliFailure::new(
+            2,
+            "--provenance-blocking-label must contain 1..100 labels",
+        ));
+    }
+    let mut normalized = Vec::with_capacity(labels.len());
+    let mut seen = BTreeSet::new();
+    for raw in labels {
+        let label = raw.trim();
+        let identity = label.to_ascii_lowercase();
+        if label.is_empty() || label.len() > 100 || !seen.insert(identity) {
+            return Err(CliFailure::new(
+                2,
+                "--provenance-blocking-label values must be non-empty, unique, and at most 100 bytes each",
+            ));
+        }
+        normalized.push(label.to_owned());
+    }
+    Ok(normalized)
 }
 
 fn append_unmatched_recovery_errors(
@@ -943,8 +989,9 @@ use cancellation_revalidation::{
     acquire_pr_mutation_guard, acquire_run_mutation_guard, attempts_for,
     authoritative_head_still_superseded, current_pull_request_heads, exact_run_still_queued,
     merge_group_pr_number, opted_out_pull_requests, pull_request_is_managed,
-    pull_request_with_required_checks, pull_request_with_required_checks_before,
-    revalidate_capacity_preemption, revalidate_coalescing_cancellation,
+    pull_request_provenance_blocked, pull_request_with_required_checks,
+    pull_request_with_required_checks_before, revalidate_capacity_preemption,
+    revalidate_coalescing_cancellation, revalidate_pending_pr_authority,
 };
 use cancellation_terminalization::{
     acquire_pending_cancellation_guard, active_runner_targets, clear_pending_cancellation,

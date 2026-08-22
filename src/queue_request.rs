@@ -35,7 +35,8 @@ use crate::ship_state::ShipState;
 use crate::warm_pool::{is_backend_eligible, warm_host_key};
 
 /// Current queued-execution schema.
-pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 1;
+pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 2;
+const LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 1;
 const MAX_SHIP_POST_VALIDATION_DETAIL_BYTES: usize = 1_200;
 
 /// Durable submitter ownership. Running ownership is derived by admitting
@@ -128,6 +129,7 @@ impl QueueRequestStore {
     pub fn new(state_dir: impl Into<PathBuf>) -> io::Result<Self> {
         let path = state_dir.into().join("queue").join("requests");
         fs::create_dir_all(&path)?;
+        protect_request_directory(&path)?;
         Ok(Self { path })
     }
 
@@ -166,7 +168,9 @@ impl QueueRequestStore {
 
     /// Load one request envelope.
     pub fn load(&self, job_id: &str) -> QueueRequestResult<Option<QueuedExecutionEnvelope>> {
-        read_versioned_json(&self.path_for(job_id))
+        read_versioned_json(&self.path_for(job_id))?
+            .map(upgrade_legacy_request)
+            .transpose()
     }
 
     /// Delete one request envelope, if present.
@@ -186,7 +190,7 @@ impl QueueRequestStore {
                 continue;
             }
             if let Some(envelope) = read_versioned_json(&path)? {
-                envelopes.push(envelope);
+                envelopes.push(upgrade_legacy_request(envelope)?);
             }
         }
         envelopes.sort_by_key(|envelope| envelope.created_at);
@@ -535,7 +539,13 @@ impl ExecutionProvenance {
 }
 
 fn config_signature(config: &LoadedConfig) -> Option<String> {
-    let serialized = toml::to_string(&config.data).ok()?;
+    // Queue snapshots already persist the resolved repository environment in
+    // each target. Excluding the mutable machine-global source table lets a
+    // delayed worker execute that immutable snapshot while every other policy
+    // change remains fenced by this signature.
+    let mut signed = config.data.clone();
+    signed.remove("repository_environment");
+    let serialized = toml::to_string(&signed).ok()?;
     Some(hex::encode(Sha256::digest(serialized.as_bytes())))
 }
 
@@ -1236,7 +1246,14 @@ impl From<&ResolvedValidation> for QueuedValidationSnapshot {
 #[must_use]
 pub fn validation_contract_digest(target: &ResolvedTarget) -> Option<String> {
     let build_type = target.validation_build_type.as_deref()?;
-    let validation = QueuedValidationSnapshot::from(&target.validation);
+    let mut validation = QueuedValidationSnapshot::from(&target.validation);
+    if let QueuedValidationSnapshot::Local(local) = &mut validation {
+        // Contract identity is portable across eligible hosts: requested
+        // variable names are policy, while resolved absolute values are a
+        // machine-local execution snapshot. Prepared-state reuse binds the
+        // values separately at execution time.
+        local.environment.clear();
+    }
     let payload = serde_json::to_vec(&(build_type, validation)).ok()?;
     Some(format!("{:x}", Sha256::digest(payload)))
 }
@@ -1254,6 +1271,12 @@ pub struct QueuedLocalValidation {
     pub prepared_state_enabled: bool,
     /// Suppress staged working-tree drift detection.
     pub allow_tree_drift: bool,
+    /// Names requested from the trusted machine-global project environment.
+    #[serde(default)]
+    pub machine_environment: Vec<String>,
+    /// Resolved trusted values snapshotted for daemon-owned execution.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 impl From<&LocalValidationConfig> for QueuedLocalValidation {
@@ -1264,6 +1287,8 @@ impl From<&LocalValidationConfig> for QueuedLocalValidation {
             contract: validation.contract.as_ref().map(QueuedContract::from),
             prepared_state_enabled: validation.prepared_state_enabled,
             allow_tree_drift: validation.allow_tree_drift,
+            machine_environment: validation.machine_environment.clone(),
+            environment: validation.environment.clone(),
         }
     }
 }
@@ -1633,6 +1658,8 @@ fn restore_validation(validation: &QueuedValidationSnapshot) -> ResolvedValidati
                 contract: validation.contract.as_ref().map(restore_contract),
                 prepared_state_enabled: validation.prepared_state_enabled,
                 allow_tree_drift: validation.allow_tree_drift,
+                machine_environment: validation.machine_environment.clone(),
+                environment: validation.environment.clone(),
             })
         }
         QueuedValidationSnapshot::Ssh {
@@ -1806,6 +1833,19 @@ fn normalized_path_claim(path: &Path) -> String {
         .into_owned()
 }
 
+#[cfg(unix)]
+fn protect_request_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep one fallible cross-platform protection contract.
+fn protect_request_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> QueueRequestResult<()> {
     let Some(parent) = path.parent() else {
         return Err(QueueRequestError::Io(io::Error::new(
@@ -1842,6 +1882,16 @@ fn read_versioned_json<T>(path: &Path) -> QueueRequestResult<Option<T>>
 where
     T: for<'de> Deserialize<'de>,
 {
+    read_versioned_json_through(path, QUEUED_EXECUTION_SCHEMA_VERSION)
+}
+
+fn read_versioned_json_through<T>(
+    path: &Path,
+    maximum_supported_version: u32,
+) -> QueueRequestResult<Option<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1855,10 +1905,55 @@ where
         .transpose()
         .map_err(|_| QueueRequestError::UnsupportedSchema { version: u32::MAX })?
         .unwrap_or_default();
-    if version != QUEUED_EXECUTION_SCHEMA_VERSION {
+    if !(LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION..=maximum_supported_version).contains(&version) {
         return Err(QueueRequestError::UnsupportedSchema { version });
     }
     Ok(Some(serde_json::from_value(value)?))
+}
+
+fn upgrade_legacy_request(
+    mut envelope: QueuedExecutionEnvelope,
+) -> QueueRequestResult<QueuedExecutionEnvelope> {
+    if envelope.schema_version == QUEUED_EXECUTION_SCHEMA_VERSION {
+        return Ok(envelope);
+    }
+    if envelope.schema_version != LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION {
+        return Err(QueueRequestError::UnsupportedSchema {
+            version: envelope.schema_version,
+        });
+    }
+    let targets = match &envelope.request {
+        QueuedExecutionRequest::Run(request) => &request.targets,
+        QueuedExecutionRequest::Ship(request) => &request.targets,
+    };
+    if targets.iter().any(target_has_trusted_environment) {
+        return Err(invalid_snapshot(
+            "legacy v1 request contains v2 trusted-environment fields",
+        ));
+    }
+    envelope.schema_version = QUEUED_EXECUTION_SCHEMA_VERSION;
+    Ok(envelope)
+}
+
+fn target_has_trusted_environment(target: &QueuedResolvedTarget) -> bool {
+    if matches!(
+        &target.validation,
+        QueuedValidationSnapshot::Local(validation)
+            if !validation.machine_environment.is_empty() || !validation.environment.is_empty()
+    ) {
+        return true;
+    }
+    match &target.backend {
+        QueuedBackendSnapshot::HostPool(pool) => pool
+            .members
+            .iter()
+            .any(|member| target_has_trusted_environment(&member.target)),
+        QueuedBackendSnapshot::Fallback(chain) => chain
+            .backends
+            .iter()
+            .any(|backend| target_has_trusted_environment(&backend.target)),
+        _ => false,
+    }
 }
 
 fn delete_if_present(path: &Path) -> QueueRequestResult<bool> {
@@ -2013,6 +2108,18 @@ mod tests {
             .validate_with_config(&repo, &original)
             .expect("unchanged config");
 
+        std::fs::write(
+            global.join("config.toml"),
+            "[queue]\nmax_workers = 2\n[repository_environment.\"Generous-Corp/forge\"]\nPULP_SDK_DIR = \"/new/sdk\"\n",
+        )
+        .expect("repository environment drift");
+        let repository_environment_changed =
+            LoadedConfig::load(Some(global.clone()), None, None, LocalOverlaySource::None)
+                .expect("changed repository environment");
+        provenance
+            .validate_with_config(&repo, &repository_environment_changed)
+            .expect("queued snapshot owns resolved repository environment");
+
         std::fs::write(global.join("config.toml"), "[queue]\nmax_workers = 3\n")
             .expect("config drift");
         let changed = LoadedConfig::load(Some(global), None, None, LocalOverlaySource::None)
@@ -2049,6 +2156,11 @@ mod tests {
                 contract: None,
                 prepared_state_enabled: true,
                 allow_tree_drift: false,
+                machine_environment: vec!["PULP_SDK_DIR".to_owned()],
+                environment: BTreeMap::from([(
+                    "PULP_SDK_DIR".to_owned(),
+                    "/machine/pulp-sdk".to_owned(),
+                )]),
             }),
             failure_parser: Some("auto".to_owned()),
         }
@@ -2194,6 +2306,108 @@ mod tests {
         assert_eq!(loaded.kind, QueuedExecutionKind::Run);
         assert!(matches!(loaded.request, QueuedExecutionRequest::Run(_)));
         assert_eq!(loaded.to_run_request().expect("restore run"), run_request());
+    }
+
+    #[test]
+    fn current_reader_safely_upgrades_a_legacy_v1_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-v1", "/work/repo", &run_request());
+        let mut value = serde_json::to_value(envelope).expect("serialize request");
+        value["schema_version"] = json!(1);
+        let validation = value
+            .pointer_mut("/request/targets/0/validation")
+            .and_then(Value::as_object_mut)
+            .expect("local validation snapshot");
+        validation.remove("machine_environment");
+        validation.remove("environment");
+        std::fs::write(
+            store.path_for("job-v1"),
+            serde_json::to_vec_pretty(&value).expect("encode v1"),
+        )
+        .expect("write v1");
+
+        let loaded = store.load("job-v1").expect("load v1").expect("present");
+
+        assert_eq!(loaded.schema_version, QUEUED_EXECUTION_SCHEMA_VERSION);
+        let request = loaded.to_run_request().expect("restore v1");
+        let ResolvedValidation::Local(validation) = &request.targets[0].validation else {
+            panic!("expected local validation");
+        };
+        assert!(validation.machine_environment.is_empty());
+        assert!(validation.environment.is_empty());
+    }
+
+    #[test]
+    fn downgraded_v1_request_cannot_smuggle_v2_trusted_environment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope = QueuedExecutionEnvelope::from_run_request(
+            "job-downgraded",
+            "/work/repo",
+            &run_request(),
+        );
+        let mut value = serde_json::to_value(envelope).expect("serialize request");
+        value["schema_version"] = json!(1);
+        std::fs::write(
+            store.path_for("job-downgraded"),
+            serde_json::to_vec_pretty(&value).expect("encode downgraded v1"),
+        )
+        .expect("write downgraded v1");
+
+        let error = store
+            .load("job-downgraded")
+            .expect_err("v1 must not carry v2 trusted environment");
+
+        assert!(matches!(error, QueueRequestError::InvalidSnapshot { .. }));
+        assert!(error.to_string().contains("v2 trusted-environment"));
+    }
+
+    #[test]
+    fn legacy_v1_reader_rejects_current_v2_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-v2", "/work/repo", &run_request());
+        store.save(&envelope).expect("save v2");
+
+        let error = super::read_versioned_json_through::<QueuedExecutionEnvelope>(
+            &store.path_for("job-v2"),
+            1,
+        )
+        .expect_err("v1 reader must reject v2");
+
+        assert!(matches!(
+            error,
+            QueueRequestError::UnsupportedSchema { version: 2 }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_store_keeps_snapshots_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-private", "/work/repo", &run_request());
+
+        store.save_durable(&envelope).expect("save durable");
+
+        let directory_mode = std::fs::metadata(store.path())
+            .expect("request directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let request_mode = std::fs::metadata(store.path_for("job-private"))
+            .expect("request metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(request_mode, 0o600);
     }
 
     #[test]

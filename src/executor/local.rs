@@ -179,6 +179,10 @@ pub struct LocalValidationConfig {
     pub prepared_state_enabled: bool,
     /// Suppress staged working-tree drift detection.
     pub allow_tree_drift: bool,
+    /// Names requested from the trusted machine-global project environment.
+    pub machine_environment: Vec<String>,
+    /// Resolved trusted environment values applied to every validation stage.
+    pub environment: BTreeMap<String, String>,
 }
 
 /// Request for one local validation run.
@@ -264,6 +268,7 @@ impl LocalExecutor {
         );
         let context = LocalRunContext {
             target: &request.target,
+            environment: &request.validation.environment,
             log_path: &request.log_path,
             started_at,
             start_time,
@@ -318,6 +323,7 @@ impl LocalExecutor {
     ) -> TargetResult {
         let mut request = StreamingCommand::shell(command);
         request.cwd.clone_from(&context.target.cwd);
+        request.environment.clone_from(context.environment);
         request.log_path = Some(context.log_path.to_path_buf());
         request.rotated_segments = self.rotated_segments;
         request.timeout = Some(context.target.timeout());
@@ -357,7 +363,13 @@ impl LocalExecutor {
             .iter()
             .map(|stage| (stage.stage.clone(), stage.command.clone()))
             .collect::<Vec<_>>();
-        let config_hash = hash_stage_commands(&stage_pairs);
+        let mut prepared_state_inputs = stage_pairs.clone();
+        prepared_state_inputs.extend(validation.environment.iter().map(|(name, value)| {
+            // The NUL-prefixed namespace cannot collide with configured stage
+            // names and keeps resolved values out of the persisted record.
+            (format!("\0environment:{name}"), value.clone())
+        }));
+        let config_hash = hash_stage_commands(&prepared_state_inputs);
         let store = validation
             .prepared_state_enabled
             .then_some(self.prepared_state_store.as_ref())
@@ -451,6 +463,7 @@ impl LocalExecutor {
             let stage_run = {
                 let mut request = StreamingCommand::shell(command);
                 request.cwd.clone_from(&context.target.cwd);
+                request.environment.clone_from(context.environment);
                 request.log_path = Some(context.log_path.to_path_buf());
                 request.append = true;
                 request.timeout = Some(context.target.timeout());
@@ -567,6 +580,7 @@ struct RunIdentity<'a> {
 
 struct LocalRunContext<'a> {
     target: &'a LocalTargetConfig,
+    environment: &'a BTreeMap<String, String>,
     log_path: &'a Path,
     started_at: DateTime<Utc>,
     start_time: Instant,
@@ -1045,6 +1059,27 @@ mod tests {
     }
 
     #[test]
+    fn local_validation_applies_explicit_environment_to_every_stage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let validation = LocalValidationConfig {
+            stages: stage_map(&[
+                ("configure", "test \"$SHIPYARD_TEST_MACHINE_ENV\" = exact"),
+                ("test", "test \"$SHIPYARD_TEST_MACHINE_ENV\" = exact"),
+            ]),
+            environment: BTreeMap::from([(
+                "SHIPYARD_TEST_MACHINE_ENV".to_owned(),
+                "exact".to_owned(),
+            )]),
+            ..LocalValidationConfig::default()
+        };
+
+        let result =
+            LocalExecutor::default().validate(request(temp.path().join("run.log"), validation));
+
+        assert_eq!(result.status, TargetStatus::Pass);
+    }
+
+    #[test]
     fn local_single_command_without_marker_fails_when_enforced() {
         let temp = tempfile::tempdir().expect("tempdir");
         let validation = LocalValidationConfig {
@@ -1228,6 +1263,20 @@ mod tests {
         let second_log = std::fs::read_to_string(temp.path().join("second.log")).expect("log");
         assert!(second_log.contains("prepared-state-reuse: skipped"));
         assert!(second_log.contains("setup, build, test"));
+
+        let mut changed_environment = LocalValidationConfig {
+            stages,
+            prepared_state_enabled: true,
+            ..LocalValidationConfig::default()
+        };
+        changed_environment
+            .environment
+            .insert("PULP_SDK_DIR".to_owned(), "/new/sdk".to_owned());
+        let third_log_path = temp.path().join("third.log");
+        let third = executor.validate(request(third_log_path.clone(), changed_environment));
+        assert_eq!(third.status, TargetStatus::Pass);
+        let third_log = std::fs::read_to_string(third_log_path).expect("log");
+        assert!(!third_log.contains("prepared-state-reuse: skipped"));
     }
 
     #[test]
