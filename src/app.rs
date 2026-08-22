@@ -346,7 +346,7 @@ fn dispatch<W: Write, E: Write>(
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
             return changed_surface_plan_command(
-                ChangedSurfacePlanArgs { target, pr, repo },
+                &ChangedSurfacePlanArgs { target, pr, repo },
                 &config,
                 &cwd,
                 &runtime_paths.state_dir,

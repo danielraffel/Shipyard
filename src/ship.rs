@@ -13,7 +13,7 @@ use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
@@ -756,6 +756,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
             defer_host_pool_lease_unavailable,
             reclassify_vitals_path: reclassify_vitals_path.as_deref(),
             transient_retry,
+            config: Some(config),
         },
     )?
     .into_completed()?;
@@ -1064,6 +1065,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
             defer_host_pool_lease_unavailable,
             reclassify_vitals_path: reclassify_vitals_path.as_deref(),
             transient_retry,
+            config: Some(config),
         },
     )?
     .into_completed()?;
@@ -2058,6 +2060,18 @@ struct TargetExecOptions<'a> {
     reclassify_vitals_path: Option<&'a Path>,
     /// Same-backend retry budget for transient local `INFRA` blips (default off).
     transient_retry: crate::ship_retry::TransientRetryPolicy,
+    /// Proven worker configuration used by throttled exact-head cancellation.
+    config: Option<&'a LoadedConfig>,
+}
+
+fn stale_head_reason(queued_head: &str, live_head: &str) -> Option<String> {
+    let is_sha =
+        |value: &str| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    (is_sha(queued_head) && is_sha(live_head) && queued_head != live_head).then(|| {
+        format!(
+            "PR head changed from queued {queued_head} to {live_head}; cancelling stale validation"
+        )
+    })
 }
 
 // The per-target retry loop keeps the cancellation-sensitive dispatch +
@@ -2101,6 +2115,7 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
         // base log path — byte-identical to the non-retry behavior.
         let mut attempt: u32 = 0;
         let mut prior_transient: Vec<String> = Vec::new();
+        let mut last_head_check: Option<Instant> = None;
         let result = loop {
             let attempt_log_path = retry_attempt_log_path(&base_log_path, attempt);
             job = job.with_result(running_result(
@@ -2134,6 +2149,37 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
                         Err(error) => {
                             let reason = error.to_string();
                             progress_error = Some(error);
+                            return ProgressAction::Terminate(reason);
+                        }
+                    }
+                    if let Some(config) = options.config
+                        && request.pr != 0
+                        && !request.repo.is_empty()
+                        && last_head_check
+                            .is_none_or(|last| last.elapsed() >= Duration::from_mins(1))
+                    {
+                        last_head_check = Some(Instant::now());
+                        if let Ok((live_head, _)) =
+                            crate::reconcile::fetch_head_and_status_check_rollup_with_config(
+                                config,
+                                options.cwd,
+                                &request.repo,
+                                request.pr,
+                            )
+                            && let Some(reason) = stale_head_reason(&request.sha, &live_head)
+                        {
+                            match queue.request_cancel(&job.id, Some(reason.clone())) {
+                                Ok(Some(cancelled)) => {
+                                    progress_cancelled = Some(cancelled);
+                                }
+                                Ok(None) => {
+                                    progress_error =
+                                        Some(ShipExecutionError::MissingQueuedJob(job.id.clone()));
+                                }
+                                Err(error) => {
+                                    progress_error = Some(ShipExecutionError::Queue(error));
+                                }
+                            }
                             return ProgressAction::Terminate(reason);
                         }
                     }
@@ -2765,7 +2811,7 @@ mod tests {
         execute_ship_worker, execute_targets_with_options,
         leases_not_covered_by_running_reservations, load_run_outcome, load_ship_outcome,
         recover_foreground_running_jobs_for_drain, retry_attempt_log_path, run_drain_worker_cycle,
-        submit_run, submit_ship, target_log_path, update_warm_pool_after_run,
+        stale_head_reason, submit_run, submit_ship, target_log_path, update_warm_pool_after_run,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::EvidenceStore;
@@ -2782,6 +2828,21 @@ mod tests {
     use crate::queue_scheduler::{AdmitPassPlan, RequestBackedAdmitPass, SamePrShipAdmission};
     use crate::ship_state::{AbandonRecord, ShipState, ShipStateStore};
     use crate::warm_pool::{PoolEntry, WarmPool};
+
+    #[test]
+    fn exact_head_monitor_only_cancels_real_sha_drift() {
+        let queued = "a".repeat(40);
+        let live = "b".repeat(40);
+        assert_eq!(stale_head_reason(&queued, &queued), None);
+        assert_eq!(stale_head_reason(&queued, ""), None);
+        assert_eq!(stale_head_reason(&queued, "malformed"), None);
+        assert_eq!(
+            stale_head_reason(&queued, &live),
+            Some(format!(
+                "PR head changed from queued {queued} to {live}; cancelling stale validation"
+            ))
+        );
+    }
 
     fn table(input: &str) -> Table {
         input.parse::<Table>().expect("valid TOML")
@@ -4730,6 +4791,7 @@ mod tests {
                 defer_host_pool_lease_unavailable: true,
                 reclassify_vitals_path: None,
                 transient_retry: crate::ship_retry::TransientRetryPolicy::disabled(),
+                config: None,
             },
         )
         .expect("targets");
@@ -5603,6 +5665,7 @@ mod tests {
                 defer_host_pool_lease_unavailable: false,
                 reclassify_vitals_path: None,
                 transient_retry: policy,
+                config: None,
             },
         )
         .expect("targets");
@@ -5847,6 +5910,7 @@ mod tests {
                 defer_host_pool_lease_unavailable: true,
                 reclassify_vitals_path: None,
                 transient_retry: crate::ship_retry::TransientRetryPolicy::with_max_retries(2),
+                config: None,
             },
         )
         .expect("targets");

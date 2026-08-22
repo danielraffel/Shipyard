@@ -1072,6 +1072,11 @@ resumed or warm-reused stage execution for the full required contract. Never
 substitute full Debug for a Release-only installed-SDK
 family or treat historical Release evidence as sufficient. See
 [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
+The optional POSIX execution canary is independently machine-global and
+default-off. `shadow_compare` runs the selected command before the full suite,
+returns the full result, and persists comparison evidence; `authoritative`
+requires a separate graduation review. Repository and local overlay config
+cannot activate either mode.
 
 Schema v2 has a default-off promotion contract for controlled local POSIX
 canaries. A bounded command is eligible only after Shipyard re-derives the

@@ -85,6 +85,12 @@ provenance is captured, and prepared-state reuse must be disabled. Without a
 fresh, non-resumed execution of the full contract the plan is policy-blocked,
 not redirected into a known-incompatible full Debug run.
 See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
+Bounded execution remains machine-global default-off. For a controlled canary,
+use `changed_surface_execution.mode = "shadow_compare"` in trusted global
+config; the repository cannot enable it, the queued command is exact-bound,
+and the repository adapter must keep the full result authoritative while
+writing selected-vs-full receipts. Do not use `authoritative` without reviewed
+graduation evidence.
 
 The selector library also understands a schema-v2, protected-base
 `execution` declaration for a future controlled promotion. It remains inert
