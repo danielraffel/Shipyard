@@ -65,6 +65,69 @@ class GuardianLifecycleTests(unittest.TestCase):
                 fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
             self.assertFalse(guardian._exclusive_lock_is_contended(path))
 
+    def test_finalize_wait_accepts_a_transient_production_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "writer.lock"
+            with contextlib.ExitStack() as stack:
+                holders = stack.enter_context(
+                    mock.patch.object(
+                        guardian,
+                        "_lock_holders",
+                        side_effect=[(4242,), (4242,), (4242,), (4242,)],
+                    )
+                )
+                contention = stack.enter_context(
+                    mock.patch.object(
+                        guardian,
+                        "_exclusive_lock_is_contended",
+                        side_effect=[True, False, False, False],
+                    )
+                )
+                stack.enter_context(mock.patch.object(guardian.time, "sleep"))
+                guardian._wait_for_idle_writer_domain(path, 4242)
+
+            self.assertEqual(holders.call_count, 4)
+            self.assertEqual(contention.call_count, 4)
+
+    def test_finalize_wait_rejects_a_retained_lifetime_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "writer.lock"
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_lock_holders", return_value=(4242,)
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_exclusive_lock_is_contended", return_value=True
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian.time, "monotonic", side_effect=[0.0, 11.0]
+                    )
+                )
+                stack.enter_context(mock.patch.object(guardian.time, "sleep"))
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "retained the writer-domain lock"
+                ):
+                    guardian._wait_for_idle_writer_domain(path, 4242)
+
+    def test_finalize_wait_rejects_a_foreign_holder_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "writer.lock"
+            with mock.patch.object(
+                guardian, "_lock_holders", return_value=(4242, 7331)
+            ), mock.patch.object(
+                guardian, "_exclusive_lock_is_contended"
+            ) as contention:
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "foreign process entered"
+                ):
+                    guardian._wait_for_idle_writer_domain(path, 4242)
+            contention.assert_not_called()
+
     def test_post_cutover_idle_daemon_selects_preserve_and_fence_path(self) -> None:
         for holders in [(), (4242,)]:
             with self.subTest(holders=holders):
