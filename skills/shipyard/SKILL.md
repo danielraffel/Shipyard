@@ -90,7 +90,8 @@ use `changed_surface_execution.mode = "shadow_compare"` in trusted global
 config; the repository cannot enable it, the queued command is exact-bound,
 and the repository adapter must keep the full result authoritative while
 writing selected-vs-full receipts. Do not use `authoritative` without reviewed
-graduation evidence.
+graduation evidence and a machine-global `accepted_shadow_policy_digest` that
+exactly matches the protected plan.
 
 The selector library also understands a schema-v2, protected-base
 `execution` declaration for a future controlled promotion. It remains inert

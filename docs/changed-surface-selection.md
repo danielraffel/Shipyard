@@ -197,14 +197,20 @@ This declaration is permission, not activation. Shipyard loads
 protected command into the durable queue request with a trusted result
 directory and tells the repository adapter to run selected then full; the full
 result remains authoritative. `authoritative` omits the full comparison and is
-reserved for a separately reviewed graduation after comparison evidence.
+reserved for a separately reviewed graduation after comparison evidence. It
+also requires machine-global `accepted_shadow_policy_digest` to match the exact
+protected policy digest; changing only `mode` cannot bypass shadow review.
 
 Only a staged local POSIX target with an exact `test` stage is eligible. The
 plan binds the exact PR head/tree, protected base, changed paths, selector
 policy, original validation contract, protected workflow, selection receipt,
-and expanded command. Shipyard persists that activation without overwrite
-before enqueue; the queued target snapshot carries the same command. Full,
-blocked, ambiguous, oversized, incompatible, and unsupported plans preserve the
-ordinary full suite. While a target runs, Shipyard checks the live PR head at a
+and expanded command. Shipyard persists that activation without overwrite and
+syncs its file and containing directory before enqueue; the queued target
+snapshot carries the same command. Full, ambiguous, oversized, incompatible,
+unsupported, and observation-failure plans preserve the ordinary full suite
+and append a bounded diagnostic. A typed blocked plan may still stop instead of
+executing a known-incompatible suite. Receipt path components include a digest
+of their canonical identity, so values such as `a/b` and `a_b` cannot alias.
+While a target runs, Shipyard checks the live PR head at a
 bounded interval and durably requests cancellation when it no longer matches
 the queued SHA; transient head-query failures do not manufacture cancellation.
