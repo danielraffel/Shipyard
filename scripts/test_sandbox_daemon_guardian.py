@@ -66,10 +66,12 @@ class GuardianLifecycleTests(unittest.TestCase):
             self.assertFalse(guardian._exclusive_lock_is_contended(path))
 
     def test_post_cutover_idle_daemon_selects_preserve_and_fence_path(self) -> None:
-        self.assertEqual(
-            guardian._select_transition(4242, (), False),
-            guardian.CORRECTED_TRANSITION,
-        )
+        for holders in [(), (4242,)]:
+            with self.subTest(holders=holders):
+                self.assertEqual(
+                    guardian._select_transition(4242, holders, False),
+                    guardian.CORRECTED_TRANSITION,
+                )
 
     def test_post_cutover_preflight_never_stops_idle_corrected_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -112,7 +114,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                     mock.patch.object(guardian, "_active_runs", return_value=())
                 )
                 stack.enter_context(
-                    mock.patch.object(guardian, "_lock_holders", return_value=())
+                    mock.patch.object(guardian, "_lock_holders", return_value=(4242,))
                 )
                 stack.enter_context(
                     mock.patch.object(
@@ -135,8 +137,8 @@ class GuardianLifecycleTests(unittest.TestCase):
 
     def test_post_cutover_ambiguous_lock_state_fails_closed(self) -> None:
         for holders, contended in [
-            ((4242,), False),
             ((), True),
+            ((7331,), False),
             ((7331,), True),
             ((4242, 7331), True),
         ]:

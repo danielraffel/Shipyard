@@ -93,7 +93,11 @@ struct ActivationReceipt<'a> {
     schema_version: u32,
     machine_mode: MachineMode,
     plan: &'a crate::changed_surface::AuthoritativeExecutionPlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_build_command_sha256: Option<String>,
     original_test_command_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    substituted_build_command_sha256: Option<String>,
     substituted_test_command_sha256: String,
 }
 
@@ -118,6 +122,7 @@ pub(super) fn apply_changed_surface_execution(
     state_dir: &Path,
     repo: &str,
     pr: Option<u64>,
+    resume_from: Option<&str>,
     targets: &mut [ResolvedTarget],
 ) -> Result<(), CliFailure> {
     let machine = MachinePolicy::from_global(config)?;
@@ -297,11 +302,48 @@ pub(super) fn apply_changed_surface_execution(
             )?;
             continue;
         }
-        let original = validation
+        if resume_bypasses_selected_transaction(&plan.stage, resume_from) {
+            persist_fallback_diagnostic(
+                &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
+                &FallbackDiagnostic {
+                    schema_version: 1,
+                    repository: repo,
+                    pull_request: pr,
+                    target: &target.name,
+                    machine_mode: machine.mode,
+                    category: "resume_bypasses_selected_transaction",
+                    diagnostic: "resume-from test would skip the selected build-and-test transaction; preserving the original validation stages"
+                        .to_owned(),
+                },
+            )?;
+            continue;
+        }
+        let original_test = validation
             .stages
             .get("test")
             .expect("checked local test stage")
             .clone();
+        let original_build = if plan.stage == "build_and_test" {
+            let Some(build) = validation.stages.get("build").cloned() else {
+                persist_fallback_diagnostic(
+                    &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
+                    &FallbackDiagnostic {
+                        schema_version: 1,
+                        repository: repo,
+                        pull_request: pr,
+                        target: &target.name,
+                        machine_mode: machine.mode,
+                        category: "full_fallback",
+                        diagnostic: "selected build-and-test requires a canonical build stage; preserving the original validation stages"
+                            .to_owned(),
+                    },
+                )?;
+                continue;
+            };
+            Some(build)
+        } else {
+            None
+        };
         let result_dir = result_dir(state_dir, repo, pr, &plan.head_sha, &target.name);
         let compare = if machine.mode == MachineMode::ShadowCompare {
             "1"
@@ -317,17 +359,34 @@ pub(super) fn apply_changed_surface_execution(
         persist_activation(
             &result_dir,
             &ActivationReceipt {
-                schema_version: 1,
+                schema_version: u32::from(plan.stage == "build_and_test") + 1,
                 machine_mode: machine.mode,
                 plan: &plan,
-                original_test_command_sha256: sha256(original.as_bytes()),
-                substituted_test_command_sha256: sha256(substituted.as_bytes()),
+                original_build_command_sha256: original_build
+                    .as_ref()
+                    .map(|command| sha256(command.as_bytes())),
+                original_test_command_sha256: sha256(original_test.as_bytes()),
+                substituted_build_command_sha256: (plan.stage == "build_and_test")
+                    .then(|| sha256(substituted.as_bytes())),
+                substituted_test_command_sha256: sha256(
+                    if plan.stage == "build_and_test" {
+                        ":"
+                    } else {
+                        &substituted
+                    }
+                    .as_bytes(),
+                ),
             },
         )?;
         let ResolvedValidation::Local(validation) = &mut target.validation else {
             unreachable!();
         };
-        validation.stages.insert("test".to_owned(), substituted);
+        if plan.stage == "build_and_test" {
+            validation.stages.insert("build".to_owned(), substituted);
+            validation.stages.insert("test".to_owned(), ":".to_owned());
+        } else {
+            validation.stages.insert("test".to_owned(), substituted);
+        }
     }
     Ok(())
 }
@@ -466,6 +525,10 @@ fn bounded_diagnostic(value: &str) -> String {
     value.chars().take(MAX_DIAGNOSTIC_CHARS).collect()
 }
 
+fn resume_bypasses_selected_transaction(plan_stage: &str, resume_from: Option<&str>) -> bool {
+    plan_stage == "build_and_test" && resume_from == Some("test")
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -474,7 +537,7 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic, path_component,
-        persist_fallback_diagnostic, shell_quote,
+        persist_fallback_diagnostic, resume_bypasses_selected_transaction, shell_quote,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::fs;
@@ -590,5 +653,22 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn resume_after_build_cannot_activate_combined_selected_transaction() {
+        assert!(resume_bypasses_selected_transaction(
+            "build_and_test",
+            Some("test")
+        ));
+        assert!(!resume_bypasses_selected_transaction(
+            "build_and_test",
+            Some("build")
+        ));
+        assert!(!resume_bypasses_selected_transaction(
+            "build_and_test",
+            None
+        ));
+        assert!(!resume_bypasses_selected_transaction("test", Some("test")));
     }
 }

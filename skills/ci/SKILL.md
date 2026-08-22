@@ -1091,7 +1091,8 @@ substitute full Debug for a Release-only installed-SDK
 family or treat historical Release evidence as sufficient. See
 [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 The optional POSIX execution canary is independently machine-global and
-default-off. `shadow_compare` runs the selected command before the full suite,
+default-off. For schema v3, `shadow_compare` builds the receipt-bound producer
+targets and runs selected tests before the original full build and test suite,
 returns the full result, and persists comparison evidence; `authoritative`
 requires a separate graduation review. Repository and local overlay config
 cannot activate either mode. Authoritative activation also requires the exact
@@ -1108,13 +1109,14 @@ head, tree, changed paths, selected tests, and hook digest. Any missing,
 ambiguous, changed, symlinked, or mismatched input falls back to the full
 authoritative validation contract.
 
-Schema v2 has a default-off promotion contract for controlled local POSIX
-canaries. A bounded command is eligible only after Shipyard re-derives the
+Schema v2 has a default-off test-stage promotion contract; schema v3 extends it
+to an atomic build-and-test contract for controlled local POSIX canaries. A
+bounded command is eligible only after Shipyard re-derives the
 exact receipt from protected-base policy and binds it to the original target
 validation digest, workflow digest, clean head/tree identity, proven POSIX
 transport, and a trusted machine-global enable bit. Any mismatch, unsupported
 transport, unknown/high-risk path, or disabled switch keeps the configured full
-test stage. The payload is size-limited canonical URL-safe base64 plus SHA-256;
+build and test stages. The payload is size-limited canonical URL-safe base64 plus SHA-256;
 test names are never interpolated into a regex or shell expression. The
 library contract alone does not activate selection: the queue/orchestration
 layer must still snapshot and substitute the immutable plan before bounded
