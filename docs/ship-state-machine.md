@@ -46,6 +46,24 @@ Failed verdicts (`STATE_VERDICT_FAIL`), refused merges, and merge
 attempts that hit a GhError all leave the active file in place for
 inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 
+### Writer-domain audit boundary
+
+The per-PR `ShipStatePrLock` remains the semantic concurrency boundary for
+ship-state transitions. When the store lives beneath a Sandbox-audited real
+home, directory creation, atomic saves, archive/delete operations, legacy
+mirror reconciliation, and coordination-lock-file creation additionally join
+the machine-wide writer domain. That lease is bounded and mutation-scoped.
+State-file mutations acquire it after any required per-PR lock is held,
+immediately before the filesystem mutation, and release it when that mutation
+completes. Directory and coordination-lock-file creation use a short creation
+guard, which is dropped before waiting on the coordination lock; this avoids a
+writer-domain/application-lock inversion. Read-only operations on an
+initialized store do not join the writer domain; first-use directory creation
+is itself a mutation and is fenced. This audit boundary changes neither the
+persisted schema nor any state transition; it allows an idle daemon to coexist
+with an exclusive Sandbox snapshot-to-contamination audit while preventing a
+real ship-state write from overlapping that audit.
+
 `ShipState` carries:
 
 | Field               | Purpose                                                                             |
