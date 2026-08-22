@@ -127,6 +127,13 @@ lists. It may replace only the exact protected `build` and `test` stages as one
 build selected targets and run selected tests first, then execute the original
 full build and test path as authority. Missing or ambiguous target projection,
 or a partial-stage substitution, fails closed.
+Do not resume schema-v3 changed-surface execution from `test`; Shipyard first
+authenticates every eligible plan in a read-only preflight, then refuses before
+persisting activation or substituting any target because the request could
+skip producer builds and test stale warm artifacts. If every plan is schema v2
+or ineligible, Shipyard preserves the original stages and resumes the ordinary
+test stage without a second observation or activation. Restart schema v3 from
+`build` or start a fresh validation.
 
 Prospective pre-push selection is only a transport optimization and is also
 machine-global default-off. Shipyard permits one non-delete branch update and

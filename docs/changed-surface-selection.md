@@ -219,9 +219,14 @@ protected policy digest; changing only `mode` cannot bypass shadow review.
 Schema v2 accepts only a staged local POSIX target with an exact `test` stage.
 Schema v3 requires both exact `build` and `test` stages and the literal
 `build_and_test` declaration; Shipyard substitutes both or neither. The
-`--resume-from test` path preserves the original stages instead of activating
-schema v3, because resuming after `build` must never turn its substituted
-no-op `test` stage into passing selected evidence. The
+`--resume-from test` performs a read-only preflight over every eligible target
+and hard-refuses an authenticated schema-v3 transaction before any activation
+is persisted or stage is substituted, because resuming after `build` must
+never turn a substituted test stage—or stale warm artifacts—into passing
+selected evidence. If every authenticated plan is schema v2 or ineligible,
+Shipyard preserves the original stages and resumes the ordinary test stage; it
+does not observe again or activate changed-surface selection in that invocation.
+Restart schema v3 from `build` or start a fresh validation. The
 plan binds the exact PR head/tree, protected base, changed paths, selector
 policy, original validation contract, protected workflow, selection receipt,
 and expanded command. Shipyard persists that activation without overwrite and

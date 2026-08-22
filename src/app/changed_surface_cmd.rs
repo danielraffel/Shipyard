@@ -288,7 +288,7 @@ fn collect_secondary_proofs(
     let Some(policy) = policy else {
         return Vec::new();
     };
-    let Ok(store) = EvidenceStore::new(state_dir.join("evidence")) else {
+    let Ok(store) = EvidenceStore::open_existing(state_dir.join("evidence")) else {
         return Vec::new();
     };
     let repository_scope = crate::evidence::repository_evidence_scope(repository);
