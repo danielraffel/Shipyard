@@ -678,7 +678,14 @@ pub fn execute_ship_worker<D: ShipTargetDispatcher>(
     stores: ShipStores<'_>,
     dispatcher: &D,
 ) -> Result<ShipExecutionOutcome, ShipExecutionError> {
-    execute_ship_worker_with_options(request, job, stores, dispatcher, false)
+    execute_ship_worker_with_options(
+        request,
+        job,
+        stores,
+        dispatcher,
+        false,
+        request.pr_snapshot_file.is_none(),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -688,6 +695,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
     stores: ShipStores<'_>,
     dispatcher: &D,
     defer_host_pool_lease_unavailable: bool,
+    enable_live_head_monitor: bool,
 ) -> Result<ShipExecutionOutcome, ShipExecutionError> {
     let ShipStores {
         queue,
@@ -756,7 +764,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
             defer_host_pool_lease_unavailable,
             reclassify_vitals_path: reclassify_vitals_path.as_deref(),
             transient_retry,
-            config: Some(config),
+            config: enable_live_head_monitor.then_some(config),
         },
     )?
     .into_completed()?;
@@ -1328,6 +1336,7 @@ fn run_drain_worker_cycle_scoped<D: ShipTargetDispatcher + Sync>(
                                         &state_dir,
                                         config,
                                         dispatcher,
+                                        pr_snapshot_file.is_none(),
                                     )
                                 }))
                                 .unwrap_or_else(|_| {
@@ -1610,6 +1619,7 @@ pub(crate) fn run_started_worker<D: ShipTargetDispatcher>(
     state_dir: &Path,
     config: &LoadedConfig,
     dispatcher: &D,
+    enable_live_head_monitor: bool,
 ) -> Result<(), ShipExecutionError> {
     let worker_cwd = envelope.cwd.as_path();
     let cwd = if worker_cwd.as_os_str().is_empty() {
@@ -1652,6 +1662,7 @@ pub(crate) fn run_started_worker<D: ShipTargetDispatcher>(
                 },
                 dispatcher,
                 true,
+                enable_live_head_monitor,
             )?;
         }
     }
@@ -1735,6 +1746,7 @@ pub(crate) fn execute_started_queued_job(
         state_dir,
         &config,
         &dispatcher,
+        true,
     )?;
     let completed = queue
         .get(job_id)?
@@ -2155,6 +2167,11 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
                     if let Some(config) = options.config
                         && request.pr != 0
                         && !request.repo.is_empty()
+                        // An explicit snapshot is the caller's authoritative,
+                        // offline PR transport. Mixing a live network head into
+                        // that execution invalidates the snapshot contract and
+                        // makes deterministic/offline runs cancel themselves.
+                        && request.pr_snapshot_file.is_none()
                         && last_head_check
                             .is_none_or(|last| last.elapsed() >= Duration::from_mins(1))
                     {

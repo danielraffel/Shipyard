@@ -449,10 +449,19 @@ fn persist_fallback_diagnostic(
     ))
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), CliFailure> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| CliFailure::new(1, format!("sync selector evidence directory: {error}")))
+}
+
+// Changed-surface execution is currently Unix-only. Windows does not permit
+// opening a directory as a File for fsync, so keep its compiled test surface
+// explicit without pretending to provide a durability guarantee there.
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), CliFailure> {
+    Ok(())
 }
 
 fn bounded_diagnostic(value: &str) -> String {
