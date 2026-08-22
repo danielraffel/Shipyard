@@ -175,6 +175,18 @@ class CiMatrixTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("MACOS_ARM64_LOCAL_SELECTOR_JSON", text, path.name)
 
+    def test_sandbox_m3_bootstrap_is_fenced_by_target_provider_and_host(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(
+            encoding="utf-8"
+        )
+        predicate = (
+            "matrix.key == 'macos-arm64' && matrix.provider == 'local' && "
+            "startsWith(runner.name, 'Shipyard-studio-')"
+        )
+        self.assertEqual(workflow.count(predicate), 3)
+        self.assertNotIn("startsWith(runner.name, 'pulp-studio')", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
