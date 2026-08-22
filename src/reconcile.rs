@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use wait_timeout::ChildExt;
 
+use crate::config::LoadedConfig;
 use crate::evidence::canonical_repository;
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
@@ -313,6 +314,29 @@ pub fn fetch_head_and_status_check_rollup_with_cwd(
     pr: u64,
 ) -> Result<(String, Vec<Value>), ReconcileFetchError> {
     let gh_client = GhClient::from_cwd(mode, cwd).map_err(|error| {
+        ReconcileFetchError::Prepare(format!(
+            "failed to load GitHub auth config while reconciling PR #{pr} ({repo}): {error}"
+        ))
+    })?;
+    fetch_head_and_status_check_rollup_with_client(
+        &gh_client,
+        cwd,
+        repo,
+        pr,
+        "headRefOid,statusCheckRollup",
+    )
+}
+
+/// Fetch exact PR head/check state using the caller's already-loaded config.
+/// Delayed workers need this to preserve command-based auth in a stripped
+/// daemon environment instead of rediscovering credentials from ambient cwd.
+pub fn fetch_head_and_status_check_rollup_with_config(
+    config: &LoadedConfig,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+) -> Result<(String, Vec<Value>), ReconcileFetchError> {
+    let gh_client = GhClient::from_loaded_config(config).map_err(|error| {
         ReconcileFetchError::Prepare(format!(
             "failed to load GitHub auth config while reconciling PR #{pr} ({repo}): {error}"
         ))

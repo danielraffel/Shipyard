@@ -91,7 +91,9 @@ pub(super) struct ShipStewardHandoff {
     pub(super) context_url: Option<String>,
 }
 
+mod changed_surface_execution;
 mod provenance;
+use changed_surface_execution::apply_changed_surface_execution;
 use provenance::{AppliedStewardHandoff, apply_requested_steward_handoff, run_pr_provenance_hook};
 
 #[allow(clippy::too_many_lines)]
@@ -112,7 +114,7 @@ pub(super) fn ship_command<W: Write>(
         config.get_str("github.auth.source"),
     )?;
     let preflight_dispatcher = ExecutorDispatcher::new(None);
-    let targets = prepare_ship_targets(
+    let mut targets = prepare_ship_targets(
         config,
         cwd,
         runtime_paths,
@@ -153,6 +155,15 @@ pub(super) fn ship_command<W: Write>(
         cwd,
         json_mode,
         stdout,
+    )?;
+
+    apply_changed_surface_execution(
+        config,
+        cwd,
+        &runtime_paths.state_dir,
+        &repo,
+        Some(pr_context.number),
+        &mut targets,
     )?;
 
     let mut queue = Queue::new(runtime_paths.state_dir.clone())

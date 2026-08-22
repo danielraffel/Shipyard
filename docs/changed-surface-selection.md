@@ -1,10 +1,10 @@
 # Exact-head changed-surface selection
 
-Shipyard's fail-closed, shadow-only planner computes a bounded candidate suite
-while the existing full target suite remains authoritative. Schema v2 adds
+Shipyard's fail-closed planner computes a bounded candidate suite while the
+existing full target suite remains authoritative by default. Schema v2 adds
 reviewed mandatory, affected, extended, and full risk tiers without changing a
-validation command, passing a regex to a test runner, skipping a target, or
-creating reusable target evidence.
+validation command unless an independently trusted machine-global canary is
+enabled. Test identities are never passed as a regex.
 
 ## Configuration
 
@@ -179,3 +179,38 @@ neighbor. A path that matches multiple families selects all of them and the
 highest applicable tier. High-risk and `full_required_paths` matches select
 full. The full suite remains authoritative throughout the shadow phase;
 activating bounded execution is a separate promotion decision.
+
+## Controlled POSIX execution canary
+
+An authenticated protected-base target may declare an execution template:
+
+```toml
+[targets.mac.changed_surface_selection.execution]
+mode = "authoritative"
+stage = "test"
+command = "python3 tools/scripts/run_changed_surface_tests.py --selection-receipt-b64 {selection_receipt_b64} --selection-receipt-sha256 {selection_receipt_digest}"
+```
+
+This declaration is permission, not activation. Shipyard loads
+`changed_surface_execution.mode` from machine-global config only. Missing or
+`off` leaves every target command unchanged. `shadow_compare` snapshots the
+protected command into the durable queue request with a trusted result
+directory and tells the repository adapter to run selected then full; the full
+result remains authoritative. `authoritative` omits the full comparison and is
+reserved for a separately reviewed graduation after comparison evidence. It
+also requires machine-global `accepted_shadow_policy_digest` to match the exact
+protected policy digest; changing only `mode` cannot bypass shadow review.
+
+Only a staged local POSIX target with an exact `test` stage is eligible. The
+plan binds the exact PR head/tree, protected base, changed paths, selector
+policy, original validation contract, protected workflow, selection receipt,
+and expanded command. Shipyard persists that activation without overwrite and
+syncs its file and containing directory before enqueue; the queued target
+snapshot carries the same command. Full, ambiguous, oversized, incompatible,
+unsupported, and observation-failure plans preserve the ordinary full suite
+and append a bounded diagnostic. A typed blocked plan may still stop instead of
+executing a known-incompatible suite. Receipt path components include a digest
+of their canonical identity, so values such as `a/b` and `a_b` cannot alias.
+While a target runs, Shipyard checks the live PR head at a
+bounded interval and durably requests cancellation when it no longer matches
+the queued SHA; transient head-query failures do not manufacture cancellation.

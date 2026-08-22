@@ -85,6 +85,25 @@ provenance is captured, and prepared-state reuse must be disabled. Without a
 fresh, non-resumed execution of the full contract the plan is policy-blocked,
 not redirected into a known-incompatible full Debug run.
 See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
+Bounded execution remains machine-global default-off. For a controlled canary,
+use `changed_surface_execution.mode = "shadow_compare"` in trusted global
+config; the repository cannot enable it, the queued command is exact-bound,
+and the repository adapter must keep the full result authoritative while
+writing selected-vs-full receipts. Do not use `authoritative` without reviewed
+graduation evidence and a machine-global `accepted_shadow_policy_digest` that
+exactly matches the protected plan.
+
+The selector library also understands a schema-v2, protected-base
+`execution` declaration for a future controlled promotion. It remains inert
+unless orchestration explicitly supplies the exact planner input again, the
+unaltered validation and workflow contract digests, a proven POSIX command
+transport, and a trusted machine-global enable bit. Shadow policy, an unset
+machine switch, unsupported transports, full/high-risk plans, stale identity,
+or any malformed digest retain the ordinary full suite. The bounded command
+contains only a size-limited authenticated receipt payload; it never embeds a
+regex or caller-selected test expression. Defining this policy is not itself
+activation: until the ship/queue path durably snapshots and substitutes the
+plan, full validation remains authoritative.
 
 Formal GitHub stacked pull requests are a separate merge lifecycle. Shipyard
 reads the protected base's top-level `stacked_pr_mode = "off" | "observe" |

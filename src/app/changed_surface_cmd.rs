@@ -11,6 +11,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use crate::changed_surface::{
@@ -29,6 +30,13 @@ pub(super) struct ChangedSurfacePlanArgs {
     pub(super) target: String,
     pub(super) pr: u64,
     pub(super) repo: Option<String>,
+}
+
+pub(super) struct ChangedSurfaceObservation {
+    pub(super) receipt: SelectionReceipt,
+    pub(super) input: ExactHeadInput,
+    pub(super) policy: Result<ChangedSurfacePolicy, String>,
+    pub(super) workflow_digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,19 +93,44 @@ struct PullFile {
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn changed_surface_plan_command<W: Write>(
-    args: ChangedSurfacePlanArgs,
+    args: &ChangedSurfacePlanArgs,
     config: &LoadedConfig,
     cwd: &Path,
     state_dir: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let observation = observe_changed_surface_plan(args, config, cwd, state_dir)?;
+    let receipt_path = receipt_path(
+        state_dir,
+        &observation.receipt.repository,
+        args.pr,
+        &observation.receipt.head_sha,
+        &args.target,
+    );
+    store_receipt(&receipt_path, &observation.receipt)?;
+
+    emit_receipt(&observation.receipt, &receipt_path, json, stdout)?;
+    if observation.receipt.planned_suite == PlannedSuite::Blocked {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn observe_changed_surface_plan(
+    args: &ChangedSurfacePlanArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    state_dir: &Path,
+) -> Result<ChangedSurfaceObservation, CliFailure> {
     if args.pr == 0 || args.target.trim().is_empty() {
         return Err(CliFailure::new(2, "--pr and --target must be nonempty"));
     }
     let started = Instant::now();
     let observed_at = Utc::now();
-    let repo = super::runner_cmd::resolve_repo_slug(args.repo, cwd)?;
+    let repo = super::runner_cmd::resolve_repo_slug(args.repo.clone(), cwd)?;
     let client = GhClient::from_loaded_config(config)
         .map_err(|error| CliFailure::new(1, format!("load GitHub auth: {error}")))?
         .with_repo_override(&repo)
@@ -161,13 +194,18 @@ pub(super) fn changed_surface_plan_command<W: Write>(
                 .map_or((Vec::new(), false), |paths| (paths, true))
             },
         );
-    let policy = git_required(
+    let protected_config = git_required(
         cwd,
         &["show", &format!("{}:.shipyard/config.toml", pull.base.sha)],
         "read selector policy from authenticated base",
-    )
-    .map_err(|error| error.message)
-    .and_then(|contents| policy_from_toml(&contents, &args.target));
+    );
+    let workflow_digest = protected_config.as_ref().map_or_else(
+        |_| String::new(),
+        |contents| format!("{:x}", Sha256::digest(contents.as_bytes())),
+    );
+    let policy = protected_config
+        .map_err(|error| error.message)
+        .and_then(|contents| policy_from_toml(&contents, &args.target));
     let (base_tracked_paths, base_tracked_paths_complete) =
         git_nul_paths(cwd, &["ls-tree", "-r", "--name-only", "-z", &pull.base.sha])
             .map_or((Vec::new(), false), |paths| (paths, true));
@@ -228,24 +266,15 @@ pub(super) fn changed_surface_plan_command<W: Write>(
         },
         secondary_proofs,
     };
-    let mut receipt =
-        plan_selection(&input, policy).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let mut receipt = plan_selection(&input, policy.clone())
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     receipt.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let receipt_path = receipt_path(
-        state_dir,
-        &receipt.repository,
-        args.pr,
-        &receipt.head_sha,
-        &args.target,
-    );
-    store_receipt(&receipt_path, &receipt)?;
-
-    emit_receipt(&receipt, &receipt_path, json, stdout)?;
-    if receipt.planned_suite == PlannedSuite::Blocked {
-        Ok(ExitCode::from(1))
-    } else {
-        Ok(ExitCode::SUCCESS)
-    }
+    Ok(ChangedSurfaceObservation {
+        receipt,
+        input,
+        policy,
+        workflow_digest,
+    })
 }
 
 fn collect_secondary_proofs(
@@ -591,6 +620,7 @@ mod tests {
                 required_secondary_target: Some("release-sdk".to_owned()),
                 required_secondary_build_type: Some(BuildType::Release),
             }],
+            execution: None,
             secondary_contract_digests: BTreeMap::from([(
                 "release-sdk".to_owned(),
                 "contract".to_owned(),

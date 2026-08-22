@@ -87,7 +87,12 @@ fn ship_command_runs_local_target_merges_and_archives_state() {
     )
     .expect("ship command");
 
-    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        code,
+        ExitCode::SUCCESS,
+        "{}",
+        String::from_utf8_lossy(&stdout)
+    );
     let output: serde_json::Value = serde_json::from_slice(&stdout).expect("json");
     assert_eq!(output["command"], "ship");
     assert_eq!(output["pr"], 42);
@@ -167,7 +172,12 @@ fn ship_command_green_merge_failure_keeps_active_state_and_exits_success() {
     )
     .expect("ship command");
 
-    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        code,
+        ExitCode::SUCCESS,
+        "{}",
+        String::from_utf8_lossy(&stdout)
+    );
     let output: serde_json::Value = serde_json::from_slice(&stdout).expect("json");
     assert_eq!(output["merged"], false);
     assert_eq!(output["run"]["overall"], "pass");
@@ -579,7 +589,12 @@ fn ship_command_skip_target_excludes_unreachable_target_before_preflight() {
     )
     .expect("ship command");
 
-    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        code,
+        ExitCode::SUCCESS,
+        "{}",
+        String::from_utf8_lossy(&stdout)
+    );
     let output: serde_json::Value = serde_json::from_slice(&stdout).expect("json");
     let evidence = output["ship_state"]["evidence_snapshot"]
         .as_object()

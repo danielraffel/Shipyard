@@ -261,6 +261,12 @@ inspection. `shipyard cleanup --ship-state` ages these out (see T12).
   terminates its supervised process tree (including descendants) and preserves
   the durable cancellation reason. A cancellation that lands during a silent
   command is observed by the next idle heartbeat.
+  A running PR validation also re-reads `headRefOid` through the delayed
+  worker's proven command-auth configuration at most once per minute. A
+  different valid 40-hex head durably requests cancellation and terminates the
+  process tree through the same callback path. Auth/network errors, missing
+  fields, and malformed SHAs do not manufacture cancellation; the final merge
+  boundary still performs its independent exact-head check.
   The drain owner starts a replacement as each worker completes instead of
   waiting for the whole admitted batch, so an independent idle slot is refilled
   while slower siblings continue. If refill admission itself fails, the owner
