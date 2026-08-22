@@ -113,13 +113,23 @@ jobs:
             --arg installed_status "$installed_status" --arg installed_argv "$installed_argv" \
             '{candidate:$candidate,candidate_sha256:$candidate_hash,candidate_status:$candidate_status,installed:$installed,installed_sha256:$installed_hash,installed_status:$installed_status,installed_argv:$installed_argv}' \
             > "$record"
-          "$candidate" daemon refresh --repo Generous-Corp/pulp
+          # Candidate proof exercises the daemon binary and writer-domain IPC,
+          # not production webhook registration. Stop the installed daemon first
+          # so a no-repo candidate cannot inherit its registrations. Removing the
+          # Actions tracking marker keeps the detached daemon out of runner orphan
+          # cleanup; the restore step stops it explicitly.
+          "$installed" daemon stop
+          /usr/bin/env -u RUNNER_TRACKING_ID "$candidate" daemon start
           "$candidate" --json daemon status > "$RUNNER_TEMP/candidate-daemon-status.json"
-          jq -e '.running == true and ((.registered_repos // []) | sort == ["Generous-Corp/pulp"])' \
+          jq -e '.running == true and ((.registered_repos // []) == [])' \
             "$RUNNER_TEMP/candidate-daemon-status.json"
           candidate_pid="$(pgrep -f "^${candidate//\//\\/} .*daemon run" | head -1)"
           test -n "$candidate_pid"
           ps -p "$candidate_pid" -o command= | grep -F -- "$candidate"
+          if ps eww -p "$candidate_pid" -o command= | grep -q 'RUNNER_TRACKING_ID='; then
+            echo "candidate daemon inherited Actions orphan tracking" >&2
+            exit 1
+          fi
           state_dir="$($candidate --json paths | jq -r .state_dir)"
           if lsof "$state_dir/.sandbox-writer-domain.lock" > "$RUNNER_TEMP/candidate-lock-holders.txt" 2>&1; then
             echo "candidate daemon retains an idle writer-domain lock" >&2
@@ -145,7 +155,19 @@ jobs:
               restore_args+=(--repo "$repo")
             fi
           done < <(jq -r '.[]' "$RUNNER_TEMP/pre-refresh-registered-repos.json")
-          "$installed" "${restore_args[@]}"
+          /usr/bin/env -u RUNNER_TRACKING_ID "$installed" "${restore_args[@]}"
+
+      - name: Verify restored M3 daemon ownership
+        if: ${{ always() && matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
+        run: |
+          set -euo pipefail
+          installed="$HOME/.local/bin/shipyard"
+          test -x "$installed"
+          test -s "$RUNNER_TEMP/pre-refresh-registered-repos.json"
+          test -s "$RUNNER_TEMP/pre-refresh-worker-status.json"
+          # A separate step means the restoring shell is already gone. The delay
+          # also crosses `daemon refresh`'s optimistic startup window.
+          sleep 2
           "$installed" --json daemon status > "$RUNNER_TEMP/restored-daemon-status.json"
           jq -e '.running == true' "$RUNNER_TEMP/restored-daemon-status.json"
           jq -S '[(.registered_repos // [])[]] | sort' \
@@ -157,6 +179,10 @@ jobs:
           restored_pid="$(pgrep -f "^${installed_path//\//\\/} .*daemon run" | head -1)"
           test -n "$restored_pid"
           ps -p "$restored_pid" -o command= | grep -F -- "$installed_path"
+          if ps eww -p "$restored_pid" -o command= | grep -q 'RUNNER_TRACKING_ID='; then
+            echo "restored daemon inherited Actions orphan tracking" >&2
+            exit 1
+          fi
           "$installed" --json status > "$RUNNER_TEMP/restored-worker-status.json"
           jq -S '[.active_runs[]?.id] | sort' "$RUNNER_TEMP/pre-refresh-worker-status.json" \
             > "$RUNNER_TEMP/pre-refresh-worker-ids.json"

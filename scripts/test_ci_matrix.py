@@ -184,7 +184,7 @@ class CiMatrixTests(unittest.TestCase):
             "matrix.key == 'macos-arm64' && matrix.provider == 'local' && "
             "startsWith(runner.name, 'Shipyard-studio-')"
         )
-        self.assertEqual(workflow.count(predicate), 3)
+        self.assertEqual(workflow.count(predicate), 4)
         self.assertNotIn("startsWith(runner.name, 'pulp-studio')", workflow)
 
     def test_sandbox_m3_restore_replays_exact_prior_repo_set(self) -> None:
@@ -201,6 +201,28 @@ class CiMatrixTests(unittest.TestCase):
         )
         self.assertNotIn(
             '"$installed" daemon refresh --repo Generous-Corp/pulp', workflow
+        )
+
+    def test_sandbox_daemons_escape_actions_cleanup_without_webhook_canary(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"$installed" daemon stop', workflow)
+        self.assertIn(
+            '/usr/bin/env -u RUNNER_TRACKING_ID "$candidate" daemon start', workflow
+        )
+        self.assertIn(
+            '/usr/bin/env -u RUNNER_TRACKING_ID "$installed" "${restore_args[@]}"',
+            workflow,
+        )
+        self.assertIn("name: Verify restored M3 daemon ownership", workflow)
+        self.assertEqual(workflow.count("inherited Actions orphan tracking"), 2)
+        self.assertIn(
+            "'.running == true and ((.registered_repos // []) == [])'", workflow
+        )
+        self.assertNotIn(
+            '"$candidate" daemon refresh --repo Generous-Corp/pulp', workflow
         )
 
 
