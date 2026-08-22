@@ -335,6 +335,15 @@ on the machine — not the tracked project config. The same App private key work
 across multiple Macs (M1/Studio/M5). Full setup, permissions, and the
 additional-client steps: [`docs/github-app-quota.md`](../../docs/github-app-quota.md).
 
+The standalone App helper must remain usable from stripped SSH/daemon
+environments without weakening TLS. It first uses Python's default trust store.
+Only after a real certificate-verification failure and proof that there is no
+explicit, loaded, or on-disk default CA source may it augment that same context
+with known platform CA files. Never broaden pinned, directory-backed, or private
+enterprise roots. It fails closed when neither source works. Do not disable
+certificate verification; set `SSL_CERT_FILE`, repair that interpreter, or use
+the helper's verified platform fallback.
+
 When debugging GitHub behavior:
 
 - Run `shipyard doctor --rate-limit --json` to see the effective auth source
