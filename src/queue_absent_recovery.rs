@@ -815,7 +815,7 @@ fn save_needs_agent(state_dir: &Path, state: &ShipState, reason: &str) -> Result
             branch: state.branch.clone(),
             base_branch: state.base_branch.clone(),
             head_sha: state.head_sha.clone(),
-            source_job_id: String::new(),
+            source_job_id: state.source_job_id.clone().unwrap_or_default(),
             replacement_job_id: String::new(),
             generation: String::new(),
             status: QueueAbsentRecoveryStatus::NeedsAgent,
@@ -829,12 +829,21 @@ fn save_needs_agent(state_dir: &Path, state: &ShipState, reason: &str) -> Result
 }
 
 fn record_matches_state(record: &QueueAbsentRecoveryRecord, state: &ShipState) -> bool {
+    let source_matches = match state.source_job_id.as_deref() {
+        Some(source_job_id) => {
+            source_job_id == record.source_job_id
+                || (!record.replacement_job_id.is_empty()
+                    && source_job_id == record.replacement_job_id)
+        }
+        None => record.source_job_id.is_empty(),
+    };
     record.pr == state.pr
         && canonical_repository(&record.repo) == canonical_repository(&state.repo)
         && record.attempt == state.attempt
         && record.branch == state.branch
         && record.base_branch == state.base_branch
         && record.head_sha == state.head_sha
+        && source_matches
 }
 
 fn recovery_record_path(state_dir: &Path, repo: &str, pr: u64) -> PathBuf {
@@ -1024,6 +1033,23 @@ mod tests {
                 after_claim,
             )
         }
+
+        fn replace_source_owner_same_sha(&self, new_source_job_id: &str) {
+            let request_store = QueueRequestStore::new(&self.state_dir).expect("requests");
+            let mut envelope = request_store
+                .load(&self.source_job_id)
+                .expect("load source")
+                .expect("source");
+            envelope.job_id = new_source_job_id.to_owned();
+            envelope.created_at = Utc::now();
+            request_store.save(&envelope).expect("new source envelope");
+
+            let state_store =
+                ShipStateStore::new(self.state_dir.join("ship")).expect("state store");
+            let mut state = state_store.get_scoped(REPO, 42).expect("state");
+            state.source_job_id = Some(new_source_job_id.to_owned());
+            state_store.save(&state).expect("new source owner");
+        }
     }
 
     fn run(cwd: &Path, args: &[&str]) {
@@ -1184,6 +1210,85 @@ mod tests {
             .expect("record");
         assert_eq!(record.status, QueueAbsentRecoveryStatus::Enqueued);
         assert_eq!(record.replacement_job_id, replacement_id);
+    }
+
+    #[test]
+    fn same_sha_resubmission_does_not_inherit_stale_needs_agent() {
+        let fixture = Fixture::new();
+        let ship_state = ShipStateStore::new(fixture.state_dir.join("ship"))
+            .expect("store")
+            .get_scoped(REPO, 42)
+            .expect("state");
+        let source = QueueRequestStore::new(&fixture.state_dir)
+            .expect("requests")
+            .load(&fixture.source_job_id)
+            .expect("load source")
+            .expect("source");
+        let mut prior_record = new_record(&ship_state, &source);
+        prior_record.status = QueueAbsentRecoveryStatus::NeedsAgent;
+        prior_record.detail = Some("old owner failed".to_owned());
+        let stale_generation = prior_record.generation.clone();
+        save_record(
+            &recovery_record_path(&fixture.state_dir, REPO, 42),
+            &prior_record,
+        )
+        .expect("stale fence");
+
+        let new_source = "same-sha-normal-resubmission";
+        fixture.replace_source_owner_same_sha(new_source);
+        let report = fixture.sweep(fixture.live(), |_| Ok(()));
+        assert_eq!(report.enqueued.len(), 1, "{report:?}");
+        assert!(report.needs_agent.is_empty(), "{report:?}");
+        let current = load_record(&recovery_record_path(&fixture.state_dir, REPO, 42))
+            .expect("record read")
+            .expect("record");
+        assert_eq!(current.source_job_id, new_source);
+        assert_ne!(current.generation, stale_generation);
+        assert_eq!(current.status, QueueAbsentRecoveryStatus::Enqueued);
+    }
+
+    #[test]
+    fn same_sha_resubmission_does_not_resume_stale_recovery_generation() {
+        for stale_status in [
+            QueueAbsentRecoveryStatus::Claimed,
+            QueueAbsentRecoveryStatus::Enqueued,
+        ] {
+            let fixture = Fixture::new();
+            let ship_state = ShipStateStore::new(fixture.state_dir.join("ship"))
+                .expect("store")
+                .get_scoped(REPO, 42)
+                .expect("state");
+            let source = QueueRequestStore::new(&fixture.state_dir)
+                .expect("requests")
+                .load(&fixture.source_job_id)
+                .expect("load source")
+                .expect("source");
+            let mut prior_record = new_record(&ship_state, &source);
+            prior_record.status = stale_status.clone();
+            let stale_generation = prior_record.generation.clone();
+            let stale_replacement = prior_record.replacement_job_id.clone();
+            save_record(
+                &recovery_record_path(&fixture.state_dir, REPO, 42),
+                &prior_record,
+            )
+            .expect("stale recovery");
+
+            let new_source = format!("same-sha-resubmission-{stale_status:?}");
+            fixture.replace_source_owner_same_sha(&new_source);
+            let report = fixture.sweep(fixture.live(), |_| Ok(()));
+            assert_eq!(report.enqueued.len(), 1, "{stale_status:?}: {report:?}");
+            assert!(
+                report.needs_agent.is_empty(),
+                "{stale_status:?}: {report:?}"
+            );
+            let current = load_record(&recovery_record_path(&fixture.state_dir, REPO, 42))
+                .expect("record read")
+                .expect("record");
+            assert_eq!(current.source_job_id, new_source);
+            assert_ne!(current.generation, stale_generation);
+            assert_ne!(current.replacement_job_id, stale_replacement);
+            assert_eq!(current.status, QueueAbsentRecoveryStatus::Enqueued);
+        }
     }
 
     #[test]
@@ -1551,6 +1656,11 @@ mod tests {
         let report = fixture.sweep(fixture.live(), |_| Ok(()));
         assert!(report.enqueued.is_empty(), "{report:?}");
         assert!(!report.needs_agent.is_empty(), "{report:?}");
+        let fenced = fixture.sweep(fixture.live(), |_| {
+            panic!("legacy needs-agent disposition must remain fail-closed")
+        });
+        assert!(fenced.enqueued.is_empty(), "{fenced:?}");
+        assert_eq!(fenced.skipped, 1, "{fenced:?}");
     }
 
     #[test]
