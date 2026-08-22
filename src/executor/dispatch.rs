@@ -960,6 +960,14 @@ fn populate_target_environment(
                         ),
                     });
                 }
+                if !approved_machine_path_name(name) {
+                    return Err(DispatchError::InvalidMachineEnvironment {
+                        repository: repository.to_owned(),
+                        reason: format!(
+                            "requested {name} is not an approved non-secret machine path name"
+                        ),
+                    });
+                }
                 let value = values.get(name).and_then(Value::as_str).ok_or_else(|| {
                     DispatchError::InvalidMachineEnvironment {
                         repository: repository.to_owned(),
@@ -1008,9 +1016,36 @@ fn sensitive_environment_name(name: &str) -> bool {
         || upper.split('_').any(|part| {
             matches!(
                 part,
-                "TOKEN" | "SECRET" | "PASSWORD" | "PASSPHRASE" | "CREDENTIAL"
+                "APIKEY"
+                    | "ACCESSKEY"
+                    | "AUTH"
+                    | "BEARER"
+                    | "CERT"
+                    | "CERTIFICATE"
+                    | "COOKIE"
+                    | "CREDENTIAL"
+                    | "CREDENTIALS"
+                    | "KEY"
+                    | "KEYCHAIN"
+                    | "KEYSTORE"
+                    | "OAUTH"
+                    | "PASSCODE"
+                    | "PASSPHRASE"
+                    | "PASSWORD"
+                    | "PIN"
+                    | "SECRET"
+                    | "SESSION"
+                    | "SIGNATURE"
+                    | "SIGNING"
+                    | "TOKEN"
             )
         })
+}
+
+fn approved_machine_path_name(name: &str) -> bool {
+    name.rsplit('_')
+        .next()
+        .is_some_and(|suffix| matches!(suffix, "DIR" | "FILE" | "HOME" | "PATH" | "ROOT"))
 }
 
 /// Resolve every configured target from a merged TOML table.
@@ -2447,13 +2482,38 @@ backend = "local"
 
     #[test]
     fn repository_environment_names_exclude_secret_bearing_inputs() {
-        assert!(super::sensitive_environment_name("GITHUB_TOKEN"));
-        assert!(super::sensitive_environment_name("SIGNING_PRIVATE_KEY"));
-        assert!(super::sensitive_environment_name("API_PASSWORD"));
+        for name in [
+            "GITHUB_TOKEN",
+            "SIGNING_PRIVATE_KEY",
+            "API_PASSWORD",
+            "API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "SIGNING_KEY",
+            "CLIENT_AUTH",
+            "SESSION_COOKIE",
+            "TLS_CERT_PATH",
+            "CREDENTIALS_FILE",
+        ] {
+            assert!(
+                super::sensitive_environment_name(name),
+                "accepted secret-bearing name {name}"
+            );
+        }
         assert!(!super::sensitive_environment_name("PULP_SDK_DIR"));
         assert!(!super::sensitive_environment_name(
             "FORGE_MODULAR_TOOLCHAIN_ROOT"
         ));
+        for name in [
+            "PULP_SDK_DIR",
+            "FORGE_MODULAR_TOOLCHAIN_ROOT",
+            "CCACHE_DIR",
+            "LOCAL_TOOL_PATH",
+        ] {
+            assert!(super::approved_machine_path_name(name));
+        }
+        for name in ["BUILD_NUMBER", "HOST_ARCH", "SDK_VERSION"] {
+            assert!(!super::approved_machine_path_name(name));
+        }
     }
 
     fn toml_string(value: impl AsRef<str>) -> String {

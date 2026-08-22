@@ -213,10 +213,12 @@ snapshotted into daemon-owned queue requests under Shipyard's protected machine
 state directory so a submitting shell or agent session can exit without
 dropping them.
 
-This surface is for paths and other non-secret machine facts. Do not put tokens,
-passwords, signing material, or other secrets in it; use Shipyard's dedicated
-credential mechanisms instead. Changing a machine mapping affects new requests;
-already-queued requests retain their exact submitted snapshot.
+This surface accepts non-secret machine paths only. Requested names must end in
+`_DIR`, `_FILE`, `_HOME`, `_PATH`, or `_ROOT`; common key, auth, cookie,
+credential, signing, certificate, session, password, secret, and token names
+are rejected even when they have a path-like suffix. Use Shipyard's dedicated
+credential mechanisms for secrets. Changing a machine mapping affects new
+requests; already-queued requests retain their exact submitted snapshot.
 
 ## tartci routing profiles
 

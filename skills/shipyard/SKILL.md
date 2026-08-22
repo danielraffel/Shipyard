@@ -258,7 +258,9 @@ For a non-secret machine path that every fresh worktree of one project needs,
 prefer the trusted project-environment contract over a copied
 `.shipyard.local` file. The tracked validation declares
 `machine_environment = ["NAME"]` plus an exact `[project].repository` slug;
-each host supplies `[repository_environment."OWNER/REPO"] NAME = "/host/path"`
+names must end in `_DIR`, `_FILE`, `_HOME`, `_PATH`, or `_ROOT`, and
+secret-like names remain rejected even with one of those suffixes. Each host
+supplies `[repository_environment."OWNER/REPO"] NAME = "/host/path"`
 in the machine-global `config.toml` reported by `shipyard paths`. Shipyard
 rejects missing, malformed, aliased, or case-confused identities before
 execution, ignores tracked attempts to supply values, and snapshots resolved
