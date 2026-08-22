@@ -131,6 +131,7 @@ pub(super) fn reconcile_recovery_signal(
         StewardDecision::Unmanaged
         | StewardDecision::HandoffMissing
         | StewardDecision::OptedOut
+        | StewardDecision::ProvenanceBlocked { .. }
         | StewardDecision::Draft
         | StewardDecision::InvalidHead => return (None, None),
         _ => false,
@@ -420,6 +421,11 @@ fn steward_policy_signature(policy: &StewardPolicy) -> String {
         format!("handoff_context={}", policy.handoff_context),
         format!("max_transient_reruns={}", policy.max_transient_reruns),
     ];
+    let mut provenance_blockers = policy.provenance_blocking_labels.clone();
+    provenance_blockers.sort_by_key(|label| label.to_ascii_lowercase());
+    for label in provenance_blockers {
+        components.push(format!("provenance_blocking_label={label}"));
+    }
     for (context, app_id) in required {
         components.push("required_check".to_owned());
         components.push(context.to_owned());
@@ -812,6 +818,7 @@ mod tests {
                 },
             ],
             opt_out_label: "shipyard:no-auto-merge".to_owned(),
+            provenance_blocking_labels: vec!["5·unresolved".to_owned()],
             managed_label: Some(MANAGED_LABEL.to_owned()),
             handoff_context: "shipyard/steward-handoff".to_owned(),
             max_transient_reruns: 1,
@@ -898,6 +905,7 @@ mod tests {
             native_auto_merge: true,
             required_checks: checks,
             opt_out_label: "shipyard:no-auto-merge".to_owned(),
+            provenance_blocking_labels: vec!["5·unresolved".to_owned()],
             managed_label: Some(MANAGED_LABEL.to_owned()),
             handoff_context: "shipyard/steward-handoff".to_owned(),
             max_transient_reruns: reruns,

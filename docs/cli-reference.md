@@ -100,6 +100,7 @@ shipyard runner fleet-status --json                 # periodic-monitor JSON + no
 shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
 shipyard runner steward --apply                     # exact-head, green-gated mutations
 shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
+shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable authority blocker
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
@@ -120,6 +121,9 @@ adds that explanatory label to unhanded PRs, but only heads carrying both
 management signals may be queued, rerun, cancelled, or recovery-signalled.
 Semantic blockers receive one deduplicated `shipyard:needs-agent` label and
 failed `shipyard/steward-recovery` status, which are cleared after recovery.
+The current PR's case-insensitive `5·unresolved` label blocks every steward
+mutation and reports `provenance_blocked`; repeat
+`--provenance-blocking-label` to configure another explicit vocabulary.
 
 `runner steward` is read-only unless `--apply` is present. Same-head duplicate
 runs are never cancelled; cancellation authority requires an immutable PR or

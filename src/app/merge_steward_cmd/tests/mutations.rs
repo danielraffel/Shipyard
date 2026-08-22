@@ -163,6 +163,51 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn enqueue_revalidation_refuses_a_new_current_head_provenance_blocker() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"5·UnReSoLvEd"}}],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"enqueuePullRequest"*) echo "mutation must not run" >&2; exit 90 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            log.display()
+        ),
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let policy = queue_policy();
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+    let (mutation, error) = mutate_pr(
+        &context,
+        &pr,
+        &policy,
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+    );
+
+    assert_eq!(mutation.as_deref(), Some("skipped_after_live_revalidation"));
+    assert!(error.is_none(), "{error:?}");
+    let calls = fs::read_to_string(log).expect("calls");
+    assert!(calls.contains("pr view 42"), "{calls}");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
 fn steward_refuses_formal_stack_before_enqueue_mutation() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
@@ -376,6 +421,7 @@ fn unauthorized_steward_does_not_consume_capacity_preemption_budget() {
         mutation_control: &mutation_control,
         managed_label: MANAGED_LABEL,
         handoff_context: HANDOFF_CONTEXT,
+        provenance_blocking_labels: &[],
     };
 
     let (mutation, error) = apply_capacity_preemption(&context, "steward:skip", &mut ledger);
@@ -428,6 +474,7 @@ fn initial_force_cancel_revalidation_failure_is_durably_rejected_before_post() {
         mutation_control: &control,
         managed_label: MANAGED_LABEL,
         handoff_context: HANDOFF_CONTEXT,
+        provenance_blocking_labels: &[],
     };
     let active = NonTerminalRun {
         status: "in_progress".to_owned(),
@@ -579,6 +626,7 @@ fn initial_capacity_guard_correlation_is_durable_before_started_audit_can_be_orp
         mutation_control: &control,
         managed_label: MANAGED_LABEL,
         handoff_context: HANDOFF_CONTEXT,
+        provenance_blocking_labels: &[],
     };
     let mut ledger = StewardLedger::default();
 
@@ -631,6 +679,7 @@ fn skipped_capacity_intent_recovers_without_sending_a_cancellation() {
         mutation_control: &control,
         managed_label: MANAGED_LABEL,
         handoff_context: HANDOFF_CONTEXT,
+        provenance_blocking_labels: &[],
     };
     let mut ledger = StewardLedger::default();
     let (guard, pending) = start_capacity_preemption(
@@ -1000,6 +1049,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         repos: vec!["owner/repo".to_owned()],
         base: "main".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
         managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
@@ -1045,6 +1095,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         repos: vec!["owner/repo".to_owned()],
         base: "main".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
         managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
@@ -1084,6 +1135,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         repos: vec!["owner/repo".to_owned()],
         base: "main".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
         managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
@@ -1260,6 +1312,7 @@ fn legacy_same_head_duplicate_reason_is_rejected_before_github_reads() {
         "steward:skip",
         MANAGED_LABEL,
         HANDOFF_CONTEXT,
+        &[],
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,
@@ -1318,6 +1371,7 @@ esac
         "steward:skip",
         MANAGED_LABEL,
         HANDOFF_CONTEXT,
+        &[],
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,
@@ -1387,6 +1441,7 @@ esac
         "steward:skip",
         MANAGED_LABEL,
         HANDOFF_CONTEXT,
+        &[],
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,
@@ -1453,6 +1508,7 @@ esac
         "steward:skip",
         MANAGED_LABEL,
         HANDOFF_CONTEXT,
+        &[],
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,
@@ -1514,6 +1570,7 @@ esac
         "steward:skip",
         MANAGED_LABEL,
         HANDOFF_CONTEXT,
+        &[],
         &temp.path().join("ledger.json"),
         &mut ledger,
         &mutation_control,

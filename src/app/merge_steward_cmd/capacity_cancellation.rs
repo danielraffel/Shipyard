@@ -23,6 +23,7 @@ pub(super) fn cancel_capacity_preemption_after_revalidation(
     opt_out_label: &str,
     managed_label: &str,
     handoff_context: &str,
+    provenance_blocking_labels: &[String],
 ) -> Result<Option<CapacityRevalidation>, CapacityCancelError> {
     if cancellation.reason != RunCancellationReason::AdvisoryPreambleCapacityTheft {
         return Ok(None);
@@ -36,6 +37,7 @@ pub(super) fn cancel_capacity_preemption_after_revalidation(
         opt_out_label,
         managed_label,
         handoff_context,
+        provenance_blocking_labels,
     )
     .map_err(CapacityCancelError::Revalidation)?;
     let Some(evidence) = evidence else {
@@ -84,6 +86,7 @@ pub(super) fn apply_capacity_preemption(
         opt_out_label,
         context.managed_label,
         context.handoff_context,
+        context.provenance_blocking_labels,
     ) {
         Ok(Some(latest)) => latest,
         Ok(None) => {
@@ -130,6 +133,7 @@ pub(super) fn apply_capacity_preemption(
         opt_out_label,
         context.managed_label,
         context.handoff_context,
+        context.provenance_blocking_labels,
     ) {
         Ok(Some(latest)) => latest,
         Ok(None) => {
@@ -221,6 +225,7 @@ pub(super) fn prepare_capacity_preemption(
         opt_out_label,
         context.managed_label,
         context.handoff_context,
+        context.provenance_blocking_labels,
     ) {
         Ok(Some(evidence)) => evidence,
         Ok(None) => {
@@ -415,6 +420,7 @@ pub(super) fn pending_cancellation(
         opt_out_label: opt_out_label.to_owned(),
         managed_label: context.managed_label.to_owned(),
         handoff_context: context.handoff_context.to_owned(),
+        provenance_blocking_labels: context.provenance_blocking_labels.to_vec(),
     })
 }
 

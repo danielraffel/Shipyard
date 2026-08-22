@@ -318,6 +318,7 @@ pub(super) fn resume_pending_intent(
         &pending.opt_out_label,
         &pending.managed_label,
         &pending.handoff_context,
+        &pending.provenance_blocking_labels,
     )?;
     let Some(evidence) = evidence else {
         return resolve_rejected_pending_intent(
@@ -364,6 +365,7 @@ pub(super) fn resume_pending_intent(
         &pending.opt_out_label,
         &pending.managed_label,
         &pending.handoff_context,
+        &pending.provenance_blocking_labels,
     ) {
         Ok(Some(_)) => {}
         Ok(None) => {

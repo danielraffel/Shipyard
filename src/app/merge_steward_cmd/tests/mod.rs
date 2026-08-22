@@ -101,6 +101,7 @@ fn queue_policy() -> StewardPolicy {
             app_id: None,
         }],
         opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: vec![DEFAULT_PROVENANCE_BLOCKING_LABEL.to_owned()],
         managed_label: None,
         handoff_context: "shipyard/steward-handoff".to_owned(),
         max_transient_reruns: 1,
@@ -141,6 +142,7 @@ fn pending_cancellation_record() -> PendingCancellation {
         mutation_kind: PendingMutationKind::NormalCancel,
         reason: "advisory_preamble_capacity_theft".to_owned(),
         opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
         managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
     }

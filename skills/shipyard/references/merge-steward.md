@@ -48,6 +48,14 @@ signals are reported as `unmanaged` or `handoff_missing` and receive no queue,
 rerun, cancellation, or recovery mutation. Add `shipyard:no-auto-merge` to opt
 an otherwise managed PR out.
 
+Unresolved provenance is a separate fail-closed authority boundary. By default,
+any case-insensitive `5·unresolved` label produces `provenance_blocked` and
+forbids queue, rerun, cancellation, preemption, recovery-signal, and
+management-label mutations. Live revalidation reads the current labels before
+acting. Repeat `--provenance-blocking-label <label>` to select an explicit
+repository vocabulary; removing a blocker grants authority only after a fresh
+current-head observation.
+
 Semantic blockers (`required_failed` or a conflicting/dirty `needs_update`)
 produce a failed `shipyard/steward-recovery` status and the
 `shipyard:needs-agent` label. This pair is deduplicated on the immutable head;
