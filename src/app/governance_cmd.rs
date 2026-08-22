@@ -241,6 +241,8 @@ fn governance_export<W: Write>(
 
     let toml_text = snapshot_to_toml(repo, &live_branches)?;
     if let Some(path) = output {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         fs::write(path, toml_text).map_err(|error| {
             CliFailure::new(1, format!("failed to write {}: {error}", path.display()))
         })?;
@@ -706,6 +708,8 @@ fn rewrite_profile_in_config(path: &Path, profile_name: &str) -> Result<(), CliF
     if !replaced {
         output.push(format!("\n[project]\nprofile   = \"{profile_name}\"\n"));
     }
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::write(path, output.concat())
         .map_err(|error| CliFailure::new(1, format!("failed to write {}: {error}", path.display())))
 }

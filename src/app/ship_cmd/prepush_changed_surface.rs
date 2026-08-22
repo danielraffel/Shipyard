@@ -116,6 +116,8 @@ struct VerifiedSnapshot<'a> {
 }
 
 pub(super) struct ProspectivePush {
+    parent_writer_domain: Option<crate::writer_domain_lease::ProductionWriterDomainLease>,
+    child_writer_path: Option<PathBuf>,
     receipt: ProspectiveReceipt,
     receipt_path: PathBuf,
     receipt_digest: String,
@@ -123,8 +125,8 @@ pub(super) struct ProspectivePush {
 }
 
 impl ProspectivePush {
-    pub(super) fn environment(&self) -> [(OsString, OsString); 4] {
-        [
+    pub(super) fn environment(&self) -> Vec<(OsString, OsString)> {
+        let mut environment = vec![
             (
                 OsString::from(RECEIPT_PATH_ENV),
                 self.receipt_path.as_os_str().to_owned(),
@@ -141,11 +143,25 @@ impl ProspectivePush {
                 OsString::from(RESULT_DIR_ENV),
                 self.receipt.result_dir.as_os_str().to_owned(),
             ),
-        ]
+        ];
+        if let Some(path) = &self.child_writer_path {
+            environment.push((
+                OsString::from(crate::writer_domain_lease::CHILD_WRITER_PATH_ENV),
+                path.as_os_str().to_owned(),
+            ));
+        }
+        environment
     }
 
     pub(super) fn mark_supervised_push_succeeded(&mut self) {
         self.supervised_push_succeeded = true;
+    }
+
+    /// End the parent's preparation lease before the child guardian enters the
+    /// domain. Keeping both while an audit owns the turnstile would deadlock:
+    /// the audit waits for the parent while the child waits for the audit.
+    pub(super) fn handoff_writer_domain_to_child(&mut self) {
+        self.parent_writer_domain.take();
     }
 }
 
@@ -185,10 +201,10 @@ fn persist_or_decline(state_dir: &Path, receipt: ProspectiveReceipt) -> Option<P
     match persist_prospective(state_dir, receipt) {
         Ok(push) => Some(push),
         Err(error) => {
-            eprintln!(
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
                 "warning: pre-push changed-surface receipt unavailable; continuing with full validation: {}",
                 error.message()
-            );
+            ));
             None
         }
     }
@@ -336,11 +352,18 @@ fn persist_prospective(
     let transactions = state_dir
         .join("changed-surface-prepush")
         .join("transactions");
+    // The supervised Git hook writes into this transaction asynchronously
+    // from the parent command, so its complete prospective-push transaction is
+    // the smallest safe mutation critical section.
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&transactions)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(&transactions)
         .map_err(|error| CliFailure::new(1, format!("create pre-push state: {error}")))?;
     if let Err(error) = reap_abandoned_transactions(&transactions, ABANDONED_TRANSACTION_RETENTION)
     {
-        eprintln!("warning: could not reap abandoned pre-push transactions: {error}");
+        let _ = crate::writer_domain_lease::write_stderr(format_args!(
+            "warning: could not reap abandoned pre-push transactions: {error}"
+        ));
     }
     let temporary = tempfile::Builder::new()
         .prefix("transaction-")
@@ -376,7 +399,10 @@ fn persist_prospective(
     let receipt_digest = sha256(&payload);
     let receipt_path = transaction_dir.join("prospective-receipt.json");
     create_immutable(&receipt_path, &payload)?;
+    let child_writer_path = writer_domain.as_ref().map(|_| transaction_dir.clone());
     Ok(ProspectivePush {
+        parent_writer_domain: writer_domain,
+        child_writer_path,
         receipt,
         receipt_path,
         receipt_digest,
@@ -411,7 +437,9 @@ pub(super) fn verify_after_push(
         head_branch,
     );
     if let Err(error) = remove_transaction(prospective) {
-        eprintln!("warning: could not remove completed pre-push transaction: {error}");
+        let _ = crate::writer_domain_lease::write_stderr(format_args!(
+            "warning: could not remove completed pre-push transaction: {error}"
+        ));
     }
     verification
 }
@@ -455,6 +483,7 @@ fn remove_transaction(prospective: &ProspectivePush) -> std::io::Result<()> {
         .receipt_path
         .parent()
         .ok_or_else(|| std::io::Error::other("receipt has no transaction directory"))?;
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(transaction_dir)?;
     fs::remove_dir_all(transaction_dir)
 }
 
@@ -918,6 +947,8 @@ fn create_immutable(path: &Path, payload: &[u8]) -> Result<(), CliFailure> {
 }
 
 fn create_immutable_idempotent(path: &Path, payload: &[u8]) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let parent = path
         .parent()
         .ok_or_else(|| CliFailure::new(1, "snapshot path has no parent"))?;

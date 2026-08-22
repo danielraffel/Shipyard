@@ -86,7 +86,7 @@ impl CloudRecordStore {
     /// Open or create a cloud record store at `path`.
     pub fn new(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        fs::create_dir_all(&path)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path)?;
         Ok(Self { path })
     }
 
@@ -109,6 +109,7 @@ impl CloudRecordStore {
     /// Save a record and return the path written.
     pub fn save(&self, record: &CloudRunRecord) -> io::Result<PathBuf> {
         let target = self.path.join(format!("{}.json", record.dispatch_id));
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&target)?;
         let tmp = self.path.join(format!(
             "{}.json.tmp.{}",
             record.dispatch_id,

@@ -10,12 +10,15 @@ const STORE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 impl RecoveryStore {
     pub(super) fn lock(&self) -> RecoveryResult<RecoveryStoreLock> {
+        let lock_path = self.root.join("store.lock");
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)?;
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(self.root.join("store.lock"))?;
+            .open(lock_path)?;
+        drop(writer_domain);
         wait_for_store_lock(file, self.lock_deadline(), true)
     }
 

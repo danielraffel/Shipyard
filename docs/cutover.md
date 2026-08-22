@@ -62,13 +62,31 @@ python3 -m pytest tools/sandbox-e2e/ -q
 
 The sandbox gate serializes its protected-path snapshot and contamination
 assertion against legitimate production Shipyard writes with the host-global
-writer-domain lease under the production state directory. Production commands
-hold shared leases for their lifetime; this gate holds the exclusive lease.
+writer-domain lease under the production state directory. Each protected
+filesystem mutation holds a shared lease only for its critical section; an idle
+daemon, a read-only command, and a session-independent worker between writes do
+not own it. This gate holds the exclusive lease from snapshot through assertion.
+A fair-entry turnstile prevents a stream of short writers from starving the
+audit while still allowing unrelated work to continue.
 `sandbox_writer_domain_overlap` is a bounded, proven-overlap deferral/failure:
 wait for the active writer or audit and rerun. Do not allowlist the reported
-protected path. During a mixed-version rollout, drain legacy Shipyard
-processes—or first prove exact-binary fleet convergence—because older binaries
-do not participate in the shared writer domain.
+protected path or delete either lock file. During a mixed-version rollout,
+restart every v0.108.1 daemon because it retains the obsolete lifetime lease;
+also drain pre-v0.108.1 processes, which do not participate in the domain.
+Prove exact-binary fleet convergence before treating a sandbox result as
+authoritative.
+
+The protected production-writer inventory covers queue requests/outcomes and
+supervisor receipts; ship, merge-queue, recovery, registrar, warm-pool,
+host-pool, cloud, metrics, evidence, and selector state; machine-global config,
+auth, target, pin, install, and runner-recovery paths; and daemon plus
+local/SSH/Windows streamed logs. Repository/worktree mutations and remote-host
+files are outside the audited home roots. Recovery-model HOME/TMP scratch is
+kept in an identity-keyed OS temporary directory because the opaque child may
+outlive its launching session; only validated receipts enter durable state.
+The default-off `artifact_transport::ArtifactStore` remains explicitly outside
+this inventory because no production path constructs it; any future production
+activation under an audited root must join this writer domain before wiring.
 
 For a release that changes merge-queue behavior, add these fleet gates:
 
@@ -135,6 +153,32 @@ uses an ephemeral keychain and the same `release-macos-local.sh
 build-health-only and does not upload an unsigned artifact.
 
 ## Webhook And Funnel Validation
+
+### Recover missing local webhook provenance
+
+Do not edit `daemon/registrations.json` or delete a remote hook to repair a
+missing local registration. Starting with the registrar reconciliation change,
+an explicit refresh first lists every remote hook page and adopts exactly one
+`web` hook whose callback URL exactly matches Shipyard's current callback. It
+creates a hook only when no exact match exists and fails closed without remote
+mutation when more than one exact match exists.
+
+For the M3 Pulp/Forge daemon, after installing the reconciliating binary, use
+the complete configured authority explicitly:
+
+```sh
+shipyard daemon refresh \
+  --repo Generous-Corp/forge \
+  --repo Generous-Corp/pulp
+shipyard --json daemon status
+```
+
+The terminal status must report both repositories under `configured_repos`.
+`registered_repos` is only the subset whose remote hook registration has
+succeeded; it is not the configured watch authority. If refresh reports
+ambiguous exact hooks, stop and resolve the named remote hook IDs with a human
+who has repository-hook administration authority. Do not choose or delete one
+automatically.
 
 Non-mutating preflight is safe anytime:
 

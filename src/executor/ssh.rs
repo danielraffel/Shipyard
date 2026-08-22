@@ -427,11 +427,17 @@ impl<O: SshOperations> SshExecutor<O> {
             started_at,
             start_time,
         };
+        let writer_domain =
+            match crate::writer_domain_lease::acquire_for_protected_path(&request.log_path) {
+                Ok(lease) => lease,
+                Err(error) => return ssh_error_result(&context, &error.to_string()),
+            };
         if let Some(parent) = request.log_path.parent()
             && let Err(error) = fs::create_dir_all(parent)
         {
             return ssh_error_result(&context, &error.to_string());
         }
+        drop(writer_domain);
 
         let Some(host) = request
             .target
@@ -1151,6 +1157,7 @@ fn safe_filesize(path: &Path) -> i64 {
 }
 
 fn append_log(path: &Path, text: &str) -> std::io::Result<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

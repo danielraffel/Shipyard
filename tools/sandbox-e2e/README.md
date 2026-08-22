@@ -36,20 +36,24 @@ sibling sandbox gate: every test runs with a fresh tempdir, a shadowed
 - The test harness refuses destructive/live commands before execution.
 - The contamination audit fails if a test creates new files under real
   Shipyard or Shipyard Rust install/state paths. It no longer guesses writer
-  ownership from filenames or queue IDs: every production Shipyard process
-  holds a shared OS lease for its lifetime, and the sandbox holds the matching
-  exclusive lease from before its protected-path snapshot through the final
-  contamination assertion. Concurrent production work either finishes before
-  the audit starts or produces the stable `sandbox_writer_domain_overlap`
-  timeout classification; protected writes are never allowlisted.
+  ownership from filenames or queue IDs: every protected production mutation
+  holds a shared OS lease for its critical section, and the sandbox holds the
+  matching fair-entry turnstile plus data-domain lease exclusively from before
+  its protected-path snapshot through the final contamination assertion. Idle
+  daemons and read-only commands can coexist. Concurrent production mutations
+  either finish before the audit starts or produce the stable
+  `sandbox_writer_domain_overlap` timeout classification; protected writes are
+  never allowlisted.
 
-The host-global lease file is `.sandbox-writer-domain.lock` in the production
-Shipyard state directory reported by `shipyard paths`. The audit waits up to
-five seconds for existing writers; production processes arriving during an
-audit wait one second before returning the temporary-failure exit `75`. A
-contention failure is a proven overlap and should be retried after the other
-writer/audit finishes, not treated as test contamination and not bypassed by
-excluding a path.
+The host-global files are `.sandbox-writer-domain.turnstile.lock` and
+`.sandbox-writer-domain.lock` in the production Shipyard state directory
+reported by `shipyard paths`. The audit waits up to five seconds for an active
+mutation; production mutations arriving during an audit wait up to 30 seconds
+before returning temporary-failure exit `75`. A contention failure is a proven
+overlap and should be retried after the other writer/audit finishes, not treated
+as test contamination and not bypassed by excluding a path. During rollout,
+restart v0.108.1 daemons because that release holds the old shared lease for the
+daemon's complete lifetime.
 
 ## Running
 

@@ -93,7 +93,11 @@ struct ActivationReceipt<'a> {
     schema_version: u32,
     machine_mode: MachineMode,
     plan: &'a crate::changed_surface::AuthoritativeExecutionPlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_build_command_sha256: Option<String>,
     original_test_command_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    substituted_build_command_sha256: Option<String>,
     substituted_test_command_sha256: String,
 }
 
@@ -118,6 +122,7 @@ pub(super) fn apply_changed_surface_execution(
     state_dir: &Path,
     repo: &str,
     pr: Option<u64>,
+    resume_from: Option<&str>,
     targets: &mut [ResolvedTarget],
 ) -> Result<(), CliFailure> {
     let machine = MachinePolicy::from_global(config)?;
@@ -128,17 +133,68 @@ pub(super) fn apply_changed_surface_execution(
         return Ok(());
     };
 
+    if resume_from == Some("test") {
+        // This pass is deliberately read-only. A later schema-v3 target must
+        // refuse the whole invocation before an earlier schema-v2 target can
+        // persist activation evidence or mutate its stages. Merged config is
+        // only a negative prefilter; the protected-base policy and exact-head
+        // receipt remain the authority.
+        for target in targets.iter() {
+            if !target_declares_changed_surface_selection(config, &target.name) {
+                continue;
+            }
+            let ResolvedValidation::Local(validation) = &target.validation else {
+                continue;
+            };
+            if validation.command.is_some() || !validation.stages.contains_key("test") {
+                continue;
+            }
+            let Some(contract_digest) = validation_contract_digest(target) else {
+                continue;
+            };
+            let Ok(observation) = observe_changed_surface_plan(
+                &ChangedSurfacePlanArgs {
+                    target: target.name.clone(),
+                    pr,
+                    repo: (!repo.is_empty()).then(|| repo.to_owned()),
+                },
+                config,
+                cwd,
+                state_dir,
+            ) else {
+                continue;
+            };
+            let Ok(policy) = observation.policy.as_ref() else {
+                continue;
+            };
+            let Ok(ExecutionDisposition::Bounded(plan)) = plan_authoritative_execution(
+                &observation.receipt,
+                &observation.input,
+                policy,
+                true,
+                ExecutionCommandTransport::PosixShell,
+                &contract_digest,
+                &observation.workflow_digest,
+            ) else {
+                continue;
+            };
+            let would_activate = machine.permits_authoritative(&plan.policy_digest)
+                && (plan.stage != "build_and_test" || validation.stages.contains_key("build"));
+            if let Some(reason) =
+                selected_resume_block_reason(&plan.stage, resume_from, would_activate)
+            {
+                return Err(CliFailure::new(2, reason));
+            }
+        }
+        // Schema v2 safely resumes the original test stage. Do not observe a
+        // second time or activate a newly changed plan after this preflight.
+        return Ok(());
+    }
+
     for target in targets {
         // This merged-layer check is only a negative performance prefilter.
         // Authorization is always reparsed from the authenticated base below.
-        if config
-            .get("targets")
-            .and_then(toml::Value::as_table)
-            .and_then(|targets| targets.get(&target.name))
-            .and_then(toml::Value::as_table)
-            .and_then(|target| target.get("changed_surface_selection"))
-            .is_none()
-        {
+        if !target_declares_changed_surface_selection(config, &target.name) {
             continue;
         }
         let ResolvedValidation::Local(validation) = &target.validation else {
@@ -297,11 +353,32 @@ pub(super) fn apply_changed_surface_execution(
             )?;
             continue;
         }
-        let original = validation
+        let original_test = validation
             .stages
             .get("test")
             .expect("checked local test stage")
             .clone();
+        let original_build = if plan.stage == "build_and_test" {
+            let Some(build) = validation.stages.get("build").cloned() else {
+                persist_fallback_diagnostic(
+                    &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
+                    &FallbackDiagnostic {
+                        schema_version: 1,
+                        repository: repo,
+                        pull_request: pr,
+                        target: &target.name,
+                        machine_mode: machine.mode,
+                        category: "full_fallback",
+                        diagnostic: "selected build-and-test requires a canonical build stage; preserving the original validation stages"
+                            .to_owned(),
+                    },
+                )?;
+                continue;
+            };
+            Some(build)
+        } else {
+            None
+        };
         let result_dir = result_dir(state_dir, repo, pr, &plan.head_sha, &target.name);
         let compare = if machine.mode == MachineMode::ShadowCompare {
             "1"
@@ -317,17 +394,34 @@ pub(super) fn apply_changed_surface_execution(
         persist_activation(
             &result_dir,
             &ActivationReceipt {
-                schema_version: 1,
+                schema_version: u32::from(plan.stage == "build_and_test") + 1,
                 machine_mode: machine.mode,
                 plan: &plan,
-                original_test_command_sha256: sha256(original.as_bytes()),
-                substituted_test_command_sha256: sha256(substituted.as_bytes()),
+                original_build_command_sha256: original_build
+                    .as_ref()
+                    .map(|command| sha256(command.as_bytes())),
+                original_test_command_sha256: sha256(original_test.as_bytes()),
+                substituted_build_command_sha256: (plan.stage == "build_and_test")
+                    .then(|| sha256(substituted.as_bytes())),
+                substituted_test_command_sha256: sha256(
+                    if plan.stage == "build_and_test" {
+                        ":"
+                    } else {
+                        &substituted
+                    }
+                    .as_bytes(),
+                ),
             },
         )?;
         let ResolvedValidation::Local(validation) = &mut target.validation else {
             unreachable!();
         };
-        validation.stages.insert("test".to_owned(), substituted);
+        if plan.stage == "build_and_test" {
+            validation.stages.insert("build".to_owned(), substituted);
+            validation.stages.insert("test".to_owned(), ":".to_owned());
+        } else {
+            validation.stages.insert("test".to_owned(), substituted);
+        }
     }
     Ok(())
 }
@@ -358,6 +452,8 @@ fn shell_quote(path: &Path) -> String {
 }
 
 fn persist_activation(path: &Path, receipt: &ActivationReceipt<'_>) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(path).map_err(|error| {
         CliFailure::new(1, format!("create selector evidence directory: {error}"))
     })?;
@@ -406,6 +502,8 @@ fn persist_fallback_diagnostic(
     path: &Path,
     diagnostic: &FallbackDiagnostic<'_>,
 ) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(path).map_err(|error| {
         CliFailure::new(1, format!("create selector diagnostic directory: {error}"))
     })?;
@@ -462,6 +560,26 @@ fn bounded_diagnostic(value: &str) -> String {
     value.chars().take(MAX_DIAGNOSTIC_CHARS).collect()
 }
 
+fn target_declares_changed_surface_selection(config: &LoadedConfig, target: &str) -> bool {
+    config
+        .get("targets")
+        .and_then(toml::Value::as_table)
+        .and_then(|targets| targets.get(target))
+        .and_then(toml::Value::as_table)
+        .and_then(|target| target.get("changed_surface_selection"))
+        .is_some()
+}
+
+fn selected_resume_block_reason(
+    plan_stage: &str,
+    resume_from: Option<&str>,
+    would_activate: bool,
+) -> Option<&'static str> {
+    (plan_stage == "build_and_test" && resume_from == Some("test") && would_activate).then_some(
+        "resume-from test cannot prove a changed-surface build/test transaction; restart from build or start a fresh validation",
+    )
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -470,7 +588,8 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic, path_component,
-        persist_fallback_diagnostic, shell_quote,
+        persist_fallback_diagnostic, selected_resume_block_reason, shell_quote,
+        target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::fs;
@@ -585,6 +704,44 @@ mod tests {
                 .filter_map(Result::ok)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn changed_surface_target_detection_is_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "[targets.mac.changed_surface_selection]\npolicy = '.shipyard/policy.toml'\n",
+        )
+        .unwrap();
+        let config = LoadedConfig::load(
+            Some(temp.path().to_path_buf()),
+            None,
+            None,
+            LocalOverlaySource::None,
+        )
+        .unwrap();
+        assert!(target_declares_changed_surface_selection(&config, "mac"));
+        assert!(!target_declares_changed_surface_selection(&config, "linux"));
+
+        assert_eq!(
+            selected_resume_block_reason("build_and_test", Some("test"), true),
+            Some(
+                "resume-from test cannot prove a changed-surface build/test transaction; restart from build or start a fresh validation"
+            )
+        );
+        assert_eq!(
+            selected_resume_block_reason("test", Some("test"), true),
+            None
+        );
+        assert_eq!(
+            selected_resume_block_reason("build_and_test", Some("build"), true),
+            None
+        );
+        assert_eq!(
+            selected_resume_block_reason("build_and_test", Some("test"), false),
+            None
         );
     }
 }

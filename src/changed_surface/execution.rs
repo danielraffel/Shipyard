@@ -22,7 +22,7 @@ pub const SELECTED_TESTS_PAYLOAD_PLACEHOLDER: &str = "{selection_receipt_b64}";
 /// Stable payload-digest placeholder accepted in a protected-base command.
 pub const SELECTED_TESTS_DIGEST_PLACEHOLDER: &str = "{selection_receipt_digest}";
 /// Current bounded-execution planning receipt schema.
-pub const AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION: u32 = 2;
 /// Stay below the Windows `cmd.exe` command-line ceiling after base64 expansion;
 /// larger selections fail closed to the ordinary full suite.
 pub const MAX_SELECTED_TEST_BYTES: usize = 4 * 1024;
@@ -69,8 +69,15 @@ impl ChangedSurfaceExecutionPolicy {
         if schema_version < 2 {
             return Err("changed-surface execution requires schema_version = 2".to_owned());
         }
-        if self.stage != "test" {
-            return Err("changed-surface execution may replace only the test stage".to_owned());
+        let expected_stage = if schema_version >= 3 {
+            "build_and_test"
+        } else {
+            "test"
+        };
+        if self.stage != expected_stage {
+            return Err(format!(
+                "changed-surface schema {schema_version} requires stage = {expected_stage}"
+            ));
         }
         match self.mode {
             ExecutionMode::Shadow if self.command.is_some() => {
@@ -162,12 +169,16 @@ pub struct AuthoritativeExecutionPlan {
     pub selection_receipt_digest: String,
     /// Digest of the exact ordered literal test file.
     pub selected_tests_digest: String,
+    /// Digest of the exact ordered `CMake` producer-target file, when selected builds apply.
+    pub selected_build_targets_digest: Option<String>,
     /// Digest of the exact identity-bound payload consumed by the adapter.
     pub execution_payload_digest: String,
     /// Selected risk tier.
     pub selection_tier: SelectionTier,
     /// Number of literal test names written to the file.
     pub selected_count: usize,
+    /// Number of selected `CMake` producer targets.
+    pub selected_build_target_count: usize,
     /// Canonical stage replaced by this plan.
     pub stage: String,
     /// Protected-base command with only the file path substituted.
@@ -189,6 +200,10 @@ struct AuthoritativeExecutionPayload<'a> {
     workflow_digest: &'a str,
     selected_tests_digest: &'a str,
     selected_tests: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_build_targets_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_build_targets: Option<&'a [String]>,
 }
 
 /// Promotion error. Callers must fail closed to the full suite and retain the
@@ -281,6 +296,7 @@ pub fn plan_authoritative_execution(
     bounded_execution_plan(
         receipt,
         execution,
+        policy.schema_version,
         validation_contract_digest,
         workflow_digest,
     )
@@ -308,6 +324,7 @@ fn rederive_receipt(
 fn bounded_execution_plan(
     receipt: &SelectionReceipt,
     execution: &ChangedSurfaceExecutionPolicy,
+    policy_schema_version: u32,
     validation_contract_digest: &str,
     workflow_digest: &str,
 ) -> Result<ExecutionDisposition, ExecutionPlanError> {
@@ -318,12 +335,29 @@ fn bounded_execution_plan(
         .map_err(|failure| error(format!("serialize selection receipt: {failure}")))?;
     let selection_receipt_digest = sha256_hex(&selection_receipt);
     let selected_tests_digest = sha256_hex(&selected);
+    let execution_schema_version = if policy_schema_version >= 3 {
+        AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION
+    } else {
+        1
+    };
+    let selected_build_targets = if policy_schema_version >= 3 {
+        Some(
+            literal_file_bytes(&receipt.selected_build_targets).map_err(|_| {
+                error("schema-v3 bounded execution requires selected CMake producer targets")
+            })?,
+        )
+    } else {
+        None
+    };
+    let selected_build_targets_digest = selected_build_targets
+        .as_ref()
+        .map(|targets| sha256_hex(targets));
     let policy_digest = receipt
         .policy_digest
         .as_deref()
         .expect("matched policy digest");
     let execution_payload = serde_json::to_vec(&AuthoritativeExecutionPayload {
-        schema_version: AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION,
+        schema_version: execution_schema_version,
         repository: &receipt.repository,
         pull_request: receipt.pull_request,
         target: &receipt.target,
@@ -336,6 +370,9 @@ fn bounded_execution_plan(
         workflow_digest,
         selected_tests_digest: &selected_tests_digest,
         selected_tests: &receipt.selected_tests,
+        selected_build_targets_digest: selected_build_targets_digest.as_deref(),
+        selected_build_targets: (policy_schema_version >= 3)
+            .then_some(receipt.selected_build_targets.as_slice()),
     })
     .map_err(|failure| error(format!("serialize authoritative payload: {failure}")))?;
     if execution_payload.len() > MAX_SELECTED_TEST_BYTES {
@@ -366,7 +403,7 @@ fn bounded_execution_plan(
     }
     Ok(ExecutionDisposition::Bounded(Box::new(
         AuthoritativeExecutionPlan {
-            schema_version: AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION,
+            schema_version: execution_schema_version,
             repository: receipt.repository.clone(),
             pull_request: receipt.pull_request,
             target: receipt.target.clone(),
@@ -382,9 +419,11 @@ fn bounded_execution_plan(
             workflow_digest: workflow_digest.to_owned(),
             selection_receipt_digest,
             selected_tests_digest,
+            selected_build_targets_digest,
             execution_payload_digest,
             selection_tier: receipt.selection_tier,
             selected_count: receipt.selected_tests.len(),
+            selected_build_target_count: receipt.selected_build_targets.len(),
             stage: execution.stage.clone(),
             command,
         },
@@ -449,6 +488,7 @@ mod tests {
             build_type: BuildType::Debug,
             build_flags: vec!["-DCMAKE_BUILD_TYPE=Debug".to_owned()],
             baseline_tests: vec!["smoke".to_owned()],
+            baseline_build_targets: Vec::new(),
             baseline_only_paths: vec!["docs/**".to_owned()],
             full_required_paths: vec!["CMakeLists.txt".to_owned()],
             policy_paths: vec!["policy.json".to_owned()],
@@ -457,6 +497,7 @@ mod tests {
                 name: "core".to_owned(),
                 paths: vec!["src/**".to_owned()],
                 tests: vec!["core exact".to_owned()],
+                build_targets: Vec::new(),
                 risk_class: crate::changed_surface::RiskClass::Low,
                 extended_tests: Vec::new(),
                 supported_build_types: vec![BuildType::Debug],
@@ -602,6 +643,68 @@ mod tests {
         assert!(!plan.command.contains(SELECTED_TESTS_PAYLOAD_PLACEHOLDER));
         assert!(!plan.command.contains(SELECTED_TESTS_DIGEST_PLACEHOLDER));
         assert!(plan.command.contains(&plan.execution_payload_digest));
+    }
+
+    #[test]
+    fn schema_v3_binds_selected_build_targets_and_replaces_build_and_test() {
+        let mut policy = fixture_policy(ExecutionMode::Authoritative);
+        policy.schema_version = 3;
+        policy.baseline_build_targets = vec!["pulp-test-build-check".to_owned()];
+        policy.families[0].build_targets = vec!["pulp-cli".to_owned()];
+        let execution = policy.execution.as_mut().expect("execution");
+        execution.stage = "build_and_test".to_owned();
+        let input = fixture_input("src/a.rs");
+        let receipt = fixture_receipt(&policy, &input);
+        assert_eq!(
+            receipt.selected_build_targets,
+            ["pulp-cli", "pulp-test-build-check"]
+        );
+        let ExecutionDisposition::Bounded(plan) =
+            fixture_execution(&receipt, &input, &policy, true).expect("bounded")
+        else {
+            panic!("expected bounded plan");
+        };
+        assert_eq!(plan.schema_version, 2);
+        assert_eq!(plan.stage, "build_and_test");
+        assert_eq!(plan.selected_build_target_count, 2);
+        assert!(plan.selected_build_targets_digest.is_some());
+        let payload = plan
+            .command
+            .split_whitespace()
+            .skip_while(|token| *token != "--receipt")
+            .nth(1)
+            .expect("payload token");
+        let bytes = URL_SAFE_NO_PAD.decode(payload).expect("decode payload");
+        let decoded: serde_json::Value = serde_json::from_slice(&bytes).expect("payload json");
+        assert_eq!(decoded["schema_version"], 2);
+        assert_eq!(
+            decoded["selected_build_targets"],
+            serde_json::json!(["pulp-cli", "pulp-test-build-check"])
+        );
+        assert_eq!(
+            decoded["selected_build_targets_digest"],
+            plan.selected_build_targets_digest
+                .as_deref()
+                .expect("digest")
+        );
+    }
+
+    #[test]
+    fn schema_v3_refuses_test_only_stage_or_missing_producer_targets() {
+        let mut policy = fixture_policy(ExecutionMode::Authoritative);
+        policy.schema_version = 3;
+        assert!(
+            policy
+                .execution
+                .as_ref()
+                .expect("execution")
+                .validate(3)
+                .is_err()
+        );
+        policy.execution.as_mut().expect("execution").stage = "build_and_test".to_owned();
+        let input = fixture_input("src/a.rs");
+        let receipt = fixture_receipt(&policy, &input);
+        assert!(fixture_execution(&receipt, &input, &policy, true).is_err());
     }
 
     #[test]

@@ -112,6 +112,8 @@ impl QuarantineList {
             .path
             .as_ref()
             .ok_or_else(|| CliFailure::new(1, "QuarantineList.save() requires a path"))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| CliFailure::new(1, error.to_string()))?;
         }

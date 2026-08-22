@@ -64,6 +64,11 @@ pub fn run_init(path: &Path, mode: RuntimeMode) -> Result<InitResult, InitError>
     let project_dir = path.join(identity.tracked_project_dir_name);
     let config_path = project_dir.join("config.toml");
 
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&config_path)
+        .map_err(|source| InitError::Io {
+            path: config_path.clone(),
+            source,
+        })?;
     fs::create_dir_all(&project_dir).map_err(|source| InitError::Io {
         path: project_dir.clone(),
         source,
@@ -72,6 +77,7 @@ pub fn run_init(path: &Path, mode: RuntimeMode) -> Result<InitResult, InitError>
         path: config_path.clone(),
         source,
     })?;
+    drop(writer_domain);
     let gitignore_path = ensure_gitignore(path, identity.local_overlay_dir_name)?;
 
     Ok(InitResult {

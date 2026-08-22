@@ -77,9 +77,212 @@ jobs:
           .venv-sandbox/bin/python -m pip install pytest
 
       - name: Run sandbox E2E
+        # M3's ephemeral Tart runners use Shipyard-studio-NN. Keep the target,
+        # provider, and host identity conjunctive so an explicit local selector
+        # for M1/M5 cannot unexpectedly run this host-specific canary.
+        if: ${{ !(matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-')) }}
         env:
           SHIPYARD_BINARY_FOR_TEST: ${{ github.workspace }}/target/release/shipyard
         run: .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
+
+      - name: Run exact isolated M3 candidate and focused Sandbox
+        if: ${{ matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
+        env:
+          SHIPYARD_BINARY_FOR_TEST: ${{ github.workspace }}/target/release/shipyard
+        run: |
+          set -euo pipefail
+          test "$RUNNER_NAME" = "Shipyard-studio-02"
+          test "$(hostname)" = "Daniels-Mac-Studio.local"
+          installed="$HOME/.local/bin/shipyard"
+          test -x "$installed"
+          test "$($installed runner tag)" = "studio"
+          canary_root="/tmp/shipyard-sandbox-m3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          lease_dir="/tmp/shipyard-sandbox-m3-lease"
+          umask 077
+          mkdir -p "$canary_root/global" "$canary_root/state"
+          candidate="$canary_root/shipyard-candidate"
+          cp "$SHIPYARD_BINARY_FOR_TEST" "$candidate"
+          chmod 700 "$candidate"
+          guardian="$canary_root/sandbox-daemon-guardian.py"
+          cp "$GITHUB_WORKSPACE/scripts/sandbox_daemon_guardian.py" "$guardian"
+          chmod 700 "$guardian"
+          candidate_hash="$(shasum -a 256 "$candidate" | awk '{print $1}')"
+          installed_hash="$(shasum -a 256 "$installed" | awk '{print $1}')"
+          candidate_status="$($candidate --version)"
+          installed_status="$($installed --version)"
+          record="$canary_root/bootstrap.json"
+          jq -n \
+            --arg candidate "$candidate" --arg candidate_hash "$candidate_hash" \
+            --arg candidate_status "$candidate_status" \
+            --arg installed "$installed" --arg installed_hash "$installed_hash" \
+            --arg installed_status "$installed_status" \
+            '{candidate:$candidate,candidate_sha256:$candidate_hash,candidate_status:$candidate_status,installed:$installed,installed_sha256:$installed_hash,installed_status:$installed_status}' \
+            > "$record"
+          guardian_label="com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          guardian_plist="$canary_root/guardian.plist"
+          cat > "$guardian_plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>$guardian_label</string>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><false/>
+            <key>ProgramArguments</key><array>
+              <string>/usr/bin/python3</string><string>$guardian</string>
+              <string>--owner-pid</string><string>$$</string>
+              <string>--installed</string><string>$installed</string>
+              <string>--candidate</string><string>$candidate</string>
+              <string>--global-dir</string><string>$canary_root/global</string>
+              <string>--state-dir</string><string>$canary_root/state</string>
+              <string>--canary-root</string><string>$canary_root</string>
+              <string>--done-file</string><string>$canary_root/done</string>
+              <string>--ready-receipt</string><string>$canary_root/ready.json</string>
+              <string>--final-receipt</string><string>$canary_root/guardian-receipt.json</string>
+              <string>--lease-dir</string><string>$lease_dir</string>
+              <string>--production-pid-file</string><string>$HOME/Library/Application Support/shipyard/daemon/daemon.pid</string>
+            </array>
+            <key>StandardOutPath</key><string>$canary_root/guardian.log</string>
+            <key>StandardErrorPath</key><string>$canary_root/guardian.log</string>
+          </dict></plist>
+          PLIST
+          plutil -lint "$guardian_plist"
+          launchctl bootstrap "gui/$(id -u)" "$guardian_plist"
+          deadline=$((SECONDS + 30))
+          while [ ! -s "$canary_root/ready.json" ] && [ ! -s "$canary_root/guardian-receipt.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+          if [ -s "$canary_root/guardian-receipt.json" ]; then
+            cat "$canary_root/guardian-receipt.json" >&2
+            exit 1
+          fi
+          jq -e '.phase == "ready" and (.candidate_pid | numbers)' "$canary_root/ready.json"
+          test "$(jq -r .candidate_sha256 "$canary_root/ready.json")" = "$candidate_hash"
+          test "$(jq -r .installed_sha256 "$canary_root/ready.json")" = "$installed_hash"
+          transition_path="$(jq -r .transition_path "$canary_root/ready.json")"
+          case "$transition_path" in
+            legacy-lifetime-lock-quiesce-restore) ;;
+            corrected-idle-preserve-fence)
+              audit_ready="$canary_root/exclusive-audit-ready"
+              audit_release="$canary_root/exclusive-audit-release"
+              production_lock="$HOME/Library/Application Support/shipyard/.sandbox-writer-domain.lock"
+              /usr/bin/python3 - "$production_lock" "$audit_ready" "$audit_release" <<'PY' &
+          import fcntl
+          import os
+          import sys
+          import time
+          from pathlib import Path
+
+          lock_path, ready_path, release_path = map(Path, sys.argv[1:])
+          lock_path.parent.mkdir(parents=True, exist_ok=True)
+          with lock_path.open("a+b") as lock:
+              fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+              temporary = ready_path.with_name(f".{ready_path.name}.{os.getpid()}.tmp")
+              temporary.write_text("exclusive\n", encoding="utf-8")
+              os.replace(temporary, ready_path)
+              deadline = time.monotonic() + 50
+              while not release_path.exists() and time.monotonic() < deadline:
+                  time.sleep(0.05)
+              if not release_path.exists():
+                  raise SystemExit("guardian mutation-fence proof timed out")
+              fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+          PY
+              audit_holder=$!
+              cleanup_audit_holder() {
+                touch "$audit_release"
+                wait "$audit_holder" 2>/dev/null || true
+              }
+              trap cleanup_audit_holder EXIT
+              deadline=$((SECONDS + 10))
+              while [ ! -s "$audit_ready" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+              test -s "$audit_ready"
+              deadline=$((SECONDS + 45))
+              while [ ! -s "$canary_root/mutation-fence.json" ] && [ ! -s "$canary_root/guardian-receipt.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+              if [ -s "$canary_root/guardian-receipt.json" ]; then
+                cat "$canary_root/guardian-receipt.json" >&2
+                exit 1
+              fi
+              jq -e '.transition_path == "corrected-idle-preserve-fence" and .returncode == 75 and .overlap_classification == "sandbox_writer_domain_overlap" and .mutation_absent == true and .selected_path_absent == true and .production_identity_preserved == true' \
+                "$canary_root/mutation-fence.json"
+              test "$(jq -r .production_pid "$canary_root/mutation-fence.json")" = "$(jq -r .production_pid "$canary_root/ready.json")"
+              test "$(jq -r .production_start_time "$canary_root/mutation-fence.json")" = "$(jq -r .production_start_time "$canary_root/ready.json")"
+              test "$(jq -r .installed_sha256 "$canary_root/mutation-fence.json")" = "$installed_hash"
+              test "$(jq -r .selected_protected_path "$canary_root/mutation-fence.json")" = "$(jq -r .mutation_guard_path "$canary_root/ready.json")"
+              touch "$audit_release"
+              wait "$audit_holder"
+              trap - EXIT
+              ;;
+            *) echo "unrecognized guardian transition: $transition_path" >&2; exit 1 ;;
+          esac
+          "$candidate" --mode isolated --global-dir "$canary_root/global" \
+            --state-dir "$canary_root/state" --json daemon status > "$canary_root/candidate-status.json"
+          jq -e '.running == true and .tunnel.backend == "inactive" and ((.configured_repos // []) == []) and ((.registered_repos // []) == [])' \
+            "$canary_root/candidate-status.json"
+          candidate_pid="$(jq -r .candidate_pid "$canary_root/ready.json")"
+          test -n "$candidate_pid"
+          ps -p "$candidate_pid" -o command= | grep -F -- "$candidate"
+          if ps eww -p "$candidate_pid" -o command= | grep -q 'RUNNER_TRACKING_ID='; then
+            echo "candidate daemon inherited Actions orphan tracking" >&2
+            exit 1
+          fi
+          state_dir="$($candidate --mode isolated --global-dir "$canary_root/global" --state-dir "$canary_root/state" --json paths | jq -r .state_dir)"
+          if lsof "$state_dir/.sandbox-writer-domain.lock" > "$RUNNER_TEMP/candidate-lock-holders.txt" 2>&1; then
+            echo "candidate daemon retains an idle writer-domain lock" >&2
+            cat "$RUNNER_TEMP/candidate-lock-holders.txt" >&2
+            exit 1
+          fi
+          test "$(shasum -a 256 "$candidate" | awk '{print $1}')" = "$candidate_hash"
+          SHIPYARD_BINARY_FOR_TEST="$candidate" \
+            .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
+          audited_hash="$(shasum -a 256 "$candidate" | awk '{print $1}')"
+          test "$audited_hash" = "$candidate_hash"
+          jq -n --arg candidate "$candidate" --arg candidate_hash "$audited_hash" \
+            --arg real_home "$HOME" \
+            '{schema_version:1,candidate:$candidate,candidate_sha256:$candidate_hash,real_home:$real_home,sandbox_passed:true}' \
+            > "$canary_root/sandbox-proof.json.tmp"
+          mv "$canary_root/sandbox-proof.json.tmp" "$canary_root/sandbox-proof.json"
+          touch "$canary_root/done"
+
+      - name: Verify M3 guardian and production daemon invariants
+        if: ${{ always() && matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
+        run: |
+          set -euo pipefail
+          installed="$HOME/.local/bin/shipyard"
+          test -x "$installed"
+          canary_root="/tmp/shipyard-sandbox-m3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          lease_dir="/tmp/shipyard-sandbox-m3-lease"
+          deadline=$((SECONDS + 45))
+          while [ ! -s "$canary_root/guardian-receipt.json" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+          jq -e '.candidate_stopped == true and .production_identity_verified == true and .lease_removed == true and .mode == "shipyard" and (.active_runs == []) and .failure == null' "$canary_root/guardian-receipt.json"
+          jq -e '.sandbox_passed == true and .real_home == env.HOME' "$canary_root/sandbox-proof.json"
+          test "$(jq -r .candidate_sha256 "$canary_root/sandbox-proof.json")" = "$(jq -r .candidate_sha256 "$canary_root/ready.json")"
+          test "$(shasum -a 256 "$installed" | awk '{print $1}')" = "$(jq -r .installed_sha256 "$canary_root/guardian-receipt.json")"
+          test "$(jq -r .transition_path "$canary_root/guardian-receipt.json")" = "$(jq -r .transition_path "$canary_root/ready.json")"
+          test "$(jq -r .old_production_pid "$canary_root/guardian-receipt.json")" = "$(jq -r .production_pid "$canary_root/ready.json")"
+          test "$(jq -r .old_production_start_time "$canary_root/guardian-receipt.json")" = "$(jq -r .production_start_time "$canary_root/ready.json")"
+          test "$(jq -r .mutation_guard_path "$canary_root/guardian-receipt.json")" = "$(jq -r .mutation_guard_path "$canary_root/ready.json")"
+          test ! -e "$lease_dir"
+          candidate_pid="$(jq -r .candidate_pid "$canary_root/ready.json")"
+          if kill -0 "$candidate_pid" 2>/dev/null; then
+            echo "candidate daemon survived guardian cleanup" >&2
+            exit 1
+          fi
+          production_pid="$(tr -d '[:space:]' < "$HOME/Library/Application Support/shipyard/daemon/daemon.pid")"
+          test "$production_pid" = "$(jq -r .final_production_pid "$canary_root/guardian-receipt.json")"
+          case "$(jq -r .transition_path "$canary_root/guardian-receipt.json")" in
+            legacy-lifetime-lock-quiesce-restore)
+              jq -e '.production_quiesced == true and .production_restored == true and .production_preserved == false and .old_lifetime_lock_owned == true and .mutation_fence_proved == false' "$canary_root/guardian-receipt.json"
+              ;;
+            corrected-idle-preserve-fence)
+              jq -e '.production_quiesced == false and .production_restored == false and .production_preserved == true and .old_lifetime_lock_owned == false and .mutation_fence_proved == true and .final_production_pid == .old_production_pid and .final_production_start_time == .old_production_start_time' "$canary_root/guardian-receipt.json"
+              ;;
+            *) exit 1 ;;
+          esac
+          ps -p "$production_pid" -o command= | grep -F -- "$installed"
+          ps -p "$production_pid" -o command= | grep -F -- "--mode shipyard"
+          ps -p "$production_pid" -o command= | grep -F -- "daemon run"
+          deadline=$((SECONDS + 10))
+          while [ "$(ps -p "$production_pid" -o ppid= | tr -d '[:space:]')" != "1" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+          test "$(ps -p "$production_pid" -o ppid= | tr -d '[:space:]')" = "1"
+          "$installed" --json daemon status | jq -e '.running == true'
+          launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
 
       - name: Upload sandbox tempdir on failure
         if: failure()
@@ -90,6 +293,7 @@ jobs:
           # TMPDIR/platform defaults. GitHub macOS runners use
           # /private/var/folders/... rather than /tmp, so cover both.
           path: |
+            /tmp/shipyard-sandbox-m3-${{ github.run_id }}-${{ github.run_attempt }}/**
             /tmp/shipyard-sandbox-e2e.*/**
             /private/var/folders/**/shipyard-sandbox-e2e.*/**
             /var/folders/**/shipyard-sandbox-e2e.*/**

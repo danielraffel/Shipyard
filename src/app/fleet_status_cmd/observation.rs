@@ -226,6 +226,8 @@ pub(super) fn reconcile_enrollment_snapshot(
     let parent = path
         .parent()
         .ok_or_else(|| "fleet snapshot path has no parent".to_owned())?;
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
+        .map_err(|error| error.to_string())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("create fleet snapshot directory failed: {error}"))?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)

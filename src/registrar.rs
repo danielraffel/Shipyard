@@ -78,6 +78,24 @@ pub enum RegistrarError {
     },
     /// GitHub CLI returned a successful response without a hook ID.
     MissingHookId(String),
+    /// GitHub returned more than one Shipyard hook for the exact callback URL.
+    /// Adopting either would make local provenance ambiguous, so fail closed.
+    AmbiguousRemoteHooks {
+        /// Repository whose hook provenance is ambiguous.
+        repo: String,
+        /// Exact callback URL used to identify Shipyard's hook.
+        url: String,
+        /// Matching GitHub hook IDs.
+        hook_ids: Vec<u64>,
+    },
+    /// GitHub accepted a hook PATCH but did not return the complete requested
+    /// subscription. Local provenance must not be committed for partial state.
+    HookReconciliationMismatch {
+        /// Hook whose returned state was incomplete.
+        hook_id: u64,
+        /// Non-secret mismatch description.
+        detail: String,
+    },
     /// Persisted registration state could not be serialized or parsed.
     Json(serde_json::Error),
 }
@@ -112,6 +130,18 @@ impl std::fmt::Display for RegistrarError {
                     output.trim()
                 )
             }
+            Self::AmbiguousRemoteHooks {
+                repo,
+                url,
+                hook_ids,
+            } => write!(
+                formatter,
+                "refusing to adopt ambiguous webhook provenance for {repo}: exact URL {url} matches hook IDs {hook_ids:?}"
+            ),
+            Self::HookReconciliationMismatch { hook_id, detail } => write!(
+                formatter,
+                "GitHub hook {hook_id} did not confirm the complete requested subscription: {detail}"
+            ),
             Self::Json(error) => write!(formatter, "{error}"),
         }
     }
@@ -234,7 +264,21 @@ impl Registrar {
             return Ok(hook_id);
         }
 
-        let hook_id = create_hook(client, &self.cwd, gh_binary, repo, url, secret)?;
+        let matching = list_matching_hooks(client, &self.cwd, gh_binary, repo, url)?;
+        let hook_id = match matching.as_slice() {
+            [] => create_hook(client, &self.cwd, gh_binary, repo, url, secret)?,
+            [hook_id] => {
+                update_hook(client, &self.cwd, gh_binary, repo, *hook_id, url, secret)?;
+                *hook_id
+            }
+            _ => {
+                return Err(RegistrarError::AmbiguousRemoteHooks {
+                    repo: repo.to_owned(),
+                    url: url.to_owned(),
+                    hook_ids: matching,
+                });
+            }
+        };
         self.by_repo.insert(repo.to_owned(), hook_id);
         self.save()?;
         Ok(hook_id)
@@ -277,6 +321,8 @@ impl Registrar {
     }
 
     fn save(&self) -> Result<(), RegistrarError> {
+        let _writer_domain =
+            crate::writer_domain_lease::acquire_for_protected_path(&self.state_path)?;
         if let Some(parent) = self.state_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -288,7 +334,19 @@ impl Registrar {
                 hook_id: *hook_id,
             })
             .collect::<Vec<_>>();
-        fs::write(&self.state_path, serde_json::to_string_pretty(&payload)?)?;
+        let encoded = serde_json::to_vec_pretty(&payload)?;
+        let parent = self.state_path.parent().ok_or_else(|| {
+            RegistrarError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "registrations path has no parent",
+            ))
+        })?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(&encoded)?;
+        temporary.flush()?;
+        temporary
+            .persist(&self.state_path)
+            .map_err(|error| RegistrarError::Io(error.error))?;
         Ok(())
     }
 
@@ -388,6 +446,48 @@ fn create_hook(
         .ok_or(RegistrarError::MissingHookId(output.stdout))
 }
 
+fn list_matching_hooks(
+    client: &GhClient,
+    cwd: &Path,
+    gh_binary: Option<&Path>,
+    repo: &str,
+    url: &str,
+) -> Result<Vec<u64>, RegistrarError> {
+    let output = run_gh(
+        client,
+        cwd,
+        gh_binary,
+        &[
+            "api",
+            "--paginate",
+            "--slurp",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &format!("repos/{repo}/hooks?per_page=100"),
+        ],
+        None,
+    )?;
+    if output.status != 0 {
+        return Err(classify_gh_failure("list", output.combined_output()));
+    }
+    let pages = serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&output.stdout)?;
+    let mut matches = pages
+        .into_iter()
+        .flatten()
+        .filter(|hook| hook.get("name").and_then(serde_json::Value::as_str) == Some("web"))
+        .filter(|hook| {
+            hook.get("config")
+                .and_then(|config| config.get("url"))
+                .and_then(serde_json::Value::as_str)
+                == Some(url)
+        })
+        .filter_map(|hook| hook.get("id").and_then(serde_json::Value::as_u64))
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches.dedup();
+    Ok(matches)
+}
+
 fn update_hook(
     client: &GhClient,
     cwd: &Path,
@@ -405,6 +505,7 @@ fn update_hook(
             "insecure_ssl": "0",
         },
         "active": true,
+        "events": SUBSCRIBED_EVENTS,
     });
     let output = run_gh(
         client,
@@ -422,10 +523,50 @@ fn update_hook(
         ],
         Some(&body.to_string()),
     )?;
-    if output.status == 0 {
-        return Ok(());
+    if output.status != 0 {
+        return Err(classify_gh_failure("patch", output.combined_output()));
     }
-    Err(classify_gh_failure("patch", output.combined_output()))
+    validate_updated_hook(hook_id, url, &output.stdout)
+}
+
+fn validate_updated_hook(hook_id: u64, url: &str, output: &str) -> Result<(), RegistrarError> {
+    let value = serde_json::from_str::<serde_json::Value>(output)?;
+    let returned_url = value
+        .get("config")
+        .and_then(|config| config.get("url"))
+        .and_then(serde_json::Value::as_str);
+    if returned_url != Some(url) {
+        return Err(RegistrarError::HookReconciliationMismatch {
+            hook_id,
+            detail: "callback URL differs".to_owned(),
+        });
+    }
+    if value.get("active").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(RegistrarError::HookReconciliationMismatch {
+            hook_id,
+            detail: "hook is not active".to_owned(),
+        });
+    }
+    let Some(events) = value.get("events").and_then(serde_json::Value::as_array) else {
+        return Err(RegistrarError::HookReconciliationMismatch {
+            hook_id,
+            detail: "events are missing".to_owned(),
+        });
+    };
+    let mut actual = events
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = SUBSCRIBED_EVENTS.to_vec();
+    expected.sort_unstable();
+    if events.len() != expected.len() || actual != expected {
+        return Err(RegistrarError::HookReconciliationMismatch {
+            hook_id,
+            detail: format!("events differ: expected {expected:?}, got {actual:?}"),
+        });
+    }
+    Ok(())
 }
 
 fn delete_hook(
@@ -680,12 +821,15 @@ mod tests {
             .expect("delete");
         assert!(reloaded.all().is_empty());
 
-        let first_args = read_log(temp.path(), "args-1");
-        let first_body = read_json_log(temp.path(), "stdin-1");
-        let second_args = read_log(temp.path(), "args-2");
-        let second_body = read_json_log(temp.path(), "stdin-2");
-        let third_args = read_log(temp.path(), "args-3");
+        let list_args = read_log(temp.path(), "args-1");
+        let first_args = read_log(temp.path(), "args-2");
+        let first_body = read_json_log(temp.path(), "stdin-2");
+        let second_args = read_log(temp.path(), "args-3");
+        let second_body = read_json_log(temp.path(), "stdin-3");
+        let third_args = read_log(temp.path(), "args-4");
 
+        assert!(list_args.contains("--paginate --slurp"));
+        assert!(list_args.contains("repos/owner/repo/hooks?per_page=100"));
         assert!(first_args.contains("-X POST"));
         assert!(first_args.contains("repos/owner/repo/hooks"));
         assert_eq!(first_body["name"], "web");
@@ -745,6 +889,130 @@ mod tests {
 
         assert!(matches!(error, RegistrarError::MissingHookId(_)));
         assert!(registrar.all().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_local_provenance_adopts_one_exact_remote_hook_transactionally() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::AdoptExisting);
+        let mut registrar = Registrar::new(temp.path());
+
+        let hook_id = registrar
+            .ensure_registered_with_gh(
+                "owner/repo",
+                "https://example.test/webhook",
+                "rotated-secret",
+                &gh,
+            )
+            .expect("adopt exact hook");
+
+        assert_eq!(hook_id, 7331);
+        assert_eq!(registrar.all().get("owner/repo"), Some(&7331));
+        assert!(read_log(temp.path(), "args-2").contains("-X PATCH"));
+        assert!(read_log(temp.path(), "args-2").contains("hooks/7331"));
+        let update_body = read_json_log(temp.path(), "stdin-2");
+        assert_eq!(update_body["events"], serde_json::json!(SUBSCRIBED_EVENTS));
+        assert!(
+            !temp.path().join("args-3").exists(),
+            "must not POST a duplicate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_url_adoption_rejects_partial_patch_response_without_local_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::AdoptPatchIncomplete);
+        let mut registrar = Registrar::new(temp.path());
+
+        let error = registrar
+            .ensure_registered_with_gh(
+                "owner/repo",
+                "https://example.test/webhook",
+                "rotated-secret",
+                &gh,
+            )
+            .expect_err("partial subscription response must fail closed");
+
+        assert!(matches!(
+            error,
+            RegistrarError::HookReconciliationMismatch { hook_id: 7331, .. }
+        ));
+        let update_body = read_json_log(temp.path(), "stdin-2");
+        assert_eq!(update_body["events"], serde_json::json!(SUBSCRIBED_EVENTS));
+        assert!(registrar.all().is_empty());
+        assert!(!temp.path().join("daemon/registrations.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_local_provenance_does_not_persist_when_exact_hook_update_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::AdoptPatchFails);
+        let mut registrar = Registrar::new(temp.path());
+
+        let error = registrar
+            .ensure_registered_with_gh(
+                "owner/repo",
+                "https://example.test/webhook",
+                "rotated-secret",
+                &gh,
+            )
+            .expect_err("failed exact-hook reconciliation");
+
+        assert!(matches!(
+            error,
+            RegistrarError::GhFailed {
+                action: "patch",
+                ..
+            }
+        ));
+        assert!(registrar.all().is_empty());
+        assert!(!temp.path().join("daemon/registrations.json").exists());
+        assert!(
+            !temp.path().join("args-3").exists(),
+            "must not create a duplicate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_local_provenance_ignores_non_exact_remote_hook_url() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::WrongUrl);
+        let mut registrar = Registrar::new(temp.path());
+
+        let hook_id = registrar
+            .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
+            .expect("create distinct exact hook");
+
+        assert_eq!(hook_id, 4242);
+        assert!(read_log(temp.path(), "args-2").contains("-X POST"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_local_provenance_fails_closed_for_ambiguous_exact_hooks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = write_gh_stub(temp.path(), GhStubMode::Ambiguous);
+        let mut registrar = Registrar::new(temp.path());
+
+        let error = registrar
+            .ensure_registered_with_gh("owner/repo", "https://example.test/webhook", "secret", &gh)
+            .expect_err("ambiguous remote provenance");
+
+        assert!(matches!(
+            error,
+            RegistrarError::AmbiguousRemoteHooks { ref hook_ids, .. }
+                if hook_ids == &vec![7331, 7332]
+        ));
+        assert!(registrar.all().is_empty());
+        assert!(
+            !temp.path().join("args-2").exists(),
+            "must not mutate remote hooks"
+        );
+        assert!(!temp.path().join("daemon/registrations.json").exists());
     }
 
     #[cfg(unix)]
@@ -871,6 +1139,11 @@ mod tests {
     #[derive(Clone, Copy)]
     enum GhStubMode {
         Ok,
+        AdoptExisting,
+        AdoptPatchFails,
+        AdoptPatchIncomplete,
+        Ambiguous,
+        WrongUrl,
         Delete404,
         MissingId,
         MissingWebhookScope,
@@ -884,6 +1157,11 @@ mod tests {
         let create_response = match mode {
             GhStubMode::MissingId => "{}",
             GhStubMode::Ok
+            | GhStubMode::AdoptExisting
+            | GhStubMode::AdoptPatchFails
+            | GhStubMode::AdoptPatchIncomplete
+            | GhStubMode::Ambiguous
+            | GhStubMode::WrongUrl
             | GhStubMode::Delete404
             | GhStubMode::MissingWebhookScope
             | GhStubMode::Unauthorized
@@ -894,6 +1172,11 @@ mod tests {
                 "  *\" -X DELETE \"*) printf '404 not found\\n' >&2; exit 1 ;;"
             }
             GhStubMode::Ok
+            | GhStubMode::AdoptExisting
+            | GhStubMode::AdoptPatchFails
+            | GhStubMode::AdoptPatchIncomplete
+            | GhStubMode::Ambiguous
+            | GhStubMode::WrongUrl
             | GhStubMode::MissingId
             | GhStubMode::MissingWebhookScope
             | GhStubMode::Unauthorized
@@ -909,9 +1192,30 @@ mod tests {
             GhStubMode::AnonRateLimit => String::from(
                 "  *\" -X POST \"*) printf 'HTTP 403: API rate limit exceeded for 203.0.113.7. (But here is the good news: Authenticated requests get a higher rate limit.)\\n' >&2; exit 1 ;;",
             ),
-            GhStubMode::Ok | GhStubMode::Delete404 | GhStubMode::MissingId => {
+            GhStubMode::Ok
+            | GhStubMode::AdoptExisting
+            | GhStubMode::AdoptPatchFails
+            | GhStubMode::AdoptPatchIncomplete
+            | GhStubMode::Ambiguous
+            | GhStubMode::WrongUrl
+            | GhStubMode::Delete404
+            | GhStubMode::MissingId => {
                 format!("  *\" -X POST \"*) printf '%s\\n' '{create_response}' ;;")
             }
+        };
+        let list_response = match mode {
+            GhStubMode::AdoptExisting
+            | GhStubMode::AdoptPatchFails
+            | GhStubMode::AdoptPatchIncomplete => {
+                r#"[[{"id":7331,"name":"web","active":false,"events":["push"],"config":{"url":"https://example.test/webhook"}}]]"#
+            }
+            GhStubMode::Ambiguous => {
+                r#"[[{"id":7332,"name":"web","config":{"url":"https://example.test/webhook"}},{"id":7331,"name":"web","config":{"url":"https://example.test/webhook"}}]]"#
+            }
+            GhStubMode::WrongUrl => {
+                r#"[[{"id":7331,"name":"web","config":{"url":"https://other.test/webhook"}}]]"#
+            }
+            _ => "[[]]",
         };
         let script = format!(
             r#"#!/bin/sh
@@ -924,8 +1228,9 @@ printf '%s' "$COUNT" > "$COUNT_FILE"
 printf '%s\n' "$*" > "$LOG_DIR/args-$COUNT"
 cat > "$LOG_DIR/stdin-$COUNT" || true
 case " $* " in
+  *" --paginate --slurp "*) printf '%s\n' '{list_response}' ;;
 {create_branch}
-  *" -X PATCH "*) printf '%s\n' '{{}}' ;;
+  *" -X PATCH "*) {patch_branch}
 {delete_branch}
   *) printf 'unexpected gh args: %s\n' "$*" >&2; exit 2 ;;
 esac
@@ -933,6 +1238,16 @@ esac
             log_dir = shell_quote(temp),
             create_branch = create_branch,
             delete_branch = delete_branch,
+            list_response = list_response,
+            patch_branch = match mode {
+                GhStubMode::AdoptPatchFails => {
+                    "printf 'patch failed\\n' >&2; exit 1 ;;"
+                }
+                GhStubMode::AdoptPatchIncomplete => {
+                    "printf '%s\\n' '{\"active\":true,\"events\":[\"push\"],\"config\":{\"url\":\"https://example.test/webhook\"}}' ;;"
+                }
+                _ => "cat \"$LOG_DIR/stdin-$COUNT\" ;;",
+            },
         );
         fs::write(&gh, script).expect("write gh stub");
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("chmod");

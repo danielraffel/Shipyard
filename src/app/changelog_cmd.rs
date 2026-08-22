@@ -57,8 +57,12 @@ fn changelog_init<W: Write>(
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let project_dir = cwd.join(ProductIdentity::for_mode(mode).tracked_project_dir_name);
-    fs::create_dir_all(&project_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
     let config_path = project_dir.join("config.toml");
+    {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&config_path)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        fs::create_dir_all(&project_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
     let resolved_repo = repo_url.unwrap_or_else(|| detect_repo_url_or_empty(cwd));
     let resolved_product = product.unwrap_or_else(|| {
         config
@@ -97,6 +101,8 @@ fn changelog_init<W: Write>(
         "{prefix}{}",
         changelog_stub(&resolved_repo, &resolved_product)
     );
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&config_path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::write(&config_path, new_text).map_err(|error| CliFailure::new(1, error.to_string()))?;
 
     if json {
@@ -153,6 +159,8 @@ fn changelog_regenerate<W: Write>(
         });
     }
 
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::write(&path, rendered).map_err(|error| CliFailure::new(1, error.to_string()))?;
     render_changelog_regenerate(&path, drift, entries.len(), json, stdout)?;
     Ok(ExitCode::SUCCESS)

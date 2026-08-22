@@ -231,9 +231,9 @@ pub(super) fn run_steward_write(
     match actions.run_gh(args) {
         Ok(value) => Ok(value),
         Err(error) if error.is_integration_permission_denial() => {
-            eprintln!(
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
                 "shipyard: configured GitHub App cannot write {purpose}; falling back to ambient gh auth for this steward mutation only."
-            );
+            ));
             actions.run_gh_ambient(args)
         }
         Err(error) => Err(error),

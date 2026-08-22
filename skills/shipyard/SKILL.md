@@ -35,20 +35,29 @@ go/no-go for that operation.
 
 The sandbox E2E contamination audit and production Shipyard share one
 host-global OS lock at `.sandbox-writer-domain.lock` under the production state
-directory reported by `shipyard paths`. Every production Rust CLI process holds
-a shared lease for its lifetime. Each sandbox fixture takes the exclusive lease
-before snapshotting protected paths and retains it through the final
-contamination assertion. Do not add filename-, PID-, queue-ID-, log-, or
-evidence-path exemptions: a protected write is either excluded by the lease or
-it remains contamination.
+directory reported by `shipyard paths`, plus a fair-entry
+`.sandbox-writer-domain.turnstile.lock`. Production acquires a shared lease only
+around each protected filesystem mutation; streamed logs reacquire per append,
+while an external child that can write a protected transaction keeps the lease
+for that bounded transaction. Idle daemons, read-only commands, and durable
+workers between writes own no lease. Each sandbox fixture keeps both exclusive
+locks from before snapshotting through the final contamination assertion. Do
+not add filename-, PID-, queue-ID-, log-, or evidence-path exemptions: a
+protected write is either fenced by the lease or it remains contamination.
 
-The audit waits up to five seconds for existing writers. A production process
-that arrives during an audit waits one second, then exits `75` with the stable
-`sandbox_writer_domain_overlap` classification. That result proves overlap:
-defer and retry after the other side finishes; do not convert it into a pass or
-a code/test failure. During a mixed-version rollout, legacy binaries do not own
-the shared lease. Drain them or finish exact-binary fleet convergence before
-treating a sandbox contamination result as attributable to the isolated child.
+The audit waits up to five seconds for an active mutation. A production
+mutation arriving during an audit waits up to 30 seconds, then propagates exit
+`75` with the stable `sandbox_writer_domain_overlap` classification. That result
+proves overlap: defer and retry after the other side finishes; do not convert it
+into a pass or code/test failure. During rollout, restart every v0.108.1 daemon
+because it holds the obsolete process-lifetime lease. Pre-v0.108.1 binaries do
+not participate at all; drain them and prove exact-binary fleet convergence
+before trusting the audit.
+
+Opaque recovery-model HOME/TMP scratch lives outside durable Shipyard state in
+an identity-keyed OS temporary directory, so a session-independent model child
+cannot contaminate the audit. Only its validated durable receipts are published
+under the protected state root.
 
 ## Merge-queue ownership
 
@@ -112,6 +121,20 @@ writing selected-vs-full receipts. Do not use `authoritative` without reviewed
 graduation evidence and a machine-global `accepted_shadow_policy_digest` that
 exactly matches the protected plan.
 
+Schema v3 also binds nonempty baseline and per-family `CMake` producer-target
+lists. It may replace only the exact protected `build` and `test` stages as one
+`build_and_test` transaction. In `shadow_compare`, the repository adapter must
+build selected targets and run selected tests first, then execute the original
+full build and test path as authority. Missing or ambiguous target projection,
+or a partial-stage substitution, fails closed.
+Do not resume schema-v3 changed-surface execution from `test`; Shipyard first
+authenticates every eligible plan in a read-only preflight, then refuses before
+persisting activation or substituting any target because the request could
+skip producer builds and test stale warm artifacts. If every plan is schema v2
+or ineligible, Shipyard preserves the original stages and resumes the ordinary
+test stage without a second observation or activation. Restart schema v3 from
+`build` or start a fresh validation.
+
 Prospective pre-push selection is only a transport optimization and is also
 machine-global default-off. Shipyard permits one non-delete branch update and
 authenticates the actual `core.hooksPath/pre-push` against the protected base:
@@ -122,7 +145,7 @@ nonce, and receipt identity; the hook must bind the exact head, tree, changed
 paths, selected tests, and hook digest. Any ambiguity or identity drift falls
 back to the full authoritative validation contract.
 
-The selector library also understands a schema-v2, protected-base
+The selector library also understands schema-v2/v3 protected-base
 `execution` declaration for a future controlled promotion. It remains inert
 unless orchestration explicitly supplies the exact planner input again, the
 unaltered validation and workflow contract digests, a proven POSIX command

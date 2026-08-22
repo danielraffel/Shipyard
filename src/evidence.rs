@@ -169,7 +169,7 @@ pub struct CommandEvidenceStore {
 impl CommandEvidenceStore {
     /// Open a command-evidence store at the given path.
     pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
-        fs::create_dir_all(&path)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path)?;
         Ok(Self { path })
     }
 
@@ -198,6 +198,7 @@ impl CommandEvidenceStore {
     /// artifacts. Directory creation is the cross-process uniqueness fence;
     /// a numeric suffix is used only when the preferred id is already owned.
     pub fn reserve_bundle_id(&self, preferred_id: &str) -> Result<String, std::io::Error> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let preferred_id = sanitize_component(preferred_id);
         for suffix in 0_u64.. {
             let candidate = if suffix == 0 {
@@ -220,6 +221,7 @@ impl CommandEvidenceStore {
         evidence: &CommandEvidenceRecord,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let bundle_dir = self.bundle_dir(&evidence.id);
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&bundle_dir)?;
         fs::create_dir_all(&bundle_dir)?;
         let payload = serde_json::to_string_pretty(evidence)?;
         let temp = tempfile::NamedTempFile::new_in(&bundle_dir)?;
@@ -283,8 +285,23 @@ pub struct EvidenceStore {
 impl EvidenceStore {
     /// Open an evidence store at the given path.
     pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
-        fs::create_dir_all(&path)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path)?;
         Ok(Self { path })
+    }
+
+    /// Open an existing evidence store without creating or repairing it.
+    ///
+    /// Observation paths use this constructor so a missing store remains a
+    /// read-only absence rather than entering the writer domain.
+    pub fn open_existing(path: PathBuf) -> Result<Self, std::io::Error> {
+        if path.is_dir() {
+            Ok(Self { path })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("evidence store does not exist: {}", path.display()),
+            ))
+        }
     }
 
     /// Backing path of the store.
@@ -700,6 +717,7 @@ impl EvidenceStore {
         branch_key: &str,
         records: &BTreeMap<String, EvidenceRecord>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let payload = serde_json::to_string_pretty(records)?;
         let temp = tempfile::NamedTempFile::new_in(&self.path)?;
         fs::write(temp.path(), format!("{payload}\n"))?;
@@ -712,6 +730,7 @@ impl EvidenceStore {
         branch_key: &str,
         records: &BTreeMap<String, EvidenceRecord>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(directory)?;
         fs::create_dir_all(directory)?;
         let payload = serde_json::to_string_pretty(records)?;
         let temp = tempfile::NamedTempFile::new_in(directory)?;
@@ -728,6 +747,7 @@ struct StoreLock {
 
 impl StoreLock {
     fn acquire(path: PathBuf) -> io::Result<Self> {
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -737,6 +757,7 @@ impl StoreLock {
             .read(true)
             .write(true)
             .open(path)?;
+        drop(writer_domain);
         file.lock_exclusive()?;
         Ok(Self { file })
     }
@@ -1066,6 +1087,17 @@ mod tests {
             reopened.get_target("main", "mac").expect("record").sha,
             "abc"
         );
+    }
+
+    #[test]
+    fn opening_missing_store_for_observation_does_not_create_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("missing-evidence");
+
+        let error = EvidenceStore::open_existing(path.clone()).expect_err("missing store");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!path.exists());
     }
 
     #[test]

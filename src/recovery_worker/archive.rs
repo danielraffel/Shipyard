@@ -165,6 +165,7 @@ impl RecoveryStore {
 }
 
 fn persist_json(path: &Path, value: &impl Serialize) -> RecoveryResult<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     let parent = path.parent().ok_or_else(|| {
         RecoveryError::InvalidRequest(format!("durable path has no parent: {}", path.display()))
     })?;
@@ -181,6 +182,7 @@ fn persist_json(path: &Path, value: &impl Serialize) -> RecoveryResult<()> {
 }
 
 fn remove_if_exists(path: &Path) -> RecoveryResult<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

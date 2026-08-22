@@ -65,7 +65,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | **Cross-repo merge-on-green stewardship** | Prefer atomic submission: configure `[merge_steward].auto_handoff = true` on the protected base branch and use `shipyard pr [--workstream-id <id>] [--context-url <url>]` (a PR branch cannot opt itself in); otherwise hand off one immutable head with `shipyard runner steward-handoff --repo <owner/repo> --pr <n> --head <sha> --workstream-id <id> [--context-url <url>] --apply`, then reconcile with `shipyard runner steward --repo <owner/pulp> --repo <owner/forge> --repo <owner/vellum> [--json]` (dry-run by default; only PRs carrying both the `shipyard:managed` label and a successful `shipyard/steward-handoff` status on their current head may be mutated, so apply mode explicitly labels old backlog `shipyard:unmanaged` without adopting it and exact handoff removes that explanatory label; `--apply` requires the trusted machine-global mutation authority, obeys central `HOLD`, serializes and write-ahead audits every GitHub mutation, emits one deduplicated `shipyard:needs-agent` plus `shipyard/steward-recovery` failure signal for semantic blockers, resumes durable exact-run pending cancellations before planning, re-enrolls only the current exact green head, preserves native queue order, refuses mutation without authoritative required-check governance and refuses client-side direct merge when GitHub cannot atomically bind the validated base revision, bounds transient reruns with both write-ahead intent and GitHub's durable `run_attempt`, cancels only queued runs whose immutable PR/merge-group head is provably superseded, and may preempt one exact allow-listed advisory Pulp workflow holding `pulp-preamble` after a 15-minute exact-front pool wait; same-head duplicates, required workflows, pushes, unknown work, and unmanaged PRs are never cancelled; opt out with `shipyard:no-auto-merge` or disable preemption with `--no-preempt-capacity`) |
 
 | **Triage a steward exception without a resident agent** | `shipyard runner recovery-worker` inspects/revalidates one durable exact-head request without launching a model; add `--apply` for one bounded phase-1 classification attempt, or `--drain --apply` for the bounded current snapshot. Policy is machine-global only; Shipyard constructs a tool-disabled argv, clears the inherited environment, uses a global model lease and overall deadline, and accepts strict JSON that can classify/escalate but cannot authorize repairs, paths, or tests. Provider/quota failures terminalize; unsafe findings escalate; neither blocks unrelated PRs. |
-| **Run sandbox E2E beside production Shipyard safely** | Production queue/supervisor/ship workers hold a shared host-global writer-domain lease for their lifetime; sandbox E2E takes the exclusive lease before its snapshot and keeps it through the final contamination assertion. A production writer that arrives during the audit waits briefly, then exits `75` with `sandbox_writer_domain_overlap` instead of contaminating the sandbox or racing its evidence. Do not bypass this with filename/PID/job-ID exemptions or delete the lease file. |
+| **Run sandbox E2E beside production Shipyard safely** | Each protected queue/supervisor/ship mutation holds the shared host-global writer-domain lease only for its critical section; streamed logs reacquire per append, while idle daemons and read-only commands own no lease. Sandbox E2E keeps the fair-entry turnstile and data-domain lease exclusive from snapshot through contamination assertion. A production mutation waits boundedly, then exits `75` with `sandbox_writer_domain_overlap` instead of racing evidence. Do not add filename/PID/job-ID exemptions or delete either lock file. Restart v0.108.1 daemons during rollout because they hold the obsolete lifetime lease. |
 | **Drain cloud-queued macOS jobs to local when a slot frees** | `shipyard runner reroute-watch [--apply] [--once] [--interval N] [--flap-window N]` (observe-only without `--apply`; logs per-host capacity + candidate list; flap-guard, one-reroute-per-tick, slot/fail-closed) |
 | **Runner provisioning: deregister a runner** | `shipyard runner remove --name <repo>-<tag>-NN --yes [--purge-dir]` |
 | **Self-update: check if a new release is available** | `shipyard update --check --json` |
@@ -1093,11 +1093,18 @@ substitute full Debug for a Release-only installed-SDK
 family or treat historical Release evidence as sufficient. See
 [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 The optional POSIX execution canary is independently machine-global and
-default-off. `shadow_compare` runs the selected command before the full suite,
+default-off. For schema v3, `shadow_compare` builds the receipt-bound producer
+targets and runs selected tests before the original full build and test suite,
 returns the full result, and persists comparison evidence; `authoritative`
 requires a separate graduation review. Repository and local overlay config
 cannot activate either mode. Authoritative activation also requires the exact
 reviewed shadow policy digest in trusted machine-global config.
+For `--resume-from test`, Shipyard authenticates all eligible target plans in a
+read-only preflight and refuses schema-v3 execution before activation
+persistence or substitution. It could skip producer builds and test stale warm
+artifacts. If every plan is schema v2 or ineligible, it preserves the original
+stages and resumes the ordinary test stage without a second observation or
+activation. Restart schema v3 from `build` or start a fresh validation.
 
 For a prospective `shipyard pr` push, selected execution is transport-only and
 remains machine-global default-off. Shipyard accepts exactly one non-delete
@@ -1110,13 +1117,14 @@ head, tree, changed paths, selected tests, and hook digest. Any missing,
 ambiguous, changed, symlinked, or mismatched input falls back to the full
 authoritative validation contract.
 
-Schema v2 has a default-off promotion contract for controlled local POSIX
-canaries. A bounded command is eligible only after Shipyard re-derives the
+Schema v2 has a default-off test-stage promotion contract; schema v3 extends it
+to an atomic build-and-test contract for controlled local POSIX canaries. A
+bounded command is eligible only after Shipyard re-derives the
 exact receipt from protected-base policy and binds it to the original target
 validation digest, workflow digest, clean head/tree identity, proven POSIX
 transport, and a trusted machine-global enable bit. Any mismatch, unsupported
 transport, unknown/high-risk path, or disabled switch keeps the configured full
-test stage. The payload is size-limited canonical URL-safe base64 plus SHA-256;
+build and test stages. The payload is size-limited canonical URL-safe base64 plus SHA-256;
 test names are never interpolated into a regex or shell expression. The
 library contract alone does not activate selection: the queue/orchestration
 layer must still snapshot and substitute the immutable plan before bounded

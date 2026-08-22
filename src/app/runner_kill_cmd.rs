@@ -414,6 +414,11 @@ fn recover_mode<W: Write>(
     if quarantine_dir.is_dir()
         && let Some(target) = worker_dir.as_deref()
     {
+        let _quarantine_writer_domain =
+            crate::writer_domain_lease::acquire_for_protected_path(&quarantine_dir)
+                .map_err(io_err)?;
+        let _writer_domain =
+            crate::writer_domain_lease::acquire_for_protected_path(target).map_err(io_err)?;
         for child in fs::read_dir(&quarantine_dir).map_err(io_err)? {
             let child = child.map_err(io_err)?;
             let src = child.path();
@@ -747,6 +752,10 @@ fn quarantine_partial_builds(
     if !work.is_dir() {
         return Ok(Vec::new());
     }
+    let _work_writer_domain =
+        crate::writer_domain_lease::acquire_for_protected_path(work).map_err(io_err)?;
+    let _writer_domain =
+        crate::writer_domain_lease::acquire_for_protected_path(quarantine_dir).map_err(io_err)?;
     let mut moved: Vec<PathBuf> = Vec::new();
     let window =
         Duration::from_secs(u64::try_from((etime_min.unwrap_or(0) + 5).max(0)).unwrap_or(0) * 60);
@@ -849,6 +858,8 @@ fn default_quarantine_root() -> PathBuf {
 }
 
 fn append_recovery_log(path: &Path, entry: &Value) -> Result<(), CliFailure> {
+    let _writer_domain =
+        crate::writer_domain_lease::acquire_for_protected_path(path).map_err(io_err)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io_err)?;
     }

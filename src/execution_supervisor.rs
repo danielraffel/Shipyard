@@ -73,13 +73,16 @@ pub(crate) fn acquire_worker_receipt_ownership_lock(
     state_dir: &Path,
 ) -> io::Result<WorkerReceiptOwnershipGuard> {
     let worker_dir = state_dir.join("queue-workers");
-    fs::create_dir_all(&worker_dir)?;
+    crate::writer_domain_lease::ensure_protected_dir_all(&worker_dir)?;
+    let lock_path = worker_dir.join(".ownership.lock");
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(worker_dir.join(".ownership.lock"))?;
+        .open(lock_path)?;
+    drop(writer_domain);
     FileExt::lock_exclusive(&file)?;
     Ok(WorkerReceiptOwnershipGuard(file))
 }
@@ -170,7 +173,7 @@ impl ExecutionSupervisor {
 
     /// Reconcile worker ownership and admit safe pending jobs.
     pub fn tick(&mut self) -> Result<(), SupervisorError> {
-        fs::create_dir_all(self.worker_dir())?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&self.worker_dir())?;
         self.observe_merged_ship_jobs()?;
         self.reconcile_terminal_outcomes()?;
         self.terminate_cancelled_workers()?;
@@ -747,10 +750,13 @@ impl ExecutionSupervisor {
                     |config| crate::log_retention::LogRetentionPolicy::from_config(&config),
                 );
         crate::log_retention::rotate_if_oversize(&self.log_path(&job.id), retention_policy)?;
+        let log_path = self.log_path(&job.id);
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&log_path)?;
         let log = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.log_path(&job.id))?;
+            .open(&log_path)?;
+        drop(writer_domain);
         let stderr = log.try_clone()?;
         let mut command = Command::new(&self.binary);
         command
@@ -765,6 +771,10 @@ impl ExecutionSupervisor {
             .arg(&job.id)
             .arg("--generation")
             .arg(&generation)
+            .env(
+                crate::writer_domain_lease::PROTECTED_STDIO_PATH_ENV,
+                log_path,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
@@ -1261,6 +1271,7 @@ pub fn verify_worker_authority(state_dir: &Path, job_id: &str, generation: &str)
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("receipt path has no parent"))?;
@@ -1275,6 +1286,7 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

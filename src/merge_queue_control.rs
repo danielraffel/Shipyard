@@ -23,15 +23,17 @@ const AUDIT_FILE: &str = "merge_queue/mutations.jsonl";
 static CORRELATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
-struct ControlLock(Option<File>);
+struct ControlLock {
+    file: Option<File>,
+}
 
 impl ControlLock {
     fn new(file: File) -> Self {
-        Self(Some(file))
+        Self { file: Some(file) }
     }
 
     fn unlock(&mut self) -> io::Result<()> {
-        let Some(file) = self.0.take() else {
+        let Some(file) = self.file.take() else {
             return Ok(());
         };
         file.unlock()
@@ -60,6 +62,8 @@ fn hold_with_lock_boundary_signal(
     let parent = path
         .parent()
         .ok_or_else(|| "merge-queue hold path has no parent".to_owned())?;
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
+        .map_err(|error| error.to_string())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create merge-queue control directory: {error}"))?;
     let payload = json!({
@@ -90,6 +94,8 @@ pub fn resume(state_root: &Path) -> Result<bool, String> {
             .map_err(|error| format!("failed to release merge-queue control lock: {error}"))?;
         return Ok(false);
     }
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
+        .map_err(|error| error.to_string())?;
     fs::remove_file(&path).map_err(|error| {
         format!(
             "failed to remove merge-queue hold {}: {error}",
@@ -174,8 +180,6 @@ pub fn preflight_mutation_authority(
     repo: &str,
     base: &str,
 ) -> Result<MergeQueueMutationPreflight, String> {
-    fs::create_dir_all(state_root.join("merge_queue"))
-        .map_err(|error| format!("failed to create merge-queue control directory: {error}"))?;
     let control_lock = acquire_control_lock(state_root, true)?;
     let hold_path = state_root.join(HOLD_FILE);
     if hold_path.exists() {
@@ -241,6 +245,10 @@ fn locked_audit_paths(audit_path: &Path) -> Result<Option<(File, Vec<PathBuf>)>,
     if !audit_dir.is_dir() {
         return Ok(None);
     }
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(
+        &audit_path.with_extension("lock"),
+    )
+    .map_err(|error| error.to_string())?;
     let audit_lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -248,6 +256,7 @@ fn locked_audit_paths(audit_path: &Path) -> Result<Option<(File, Vec<PathBuf>)>,
         .write(true)
         .open(audit_path.with_extension("lock"))
         .map_err(|error| format!("failed to lock merge-queue mutation audit: {error}"))?;
+    drop(writer_domain);
     audit_lock
         .lock_exclusive()
         .map_err(|error| format!("failed to lock merge-queue mutation audit: {error}"))?;
@@ -683,9 +692,6 @@ impl MergeQueueMutationGuard {
         action: &str,
     ) -> Result<Self, String> {
         let state_root = store.path().parent().unwrap_or_else(|| store.path());
-        let control_dir = state_root.join("merge_queue");
-        fs::create_dir_all(control_dir.join("locks"))
-            .map_err(|error| format!("failed to create merge-queue control directory: {error}"))?;
         let control_lock = acquire_control_lock(state_root, true)?;
         let config = LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
             .map_err(|error| format!("failed to load merge-queue mutation policy: {error}"))?;
@@ -753,8 +759,6 @@ impl MergeQueueMutationGuard {
     ) -> Result<Self, String> {
         let state_root = store.path().parent().unwrap_or_else(|| store.path());
         let control_dir = state_root.join("merge_queue");
-        fs::create_dir_all(control_dir.join("locks"))
-            .map_err(|error| format!("failed to create merge-queue control directory: {error}"))?;
         let hold_path = state_root.join(HOLD_FILE);
         if hold_path.exists() {
             return Err(format!(
@@ -782,6 +786,10 @@ impl MergeQueueMutationGuard {
             "{}.lock",
             queue_key(&state.repo, &state.base_branch)
         ));
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)
+            .map_err(|error| error.to_string())?;
+        fs::create_dir_all(control_dir.join("locks"))
+            .map_err(|error| format!("failed to create merge-queue control directory: {error}"))?;
         let mut lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -789,6 +797,7 @@ impl MergeQueueMutationGuard {
             .write(true)
             .open(&lock_path)
             .map_err(|error| format!("failed to open merge-queue mutation lock: {error}"))?;
+        drop(writer_domain);
         match lock.try_lock_exclusive() {
             Ok(()) => {}
             Err(error) if lock_is_contended(&error) => {
@@ -805,21 +814,14 @@ impl MergeQueueMutationGuard {
         }
 
         let correlation_id = correlation_id.map_or_else(Self::new_correlation_id, str::to_owned);
-        lock.set_len(0)
-            .and_then(|()| {
-                writeln!(
-                    lock,
-                    "correlation_id={correlation_id}\npid={}\nmachine={}\nrepo={}\nbase={}\npr={}\nhead={}\naction={action}",
-                    process::id(),
-                    machine_tag.as_deref().unwrap_or("unconfigured"),
-                    state.repo,
-                    state.base_branch,
-                    state.pr,
-                    state.head_sha
-                )
-            })
-            .and_then(|()| lock.sync_all())
-            .map_err(|error| format!("failed to persist merge-queue lock owner: {error}"))?;
+        persist_mutation_lock_owner(
+            &mut lock,
+            &lock_path,
+            &correlation_id,
+            machine_tag.as_deref(),
+            state,
+            action,
+        )?;
 
         let audit_path = state_root.join(AUDIT_FILE);
         append_audit(
@@ -876,6 +878,33 @@ impl MergeQueueMutationGuard {
         self.finished = true;
         Ok(())
     }
+}
+
+fn persist_mutation_lock_owner(
+    lock: &mut File,
+    lock_path: &Path,
+    correlation_id: &str,
+    machine_tag: Option<&str>,
+    state: &ShipState,
+    action: &str,
+) -> Result<(), String> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(lock_path)
+        .map_err(|error| error.to_string())?;
+    lock.set_len(0)
+        .and_then(|()| {
+            writeln!(
+                lock,
+                "correlation_id={correlation_id}\npid={}\nmachine={}\nrepo={}\nbase={}\npr={}\nhead={}\naction={action}",
+                process::id(),
+                machine_tag.unwrap_or("unconfigured"),
+                state.repo,
+                state.base_branch,
+                state.pr,
+                state.head_sha
+            )
+        })
+        .and_then(|()| lock.sync_all())
+        .map_err(|error| format!("failed to persist merge-queue lock owner: {error}"))
 }
 
 impl Drop for MergeQueueMutationGuard {
@@ -943,6 +972,8 @@ fn acquire_control_lock_with_boundary_signal(
     at_lock_boundary: impl FnOnce(),
 ) -> Result<ControlLock, String> {
     let path = state_root.join(CONTROL_LOCK_FILE);
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)
+        .map_err(|error| error.to_string())?;
     let parent = path
         .parent()
         .ok_or_else(|| "merge-queue control lock path has no parent".to_owned())?;
@@ -955,6 +986,7 @@ fn acquire_control_lock_with_boundary_signal(
         .write(true)
         .open(&path)
         .map_err(|error| format!("failed to open merge-queue control lock: {error}"))?;
+    drop(writer_domain);
     at_lock_boundary();
     let result = if nonblocking {
         lock.try_lock_exclusive()
@@ -992,12 +1024,14 @@ fn append_audit(
     value: &serde_json::Value,
 ) -> io::Result<()> {
     let lock_path = path.with_extension("lock");
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(lock_path)?;
+    drop(writer_domain);
     lock.lock_exclusive()?;
     let unresolved = ordered_audit_paths(path)
         .map_err(io::Error::other)?
@@ -1006,6 +1040,7 @@ fn append_audit(
     if unresolved.is_empty() {
         crate::log_retention::rotate_if_oversize(path, policy)?;
     }
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     let result = OpenOptions::new()
         .create(true)
         .append(true)

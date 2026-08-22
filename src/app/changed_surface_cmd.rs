@@ -288,7 +288,7 @@ fn collect_secondary_proofs(
     let Some(policy) = policy else {
         return Vec::new();
     };
-    let Ok(store) = EvidenceStore::new(state_dir.join("evidence")) else {
+    let Ok(store) = EvidenceStore::open_existing(state_dir.join("evidence")) else {
         return Vec::new();
     };
     let repository_scope = crate::evidence::repository_evidence_scope(repository);
@@ -510,6 +510,8 @@ fn store_receipt(
     path: &Path,
     receipt: &crate::changed_surface::SelectionReceipt,
 ) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let parent = path
         .parent()
         .ok_or_else(|| CliFailure::new(1, "receipt path has no parent"))?;
@@ -606,6 +608,7 @@ mod tests {
             build_type: BuildType::Debug,
             build_flags: Vec::new(),
             baseline_tests: vec!["smoke".to_owned()],
+            baseline_build_targets: Vec::new(),
             baseline_only_paths: Vec::new(),
             full_required_paths: Vec::new(),
             policy_paths: Vec::new(),
@@ -614,6 +617,7 @@ mod tests {
                 name: "sdk".to_owned(),
                 paths: vec!["sdk/**".to_owned()],
                 tests: vec!["installed SDK".to_owned()],
+                build_targets: Vec::new(),
                 risk_class: crate::changed_surface::RiskClass::Low,
                 extended_tests: Vec::new(),
                 supported_build_types: vec![BuildType::Release],

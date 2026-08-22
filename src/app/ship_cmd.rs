@@ -140,9 +140,9 @@ pub(super) fn ship_command<W: Write>(
             Ok(Some(info)) => Some(info.base),
             Ok(None) => Some(args.base.clone()),
             Err(error) => {
-                eprintln!(
+                let _ = crate::writer_domain_lease::write_stderr(format_args!(
                     "warning: existing PR base unavailable; declining pre-push changed-surface optimization: {error}"
-                );
+                ));
                 None
             }
         }
@@ -187,10 +187,10 @@ pub(super) fn ship_command<W: Write>(
         // downstream full path. Identity/result ambiguity merely declines its
         // future dedupe hint.
         if json_mode {
-            eprintln!(
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
                 "warning: pre-push changed-surface receipt not reusable: {}",
                 error.message
-            );
+            ));
         } else {
             writeln!(
                 stdout,
@@ -229,6 +229,7 @@ pub(super) fn ship_command<W: Write>(
         &runtime_paths.state_dir,
         &repo,
         Some(pr_context.number),
+        args.resume_from.as_deref(),
         &mut targets,
     )?;
 
@@ -640,7 +641,7 @@ fn resolve_pr_context(
     cwd: &Path,
     branch: &str,
     lane_policy: &LanePolicy,
-    prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
+    mut prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
 ) -> Result<ResolvedPrContext, CliFailure> {
     if let Some(number) = args.pr {
         if let Some(path) = args.pr_snapshot_file.as_deref() {
@@ -676,8 +677,12 @@ fn resolve_pr_context(
     }
 
     let environment = prospective_push
-        .as_deref()
-        .map_or_else(Vec::new, |push| push.environment().to_vec());
+        .as_deref_mut()
+        .map_or_else(Vec::new, |push| {
+            let environment = push.environment();
+            push.handoff_writer_domain_to_child();
+            environment
+        });
     push_branch_with_env(cwd, branch, environment)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if let Some(push) = prospective_push {

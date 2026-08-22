@@ -23,6 +23,8 @@ pub(super) fn write_recovery_witness(
     failure_fingerprint: &str,
 ) -> Result<(), CliFailure> {
     let path = recovery_witness_path(state_dir, repo, pr);
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let parent = path
         .parent()
         .ok_or_else(|| CliFailure::new(1, "recovery witness path has no parent"))?;
@@ -67,6 +69,8 @@ pub(super) fn remove_recovery_witness(
     pr: u64,
 ) -> Result<(), CliFailure> {
     let path = recovery_witness_path(state_dir, repo, pr);
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     match fs::remove_file(&path) {
         Ok(()) => {
             if let Some(parent) = path.parent() {
