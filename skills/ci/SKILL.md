@@ -1382,6 +1382,46 @@ Both guards are skipped silently when their inputs are unavailable (no `shipyard
 
 `shipyard pin show` reports the current pin and the latest upstream release without touching anything — safe to run anywhere.
 
+## Pulp dependency channels (`shipyard dependency pulp`)
+
+This is the opposite pin direction: a plugin/consumer tracks an immutable Pulp
+release in `.shipyard/config.toml` and a committed JSON lock. It is opt-in.
+Active first-party repositories should adopt the explicit `latest-qualified`
+template; production repositories may set `stable` plus a reviewed
+`stable_tag`; frozen repositories may set `fixed` plus an exact tag and peeled
+commit. Never substitute `main`, a branch, a prerelease, or an inferred “N-1”
+stable release. See `docs/dependency-channels.md` for complete repo-level
+templates.
+
+Use `shipyard dependency pulp update` to qualify and open the pin PR. The
+command requires trusted machine-global Shipyard GitHub App auth and rejects
+ambient credentials. It verifies the immutable GitHub Release proof, exact
+asset/checksum inventory, and SLSA build provenance before writing a lock with
+the exact tag object, commit, asset digests, and provenance statement digests.
+Same-version identity swaps, changed assets, missing proof, and non-fixed
+downgrades stop fail-closed. A qualification cache may avoid repeated SDK
+downloads when reproducing a tracked proof, but its key includes the complete
+immutable release identity; untracked candidates are freshly verified. Scan all
+GitHub release pages and every candidate's separately paginated asset inventory.
+Only deterministic qualification rejection may try an older version; abort on
+API, auth, download, token, or I/O failure. The App-authored writer pins the
+validated helper token, resolves its bot identity, disables repository
+hooks/helpers, requires explicitly configured trusted absolute native
+executables for token-bearing `gh`/`git`, verifies an exact lock-only commit,
+and rechecks the consumer base before push/PR creation. Build
+provenance must bind the tag ref and peeled commit in the GitHub certificate,
+not only workflow-authored predicate fields. Branch identity binds both base SHA
+and full lock digest; first push is create-only, and reuse requires the exact
+commit/tree plus App-authored PR envelope. Never adopt an orphan or foreign
+branch. Later valid attestations cannot replace the exact proof already recorded
+in a lock.
+
+Make `shipyard dependency pulp verify` a required consumer PR check. It bypasses
+the cache and independently reproduces the lock from freshly downloaded and
+verified assets. The consumer build must still verify the SDK bytes it uses and
+the extracted `sdk-provenance.json` against that lock; Shipyard qualification is
+not build authority.
+
 ## State-machine lane + doc-sync gate
 
 A dedicated Rust test suite exercises ship-state transitions under `cargo test --all-targets --locked`. Failures show up in the cross-platform test matrix and the coverage gate.

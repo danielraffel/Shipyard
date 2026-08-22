@@ -199,6 +199,8 @@ token_command = [
 ]
 refresh_skew_seconds = 60
 ambient_gh_binary = "/absolute/path/to/gh"
+privileged_gh_binary = "/absolute/trusted/path/to/gh"
+privileged_git_binary = "/absolute/trusted/path/to/git"
 ```
 
 Use an absolute helper path. That keeps `shipyard auth export` portable when you
@@ -211,6 +213,18 @@ variables and rejects script/wrapper paths, so do not point it at a `gh` shim
 that delegates to the App helper. If omitted, Shipyard scans `PATH` and skips
 non-native `gh` wrappers. Update this path after importing the bundle on a
 machine with a different GitHub CLI installation.
+
+`privileged_gh_binary` and `privileged_git_binary` are separately required by
+the Pulp dependency pin writer. They belong only in machine-global config and
+must name trusted absolute native executables; privileged dependency operations
+never discover a token recipient through `PATH`. Token-bearing Git runs only
+inside a newly initialized isolated repository, excludes inherited/system/global
+Git configuration, and releases its credential only to exact HTTPS
+`github.com` requests. Privileged children receive a minimal allowlisted
+environment rather than inherited loader, proxy, CA, trace, or tool-routing
+state. App-authenticated `--delete-branch` also preflights the trusted Git path
+before any merge mutation, so an older machine config fails explicitly instead
+of silently leaving a branch behind.
 
 You can also use environment variables:
 

@@ -31,6 +31,10 @@ const PR_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct GhClient {
     auth: GhAuthConfig,
     cache: Arc<Mutex<Option<CachedToken>>>,
+    // Some security-sensitive operations must prove one exact helper token's
+    // authority before using it. Once pinned, every command prepared by this
+    // client uses that same token or fails when its lifetime ends.
+    pinned_token: Option<TokenResolution>,
     /// Repo to use for a `{repo_slug}` token-command placeholder when the
     /// working directory has no GitHub remote. The daemon serves explicit
     /// `--repo` values but runs from a non-repo CWD, so without this a
@@ -73,6 +77,7 @@ impl GhClient {
     #[must_use]
     pub fn with_repo_hint(mut self, slug: &str) -> Self {
         self.repo_hint = RepoIdentity::from_slug(slug);
+        self.pinned_token = None;
         self
     }
 
@@ -84,6 +89,7 @@ impl GhClient {
                     slug: slug.to_owned(),
                 })?,
             );
+        self.pinned_token = None;
         Ok(self)
     }
 
@@ -160,6 +166,31 @@ impl GhClient {
         Ok(command)
     }
 
+    /// Prepare a direct native `gh` command for operations that may carry a
+    /// privileged token. Unlike the general injectable boundary, this never
+    /// executes a PATH-resolved script or wrapper.
+    pub(crate) fn prepare_privileged_command(
+        &self,
+        cwd: &Path,
+        supervision: GhSupervision,
+    ) -> Result<Command, GhPrepareError> {
+        let binary = self.resolve_privileged_gh_binary()?;
+        let mut command = match supervision {
+            GhSupervision::Supervised => crate::supervised::gh_supervised(Some(&binary)),
+            GhSupervision::Unsupervised => Command::new(&binary),
+        };
+        clear_privileged_environment(&mut command, supervision, &binary);
+        command
+            .current_dir(cwd)
+            .env("LC_ALL", "C")
+            .env("GH_HOST", "github.com")
+            .env("GH_PROMPT_DISABLED", "1");
+        if let Some(token) = self.resolve_token(cwd)? {
+            command.env(GH_TOKEN_ENV, token.token);
+        }
+        Ok(command)
+    }
+
     fn resolve_ambient_gh_binary(&self) -> Result<PathBuf, GhPrepareError> {
         if let Some(path) = self.auth.ambient_gh_binary.as_deref() {
             return validate_native_executable(path).map_err(|error| {
@@ -172,22 +203,111 @@ impl GhClient {
         resolve_ambient_gh_from_path(env::var_os("PATH").as_deref())
     }
 
+    fn resolve_privileged_gh_binary(&self) -> Result<PathBuf, GhPrepareError> {
+        let path = self
+            .auth
+            .privileged_gh_binary
+            .as_deref()
+            .ok_or(GhPrepareError::PrivilegedGhBinaryNotConfigured)?;
+        validate_native_executable(path).map_err(|error| {
+            GhPrepareError::InvalidPrivilegedGhBinary {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            }
+        })
+    }
+
+    fn resolve_privileged_git_binary(&self) -> Result<PathBuf, GhPrepareError> {
+        let path = self
+            .auth
+            .privileged_git_binary
+            .as_deref()
+            .ok_or(GhPrepareError::PrivilegedGitBinaryNotConfigured)?;
+        validate_native_executable(path).map_err(|error| {
+            GhPrepareError::InvalidPrivilegedGitBinary {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            }
+        })
+    }
+
     /// Prepare a non-interactive `git` command that uses the same configured
     /// GitHub identity as `prepare_command`.
     ///
-    /// The credential helper receives `GH_TOKEN` through the child
-    /// environment; token material is never placed in argv or a remote URL.
+    /// Explicit token material is kept in the child environment and is never
+    /// placed in argv or a remote URL. Token-bearing commands use direct native
+    /// executables so a repository-controlled PATH shim cannot receive it.
     pub fn prepare_git_command(&self, cwd: &Path) -> Result<Command, GhPrepareError> {
-        let mut command = crate::supervised::git_supervised();
+        self.prepare_git_command_with_binary_authority(cwd, self)
+    }
+
+    /// Prepare authenticated Git while sourcing the privileged executable
+    /// from a separate trusted configuration boundary.
+    pub(crate) fn prepare_git_command_with_binary_authority(
+        &self,
+        cwd: &Path,
+        binary_authority: &Self,
+    ) -> Result<Command, GhPrepareError> {
+        let token = self.resolve_token(cwd)?;
+        let mut command = if token.is_some() {
+            binary_authority.prepare_privileged_git_command(cwd)?
+        } else {
+            let mut command = crate::supervised::git_supervised();
+            command.current_dir(cwd);
+            command
+        };
+        let credential_helper = if token.is_some() {
+            token_environment_credential_helper()
+        } else {
+            "!gh auth git-credential"
+        };
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_COUNT", "7")
+            .env("GIT_CONFIG_KEY_0", "credential.helper")
+            .env("GIT_CONFIG_VALUE_0", "")
+            .env("GIT_CONFIG_KEY_1", "credential.helper")
+            .env("GIT_CONFIG_VALUE_1", credential_helper)
+            .env("GIT_CONFIG_KEY_2", "credential.interactive")
+            .env("GIT_CONFIG_VALUE_2", "never")
+            .env("GIT_CONFIG_KEY_3", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_3", null_device())
+            .env("GIT_CONFIG_KEY_4", "protocol.allow")
+            .env("GIT_CONFIG_VALUE_4", "never")
+            .env("GIT_CONFIG_KEY_5", "protocol.https.allow")
+            .env("GIT_CONFIG_VALUE_5", "always")
+            .env("GIT_CONFIG_KEY_6", "http.followRedirects")
+            .env("GIT_CONFIG_VALUE_6", "false");
+        if let Some(token) = token {
+            command.env(GH_TOKEN_ENV, token.token);
+        } else {
+            command.env_remove(GH_TOKEN_ENV).env_remove("GITHUB_TOKEN");
+        }
+        Ok(command)
+    }
+
+    /// Prepare the configured trusted native Git without credentials.
+    ///
+    /// Dependency publication uses this for every local object and worktree
+    /// operation. System/global/inherited Git configuration is excluded; the
+    /// caller must use a Shipyard-created repository whose local config is not
+    /// consumer-controlled.
+    pub(crate) fn prepare_privileged_git_command(
+        &self,
+        cwd: &Path,
+    ) -> Result<Command, GhPrepareError> {
+        let git = self.resolve_privileged_git_binary()?;
+        let mut command = crate::supervised::supervised(Command::new(&git));
+        clear_privileged_environment(&mut command, GhSupervision::Supervised, &git);
         command
             .current_dir(cwd)
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "credential.helper")
-            .env("GIT_CONFIG_VALUE_0", "!gh auth git-credential");
-        if let Some(token) = self.resolve_token(cwd)? {
-            command.env(GH_TOKEN_ENV, token.token);
-        }
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", null_device());
         Ok(command)
     }
 
@@ -234,10 +354,32 @@ impl GhClient {
         }
     }
 
+    /// Resolve a command-helper token once and retain that exact credential
+    /// for all later API and Git commands prepared by this client.
+    ///
+    /// Callers can validate the returned sanitized summary before granting
+    /// authority without a time-of-check/time-of-use helper re-resolution.
+    pub(crate) fn pin_command_auth(&mut self, cwd: &Path) -> Result<GhAuthSummary, GhPrepareError> {
+        let GhAuthSource::Command { .. } = &self.auth.source else {
+            return self.auth_summary(cwd, GhAuthPolicy::Default);
+        };
+        let token = self
+            .resolve_token(cwd)?
+            .expect("command auth should resolve a token");
+        let summary = GhAuthSummary {
+            source: GhAuthSourceSummary::Command,
+            token_kind: token.kind.clone(),
+            expires_at: token.expires_at,
+        };
+        self.pinned_token = Some(token);
+        Ok(summary)
+    }
+
     fn new(auth: GhAuthConfig) -> Self {
         Self {
             auth,
             cache: Arc::new(Mutex::new(None)),
+            pinned_token: None,
             repo_hint: None,
             repo_override: None,
         }
@@ -268,6 +410,15 @@ impl GhClient {
         cwd: &Path,
         timeout: Option<Duration>,
     ) -> Result<Option<TokenResolution>, GhPrepareError> {
+        if let Some(token) = &self.pinned_token {
+            if token
+                .valid_until
+                .is_some_and(|valid_until| valid_until <= Utc::now())
+            {
+                return Err(GhPrepareError::TokenExpired);
+            }
+            return Ok(Some(token.clone()));
+        }
         match &self.auth.source {
             GhAuthSource::GhCli => Ok(None),
             GhAuthSource::Env { token_env } => env_token(token_env).map(Some),
@@ -372,9 +523,53 @@ impl GhClient {
 }
 
 fn resolve_ambient_gh_from_path(path: Option<&std::ffi::OsStr>) -> Result<PathBuf, GhPrepareError> {
+    resolve_native_gh_from_path(path).ok_or(GhPrepareError::AmbientGhBinaryNotFound)
+}
+
+fn resolve_native_gh_from_path(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let executable = format!("gh{}", env::consts::EXE_SUFFIX);
     resolve_native_executable_from_path(&executable, path)
-        .ok_or(GhPrepareError::AmbientGhBinaryNotFound)
+}
+
+fn token_environment_credential_helper() -> &'static str {
+    "!f() { test \"$1\" = get || exit 0; protocol=; host=; while IFS= read -r line; do case \"$line\" in protocol=*) protocol=${line#protocol=} ;; host=*) host=${line#host=} ;; esac; done; test \"$protocol\" = https && test \"$host\" = github.com || exit 1; printf '%s\\n' username=x-access-token password=\"$GH_TOKEN\"; }; f"
+}
+
+const fn null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
+fn clear_privileged_environment(command: &mut Command, supervision: GhSupervision, binary: &Path) {
+    // All auth-bearing children start from a closed environment. An explicit
+    // deny-list inevitably misses a platform loader, proxy, CA, tracing, or
+    // tool-specific override; an allow-list keeps native-path validation from
+    // being bypassed before `main` and keeps spawned helper shells equally
+    // constrained.
+    command.env_clear();
+    if supervision == GhSupervision::Supervised {
+        command.env(
+            crate::supervised::SUPERVISED_ENV_VAR,
+            crate::supervised::SUPERVISED_ENV_VALUE,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = binary;
+    #[cfg(windows)]
+    if let Some(windows) = known_folders::get_known_folder_path(known_folders::KnownFolder::Windows)
+    {
+        let system = windows.join("System32");
+        command
+            .env("SYSTEMROOT", &windows)
+            .env("WINDIR", &windows)
+            .env("COMSPEC", system.join("cmd.exe"));
+        let mut path = vec![system];
+        if let Some(parent) = binary.parent() {
+            path.insert(0, parent.to_path_buf());
+        }
+        if let Ok(path) = env::join_paths(path) {
+            command.env("PATH", path);
+        }
+    }
 }
 
 fn run_helper_with_timeout(
@@ -524,7 +719,7 @@ fn parse_helper_stdout(
     }
     Ok(TokenResolution {
         token: trimmed.to_owned(),
-        kind: None,
+        kind: inferred_token_kind(trimmed),
         expires_at: None,
         valid_until: cache_ttl_seconds.map(|ttl| now + chrono::Duration::seconds(ttl_seconds(ttl))),
     })
@@ -548,7 +743,8 @@ fn parse_json_helper_stdout(
         .get("kind")
         .and_then(Value::as_str)
         .filter(|kind| !kind.trim().is_empty())
-        .map(ToOwned::to_owned);
+        .map(ToOwned::to_owned)
+        .or_else(|| inferred_token_kind(&token));
     let expires_at = match value.get("expires_at") {
         Some(Value::String(expires_at)) => Some(
             DateTime::parse_from_rfc3339(expires_at)
@@ -577,6 +773,16 @@ fn parse_json_helper_stdout(
         return Err(GhPrepareError::TokenExpired);
     }
     Ok(token)
+}
+
+fn inferred_token_kind(token: &str) -> Option<String> {
+    // GitHub installation access tokens use the documented `ghs_` prefix.
+    // Recording the sanitized kind lets security-sensitive callers require
+    // App authority even when an existing helper emits the traditional plain
+    // token form instead of Shipyard's optional JSON envelope.
+    token
+        .starts_with("ghs_")
+        .then(|| "github-app-installation".to_owned())
 }
 
 fn expand_token_command(

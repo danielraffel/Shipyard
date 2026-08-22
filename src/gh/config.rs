@@ -57,6 +57,8 @@ pub(super) struct GhAuthConfig {
     pub(super) source: GhAuthSource,
     pub(super) refresh_skew_seconds: u64,
     pub(super) ambient_gh_binary: Option<PathBuf>,
+    pub(super) privileged_gh_binary: Option<PathBuf>,
+    pub(super) privileged_git_binary: Option<PathBuf>,
 }
 
 impl GhAuthConfig {
@@ -65,6 +67,8 @@ impl GhAuthConfig {
             source: GhAuthSource::GhCli,
             refresh_skew_seconds: DEFAULT_REFRESH_SKEW_SECONDS,
             ambient_gh_binary: None,
+            privileged_gh_binary: None,
+            privileged_git_binary: None,
         }
     }
 
@@ -101,6 +105,8 @@ struct RawGithubAuthConfig {
     cache_ttl_seconds: Option<u64>,
     refresh_skew_seconds: Option<u64>,
     ambient_gh_binary: Option<PathBuf>,
+    privileged_gh_binary: Option<PathBuf>,
+    privileged_git_binary: Option<PathBuf>,
 }
 
 impl RawGithubAuthConfig {
@@ -120,6 +126,22 @@ impl RawGithubAuthConfig {
             return Err(GhConfigError::Invalid {
                 message: "`github.auth.ambient_gh_binary` must be an absolute path".to_owned(),
             });
+        }
+        for (key, path) in [
+            (
+                "github.auth.privileged_gh_binary",
+                self.privileged_gh_binary.as_ref(),
+            ),
+            (
+                "github.auth.privileged_git_binary",
+                self.privileged_git_binary.as_ref(),
+            ),
+        ] {
+            if path.is_some_and(|path| !path.is_absolute()) {
+                return Err(GhConfigError::Invalid {
+                    message: format!("`{key}` must be an absolute path"),
+                });
+            }
         }
 
         let has_credential_fields = self.token_env.is_some() || self.token_command.is_some();
@@ -161,6 +183,8 @@ impl RawGithubAuthConfig {
             source,
             refresh_skew_seconds,
             ambient_gh_binary: self.ambient_gh_binary,
+            privileged_gh_binary: self.privileged_gh_binary,
+            privileged_git_binary: self.privileged_git_binary,
         })
     }
 }
@@ -209,6 +233,24 @@ pub enum GhPrepareError {
     AmbientGhBinaryNotFound,
     /// An explicitly configured ambient `gh` path was not a usable native executable.
     InvalidAmbientGhBinary {
+        /// Rejected path.
+        path: PathBuf,
+        /// Sanitized validation failure.
+        detail: String,
+    },
+    /// No trusted direct native `gh` executable was configured for a token-bearing command.
+    PrivilegedGhBinaryNotConfigured,
+    /// A token-bearing command was given a non-native `gh` executable.
+    InvalidPrivilegedGhBinary {
+        /// Rejected path.
+        path: PathBuf,
+        /// Sanitized validation failure.
+        detail: String,
+    },
+    /// No trusted direct native `git` executable was configured for a token-bearing command.
+    PrivilegedGitBinaryNotConfigured,
+    /// A token-bearing command was given a non-native `git` executable.
+    InvalidPrivilegedGitBinary {
         /// Rejected path.
         path: PathBuf,
         /// Sanitized validation failure.
@@ -281,6 +323,24 @@ impl Display for GhPrepareError {
             Self::InvalidAmbientGhBinary { path, detail } => write!(
                 f,
                 "configured ambient gh binary {} is invalid: {detail}",
+                path.display()
+            ),
+            Self::PrivilegedGhBinaryNotConfigured => write!(
+                f,
+                "token-bearing GitHub command requires github.auth.privileged_gh_binary to name a trusted absolute native gh executable"
+            ),
+            Self::InvalidPrivilegedGhBinary { path, detail } => write!(
+                f,
+                "token-bearing GitHub command rejected gh binary {}: {detail}",
+                path.display()
+            ),
+            Self::PrivilegedGitBinaryNotConfigured => write!(
+                f,
+                "token-bearing Git command requires github.auth.privileged_git_binary to name a trusted absolute native git executable"
+            ),
+            Self::InvalidPrivilegedGitBinary { path, detail } => write!(
+                f,
+                "token-bearing Git command rejected git binary {}: {detail}",
                 path.display()
             ),
             Self::MissingTokenEnv { name } => {
@@ -361,6 +421,10 @@ impl GhPrepareError {
             Self::MissingTokenEnv { .. }
             | Self::AmbientGhBinaryNotFound
             | Self::InvalidAmbientGhBinary { .. }
+            | Self::PrivilegedGhBinaryNotConfigured
+            | Self::InvalidPrivilegedGhBinary { .. }
+            | Self::PrivilegedGitBinaryNotConfigured
+            | Self::InvalidPrivilegedGitBinary { .. }
             | Self::EmptyTokenEnv { .. }
             | Self::EmptyTokenCommand
             | Self::HelperStdoutEmpty
