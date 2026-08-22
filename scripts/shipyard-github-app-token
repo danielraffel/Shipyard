@@ -12,6 +12,7 @@ import argparse
 import base64
 import json
 import os
+import ssl
 import subprocess
 import sys
 import time
@@ -23,6 +24,12 @@ from typing import Any
 
 DEFAULT_API_URL = "https://api.github.com"
 API_VERSION = "2022-11-28"
+SYSTEM_CA_FILES = (
+    Path("/private/etc/ssl/cert.pem"),
+    Path("/etc/ssl/cert.pem"),
+    Path("/opt/homebrew/etc/openssl@3/cert.pem"),
+    Path("/usr/local/etc/openssl@3/cert.pem"),
+)
 
 
 class HelperError(Exception):
@@ -181,14 +188,32 @@ def api_request(request: urllib.request.Request, jwt: str) -> dict[str, Any]:
     request.add_header("Authorization", f"Bearer {jwt}")
     request.add_header("Accept", "application/vnd.github+json")
     request.add_header("X-GitHub-Api-Version", API_VERSION)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read()
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode(errors="replace").strip()
-        raise HelperError(f"GitHub API returned HTTP {error.code}: {detail}") from error
-    except urllib.error.URLError as error:
-        raise HelperError(f"GitHub API request failed: {error.reason}") from error
+    context = ssl.create_default_context()
+    retried_with_platform_ca = False
+    while True:
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+                context=context,
+            ) as response:
+                body = response.read()
+            break
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode(errors="replace").strip()
+            raise HelperError(
+                f"GitHub API returned HTTP {error.code}: {detail}"
+            ) from error
+        except urllib.error.URLError as error:
+            if (
+                not retried_with_platform_ca
+                and isinstance(error.reason, ssl.SSLCertVerificationError)
+                and default_trust_store_is_missing(context)
+            ):
+                context = add_platform_ca_files(context)
+                retried_with_platform_ca = True
+                continue
+            raise HelperError(f"GitHub API request failed: {error.reason}") from error
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as error:
@@ -196,6 +221,42 @@ def api_request(request: urllib.request.Request, jwt: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise HelperError("GitHub API returned an unexpected JSON payload")
     return payload
+
+
+def default_trust_store_is_missing(context: ssl.SSLContext) -> bool:
+    """Recognize only an unconfigured, physically absent Python CA store."""
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return False
+    if context.cert_store_stats().get("x509_ca", 0) > 0:
+        return False
+
+    paths = ssl.get_default_verify_paths()
+    if paths.cafile and Path(paths.cafile).is_file():
+        return False
+    if paths.capath and Path(paths.capath).is_dir():
+        return False
+    return True
+
+
+def add_platform_ca_files(context: ssl.SSLContext) -> ssl.SSLContext:
+    """Augment a failing default context without discarding private trust roots."""
+    loaded = False
+    for ca_file in SYSTEM_CA_FILES:
+        if not ca_file.is_file():
+            continue
+        try:
+            context.load_verify_locations(cafile=str(ca_file))
+        except (OSError, ssl.SSLError):
+            continue
+        loaded = True
+
+    if loaded:
+        return context
+
+    raise HelperError(
+        "Python could not verify GitHub TLS and no platform CA bundle was usable; "
+        "set SSL_CERT_FILE to a trusted CA bundle or repair the Python installation"
+    )
 
 
 if __name__ == "__main__":
