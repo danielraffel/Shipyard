@@ -127,6 +127,8 @@ The steward defaults to treating case-insensitive `5·unresolved` as an
 unresolved-provenance authority blocker. It reports `provenance_blocked` and
 makes no mutation until a current-head revalidation sees the label absent.
 Repeat `--provenance-blocking-label <label>` for another explicit vocabulary.
+The blocker precedes opt-out, and the final force-cancel boundary revalidates
+current PR provenance and management authority even after a restart.
 
 ## tartci local VM routing profiles
 

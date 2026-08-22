@@ -1,7 +1,7 @@
 use super::{
     BTreeMap, BTreeSet, CapacityPreemptionPolicy, CapacityRevalidation, GitHubActions, Instant,
-    MergeQueueMutationGuard, MutationControl, ObservedPr, RepoObservation, RequiredCheck,
-    RunCancellation, RunCancellationReason, ShipState, StewardJob, StewardLedger,
+    MergeQueueMutationGuard, MutationControl, ObservedPr, PendingCancellation, RepoObservation,
+    RequiredCheck, RunCancellation, RunCancellationReason, ShipState, StewardJob, StewardLedger,
     StewardPullRequest, StewardRun, Value, active_runs, attempt_key, coalescing_reason_authorizes,
     fetch_run_jobs, gh_json, gh_json_before, has_successful_status,
     hydrate_required_check_identities, hydrate_required_check_identities_before, is_full_sha,
@@ -263,6 +263,38 @@ pub(super) fn authority_excluded_pull_requests(
         })
         .map(|pr| pr.fact.number)
         .collect()
+}
+
+/// Re-establish current-PR authority immediately before force-cancelling an
+/// already accepted cancellation. The stale run SHA remains bound separately
+/// by `read_current_pending_run_identity`; this read proves that the current PR
+/// at the recorded number/base still permits Shipyard mutation.
+pub(super) fn revalidate_pending_pr_authority(
+    actions: &GitHubActions,
+    pending: &PendingCancellation,
+) -> Result<(), String> {
+    let live = pull_request(
+        actions,
+        &pending.repo,
+        pending.pr_number,
+        &pending.base,
+        &BTreeMap::new(),
+    )?
+    .ok_or_else(|| {
+        "pending cancellation pull request is no longer open on its recorded base".to_owned()
+    })?;
+    if pull_request_provenance_blocked(&live, &pending.provenance_blocking_labels) {
+        return Err("current pull request has a provenance-blocking label".to_owned());
+    }
+    if pull_request_opted_out(&live, &pending.opt_out_label) {
+        return Err("current pull request has the steward opt-out label".to_owned());
+    }
+    if !pull_request_is_managed(&live, &pending.managed_label, &pending.handoff_context) {
+        return Err(
+            "current pull request no longer has exact-head steward management authority".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn pull_request_is_managed(

@@ -8,7 +8,8 @@ use super::{
     cancel_capacity_preemption_after_revalidation, clear_pending_cancellation,
     finish_force_cancel_revalidation_failure, mark_cancellation_skipped, observe_repo,
     persist_capacity_evidence, persist_force_cancel_intent, read_current_pending_run_identity,
-    read_pending_run, record_audit, revalidate_capacity_preemption, save_ledger, thread,
+    read_pending_run, record_audit, revalidate_capacity_preemption,
+    revalidate_pending_pr_authority, save_ledger, thread,
 };
 
 pub(super) fn resume_pending_cancellations(
@@ -163,7 +164,9 @@ pub(super) fn resume_force_cancel_after_normal_wait(
         &format!("runner steward resume force-cancel run {}", pending.run_id),
         &intent,
     )?;
-    if let Err(error) = read_current_pending_run_identity(actions, pending) {
+    if let Err(error) = revalidate_pending_pr_authority(actions, pending)
+        .and_then(|()| read_current_pending_run_identity(actions, pending))
+    {
         let audit_error = finish_force_cancel_revalidation_failure(
             guard,
             ledger,

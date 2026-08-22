@@ -873,7 +873,9 @@ The case-insensitive `5·unresolved` label is a fail-closed provenance blocker
 by default. A matching current PR reports `provenance_blocked` and receives no
 mutation. Repeat `--provenance-blocking-label <label>` for another repository
 vocabulary; live revalidation must observe the blocker absent before authority
-returns.
+returns. This decision precedes opt-out, and both same-process and restarted
+force-cancel terminalization re-read the current PR's blocker, opt-out, and
+exact-head management authority before making the final POST.
 
 Stewardship is opt-in per immutable head. Prefer making the receipt atomic with
 PR creation: set `[merge_steward].auto_handoff = true` on the protected base
