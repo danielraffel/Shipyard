@@ -530,9 +530,13 @@ multi-worker admission are separate work and are not implied by this feature.
 
 The separate artifact transport proof is also default-off. It validates typed
 manifests, exact source/toolchain/cache generations, authenticated chunk-prefix
-resume, space watermarks, and same-root atomic publication, but it does not
-select a host or dispatch a shard. A roaming/offline worker is additive only and
-must be excluded or reassigned without blocking the minimum completion set.
+resume with opaque manifest/session-bound plans, space watermarks, same-root
+atomic publication, and safe exact-layout `tar.zst` extraction. Archive
+consumption rejects traversal, links, duplicates, undeclared/missing members,
+and type/mode/size/digest drift before atomically exposing an extracted tree.
+The proof does not select a host or dispatch a shard. A roaming/offline worker
+is additive only and must be excluded or reassigned without blocking the
+minimum completion set.
 Follow [`docs/artifact-transport.md`](../../docs/artifact-transport.md) before
 integrating it with a scheduler.
 

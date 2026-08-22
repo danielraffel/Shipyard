@@ -43,6 +43,11 @@ macOS `/usr/bin/rsync` (openrsync) does not provide `--append-verify`. Therefore
 plain `--partial` is not considered resumable proof, and blind `--append` is
 forbidden. Shipyard hashes each complete prefix chunk, truncates an incomplete
 or corrupt tail to the last verified boundary, and only then permits `--append`.
+The resume plan is opaque and bound to the exact manifest digest, transfer
+session, leased partial path, and observed length. Applying it re-reads the
+partial and refuses drift; receiver-pull command construction accepts only the
+applied plan and checks the prepared length again. Callers cannot construct an
+append boundary or reuse a plan from another transfer.
 After transfer, it rechecks every chunk, total size, final SHA-256, manifest
 authority, and producer fence.
 
@@ -53,6 +58,18 @@ winner before reuse. Validation failure restores the resumable partial;
 post-verification publication failure retains the sealed bytes for diagnosis or
 retry. An existing immutable object is reused only after its size and digest
 match; it is never overwritten.
+
+Publication authenticates the encoded object, but encoded-object identity alone
+does not authorize unpacking. Before extraction, `verify_archive_layout`
+decodes the `tar.zst` without writing files and requires every archive member to
+match the manifest's complete sorted layout. It rejects traversal, absolute or
+non-portable paths, links and special files, duplicates, undeclared or missing
+members, omitted parent-directory records, hidden post-archive data, and
+type/mode/size/digest mismatches. `extract_verified_archive` then repeats that
+validation into a private sibling staging directory, rechecks the encoded
+object for mutation, holds an OS-backed parent extraction lease, and atomically
+renames the complete tree into a previously absent destination. A failed,
+partial, or competing layout never becomes a consumable destination.
 
 The host declares the store root. Do not assume `/Volumes/Workshop` or a home
 directory: a machine with a nearly-full external volume may correctly choose a

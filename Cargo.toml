@@ -28,8 +28,10 @@ regex = "1.12.2"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 same-file = "1.0.6"
 tempfile = "3.23.0"
+tar = { version = "0.4.44", default-features = false }
 toml = "0.8.23"
 wait-timeout = "0.2.1"
+zstd = { version = "0.13.3", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["user"] }

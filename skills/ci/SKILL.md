@@ -1053,10 +1053,12 @@ SSH-backed targets deliver code via `git bundle`. On the first run the bundle is
 
 Source delivery is not build-artifact delivery. The default-off artifact proof
 core uses typed exact-head/toolchain/cache-generation manifests, authenticated
-chunk resume, and same-root atomic publication. It has no dispatch or live
-sharding behavior. Do not copy a full repository, build tree, Skia/Dawn cache,
-or other heavyweight cache to feed a shard; prefer an exact cache-generation
-reference, basis-aware Git objects, then a compressed immutable artifact. See
+chunk resume through opaque manifest/session-bound plans, same-root atomic
+publication, and exact-layout safe extraction that rejects traversal, links,
+duplicates, and manifest drift. It has no dispatch or live sharding behavior.
+Do not copy a full repository, build tree, Skia/Dawn cache, or other heavyweight
+cache to feed a shard; prefer an exact cache-generation reference, basis-aware
+Git objects, then a compressed immutable artifact. See
 [`docs/artifact-transport.md`](../../docs/artifact-transport.md).
 
 ## Exact-head changed-surface shadow planning

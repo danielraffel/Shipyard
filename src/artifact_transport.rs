@@ -8,10 +8,11 @@
 use fs2::{FileExt, available_space};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 /// Current on-disk/wire manifest schema.
@@ -245,6 +246,28 @@ impl ArtifactManifest {
                 }
             }
         }
+        let by_path: HashMap<&str, &LayoutEntry> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.path(), entry))
+            .collect();
+        for entry in &self.entries {
+            let mut parent = Path::new(entry.path()).parent();
+            while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+                let parent_path = path.to_str().ok_or_else(|| {
+                    Error::Invalid("layout parent path must be portable UTF-8".into())
+                })?;
+                if !matches!(
+                    by_path.get(parent_path),
+                    Some(LayoutEntry::Directory { .. })
+                ) {
+                    return Err(Error::Invalid(format!(
+                        "layout omits parent directory {parent_path}"
+                    )));
+                }
+                parent = path.parent();
+            }
+        }
         let encoded = serde_json::to_vec(&self.entries)?;
         if sha256_bytes(&encoded) != self.layout_sha256 {
             return Err(Error::Invalid(
@@ -351,25 +374,83 @@ impl ArtifactManifest {
     }
 }
 
-/// Outcome of authenticating an interrupted partial artifact.
+/// Read-only outcome of authenticating an interrupted partial artifact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResumePlan {
+pub enum ResumeDisposition {
     Restart,
-    Append {
-        verified_bytes: u64,
-        truncate_to: u64,
-    },
+    Append { verified_bytes: u64 },
     CompletePendingFinalVerification,
 }
 
-/// Authenticate full chunks of a partial file and find the only safe append boundary.
-pub fn plan_verified_resume(path: &Path, manifest: &ArtifactManifest) -> Result<ResumePlan, Error> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResumeAction {
+    Restart,
+    Append { verified_bytes: u64 },
+    CompletePendingFinalVerification,
+}
+
+/// An opaque resume decision bound to one manifest, lease, path, and observed file state.
+///
+/// Callers cannot construct or modify this value. It must be revalidated and
+/// applied with [`apply_resume_plan`] before it can authorize receiver-pull
+/// command construction.
+#[derive(Debug)]
+pub struct ResumePlan {
+    artifact_sha256: String,
+    manifest_sha256: String,
+    session: String,
+    partial_path: PathBuf,
+    observed_length: u64,
+    action: ResumeAction,
+    prepared: bool,
+    prepared_sha256: Option<String>,
+}
+
+impl ResumePlan {
+    /// Describe the authenticated action without exposing mutable plan state.
+    #[must_use]
+    pub fn disposition(&self) -> ResumeDisposition {
+        match self.action {
+            ResumeAction::Restart => ResumeDisposition::Restart,
+            ResumeAction::Append { verified_bytes } => ResumeDisposition::Append { verified_bytes },
+            ResumeAction::CompletePendingFinalVerification => {
+                ResumeDisposition::CompletePendingFinalVerification
+            }
+        }
+    }
+}
+
+/// Authenticate full chunks and bind the only safe resume action to an active transfer lease.
+pub fn plan_verified_resume(
+    transfer: &ArtifactTransferLease,
+    manifest: &ArtifactManifest,
+) -> Result<ResumePlan, Error> {
     manifest.validate()?;
+    validate_transfer_binding(transfer, manifest)?;
+    let path = transfer.partial_path();
     reject_non_regular_file(path, "artifact partial")?;
     let mut file = File::open(path)?;
     let length = file.metadata()?.len();
+    let action = plan_resume_action(&mut file, length, manifest)?;
+    Ok(ResumePlan {
+        artifact_sha256: manifest.artifact_sha256.clone(),
+        manifest_sha256: manifest.canonical_sha256()?,
+        session: transfer.session.clone(),
+        partial_path: path.to_path_buf(),
+        observed_length: length,
+        action,
+        prepared: false,
+        prepared_sha256: None,
+    })
+}
+
+fn plan_resume_action(
+    file: &mut File,
+    length: u64,
+    manifest: &ArtifactManifest,
+) -> Result<ResumeAction, Error> {
     if length > manifest.artifact_size_bytes {
-        return Ok(ResumePlan::Restart);
+        return Ok(ResumeAction::Restart);
     }
     let mut verified = 0_u64;
     for chunk in &manifest.chunks {
@@ -377,42 +458,62 @@ pub fn plan_verified_resume(path: &Path, manifest: &ArtifactManifest) -> Result<
             break;
         }
         file.seek(SeekFrom::Start(chunk.offset))?;
-        let mut take = (&mut file).take(chunk.size_bytes);
+        let mut take = Read::by_ref(file).take(chunk.size_bytes);
         let digest = sha256_reader(&mut take)?;
         if digest != chunk.sha256 {
             return if verified == 0 {
-                Ok(ResumePlan::Restart)
+                Ok(ResumeAction::Restart)
             } else {
-                Ok(ResumePlan::Append {
+                Ok(ResumeAction::Append {
                     verified_bytes: verified,
-                    truncate_to: verified,
                 })
             };
         }
         verified += chunk.size_bytes;
     }
     if verified == manifest.artifact_size_bytes && length == verified {
-        Ok(ResumePlan::CompletePendingFinalVerification)
+        Ok(ResumeAction::CompletePendingFinalVerification)
     } else if verified == 0 {
-        Ok(ResumePlan::Restart)
+        Ok(ResumeAction::Restart)
     } else {
-        Ok(ResumePlan::Append {
+        Ok(ResumeAction::Append {
             verified_bytes: verified,
-            truncate_to: verified,
         })
     }
 }
 
-/// Truncate a partial file to the authenticated boundary selected by [`plan_verified_resume`].
-pub fn apply_resume_plan(path: &Path, plan: ResumePlan) -> Result<(), Error> {
-    let length = match plan {
-        ResumePlan::Restart => 0,
-        ResumePlan::Append { truncate_to, .. } => truncate_to,
-        ResumePlan::CompletePendingFinalVerification => return Ok(()),
+/// Revalidate and apply an opaque plan, returning the prepared value required by receiver-pull.
+pub fn apply_resume_plan(
+    transfer: &ArtifactTransferLease,
+    manifest: &ArtifactManifest,
+    mut plan: ResumePlan,
+) -> Result<ResumePlan, Error> {
+    manifest.validate()?;
+    validate_resume_binding(transfer, manifest, &plan)?;
+    reject_non_regular_file(transfer.partial_path(), "artifact partial")?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(transfer.partial_path())?;
+    let current_length = file.metadata()?.len();
+    let current_action = plan_resume_action(&mut file, current_length, manifest)?;
+    if current_length != plan.observed_length || current_action != plan.action {
+        return Err(Error::Invalid(
+            "artifact partial changed after resume planning".into(),
+        ));
+    }
+    let prepared_length = match plan.action {
+        ResumeAction::Restart => 0,
+        ResumeAction::Append { verified_bytes } => verified_bytes,
+        ResumeAction::CompletePendingFinalVerification => current_length,
     };
-    reject_non_regular_file(path, "artifact partial")?;
-    OpenOptions::new().write(true).open(path)?.set_len(length)?;
-    Ok(())
+    file.set_len(prepared_length)?;
+    file.sync_all()?;
+    plan.observed_length = prepared_length;
+    plan.prepared = true;
+    file.seek(SeekFrom::Start(0))?;
+    plan.prepared_sha256 = Some(sha256_reader(&mut file)?);
+    Ok(plan)
 }
 
 /// Shell-free command description for receiver-pull `rsync`.
@@ -429,7 +530,7 @@ pub struct ReceiverPullRequest<'a> {
     pub remote_store_root: &'a Path,
     /// Exclusive receiver-side ownership retained through publication.
     pub transfer: &'a ArtifactTransferLease,
-    pub resume: ResumePlan,
+    pub resume: &'a ResumePlan,
     pub timeout_seconds: u32,
 }
 
@@ -445,6 +546,7 @@ pub fn receiver_pull_command(
         resume,
         timeout_seconds,
     } = request;
+    validate_prepared_resume(transfer, resume)?;
     if !rsync_program.is_absolute() || rsync_program.file_name().is_none() {
         return Err(Error::Invalid(
             "rsync program must be an absolute path".into(),
@@ -468,20 +570,17 @@ pub fn receiver_pull_command(
     }
     let remote = format!("{remote_host}:{root}/objects/{artifact_sha256}.tar.zst");
     let mut args = vec![OsString::from("-a"), OsString::from("--partial")];
-    match *resume {
-        ResumePlan::Append {
-            verified_bytes,
-            truncate_to,
-        } if verified_bytes > 0 && verified_bytes == truncate_to => {
+    match resume.action {
+        ResumeAction::Append { verified_bytes } if verified_bytes > 0 => {
             args.push(OsString::from("--append"));
         }
-        ResumePlan::Append { .. } => {
+        ResumeAction::Append { .. } => {
             return Err(Error::Invalid(
                 "append requires a non-zero verified boundary".into(),
             ));
         }
-        ResumePlan::Restart => {}
-        ResumePlan::CompletePendingFinalVerification => {
+        ResumeAction::Restart => {}
+        ResumeAction::CompletePendingFinalVerification => {
             return Err(Error::Invalid(
                 "completed partial must be published, not transferred again".into(),
             ));
@@ -499,6 +598,68 @@ pub fn receiver_pull_command(
         program: rsync_program.to_path_buf(),
         args,
     })
+}
+
+fn validate_transfer_binding(
+    transfer: &ArtifactTransferLease,
+    manifest: &ArtifactManifest,
+) -> Result<(), Error> {
+    if transfer.artifact_sha256 != manifest.artifact_sha256 {
+        return Err(Error::Invalid(
+            "resume manifest does not match the transfer lease digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resume_binding(
+    transfer: &ArtifactTransferLease,
+    manifest: &ArtifactManifest,
+    plan: &ResumePlan,
+) -> Result<(), Error> {
+    validate_transfer_binding(transfer, manifest)?;
+    if plan.prepared
+        || plan.artifact_sha256 != manifest.artifact_sha256
+        || plan.manifest_sha256 != manifest.canonical_sha256()?
+        || plan.session != transfer.session
+        || plan.partial_path != transfer.partial_path
+    {
+        return Err(Error::Invalid(
+            "resume plan is stale or belongs to a different transfer".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prepared_resume(
+    transfer: &ArtifactTransferLease,
+    plan: &ResumePlan,
+) -> Result<(), Error> {
+    if !plan.prepared
+        || plan.artifact_sha256 != transfer.artifact_sha256
+        || plan.session != transfer.session
+        || plan.partial_path != transfer.partial_path
+    {
+        return Err(Error::Invalid(
+            "receiver pull requires a prepared plan for this exact transfer".into(),
+        ));
+    }
+    reject_non_regular_file(transfer.partial_path(), "artifact partial")?;
+    if fs::metadata(transfer.partial_path())?.len() != plan.observed_length {
+        return Err(Error::Invalid(
+            "artifact partial changed after resume preparation".into(),
+        ));
+    }
+    let expected_digest = plan.prepared_sha256.as_deref().ok_or_else(|| {
+        Error::Invalid("prepared resume plan has no authenticated content digest".into())
+    })?;
+    let mut partial = File::open(transfer.partial_path())?;
+    if sha256_reader(&mut partial)? != expected_digest {
+        return Err(Error::Invalid(
+            "artifact partial content changed after resume preparation".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Disk reserve enforced before receiving more artifact bytes.
@@ -834,7 +995,10 @@ fn verify_sealed_artifact(path: &Path, manifest: &ArtifactManifest) -> Result<()
     if metadata.len() != manifest.artifact_size_bytes {
         return Err(Error::Invalid("sealed artifact has the wrong size".into()));
     }
-    if plan_verified_resume(path, manifest)? != ResumePlan::CompletePendingFinalVerification {
+    let mut chunk_file = File::open(path)?;
+    if plan_resume_action(&mut chunk_file, metadata.len(), manifest)?
+        != ResumeAction::CompletePendingFinalVerification
+    {
         return Err(Error::Invalid(
             "sealed artifact failed chunk verification".into(),
         ));
@@ -844,6 +1008,303 @@ fn verify_sealed_artifact(path: &Path, manifest: &ArtifactManifest) -> Result<()
         return Err(Error::Invalid("artifact final digest mismatch".into()));
     }
     file.sync_all()?;
+    Ok(())
+}
+
+/// Verify encoded bytes and require the archive's complete unpacked layout to
+/// match the manifest exactly. Nothing is extracted by this operation.
+pub fn verify_archive_layout(path: &Path, manifest: &ArtifactManifest) -> Result<(), Error> {
+    manifest.validate()?;
+    verify_encoded_artifact(path, manifest)?;
+    scan_archive(path, manifest, None)?;
+    // Detect replacement or mutation while the archive was decoded.
+    verify_encoded_artifact(path, manifest)
+}
+
+/// Verify an archive, safely extract it into private sibling staging, then
+/// atomically publish the complete unpacked tree at `destination`.
+///
+/// The destination must not exist. Traversal, links, special files, duplicate
+/// paths, undeclared paths, and any type/mode/size/digest mismatch fail closed.
+pub fn extract_verified_archive(
+    path: &Path,
+    manifest: &ArtifactManifest,
+    destination: &Path,
+) -> Result<(), Error> {
+    verify_archive_layout(path, manifest)?;
+    if !destination.is_absolute() {
+        return Err(Error::Invalid(
+            "artifact extraction destination must be absolute".into(),
+        ));
+    }
+    reject_symlink(destination)?;
+    if destination.exists() {
+        return Err(Error::Invalid(
+            "artifact extraction destination already exists".into(),
+        ));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Error::Invalid("artifact extraction destination has no parent".into()))?;
+    reject_symlink(parent)?;
+    if !parent.metadata()?.is_dir() {
+        return Err(Error::Invalid(
+            "artifact extraction parent is not a directory".into(),
+        ));
+    }
+    let extraction_lock_path = parent.join(".shipyard-artifact-extract.lease");
+    reject_symlink(&extraction_lock_path)?;
+    let extraction_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&extraction_lock_path)?;
+    reject_non_regular_file(&extraction_lock_path, "artifact extraction lease")?;
+    FileExt::try_lock_exclusive(&extraction_lock).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Error::Invalid("another artifact extraction owns this destination parent".into())
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    if destination.exists() {
+        return Err(Error::Invalid(
+            "artifact extraction destination already exists".into(),
+        ));
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(".shipyard-artifact-")
+        .tempdir_in(parent)?;
+    scan_archive(path, manifest, Some(staging.path()))?;
+    // A mutable source cannot become trusted by changing between the proof and
+    // extraction pass. The private staging tree is discarded on mismatch.
+    verify_encoded_artifact(path, manifest)?;
+    let staging_path = staging.keep();
+    if destination.exists() {
+        fs::remove_dir_all(&staging_path)?;
+        return Err(Error::Invalid(
+            "artifact extraction destination appeared before publication".into(),
+        ));
+    }
+    if let Err(error) = fs::rename(&staging_path, destination) {
+        let _ = fs::remove_dir_all(&staging_path);
+        return Err(error.into());
+    }
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn verify_encoded_artifact(path: &Path, manifest: &ArtifactManifest) -> Result<(), Error> {
+    reject_non_regular_file(path, "artifact archive")?;
+    let metadata = fs::metadata(path)?;
+    if metadata.len() != manifest.artifact_size_bytes {
+        return Err(Error::Invalid("artifact archive has the wrong size".into()));
+    }
+    let mut file = File::open(path)?;
+    if sha256_reader(&mut file)? != manifest.artifact_sha256 {
+        return Err(Error::Invalid("artifact archive digest mismatch".into()));
+    }
+    Ok(())
+}
+
+fn scan_archive(
+    path: &Path,
+    manifest: &ArtifactManifest,
+    extraction_root: Option<&Path>,
+) -> Result<(), Error> {
+    let file = File::open(path)?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|error| Error::Invalid(format!("invalid zstd artifact: {error}")))?;
+    let mut archive = tar::Archive::new(decoder);
+    let expected: HashMap<&str, &LayoutEntry> = manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.path(), entry))
+        .collect();
+    let mut seen = HashSet::with_capacity(expected.len());
+    let mut directory_modes = Vec::new();
+    for entry in archive
+        .entries()
+        .map_err(|error| Error::Invalid(format!("invalid tar artifact: {error}")))?
+    {
+        let mut entry =
+            entry.map_err(|error| Error::Invalid(format!("invalid tar entry: {error}")))?;
+        let entry_type = entry.header().entry_type();
+        let entry_path = entry
+            .path()
+            .map_err(|error| Error::Invalid(format!("invalid tar path: {error}")))?;
+        let raw_path = entry_path
+            .to_str()
+            .ok_or_else(|| Error::Invalid("archive path must be UTF-8".into()))?
+            .to_owned();
+        let path_string = if entry_type.is_dir() {
+            raw_path.trim_end_matches('/').to_owned()
+        } else {
+            raw_path
+        };
+        validate_relative_path(&path_string)?;
+        if !seen.insert(path_string.clone()) {
+            return Err(Error::Invalid(format!(
+                "archive contains duplicate path {path_string}"
+            )));
+        }
+        let expected_entry = expected.get(path_string.as_str()).ok_or_else(|| {
+            Error::Invalid(format!("archive contains undeclared path {path_string}"))
+        })?;
+        let mode = entry
+            .header()
+            .mode()
+            .map_err(|error| Error::Invalid(format!("invalid mode for {path_string}: {error}")))?;
+        validate_mode(mode)?;
+        scan_layout_entry(
+            &mut entry,
+            &path_string,
+            entry_type,
+            mode,
+            expected_entry,
+            extraction_root,
+            &mut directory_modes,
+        )?;
+    }
+    if seen.len() != expected.len() {
+        let missing = manifest
+            .entries
+            .iter()
+            .find(|entry| !seen.contains(entry.path()))
+            .map_or("unknown", LayoutEntry::path);
+        return Err(Error::Invalid(format!(
+            "archive layout is incomplete; missing {missing}"
+        )));
+    }
+    directory_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (path, mode) in directory_modes {
+        set_portable_permissions(&path, mode)?;
+    }
+    reject_trailing_archive_data(archive.into_inner())?;
+    Ok(())
+}
+
+fn scan_layout_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    path: &str,
+    entry_type: tar::EntryType,
+    mode: u32,
+    expected: &LayoutEntry,
+    extraction_root: Option<&Path>,
+    directory_modes: &mut Vec<(PathBuf, u32)>,
+) -> Result<(), Error> {
+    match expected {
+        LayoutEntry::Directory {
+            mode: expected_mode,
+            ..
+        } => {
+            if !entry_type.is_dir() || mode != *expected_mode {
+                return Err(Error::Invalid(format!(
+                    "archive directory type or mode mismatch for {path}"
+                )));
+            }
+            if let Some(root) = extraction_root {
+                let output = root.join(path);
+                fs::create_dir_all(&output)?;
+                directory_modes.push((output, *expected_mode));
+            }
+        }
+        LayoutEntry::File {
+            mode: expected_mode,
+            size_bytes,
+            sha256,
+            ..
+        } => {
+            if entry_type != tar::EntryType::Regular
+                || mode != *expected_mode
+                || entry.size() != *size_bytes
+            {
+                return Err(Error::Invalid(format!(
+                    "archive file type, mode, or size mismatch for {path}"
+                )));
+            }
+            let mut hasher = Sha256::new();
+            let copied = if let Some(root) = extraction_root {
+                let output = root.join(path);
+                if let Some(parent) = output.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut output_file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&output)?;
+                let copied = copy_and_hash(entry, &mut output_file, &mut hasher)?;
+                output_file.sync_all()?;
+                set_portable_permissions(&output, *expected_mode)?;
+                copied
+            } else {
+                copy_and_hash(entry, &mut std::io::sink(), &mut hasher)?
+            };
+            if copied != *size_bytes {
+                return Err(Error::Invalid(format!(
+                    "archive file length changed while reading {path}"
+                )));
+            }
+            if hex::encode(hasher.finalize()) != *sha256 {
+                return Err(Error::Invalid(format!(
+                    "archive file digest mismatch for {path}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_trailing_archive_data(mut decoder: impl Read) -> Result<(), Error> {
+    let mut trailing = [0_u8; 1024];
+    let mut trailing_bytes = 0_usize;
+    loop {
+        let read = decoder.read(&mut trailing)?;
+        if read == 0 {
+            break;
+        }
+        trailing_bytes = trailing_bytes.saturating_add(read);
+        if trailing_bytes > 1024 || trailing[..read].iter().any(|byte| *byte != 0) {
+            return Err(Error::Invalid(
+                "archive contains data after the terminal tar record".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copy_and_hash(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    hasher: &mut Sha256,
+) -> Result<u64, Error> {
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| Error::Invalid("archive file size overflows u64".into()))?;
+    }
+    Ok(total)
+}
+
+#[cfg(unix)]
+fn set_portable_permissions(path: &Path, mode: u32) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn set_portable_permissions(_path: &Path, _mode: u32) -> Result<(), Error> {
     Ok(())
 }
 
@@ -1033,12 +1494,18 @@ mod tests {
     }
 
     fn fixture(bytes: &[u8]) -> ArtifactManifest {
-        let entries = vec![LayoutEntry::File {
-            path: "bin/tool".into(),
-            mode: 0o755,
-            size_bytes: 4,
-            sha256: digest(b"tool"),
-        }];
+        let entries = vec![
+            LayoutEntry::Directory {
+                path: "bin".into(),
+                mode: 0o755,
+            },
+            LayoutEntry::File {
+                path: "bin/tool".into(),
+                mode: 0o755,
+                size_bytes: 4,
+                sha256: digest(b"tool"),
+            },
+        ];
         let chunks = bytes
             .chunks(TEST_CHUNK_SIZE)
             .enumerate()
@@ -1098,6 +1565,88 @@ mod tests {
         }
     }
 
+    fn pull_request<'a>(
+        program: &'a str,
+        host: &'a str,
+        root: &'a str,
+        transfer: &'a ArtifactTransferLease,
+        resume: &'a ResumePlan,
+    ) -> ReceiverPullRequest<'a> {
+        ReceiverPullRequest {
+            rsync_program: Path::new(program),
+            remote_host: host,
+            remote_store_root: Path::new(root),
+            transfer,
+            resume,
+            timeout_seconds: 30,
+        }
+    }
+
+    enum TestArchiveEntry<'a> {
+        Directory(&'a str, u32),
+        File(&'a str, u32, &'a [u8]),
+        Symlink(&'a str, &'a str),
+    }
+
+    fn test_archive(entries: &[TestArchiveEntry<'_>]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for entry in entries {
+            match entry {
+                TestArchiveEntry::Directory(path, mode) => {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_mode(*mode);
+                    header.set_size(0);
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, *path, std::io::empty())
+                        .unwrap();
+                }
+                TestArchiveEntry::File(path, mode, bytes) => {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_mode(*mode);
+                    header.set_size(bytes.len() as u64);
+                    header.set_cksum();
+                    builder.append_data(&mut header, *path, *bytes).unwrap();
+                }
+                TestArchiveEntry::Symlink(path, target) => {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    header.set_mode(0o777);
+                    header.set_size(0);
+                    header.set_link_name(*target).unwrap();
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, *path, std::io::empty())
+                        .unwrap();
+                }
+            }
+        }
+        builder.finish().unwrap();
+        let raw = builder.into_inner().unwrap();
+        zstd::stream::encode_all(raw.as_slice(), 1).unwrap()
+    }
+
+    fn archive_manifest(bytes: &[u8], entries: Vec<LayoutEntry>) -> ArtifactManifest {
+        let mut manifest = fixture(bytes);
+        manifest.layout_sha256 = digest(&serde_json::to_vec(&entries).unwrap());
+        manifest.entries = entries;
+        manifest
+    }
+
+    fn replace_first_tar_path(bytes: &[u8], path: &str) -> Vec<u8> {
+        let mut raw = zstd::stream::decode_all(bytes).unwrap();
+        assert!(path.len() < 100);
+        raw[..100].fill(0);
+        raw[..path.len()].copy_from_slice(path.as_bytes());
+        raw[148..156].fill(b' ');
+        let checksum: u32 = raw[..512].iter().map(|byte| u32::from(*byte)).sum();
+        let encoded = format!("{checksum:06o}\0 ");
+        raw[148..156].copy_from_slice(encoded.as_bytes());
+        zstd::stream::encode_all(raw.as_slice(), 1).unwrap()
+    }
+
     #[test]
     fn validates_exact_identity_and_rejects_stale_fence() {
         let bytes = vec![7; TEST_CHUNK_SIZE + 31];
@@ -1124,7 +1673,7 @@ mod tests {
             "space bad",
         ] {
             let mut manifest = fixture(&bytes);
-            if let LayoutEntry::File { path, .. } = &mut manifest.entries[0] {
+            if let LayoutEntry::File { path, .. } = &mut manifest.entries[1] {
                 *path = hostile.into();
             }
             manifest.layout_sha256 = digest(&serde_json::to_vec(&manifest.entries).unwrap());
@@ -1150,7 +1699,7 @@ mod tests {
         manifest.layout_sha256 = "0".repeat(64);
         assert!(manifest.validate().is_err());
         let mut manifest = fixture(&bytes);
-        if let LayoutEntry::File { mode, .. } = &mut manifest.entries[0] {
+        if let LayoutEntry::File { mode, .. } = &mut manifest.entries[1] {
             *mode = 0o4755;
         }
         manifest.layout_sha256 = digest(&serde_json::to_vec(&manifest.entries).unwrap());
@@ -1174,27 +1723,31 @@ mod tests {
         let bytes = vec![3; TEST_CHUNK_SIZE * 2 + 10];
         let manifest = fixture(&bytes);
         let temp = TempDir::new().unwrap();
-        let partial = temp.path().join("partial");
+        let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let transfer = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run")
+            .unwrap();
+        let partial = transfer.partial_path().to_path_buf();
         fs::write(&partial, &bytes[..TEST_CHUNK_SIZE + 17]).unwrap();
-        let plan = plan_verified_resume(&partial, &manifest).unwrap();
+        let plan = plan_verified_resume(&transfer, &manifest).unwrap();
         assert_eq!(
-            plan,
-            ResumePlan::Append {
-                verified_bytes: MIN_CHUNK_SIZE,
-                truncate_to: MIN_CHUNK_SIZE
+            plan.disposition(),
+            ResumeDisposition::Append {
+                verified_bytes: MIN_CHUNK_SIZE
             }
         );
-        apply_resume_plan(&partial, plan).unwrap();
+        let _prepared = apply_resume_plan(&transfer, &manifest, plan).unwrap();
         assert_eq!(fs::metadata(&partial).unwrap().len(), MIN_CHUNK_SIZE);
 
         let mut corrupt = bytes.clone();
         corrupt[TEST_CHUNK_SIZE + 1] ^= 1;
         fs::write(&partial, &corrupt).unwrap();
         assert_eq!(
-            plan_verified_resume(&partial, &manifest).unwrap(),
-            ResumePlan::Append {
-                verified_bytes: MIN_CHUNK_SIZE,
-                truncate_to: MIN_CHUNK_SIZE
+            plan_verified_resume(&transfer, &manifest)
+                .unwrap()
+                .disposition(),
+            ResumeDisposition::Append {
+                verified_bytes: MIN_CHUNK_SIZE
             }
         );
     }
@@ -1204,87 +1757,332 @@ mod tests {
         let bytes = vec![4; TEST_CHUNK_SIZE];
         let manifest = fixture(&bytes);
         let temp = TempDir::new().unwrap();
-        let partial = temp.path().join("partial");
+        let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let transfer = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run")
+            .unwrap();
+        let partial = transfer.partial_path().to_path_buf();
         let mut corrupt = bytes.clone();
         corrupt[0] ^= 1;
         fs::write(&partial, &corrupt).unwrap();
         assert_eq!(
-            plan_verified_resume(&partial, &manifest).unwrap(),
-            ResumePlan::Restart
+            plan_verified_resume(&transfer, &manifest)
+                .unwrap()
+                .disposition(),
+            ResumeDisposition::Restart
         );
         fs::write(&partial, vec![4; TEST_CHUNK_SIZE + 1]).unwrap();
         assert_eq!(
-            plan_verified_resume(&partial, &manifest).unwrap(),
-            ResumePlan::Restart
+            plan_verified_resume(&transfer, &manifest)
+                .unwrap()
+                .disposition(),
+            ResumeDisposition::Restart
         );
     }
 
     #[test]
     fn receiver_pull_argv_is_shell_free_and_append_is_fenced() {
-        let digest = "a".repeat(64);
+        let bytes = vec![1; TEST_CHUNK_SIZE * 2];
+        let manifest = fixture(&bytes);
         let temp = TempDir::new().unwrap();
         let store = ArtifactStore::open(temp.path().join("store")).unwrap();
-        let transfer = store.acquire_transfer_lease(&digest, "run-1").unwrap();
-        let request = |program, host, root, resume| ReceiverPullRequest {
-            rsync_program: Path::new(program),
-            remote_host: host,
-            remote_store_root: Path::new(root),
-            transfer: &transfer,
-            resume,
-            timeout_seconds: 30,
-        };
+        let transfer = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run-1")
+            .unwrap();
+        fs::write(transfer.partial_path(), &bytes[..TEST_CHUNK_SIZE]).unwrap();
+        let append = apply_resume_plan(
+            &transfer,
+            &manifest,
+            plan_verified_resume(&transfer, &manifest).unwrap(),
+        )
+        .unwrap();
         #[cfg(windows)]
         let absolute_rsync = r"C:\Shipyard\rsync.exe";
         #[cfg(not(windows))]
         let absolute_rsync = "/usr/bin/rsync";
-        let command = receiver_pull_command(&request(
+        let command = receiver_pull_command(&pull_request(
             absolute_rsync,
             "m1-lan",
             "/var/lib/shipyard/artifacts",
-            ResumePlan::Append {
-                verified_bytes: 65536,
-                truncate_to: 65536,
-            },
+            &transfer,
+            &append,
         ))
         .unwrap();
         assert_eq!(command.program, Path::new(absolute_rsync));
         assert!(command.args.iter().any(|arg| arg == "--append"));
         for hostile in ["-oProxyCommand=bad", "host;bad", "host name"] {
             assert!(
-                receiver_pull_command(&request(
+                receiver_pull_command(&pull_request(
                     absolute_rsync,
                     hostile,
                     "/safe",
-                    ResumePlan::Restart,
+                    &transfer,
+                    &append,
                 ))
                 .is_err()
             );
         }
         assert!(
-            receiver_pull_command(&request("rsync", "m1", "/safe", ResumePlan::Restart,)).is_err()
+            receiver_pull_command(&pull_request("rsync", "m1", "/safe", &transfer, &append,))
+                .is_err()
         );
         assert!(
-            receiver_pull_command(&request(
+            receiver_pull_command(&pull_request(
                 absolute_rsync,
                 "m1",
                 "/safe;bad",
-                ResumePlan::Restart,
+                &transfer,
+                &append,
             ))
             .is_err()
         );
         assert!(
-            receiver_pull_command(&request(
-                absolute_rsync,
+            store
+                .acquire_transfer_lease(&manifest.artifact_sha256, "../escape")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resume_plan_rejects_cross_session_replay_and_file_drift() {
+        let bytes = vec![2; TEST_CHUNK_SIZE * 2];
+        let manifest = fixture(&bytes);
+        let temp = TempDir::new().unwrap();
+        let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let first = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "first")
+            .unwrap();
+        let second = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "second")
+            .unwrap();
+        fs::write(first.partial_path(), &bytes[..TEST_CHUNK_SIZE]).unwrap();
+        fs::write(second.partial_path(), &bytes[..TEST_CHUNK_SIZE]).unwrap();
+        let cross_session = plan_verified_resume(&first, &manifest).unwrap();
+        assert!(apply_resume_plan(&second, &manifest, cross_session).is_err());
+
+        let stale = plan_verified_resume(&first, &manifest).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(first.partial_path())
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(apply_resume_plan(&first, &manifest, stale).is_err());
+
+        fs::write(first.partial_path(), &bytes[..TEST_CHUNK_SIZE]).unwrap();
+        let wrong_manifest_plan = plan_verified_resume(&first, &manifest).unwrap();
+        let mut different_manifest = manifest.clone();
+        different_manifest.producer.attempt += 1;
+        assert!(apply_resume_plan(&first, &different_manifest, wrong_manifest_plan).is_err());
+
+        fs::write(first.partial_path(), &bytes[..TEST_CHUNK_SIZE]).unwrap();
+        let unprepared = plan_verified_resume(&first, &manifest).unwrap();
+        assert!(
+            receiver_pull_command(&pull_request(
+                "/usr/bin/rsync",
                 "m1",
                 "/safe",
-                ResumePlan::Append {
-                    verified_bytes: 0,
-                    truncate_to: 0
-                },
+                &first,
+                &unprepared,
             ))
             .is_err()
         );
-        assert!(store.acquire_transfer_lease(&digest, "../escape").is_err());
+        let prepared = apply_resume_plan(
+            &first,
+            &manifest,
+            plan_verified_resume(&first, &manifest).unwrap(),
+        )
+        .unwrap();
+        let mut changed = OpenOptions::new()
+            .write(true)
+            .open(first.partial_path())
+            .unwrap();
+        changed.write_all(b"X").unwrap();
+        assert!(
+            receiver_pull_command(&pull_request(
+                "/usr/bin/rsync",
+                "m1",
+                "/safe",
+                &first,
+                &prepared,
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn archive_layout_verifies_and_extracts_only_the_exact_manifest() {
+        let tool = b"verified tool";
+        let bytes = test_archive(&[
+            TestArchiveEntry::Directory("bin", 0o755),
+            TestArchiveEntry::File("bin/tool", 0o755, tool),
+        ]);
+        let manifest = archive_manifest(
+            &bytes,
+            vec![
+                LayoutEntry::Directory {
+                    path: "bin".into(),
+                    mode: 0o755,
+                },
+                LayoutEntry::File {
+                    path: "bin/tool".into(),
+                    mode: 0o755,
+                    size_bytes: tool.len() as u64,
+                    sha256: digest(tool),
+                },
+            ],
+        );
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("artifact.tar.zst");
+        fs::write(&archive, &bytes).unwrap();
+        verify_archive_layout(&archive, &manifest).unwrap();
+        let destination = temp.path().join("unpacked");
+        let competing_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(temp.path().join(".shipyard-artifact-extract.lease"))
+            .unwrap();
+        FileExt::try_lock_exclusive(&competing_lock).unwrap();
+        assert!(extract_verified_archive(&archive, &manifest, &destination).is_err());
+        assert!(!destination.exists());
+        FileExt::unlock(&competing_lock).unwrap();
+        extract_verified_archive(&archive, &manifest, &destination).unwrap();
+        assert_eq!(fs::read(destination.join("bin/tool")).unwrap(), tool);
+        assert!(extract_verified_archive(&archive, &manifest, &destination).is_err());
+    }
+
+    #[test]
+    fn archive_rejects_traversal_links_duplicates_and_undeclared_paths() {
+        let file = b"x";
+        let regular = test_archive(&[TestArchiveEntry::File("safe", 0o644, file)]);
+        let entries = vec![LayoutEntry::File {
+            path: "safe".into(),
+            mode: 0o644,
+            size_bytes: 1,
+            sha256: digest(file),
+        }];
+        let temp = TempDir::new().unwrap();
+
+        let traversal = replace_first_tar_path(&regular, "../escape");
+        let traversal_manifest = archive_manifest(&traversal, entries.clone());
+        let traversal_path = temp.path().join("traversal.tar.zst");
+        fs::write(&traversal_path, traversal).unwrap();
+        assert!(verify_archive_layout(&traversal_path, &traversal_manifest).is_err());
+
+        let links = test_archive(&[TestArchiveEntry::Symlink("safe", "../escape")]);
+        let link_manifest = archive_manifest(&links, entries.clone());
+        let link_path = temp.path().join("link.tar.zst");
+        fs::write(&link_path, links).unwrap();
+        assert!(verify_archive_layout(&link_path, &link_manifest).is_err());
+
+        let duplicates = test_archive(&[
+            TestArchiveEntry::File("safe", 0o644, file),
+            TestArchiveEntry::File("safe", 0o644, file),
+        ]);
+        let duplicate_manifest = archive_manifest(&duplicates, entries.clone());
+        let duplicate_path = temp.path().join("duplicate.tar.zst");
+        fs::write(&duplicate_path, duplicates).unwrap();
+        assert!(verify_archive_layout(&duplicate_path, &duplicate_manifest).is_err());
+
+        let extra = test_archive(&[
+            TestArchiveEntry::File("safe", 0o644, file),
+            TestArchiveEntry::File("extra", 0o644, file),
+        ]);
+        let extra_manifest = archive_manifest(&extra, entries);
+        let extra_path = temp.path().join("extra.tar.zst");
+        fs::write(&extra_path, extra).unwrap();
+        assert!(verify_archive_layout(&extra_path, &extra_manifest).is_err());
+
+        let elevated = test_archive(&[TestArchiveEntry::File("safe", 0o4755, file)]);
+        let elevated_manifest = archive_manifest(
+            &elevated,
+            vec![LayoutEntry::File {
+                path: "safe".into(),
+                mode: 0o755,
+                size_bytes: 1,
+                sha256: digest(file),
+            }],
+        );
+        let elevated_path = temp.path().join("elevated.tar.zst");
+        fs::write(&elevated_path, elevated).unwrap();
+        assert!(verify_archive_layout(&elevated_path, &elevated_manifest).is_err());
+
+        let mut trailing_raw = zstd::stream::decode_all(regular.as_slice()).unwrap();
+        trailing_raw.extend_from_slice(b"hidden-after-end");
+        let trailing = zstd::stream::encode_all(trailing_raw.as_slice(), 1).unwrap();
+        let trailing_manifest = archive_manifest(
+            &trailing,
+            vec![LayoutEntry::File {
+                path: "safe".into(),
+                mode: 0o644,
+                size_bytes: 1,
+                sha256: digest(file),
+            }],
+        );
+        let trailing_path = temp.path().join("trailing.tar.zst");
+        fs::write(&trailing_path, trailing).unwrap();
+        assert!(verify_archive_layout(&trailing_path, &trailing_manifest).is_err());
+    }
+
+    #[test]
+    fn archive_rejects_partial_layout_and_type_size_mode_or_digest_mismatch() {
+        let file = b"payload";
+        let bytes = test_archive(&[TestArchiveEntry::File("tool", 0o755, file)]);
+        let base_entry = LayoutEntry::File {
+            path: "tool".into(),
+            mode: 0o755,
+            size_bytes: file.len() as u64,
+            sha256: digest(file),
+        };
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("artifact.tar.zst");
+        fs::write(&archive, &bytes).unwrap();
+
+        let mut partial_entries = vec![base_entry.clone()];
+        partial_entries.push(LayoutEntry::File {
+            path: "missing".into(),
+            mode: 0o644,
+            size_bytes: 1,
+            sha256: digest(b"x"),
+        });
+        partial_entries.sort_by(|left, right| left.path().cmp(right.path()));
+        let partial = archive_manifest(&bytes, partial_entries);
+        assert!(verify_archive_layout(&archive, &partial).is_err());
+
+        for hostile in [
+            LayoutEntry::Directory {
+                path: "tool".into(),
+                mode: 0o755,
+            },
+            LayoutEntry::File {
+                path: "tool".into(),
+                mode: 0o644,
+                size_bytes: file.len() as u64,
+                sha256: digest(file),
+            },
+            LayoutEntry::File {
+                path: "tool".into(),
+                mode: 0o755,
+                size_bytes: file.len() as u64 + 1,
+                sha256: digest(file),
+            },
+            LayoutEntry::File {
+                path: "tool".into(),
+                mode: 0o755,
+                size_bytes: file.len() as u64,
+                sha256: "0".repeat(64),
+            },
+        ] {
+            let manifest = archive_manifest(&bytes, vec![hostile]);
+            assert!(verify_archive_layout(&archive, &manifest).is_err());
+            let destination = temp
+                .path()
+                .join(format!("failed-{}", manifest.layout_sha256));
+            assert!(extract_verified_archive(&archive, &manifest, &destination).is_err());
+            assert!(!destination.exists());
+        }
     }
 
     #[test]
@@ -1471,15 +2269,7 @@ mod tests {
         let resumed = store
             .acquire_transfer_lease(&manifest.artifact_sha256, "run-restart")
             .unwrap();
-        let pull = ReceiverPullRequest {
-            rsync_program: Path::new("/usr/bin/rsync"),
-            remote_host: "m1",
-            remote_store_root: Path::new("/safe"),
-            transfer: &resumed,
-            resume: ResumePlan::Restart,
-            timeout_seconds: 30,
-        };
-        assert!(receiver_pull_command(&pull).is_err());
+        assert!(plan_verified_resume(&resumed, &manifest).is_err());
         assert!(matches!(
             store.publish_verified(&manifest, &auth, resumed).unwrap(),
             PublishOutcome::Published(_)
