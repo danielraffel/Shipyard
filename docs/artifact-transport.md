@@ -47,7 +47,10 @@ The resume plan is opaque and bound to the exact manifest digest, transfer
 session, leased partial path, and observed length. Applying it re-reads the
 partial and refuses drift; receiver-pull command construction accepts only the
 applied plan and checks the prepared length again. Callers cannot construct an
-append boundary or reuse a plan from another transfer.
+append boundary or reuse a plan from another transfer. A fresh lease with no
+partial produces an authenticated restart plan; applying that plan atomically
+creates the empty receiver file, so callers never need to manufacture
+undocumented staging state.
 After transfer, it rechecks every chunk, total size, final SHA-256, manifest
 authority, and producer fence.
 

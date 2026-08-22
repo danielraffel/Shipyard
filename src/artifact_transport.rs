@@ -443,10 +443,23 @@ pub fn plan_verified_resume(
     manifest.validate()?;
     validate_transfer_binding(transfer, manifest)?;
     let path = transfer.partial_path();
-    reject_non_regular_file(path, "artifact partial")?;
-    let mut file = File::open(path)?;
-    let length = file.metadata()?.len();
-    let action = plan_resume_action(&mut file, length, manifest)?;
+    let (length, action) = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(Error::Invalid(
+                    "artifact partial must be a regular non-symlink file".into(),
+                ));
+            }
+            let mut file = File::open(path)?;
+            let length = file.metadata()?.len();
+            (length, plan_resume_action(&mut file, length, manifest)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            reject_existing_sealed_transfer(transfer)?;
+            (0, ResumeAction::Restart)
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok(ResumePlan {
         artifact_sha256: manifest.artifact_sha256.clone(),
         manifest_sha256: manifest.canonical_sha256()?,
@@ -505,11 +518,40 @@ pub fn apply_resume_plan(
 ) -> Result<ResumePlan, Error> {
     manifest.validate()?;
     validate_resume_binding(transfer, manifest, &plan)?;
-    reject_non_regular_file(transfer.partial_path(), "artifact partial")?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(transfer.partial_path())?;
+    let mut file = match fs::symlink_metadata(transfer.partial_path()) {
+        Ok(_) => {
+            reject_non_regular_file(transfer.partial_path(), "artifact partial")?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(transfer.partial_path())?
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && plan.observed_length == 0
+                && plan.action == ResumeAction::Restart =>
+        {
+            reject_existing_sealed_transfer(transfer)?;
+            OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(transfer.partial_path())
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        Error::Invalid("artifact partial appeared after resume planning".into())
+                    } else {
+                        Error::Io(error)
+                    }
+                })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::Invalid(
+                "artifact partial disappeared after resume planning".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let current_length = file.metadata()?.len();
     let current_action = plan_resume_action(&mut file, current_length, manifest)?;
     if current_length != plan.observed_length || current_action != plan.action {
@@ -625,6 +667,16 @@ fn validate_transfer_binding(
         ));
     }
     Ok(())
+}
+
+fn reject_existing_sealed_transfer(transfer: &ArtifactTransferLease) -> Result<(), Error> {
+    match fs::symlink_metadata(&transfer.sealed_path) {
+        Ok(_) => Err(Error::Invalid(
+            "sealed artifact must be published or recovered before receiving again".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn validate_resume_binding(
@@ -1882,6 +1934,37 @@ mod tests {
                 verified_bytes: MIN_CHUNK_SIZE
             }
         );
+    }
+
+    #[test]
+    fn fresh_transfer_plans_and_prepares_an_empty_restart_without_manual_files() {
+        let bytes = vec![6; TEST_CHUNK_SIZE];
+        let manifest = fixture(&bytes);
+        let temp = TempDir::new().unwrap();
+        let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let transfer = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "fresh")
+            .unwrap();
+        assert!(!transfer.partial_path().exists());
+        let plan = plan_verified_resume(&transfer, &manifest).unwrap();
+        assert_eq!(plan.disposition(), ResumeDisposition::Restart);
+        assert!(!transfer.partial_path().exists());
+        let prepared = apply_resume_plan(&transfer, &manifest, plan).unwrap();
+        assert_eq!(fs::metadata(transfer.partial_path()).unwrap().len(), 0);
+
+        #[cfg(windows)]
+        let absolute_rsync = r"C:\Shipyard\rsync.exe";
+        #[cfg(not(windows))]
+        let absolute_rsync = "/usr/bin/rsync";
+        let command = receiver_pull_command(&pull_request(
+            absolute_rsync,
+            "m1-lan",
+            "/var/lib/shipyard/artifacts",
+            &transfer,
+            &prepared,
+        ))
+        .unwrap();
+        assert!(!command.args.iter().any(|arg| arg == "--append"));
     }
 
     #[test]
