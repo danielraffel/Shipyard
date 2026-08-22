@@ -136,10 +136,10 @@ pub(super) fn queue_observer_command<W: Write>(
             Err(error) if args.follow && failures < FAILURE_BACKOFF.len() => {
                 let delay = FAILURE_BACKOFF[failures];
                 failures += 1;
-                eprintln!(
+                let _ = crate::writer_domain_lease::write_stderr(format_args!(
                     "queue observer read failed; retrying in {delay}s: {}",
                     error.message
-                );
+                ));
                 thread::sleep(Duration::from_secs(delay));
                 continue;
             }

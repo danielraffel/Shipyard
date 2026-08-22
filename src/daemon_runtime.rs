@@ -1322,9 +1322,9 @@ fn register_webhooks(
     for repo in repos {
         if let Err(error) = registrar.ensure_registered(repo, public_url, secret) {
             let message = registration_error_message(repo, &error);
-            if let Ok(_writer_domain) = crate::writer_domain_lease::acquire_for_protected_stdio() {
-                eprintln!("shipyard daemon: failed to register webhook for {repo}: {message}");
-            }
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                "shipyard daemon: failed to register webhook for {repo}: {message}"
+            ));
             if first_error.is_none() {
                 first_error = Some(message);
             }
@@ -1357,10 +1357,10 @@ fn unregister_webhooks(registrar: &Arc<Mutex<Registrar>>) {
     let Ok(mut registrar) = registrar.lock() else {
         return;
     };
-    if let Err(error) = registrar.unregister_all()
-        && let Ok(_writer_domain) = crate::writer_domain_lease::acquire_for_protected_stdio()
-    {
-        eprintln!("shipyard daemon: failed to unregister webhooks: {error}");
+    if let Err(error) = registrar.unregister_all() {
+        let _ = crate::writer_domain_lease::write_stderr(format_args!(
+            "shipyard daemon: failed to unregister webhooks: {error}"
+        ));
     }
 }
 

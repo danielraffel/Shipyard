@@ -664,10 +664,10 @@ fn invoke_install_script(
         Stdio::inherit()
     };
 
-    // The installer is an external process, so retain the shared writer-domain
-    // lease through its complete install transaction. The network fetch above
-    // remains outside the critical section.
-    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(install_dir)
+    // The installer is an external process, so establish the writer domain
+    // before handing ownership to its self-owning guardian below. The network
+    // fetch above remains outside the critical section.
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_path(install_dir)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
 
     let env_tag = target_tag.strip_prefix('v').unwrap_or(target_tag);
@@ -684,7 +684,21 @@ fn invoke_install_script(
     if let Some(token) = token {
         sh_command.env("SHIPYARD_GITHUB_TOKEN", token);
     }
-    let mut sh = sh_command
+    let mut guarded;
+    let command = if writer_domain.is_some() {
+        guarded = crate::writer_domain_lease::guarded_child_command(&sh_command, install_dir)
+            .map_err(|error| {
+                CliFailure::new(1, format!("failed to prepare installer guardian: {error}"))
+            })?;
+        &mut guarded
+    } else {
+        &mut sh_command
+    };
+    // The guardian owns the child transaction directly. Release the parent
+    // lease before it attempts acquisition so an arriving exclusive audit can
+    // interpose without forming a parent/child/turnstile wait cycle.
+    drop(writer_domain);
+    let mut sh = command
         .stdin(Stdio::null())
         .stdout(install_stdout)
         .stderr(Stdio::inherit())

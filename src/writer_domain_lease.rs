@@ -11,9 +11,10 @@
 
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, ExitStatus};
 use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,6 +37,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Internal marker set only when Shipyard redirects a detached process's
 /// stdout/stderr to a protected log.
 pub(crate) const PROTECTED_STDIO_PATH_ENV: &str = "SHIPYARD_PROTECTED_STDIO_PATH";
+pub(crate) const CHILD_WRITER_PATH_ENV: &str = "SHIPYARD_CHILD_WRITER_PATH";
 
 struct ThreadWriterDomainLease {
     domain: File,
@@ -88,7 +90,7 @@ pub(crate) fn acquire_for_protected_path(
     path: &Path,
 ) -> io::Result<Option<ProductionWriterDomainLease>> {
     let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
-    if !is_protected_path(path, &home_dir(), &runtime_paths) {
+    if !is_protected_path(path, &home_dir(), &runtime_paths)? {
         return Ok(None);
     }
     acquire_thread_lease_at(&runtime_paths.state_dir, DEFAULT_ACQUIRE_TIMEOUT).map(Some)
@@ -128,6 +130,60 @@ pub(crate) fn acquire_for_protected_stdio() -> io::Result<Option<ProductionWrite
     acquire_for_protected_path(Path::new(&path))
 }
 
+/// Append one complete diagnostic to stderr while respecting a detached
+/// protected-log marker. Callers intentionally ignore failures: writing after
+/// an exclusive audit wins would contaminate evidence, so silence is safer.
+pub(crate) fn write_stderr(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
+    let _writer_domain = acquire_for_protected_stdio()?;
+    let mut stderr = io::stderr().lock();
+    stderr.write_fmt(arguments)?;
+    stderr.write_all(b"\n")?;
+    stderr.flush()
+}
+
+/// Wrap an external command in a Shipyard process that acquires its own lease
+/// before spawning the writer. Environment and cwd overrides are preserved.
+pub(crate) fn guarded_child_command(command: &Command, path: &Path) -> io::Result<Command> {
+    let mut guarded = Command::new(std::env::current_exe()?);
+    guarded
+        .arg("writer-domain-exec")
+        .arg("--path")
+        .arg(path)
+        .arg("--")
+        .arg(command.get_program())
+        .args(command.get_args());
+    if let Some(cwd) = command.get_current_dir() {
+        guarded.current_dir(cwd);
+    }
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            guarded.env(key, value);
+        } else {
+            guarded.env_remove(key);
+        }
+    }
+    Ok(guarded)
+}
+
+pub(crate) fn run_guarded_child(
+    path: &Path,
+    argv: &[std::ffi::OsString],
+) -> io::Result<ExitStatus> {
+    let (program, command_args) = argv
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing guarded command"))?;
+    let _writer_domain = acquire_for_protected_path(path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "guarded child path is outside protected roots: {}",
+                path.display()
+            ),
+        )
+    })?;
+    Command::new(program).args(command_args).status()
+}
+
 /// Create a protected directory only when it is absent. Existing stores are a
 /// read surface and must not briefly enter the writer domain merely because a
 /// constructor was used to inspect them.
@@ -151,11 +207,11 @@ pub(crate) fn acquire_for_protected_creation(
     acquire_for_protected_path(path)
 }
 
-fn is_protected_path(path: &Path, home: &Path, runtime_paths: &RuntimePaths) -> bool {
-    if path.starts_with(&runtime_paths.state_dir) || path.starts_with(&runtime_paths.global_dir) {
-        return true;
-    }
-    [
+fn is_protected_path(path: &Path, home: &Path, runtime_paths: &RuntimePaths) -> io::Result<bool> {
+    let candidate = canonicalize_with_missing_suffix(path)?;
+    let roots = [
+        runtime_paths.state_dir.clone(),
+        runtime_paths.global_dir.clone(),
         home.join("Library/Application Support/shipyard"),
         home.join("Library/Application Support/shipyard-dev"),
         home.join(".config/shipyard"),
@@ -169,9 +225,80 @@ fn is_protected_path(path: &Path, home: &Path, runtime_paths: &RuntimePaths) -> 
         home.join(".shipyard-dev"),
         home.join(".cache/shipyard"),
         home.join(".cache/shipyard-dev"),
-    ]
-    .iter()
-    .any(|root| path.starts_with(root))
+    ];
+    for root in roots {
+        let root = canonicalize_with_missing_suffix(&root)?;
+        if protected_prefix(&candidate, &root) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Resolve aliases one component at a time while retaining a normalized suffix
+/// for paths that a writer is about to create. Resolving each existing
+/// component before interpreting `..` preserves filesystem semantics when a
+/// parent component is itself a symlink.
+fn canonicalize_with_missing_suffix(path: &Path) -> io::Result<PathBuf> {
+    canonicalize_with_missing_suffix_from(path, &std::env::current_dir()?)
+}
+
+fn canonicalize_with_missing_suffix_from(path: &Path, current_dir: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
+            Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        // A dangling symlink/reparse point is ambiguous: treating it
+                        // as an ordinary missing path could let a later target swap
+                        // cross the protected-root boundary.
+                        match fs::symlink_metadata(&candidate) {
+                            Ok(_) => return Err(error),
+                            Err(metadata_error)
+                                if metadata_error.kind() == io::ErrorKind::NotFound =>
+                            {
+                                resolved.push(name);
+                            }
+                            Err(metadata_error) => return Err(metadata_error),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+fn protected_prefix(path: &Path, root: &Path) -> bool {
+    let path_components: Vec<_> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    let root_components: Vec<_> = root
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    path_components.starts_with(&root_components)
+}
+
+#[cfg(not(windows))]
+fn protected_prefix(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
 }
 
 fn acquire_at(state_dir: &Path, timeout: Duration) -> io::Result<File> {
@@ -292,15 +419,76 @@ mod tests {
             ".cache/shipyard-dev/object",
         ] {
             assert!(
-                is_protected_path(&home.join(relative), home, &runtime_paths),
+                is_protected_path(&home.join(relative), home, &runtime_paths)
+                    .expect("classify protected root"),
                 "missing protected root {relative}"
             );
         }
-        assert!(!is_protected_path(
-            &home.join("Code/Shipyard"),
-            home,
-            &runtime_paths
-        ));
+        assert!(
+            !is_protected_path(&home.join("Code/Shipyard"), home, &runtime_paths)
+                .expect("classify unrelated root")
+        );
+    }
+
+    #[test]
+    fn relative_dotdot_and_symlink_aliases_resolve_into_protected_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let protected = home.join(".local/state/shipyard");
+        fs::create_dir_all(&protected).expect("protected root");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&protected, outside.join("state-link")).expect("state symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&protected, outside.join("state-link"))
+            .expect("state symlink");
+        let runtime_paths = RuntimePaths::for_platform(
+            crate::platform::Platform::current(),
+            &home,
+            RuntimeMode::Shipyard,
+        );
+
+        assert!(
+            is_protected_path(
+                &outside.join("../home/.local/state/shipyard/new.json"),
+                &home,
+                &runtime_paths,
+            )
+            .expect("dotdot alias")
+        );
+        assert!(
+            is_protected_path(&outside.join("state-link/new.json"), &home, &runtime_paths,)
+                .expect("symlink alias")
+        );
+        assert_eq!(
+            canonicalize_with_missing_suffix_from(Path::new("new.json"), &protected)
+                .expect("relative protected path"),
+            fs::canonicalize(&protected)
+                .expect("canonical protected root")
+                .join("new.json")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_alias_of_missing_protected_suffix_is_protected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("home");
+        let runtime_paths = RuntimePaths::for_platform(
+            crate::platform::Platform::Windows,
+            &home,
+            RuntimeMode::Shipyard,
+        );
+        assert!(
+            is_protected_path(
+                &home.join(".LOCAL/STATE/SHIPYARD/new.json"),
+                &home,
+                &runtime_paths,
+            )
+            .expect("case alias")
+        );
     }
 
     #[test]

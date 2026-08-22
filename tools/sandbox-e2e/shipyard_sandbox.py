@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -113,13 +114,51 @@ class ContaminationReport:
         return "\n".join(lines)
 
 
-def _snapshot_paths(root: Path) -> set[Path]:
+@dataclass(frozen=True)
+class PathFingerprint:
+    mode: int
+    size: int
+    mtime_ns: int
+    device: int
+    inode: int
+    digest: str | None
+
+
+def _fingerprint(path: Path) -> PathFingerprint:
+    stat = path.lstat()
+    digest = None
+    if path.is_file() and not path.is_symlink():
+        hasher = hashlib.sha256()
+        with path.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        digest = hasher.hexdigest()
+    return PathFingerprint(
+        mode=stat.st_mode,
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        digest=digest,
+    )
+
+
+def _snapshot_paths(root: Path) -> dict[Path, PathFingerprint]:
     if not root.exists():
-        return set()
+        return {}
     try:
-        return set(root.rglob("*"))
+        paths = [root, *root.rglob("*")]
     except OSError:
-        return set()
+        return {}
+    snapshot: dict[Path, PathFingerprint] = {}
+    for path in paths:
+        try:
+            snapshot[path] = _fingerprint(path)
+        except OSError:
+            # An unreadable protected entry makes the audit indeterminate and
+            # therefore an offender instead of silently disappearing.
+            snapshot[path] = PathFingerprint(0, -1, -1, -1, -1, None)
+    return snapshot
 
 
 def production_writer_domain_lock_path(home: Path | None = None) -> Path:
@@ -294,25 +333,15 @@ class WriterDomainLease:
 def _find_newer(
     root: Path,
     sentinel_mtime: float,
-    pre_existing: set[Path],
+    pre_existing: Mapping[Path, PathFingerprint],
 ) -> list[Path]:
-    if not root.exists():
-        return []
-    offenders: list[Path] = []
-    try:
-        iterator = root.rglob("*")
-    except OSError:
-        return offenders
-    for path in iterator:
-        if path in pre_existing:
-            continue
-        try:
-            stat = path.lstat()
-        except OSError:
-            continue
-        if stat.st_mtime > sentinel_mtime:
-            offenders.append(path)
-    return offenders
+    del sentinel_mtime  # identity/content comparison is stronger than wall-clock ordering.
+    current = _snapshot_paths(root)
+    return sorted(
+        path
+        for path in pre_existing.keys() | current.keys()
+        if pre_existing.get(path) != current.get(path)
+    )
 
 
 def _otool_dylibs(binary: Path) -> list[Path]:

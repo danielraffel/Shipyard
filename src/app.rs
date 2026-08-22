@@ -191,6 +191,30 @@ fn dispatch<W: Write, E: Write>(
     let cwd = cli_cwd(&cli);
 
     match cli.command {
+        Command::WriterDomainExec { path, command } => {
+            let status = crate::writer_domain_lease::run_guarded_child(&path, &command).map_err(
+                |error| {
+                    let code =
+                        if crate::writer_domain_lease::is_writer_domain_overlap(&error.to_string())
+                        {
+                            crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_EXIT_CODE
+                        } else {
+                            1
+                        };
+                    CliFailure::new(code, format!("guarded child failed: {error}"))
+                },
+            )?;
+            let code = if status.success() {
+                0
+            } else {
+                status
+                    .code()
+                    .and_then(|code| u8::try_from(code).ok())
+                    .filter(|code| *code != 0)
+                    .unwrap_or(1)
+            };
+            return Ok(ExitCode::from(code));
+        }
         Command::ExecutionWorker { job_id, generation } => {
             return execution_worker_command(
                 &job_id,
@@ -434,7 +458,8 @@ fn handle_operational_variant<W: Write>(
         Command::Runner { command } => {
             handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
         }
-        Command::Paths
+        Command::WriterDomainExec { .. }
+        | Command::Paths
         | Command::ExecutionWorker { .. }
         | Command::Pin { .. }
         | Command::Dependency { .. }

@@ -77,9 +77,70 @@ jobs:
           .venv-sandbox/bin/python -m pip install pytest
 
       - name: Run sandbox E2E
+        if: ${{ !(matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'pulp-studio')) }}
         env:
           SHIPYARD_BINARY_FOR_TEST: ${{ github.workspace }}/target/release/shipyard
         run: .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
+
+      - name: Refresh M3 daemon to exact candidate and run focused Sandbox
+        if: ${{ matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'pulp-studio') }}
+        env:
+          SHIPYARD_BINARY_FOR_TEST: ${{ github.workspace }}/target/release/shipyard
+        run: |
+          set -euo pipefail
+          candidate="$(cd "$(dirname "$SHIPYARD_BINARY_FOR_TEST")" && pwd -P)/$(basename "$SHIPYARD_BINARY_FOR_TEST")"
+          installed="$HOME/.local/bin/shipyard"
+          test -x "$candidate"
+          test -x "$installed"
+          candidate_hash="$(shasum -a 256 "$candidate" | awk '{print $1}')"
+          installed_hash="$(shasum -a 256 "$installed" | awk '{print $1}')"
+          candidate_status="$($candidate --version)"
+          installed_status="$($installed --version)"
+          installed_argv="$(pgrep -f 'shipyard.*daemon run' | xargs -r ps -o command= -p 2>/dev/null || true)"
+          "$installed" --json status > "$RUNNER_TEMP/pre-refresh-worker-status.json"
+          record="$RUNNER_TEMP/shipyard-sandbox-bootstrap.json"
+          jq -n \
+            --arg candidate "$candidate" --arg candidate_hash "$candidate_hash" \
+            --arg candidate_status "$candidate_status" \
+            --arg installed "$installed" --arg installed_hash "$installed_hash" \
+            --arg installed_status "$installed_status" --arg installed_argv "$installed_argv" \
+            '{candidate:$candidate,candidate_sha256:$candidate_hash,candidate_status:$candidate_status,installed:$installed,installed_sha256:$installed_hash,installed_status:$installed_status,installed_argv:$installed_argv}' \
+            > "$record"
+          "$candidate" daemon refresh --repo Generous-Corp/pulp
+          "$candidate" --json daemon status > "$RUNNER_TEMP/candidate-daemon-status.json"
+          jq -e '.running == true and (.registered_repos | index("Generous-Corp/pulp")) != null' \
+            "$RUNNER_TEMP/candidate-daemon-status.json"
+          candidate_pid="$(pgrep -f "^${candidate//\//\\/} .*daemon run" | head -1)"
+          test -n "$candidate_pid"
+          ps -p "$candidate_pid" -o command= | grep -F -- "$candidate"
+          state_dir="$($candidate --json paths | jq -r .state_dir)"
+          if lsof "$state_dir/.sandbox-writer-domain.lock" > "$RUNNER_TEMP/candidate-lock-holders.txt" 2>&1; then
+            echo "candidate daemon retains an idle writer-domain lock" >&2
+            cat "$RUNNER_TEMP/candidate-lock-holders.txt" >&2
+            exit 1
+          fi
+          .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
+
+      - name: Restore installed M3 daemon
+        if: ${{ always() && matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'pulp-studio') }}
+        run: |
+          set -euo pipefail
+          installed="$HOME/.local/bin/shipyard"
+          test -x "$installed"
+          "$installed" daemon refresh --repo Generous-Corp/pulp
+          "$installed" --json daemon status > "$RUNNER_TEMP/restored-daemon-status.json"
+          jq -e '.running == true and (.registered_repos | index("Generous-Corp/pulp")) != null' \
+            "$RUNNER_TEMP/restored-daemon-status.json"
+          installed_path="$(cd "$(dirname "$installed")" && pwd -P)/$(basename "$installed")"
+          restored_pid="$(pgrep -f "^${installed_path//\//\\/} .*daemon run" | head -1)"
+          test -n "$restored_pid"
+          ps -p "$restored_pid" -o command= | grep -F -- "$installed_path"
+          "$installed" --json status > "$RUNNER_TEMP/restored-worker-status.json"
+          jq -S '[.active_runs[]?.id] | sort' "$RUNNER_TEMP/pre-refresh-worker-status.json" \
+            > "$RUNNER_TEMP/pre-refresh-worker-ids.json"
+          jq -S '[.active_runs[]?.id] | sort' "$RUNNER_TEMP/restored-worker-status.json" \
+            > "$RUNNER_TEMP/restored-worker-ids.json"
+          cmp "$RUNNER_TEMP/pre-refresh-worker-ids.json" "$RUNNER_TEMP/restored-worker-ids.json"
 
       - name: Upload sandbox tempdir on failure
         if: failure()

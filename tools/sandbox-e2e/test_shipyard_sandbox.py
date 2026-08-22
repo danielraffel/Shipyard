@@ -15,6 +15,7 @@ from shipyard_sandbox import (
     WriterDomainLease,
     WriterDomainOverlap,
     _find_newer,
+    _snapshot_paths,
     production_writer_domain_lock_path,
     production_writer_domain_turnstile_path,
 )
@@ -293,6 +294,85 @@ def test_python_and_binary_resolve_the_same_writer_domain(
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="parent SIGTERM proof uses POSIX process semantics")
+@pytest.mark.parametrize("surface", ["updater", "prepush"])
+def test_guarded_external_writer_retains_lease_after_parent_death(
+    tmp_path: Path, shipyard_binary: Path, surface: str
+) -> None:
+    home = tmp_path / "home"
+    protected = (
+        home / ".local/bin/shipyard-next"
+        if surface == "updater"
+        else home / ".local/state/shipyard/changed-surface-prepush/result.json"
+    )
+    protected.parent.mkdir(parents=True)
+    ready = tmp_path / f"{surface}.ready"
+    go = tmp_path / f"{surface}.go"
+    guardian_pid = tmp_path / f"{surface}.guardian-pid"
+    child = tmp_path / f"{surface}-child.sh"
+    child.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "ready=$1; go=$2; output=$3\n"
+        ": > \"$ready\"\n"
+        "while [ ! -e \"$go\" ]; do sleep 0.01; done\n"
+        "printf guarded > \"$output\"\n",
+        encoding="utf-8",
+    )
+    child.chmod(0o755)
+    parent_script = tmp_path / f"{surface}-parent.sh"
+    parent_script.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        '"$1" writer-domain-exec --path "$2" -- "$3" "$4" "$5" "$2" &\n'
+        "guardian=$!\n"
+        'printf "%s" "$guardian" > "$6"\n'
+        'wait "$guardian"\n',
+        encoding="utf-8",
+    )
+    parent_script.chmod(0o755)
+    env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
+    parent = subprocess.Popen(
+        [
+            str(parent_script),
+            str(shipyard_binary),
+            str(protected),
+            str(child),
+            str(ready),
+            str(go),
+            str(guardian_pid),
+        ],
+        env=env,
+    )
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        assert parent.poll() is None
+        time.sleep(0.01)
+    assert ready.exists()
+    guardian = int(guardian_pid.read_text(encoding="utf-8"))
+
+    parent.terminate()
+    parent.wait(timeout=5)
+    os.kill(guardian, 0)
+    audit = WriterDomainLease(production_writer_domain_lock_path(home), exclusive=True)
+    with pytest.raises(WriterDomainOverlap):
+        audit.acquire(timeout=0.1)
+    assert not protected.exists()
+
+    go.touch()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            audit.acquire(timeout=0.05)
+            break
+        except WriterDomainOverlap:
+            time.sleep(0.01)
+    else:
+        pytest.fail("writer-domain guardian did not release after child completion")
+    assert protected.read_text(encoding="utf-8") == "guarded"
+    audit.release()
+
+
 def test_protected_write_is_never_allowlisted_by_filename(tmp_path: Path) -> None:
     sentinel_mtime = 1_000.0
     queue_temp = tmp_path / ".queue-85829-1785087066142925000-0.json.tmp"
@@ -301,7 +381,31 @@ def test_protected_write_is_never_allowlisted_by_filename(tmp_path: Path) -> Non
     queue_temp.write_text("temp", encoding="utf-8")
     outcome.write_text("{}", encoding="utf-8")
 
-    offenders = _find_newer(tmp_path, sentinel_mtime, set())
+    offenders = _find_newer(tmp_path, sentinel_mtime, {})
 
     assert queue_temp in offenders
     assert outcome in offenders
+
+
+@pytest.mark.parametrize("mutation", ["same-length", "append", "replace", "delete"])
+def test_preexisting_protected_file_mutation_is_reported(
+    tmp_path: Path, mutation: str
+) -> None:
+    protected = tmp_path / "state"
+    protected.mkdir()
+    file = protected / "queue.json"
+    file.write_text("AAAA", encoding="utf-8")
+    before = _snapshot_paths(protected)
+
+    if mutation == "same-length":
+        file.write_text("BBBB", encoding="utf-8")
+    elif mutation == "append":
+        file.write_text("AAAA-more", encoding="utf-8")
+    elif mutation == "replace":
+        replacement = protected / "replacement"
+        replacement.write_text("AAAA", encoding="utf-8")
+        replacement.replace(file)
+    else:
+        file.unlink()
+
+    assert file in _find_newer(protected, 0.0, before)

@@ -500,7 +500,9 @@ pub(crate) fn fetch_pr_snapshot_with_client(
             // The shared reporter performs a best-effort reset-time probe. A
             // waiter cannot make that extra unbounded call without violating
             // its overall deadline, so retain the notice and skip the probe.
-            eprintln!("shipyard: GraphQL rate limit hit for gh pr snapshot. Falling back to REST.");
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                "shipyard: GraphQL rate limit hit for gh pr snapshot. Falling back to REST."
+            ));
             let remaining = timeout.saturating_sub(started.elapsed());
             fetch_pr_snapshot_rest_with_client(client, repo, pr_number, cwd, remaining)
         }
