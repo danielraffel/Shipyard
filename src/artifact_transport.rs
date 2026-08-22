@@ -5,7 +5,7 @@
 //! a receiver-pull transport. Publication is fail-closed and digest addressed.
 #![allow(missing_docs)]
 
-use fs2::available_space;
+use fs2::{FileExt, available_space};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -427,9 +427,8 @@ pub struct ReceiverPullRequest<'a> {
     pub rsync_program: &'a Path,
     pub remote_host: &'a str,
     pub remote_store_root: &'a Path,
-    pub local_store: &'a ArtifactStore,
-    pub transfer_session: &'a str,
-    pub artifact_sha256: &'a str,
+    /// Exclusive receiver-side ownership retained through publication.
+    pub transfer: &'a ArtifactTransferLease,
     pub resume: ResumePlan,
     pub timeout_seconds: u32,
 }
@@ -442,9 +441,7 @@ pub fn receiver_pull_command(
         rsync_program,
         remote_host,
         remote_store_root,
-        local_store,
-        transfer_session,
-        artifact_sha256,
+        transfer,
         resume,
         timeout_seconds,
     } = request;
@@ -454,9 +451,15 @@ pub fn receiver_pull_command(
         ));
     }
     validate_host(remote_host)?;
-    validate_digest(artifact_sha256, "artifact digest")?;
     let root = portable_absolute_path(remote_store_root)?;
-    let local_partial = local_store.partial_path(artifact_sha256, transfer_session)?;
+    let artifact_sha256 = transfer.artifact_sha256();
+    let local_partial = transfer.partial_path().to_path_buf();
+    if transfer.sealed_path.exists() {
+        reject_non_regular_file(&transfer.sealed_path, "sealed artifact")?;
+        return Err(Error::Invalid(
+            "sealed artifact must be published, not transferred again".into(),
+        ));
+    }
     if local_partial.exists() {
         reject_non_regular_file(&local_partial, "artifact partial")?;
     }
@@ -546,6 +549,47 @@ pub struct ArtifactStore {
     root: PathBuf,
 }
 
+/// Exclusive ownership of one digest/session receiver staging path.
+///
+/// The lease is process-independent: an OS file lock releases automatically if
+/// its owner exits. Callers keep the same value alive while planning/resuming a
+/// receiver pull and pass it into publication so two cooperating Shipyard
+/// processes cannot write or publish the same staging path concurrently.
+pub struct ArtifactTransferLease {
+    store_root: PathBuf,
+    artifact_sha256: String,
+    session: String,
+    partial_path: PathBuf,
+    sealed_path: PathBuf,
+    lock_file: File,
+}
+
+impl ArtifactTransferLease {
+    /// Digest whose staging path this lease exclusively owns.
+    #[must_use]
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+
+    /// Transfer-session identifier whose staging path this lease owns.
+    #[must_use]
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// Receiver destination for the resumable partial.
+    #[must_use]
+    pub fn partial_path(&self) -> &Path {
+        &self.partial_path
+    }
+}
+
+impl Drop for ArtifactTransferLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+    }
+}
+
 /// Verified publication result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PublishOutcome {
@@ -600,66 +644,207 @@ impl ArtifactStore {
             .join(format!("{digest}.{session}.partial")))
     }
 
+    /// Acquire exclusive ownership of one digest/session transfer path.
+    ///
+    /// Lock files deliberately remain on disk after release: unlinking a lock
+    /// pathname can split concurrent lockers across two inodes. The kernel lock
+    /// itself is released automatically on process death, so an offline or
+    /// crashed receiver cannot permanently wedge the session.
+    pub fn acquire_transfer_lease(
+        &self,
+        digest: &str,
+        session: &str,
+    ) -> Result<ArtifactTransferLease, Error> {
+        let partial_path = self.partial_path(digest, session)?;
+        let sealed_path = self
+            .root
+            .join(".incoming")
+            .join(format!("{digest}.{session}.sealed"));
+        let lock_path = self
+            .root
+            .join(".incoming")
+            .join(format!("{digest}.{session}.lease"));
+        reject_symlink(&lock_path)?;
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        reject_non_regular_file(&lock_path, "artifact transfer lease")?;
+        FileExt::try_lock_exclusive(&lock_file).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                Error::Invalid(format!(
+                    "artifact transfer {digest}/{session} is already leased"
+                ))
+            } else {
+                Error::Io(error)
+            }
+        })?;
+        Ok(ArtifactTransferLease {
+            store_root: self.root.clone(),
+            artifact_sha256: digest.to_owned(),
+            session: session.to_owned(),
+            partial_path,
+            sealed_path,
+            lock_file,
+        })
+    }
+
     /// Verify exact manifest authority, bytes, and chunks, then atomically publish.
     pub fn publish_verified(
         &self,
         manifest: &ArtifactManifest,
         authority: &ManifestAuthority,
-        session: &str,
+        transfer: ArtifactTransferLease,
+    ) -> Result<PublishOutcome, Error> {
+        self.publish_verified_with_hook(manifest, authority, transfer, |_| Ok(()))
+    }
+
+    fn publish_verified_with_hook(
+        &self,
+        manifest: &ArtifactManifest,
+        authority: &ManifestAuthority,
+        transfer: ArtifactTransferLease,
+        before_publish: impl FnOnce(&Path) -> Result<(), Error>,
     ) -> Result<PublishOutcome, Error> {
         manifest.validate_authority(authority)?;
-        let partial = self.partial_path(&manifest.artifact_sha256, session)?;
-        let metadata = fs::symlink_metadata(&partial)?;
-        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-            return Err(Error::Invalid(
-                "artifact partial must be a regular non-symlink file".into(),
-            ));
-        }
-        if metadata.len() != manifest.artifact_size_bytes {
-            return Err(Error::Invalid("artifact partial has the wrong size".into()));
-        }
-        if plan_verified_resume(&partial, manifest)? != ResumePlan::CompletePendingFinalVerification
+        if transfer.store_root != self.root || transfer.artifact_sha256 != manifest.artifact_sha256
         {
             return Err(Error::Invalid(
-                "artifact partial failed chunk verification".into(),
+                "artifact transfer lease does not belong to this store and digest".into(),
             ));
         }
-        let mut file = File::open(&partial)?;
-        if sha256_reader(&mut file)? != manifest.artifact_sha256 {
-            return Err(Error::Invalid("artifact final digest mismatch".into()));
+        let sealed = Self::seal_transfer(&transfer)?;
+        if let Err(validation_error) = verify_sealed_artifact(&sealed, manifest) {
+            if let Err(recovery_error) = Self::restore_partial_after_validation_failure(&transfer) {
+                return Err(Error::Invalid(format!(
+                    "{validation_error}; failed to restore resumable partial: {recovery_error}"
+                )));
+            }
+            return Err(validation_error);
         }
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&partial)?
-            .sync_all()?;
         let destination = self
             .root
             .join("objects")
             .join(format!("{}.tar.zst", manifest.artifact_sha256));
-        if destination.exists() {
-            let existing = fs::symlink_metadata(&destination)?;
-            if !existing.file_type().is_file()
-                || existing.file_type().is_symlink()
-                || existing.len() != manifest.artifact_size_bytes
-            {
-                return Err(Error::Invalid(
-                    "published artifact path is not the expected immutable object".into(),
-                ));
+        before_publish(&destination)?;
+        let outcome = match fs::hard_link(&sealed, &destination) {
+            Ok(()) => {
+                sync_directory(destination.parent().expect("destination has parent"))?;
+                PublishOutcome::Published(destination)
             }
-            let mut existing_file = File::open(&destination)?;
-            if sha256_reader(&mut existing_file)? != manifest.artifact_sha256 {
-                return Err(Error::Invalid(
-                    "published artifact digest conflicts with manifest".into(),
-                ));
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Self::verify_existing_object(&destination, manifest)?;
+                sync_directory(destination.parent().expect("destination has parent"))?;
+                PublishOutcome::Reused(destination)
             }
-            fs::remove_file(&partial)?;
-            return Ok(PublishOutcome::Reused(destination));
-        }
-        fs::rename(&partial, &destination)?;
-        sync_directory(destination.parent().expect("destination has parent"))?;
-        Ok(PublishOutcome::Published(destination))
+            Err(error) => return Err(error.into()),
+        };
+        fs::remove_file(&sealed)?;
+        // The object-directory entry is already durable. A crash before this
+        // cleanup directory sync can only resurrect a verified sealed link;
+        // the retry path safely verifies/reuses the immutable object.
+        let _ = sync_directory(sealed.parent().expect("sealed artifact has parent"));
+        // Publication deliberately consumes the lease so its caller cannot
+        // accidentally resume a receiver with stale ownership afterward.
+        drop(transfer);
+        Ok(outcome)
     }
+
+    fn seal_transfer(transfer: &ArtifactTransferLease) -> Result<PathBuf, Error> {
+        match (
+            transfer.partial_path.exists(),
+            transfer.sealed_path.exists(),
+        ) {
+            (true, true) => Err(Error::Invalid(
+                "artifact transfer has both partial and sealed state".into(),
+            )),
+            (false, false) => Err(Error::Invalid(
+                "artifact transfer has no partial or sealed state".into(),
+            )),
+            (false, true) => {
+                reject_non_regular_file(&transfer.sealed_path, "sealed artifact")?;
+                Ok(transfer.sealed_path.clone())
+            }
+            (true, false) => {
+                reject_non_regular_file(&transfer.partial_path, "artifact partial")?;
+                reject_symlink(&transfer.sealed_path)?;
+                fs::rename(&transfer.partial_path, &transfer.sealed_path)?;
+                sync_directory(
+                    transfer
+                        .sealed_path
+                        .parent()
+                        .expect("sealed artifact has parent"),
+                )?;
+                Ok(transfer.sealed_path.clone())
+            }
+        }
+    }
+
+    fn restore_partial_after_validation_failure(
+        transfer: &ArtifactTransferLease,
+    ) -> Result<(), Error> {
+        if transfer.partial_path.exists() {
+            return Err(Error::Invalid(
+                "cannot restore sealed artifact over an existing partial".into(),
+            ));
+        }
+        reject_non_regular_file(&transfer.sealed_path, "sealed artifact")?;
+        fs::rename(&transfer.sealed_path, &transfer.partial_path)?;
+        sync_directory(
+            transfer
+                .partial_path
+                .parent()
+                .expect("artifact partial has parent"),
+        )?;
+        Ok(())
+    }
+
+    fn verify_existing_object(
+        destination: &Path,
+        manifest: &ArtifactManifest,
+    ) -> Result<(), Error> {
+        let existing = fs::symlink_metadata(destination)?;
+        if !existing.file_type().is_file()
+            || existing.file_type().is_symlink()
+            || existing.len() != manifest.artifact_size_bytes
+        {
+            return Err(Error::Invalid(
+                "published artifact path is not the expected immutable object".into(),
+            ));
+        }
+        let mut existing_file = File::open(destination)?;
+        if sha256_reader(&mut existing_file)? != manifest.artifact_sha256 {
+            return Err(Error::Invalid(
+                "published artifact digest conflicts with manifest".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn verify_sealed_artifact(path: &Path, manifest: &ArtifactManifest) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(Error::Invalid(
+            "sealed artifact must be a regular non-symlink file".into(),
+        ));
+    }
+    if metadata.len() != manifest.artifact_size_bytes {
+        return Err(Error::Invalid("sealed artifact has the wrong size".into()));
+    }
+    if plan_verified_resume(path, manifest)? != ResumePlan::CompletePendingFinalVerification {
+        return Err(Error::Invalid(
+            "sealed artifact failed chunk verification".into(),
+        ));
+    }
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    if sha256_reader(&mut file)? != manifest.artifact_sha256 {
+        return Err(Error::Invalid("artifact final digest mismatch".into()));
+    }
+    file.sync_all()?;
+    Ok(())
 }
 
 fn sha256_reader(reader: &mut impl Read) -> Result<String, Error> {
@@ -1038,13 +1223,12 @@ mod tests {
         let digest = "a".repeat(64);
         let temp = TempDir::new().unwrap();
         let store = ArtifactStore::open(temp.path().join("store")).unwrap();
-        let request = |program, host, root, session, resume| ReceiverPullRequest {
+        let transfer = store.acquire_transfer_lease(&digest, "run-1").unwrap();
+        let request = |program, host, root, resume| ReceiverPullRequest {
             rsync_program: Path::new(program),
             remote_host: host,
             remote_store_root: Path::new(root),
-            local_store: &store,
-            transfer_session: session,
-            artifact_sha256: &digest,
+            transfer: &transfer,
             resume,
             timeout_seconds: 30,
         };
@@ -1052,7 +1236,6 @@ mod tests {
             "/usr/bin/rsync",
             "m1-lan",
             "/var/lib/shipyard/artifacts",
-            "run-1",
             ResumePlan::Append {
                 verified_bytes: 65536,
                 truncate_to: 65536,
@@ -1067,28 +1250,19 @@ mod tests {
                     "/usr/bin/rsync",
                     hostile,
                     "/safe",
-                    "run-1",
                     ResumePlan::Restart,
                 ))
                 .is_err()
             );
         }
         assert!(
-            receiver_pull_command(&request(
-                "rsync",
-                "m1",
-                "/safe",
-                "run-1",
-                ResumePlan::Restart,
-            ))
-            .is_err()
+            receiver_pull_command(&request("rsync", "m1", "/safe", ResumePlan::Restart,)).is_err()
         );
         assert!(
             receiver_pull_command(&request(
                 "/usr/bin/rsync",
                 "m1",
                 "/safe;bad",
-                "run-1",
                 ResumePlan::Restart,
             ))
             .is_err()
@@ -1098,7 +1272,6 @@ mod tests {
                 "/usr/bin/rsync",
                 "m1",
                 "/safe",
-                "run-1",
                 ResumePlan::Append {
                     verified_bytes: 0,
                     truncate_to: 0
@@ -1106,16 +1279,20 @@ mod tests {
             ))
             .is_err()
         );
-        assert!(
-            receiver_pull_command(&request(
-                "/usr/bin/rsync",
-                "m1",
-                "/safe",
-                "../escape",
-                ResumePlan::Restart,
-            ))
-            .is_err()
-        );
+        assert!(store.acquire_transfer_lease(&digest, "../escape").is_err());
+    }
+
+    #[test]
+    fn transfer_lease_is_exclusive_and_recovers_after_owner_exit() {
+        let digest = "a".repeat(64);
+        let temp = TempDir::new().unwrap();
+        let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let first = store.acquire_transfer_lease(&digest, "run-1").unwrap();
+        assert_eq!(first.artifact_sha256(), digest);
+        assert_eq!(first.session(), "run-1");
+        assert!(store.acquire_transfer_lease(&digest, "run-1").is_err());
+        drop(first);
+        store.acquire_transfer_lease(&digest, "run-1").unwrap();
     }
 
     #[test]
@@ -1139,34 +1316,170 @@ mod tests {
         let auth = authority(&manifest);
         let temp = TempDir::new().unwrap();
         let store = ArtifactStore::open(temp.path().join("store")).unwrap();
-        let partial = store
-            .partial_path(&manifest.artifact_sha256, "run-1")
+        let first = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run-1")
             .unwrap();
+        let partial = first.partial_path().to_path_buf();
         fs::write(&partial, &bytes).unwrap();
-        let outcome = store.publish_verified(&manifest, &auth, "run-1").unwrap();
+        let outcome = store.publish_verified(&manifest, &auth, first).unwrap();
         let PublishOutcome::Published(published) = outcome else {
             panic!("expected publication")
         };
         assert!(!partial.exists());
         assert_eq!(fs::read(&published).unwrap(), bytes);
 
-        let second = store
-            .partial_path(&manifest.artifact_sha256, "run-2")
+        let second_lease = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run-2")
             .unwrap();
+        let second = second_lease.partial_path().to_path_buf();
         fs::write(&second, &bytes).unwrap();
         assert!(matches!(
-            store.publish_verified(&manifest, &auth, "run-2").unwrap(),
+            store
+                .publish_verified(&manifest, &auth, second_lease)
+                .unwrap(),
             PublishOutcome::Reused(_)
         ));
 
-        let bad = store
-            .partial_path(&manifest.artifact_sha256, "run-3")
+        let bad_lease = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run-3")
             .unwrap();
+        let bad = bad_lease.partial_path().to_path_buf();
+        let sealed = bad_lease.sealed_path.clone();
         let mut corrupt = bytes.clone();
         corrupt[0] ^= 1;
         fs::write(&bad, corrupt).unwrap();
-        assert!(store.publish_verified(&manifest, &auth, "run-3").is_err());
+        assert!(store.publish_verified(&manifest, &auth, bad_lease).is_err());
         assert!(bad.exists());
+        assert!(!sealed.exists());
+    }
+
+    #[test]
+    fn concurrent_publishers_never_clobber_and_publish_the_named_digest() {
+        use std::sync::{Arc, Barrier};
+
+        let bytes = vec![6; TEST_CHUNK_SIZE * 2 + 17];
+        let manifest = fixture(&bytes);
+        let auth = authority(&manifest);
+        let temp = TempDir::new().unwrap();
+        let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let first = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run-a")
+            .unwrap();
+        let second = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run-b")
+            .unwrap();
+        fs::write(first.partial_path(), &bytes).unwrap();
+        fs::write(second.partial_path(), &bytes).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let publish = |store: ArtifactStore,
+                       manifest: ArtifactManifest,
+                       auth: ManifestAuthority,
+                       transfer: ArtifactTransferLease,
+                       barrier: Arc<Barrier>| {
+            std::thread::spawn(move || {
+                store.publish_verified_with_hook(&manifest, &auth, transfer, |_| {
+                    barrier.wait();
+                    Ok(())
+                })
+            })
+        };
+        let a = publish(
+            store.clone(),
+            manifest.clone(),
+            auth.clone(),
+            first,
+            barrier.clone(),
+        );
+        let b = publish(store.clone(), manifest.clone(), auth, second, barrier);
+        let outcomes = [a.join().unwrap().unwrap(), b.join().unwrap().unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, PublishOutcome::Published(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, PublishOutcome::Reused(_)))
+                .count(),
+            1
+        );
+        let published = store
+            .root
+            .join("objects")
+            .join(format!("{}.tar.zst", manifest.artifact_sha256));
+        let mut file = File::open(published).unwrap();
+        assert_eq!(sha256_reader(&mut file).unwrap(), manifest.artifact_sha256);
+    }
+
+    #[test]
+    fn destination_created_at_publication_is_verified_and_never_overwritten() {
+        let bytes = vec![7; TEST_CHUNK_SIZE + 29];
+        let manifest = fixture(&bytes);
+        let auth = authority(&manifest);
+        let temp = TempDir::new().unwrap();
+        let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let transfer = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run-race")
+            .unwrap();
+        let sealed = transfer.sealed_path.clone();
+        fs::write(transfer.partial_path(), &bytes).unwrap();
+        let hostile = vec![0; bytes.len()];
+        let hostile_copy = hostile.clone();
+        let result =
+            store.publish_verified_with_hook(&manifest, &auth, transfer, move |destination| {
+                fs::write(destination, hostile_copy)?;
+                Ok(())
+            });
+        assert!(matches!(result, Err(Error::Invalid(_))));
+        let destination = store
+            .root
+            .join("objects")
+            .join(format!("{}.tar.zst", manifest.artifact_sha256));
+        assert_eq!(fs::read(destination).unwrap(), hostile);
+        assert!(sealed.exists(), "verified source must survive the conflict");
+    }
+
+    #[test]
+    fn sealed_transfer_survives_restart_and_cannot_be_received_again() {
+        let bytes = vec![8; TEST_CHUNK_SIZE + 41];
+        let manifest = fixture(&bytes);
+        let auth = authority(&manifest);
+        let temp = TempDir::new().unwrap();
+        let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let transfer = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run-restart")
+            .unwrap();
+        let sealed = transfer.sealed_path.clone();
+        fs::write(transfer.partial_path(), &bytes).unwrap();
+        assert!(
+            store
+                .publish_verified_with_hook(&manifest, &auth, transfer, |_| {
+                    Err(Error::Invalid("simulated process loss".into()))
+                })
+                .is_err()
+        );
+        assert!(sealed.exists());
+
+        let resumed = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run-restart")
+            .unwrap();
+        let pull = ReceiverPullRequest {
+            rsync_program: Path::new("/usr/bin/rsync"),
+            remote_host: "m1",
+            remote_store_root: Path::new("/safe"),
+            transfer: &resumed,
+            resume: ResumePlan::Restart,
+            timeout_seconds: 30,
+        };
+        assert!(receiver_pull_command(&pull).is_err());
+        assert!(matches!(
+            store.publish_verified(&manifest, &auth, resumed).unwrap(),
+            PublishOutcome::Published(_)
+        ));
+        assert!(!sealed.exists());
     }
 
     #[test]
@@ -1194,18 +1507,15 @@ mod tests {
         let bytes = vec![9; TEST_CHUNK_SIZE];
         let manifest = fixture(&bytes);
         let store = ArtifactStore::open(temp.path().join("store")).unwrap();
+        let transfer = store
+            .acquire_transfer_lease(&manifest.artifact_sha256, "run")
+            .unwrap();
         let external = temp.path().join("external");
         fs::write(&external, &bytes).unwrap();
-        symlink(
-            &external,
-            store
-                .partial_path(&manifest.artifact_sha256, "run")
-                .unwrap(),
-        )
-        .unwrap();
+        symlink(&external, transfer.partial_path()).unwrap();
         assert!(
             store
-                .publish_verified(&manifest, &authority(&manifest), "run")
+                .publish_verified(&manifest, &authority(&manifest), transfer)
                 .is_err()
         );
     }
