@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01100"></a>
+## [0.110.0] - 2026-08-22
+
+- fix: reject unsafe selected-test resume ([#461](https://github.com/danielraffel/Shipyard/pull/461))
+
 <a id="v01090"></a>
 ## [0.109.0] - 2026-08-22
 
@@ -1004,6 +1009,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.110.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.110.0
 [0.109.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.109.0
 [0.108.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.108.2
 [0.108.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.108.1
