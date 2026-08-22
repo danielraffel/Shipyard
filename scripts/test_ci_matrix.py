@@ -230,7 +230,14 @@ class CiMatrixTests(unittest.TestCase):
         self.assertIn('.real_home == env.HOME', workflow)
         self.assertIn('.mode == "shipyard"', workflow)
         self.assertIn('(.active_runs == [])', workflow)
-        self.assertIn('.restored_production_pid', workflow)
+        self.assertIn('.final_production_pid', workflow)
+        self.assertIn("legacy-lifetime-lock-quiesce-restore", workflow)
+        self.assertIn("corrected-idle-preserve-fence", workflow)
+        self.assertIn('"$canary_root/mutation-fence.json"', workflow)
+        self.assertIn('returncode == 75', workflow)
+        self.assertIn('overlap_classification == "sandbox_writer_domain_overlap"', workflow)
+        self.assertIn('.production_identity_preserved == true', workflow)
+        self.assertIn('.final_production_pid == .old_production_pid', workflow)
         self.assertIn('grep -F -- "--mode shipyard"', workflow)
 
     def test_sandbox_candidate_has_host_owned_cleanup_guardian(self) -> None:
@@ -257,6 +264,9 @@ class CiMatrixTests(unittest.TestCase):
         self.assertNotIn('mkdir "$lease_dir"', workflow)
         self.assertIn(".production_quiesced == true", workflow)
         self.assertIn(".production_restored == true", workflow)
+        self.assertIn(".production_preserved == true", workflow)
+        self.assertIn(".mutation_fence_proved == true", workflow)
+        self.assertIn(".production_identity_verified == true", workflow)
         self.assertIn(".lease_removed == true", workflow)
 
 

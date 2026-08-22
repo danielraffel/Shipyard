@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
 import fcntl
 import os
 import sys
@@ -8,6 +9,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("sandbox_daemon_guardian.py")
@@ -62,6 +64,87 @@ class GuardianLifecycleTests(unittest.TestCase):
                 self.assertTrue(guardian._exclusive_lock_is_contended(path))
                 fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
             self.assertFalse(guardian._exclusive_lock_is_contended(path))
+
+    def test_post_cutover_idle_daemon_selects_preserve_and_fence_path(self) -> None:
+        self.assertEqual(
+            guardian._select_transition(4242, (), False),
+            guardian.CORRECTED_TRANSITION,
+        )
+
+    def test_post_cutover_preflight_never_stops_idle_corrected_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.candidate.write_bytes(b"candidate")
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(
+                    str(active.installed),
+                    "--mode",
+                    "shipyard",
+                    "daemon",
+                    "run",
+                    "--repo",
+                    "owner/repo",
+                ),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "snapshot_process", return_value=snapshot
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_configured_repos", return_value=("owner/repo",)
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(guardian, "_active_runs", return_value=())
+                )
+                stack.enter_context(
+                    mock.patch.object(guardian, "_lock_holders", return_value=())
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_exclusive_lock_is_contended", return_value=False
+                    )
+                )
+                run = stack.enter_context(mock.patch.object(guardian, "_run"))
+                active.preflight_and_transition()
+
+            self.assertEqual(active.transition_path, guardian.CORRECTED_TRANSITION)
+            self.assertFalse(active.production_quiesced)
+            self.assertFalse(active.old_lifetime_lock_owned)
+            run.assert_not_called()
+
+    def test_pre_cutover_lifetime_lock_selects_quiesce_restore_path(self) -> None:
+        self.assertEqual(
+            guardian._select_transition(4242, (4242,), True),
+            guardian.LEGACY_TRANSITION,
+        )
+
+    def test_post_cutover_ambiguous_lock_state_fails_closed(self) -> None:
+        for holders, contended in [
+            ((4242,), False),
+            ((), True),
+            ((7331,), True),
+            ((4242, 7331), True),
+        ]:
+            with self.subTest(holders=holders, contended=contended):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "ambiguous production writer-domain state"
+                ):
+                    guardian._select_transition(4242, holders, contended)
 
     def test_owner_cancellation_stops_restores_then_releases(self) -> None:
         events: list[str] = []
