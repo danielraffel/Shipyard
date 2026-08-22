@@ -1,6 +1,7 @@
 //! Pull request shell boundary used by `ship`.
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 use std::process::Command;
@@ -55,9 +56,25 @@ impl Error for PrError {}
 
 /// Push the current branch before PR lookup/create.
 pub fn push_branch(cwd: &Path, branch: &str) -> Result<(), PrError> {
+    push_branch_with_env(cwd, branch, std::iter::empty::<(OsString, OsString)>())
+}
+
+/// Push the current branch while extending the supervised child environment.
+///
+/// Callers must supply only trusted, process-local transport values. This seam
+/// exists so a repository pre-push hook can consume an exact Shipyard receipt
+/// without placing policy or caller-selected test expressions on the command
+/// line.
+pub fn push_branch_with_env(
+    cwd: &Path,
+    branch: &str,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<(), PrError> {
     // Supervised git push — sets SHIPYARD_PR_RUNNING=1 so downstream
     // pre-push hooks know this push originated from `shipyard pr`.
-    let output = crate::supervised::git_push_supervised()
+    let mut command = crate::supervised::git_push_supervised();
+    command.envs(environment);
+    let output = command
         .args(["push", "-u", "origin", branch])
         .current_dir(cwd)
         .output()

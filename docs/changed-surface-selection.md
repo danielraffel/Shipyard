@@ -214,3 +214,47 @@ of their canonical identity, so values such as `a/b` and `a_b` cannot alias.
 While a target runs, Shipyard checks the live PR head at a
 bounded interval and durably requests cancellation when it no longer matches
 the queued SHA; transient head-query failures do not manufacture cancellation.
+
+## Default-off supervised pre-push shadow receipt
+
+Shipyard can prepare the same protected-base changed-surface selection before
+it supervises the first branch push. This is a machine-trusted canary enabled
+only by `changed_surface_prepush.mode = "shadow_compare"` in the machine-global
+config. Missing or `off` preserves the pre-v0.107 behavior. `authoritative` is
+parsed so configuration drift is visible but is intentionally inert: a
+pre-push result never replaces the downstream full suite or an authoritative
+selected execution.
+
+The prospective receipt requires one resolved selector target, a GitHub-
+authenticated protected base ref/SHA, a clean local HEAD/tree, a merge base
+equal to that protected SHA, the exact NUL-delimited `base..HEAD` paths, and the
+selector policy read from the protected base object. No CLI-selected test,
+regex, target, or arbitrary unprotected base enters the plan. Policy, selector,
+test-topology, unknown-path, dirty-tree, stale-base, and target ambiguity all
+retain the ordinary full path.
+
+The supervised `git push` child receives only versioned receipt-path, receipt-
+digest, transaction-nonce, and private-result-directory environment variables,
+alongside the existing `SHIPYARD_PR_RUNNING=1` marker. A repository hook must
+independently require exactly one non-delete branch update matching the bound
+HEAD/ref/tree and must fail closed for direct, tag, deletion, or multi-ref
+pushes. The active repository-relative `core.hooksPath/pre-push` must itself be
+tracked by the protected base, covered by that policy's `policy_paths` or
+`test_topology_paths`, be a regular non-symlink file, and remain byte-identical
+to the protected blob before and after push. Untracked, absolute, changed, or
+uncovered hook implementations have no dedupe authority. Its bounded
+`hook-result.json` is not trusted by itself. After PR creation Shipyard
+re-observes authenticated PR/base/head/tree/path/policy/test identity and
+accepts a hook result only when every digest, hook identity, and nonce agrees.
+The JSON does not assert pass authority. Only Shipyard's parent process
+observing the supervised `git push` exit zero creates the private successful-
+push state required by the snapshot. The protected hook contract must return
+nonzero when its selected run fails, so an untrusted test descendant can write
+telemetry but cannot turn an aborted push into a reusable result.
+
+An exact passing bounded result creates an immutable snapshot with disposition
+`full_only_due_exact_prepush_shadow`. This is only a dedupe seam for a later
+queue integration: it may eventually suppress the redundant downstream
+selected shadow half, never the downstream full validation. There is no cross-
+invocation artifact reuse, selected build-target substitution, or authoritative
+activation in this slice.
