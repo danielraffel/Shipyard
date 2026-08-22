@@ -275,9 +275,9 @@ pub struct ShipStateStore {
 impl ShipStateStore {
     /// Open a state store at the given path.
     pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
-        fs::create_dir_all(&path)?;
-        fs::create_dir_all(path.join("archive"))?;
-        fs::create_dir_all(path.join("scoped"))?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path.join("archive"))?;
+        crate::writer_domain_lease::ensure_protected_dir_all(&path.join("scoped"))?;
         Ok(Self { path })
     }
 
@@ -414,6 +414,7 @@ impl ShipStateStore {
         } else {
             let path = self.state_path(pr);
             if path.exists() {
+                let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)?;
                 fs::remove_file(path)?;
             }
         }
@@ -441,6 +442,7 @@ impl ShipStateStore {
         state: &ShipState,
         _lock: &ShipStatePrLock,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let payload = serde_json::to_string_pretty(state)?;
         let temp = tempfile::NamedTempFile::new_in(&self.path)?;
         fs::write(temp.path(), format!("{payload}\n"))?;
@@ -482,11 +484,15 @@ impl ShipStateStore {
     }
 
     fn delete_scoped_locked(&self, repository: &str, pr: u64) -> Result<(), std::io::Error> {
-        let path = self.state_path_scoped(repository, pr);
-        if path.exists() {
-            fs::remove_file(path)?;
+        {
+            let _writer_domain =
+                crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+            let path = self.state_path_scoped(repository, pr);
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+            self.remove_matching_legacy(repository, pr)?;
         }
-        self.remove_matching_legacy(repository, pr)?;
         self.sync_legacy_mirror_for_pr(pr)?;
         Ok(())
     }
@@ -520,6 +526,7 @@ impl ShipStateStore {
         pr: u64,
         _lock: &ShipStatePrLock,
     ) -> Result<Option<PathBuf>, std::io::Error> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let source = self.state_path(pr);
         if !source.exists() {
             return Ok(None);
@@ -549,12 +556,17 @@ impl ShipStateStore {
             }
             legacy
         };
-        let archive_dir = self.archive_dir().join(repository_key(repository));
-        fs::create_dir_all(&archive_dir)?;
-        let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-        let dest = archive_dir.join(format!("{pr}-{stamp}.json"));
-        fs::rename(source, &dest)?;
-        self.remove_matching_legacy(repository, pr)?;
+        let dest = {
+            let _writer_domain =
+                crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+            let archive_dir = self.archive_dir().join(repository_key(repository));
+            fs::create_dir_all(&archive_dir)?;
+            let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+            let dest = archive_dir.join(format!("{pr}-{stamp}.json"));
+            fs::rename(source, &dest)?;
+            self.remove_matching_legacy(repository, pr)?;
+            dest
+        };
         self.sync_legacy_mirror_for_pr(pr)?;
         Ok(Some(dest))
     }
@@ -714,6 +726,7 @@ impl ShipStateStore {
     }
 
     fn persist_state_at(state: &ShipState, path: &Path) -> io::Result<()> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
         let parent = path.parent().expect("ship-state path has parent");
         fs::create_dir_all(parent)?;
         let payload = serde_json::to_string_pretty(state)
@@ -784,6 +797,7 @@ impl ShipStateStore {
     /// mirror update without serializing the repository-scoped operations.
     fn sync_legacy_mirror_for_pr(&self, pr: u64) -> io::Result<()> {
         let _compatibility_lock = ShipStatePrLock::acquire(self.compatibility_lock_path(pr))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         self.ensure_legacy_is_preserved(pr)?;
         let scoped = self.scoped_states_for_pr(pr);
         let legacy_path = self.state_path(pr);
@@ -853,6 +867,7 @@ pub struct ShipStatePrLock {
 
 impl ShipStatePrLock {
     fn acquire(path: PathBuf) -> io::Result<Self> {
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -862,11 +877,13 @@ impl ShipStatePrLock {
             .read(true)
             .write(true)
             .open(path)?;
+        drop(writer_domain);
         FileExt::lock_exclusive(&file)?;
         Ok(Self { files: vec![file] })
     }
 
     fn acquire_shared(path: PathBuf) -> io::Result<Self> {
+        let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -876,6 +893,7 @@ impl ShipStatePrLock {
             .read(true)
             .write(true)
             .open(path)?;
+        drop(writer_domain);
         FileExt::lock_shared(&file)?;
         Ok(Self { files: vec![file] })
     }

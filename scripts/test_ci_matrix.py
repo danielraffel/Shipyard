@@ -168,12 +168,106 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual(rows["linux-arm64"]["provider"], "github-hosted")
         self.assertEqual(rows["windows"]["provider"], "github-hosted")
 
+    def test_sandbox_local_macos_requires_explicit_m3_canary_capability(self) -> None:
+        matrix = ci_matrix.workflow_matrix(
+            "sandbox-e2e", {"REQUESTED_PROVIDER": "local"}
+        )
+        rows = {row["key"]: row for row in matrix["include"]}
+        self.assertEqual(
+            json.loads(rows["macos-arm64"]["runs_on_json"]),
+            ["self-hosted", "local-mac", "shipyard-sandbox-m3"],
+        )
+
+    def test_sandbox_local_override_cannot_escape_m3_capability(self) -> None:
+        matrix = ci_matrix.workflow_matrix(
+            "sandbox-e2e",
+            {
+                "REQUESTED_PROVIDER": "local",
+                "LOCAL_MACOS_ARM64_RUNS_ON_JSON": '["self-hosted","studio"]',
+            },
+        )
+        rows = {row["key"]: row for row in matrix["include"]}
+        self.assertEqual(
+            json.loads(rows["macos-arm64"]["runs_on_json"]),
+            ["self-hosted", "studio", "shipyard-sandbox-m3"],
+        )
+
     def test_workflows_do_not_implicitly_route_macos_to_local_runner(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow_dir = root / ".github" / "workflows"
         for path in workflow_dir.glob("*.yml"):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("MACOS_ARM64_LOCAL_SELECTOR_JSON", text, path.name)
+
+    def test_sandbox_m3_bootstrap_is_fenced_by_target_provider_and_host(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(
+            encoding="utf-8"
+        )
+        predicate = (
+            "matrix.key == 'macos-arm64' && matrix.provider == 'local' && "
+            "startsWith(runner.name, 'Shipyard-studio-')"
+        )
+        self.assertEqual(workflow.count(predicate), 3)
+        self.assertNotIn("startsWith(runner.name, 'pulp-studio')", workflow)
+        self.assertIn('test "$RUNNER_NAME" = "Shipyard-studio-02"', workflow)
+        self.assertIn('test "$(hostname)" = "Daniels-Mac-Studio.local"', workflow)
+        self.assertIn('test "$($installed runner tag)" = "studio"', workflow)
+
+    def test_sandbox_m3_candidate_is_exact_and_production_is_restored(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('canary_root="/tmp/shipyard-sandbox-m3-', workflow)
+        self.assertIn('"$candidate" --mode isolated', workflow)
+        self.assertIn('--global-dir "$canary_root/global"', workflow)
+        self.assertIn('--state-dir "$canary_root/state"', workflow)
+        self.assertIn('.tunnel.backend == "inactive"', workflow)
+        self.assertIn('SHIPYARD_BINARY_FOR_TEST="$candidate"', workflow)
+        self.assertIn('candidate_sha256:$candidate_hash', workflow)
+        self.assertIn('sandbox_passed:true', workflow)
+        self.assertIn('.real_home == env.HOME', workflow)
+        self.assertIn('.mode == "shipyard"', workflow)
+        self.assertIn('(.active_runs == [])', workflow)
+        self.assertIn('.final_production_pid', workflow)
+        self.assertIn("legacy-lifetime-lock-quiesce-restore", workflow)
+        self.assertIn("corrected-idle-preserve-fence", workflow)
+        self.assertIn('"$canary_root/mutation-fence.json"', workflow)
+        self.assertIn('returncode == 75', workflow)
+        self.assertIn('overlap_classification == "sandbox_writer_domain_overlap"', workflow)
+        self.assertIn('.production_identity_preserved == true', workflow)
+        self.assertIn('.final_production_pid == .old_production_pid', workflow)
+        self.assertIn('grep -F -- "--mode shipyard"', workflow)
+
+    def test_sandbox_candidate_has_host_owned_cleanup_guardian(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('launchctl bootstrap "gui/$(id -u)" "$guardian_plist"', workflow)
+        self.assertIn("<key>KeepAlive</key><false/>", workflow)
+        self.assertIn(
+            'cp "$GITHUB_WORKSPACE/scripts/sandbox_daemon_guardian.py" "$guardian"',
+            workflow,
+        )
+        self.assertIn('<string>--owner-pid</string><string>$$</string>', workflow)
+        self.assertIn('if kill -0 "$candidate_pid"', workflow)
+        self.assertIn("name: Verify M3 guardian and production daemon invariants", workflow)
+        self.assertEqual(workflow.count("inherited Actions orphan tracking"), 1)
+        self.assertIn(
+            "((.configured_repos // []) == [])", workflow
+        )
+        self.assertNotIn(
+            '"$candidate" daemon refresh --repo Generous-Corp/pulp', workflow
+        )
+        self.assertNotIn('mkdir "$lease_dir"', workflow)
+        self.assertIn(".production_quiesced == true", workflow)
+        self.assertIn(".production_restored == true", workflow)
+        self.assertIn(".production_preserved == true", workflow)
+        self.assertIn(".mutation_fence_proved == true", workflow)
+        self.assertIn(".production_identity_verified == true", workflow)
+        self.assertIn(".lease_removed == true", workflow)
 
 
 if __name__ == "__main__":

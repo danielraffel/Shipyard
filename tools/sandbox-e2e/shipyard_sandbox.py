@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -26,6 +27,7 @@ BINARY_NAME = "shipyard.exe" if sys.platform == "win32" else "shipyard"
 PYTHON_BINARY_NAME = "shipyard-py"
 WRITER_DOMAIN_OVERLAP_CLASSIFICATION = "sandbox_writer_domain_overlap"
 WRITER_DOMAIN_LOCK_NAME = ".sandbox-writer-domain.lock"
+WRITER_DOMAIN_TURNSTILE_NAME = ".sandbox-writer-domain.turnstile.lock"
 WRITER_DOMAIN_ACQUIRE_TIMEOUT_SECONDS = 5.0
 
 PROTECTED_PATHS: tuple[Path, ...] = (
@@ -112,13 +114,51 @@ class ContaminationReport:
         return "\n".join(lines)
 
 
-def _snapshot_paths(root: Path) -> set[Path]:
+@dataclass(frozen=True)
+class PathFingerprint:
+    mode: int
+    size: int
+    mtime_ns: int
+    device: int
+    inode: int
+    digest: str | None
+
+
+def _fingerprint(path: Path) -> PathFingerprint:
+    stat = path.lstat()
+    digest = None
+    if path.is_file() and not path.is_symlink():
+        hasher = hashlib.sha256()
+        with path.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        digest = hasher.hexdigest()
+    return PathFingerprint(
+        mode=stat.st_mode,
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        digest=digest,
+    )
+
+
+def _snapshot_paths(root: Path) -> dict[Path, PathFingerprint]:
     if not root.exists():
-        return set()
+        return {}
     try:
-        return set(root.rglob("*"))
+        paths = [root, *root.rglob("*")]
     except OSError:
-        return set()
+        return {}
+    snapshot: dict[Path, PathFingerprint] = {}
+    for path in paths:
+        try:
+            snapshot[path] = _fingerprint(path)
+        except OSError:
+            # An unreadable protected entry makes the audit indeterminate and
+            # therefore an offender instead of silently disappearing.
+            snapshot[path] = PathFingerprint(0, -1, -1, -1, -1, None)
+    return snapshot
 
 
 def production_writer_domain_lock_path(home: Path | None = None) -> Path:
@@ -131,6 +171,13 @@ def production_writer_domain_lock_path(home: Path | None = None) -> Path:
     else:
         state_dir = root / ".local" / "state" / "shipyard"
     return state_dir / WRITER_DOMAIN_LOCK_NAME
+
+
+def production_writer_domain_turnstile_path(home: Path | None = None) -> Path:
+    """Return the fair-entry turnstile paired with the writer-domain lock."""
+    return production_writer_domain_lock_path(home).with_name(
+        WRITER_DOMAIN_TURNSTILE_NAME
+    )
 
 
 class WriterDomainOverlap(RuntimeError):
@@ -199,63 +246,102 @@ def _unlock_writer_domain(file: BinaryIO) -> None:
 
 
 class WriterDomainLease:
-    """A bounded OS-backed shared or exclusive host writer-domain lease."""
+    """A bounded, starvation-resistant shared or exclusive writer lease."""
 
     def __init__(self, path: Path, *, exclusive: bool) -> None:
         self.path = path
         self.exclusive = exclusive
         self._file: BinaryIO | None = None
+        self._turnstile: BinaryIO | None = None
 
     def acquire(self, timeout: float = WRITER_DOMAIN_ACQUIRE_TIMEOUT_SECONDS) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout
+        turnstile_path = self.path.with_name(WRITER_DOMAIN_TURNSTILE_NAME)
+        turnstile = turnstile_path.open("a+b")
         file = self.path.open("a+b")
         if os.name != "nt":
+            os.chmod(turnstile_path, 0o600)
             os.chmod(self.path, 0o600)
-        deadline = time.monotonic() + timeout
-        while not _try_writer_domain_lock(file, exclusive=self.exclusive):
+        try:
+            self._acquire_file(
+                turnstile,
+                exclusive=True,
+                deadline=deadline,
+                timeout=timeout,
+                kind="writer-domain turnstile",
+            )
+            self._acquire_file(
+                file,
+                exclusive=self.exclusive,
+                deadline=deadline,
+                timeout=timeout,
+                kind=(
+                    "exclusive sandbox audit"
+                    if self.exclusive
+                    else "production mutation"
+                ),
+            )
+        except Exception:
+            try:
+                _unlock_writer_domain(turnstile)
+            except OSError:
+                pass
+            turnstile.close()
+            file.close()
+            raise
+        self._file = file
+        if self.exclusive:
+            self._turnstile = turnstile
+        else:
+            _unlock_writer_domain(turnstile)
+            turnstile.close()
+
+    def _acquire_file(
+        self,
+        file: BinaryIO,
+        *,
+        exclusive: bool,
+        deadline: float,
+        timeout: float,
+        kind: str,
+    ) -> None:
+        while not _try_writer_domain_lock(file, exclusive=exclusive):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                file.close()
-                kind = "exclusive sandbox audit" if self.exclusive else "production writer"
                 raise WriterDomainOverlap(
                     f"{WRITER_DOMAIN_OVERLAP_CLASSIFICATION}: {kind} could not acquire "
                     f"{self.path} within {timeout:.3f}s"
                 )
-            time.sleep(min(0.025, remaining))
-        self._file = file
+            time.sleep(min(0.010, remaining))
 
     def release(self) -> None:
-        if self._file is None:
-            return
-        try:
-            _unlock_writer_domain(self._file)
-        finally:
-            self._file.close()
-            self._file = None
+        if self._file is not None:
+            try:
+                _unlock_writer_domain(self._file)
+            finally:
+                self._file.close()
+                self._file = None
+        if self._turnstile is not None:
+            try:
+                _unlock_writer_domain(self._turnstile)
+            finally:
+                self._turnstile.close()
+                self._turnstile = None
 
 
 def _find_newer(
     root: Path,
     sentinel_mtime: float,
-    pre_existing: set[Path],
+    pre_existing: Mapping[Path, PathFingerprint],
 ) -> list[Path]:
-    if not root.exists():
-        return []
-    offenders: list[Path] = []
-    try:
-        iterator = root.rglob("*")
-    except OSError:
-        return offenders
-    for path in iterator:
-        if path in pre_existing:
-            continue
-        try:
-            stat = path.lstat()
-        except OSError:
-            continue
-        if stat.st_mtime > sentinel_mtime:
-            offenders.append(path)
-    return offenders
+    del sentinel_mtime  # identity/content comparison is stronger than wall-clock ordering.
+    current = _snapshot_paths(root)
+    return sorted(
+        path
+        for path in pre_existing.keys() | current.keys()
+        if pre_existing.get(path) != current.get(path)
+    )
 
 
 def _otool_dylibs(binary: Path) -> list[Path]:

@@ -128,6 +128,8 @@ impl TemporaryWorktree {
 }
 
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| error.to_string())?;
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;

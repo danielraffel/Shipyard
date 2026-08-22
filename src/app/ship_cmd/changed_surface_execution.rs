@@ -358,6 +358,8 @@ fn shell_quote(path: &Path) -> String {
 }
 
 fn persist_activation(path: &Path, receipt: &ActivationReceipt<'_>) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(path).map_err(|error| {
         CliFailure::new(1, format!("create selector evidence directory: {error}"))
     })?;
@@ -406,6 +408,8 @@ fn persist_fallback_diagnostic(
     path: &Path,
     diagnostic: &FallbackDiagnostic<'_>,
 ) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(path).map_err(|error| {
         CliFailure::new(1, format!("create selector diagnostic directory: {error}"))
     })?;

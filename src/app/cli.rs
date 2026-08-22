@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -36,6 +37,16 @@ pub(super) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum Command {
+    /// Internal external-writer lease guardian.
+    #[command(name = "writer-domain-exec", hide = true)]
+    WriterDomainExec {
+        /// Protected path the external process may mutate.
+        #[arg(long)]
+        path: PathBuf,
+        /// External command and arguments.
+        #[arg(last = true, required = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
     /// Internal daemon-owned queue worker.
     #[command(name = "execution-worker", hide = true)]
     ExecutionWorker {

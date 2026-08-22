@@ -510,6 +510,8 @@ fn store_receipt(
     path: &Path,
     receipt: &crate::changed_surface::SelectionReceipt,
 ) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let parent = path
         .parent()
         .ok_or_else(|| CliFailure::new(1, "receipt path has no parent"))?;

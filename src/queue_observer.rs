@@ -300,6 +300,8 @@ pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
 
 /// Atomically persist the latest cursor.
 pub fn save_state(path: &Path, state: &ObserverState) -> Result<(), String> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| error.to_string())?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -322,6 +324,8 @@ pub fn save_state(path: &Path, state: &ObserverState) -> Result<(), String> {
 
 /// Append one transition as compact NDJSON.
 pub fn append_transition(path: &Path, transition: &Transition) -> Result<(), String> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| error.to_string())?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

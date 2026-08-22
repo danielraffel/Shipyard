@@ -197,6 +197,7 @@ pub fn write_terminal_manifest(state_dir: &Path, job: &Job) -> io::Result<()> {
     if !job_dir.is_dir() {
         return Ok(());
     }
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&job_dir)?;
     let destination = job_dir.join(TERMINAL_MANIFEST_FILE);
     let bytes = serde_json::to_vec_pretty(&TerminalLogManifest::from_job(job))?;
     let mut temporary = tempfile::NamedTempFile::new_in(&job_dir)?;
@@ -221,6 +222,7 @@ pub fn invalidate_conflicting_terminal_manifest(state_dir: &Path, job: &Job) -> 
     if existing == TerminalLogManifest::from_job(job) {
         return Ok(());
     }
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&job_dir)?;
     fs::remove_file(job_dir.join(TERMINAL_MANIFEST_FILE))?;
     #[cfg(unix)]
     File::open(job_dir)?.sync_all()?;
@@ -242,6 +244,11 @@ pub fn read_terminal_manifest(job_dir: &Path) -> Option<TerminalLogManifest> {
 /// Preserve an existing file, including a small bounded restart history,
 /// before opening a new writer. The active file is never truncated in place.
 pub fn rotate_before_open(path: &Path, segments: usize) -> io::Result<bool> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
+    rotate_before_open_unlocked(path, segments)
+}
+
+fn rotate_before_open_unlocked(path: &Path, segments: usize) -> io::Result<bool> {
     let segments = segments.max(1);
     prune_excess_segments(path, segments)?;
     sync_parent_directory(path)?;
@@ -290,13 +297,14 @@ fn prune_excess_segments(path: &Path, segments: usize) -> io::Result<()> {
 
 /// Rotate only when the configured size threshold has been crossed.
 pub fn rotate_if_oversize(path: &Path, policy: LogRetentionPolicy) -> io::Result<bool> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     prune_excess_segments(path, policy.rotated_segments.max(1))?;
     sync_parent_directory(path)?;
     if path
         .metadata()
         .is_ok_and(|metadata| metadata.len() >= policy.max_active_file_bytes)
     {
-        rotate_before_open(path, policy.rotated_segments)
+        rotate_before_open_unlocked(path, policy.rotated_segments)
     } else {
         Ok(false)
     }
@@ -413,6 +421,7 @@ pub fn retire_verified_gzip_source(
     {
         return Ok(false);
     }
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
     fs::remove_file(path)?;
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
@@ -428,6 +437,7 @@ pub struct PreparedGzip {
 
 /// Build and fsync a gzip derivative without publishing or removing evidence.
 pub fn prepare_gzip_derivative(path: &Path, staging_dir: &Path) -> io::Result<PreparedGzip> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(staging_dir)?;
     fs::create_dir_all(staging_dir)?;
     let mut temporary = tempfile::NamedTempFile::new_in(staging_dir)?;
     let source = File::open(path)?;
@@ -443,6 +453,7 @@ pub fn prepare_gzip_derivative(path: &Path, staging_dir: &Path) -> io::Result<Pr
 /// Atomically publish a prepared derivative while retaining its source.
 pub fn publish_gzip_derivative(path: &Path, prepared: PreparedGzip) -> io::Result<PathBuf> {
     let destination = suffixed_path(path, ".gz");
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&destination)?;
     if destination.exists() {
         fs::remove_file(&destination)?;
     }

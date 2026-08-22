@@ -72,11 +72,23 @@ pub fn push_branch_with_env(
 ) -> Result<(), PrError> {
     // Supervised git push — sets SHIPYARD_PR_RUNNING=1 so downstream
     // pre-push hooks know this push originated from `shipyard pr`.
+    let environment: Vec<_> = environment.into_iter().collect();
+    let child_writer_path = environment.iter().find_map(|(key, value)| {
+        (key == crate::writer_domain_lease::CHILD_WRITER_PATH_ENV)
+            .then(|| std::path::PathBuf::from(value))
+    });
     let mut command = crate::supervised::git_push_supervised();
-    command.envs(environment);
-    let output = command
+    command
+        .envs(environment)
         .args(["push", "-u", "origin", branch])
-        .current_dir(cwd)
+        .current_dir(cwd);
+    let mut command = if let Some(path) = child_writer_path {
+        crate::writer_domain_lease::guarded_child_command(&command, &path)
+            .map_err(|error| PrError::new(format!("git push guardian failed to start: {error}")))?
+    } else {
+        command
+    };
+    let output = command
         .output()
         .map_err(|error| PrError::new(format!("git push failed to start: {error}")))?;
     if output.status.success() {
@@ -329,9 +341,9 @@ fn create_pr_with_ambient_gh(
     title: &str,
     body: &str,
 ) -> Result<PrInfo, PrError> {
-    eprintln!(
+    let _ = crate::writer_domain_lease::write_stderr(format_args!(
         "shipyard: GitHub App token cannot create this pull request through GraphQL or REST. Falling back to ambient gh auth for PR creation only."
-    );
+    ));
     let output = gh_with_policy(client, cwd, gh_command, GhAuthPolicy::AmbientOnly)?
         .args([
             "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
@@ -455,9 +467,9 @@ fn report_graphql_pr_create_fallback_with_client(client: &GhClient, message: &st
         report_rate_limit_fallback_with_client(client, "gh pr create", cwd);
         return;
     }
-    eprintln!(
+    let _ = crate::writer_domain_lease::write_stderr(format_args!(
         "shipyard: GraphQL PR creation is unavailable for this GitHub identity. Falling back to REST."
-    );
+    ));
 }
 
 /// Print a one-line user-facing notice that GraphQL is exhausted and
@@ -478,9 +490,9 @@ pub(crate) fn report_rate_limit_fallback_with_client(
         .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
         .map(|dt| format!("; reset at {} UTC", dt.format("%H:%M:%S")))
         .unwrap_or_default();
-    eprintln!(
+    let _ = crate::writer_domain_lease::write_stderr(format_args!(
         "shipyard: GraphQL rate limit hit for {operation}{reset_suffix}. Falling back to REST."
-    );
+    ));
 }
 
 /// Probe `gh api rate_limit --jq .resources.graphql.reset` for the

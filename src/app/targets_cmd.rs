@@ -778,6 +778,8 @@ fn append_target_section(
     name: &str,
     target: &NewTargetConfig,
 ) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(config_path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let mut text =
         fs::read_to_string(config_path).map_err(|error| CliFailure::new(1, error.to_string()))?;
     if !text.ends_with('\n') {
@@ -808,6 +810,8 @@ fn render_target_section(name: &str, target: &NewTargetConfig) -> String {
 }
 
 fn remove_target_section(config_path: &Path, name: &str) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(config_path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let text =
         fs::read_to_string(config_path).map_err(|error| CliFailure::new(1, error.to_string()))?;
     let mut output = String::new();

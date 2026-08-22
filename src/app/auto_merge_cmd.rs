@@ -851,9 +851,9 @@ fn merge_pr(
         if crate::pr::is_graphql_rate_limited(&message) {
             crate::pr::report_rate_limit_fallback_with_client(client, "gh pr merge", cwd);
         } else {
-            eprintln!(
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
                 "shipyard: GraphQL PR merge is unavailable for this GitHub identity. Falling back to REST."
-            );
+            ));
         }
         // Do not repeat stack discovery here: this path exists specifically
         // because GraphQL became unavailable after the earlier mutation-boundary
@@ -921,9 +921,9 @@ fn allow_classic_rest_fallback(
             // asynchronous endpoint is required for that. Preserve Shipyard's
             // independent REST quota fallback when this last read exhausts
             // GraphQL, while retaining the exact validated-head REST guard.
-            eprintln!(
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
                 "shipyard: stack inspection exhausted GraphQL at the classic merge boundary; continuing to the server-enforced exact-head merge path"
-            );
+            ));
             Ok(())
         }
         Ok(()) => Ok(()),
@@ -2179,9 +2179,9 @@ fn repository_requires_merge_queue(
             MergeQueueRequirement::Required => Ok(true),
             MergeQueueRequirement::Classic => Ok(false),
             MergeQueueRequirement::PrivateFreeClassicFallback => {
-                eprintln!(
+                let _ = crate::writer_domain_lease::write_stderr(format_args!(
                     "shipyard: evaluated branch rules are unavailable on this private-free repository; the authoritative mergeQueue query returned null, so continuing with classic exact-head merge"
-                );
+                ));
                 Ok(false)
             }
         };

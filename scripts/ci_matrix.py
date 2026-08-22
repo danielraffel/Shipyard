@@ -21,6 +21,7 @@ from typing import Mapping
 
 
 VALID_PROVIDERS = ("namespace", "github-hosted", "local")
+SANDBOX_M3_CAPABILITY_LABEL = "shipyard-sandbox-m3"
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,15 @@ def workflow_matrix(workflow: str, env: Mapping[str, str] = os.environ) -> dict[
     rows = []
     for target_key in target_keys:
         row = resolve_runs_on(target_key, env)
+        if workflow == "sandbox-e2e" and target_key == "macos-arm64" and row["provider"] == "local":
+            selector = json.loads(row["runs_on_json"])
+            if not isinstance(selector, list) or "self-hosted" not in selector:
+                raise SystemExit(
+                    "the local Sandbox M3 canary requires a self-hosted label array"
+                )
+            if SANDBOX_M3_CAPABILITY_LABEL not in selector:
+                selector.append(SANDBOX_M3_CAPABILITY_LABEL)
+            row["runs_on_json"] = json.dumps(selector, separators=(",", ":"))
         if workflow in {"package-smoke", "release"}:
             row.update(PACKAGE_ROWS[target_key])
             row["name"] = f"{row['name']} package"

@@ -148,15 +148,6 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
-    let mode = cli.mode.into();
-    let _writer_domain_lease =
-        match crate::writer_domain_lease::acquire_production_writer_domain_lease(mode) {
-            Ok(lease) => lease,
-            Err(error) => {
-                let _ = writeln!(stderr, "{error}");
-                return ExitCode::from(crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_EXIT_CODE);
-            }
-        };
     run_with(cli, &mut stdout, &mut stderr)
 }
 
@@ -165,9 +156,23 @@ fn run_with<W: Write, E: Write>(cli: Cli, stdout: &mut W, stderr: &mut E) -> Exi
         Ok(code) => code,
         Err(error) => {
             if !error.message.is_empty() {
-                let _ = writeln!(stderr, "{}", error.message);
+                match crate::writer_domain_lease::acquire_for_protected_stdio() {
+                    Ok(_writer_domain) => {
+                        let _ = writeln!(stderr, "{}", error.message);
+                    }
+                    Err(_) => {
+                        return ExitCode::from(
+                            crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_EXIT_CODE,
+                        );
+                    }
+                }
             }
-            ExitCode::from(error.code)
+            let code = if crate::writer_domain_lease::is_writer_domain_overlap(&error.message) {
+                crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_EXIT_CODE
+            } else {
+                error.code
+            };
+            ExitCode::from(code)
         }
     }
 }
@@ -186,6 +191,30 @@ fn dispatch<W: Write, E: Write>(
     let cwd = cli_cwd(&cli);
 
     match cli.command {
+        Command::WriterDomainExec { path, command } => {
+            let status = crate::writer_domain_lease::run_guarded_child(&path, &command).map_err(
+                |error| {
+                    let code =
+                        if crate::writer_domain_lease::is_writer_domain_overlap(&error.to_string())
+                        {
+                            crate::writer_domain_lease::WRITER_DOMAIN_OVERLAP_EXIT_CODE
+                        } else {
+                            1
+                        };
+                    CliFailure::new(code, format!("guarded child failed: {error}"))
+                },
+            )?;
+            let code = if status.success() {
+                0
+            } else {
+                status
+                    .code()
+                    .and_then(|code| u8::try_from(code).ok())
+                    .filter(|code| *code != 0)
+                    .unwrap_or(1)
+            };
+            return Ok(ExitCode::from(code));
+        }
         Command::ExecutionWorker { job_id, generation } => {
             return execution_worker_command(
                 &job_id,
@@ -429,7 +458,8 @@ fn handle_operational_variant<W: Write>(
         Command::Runner { command } => {
             handle_runner_command(command, mode, cwd, runtime_paths, json, stdout)
         }
-        Command::Paths
+        Command::WriterDomainExec { .. }
+        | Command::Paths
         | Command::ExecutionWorker { .. }
         | Command::Pin { .. }
         | Command::Dependency { .. }

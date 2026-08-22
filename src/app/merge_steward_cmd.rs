@@ -922,6 +922,9 @@ fn persist_final_ledger(
 }
 
 fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
+    let lock_path = path.with_extension("json.lock");
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_creation(&lock_path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -936,7 +939,6 @@ fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
             )
         })?;
     }
-    let lock_path = path.with_extension("json.lock");
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -952,6 +954,7 @@ fn acquire_ledger_lock(path: &Path) -> Result<fs::File, CliFailure> {
                 ),
             )
         })?;
+    drop(writer_domain);
     file.try_lock_exclusive().map_err(|error| {
         let reason = if lock_is_contended(&error) {
             "another steward apply pass is already running".to_owned()

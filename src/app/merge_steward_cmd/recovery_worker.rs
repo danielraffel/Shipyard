@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::super::CliFailure;
 use crate::cloud::GitHubActions;
@@ -521,6 +522,7 @@ fn process_durable_requests<W: Write>(
     reports.reserve(records.len());
     let mut had_error = false;
     for record in records {
+        let scratch_root = recovery_worker_scratch_root(&runtime_paths.state_dir);
         match process_record(ProcessRecordInputs {
             store: &store,
             record: &record,
@@ -530,7 +532,11 @@ fn process_durable_requests<W: Write>(
             trusted_config,
             model_lease: model_lease.as_ref(),
             state_dir: &runtime_paths.state_dir,
-            scratch_dir: &store_root.join("scratch"),
+            // A recovery model owns HOME/TMPDIR for its complete process
+            // lifetime and may survive its launching session. Keep that
+            // opaque child-owned scratch outside the sandbox-audited Shipyard
+            // state tree; only validated receipts enter durable state.
+            scratch_dir: &scratch_root,
         }) {
             Ok(report) => reports.push(report),
             Err(error) => {
@@ -545,6 +551,30 @@ fn process_durable_requests<W: Write>(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn recovery_worker_scratch_root(state_dir: &Path) -> PathBuf {
+    let digest = Sha256::digest(state_dir.to_string_lossy().as_bytes());
+    std::env::temp_dir()
+        .join("shipyard-recovery-worker")
+        .join(hex::encode(&digest[..12]))
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_model_home_is_stable_and_outside_durable_state() {
+        let state = Path::new("/protected/shipyard/state");
+        let first = recovery_worker_scratch_root(state);
+        assert_eq!(first, recovery_worker_scratch_root(state));
+        assert!(!first.starts_with(state));
+        assert_ne!(
+            first,
+            recovery_worker_scratch_root(Path::new("/protected/shipyard-dev/state"))
+        );
+    }
 }
 
 fn reconcile_orphaned_requests(

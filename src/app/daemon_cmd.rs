@@ -35,28 +35,29 @@ pub(super) fn ensure_execution_daemon(
                 ),
             ));
         }
-        let mut registered = status
-            .get("registered_repos")
+        let mut configured = status
+            .get("configured_repos")
+            .or_else(|| status.get("registered_repos"))
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let missing_repo = repos.iter().any(|repo| !registered.contains(repo));
+        let missing_repo = repos.iter().any(|repo| !configured.contains(repo));
         if !missing_repo {
             return Ok(0);
         }
-        registered.extend(repos);
-        registered.sort();
-        registered.dedup();
+        configured.extend(repos);
+        configured.sort();
+        configured.dedup();
         if !stop_running(&runtime_paths.state_dir) {
             return Err(CliFailure::new(
                 3,
                 "daemon disappeared while registering a repository; retry the submission",
             ));
         }
-        return spawn_execution_daemon(mode, runtime_paths, registered);
+        return spawn_execution_daemon(mode, runtime_paths, configured);
     }
     spawn_execution_daemon(mode, runtime_paths, repos)
 }
@@ -291,7 +292,7 @@ where
     let prior_status = read_daemon_status(&runtime_paths.state_dir);
     let had_prior = prior_status.is_some();
     let prior_repos = if explicit_repos.is_empty() {
-        registered_repos_from_status(prior_status.as_ref())
+        configured_repos_from_status(prior_status.as_ref())
     } else {
         Vec::new()
     };
@@ -357,9 +358,13 @@ pub(super) fn refresh_after_verified_update(
     .map_err(|error| error.error)
 }
 
-fn registered_repos_from_status(status: Option<&Value>) -> Vec<String> {
+fn configured_repos_from_status(status: Option<&Value>) -> Vec<String> {
     status
-        .and_then(|status| status.get("registered_repos"))
+        .and_then(|status| {
+            status
+                .get("configured_repos")
+                .or_else(|| status.get("registered_repos"))
+        })
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -460,7 +465,8 @@ fn render_daemon_status<W: Write>(
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let repos = status
-        .get("registered_repos")
+        .get("configured_repos")
+        .or_else(|| status.get("registered_repos"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
@@ -489,10 +495,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        DaemonRefreshError, DaemonRefreshOutcome, RuntimeMode, daemon_command,
-        execute_daemon_refresh, registered_repos_from_status, render_daemon_refresh,
-        render_daemon_refresh_error, render_daemon_start, render_daemon_status, render_daemon_stop,
-        stop_running,
+        DaemonRefreshError, DaemonRefreshOutcome, RuntimeMode, configured_repos_from_status,
+        daemon_command, execute_daemon_refresh, render_daemon_refresh, render_daemon_refresh_error,
+        render_daemon_start, render_daemon_status, render_daemon_stop, stop_running,
     };
     #[cfg(unix)]
     use super::{DaemonRunConfig, daemon_run_with_repos, read_daemon_status, run_blocking};
@@ -658,17 +663,24 @@ mod tests {
     }
 
     #[test]
-    fn registered_repos_from_status_filters_to_strings() {
+    fn configured_repos_from_status_is_authoritative_and_filters_to_strings() {
         let status = serde_json::json!({
-            "registered_repos": ["owner/b", 10, null, "owner/a"]
+            "configured_repos": ["owner/b", 10, null, "owner/a"],
+            "registered_repos": ["owner/registered-only"]
         });
 
         assert_eq!(
-            registered_repos_from_status(Some(&status)),
+            configured_repos_from_status(Some(&status)),
             vec!["owner/b", "owner/a"]
         );
-        assert!(registered_repos_from_status(None).is_empty());
-        assert!(registered_repos_from_status(Some(&serde_json::json!({}))).is_empty());
+        assert_eq!(
+            configured_repos_from_status(Some(
+                &serde_json::json!({"registered_repos": ["owner/legacy"]}),
+            )),
+            vec!["owner/legacy"]
+        );
+        assert!(configured_repos_from_status(None).is_empty());
+        assert!(configured_repos_from_status(Some(&serde_json::json!({}))).is_empty());
     }
 
     #[test]
@@ -760,7 +772,10 @@ mod tests {
     #[test]
     fn refresh_reuses_prior_daemon_repos_when_none_are_explicit() {
         let temp = tempfile::tempdir().expect("tempdir");
-        seed_registered_repos(temp.path(), &["owner/a", "owner/z"]);
+        // Successful remote registration is deliberately divergent: refresh
+        // authority comes from the daemon's configured watch set, not from the
+        // subset whose webhook setup happened to succeed.
+        seed_registered_repos(temp.path(), &["owner/registered-only"]);
         let worker = spawn_test_daemon(
             temp.path(),
             vec![

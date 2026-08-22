@@ -320,7 +320,7 @@ impl StreamState {
     fn record_line(
         &mut self,
         line: &str,
-        log: &mut Option<std::fs::File>,
+        log: &mut Option<GuardedLog>,
         progress_callback: &mut Option<&mut dyn FnMut(ProgressEvent) -> ProgressAction>,
     ) -> io::Result<ProgressAction> {
         self.output_tail.push_back(line.to_owned());
@@ -332,8 +332,7 @@ impl StreamState {
         }
 
         if let Some(log) = log {
-            log.write_all(line.as_bytes())?;
-            log.flush()?;
+            log.write_line(line)?;
         }
 
         if let Some(phase) = parse_phase_marker(line.trim()) {
@@ -440,24 +439,39 @@ fn argv_command(argv: &[String]) -> Result<Command, StreamingError> {
     Ok(command)
 }
 
-fn open_log(request: &StreamingCommand<'_>) -> io::Result<Option<std::fs::File>> {
+struct GuardedLog {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl GuardedLog {
+    fn write_line(&mut self, line: &str) -> io::Result<()> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        self.file.write_all(line.as_bytes())?;
+        self.file.flush()
+    }
+}
+
+fn open_log(request: &StreamingCommand<'_>) -> io::Result<Option<GuardedLog>> {
     let Some(path) = &request.log_path else {
         return Ok(None);
     };
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::writer_domain_lease::ensure_protected_dir_all(parent)?;
     }
     if !request.append {
         crate::log_retention::rotate_before_open(path, request.rotated_segments)?;
     }
-    Ok(Some(
-        std::fs::OpenOptions::new()
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
+    Ok(Some(GuardedLog {
+        file: std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .append(request.append)
             .truncate(!request.append)
             .open(path)?,
-    ))
+        path: path.clone(),
+    }))
 }
 
 fn spawn_readers(

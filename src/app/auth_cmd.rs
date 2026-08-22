@@ -75,6 +75,8 @@ fn auth_export<W: Write>(
     let bundle = export_bundle(config);
     let text = format!("{bundle}\n");
     if let Some(path) = output {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -293,6 +295,8 @@ fn config_path_for_scope(
 }
 
 fn write_auth_table(path: &Path, auth: Table) -> Result<(), CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| CliFailure::new(1, error.to_string()))?;
     }

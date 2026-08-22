@@ -85,6 +85,8 @@ impl<'a> ClaimedRecovery<'a> {
 }
 
 pub(super) fn worker_generation(scratch_dir: &Path) -> Result<String, CliFailure> {
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(scratch_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(scratch_dir).map_err(|error| {
         CliFailure::new(
             1,

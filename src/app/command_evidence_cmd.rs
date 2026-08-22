@@ -344,6 +344,8 @@ fn collect_artifacts(
     if patterns.is_empty() {
         return Ok(Vec::new());
     }
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(artifact_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(artifact_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
     match backend {
         ArtifactBackend::Local { cwd } => {

@@ -88,6 +88,7 @@ pub fn rewrite_pinned_version(
     let Some(new_text) = rewrite_pinned_text(&text, new_version) else {
         return Err(format!("Failed to rewrite version in {}", pin_file.display()).into());
     };
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(pin_file)?;
     fs::write(pin_file, new_text)?;
     Ok(())
 }

@@ -94,6 +94,7 @@ impl MetricsStore {
     /// Open a metrics store under the selected Shipyard state directory.
     pub fn open(state_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = state_dir.join("metrics");
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&dir)?;
         fs::create_dir_all(&dir)?;
         let store = Self {
             path: dir.join("metrics.db"),
@@ -183,6 +184,7 @@ impl MetricsStore {
 
     /// Record one low-friction timing row.
     pub fn record(&self, input: &MetricRecordInput) -> Result<i64, Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let conn = self.connect()?;
         if let Some(provider) = input.provider.as_deref()
             && let Some(existing) = existing_job_id(&conn, provider, input.external_id.as_deref())?
@@ -261,6 +263,7 @@ impl MetricsStore {
     /// Import tartci runtime export records from JSONL or JSON array text.
     pub fn import_tartci(&self, text: &str) -> Result<usize, Box<dyn std::error::Error>> {
         let values = parse_json_records(text)?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let mut imported = 0;
         for value in values {
             if self.import_tartci_value(&value)? {

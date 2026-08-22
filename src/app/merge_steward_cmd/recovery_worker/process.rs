@@ -22,6 +22,19 @@ pub(super) fn run_worker_process(
             ),
         )
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(scratch_dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            CliFailure::new(
+                1,
+                format!(
+                    "failed to protect recovery-worker scratch directory {}: {error}",
+                    scratch_dir.display()
+                ),
+            )
+        })?;
+    }
     // The lease file is both the bounded JSON input and an inherited capacity
     // handle. Its Unix lock or Windows deny-sharing open survives in the model
     // process if Shipyard crashes while that process is still alive.
