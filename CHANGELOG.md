@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01080"></a>
+## [0.108.0] - 2026-08-22
+
+- security: constrain trusted environment to path inputs ([#456](https://github.com/danielraffel/Shipyard/pull/456))
+
 <a id="v01070"></a>
 ## [0.107.0] - 2026-08-22
 
@@ -984,6 +989,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.108.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.108.0
 [0.107.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.107.0
 [0.106.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.106.0
 [0.105.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.105.0
