@@ -123,7 +123,9 @@ Semantic blockers receive one deduplicated `shipyard:needs-agent` label and
 failed `shipyard/steward-recovery` status, which are cleared after recovery.
 The current PR's case-insensitive `5·unresolved` label blocks every steward
 mutation and reports `provenance_blocked`; repeat
-`--provenance-blocking-label` to configure another explicit vocabulary.
+`--provenance-blocking-label` to configure another explicit vocabulary. The
+blocker takes precedence over opt-out, including final force-cancel
+revalidation after an accepted cancellation or controller restart.
 
 `runner steward` is read-only unless `--apply` is present. Same-head duplicate
 runs are never cancelled; cancellation authority requires an immutable PR or

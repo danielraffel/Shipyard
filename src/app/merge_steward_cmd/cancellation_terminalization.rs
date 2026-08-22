@@ -4,7 +4,7 @@ use super::{
     DurableMutationIntent, GitHubActions, Instant, MergeQueueMutationGuard, MutationControl,
     NonTerminalRun, Path, PendingCancellation, PendingMutationKind, PendingRunState, ShipState,
     StewardJob, StewardLedger, StewardRun, Value, fetch_run_jobs_before, gh_json, gh_json_timeout,
-    parse_job, parse_run, record_audit, save_ledger, thread,
+    parse_job, parse_run, record_audit, revalidate_pending_pr_authority, save_ledger, thread,
 };
 
 pub(super) fn read_pending_run(
@@ -411,6 +411,7 @@ pub(super) fn revalidate_force_cancel_attempt(
         .values()
         .find(|pending| pending.repo == context.observation.repo && pending.run_id == run_id)
         .ok_or_else(|| "pending cancellation record disappeared before force-cancel".to_owned())?;
+    revalidate_pending_pr_authority(context.actions, pending)?;
     read_current_pending_run_identity(context.actions, pending)
 }
 

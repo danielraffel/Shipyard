@@ -54,7 +54,11 @@ forbids queue, rerun, cancellation, preemption, recovery-signal, and
 management-label mutations. Live revalidation reads the current labels before
 acting. Repeat `--provenance-blocking-label <label>` to select an explicit
 repository vocabulary; removing a blocker grants authority only after a fresh
-current-head observation.
+current-head observation. Provenance blocking takes precedence even when the
+opt-out label is also present. If a normal cancellation was already accepted,
+the final force-cancel boundary re-reads blocker, opt-out, management label,
+exact-head handoff status, PR number, and base; a late authority loss leaves the
+pending record and a durable rejected-revalidation audit without another POST.
 
 Semantic blockers (`required_failed` or a conflicting/dirty `needs_update`)
 produce a failed `shipyard/steward-recovery` status and the

@@ -991,7 +991,7 @@ use cancellation_revalidation::{
     merge_group_pr_number, opted_out_pull_requests, pull_request_is_managed,
     pull_request_provenance_blocked, pull_request_with_required_checks,
     pull_request_with_required_checks_before, revalidate_capacity_preemption,
-    revalidate_coalescing_cancellation,
+    revalidate_coalescing_cancellation, revalidate_pending_pr_authority,
 };
 use cancellation_terminalization::{
     acquire_pending_cancellation_guard, active_runner_targets, clear_pending_cancellation,

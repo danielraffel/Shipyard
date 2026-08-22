@@ -126,6 +126,21 @@ fn provenance_blocker_is_case_insensitive_and_precedes_queue_authority() {
 }
 
 #[test]
+fn provenance_blocker_precedes_opt_out_with_exact_json() {
+    let mut pr = green_pr();
+    pr.labels
+        .extend(["STEWARD:SKIP".to_owned(), "5·Unresolved".to_owned()]);
+    let decision = classify_pr(&pr, &queue_policy(), &BTreeMap::new());
+    assert_eq!(
+        serde_json::to_value(decision).expect("serialize"),
+        serde_json::json!({
+            "action": "provenance_blocked",
+            "labels": ["5·unresolved"]
+        })
+    );
+}
+
+#[test]
 fn only_a_current_observation_without_the_blocker_regains_authority() {
     let policy = queue_policy();
     let mut pr = green_pr();

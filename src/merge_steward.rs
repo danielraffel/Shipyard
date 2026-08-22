@@ -286,11 +286,11 @@ pub fn classify_pr(
     policy: &StewardPolicy,
     transient_attempts: &BTreeMap<u64, u32>,
 ) -> StewardDecision {
-    if has_pr_label(pr, &policy.opt_out_label) {
-        return StewardDecision::OptedOut;
-    }
     if let Some(decision) = classify_provenance(pr, policy) {
         return decision;
+    }
+    if has_pr_label(pr, &policy.opt_out_label) {
+        return StewardDecision::OptedOut;
     }
     if let Some(decision) = classify_management(pr, policy) {
         return decision;

@@ -542,6 +542,120 @@ fn recovered_force_cancel_revalidation_failure_is_durably_rejected_before_post()
 }
 
 #[cfg(unix)]
+#[test]
+fn blocker_added_after_normal_cancel_acceptance_prevents_force_cancel() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("calls");
+    let actions = provenance_blocked_force_cancel(&temp, &calls);
+    let control = mutation_control(&temp, "studio", "studio");
+    let pending = pending_cancellation_record();
+    let key = pending_cancellation_key(&pending);
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger {
+        pending_cancellations: BTreeMap::from([(key, pending.clone())]),
+        ..StewardLedger::default()
+    };
+    save_ledger(&ledger_path, &ledger).expect("seed ledger");
+    let observation = observation_for(ready_pr(), true);
+    let cancellation = RunCancellation {
+        run_id: pending.run_id,
+        reason: RunCancellationReason::AdvisoryPreambleCapacityTheft,
+    };
+    let context = CapacityApplyContext {
+        actions: &actions,
+        observation: &observation,
+        cancellation: &cancellation,
+        ledger_path: &ledger_path,
+        mutation_control: &control,
+        managed_label: MANAGED_LABEL,
+        handoff_context: HANDOFF_CONTEXT,
+        provenance_blocking_labels: &pending.provenance_blocking_labels,
+    };
+    let active = NonTerminalRun {
+        status: "in_progress".to_owned(),
+        jobs: Vec::new(),
+    };
+
+    let (mutation, error) =
+        force_cancel_nonterminal_run(&context, pending.run_id, &active, &mut ledger);
+
+    assert_eq!(mutation.as_deref(), Some("cancel_not_terminal"));
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|message| message.contains("provenance-blocking label")),
+        "{error:?}"
+    );
+    assert_force_cancel_revalidation_rejected(
+        &calls,
+        &control,
+        &ledger_path,
+        &ledger,
+        "force_cancel_revalidation_failed",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn blocker_added_before_restart_prevents_recovered_force_cancel() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("calls");
+    let actions = provenance_blocked_force_cancel(&temp, &calls);
+    let control = mutation_control(&temp, "studio", "studio");
+    let pending = pending_cancellation_record();
+    let key = pending_cancellation_key(&pending);
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger {
+        pending_cancellations: BTreeMap::from([(key.clone(), pending.clone())]),
+        ..StewardLedger::default()
+    };
+    save_ledger(&ledger_path, &ledger).expect("seed ledger");
+    let active = NonTerminalRun {
+        status: "in_progress".to_owned(),
+        jobs: Vec::new(),
+    };
+
+    let error = resume_force_cancel_after_normal_wait(
+        &actions,
+        &ledger_path,
+        &mut ledger,
+        &control,
+        &key,
+        &pending,
+        &active,
+    )
+    .expect_err("late provenance blocker must reject recovered force-cancel");
+
+    assert!(error.contains("provenance-blocking label"), "{error}");
+    assert_force_cancel_revalidation_rejected(
+        &calls,
+        &control,
+        &ledger_path,
+        &ledger,
+        "pending_force_cancel_revalidation_failed",
+    );
+}
+
+#[cfg(unix)]
+fn provenance_blocked_force_cancel(temp: &tempfile::TempDir, calls: &Path) -> GitHubActions {
+    fake_gh(
+        temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  "pr view 42 "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"feature-current","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"shipyard:managed"}},{{"name":"5·UnReSoLvEd"}}],"statusCheckRollup":[{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-22T00:00:00Z"}}]}}' ;;
+  *"/force-cancel") echo "force-cancel POST must not run" >&2; exit 90 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
 fn mismatched_force_cancel_identity(temp: &tempfile::TempDir, calls: &Path) -> GitHubActions {
     fake_gh(
         temp,
@@ -549,6 +663,8 @@ fn mismatched_force_cancel_identity(temp: &tempfile::TempDir, calls: &Path) -> G
             r#"
 printf '%s\n' "$*" >> '{}'
 case "$*" in
+  "pr view 42 "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"feature-current","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"shipyard:managed"}}],"statusCheckRollup":[{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-22T00:00:00Z"}}]}}' ;;
   "api repos/owner/repo/actions/runs/100")
     printf '%s' '{{"id":100,"workflow_id":77,"run_attempt":2,"name":"Required","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head_branch":"feature","status":"in_progress","event":"pull_request","created_at":"2026-07-26T00:00:00Z","pull_requests":[{{"number":42}}]}}' ;;
   *"/force-cancel") echo "force-cancel POST must not run" >&2; exit 90 ;;
@@ -797,6 +913,8 @@ fn pending_capacity_cancellation_resumes_after_cancel_accepted_restart() {
             r#"
 printf '%s\n' "$*" >> '{}'
 case "$*" in
+  "pr view 42 "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"feature-current","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"shipyard:managed"}}],"statusCheckRollup":[{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-22T00:00:00Z"}}]}}' ;;
   *"/force-cancel") exit 0 ;;
   *"/jobs?"*) printf '%s' '{{"jobs":[]}}' ;;
   *"actions/runs/100/attempts/1"|*"actions/runs/100")
@@ -894,6 +1012,8 @@ fn pending_cancellation_survives_transient_read_failure_then_recovers() {
         &format!(
             r#"
 case "$*" in
+  "pr view 42 "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"feature-current","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"shipyard:managed"}}],"statusCheckRollup":[{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-22T00:00:00Z"}}]}}' ;;
   *"/force-cancel") exit 0 ;;
   *"/jobs?"*) printf '%s' '{{"jobs":[]}}' ;;
   *"actions/runs/100/attempts/1"|*"actions/runs/100")
@@ -1077,6 +1197,76 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
     assert!(reports[0].mutation.is_none());
     assert!(reports[0].error.is_none());
     assert!(!temp.path().join("state/ship").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn provenance_blocker_with_opt_out_and_steward_state_makes_no_github_write() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, r#"echo "unexpected GitHub call: $*" >&2; exit 90"#);
+    let mut pr = ready_pr();
+    pr.fact.labels.extend([
+        "shipyard:no-auto-merge".to_owned(),
+        "5·UNRESOLVED".to_owned(),
+        MANAGED_LABEL.to_owned(),
+        UNMANAGED_LABEL.to_owned(),
+        NEEDS_AGENT_LABEL.to_owned(),
+    ]);
+    pr.fact.checks.extend([
+        StewardCheck {
+            name: HANDOFF_CONTEXT.to_owned(),
+            source: StewardCheckSource::StatusContext,
+            app_id: None,
+            status: "COMPLETED".to_owned(),
+            conclusion: Some("SUCCESS".to_owned()),
+            run_id: None,
+            observed_at: Some("2026-08-22T00:00:00Z".to_owned()),
+        },
+        StewardCheck {
+            name: RECOVERY_CONTEXT.to_owned(),
+            source: StewardCheckSource::StatusContext,
+            app_id: None,
+            status: "COMPLETED".to_owned(),
+            conclusion: Some("FAILURE".to_owned()),
+            run_id: None,
+            observed_at: Some("2026-08-22T00:00:01Z".to_owned()),
+        },
+    ]);
+    let observation = observation_for(pr, true);
+    let args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "shipyard:no-auto-merge".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        coalesce: true,
+        preempt_capacity: true,
+        max_preemptions_per_head: 1,
+        apply: true,
+        ledger: None,
+    };
+    let control = mutation_control(&temp, "studio", "studio");
+    let mut policy = queue_policy();
+    policy.opt_out_label = "shipyard:no-auto-merge".to_owned();
+    let (reports, failed) = apply_pr_plans(
+        &actions,
+        &args,
+        &observation,
+        &policy,
+        &temp.path().join("ledger.json"),
+        &mut StewardLedger::default(),
+        Some(&control),
+    );
+
+    assert!(!failed);
+    assert_eq!(
+        serde_json::to_value(&reports[0].decision).expect("serialize"),
+        serde_json::json!({"action":"provenance_blocked","labels":["5·unresolved"]})
+    );
+    assert!(reports[0].mutation.is_none());
+    assert!(reports[0].error.is_none());
 }
 
 #[cfg(unix)]
