@@ -1292,11 +1292,34 @@ fn publish_staging_no_replace(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
 fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), Error> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE)
         .map_err(|error| Error::Io(error.into()))
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))
+))]
+fn rename_no_replace(_source: &Path, _destination: &Path) -> Result<(), Error> {
+    // POSIX rename may overwrite the destination. Targets without a native
+    // atomic no-replace primitive must fail closed instead of weakening the
+    // immutable publication contract with an existence-check race.
+    Err(Error::Invalid(
+        "atomic no-replace artifact publication is unsupported on this platform".into(),
+    ))
 }
 
 #[cfg(windows)]
