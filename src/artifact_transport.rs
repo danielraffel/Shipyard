@@ -28,6 +28,10 @@ const MAX_LAYOUT_PATH_BYTES: usize = 1024;
 const MAX_LAYOUT_PATH_DEPTH: usize = 64;
 const MAX_LAYOUT_COMPONENT_BYTES: usize = 255;
 const MAX_LAYOUT_PREFIXES: usize = 250_000;
+// GNU tar's default blocking factor is twenty 512-byte records. Supporting
+// that canonical padding preserves common-producer interoperability without
+// allowing an authenticated tiny archive to expand into unbounded zero data.
+const MAX_TAR_ZERO_PADDING_BYTES: usize = 20 * 512;
 const ENTRY_ALLOCATION_RESERVE_BYTES: u64 = 64 * 1024;
 const MAX_ZSTD_WINDOW_LOG: u32 = 25;
 
@@ -1578,7 +1582,9 @@ fn reject_trailing_archive_data(mut decoder: impl Read) -> Result<(), Error> {
             break;
         }
         trailing_bytes = trailing_bytes.saturating_add(read);
-        if trailing_bytes > 1024 || trailing[..read].iter().any(|byte| *byte != 0) {
+        if trailing_bytes > MAX_TAR_ZERO_PADDING_BYTES
+            || trailing[..read].iter().any(|byte| *byte != 0)
+        {
             return Err(Error::Invalid(
                 "archive contains data after the terminal tar record".into(),
             ));
@@ -2735,6 +2741,22 @@ mod tests {
         let trailing_path = temp.path().join("trailing.tar.zst");
         fs::write(&trailing_path, trailing).unwrap();
         assert!(verify_archive_layout(&trailing_path, &trailing_manifest).is_err());
+    }
+
+    #[test]
+    fn archive_trailing_padding_accepts_standard_tar_records_but_stays_bounded() {
+        reject_trailing_archive_data(std::io::Cursor::new(vec![0_u8; MAX_TAR_ZERO_PADDING_BYTES]))
+            .unwrap();
+        assert!(
+            reject_trailing_archive_data(std::io::Cursor::new(vec![
+                0_u8;
+                MAX_TAR_ZERO_PADDING_BYTES + 1
+            ]))
+            .is_err()
+        );
+        let mut nonzero = vec![0_u8; 512];
+        nonzero[511] = 1;
+        assert!(reject_trailing_archive_data(std::io::Cursor::new(nonzero)).is_err());
     }
 
     #[test]

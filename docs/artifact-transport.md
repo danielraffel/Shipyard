@@ -73,6 +73,9 @@ type/mode/size/digest mismatches. Portable identity is ASCII case-folded at
 every component prefix, and Windows device aliases and trailing-period names
 are rejected, so authenticated paths cannot collapse together on default APFS
 or Windows filesystems. The entry count and zstd decoder window are bounded.
+Terminal zero padding accepts the standard twenty-record tar block (10 KiB)
+and rejects non-zero or larger tails, so common tar producers interoperate
+without turning compressed padding into an unbounded decode path.
 Schema 2 requires explicit parent-directory records. Schema-1 manifests remain
 readable when they satisfy the current bounded portable-path policy, so ordinary
 in-flight immutable artifacts survive an upgrade; an oversized or newly unsafe
