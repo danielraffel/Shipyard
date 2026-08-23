@@ -1850,6 +1850,7 @@ fn open_directory_handles_bottom_up(root: &Path) -> Result<Vec<File>, Error> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn open_directory_handles_bottom_up(_root: &Path) -> Result<Vec<File>, Error> {
     Ok(Vec::new())
 }
