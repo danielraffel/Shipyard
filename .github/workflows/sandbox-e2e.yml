@@ -83,7 +83,10 @@ jobs:
         if: ${{ !(matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-')) }}
         env:
           SHIPYARD_BINARY_FOR_TEST: ${{ github.workspace }}/target/release/shipyard
-        run: .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
+          TMPDIR: /tmp/sye2e-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p "$TMPDIR"
+          .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
 
       - name: Run exact isolated M3 candidate and focused Sandbox
         if: ${{ matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
@@ -99,7 +102,8 @@ jobs:
           canary_root="/tmp/shipyard-sandbox-m3-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           lease_dir="/tmp/shipyard-sandbox-m3-lease"
           umask 077
-          mkdir -p "$canary_root/global" "$canary_root/state"
+          export TMPDIR="/tmp/sye2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$canary_root/global" "$canary_root/state" "$TMPDIR"
           candidate="$canary_root/shipyard-candidate"
           cp "$SHIPYARD_BINARY_FOR_TEST" "$candidate"
           chmod 700 "$candidate"
@@ -289,13 +293,10 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: sandbox-e2e-${{ matrix.name }}-logs
-          # Sandbox tempdirs come from tempfile.mkdtemp(...), which honors
-          # TMPDIR/platform defaults. GitHub macOS runners use
-          # /private/var/folders/... rather than /tmp, so cover both.
+          # Each test step pins TMPDIR to one explicit root. Avoid recursive
+          # system-temp globs: macOS contains protected LaunchServices paths.
           path: |
             /tmp/shipyard-sandbox-m3-${{ github.run_id }}-${{ github.run_attempt }}/**
-            /tmp/shipyard-sandbox-e2e.*/**
-            /private/var/folders/**/shipyard-sandbox-e2e.*/**
-            /var/folders/**/shipyard-sandbox-e2e.*/**
+            /tmp/sye2e-${{ github.run_id }}-${{ github.run_attempt }}/**
           if-no-files-found: ignore
           retention-days: 7

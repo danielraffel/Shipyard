@@ -54,6 +54,14 @@ because it holds the obsolete process-lifetime lease. Pre-v0.108.1 binaries do
 not participate at all; drain them and prove exact-binary fleet convergence
 before trusting the audit.
 
+On macOS, advisory-lock contention can briefly appear before `lsof` reports its
+holder. The guardian may observe only that exact no-holder/contended state for a
+bounded stable-idle window while continuously fencing the production PID/start
+identity, binary hash, configuration, and active-worker set. Any reported holder,
+identity drift, new worker, persistent contention, or deadline remains a hard
+failure. Sandbox failure artifacts must stay inside the explicit canary or
+runner temp root; never glob protected system temp trees.
+
 Opaque recovery-model HOME/TMP scratch lives outside durable Shipyard state in
 an identity-keyed OS temporary directory, so a session-independent model child
 cannot contaminate the audit. Only its validated durable receipts are published

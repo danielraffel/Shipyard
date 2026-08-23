@@ -151,11 +151,14 @@ def _darwin_argv_environment(pid: int) -> tuple[str, tuple[str, ...], dict[str, 
     return executable, argv, environment
 
 
-def _lsof_field(pid: int, descriptor: str) -> str:
+def _lsof_field(
+    pid: int, descriptor: str, *, deadline: Optional[float] = None
+) -> str:
     result = _run(
         ["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", descriptor, "-Fn"],
         cwd="/",
         env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        timeout=_bounded_timeout(deadline),
     )
     values = [line[1:] for line in result.stdout.splitlines() if line.startswith("n")]
     if len(values) != 1:
@@ -163,9 +166,9 @@ def _lsof_field(pid: int, descriptor: str) -> str:
     return values[0]
 
 
-def snapshot_process(pid: int) -> ProcessSnapshot:
+def snapshot_process(pid: int, *, deadline: Optional[float] = None) -> ProcessSnapshot:
     executable, argv, environment = _darwin_argv_environment(pid)
-    start_time = _process_start(pid)
+    start_time = _process_start(pid, deadline=deadline)
     if start_time is None:
         raise GuardianError(f"process {pid} disappeared while being snapshotted")
     return ProcessSnapshot(
@@ -173,10 +176,10 @@ def snapshot_process(pid: int) -> ProcessSnapshot:
         executable=executable,
         argv=argv,
         environment=environment,
-        cwd=_lsof_field(pid, "cwd"),
-        stdin_path=_lsof_field(pid, "0"),
-        stdout_path=_lsof_field(pid, "1"),
-        stderr_path=_lsof_field(pid, "2"),
+        cwd=_lsof_field(pid, "cwd", deadline=deadline),
+        stdin_path=_lsof_field(pid, "0", deadline=deadline),
+        stdout_path=_lsof_field(pid, "1", deadline=deadline),
+        stderr_path=_lsof_field(pid, "2", deadline=deadline),
         start_time=start_time,
     )
 
@@ -189,31 +192,56 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _process_start(pid: int) -> Optional[str]:
+def _bounded_timeout(deadline: Optional[float], default: float = 15.0) -> float:
+    if deadline is None:
+        return default
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise GuardianError("bounded production verification deadline expired")
+    return min(default, remaining)
+
+
+def _process_start(pid: int, *, deadline: Optional[float] = None) -> Optional[str]:
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "lstart="],
         capture_output=True,
         text=True,
+        timeout=_bounded_timeout(deadline),
         check=False,
     )
     value = result.stdout.strip()
     return value or None
 
 
-def _lock_holders(path: Path) -> tuple[int, ...]:
+def _lock_holders(
+    path: Path, *, deadline: Optional[float] = None
+) -> tuple[int, ...]:
     result = subprocess.run(
         ["/usr/sbin/lsof", "-t", str(path)],
         capture_output=True,
         text=True,
+        timeout=_bounded_timeout(deadline),
         check=False,
     )
+    diagnostic = result.stderr.strip()
+    if result.returncode not in (0, 1) or diagnostic:
+        raise GuardianError(
+            f"could not inspect writer-domain holders for {path}: "
+            f"returncode={result.returncode}, stderr={diagnostic!r}"
+        )
     holders: list[int] = []
     for value in result.stdout.split():
         try:
             holders.append(int(value))
         except ValueError as error:
             raise GuardianError(f"invalid lsof pid for {path}: {value!r}") from error
-    return tuple(sorted(set(holders)))
+    observed = tuple(sorted(set(holders)))
+    if (result.returncode == 0) != bool(observed):
+        raise GuardianError(
+            f"inconsistent lsof holder result for {path}: "
+            f"returncode={result.returncode}, holders={observed!r}"
+        )
+    return observed
 
 
 def _exclusive_lock_is_contended(path: Path) -> bool:
@@ -233,6 +261,8 @@ def _wait_for_idle_writer_domain(
     timeout: float = 10.0,
     poll_interval: float = 0.1,
     stable_observations: int = 3,
+    require_no_holders: bool = False,
+    verify_production: Optional[Callable[[float], object]] = None,
 ) -> None:
     """Distinguish a transient production mutation from a lifetime lock.
 
@@ -245,9 +275,26 @@ def _wait_for_idle_writer_domain(
     deadline = time.monotonic() + timeout
     stable = 0
     last_holders: tuple[int, ...] = ()
+
+    def fail_if_expired() -> None:
+        if time.monotonic() >= deadline:
+            raise GuardianError(
+                "corrected daemon retained the writer-domain lock through the "
+                f"bounded idle wait: {last_holders!r}"
+            )
+
     while True:
-        holders = _lock_holders(path)
+        fail_if_expired()
+        if verify_production is not None:
+            verify_production(deadline)
+        fail_if_expired()
+        holders = _lock_holders(path, deadline=deadline)
         last_holders = holders
+        if require_no_holders and holders:
+            raise GuardianError(
+                "writer-domain holder appeared during the bounded idle wait: "
+                f"{holders!r}"
+            )
         foreign_holders = tuple(pid for pid in holders if pid != production_pid)
         if foreign_holders:
             raise GuardianError(
@@ -257,14 +304,11 @@ def _wait_for_idle_writer_domain(
         if not _exclusive_lock_is_contended(path):
             stable += 1
             if stable >= stable_observations:
+                fail_if_expired()
                 return
         else:
             stable = 0
-        if time.monotonic() >= deadline:
-            raise GuardianError(
-                "corrected daemon retained the writer-domain lock through the "
-                f"bounded idle wait: {last_holders!r}"
-            )
+        fail_if_expired()
         time.sleep(poll_interval)
 
 
@@ -299,11 +343,17 @@ def _mode_arg(argv: tuple[str, ...]) -> Optional[str]:
     return None
 
 
-def _json_command(snapshot: ProcessSnapshot, installed: Path, *args: str) -> dict[str, object]:
+def _json_command(
+    snapshot: ProcessSnapshot,
+    installed: Path,
+    *args: str,
+    deadline: Optional[float] = None,
+) -> dict[str, object]:
     result = _run(
         [str(installed), "--json", *args],
         cwd=snapshot.cwd,
         env=snapshot.environment,
+        timeout=_bounded_timeout(deadline),
     )
     value = json.loads(result.stdout)
     if not isinstance(value, dict):
@@ -311,16 +361,22 @@ def _json_command(snapshot: ProcessSnapshot, installed: Path, *args: str) -> dic
     return value
 
 
-def _active_runs(snapshot: ProcessSnapshot, installed: Path) -> tuple[str, ...]:
-    status = _json_command(snapshot, installed, "status")
+def _active_runs(
+    snapshot: ProcessSnapshot, installed: Path, *, deadline: Optional[float] = None
+) -> tuple[str, ...]:
+    status = _json_command(snapshot, installed, "status", deadline=deadline)
     runs = status.get("active_runs")
     if not isinstance(runs, list):
         raise GuardianError("worker status active_runs is not an array")
     return tuple(sorted(str(run["id"]) for run in runs if isinstance(run, dict) and "id" in run))
 
 
-def _configured_repos(snapshot: ProcessSnapshot, installed: Path) -> tuple[str, ...]:
-    status = _json_command(snapshot, installed, "daemon", "status")
+def _configured_repos(
+    snapshot: ProcessSnapshot, installed: Path, *, deadline: Optional[float] = None
+) -> tuple[str, ...]:
+    status = _json_command(
+        snapshot, installed, "daemon", "status", deadline=deadline
+    )
     configured = status.get("configured_repos")
     if isinstance(configured, list):
         return tuple(sorted(str(repo) for repo in configured))
@@ -445,11 +501,26 @@ class Guardian:
             )
         self.lock_path = self.production_pid_file.parent.parent / ".sandbox-writer-domain.lock"
         old_holders = _lock_holders(self.lock_path)
-        self.transition_path = _select_transition(
-            snapshot.pid,
-            old_holders,
-            _exclusive_lock_is_contended(self.lock_path),
-        )
+        old_contended = _exclusive_lock_is_contended(self.lock_path)
+        if not old_holders and old_contended:
+            # lsof can briefly lag an advisory-lock owner. Treat this one
+            # otherwise-unclassifiable state as a bounded observation window,
+            # while continuously fencing the exact production identity and
+            # requiring the writer domain to remain holder-free. Every other
+            # ambiguous state still fails immediately in _select_transition.
+            _wait_for_idle_writer_domain(
+                self.lock_path,
+                snapshot.pid,
+                require_no_holders=True,
+                verify_production=self.verify_unchanged_production,
+            )
+            self.transition_path = CORRECTED_TRANSITION
+        else:
+            self.transition_path = _select_transition(
+                snapshot.pid,
+                old_holders,
+                old_contended,
+            )
         self.old_lifetime_lock_owned = self.transition_path == LEGACY_TRANSITION
         if self.transition_path == CORRECTED_TRANSITION:
             return
@@ -598,6 +669,34 @@ class Guardian:
         ):
             raise GuardianError("production daemon process identity differs from snapshot")
 
+    def verify_unchanged_production(
+        self, deadline: Optional[float] = None
+    ) -> ProcessSnapshot:
+        """Fail closed if production changes during a lock observation window."""
+        snapshot = self.snapshot
+        if snapshot is None:
+            raise GuardianError("production snapshot is unavailable")
+        _bounded_timeout(deadline)
+        if _sha256(self.installed) != self.installed_hash:
+            raise GuardianError("installed production binary changed during idle wait")
+        _bounded_timeout(deadline)
+        current_pid = int(self.production_pid_file.read_text(encoding="utf-8").strip())
+        if current_pid != snapshot.pid:
+            raise GuardianError("production daemon pid changed during idle wait")
+        current = snapshot_process(current_pid, deadline=deadline)
+        self.assert_process_identity(current, require_same_pid=True)
+        if (
+            _configured_repos(current, self.installed, deadline=deadline)
+            != self.configured_repos
+        ):
+            raise GuardianError(
+                "production configured repository authority changed during idle wait"
+            )
+        if _active_runs(current, self.installed, deadline=deadline) != self.worker_ids:
+            raise GuardianError("production active workers changed during idle wait")
+        _bounded_timeout(deadline)
+        return current
+
     def prove_corrected_mutation_fence(self) -> None:
         snapshot = self.snapshot
         if snapshot is None:
@@ -739,23 +838,13 @@ class Guardian:
             raise GuardianError("preserved configured repository authority differs")
         if _active_runs(current, self.installed) != self.worker_ids:
             raise GuardianError("preserved active worker ownership differs")
-        _wait_for_idle_writer_domain(self.lock_path, snapshot.pid)
-        if _sha256(self.installed) != self.installed_hash:
-            raise GuardianError("installed production binary changed during idle wait")
-        final_pid = int(self.production_pid_file.read_text(encoding="utf-8").strip())
-        if final_pid != snapshot.pid:
-            raise GuardianError("corrected production pid changed during idle wait")
-        current = snapshot_process(final_pid)
-        self.assert_process_identity(current, require_same_pid=True)
-        if _configured_repos(current, self.installed) != self.configured_repos:
-            raise GuardianError(
-                "preserved configured repository authority changed during idle wait"
-            )
-        if _active_runs(current, self.installed) != self.worker_ids:
-            raise GuardianError(
-                "preserved active worker ownership changed during idle wait"
-            )
-        self.restored_pid = final_pid
+        _wait_for_idle_writer_domain(
+            self.lock_path,
+            snapshot.pid,
+            verify_production=self.verify_unchanged_production,
+        )
+        current = self.verify_unchanged_production()
+        self.restored_pid = current.pid
         self.final_production_start_time = current.start_time
         self.production_preserved = True
         self.production_identity_verified = True

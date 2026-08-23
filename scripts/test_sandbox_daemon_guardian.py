@@ -65,6 +65,27 @@ class GuardianLifecycleTests(unittest.TestCase):
                 fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
             self.assertFalse(guardian._exclusive_lock_is_contended(path))
 
+    def test_holder_probe_distinguishes_no_match_from_lsof_failure(self) -> None:
+        path = Path("/tmp/writer.lock")
+        no_match = mock.Mock(returncode=1, stdout="", stderr="")
+        with mock.patch.object(guardian.subprocess, "run", return_value=no_match):
+            self.assertEqual(guardian._lock_holders(path), ())
+
+        failed = mock.Mock(returncode=1, stdout="", stderr="permission denied")
+        with mock.patch.object(guardian.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(
+                guardian.GuardianError, "could not inspect writer-domain holders"
+            ):
+                guardian._lock_holders(path)
+
+    def test_holder_probe_rejects_inconsistent_lsof_success(self) -> None:
+        path = Path("/tmp/writer.lock")
+        inconsistent = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+            guardian.subprocess, "run", return_value=inconsistent
+        ), self.assertRaisesRegex(guardian.GuardianError, "inconsistent lsof"):
+            guardian._lock_holders(path)
+
     def test_finalize_wait_accepts_a_transient_production_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "writer.lock"
@@ -89,6 +110,98 @@ class GuardianLifecycleTests(unittest.TestCase):
             self.assertEqual(holders.call_count, 4)
             self.assertEqual(contention.call_count, 4)
 
+    def test_ambiguous_no_holder_wait_accepts_only_stable_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "writer.lock"
+            verified: list[str] = []
+            with contextlib.ExitStack() as stack:
+                holders = stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_lock_holders", side_effect=[(), (), (), ()]
+                    )
+                )
+                contention = stack.enter_context(
+                    mock.patch.object(
+                        guardian,
+                        "_exclusive_lock_is_contended",
+                        side_effect=[True, False, False, False],
+                    )
+                )
+                stack.enter_context(mock.patch.object(guardian.time, "sleep"))
+                guardian._wait_for_idle_writer_domain(
+                    path,
+                    4242,
+                    require_no_holders=True,
+                    verify_production=lambda _deadline: verified.append("verified"),
+                )
+
+            self.assertEqual(holders.call_count, 4)
+            self.assertEqual(contention.call_count, 4)
+            self.assertEqual(len(verified), 4)
+
+    def test_ambiguous_no_holder_wait_rejects_persistent_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "writer.lock"
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(guardian, "_lock_holders", return_value=())
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_exclusive_lock_is_contended", return_value=True
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian.time,
+                        "monotonic",
+                        side_effect=[0.0, 0.0, 0.0, 11.0],
+                    )
+                )
+                stack.enter_context(mock.patch.object(guardian.time, "sleep"))
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "retained the writer-domain lock"
+                ):
+                    guardian._wait_for_idle_writer_domain(
+                        path, 4242, require_no_holders=True
+                    )
+
+    def test_ambiguous_no_holder_wait_rejects_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "writer.lock"
+            verify = mock.Mock(
+                side_effect=[None, guardian.GuardianError("production identity drift")]
+            )
+            with mock.patch.object(
+                guardian, "_lock_holders", return_value=()
+            ), mock.patch.object(
+                guardian, "_exclusive_lock_is_contended", return_value=False
+            ), mock.patch.object(guardian.time, "sleep"):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "production identity drift"
+                ):
+                    guardian._wait_for_idle_writer_domain(
+                        path,
+                        4242,
+                        require_no_holders=True,
+                        verify_production=verify,
+                    )
+
+    def test_ambiguous_no_holder_wait_rejects_appearing_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "writer.lock"
+            with mock.patch.object(
+                guardian, "_lock_holders", side_effect=[(), (4242,)]
+            ), mock.patch.object(
+                guardian, "_exclusive_lock_is_contended", return_value=False
+            ), mock.patch.object(guardian.time, "sleep"):
+                with self.assertRaisesRegex(
+                    guardian.GuardianError, "writer-domain holder appeared"
+                ):
+                    guardian._wait_for_idle_writer_domain(
+                        path, 4242, require_no_holders=True
+                    )
+
     def test_finalize_wait_rejects_a_retained_lifetime_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "writer.lock"
@@ -105,7 +218,9 @@ class GuardianLifecycleTests(unittest.TestCase):
                 )
                 stack.enter_context(
                     mock.patch.object(
-                        guardian.time, "monotonic", side_effect=[0.0, 11.0]
+                        guardian.time,
+                        "monotonic",
+                        side_effect=[0.0, 0.0, 0.0, 11.0],
                     )
                 )
                 stack.enter_context(mock.patch.object(guardian.time, "sleep"))
@@ -190,6 +305,71 @@ class GuardianLifecycleTests(unittest.TestCase):
             self.assertEqual(active.transition_path, guardian.CORRECTED_TRANSITION)
             self.assertFalse(active.production_quiesced)
             self.assertFalse(active.old_lifetime_lock_owned)
+            run.assert_not_called()
+
+    def test_preflight_routes_only_no_holder_contention_through_bounded_wait(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = self.make_guardian(root)
+            active.installed.write_bytes(b"installed")
+            active.candidate.write_bytes(b"candidate")
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(active.installed),
+                argv=(
+                    str(active.installed),
+                    "--mode",
+                    "shipyard",
+                    "daemon",
+                    "run",
+                    "--repo",
+                    "owner/repo",
+                ),
+                environment={"HOME": str(root)},
+                cwd=str(root),
+                stdin_path="/dev/null",
+                stdout_path="/dev/null",
+                stderr_path="/dev/null",
+                start_time="Sat Aug 22 00:00:00 2026",
+            )
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "snapshot_process", return_value=snapshot
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_configured_repos", return_value=("owner/repo",)
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(guardian, "_active_runs", return_value=())
+                )
+                stack.enter_context(
+                    mock.patch.object(guardian, "_lock_holders", return_value=())
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        guardian, "_exclusive_lock_is_contended", return_value=True
+                    )
+                )
+                wait = stack.enter_context(
+                    mock.patch.object(guardian, "_wait_for_idle_writer_domain")
+                )
+                run = stack.enter_context(mock.patch.object(guardian, "_run"))
+                active.preflight_and_transition()
+
+            self.assertEqual(active.transition_path, guardian.CORRECTED_TRANSITION)
+            wait.assert_called_once_with(
+                active.lock_path,
+                snapshot.pid,
+                require_no_holders=True,
+                verify_production=active.verify_unchanged_production,
+            )
             run.assert_not_called()
 
     def test_pre_cutover_lifetime_lock_selects_quiesce_restore_path(self) -> None:

@@ -269,6 +269,22 @@ class CiMatrixTests(unittest.TestCase):
         self.assertIn(".production_identity_verified == true", workflow)
         self.assertIn(".lease_removed == true", workflow)
 
+    def test_sandbox_failure_artifacts_stay_in_explicit_temp_roots(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "/tmp/sye2e-${{ github.run_id }}-${{ github.run_attempt }}/**",
+            workflow,
+        )
+        self.assertIn(
+            'export TMPDIR="/tmp/sye2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+            workflow,
+        )
+        self.assertNotIn("/private/var/folders/**", workflow)
+        self.assertNotIn("/var/folders/**", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
