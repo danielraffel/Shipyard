@@ -285,7 +285,23 @@ jobs:
           deadline=$((SECONDS + 10))
           while [ "$(ps -p "$production_pid" -o ppid= | tr -d '[:space:]')" != "1" ] && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
           test "$(ps -p "$production_pid" -o ppid= | tr -d '[:space:]')" = "1"
-          "$installed" --json daemon status | jq -e '.running == true'
+          expected_repos="$(jq -c '.configured_repos | sort' "$canary_root/guardian-receipt.json")"
+          status_file="$canary_root/production-status.json"
+          deadline=$((SECONDS + 15))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            current_pid="$(tr -d '[:space:]' < "$HOME/Library/Application Support/shipyard/daemon/daemon.pid")"
+            test "$current_pid" = "$production_pid"
+            ps -p "$production_pid" -o command= | grep -F -- "$installed" >/dev/null
+            if "$installed" --mode shipyard --json daemon status > "$status_file.tmp" && \
+              jq -e --argjson expected "$expected_repos" \
+                '.running == true and ((.configured_repos // []) | sort) == $expected' \
+                "$status_file.tmp" >/dev/null; then
+              mv "$status_file.tmp" "$status_file"
+              break
+            fi
+            sleep 1
+          done
+          test -s "$status_file"
           launchctl bootout "gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" 2>/dev/null || true
 
       - name: Upload sandbox tempdir on failure

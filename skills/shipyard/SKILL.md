@@ -62,6 +62,12 @@ identity drift, new worker, persistent contention, or deadline remains a hard
 failure. Sandbox failure artifacts must stay inside the explicit canary or
 runner temp root; never glob protected system temp trees.
 
+After cleanup, treat a single daemon IPC status miss as an observation rather
+than proof of death: use a bounded status window that continuously rechecks the
+exact production PID and requires the configured repository set from the
+guardian receipt before accepting liveness. A PID change, process loss,
+repository drift, or deadline still fails closed.
+
 Opaque recovery-model HOME/TMP scratch lives outside durable Shipyard state in
 an identity-keyed OS temporary directory, so a session-independent model child
 cannot contaminate the audit. Only its validated durable receipts are published
