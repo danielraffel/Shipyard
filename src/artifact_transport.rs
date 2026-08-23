@@ -2534,8 +2534,13 @@ mod tests {
         let archive = temp.path().join("space.tar.zst");
         fs::write(&archive, &bytes).unwrap();
         let destination = temp.path().join("space-failed");
+        let allocation_budget = manifest.unpacked_allocation_budget_bytes().unwrap();
         let unavailable = SpacePolicy {
-            minimum_free_bytes: available_space(temp.path()).unwrap(),
+            // Make the required total exactly u64::MAX.  A live free-space
+            // reading can increase between this test's setup and extraction
+            // (notably on Windows CI), so deriving the watermark from an
+            // earlier reading makes this negative control nondeterministic.
+            minimum_free_bytes: u64::MAX - allocation_budget,
         };
         assert!(matches!(
             extract_verified_archive(
