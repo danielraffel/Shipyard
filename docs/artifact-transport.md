@@ -78,7 +78,8 @@ readable when they satisfy the current bounded portable-path policy, so ordinary
 in-flight immutable artifacts survive an upgrade; an oversized or newly unsafe
 legacy layout fails closed and must be republished rather than weakening the
 receiver for backward compatibility.
-`extract_verified_archive` then repeats validation into a private
+`extract_verified_archive` first requires the current exact manifest/source/
+producer authority fence, then repeats validation into a private
 sibling staging directory, rechecks the encoded object for mutation, holds an
 OS-backed parent extraction lease, and atomically renames the complete tree
 into a previously absent destination. Its caller supplies the free-space

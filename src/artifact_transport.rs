@@ -1178,9 +1178,14 @@ pub fn verify_archive_layout(path: &Path, manifest: &ArtifactManifest) -> Result
 pub fn extract_verified_archive(
     path: &Path,
     manifest: &ArtifactManifest,
+    authority: &ManifestAuthority,
     destination: &Path,
     space_policy: SpacePolicy,
 ) -> Result<PublicationOutcome, Error> {
+    // Archive hashes prove byte identity, not that the current scheduler still
+    // authorizes this source head and producer lease. Bind consumption to the
+    // same exact authority fence required for object publication.
+    manifest.validate_authority(authority)?;
     verify_archive_layout(path, manifest)?;
     if !destination.is_absolute() {
         return Err(Error::Invalid(
@@ -2115,8 +2120,14 @@ mod tests {
         verify_archive_layout(&archive, &manifest).unwrap();
         let destination = temp.path().join("legacy");
         assert_eq!(
-            extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
-                .unwrap(),
+            extract_verified_archive(
+                &archive,
+                &manifest,
+                &authority(&manifest),
+                &destination,
+                test_space_policy(),
+            )
+            .unwrap(),
             PublicationOutcome::Durable
         );
         assert_eq!(fs::read(destination.join("bin/tool")).unwrap(), tool);
@@ -2406,6 +2417,19 @@ mod tests {
         fs::write(&archive, &bytes).unwrap();
         verify_archive_layout(&archive, &manifest).unwrap();
         let destination = temp.path().join("unpacked");
+        let mut stale_authority = authority(&manifest);
+        stale_authority.attempt += 1;
+        assert!(matches!(
+            extract_verified_archive(
+                &archive,
+                &manifest,
+                &stale_authority,
+                &destination,
+                test_space_policy(),
+            ),
+            Err(Error::StaleFence(_))
+        ));
+        assert!(!destination.exists());
         let competing_lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -2415,20 +2439,38 @@ mod tests {
             .unwrap();
         FileExt::try_lock_exclusive(&competing_lock).unwrap();
         assert!(
-            extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
-                .is_err()
+            extract_verified_archive(
+                &archive,
+                &manifest,
+                &authority(&manifest),
+                &destination,
+                test_space_policy(),
+            )
+            .is_err()
         );
         assert!(!destination.exists());
         FileExt::unlock(&competing_lock).unwrap();
         assert_eq!(
-            extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
-                .unwrap(),
+            extract_verified_archive(
+                &archive,
+                &manifest,
+                &authority(&manifest),
+                &destination,
+                test_space_policy(),
+            )
+            .unwrap(),
             PublicationOutcome::Durable
         );
         assert_eq!(fs::read(destination.join("bin/tool")).unwrap(), tool);
         assert!(
-            extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
-                .is_err()
+            extract_verified_archive(
+                &archive,
+                &manifest,
+                &authority(&manifest),
+                &destination,
+                test_space_policy(),
+            )
+            .is_err()
         );
     }
 
@@ -2466,7 +2508,13 @@ mod tests {
             minimum_free_bytes: available_space(temp.path()).unwrap(),
         };
         assert!(matches!(
-            extract_verified_archive(&archive, &manifest, &destination, unavailable),
+            extract_verified_archive(
+                &archive,
+                &manifest,
+                &authority(&manifest),
+                &destination,
+                unavailable,
+            ),
             Err(Error::InsufficientSpace { .. })
         ));
         assert!(!destination.exists());
@@ -2721,8 +2769,14 @@ mod tests {
                 .path()
                 .join(format!("failed-{}", manifest.layout_sha256));
             assert!(
-                extract_verified_archive(&archive, &manifest, &destination, test_space_policy())
-                    .is_err()
+                extract_verified_archive(
+                    &archive,
+                    &manifest,
+                    &authority(&manifest),
+                    &destination,
+                    test_space_policy(),
+                )
+                .is_err()
             );
             assert!(!destination.exists());
         }
