@@ -326,6 +326,15 @@ an M5, etc. Each additional client needs four things:
    chmod +x ~/.config/shipyard/bin/shipyard-github-app-token
    ```
 
+   The helper first verifies GitHub TLS with Python's configured trust store.
+   Only after an actual certificate-verification failure *and* proof that the
+   ambient interpreter has no explicit, loaded, or on-disk default CA store does
+   it augment that same context with a platform CA file such as
+   `/etc/ssl/cert.pem`. Directory-backed, pinned, and private enterprise roots
+   are never broadened; certificate verification is never disabled. If neither
+   source is usable, it fails closed and asks for `SSL_CERT_FILE` or a repaired
+   Python installation.
+
 3. **The same private key**, transferred securely (AirDrop/`scp` — it cannot be
    re-downloaded from GitHub). Store and lock it down exactly as above:
 
