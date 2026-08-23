@@ -73,8 +73,11 @@ type/mode/size/digest mismatches. Portable identity is ASCII case-folded at
 every component prefix, and Windows device aliases and trailing-period names
 are rejected, so authenticated paths cannot collapse together on default APFS
 or Windows filesystems. The entry count and zstd decoder window are bounded.
-Schema 2 requires explicit parent-directory records; schema-1 manifests remain
-readable so an upgrade cannot strand an in-flight immutable artifact.
+Schema 2 requires explicit parent-directory records. Schema-1 manifests remain
+readable when they satisfy the current bounded portable-path policy, so ordinary
+in-flight immutable artifacts survive an upgrade; an oversized or newly unsafe
+legacy layout fails closed and must be republished rather than weakening the
+receiver for backward compatibility.
 `extract_verified_archive` then repeats validation into a private
 sibling staging directory, rechecks the encoded object for mutation, holds an
 OS-backed parent extraction lease, and atomically renames the complete tree

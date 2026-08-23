@@ -26,6 +26,7 @@ const MAX_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_LAYOUT_ENTRIES: usize = 100_000;
 const MAX_LAYOUT_PATH_BYTES: usize = 1024;
 const MAX_LAYOUT_PATH_DEPTH: usize = 64;
+const MAX_LAYOUT_COMPONENT_BYTES: usize = 255;
 const MAX_LAYOUT_PREFIXES: usize = 250_000;
 const ENTRY_ALLOCATION_RESERVE_BYTES: u64 = 64 * 1024;
 const MAX_ZSTD_WINDOW_LOG: u32 = 25;
@@ -1264,7 +1265,16 @@ fn publish_staging_no_replace(
     destination: &Path,
     mut directory_modes: Vec<(PathBuf, u32)>,
 ) -> Result<(), Error> {
+    // Open every directory while the private tree is still traversable. Some
+    // declared final modes intentionally remove read/search permission, but an
+    // already-open handle can still durably flush the final metadata and child
+    // entries before the tree is made visible.
+    let directory_handles = open_directory_handles_bottom_up(staging.path())?;
     if let Err(error) = apply_directory_modes(&mut directory_modes) {
+        restore_directory_modes_for_cleanup(&mut directory_modes);
+        return Err(error);
+    }
+    if let Err(error) = sync_directory_handles(directory_handles) {
         restore_directory_modes_for_cleanup(&mut directory_modes);
         return Err(error);
     }
@@ -1497,8 +1507,10 @@ fn scan_layout_entry<R: Read>(
                     .write(true)
                     .open(&output)?;
                 let copied = copy_and_hash(entry, &mut output_file, &mut hasher)?;
-                output_file.sync_all()?;
                 set_portable_permissions(&output, *expected_mode)?;
+                // Persist both bytes and the final executable/permission mode
+                // before the containing directory can be published.
+                output_file.sync_all()?;
                 extraction.remaining_bytes = extraction
                     .remaining_bytes
                     .checked_sub(
@@ -1695,6 +1707,11 @@ fn validate_relative_path(value: &str) -> Result<(), Error> {
 }
 
 fn validate_portable_component(component: &str) -> Result<(), Error> {
+    if component.len() > MAX_LAYOUT_COMPONENT_BYTES {
+        return Err(Error::Invalid(
+            "layout path component exceeds the portable byte limit".into(),
+        ));
+    }
     if component.ends_with('.') {
         return Err(Error::Invalid(
             "layout path component has a Windows-normalized trailing period".into(),
@@ -1777,6 +1794,36 @@ fn sync_directory(path: &Path) -> Result<(), Error> {
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)] // Keep one fallible cross-platform durability contract.
 fn sync_directory(_path: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory_handles_bottom_up(root: &Path) -> Result<Vec<File>, Error> {
+    fn visit(path: &Path, handles: &mut Vec<File>) -> Result<(), Error> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                visit(&entry.path(), handles)?;
+            }
+        }
+        handles.push(File::open(path)?);
+        Ok(())
+    }
+
+    let mut handles = Vec::new();
+    visit(root, &mut handles)?;
+    Ok(handles)
+}
+
+#[cfg(not(unix))]
+fn open_directory_handles_bottom_up(_root: &Path) -> Result<Vec<File>, Error> {
+    Ok(Vec::new())
+}
+
+fn sync_directory_handles(handles: Vec<File>) -> Result<(), Error> {
+    for handle in handles {
+        handle.sync_all()?;
+    }
     Ok(())
 }
 
@@ -1994,6 +2041,7 @@ mod tests {
             "a//b".into(),
             "space bad".into(),
             "a/".repeat(MAX_LAYOUT_PATH_DEPTH),
+            "a".repeat(MAX_LAYOUT_COMPONENT_BYTES + 1),
             "a".repeat(MAX_LAYOUT_PATH_BYTES + 1),
         ];
         for hostile in hostile_paths {
