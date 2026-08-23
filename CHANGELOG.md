@@ -3,6 +3,13 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01110"></a>
+## [0.111.0] - 2026-08-23
+
+- feat: harden artifact resume and extraction ([#458](https://github.com/danielraffel/Shipyard/pull/458))
+- fix: recover App auth from empty Python CA stores ([#463](https://github.com/danielraffel/Shipyard/pull/463))
+- fix/guardian finalize transient lock 20260822 ([#462](https://github.com/danielraffel/Shipyard/pull/462))
+
 <a id="v01100"></a>
 ## [0.110.0] - 2026-08-22
 
@@ -1009,6 +1016,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.111.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.111.0
 [0.110.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.110.0
 [0.109.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.109.0
 [0.108.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.108.2
