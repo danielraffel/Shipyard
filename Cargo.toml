@@ -1,6 +1,6 @@
 [package]
 name = "shipyard"
-version = "0.110.0"
+version = "0.111.0"
 edition = "2024"
 description = "Cross-platform CI coordination for local, SSH, and cloud runners."
 rust-version = "1.92"
@@ -28,13 +28,17 @@ regex = "1.12.2"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 same-file = "1.0.6"
 tempfile = "3.23.0"
+tar = { version = "0.4.44", default-features = false }
 toml = "0.8.23"
 wait-timeout = "0.2.1"
+zstd = { version = "0.13.3", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["user"] }
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
+atomicwrites = "0.4.4"
 known-folders = "1.4.2"
 process-wrap = { version = "9.1.0", default-features = false, features = ["std", "job-object"] }
 winapi-util = "0.1.11"

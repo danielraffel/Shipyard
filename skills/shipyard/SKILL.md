@@ -54,6 +54,20 @@ because it holds the obsolete process-lifetime lease. Pre-v0.108.1 binaries do
 not participate at all; drain them and prove exact-binary fleet convergence
 before trusting the audit.
 
+On macOS, advisory-lock contention can briefly appear before `lsof` reports its
+holder. The guardian may observe only that exact no-holder/contended state for a
+bounded stable-idle window while continuously fencing the production PID/start
+identity, binary hash, configuration, and active-worker set. Any reported holder,
+identity drift, new worker, persistent contention, or deadline remains a hard
+failure. Sandbox failure artifacts must stay inside the explicit canary or
+runner temp root; never glob protected system temp trees.
+
+After cleanup, treat a single daemon IPC status miss as an observation rather
+than proof of death: use a bounded status window that continuously rechecks the
+exact production PID and requires the configured repository set from the
+guardian receipt before accepting liveness. A PID change, process loss,
+repository drift, or deadline still fails closed.
+
 Opaque recovery-model HOME/TMP scratch lives outside durable Shipyard state in
 an identity-keyed OS temporary directory, so a session-independent model child
 cannot contaminate the audit. Only its validated durable receipts are published
@@ -562,9 +576,18 @@ multi-worker admission are separate work and are not implied by this feature.
 
 The separate artifact transport proof is also default-off. It validates typed
 manifests, exact source/toolchain/cache generations, authenticated chunk-prefix
-resume, space watermarks, and same-root atomic publication, but it does not
-select a host or dispatch a shard. A roaming/offline worker is additive only and
-must be excluded or reassigned without blocking the minimum completion set.
+resume with opaque manifest/session-bound plans, space watermarks, same-root
+atomic publication, and safe exact-layout `tar.zst` extraction. Archive
+consumption rejects traversal, links, duplicates, undeclared/missing members,
+case-insensitive/Windows path aliases, unbounded decoder or layout metadata,
+and type/mode/size/digest drift before atomically exposing an extracted tree.
+Extraction reserves allocation overhead, rechecks live space around every
+directory/file allocation, and reports a distinct published-but-parent-sync-
+pending outcome after the atomic commit point; never blindly retry that outcome
+as though no destination exists.
+The proof does not select a host or dispatch a shard. A roaming/offline worker
+is additive only and must be excluded or reassigned without blocking the
+minimum completion set.
 Follow [`docs/artifact-transport.md`](../../docs/artifact-transport.md) before
 integrating it with a scheduler.
 

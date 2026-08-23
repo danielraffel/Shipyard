@@ -43,6 +43,14 @@ macOS `/usr/bin/rsync` (openrsync) does not provide `--append-verify`. Therefore
 plain `--partial` is not considered resumable proof, and blind `--append` is
 forbidden. Shipyard hashes each complete prefix chunk, truncates an incomplete
 or corrupt tail to the last verified boundary, and only then permits `--append`.
+The resume plan is opaque and bound to the exact manifest digest, transfer
+session, leased partial path, and observed length. Applying it re-reads the
+partial and refuses drift; receiver-pull command construction accepts only the
+applied plan and checks the prepared length again. Callers cannot construct an
+append boundary or reuse a plan from another transfer. A fresh lease with no
+partial produces an authenticated restart plan; applying that plan atomically
+creates the empty receiver file, so callers never need to manufacture
+undocumented staging state.
 After transfer, it rechecks every chunk, total size, final SHA-256, manifest
 authority, and producer fence.
 
@@ -54,10 +62,50 @@ post-verification publication failure retains the sealed bytes for diagnosis or
 retry. An existing immutable object is reused only after its size and digest
 match; it is never overwritten.
 
+Publication authenticates the encoded object, but encoded-object identity alone
+does not authorize unpacking. Before extraction, `verify_archive_layout`
+decodes the `tar.zst` without writing files and requires every archive member to
+match the manifest's complete sorted layout. Raw tar iteration rejects extension
+records before their payloads can be buffered, and also rejects traversal,
+absolute or non-portable paths, links and special files, duplicates, undeclared
+or missing members, hidden post-archive data, directory payloads, and
+type/mode/size/digest mismatches. Portable identity is ASCII case-folded at
+every component prefix, and Windows device aliases and trailing-period names
+are rejected, so authenticated paths cannot collapse together on default APFS
+or Windows filesystems. The entry count and zstd decoder window are bounded.
+Terminal zero padding accepts the standard twenty-record tar block (10 KiB)
+and rejects non-zero or larger tails, so common tar producers interoperate
+without turning compressed padding into an unbounded decode path.
+Schema 2 requires explicit parent-directory records. Schema-1 manifests remain
+readable when they satisfy the current bounded portable-path policy, so ordinary
+in-flight immutable artifacts survive an upgrade; an oversized or newly unsafe
+legacy layout fails closed and must be republished rather than weakening the
+receiver for backward compatibility.
+`extract_verified_archive` first requires the current exact manifest/source/
+producer authority fence, then repeats validation into a private
+sibling staging directory, rechecks the encoded object for mutation, holds an
+OS-backed parent extraction lease, and atomically renames the complete tree
+into a previously absent destination. Its caller supplies the free-space
+reserve policy; Shipyard checks the overflow-safe sum of declared file bytes
+plus conservative per-file and per-directory allocation reserves before
+staging, then rechecks live space before and after every allocation (including
+schema-1 implicit parents). Concurrent disk use therefore fails closed and
+discards private staging.
+Restrictive directory modes are deferred until every fallible verification has
+finished; atomic no-replace publication cannot overwrite a destination created
+by another process, and restores traversable staging permissions before cleanup
+if publication loses that race. Extraction returns an explicit durability
+outcome after the rename commit point: a parent-sync failure means the complete
+destination is already visible and must be reconciled, not blindly retried as
+an unpublished failure. A failed, partial, or competing layout never becomes a
+consumable destination.
+
 The host declares the store root. Do not assume `/Volumes/Workshop` or a home
 directory: a machine with a nearly-full external volume may correctly choose a
 root-volume staging directory, while other machines may be root-only. Apply a
-free-space watermark to the remaining transfer bytes before starting.
+free-space watermark to both the remaining encoded transfer bytes and the
+declared unpacked extraction bytes before starting, and preserve that watermark
+through extraction.
 
 ## Promotion boundary
 
