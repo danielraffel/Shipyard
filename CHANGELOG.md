@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01122"></a>
+## [0.112.2] - 2026-08-24
+
+- docs: scope check reconciliation to cloud runs ([#467](https://github.com/danielraffel/Shipyard/pull/467))
+
 <a id="v01121"></a>
 ## [0.112.1] - 2026-08-24
 
@@ -1027,6 +1032,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.112.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.112.2
 [0.112.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.112.1
 [0.112.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.112.0
 [0.111.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.111.0
