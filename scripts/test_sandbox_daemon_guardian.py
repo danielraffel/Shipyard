@@ -86,6 +86,98 @@ class GuardianLifecycleTests(unittest.TestCase):
         ), self.assertRaisesRegex(guardian.GuardianError, "inconsistent lsof"):
             guardian._lock_holders(path)
 
+    def test_json_status_probe_does_not_inherit_protected_stdio_marker(self) -> None:
+        snapshot = guardian.ProcessSnapshot(
+            pid=4242,
+            executable="/tmp/shipyard",
+            argv=("/tmp/shipyard", "daemon", "run"),
+            environment={
+                "HOME": "/tmp/home",
+                guardian.PROTECTED_STDIO_PATH_ENV: "/tmp/daemon.log",
+            },
+            cwd="/tmp",
+            stdin_path="/dev/null",
+            stdout_path="/tmp/daemon.log",
+            stderr_path="/tmp/daemon.log",
+            start_time="Sat Aug 22 00:00:00 2026",
+        )
+        completed = mock.Mock(returncode=0, stdout='{"running":true}', stderr="")
+
+        with mock.patch.object(guardian, "_run", return_value=completed) as run:
+            self.assertEqual(
+                guardian._json_command(snapshot, Path("/tmp/shipyard"), "daemon", "status"),
+                {"running": True},
+            )
+
+        self.assertNotIn(
+            guardian.PROTECTED_STDIO_PATH_ENV,
+            run.call_args.kwargs["env"],
+        )
+        self.assertEqual(run.call_args.kwargs["cwd"], "/")
+        self.assertEqual(
+            run.call_args.args[0][:4],
+            ["/tmp/shipyard", "--cwd", "/", "--json"],
+        )
+
+    def test_timed_out_status_captures_live_processes_before_terminating_child(self) -> None:
+        process = mock.Mock(pid=7331, returncode=None)
+        process.communicate.side_effect = [
+            guardian.subprocess.TimeoutExpired(["shipyard"], 15.0),
+            ("", "terminated"),
+        ]
+        evidence = Path("/tmp/status-timeout-7331")
+        events: list[str] = []
+        process.terminate.side_effect = lambda: events.append("terminate")
+
+        with mock.patch.object(
+            guardian.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            guardian,
+            "_capture_status_timeout",
+            side_effect=lambda *_args: events.append("capture") or evidence,
+        ):
+            with self.assertRaises(guardian.subprocess.TimeoutExpired) as raised:
+                guardian._run_status_probe(
+                    ["shipyard", "--json", "daemon", "status"],
+                    cwd="/tmp",
+                    env={"HOME": "/tmp/home"},
+                    timeout=15.0,
+                    diagnostic_root=Path("/tmp/canary"),
+                    production_pid=4242,
+                )
+
+        self.assertEqual(events, ["capture", "terminate"])
+        self.assertIn(str(evidence), raised.exception.stderr)
+        process.kill.assert_not_called()
+
+    def test_status_timeout_diagnostic_failure_does_not_skip_child_cleanup(self) -> None:
+        process = mock.Mock(pid=7331, returncode=None)
+        process.communicate.side_effect = [
+            guardian.subprocess.TimeoutExpired(["shipyard"], 15.0),
+            ("", "terminated"),
+        ]
+
+        with mock.patch.object(
+            guardian.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            guardian,
+            "_capture_status_timeout",
+            side_effect=OSError("sample unavailable"),
+        ):
+            with self.assertRaises(guardian.subprocess.TimeoutExpired) as raised:
+                guardian._run_status_probe(
+                    ["shipyard", "--json", "daemon", "status"],
+                    cwd="/tmp",
+                    env={"HOME": "/tmp/home"},
+                    timeout=15.0,
+                    diagnostic_root=Path("/tmp/canary"),
+                    production_pid=4242,
+                )
+
+        # A diagnostic helper defect must never leave the timed-out child alive.
+        process.terminate.assert_called_once_with()
+        self.assertIn("diagnostic capture failed", raised.exception.stderr)
+
     def test_finalize_wait_accepts_a_transient_production_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "writer.lock"
@@ -131,7 +223,6 @@ class GuardianLifecycleTests(unittest.TestCase):
                 guardian._wait_for_idle_writer_domain(
                     path,
                     4242,
-                    require_no_holders=True,
                     verify_production=lambda _deadline: verified.append("verified"),
                 )
 
@@ -163,7 +254,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                     guardian.GuardianError, "retained the writer-domain lock"
                 ):
                     guardian._wait_for_idle_writer_domain(
-                        path, 4242, require_no_holders=True
+                        path, 4242
                     )
 
     def test_ambiguous_no_holder_wait_rejects_identity_drift(self) -> None:
@@ -183,24 +274,22 @@ class GuardianLifecycleTests(unittest.TestCase):
                     guardian._wait_for_idle_writer_domain(
                         path,
                         4242,
-                        require_no_holders=True,
                         verify_production=verify,
                     )
 
-    def test_ambiguous_no_holder_wait_rejects_appearing_holder(self) -> None:
+    def test_ambiguous_no_holder_wait_accepts_transient_production_holder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "writer.lock"
             with mock.patch.object(
-                guardian, "_lock_holders", side_effect=[(), (4242,)]
+                guardian,
+                "_lock_holders",
+                side_effect=[(), (4242,), (), (), ()],
             ), mock.patch.object(
-                guardian, "_exclusive_lock_is_contended", return_value=False
+                guardian,
+                "_exclusive_lock_is_contended",
+                side_effect=[False, True, False, False, False],
             ), mock.patch.object(guardian.time, "sleep"):
-                with self.assertRaisesRegex(
-                    guardian.GuardianError, "writer-domain holder appeared"
-                ):
-                    guardian._wait_for_idle_writer_domain(
-                        path, 4242, require_no_holders=True
-                    )
+                guardian._wait_for_idle_writer_domain(path, 4242)
 
     def test_finalize_wait_rejects_a_retained_lifetime_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -367,7 +456,6 @@ class GuardianLifecycleTests(unittest.TestCase):
             wait.assert_called_once_with(
                 active.lock_path,
                 snapshot.pid,
-                require_no_holders=True,
                 verify_production=active.verify_unchanged_production,
             )
             run.assert_not_called()

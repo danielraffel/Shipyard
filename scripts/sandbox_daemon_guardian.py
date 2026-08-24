@@ -105,6 +105,86 @@ def _run(
     return result
 
 
+def _capture_status_timeout(
+    root: Path, child_pid: int, production_pid: int
+) -> Path:
+    """Preserve live macOS process/socket evidence before killing a stuck probe."""
+    evidence = root / f"status-timeout-{int(time.time())}-{child_pid}"
+    evidence.mkdir(parents=True, exist_ok=False)
+    commands = {
+        "child-sample.txt": ["/usr/bin/sample", str(child_pid), "1", "1"],
+        "production-sample.txt": ["/usr/bin/sample", str(production_pid), "1", "1"],
+        "child-lsof.txt": ["/usr/sbin/lsof", "-nP", "-p", str(child_pid)],
+        "production-lsof.txt": ["/usr/sbin/lsof", "-nP", "-p", str(production_pid)],
+        "unix-sockets.txt": ["/usr/sbin/netstat", "-anv", "-f", "unix"],
+    }
+    for name, argv in commands.items():
+        try:
+            result = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=4.0,
+                check=False,
+            )
+            (evidence / name).write_bytes(result.stdout + result.stderr)
+        except Exception as error:  # diagnostic failure must not mask the timeout
+            (evidence / name).write_text(
+                f"diagnostic failed: {type(error).__name__}: {error}\n",
+                encoding="utf-8",
+            )
+    return evidence
+
+
+def _run_status_probe(
+    argv: list[str],
+    *,
+    cwd: Union[str, Path],
+    env: dict[str, str],
+    timeout: float,
+    diagnostic_root: Path,
+    production_pid: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run status while retaining the live child long enough to diagnose a timeout."""
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        try:
+            evidence_detail = str(
+                _capture_status_timeout(
+                    diagnostic_root, process.pid, production_pid
+                )
+            )
+        except Exception as diagnostic_error:
+            evidence_detail = (
+                "diagnostic capture failed: "
+                f"{type(diagnostic_error).__name__}: {diagnostic_error}"
+            )
+        process.terminate()
+        try:
+            stdout, stderr = process.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=2.0)
+        raise subprocess.TimeoutExpired(
+            argv,
+            timeout,
+            output=stdout or error.output,
+            stderr=(stderr or error.stderr or "")
+            + f"\ntimeout diagnostics: {evidence_detail}",
+        ) from error
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
 def _darwin_argv_environment(pid: int) -> tuple[str, tuple[str, ...], dict[str, str]]:
     if sys.platform != "darwin":
         raise GuardianError("the production process snapshot is macOS-only")
@@ -261,7 +341,6 @@ def _wait_for_idle_writer_domain(
     timeout: float = 10.0,
     poll_interval: float = 0.1,
     stable_observations: int = 3,
-    require_no_holders: bool = False,
     verify_production: Optional[Callable[[float], object]] = None,
 ) -> None:
     """Distinguish a transient production mutation from a lifetime lock.
@@ -290,11 +369,6 @@ def _wait_for_idle_writer_domain(
         fail_if_expired()
         holders = _lock_holders(path, deadline=deadline)
         last_holders = holders
-        if require_no_holders and holders:
-            raise GuardianError(
-                "writer-domain holder appeared during the bounded idle wait: "
-                f"{holders!r}"
-            )
         foreign_holders = tuple(pid for pid in holders if pid != production_pid)
         if foreign_holders:
             raise GuardianError(
@@ -348,13 +422,35 @@ def _json_command(
     installed: Path,
     *args: str,
     deadline: Optional[float] = None,
+    diagnostic_root: Optional[Path] = None,
 ) -> dict[str, object]:
-    result = _run(
-        [str(installed), "--json", *args],
-        cwd=snapshot.cwd,
-        env=snapshot.environment,
-        timeout=_bounded_timeout(deadline),
-    )
+    foreground_environment = dict(snapshot.environment)
+    # This foreground verifier writes to a captured pipe, not the daemon log.
+    # Inheriting the daemon's marker can make a read-only status probe wait
+    # behind the very writer-domain audit the guardian is measuring.
+    foreground_environment.pop(PROTECTED_STDIO_PATH_ENV, None)
+    # These probes read only explicit production state/IPC. Never inherit the
+    # daemon's checkout cwd: an external volume can be temporarily unavailable,
+    # and worker status does not need repository-local configuration here.
+    probe_cwd = "/"
+    argv = [str(installed), "--cwd", probe_cwd, "--json", *args]
+    timeout = _bounded_timeout(deadline)
+    if diagnostic_root is None:
+        result = _run(
+            argv,
+            cwd=probe_cwd,
+            env=foreground_environment,
+            timeout=timeout,
+        )
+    else:
+        result = _run_status_probe(
+            argv,
+            cwd=probe_cwd,
+            env=foreground_environment,
+            timeout=timeout,
+            diagnostic_root=diagnostic_root,
+            production_pid=snapshot.pid,
+        )
     value = json.loads(result.stdout)
     if not isinstance(value, dict):
         raise GuardianError(f"expected JSON object from {args!r}")
@@ -362,9 +458,19 @@ def _json_command(
 
 
 def _active_runs(
-    snapshot: ProcessSnapshot, installed: Path, *, deadline: Optional[float] = None
+    snapshot: ProcessSnapshot,
+    installed: Path,
+    *,
+    deadline: Optional[float] = None,
+    diagnostic_root: Optional[Path] = None,
 ) -> tuple[str, ...]:
-    status = _json_command(snapshot, installed, "status", deadline=deadline)
+    status = _json_command(
+        snapshot,
+        installed,
+        "status",
+        deadline=deadline,
+        diagnostic_root=diagnostic_root,
+    )
     runs = status.get("active_runs")
     if not isinstance(runs, list):
         raise GuardianError("worker status active_runs is not an array")
@@ -372,10 +478,19 @@ def _active_runs(
 
 
 def _configured_repos(
-    snapshot: ProcessSnapshot, installed: Path, *, deadline: Optional[float] = None
+    snapshot: ProcessSnapshot,
+    installed: Path,
+    *,
+    deadline: Optional[float] = None,
+    diagnostic_root: Optional[Path] = None,
 ) -> tuple[str, ...]:
     status = _json_command(
-        snapshot, installed, "daemon", "status", deadline=deadline
+        snapshot,
+        installed,
+        "daemon",
+        "status",
+        deadline=deadline,
+        diagnostic_root=diagnostic_root,
     )
     configured = status.get("configured_repos")
     if isinstance(configured, list):
@@ -491,10 +606,14 @@ class Guardian:
         self.snapshot = snapshot
         self.installed_hash = _sha256(self.installed)
         self.candidate_hash = _sha256(self.candidate)
-        self.configured_repos = _configured_repos(snapshot, self.installed)
+        self.configured_repos = _configured_repos(
+            snapshot, self.installed, diagnostic_root=self.root
+        )
         if self.configured_repos != _repo_args(snapshot.argv):
             raise GuardianError("daemon status configured_repos disagrees with exact argv")
-        self.worker_ids = _active_runs(snapshot, self.installed)
+        self.worker_ids = _active_runs(
+            snapshot, self.installed, diagnostic_root=self.root
+        )
         if self.worker_ids:
             raise GuardianError(
                 f"refusing canary transition with active workers: {self.worker_ids!r}"
@@ -506,12 +625,12 @@ class Guardian:
             # lsof can briefly lag an advisory-lock owner. Treat this one
             # otherwise-unclassifiable state as a bounded observation window,
             # while continuously fencing the exact production identity and
-            # requiring the writer domain to remain holder-free. Every other
-            # ambiguous state still fails immediately in _select_transition.
+            # allowing only the exact production PID to finish a transient
+            # mutation. Every other ambiguous state still fails immediately in
+            # _select_transition.
             _wait_for_idle_writer_domain(
                 self.lock_path,
                 snapshot.pid,
-                require_no_holders=True,
                 verify_production=self.verify_unchanged_production,
             )
             self.transition_path = CORRECTED_TRANSITION
@@ -686,13 +805,26 @@ class Guardian:
         current = snapshot_process(current_pid, deadline=deadline)
         self.assert_process_identity(current, require_same_pid=True)
         if (
-            _configured_repos(current, self.installed, deadline=deadline)
+            _configured_repos(
+                current,
+                self.installed,
+                deadline=deadline,
+                diagnostic_root=self.root,
+            )
             != self.configured_repos
         ):
             raise GuardianError(
                 "production configured repository authority changed during idle wait"
             )
-        if _active_runs(current, self.installed, deadline=deadline) != self.worker_ids:
+        if (
+            _active_runs(
+                current,
+                self.installed,
+                deadline=deadline,
+                diagnostic_root=self.root,
+            )
+            != self.worker_ids
+        ):
             raise GuardianError("production active workers changed during idle wait")
         _bounded_timeout(deadline)
         return current
@@ -718,7 +850,7 @@ class Guardian:
         # on its captured pipe rather than trying to acquire the same exclusive
         # audit merely to print the diagnostic.
         probe_environment.pop(PROTECTED_STDIO_PATH_ENV, None)
-        result = _run(
+        result = _run_status_probe(
             [
                 str(self.installed),
                 "--mode",
@@ -733,7 +865,8 @@ class Guardian:
             cwd=snapshot.cwd,
             env=probe_environment,
             timeout=40.0,
-            check=False,
+            diagnostic_root=self.root,
+            production_pid=snapshot.pid,
         )
         combined = f"{result.stdout}\n{result.stderr}"
         if (
@@ -751,9 +884,17 @@ class Guardian:
             raise GuardianError("corrected production pid file changed during audit")
         current = snapshot_process(current_pid)
         self.assert_process_identity(current, require_same_pid=True)
-        if _configured_repos(current, self.installed) != self.configured_repos:
+        if (
+            _configured_repos(
+                current, self.installed, diagnostic_root=self.root
+            )
+            != self.configured_repos
+        ):
             raise GuardianError("corrected production configured repositories changed")
-        if _active_runs(current, self.installed) != self.worker_ids:
+        if (
+            _active_runs(current, self.installed, diagnostic_root=self.root)
+            != self.worker_ids
+        ):
             raise GuardianError("corrected production active workers changed")
         _atomic_json(
             self.mutation_receipt,
@@ -834,9 +975,17 @@ class Guardian:
             raise GuardianError("corrected production pid changed during canary")
         current = snapshot_process(current_pid)
         self.assert_process_identity(current, require_same_pid=True)
-        if _configured_repos(current, self.installed) != self.configured_repos:
+        if (
+            _configured_repos(
+                current, self.installed, diagnostic_root=self.root
+            )
+            != self.configured_repos
+        ):
             raise GuardianError("preserved configured repository authority differs")
-        if _active_runs(current, self.installed) != self.worker_ids:
+        if (
+            _active_runs(current, self.installed, diagnostic_root=self.root)
+            != self.worker_ids
+        ):
             raise GuardianError("preserved active worker ownership differs")
         _wait_for_idle_writer_domain(
             self.lock_path,
@@ -893,9 +1042,17 @@ class Guardian:
             raise GuardianError("restored daemon did not own the production pid file")
         restored = snapshot_process(process.pid)
         self.assert_process_identity(restored, require_same_pid=False)
-        if _configured_repos(restored, self.installed) != self.configured_repos:
+        if (
+            _configured_repos(
+                restored, self.installed, diagnostic_root=self.root
+            )
+            != self.configured_repos
+        ):
             raise GuardianError("restored configured repository authority differs")
-        if _active_runs(restored, self.installed) != self.worker_ids:
+        if (
+            _active_runs(restored, self.installed, diagnostic_root=self.root)
+            != self.worker_ids
+        ):
             raise GuardianError("restored active worker ownership differs")
         restored_holders = _lock_holders(self.lock_path)
         if restored_holders != (process.pid,) or not _exclusive_lock_is_contended(

@@ -89,11 +89,18 @@ impl Drop for ProductionWriterDomainLease {
 pub(crate) fn acquire_for_protected_path(
     path: &Path,
 ) -> io::Result<Option<ProductionWriterDomainLease>> {
-    let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
-    if !is_protected_path(path, &home_dir(), &runtime_paths)? {
+    if !is_current_protected_path(path)? {
         return Ok(None);
     }
+    let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
     acquire_thread_lease_at(&runtime_paths.state_dir, DEFAULT_ACQUIRE_TIMEOUT).map(Some)
+}
+
+/// Report whether a path belongs to the current machine's production writer
+/// domain without acquiring its lease.
+pub(crate) fn is_current_protected_path(path: &Path) -> io::Result<bool> {
+    let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
+    is_protected_path(path, &home_dir(), &runtime_paths)
 }
 
 fn acquire_thread_lease_at(
@@ -240,7 +247,17 @@ fn is_protected_path(path: &Path, home: &Path, runtime_paths: &RuntimePaths) -> 
 /// component before interpreting `..` preserves filesystem semantics when a
 /// parent component is itself a symlink.
 fn canonicalize_with_missing_suffix(path: &Path) -> io::Result<PathBuf> {
-    canonicalize_with_missing_suffix_from(path, &std::env::current_dir()?)
+    canonicalize_with_missing_suffix_with(path, std::env::current_dir)
+}
+
+fn canonicalize_with_missing_suffix_with<C>(path: &Path, current_dir: C) -> io::Result<PathBuf>
+where
+    C: FnOnce() -> io::Result<PathBuf>,
+{
+    if path.is_absolute() {
+        return canonicalize_with_missing_suffix_from(path, Path::new(""));
+    }
+    canonicalize_with_missing_suffix_from(path, &current_dir()?)
 }
 
 fn canonicalize_with_missing_suffix_from(path: &Path, current_dir: &Path) -> io::Result<PathBuf> {
@@ -385,6 +402,23 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[test]
+    fn absolute_protected_path_never_resolves_process_cwd() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let absolute = root.path().join("shipyard-absolute-protected-path");
+        let resolved = canonicalize_with_missing_suffix_with(&absolute, || {
+            panic!("absolute path classification must not inspect the process cwd")
+        })
+        .expect("absolute path");
+
+        assert_eq!(
+            resolved,
+            fs::canonicalize(root.path())
+                .expect("canonical tempdir")
+                .join("shipyard-absolute-protected-path")
+        );
+    }
 
     #[test]
     fn unrelated_test_path_never_opens_production_writer_domain() {

@@ -223,12 +223,20 @@ command source, helper failure stops before downloading or replacing anything;
 Shipyard does not silently fall back to the anonymous GitHub API. The updater
 downloads the installer from the exact target tag completely before executing
 it, and `--refresh-daemon` restarts the daemon only after the installer's staged
-binary smoke passes.
+binary smoke passes. The verified newly installed binary performs the refresh
+with the caller's exact mode, global-config directory, and state directory; the
+older updater process never reuses its own daemon-spawn implementation after
+replacement. A non-zero child exit or malformed refresh receipt fails closed.
 
 Non-login SSH and launchd do not need a caller-built `PATH`. Shipyard resolves
 system curl/Bash from canonical absolute locations and starts detached daemons
 with Homebrew, `/usr/local/bin`, `~/.local/bin`, and system tool directories in
-a deterministic PATH. Custom locations can be configured globally:
+a deterministic PATH. The daemon retains its state-owned private `TMPDIR`, but
+local validation subprocesses that inherit that protected path receive a fresh
+owner-private directory under the platform's real temporary root. This keeps
+test fixtures ephemeral and outside the production writer domain without
+weakening protected-path classification. Custom locations can be configured
+globally:
 
 ```toml
 [update]

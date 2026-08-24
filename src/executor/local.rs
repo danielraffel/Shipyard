@@ -7,6 +7,8 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -266,9 +268,23 @@ impl LocalExecutor {
             &request.validation.stages,
             request.resume_from.as_deref(),
         );
+        let mut environment = request.validation.environment.clone();
+        let _validation_temp_dir = match isolate_protected_inherited_tmpdir(&mut environment) {
+            Ok(temp_dir) => temp_dir,
+            Err(error) => {
+                let context = LocalRunContext {
+                    target: &request.target,
+                    environment: &environment,
+                    log_path: &request.log_path,
+                    started_at,
+                    start_time,
+                };
+                return io_error_result(&context, &error.to_string());
+            }
+        };
         let context = LocalRunContext {
             target: &request.target,
-            environment: &request.validation.environment,
+            environment: &environment,
             log_path: &request.log_path,
             started_at,
             start_time,
@@ -562,6 +578,60 @@ impl LocalExecutor {
     }
 }
 
+#[cfg(unix)]
+fn isolate_protected_inherited_tmpdir(
+    environment: &mut BTreeMap<String, String>,
+) -> std::io::Result<Option<tempfile::TempDir>> {
+    if environment.contains_key("TMPDIR") {
+        return Ok(None);
+    }
+    let Some(inherited_tmpdir) = std::env::var_os("TMPDIR") else {
+        return Ok(None);
+    };
+    isolate_protected_tmpdir(environment, Path::new(&inherited_tmpdir))
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep one fallible cross-platform isolation contract.
+fn isolate_protected_inherited_tmpdir(
+    _environment: &mut BTreeMap<String, String>,
+) -> std::io::Result<Option<tempfile::TempDir>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn isolate_protected_tmpdir(
+    environment: &mut BTreeMap<String, String>,
+    inherited_tmpdir: &Path,
+) -> std::io::Result<Option<tempfile::TempDir>> {
+    if !crate::writer_domain_lease::is_current_protected_path(inherited_tmpdir)? {
+        return Ok(None);
+    }
+    #[cfg(target_os = "macos")]
+    let base = Path::new("/private/tmp");
+    #[cfg(not(target_os = "macos"))]
+    let base = Path::new("/tmp");
+    let metadata = std::fs::symlink_metadata(base)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "validation temporary base {} is not a real directory",
+            base.display()
+        )));
+    }
+    let temp_dir = tempfile::Builder::new()
+        .prefix("shipyard-validation-")
+        .tempdir_in(base)?;
+    std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    let value = temp_dir.path().to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "validation temporary path is not valid UTF-8",
+        )
+    })?;
+    environment.insert("TMPDIR".to_owned(), value.to_owned());
+    Ok(Some(temp_dir))
+}
+
 fn source_provenance(cwd: &Path) -> Option<(String, String, bool)> {
     let git = |args: &[&str]| {
         let output = Command::new("git")
@@ -839,11 +909,17 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
+    #[cfg(unix)]
+    use super::isolate_protected_tmpdir;
     use super::{
         ContractConfig, LocalExecutor, LocalTargetConfig, LocalValidationConfig,
         LocalValidationPlan, LocalValidationRequest, StageCommand, TargetStatus, configured_stages,
         plan_validation, prepared_state_enabled, read_log_tail, source_provenance,
     };
+    #[cfg(unix)]
+    use crate::identity::RuntimeMode;
+    #[cfg(unix)]
+    use crate::paths::RuntimePaths;
     use crate::prepared_state::PreparedStateStore;
 
     fn stage_map(values: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -851,6 +927,60 @@ mod tests {
             .iter()
             .map(|(stage, command)| ((*stage).to_owned(), (*command).to_owned()))
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_owned_validation_moves_test_fixtures_out_of_the_protected_tmpdir() {
+        let inherited = RuntimePaths::current(RuntimeMode::Shipyard)
+            .state_dir
+            .join("daemon/tmp");
+        let mut environment = BTreeMap::new();
+        let temp_dir = isolate_protected_tmpdir(&mut environment, &inherited)
+            .expect("isolation")
+            .expect("protected inherited root");
+        let isolated = Path::new(environment.get("TMPDIR").expect("isolated TMPDIR"));
+
+        assert_eq!(isolated, temp_dir.path());
+        assert!(isolated.is_dir());
+        assert!(
+            !std::fs::symlink_metadata(isolated)
+                .expect("metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !crate::writer_domain_lease::is_current_protected_path(isolated)
+                .expect("protected-path classification")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(isolated)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        for test_name in [
+            "app::ship_cmd::prepush_changed_surface::tests::push_hook_receipt_and_postpush_equivalence_create_one_verified_snapshot",
+            "app::update_cmd::tests::installer_receives_exact_binary_directory_and_curl_identity",
+            "writer_domain_lease::tests::unrelated_test_path_never_opens_production_writer_domain",
+        ] {
+            let status = Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", test_name])
+                .env("TMPDIR", isolated)
+                .status()
+                .expect("focused child test");
+            assert!(
+                status.success(),
+                "{test_name} must pass in the isolated root"
+            );
+        }
     }
 
     #[test]

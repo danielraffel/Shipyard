@@ -152,7 +152,19 @@ pub fn run() -> ExitCode {
 }
 
 fn run_with<W: Write, E: Write>(cli: Cli, stdout: &mut W, stderr: &mut E) -> ExitCode {
-    match dispatch(cli, stdout, stderr) {
+    run_with_cwd_provider(cli, stdout, stderr, std::env::current_dir)
+}
+
+fn run_with_cwd_provider<W: Write, E: Write, C>(
+    cli: Cli,
+    stdout: &mut W,
+    stderr: &mut E,
+    current_dir: C,
+) -> ExitCode
+where
+    C: FnOnce() -> std::io::Result<PathBuf>,
+{
+    match dispatch_with_cwd_provider(cli, stdout, stderr, current_dir) {
         Ok(code) => code,
         Err(error) => {
             if !error.message.is_empty() {
@@ -178,17 +190,31 @@ fn run_with<W: Write, E: Write>(cli: Cli, stdout: &mut W, stderr: &mut E) -> Exi
 }
 
 #[allow(clippy::too_many_lines)]
-fn dispatch<W: Write, E: Write>(
+fn dispatch_with_cwd_provider<W: Write, E: Write, C>(
     cli: Cli,
     stdout: &mut W,
     _stderr: &mut E,
-) -> Result<ExitCode, CliFailure> {
+    current_dir: C,
+) -> Result<ExitCode, CliFailure>
+where
+    C: FnOnce() -> std::io::Result<PathBuf>,
+{
     let runtime_paths = RuntimePaths::current_with_overrides(
         cli.mode.into(),
         cli.global_dir.clone(),
         cli.state_dir.clone(),
     );
-    let cwd = cli_cwd(&cli);
+    // Daemon control uses only explicit runtime paths and IPC. Resolving an
+    // unrelated checkout here made `daemon status` block when an external
+    // volume's cwd was temporarily unavailable.
+    let cwd = if matches!(
+        &cli.command,
+        Command::Daemon { .. } | Command::WriterDomainExec { .. }
+    ) {
+        PathBuf::new()
+    } else {
+        cli_cwd_with(&cli, current_dir)
+    };
 
     match cli.command {
         Command::WriterDomainExec { path, command } => {
@@ -417,10 +443,13 @@ fn dispatch<W: Write, E: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
-fn cli_cwd(cli: &Cli) -> PathBuf {
+fn cli_cwd_with<C>(cli: &Cli, current_dir: C) -> PathBuf
+where
+    C: FnOnce() -> std::io::Result<PathBuf>,
+{
     cli.cwd
         .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .unwrap_or_else(|| current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 fn handle_operational_variant<W: Write>(
@@ -1140,7 +1169,7 @@ mod tests {
 
     use super::{
         Cli, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_RUN_TERMINAL_WRONG, WAIT_EXIT_UNSUPPORTED, run_with,
-        wait_cmd::parse_github_repo_slug,
+        run_with_cwd_provider, wait_cmd::parse_github_repo_slug,
     };
     use crate::cloud_records::{CloudRecordStore, CloudRunRecord};
     #[cfg(unix)]
@@ -3757,6 +3786,64 @@ mod tests {
 
         assert!(stop_running(temp.path()));
         worker.join().expect("join");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_reaches_live_ipc_without_resolving_process_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        seed_registered_repos(temp.path(), &["owner/repo"]);
+        let worker = spawn_test_daemon(temp.path(), vec!["owner/repo".to_owned()]);
+        wait_for_daemon(temp.path());
+
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "daemon",
+            "status",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with_cwd_provider(cli, &mut stdout, &mut stderr, || {
+            panic!("daemon status must not inspect the process cwd")
+        });
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["command"], "daemon:status");
+        assert_eq!(value["running"], Value::Bool(true));
+        assert_eq!(value["registered_repos"][0], "owner/repo");
+
+        assert!(stop_running(temp.path()));
+        worker.join().expect("join");
+    }
+
+    #[test]
+    fn writer_domain_control_rejects_unprotected_path_without_resolving_process_cwd() {
+        let cli = Cli::parse_from([
+            "shipyard",
+            "writer-domain-exec",
+            "--path",
+            "/tmp/outside-shipyard-production-roots",
+            "--",
+            "/usr/bin/true",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with_cwd_provider(cli, &mut stdout, &mut stderr, || {
+            panic!("writer-domain control must not inspect the process cwd")
+        });
+
+        assert_ne!(code, ExitCode::SUCCESS);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf8")
+                .contains("outside protected roots")
+        );
     }
 
     #[cfg(unix)]
