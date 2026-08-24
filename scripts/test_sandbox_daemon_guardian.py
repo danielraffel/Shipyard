@@ -114,6 +114,65 @@ class GuardianLifecycleTests(unittest.TestCase):
             run.call_args.kwargs["env"],
         )
 
+    def test_timed_out_status_captures_live_processes_before_terminating_child(self) -> None:
+        process = mock.Mock(pid=7331, returncode=None)
+        process.communicate.side_effect = [
+            guardian.subprocess.TimeoutExpired(["shipyard"], 15.0),
+            ("", "terminated"),
+        ]
+        evidence = Path("/tmp/status-timeout-7331")
+        events: list[str] = []
+        process.terminate.side_effect = lambda: events.append("terminate")
+
+        with mock.patch.object(
+            guardian.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            guardian,
+            "_capture_status_timeout",
+            side_effect=lambda *_args: events.append("capture") or evidence,
+        ):
+            with self.assertRaises(guardian.subprocess.TimeoutExpired) as raised:
+                guardian._run_status_probe(
+                    ["shipyard", "--json", "daemon", "status"],
+                    cwd="/tmp",
+                    env={"HOME": "/tmp/home"},
+                    timeout=15.0,
+                    diagnostic_root=Path("/tmp/canary"),
+                    production_pid=4242,
+                )
+
+        self.assertEqual(events, ["capture", "terminate"])
+        self.assertIn(str(evidence), raised.exception.stderr)
+        process.kill.assert_not_called()
+
+    def test_status_timeout_diagnostic_failure_does_not_skip_child_cleanup(self) -> None:
+        process = mock.Mock(pid=7331, returncode=None)
+        process.communicate.side_effect = [
+            guardian.subprocess.TimeoutExpired(["shipyard"], 15.0),
+            ("", "terminated"),
+        ]
+
+        with mock.patch.object(
+            guardian.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            guardian,
+            "_capture_status_timeout",
+            side_effect=OSError("sample unavailable"),
+        ):
+            with self.assertRaises(guardian.subprocess.TimeoutExpired) as raised:
+                guardian._run_status_probe(
+                    ["shipyard", "--json", "daemon", "status"],
+                    cwd="/tmp",
+                    env={"HOME": "/tmp/home"},
+                    timeout=15.0,
+                    diagnostic_root=Path("/tmp/canary"),
+                    production_pid=4242,
+                )
+
+        # A diagnostic helper defect must never leave the timed-out child alive.
+        process.terminate.assert_called_once_with()
+        self.assertIn("diagnostic capture failed", raised.exception.stderr)
+
     def test_finalize_wait_accepts_a_transient_production_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "writer.lock"
