@@ -216,6 +216,11 @@ real ship-state write from overlapping that audit.
 | `shipyard cleanup --ship-state` | `prune(active_days=14, archive_days=30, closed_prs=...)` | Queries each active state's recorded repository and deletes aged-out active state only for the matching closed `(repo, PR)`, plus aged archives. Unlinks are unguarded — a failure raises. |
 | `shipyard runner recovery-worker` | Durable steward recovery requests plus the live exact PR head; trusted machine-global `[merge_steward.recovery_worker]` only | Without `--apply`, no writes and no model launch. With `--apply`, claims at most one request by default and persists a bounded terminal escalation/failure receipt; it never writes ship state or GitHub/queue/merge/release state. |
 
+The daemon's GitHub check-rollup reconciler may heal only dispatched runs whose
+`run_id` is a numeric GitHub Actions workflow-run database id. Local and SSH
+runs retain Shipyard-generated `sy-*` ids, so their terminal evidence remains
+authoritative even when an unrelated hosted check has a similar target name.
+
 ## Transitions — preconditions, postconditions, failure modes
 
 ### T1 — Create a fresh ship state
