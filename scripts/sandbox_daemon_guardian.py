@@ -435,19 +435,23 @@ def _json_command(
     # Inheriting the daemon's marker can make a read-only status probe wait
     # behind the very writer-domain audit the guardian is measuring.
     foreground_environment.pop(PROTECTED_STDIO_PATH_ENV, None)
-    argv = [str(installed), "--json", *args]
+    # These probes read only explicit production state/IPC. Never inherit the
+    # daemon's checkout cwd: an external volume can be temporarily unavailable,
+    # and worker status does not need repository-local configuration here.
+    probe_cwd = "/"
+    argv = [str(installed), "--cwd", probe_cwd, "--json", *args]
     timeout = _bounded_timeout(deadline)
     if diagnostic_root is None:
         result = _run(
             argv,
-            cwd=snapshot.cwd,
+            cwd=probe_cwd,
             env=foreground_environment,
             timeout=timeout,
         )
     else:
         result = _run_status_probe(
             argv,
-            cwd=snapshot.cwd,
+            cwd=probe_cwd,
             env=foreground_environment,
             timeout=timeout,
             diagnostic_root=diagnostic_root,

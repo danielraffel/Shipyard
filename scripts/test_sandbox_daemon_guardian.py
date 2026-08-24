@@ -113,6 +113,11 @@ class GuardianLifecycleTests(unittest.TestCase):
             guardian.PROTECTED_STDIO_PATH_ENV,
             run.call_args.kwargs["env"],
         )
+        self.assertEqual(run.call_args.kwargs["cwd"], "/")
+        self.assertEqual(
+            run.call_args.args[0][:4],
+            ["/tmp/shipyard", "--cwd", "/", "--json"],
+        )
 
     def test_timed_out_status_captures_live_processes_before_terminating_child(self) -> None:
         process = mock.Mock(pid=7331, returncode=None)
