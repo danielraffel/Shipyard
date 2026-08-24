@@ -394,6 +394,12 @@ resumes the moment a subscriber attaches. Webhook registration
 also retries on a 5-minute backoff after failure rather than every
 loop iteration.
 
+Reconciliation is transport-scoped: GitHub rollups may update only runs with
+numeric GitHub Actions workflow-run IDs. Local and SSH `sy-*` runs keep their
+own terminal evidence even when a similarly named hosted check is green. If a
+local failure and hosted success disagree, classify the local log; do not
+expect daemon reconciliation to turn it green.
+
 See [`docs/live-mode.md`](../../docs/live-mode.md) for setup (≈1
 click on a Tailscale-ready Mac) and troubleshooting. The macOS
 menu-bar app (`shipyard-macos-gui`) is a thin subscriber to this
