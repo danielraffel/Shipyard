@@ -7,6 +7,8 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -618,7 +620,6 @@ fn isolate_protected_tmpdir(
     let temp_dir = tempfile::Builder::new()
         .prefix("shipyard-validation-")
         .tempdir_in(base)?;
-    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700))?;
     let value = temp_dir.path().to_str().ok_or_else(|| {
         std::io::Error::new(
