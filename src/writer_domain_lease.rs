@@ -247,7 +247,17 @@ fn is_protected_path(path: &Path, home: &Path, runtime_paths: &RuntimePaths) -> 
 /// component before interpreting `..` preserves filesystem semantics when a
 /// parent component is itself a symlink.
 fn canonicalize_with_missing_suffix(path: &Path) -> io::Result<PathBuf> {
-    canonicalize_with_missing_suffix_from(path, &std::env::current_dir()?)
+    canonicalize_with_missing_suffix_with(path, std::env::current_dir)
+}
+
+fn canonicalize_with_missing_suffix_with<C>(path: &Path, current_dir: C) -> io::Result<PathBuf>
+where
+    C: FnOnce() -> io::Result<PathBuf>,
+{
+    if path.is_absolute() {
+        return canonicalize_with_missing_suffix_from(path, Path::new(""));
+    }
+    canonicalize_with_missing_suffix_from(path, &current_dir()?)
 }
 
 fn canonicalize_with_missing_suffix_from(path: &Path, current_dir: &Path) -> io::Result<PathBuf> {
@@ -392,6 +402,22 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[test]
+    fn absolute_protected_path_never_resolves_process_cwd() {
+        let resolved = canonicalize_with_missing_suffix_with(
+            Path::new("/tmp/shipyard-absolute-protected-path"),
+            || panic!("absolute path classification must not inspect the process cwd"),
+        )
+        .expect("absolute path");
+
+        assert_eq!(
+            resolved,
+            fs::canonicalize("/tmp")
+                .expect("canonical /tmp")
+                .join("shipyard-absolute-protected-path")
+        );
+    }
 
     #[test]
     fn unrelated_test_path_never_opens_production_writer_domain() {
