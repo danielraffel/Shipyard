@@ -856,7 +856,7 @@ class Guardian:
         # on its captured pipe rather than trying to acquire the same exclusive
         # audit merely to print the diagnostic.
         probe_environment.pop(PROTECTED_STDIO_PATH_ENV, None)
-        result = _run(
+        result = _run_status_probe(
             [
                 str(self.installed),
                 "--mode",
@@ -871,7 +871,8 @@ class Guardian:
             cwd=snapshot.cwd,
             env=probe_environment,
             timeout=40.0,
-            check=False,
+            diagnostic_root=self.root,
+            production_pid=snapshot.pid,
         )
         combined = f"{result.stdout}\n{result.stderr}"
         if (
