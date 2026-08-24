@@ -1372,6 +1372,12 @@ readiness transition, and the operator should use
 `green_validation_state_missing` with exit `9`, preserve the validation proof,
 forbid an automatic rerun, and recover state before waiting or merging.
 
+The inverse boundary is equally strict: GitHub's check-rollup reconciler may
+heal only dispatched runs carrying a numeric GitHub Actions workflow-run ID.
+Local and SSH targets retain Shipyard `sy-*` job IDs, and their terminal
+evidence is authoritative. Never fuzzy-match a local target such as `mac` to a
+hosted check and replace a local failure with that check's green conclusion.
+
 ### Flaky-required-leg wedge → rescue hand-off (`auto_rescue`)
 
 When Shipyard validated every target green but `gh pr merge` is *rejected*

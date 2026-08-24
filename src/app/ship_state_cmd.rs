@@ -639,7 +639,7 @@ mod tests {
         let mut state = sample_state(42, "4242424242424242424242424242424242424242");
         state.dispatched_runs.push(DispatchedRun {
             status: "in_progress".to_owned(),
-            ..sample_run("macos", "run-42")
+            ..sample_run("macos", "42424242")
         });
         store.save(&state).expect("state should save");
         let mut out = Vec::new();
