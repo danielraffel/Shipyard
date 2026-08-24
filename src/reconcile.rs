@@ -210,6 +210,15 @@ pub fn reconcile_ship_state(
     let mut next_runs = Vec::with_capacity(state.dispatched_runs.len());
 
     for run in &state.dispatched_runs {
+        // GitHub's check rollup can only authoritatively heal runs that were
+        // dispatched through GitHub Actions. Local/SSH runs carry Shipyard's
+        // own job id here; matching those by a short target name (for example
+        // `mac`) can otherwise overwrite a failed local proof with an
+        // unrelated green hosted check.
+        if !run_is_github_actions_backed(run) {
+            next_runs.push(run.clone());
+            continue;
+        }
         let Some(check) = match_check(run, status_check_rollup) else {
             next_runs.push(run.clone());
             continue;
@@ -265,6 +274,12 @@ pub fn reconcile_ship_state(
         transitions,
         changes,
     }
+}
+
+fn run_is_github_actions_backed(run: &DispatchedRun) -> bool {
+    // Cloud target results persist GitHub's numeric workflow-run database id.
+    // Local and SSH targets retain Shipyard's `sy-*` job id instead.
+    run.run_id.parse::<u64>().is_ok()
 }
 
 /// Fetch `statusCheckRollup` for a PR through the GitHub CLI.
@@ -603,7 +618,7 @@ mod tests {
         DispatchedRun {
             target: target.to_owned(),
             provider: "namespace".to_owned(),
-            run_id: format!("run-{target}"),
+            run_id: "123456789".to_owned(),
             status: status.to_owned(),
             started_at: now,
             updated_at: now,
@@ -651,6 +666,30 @@ mod tests {
                 to_status: "completed".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn green_github_check_cannot_overwrite_failed_local_validation() {
+        let mut state = state_with_run(7_792, "mac", "failed");
+        state.dispatched_runs[0].provider = "local".to_owned();
+        state.dispatched_runs[0].run_id = "sy-20260824-5f5628".to_owned();
+        state
+            .evidence_snapshot
+            .insert("mac".to_owned(), "fail".to_owned());
+        let rollup = vec![serde_json::json!({
+            "name": "Build and Test / mac (pull_request)",
+            "state": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "completedAt": "2026-08-24T15:08:00Z"
+        })];
+
+        let reconciled =
+            reconcile_ship_state(&state, &rollup, sample_time() + Duration::minutes(5));
+
+        assert!(reconciled.changes.is_empty());
+        assert!(reconciled.transitions.is_empty());
+        assert_eq!(reconciled.state, state);
+        assert_eq!(reconciled.state.evidence_snapshot["mac"], "fail");
     }
 
     #[test]
