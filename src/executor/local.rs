@@ -592,6 +592,7 @@ fn isolate_protected_inherited_tmpdir(
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep one fallible cross-platform isolation contract.
 fn isolate_protected_inherited_tmpdir(
     _environment: &mut BTreeMap<String, String>,
 ) -> std::io::Result<Option<tempfile::TempDir>> {
