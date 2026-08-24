@@ -337,27 +337,6 @@ where
     })
 }
 
-/// Refresh the daemon after a self-update has completed and the installed
-/// binary has passed the installer's smoke verification. No existing daemon
-/// is stopped before the caller reaches this function.
-pub(super) fn refresh_after_verified_update(
-    mode: RuntimeMode,
-    runtime_paths: &RuntimePaths,
-    installed_binary: PathBuf,
-) -> Result<u32, String> {
-    execute_daemon_refresh(
-        mode,
-        Some(runtime_paths.global_dir.clone()),
-        Some(runtime_paths.state_dir.clone()),
-        runtime_paths,
-        &[],
-        Some(installed_binary),
-        spawn_detached,
-    )
-    .map(|outcome| outcome.new_pid)
-    .map_err(|error| error.error)
-}
-
 fn configured_repos_from_status(status: Option<&Value>) -> Vec<String> {
     status
         .and_then(|status| {

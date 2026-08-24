@@ -127,14 +127,13 @@ pub(super) fn update_command<W: Write>(
     verify_installed_version(&installed_binary, &target)?;
 
     if args.refresh_daemon {
-        let pid =
-            super::daemon_cmd::refresh_after_verified_update(mode, runtime_paths, installed_binary)
-                .map_err(|message| {
-                    CliFailure::new(
-                        3,
-                        format!("update installed, but daemon refresh failed: {message}"),
-                    )
-                })?;
+        let pid = refresh_daemon_with_installed_binary(mode, runtime_paths, &installed_binary)
+            .map_err(|message| {
+                CliFailure::new(
+                    3,
+                    format!("update installed, but daemon refresh failed: {message}"),
+                )
+            })?;
         let mut data = BTreeMap::new();
         data.insert("event".to_owned(), Value::from("daemon_refreshed"));
         data.insert("target".to_owned(), Value::from(target));
@@ -196,6 +195,59 @@ fn verify_installed_version(binary: &Path, target_tag: &str) -> Result<(), CliFa
             "installed binary verification mismatch: expected {expected:?}, observed {actual:?}; daemon was not refreshed"
         ),
     ))
+}
+
+/// Cross the self-update process boundary before refreshing the daemon. The
+/// process that performed the install may predate daemon-spawn fixes in the
+/// release it just installed, so it must not execute its own refresh code.
+fn refresh_daemon_with_installed_binary(
+    mode: RuntimeMode,
+    runtime_paths: &RuntimePaths,
+    installed_binary: &Path,
+) -> Result<u32, String> {
+    let output = Command::new(installed_binary)
+        .arg("--mode")
+        .arg(mode.as_str())
+        .arg("--global-dir")
+        .arg(&runtime_paths.global_dir)
+        .arg("--state-dir")
+        .arg(&runtime_paths.state_dir)
+        .arg("--json")
+        .args(["daemon", "refresh"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to execute verified installed binary {}: {error}",
+                installed_binary.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "verified installed binary {} exited {} while refreshing the daemon",
+            installed_binary.display(),
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let receipt: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        "verified installed binary returned an invalid daemon refresh receipt".to_owned()
+    })?;
+    if receipt.get("schema_version").and_then(Value::as_u64)
+        != Some(u64::from(crate::output::SCHEMA_VERSION))
+        || receipt.get("command").and_then(Value::as_str) != Some("daemon:refresh")
+    {
+        return Err(
+            "verified installed binary returned an unexpected daemon refresh receipt".to_owned(),
+        );
+    }
+    receipt
+        .get("new_pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| {
+            "verified installed binary did not prove the refreshed daemon PID".to_owned()
+        })
 }
 
 fn validate_unattended_auth(config: &LoadedConfig) -> Result<(), CliFailure> {
@@ -909,6 +961,70 @@ mod tests {
         verify_installed_version(&binary, "v0.99.1").expect("exact version");
         let error = verify_installed_version(&binary, "v0.99.2").expect_err("mismatch");
         assert!(error.message.contains("daemon was not refreshed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_refresh_executes_verified_binary_with_exact_runtime_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("shipyard");
+        let args_capture = temp.path().join("args");
+        write_executable(
+            &binary,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' '{{\"schema_version\":1,\"command\":\"daemon:refresh\",\"new_pid\":4242}}'\n",
+                shlex_quote_path(&args_capture)
+            ),
+        );
+        let global_dir = temp.path().join("governed config");
+        let state_dir = temp.path().join("governed state");
+        let runtime_paths = RuntimePaths::current_with_overrides(
+            RuntimeMode::Isolated,
+            Some(global_dir.clone()),
+            Some(state_dir.clone()),
+        );
+
+        assert_eq!(
+            refresh_daemon_with_installed_binary(RuntimeMode::Isolated, &runtime_paths, &binary,)
+                .expect("refresh receipt"),
+            4242
+        );
+        let captured = std::fs::read_to_string(args_capture).expect("captured argv");
+        assert_eq!(
+            captured.lines().collect::<Vec<_>>(),
+            vec![
+                "--mode",
+                "isolated",
+                "--global-dir",
+                global_dir.to_str().expect("global dir"),
+                "--state-dir",
+                state_dir.to_str().expect("state dir"),
+                "--json",
+                "daemon",
+                "refresh",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_refresh_fails_closed_without_exact_typed_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("shipyard");
+        write_executable(
+            &binary,
+            "#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":1,\"command\":\"daemon:start\",\"new_pid\":4242}'\n",
+        );
+        let runtime_paths = RuntimePaths::current_with_overrides(
+            RuntimeMode::Isolated,
+            Some(temp.path().join("config")),
+            Some(temp.path().join("state")),
+        );
+
+        let error =
+            refresh_daemon_with_installed_binary(RuntimeMode::Isolated, &runtime_paths, &binary)
+                .expect_err("wrong receipt type");
+        assert!(error.contains("unexpected daemon refresh receipt"));
     }
 
     #[test]

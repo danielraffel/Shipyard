@@ -1508,6 +1508,13 @@ directory under its state-owned daemon root and exports that exact path as
 `TMPDIR` before detaching. Preserve the real-directory and mode-0700 checks;
 adding a shell-profile export does not fix unattended workers.
 
+**A self-update must refresh through the verified replacement binary.** The
+process running `update --refresh-daemon` may predate daemon-spawn fixes in the
+release it just installed. After exact version verification, it invokes the
+installed binary's `daemon refresh` with explicit mode/global/state paths and
+requires the typed refresh receipt. Do not call old in-process refresh code or
+accept child exit zero without the exact receipt.
+
 **Manual release fallback:** `./scripts/release.sh` still exists for emergencies but is no longer the happy path. Normal releases flow through `shipyard pr` → merge → auto-release workflow.
 
 **Local Linux lease liveness:** one `runner local-linux-lease` fleet

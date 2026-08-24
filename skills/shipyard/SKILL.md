@@ -568,6 +568,13 @@ launchd and minimal SSH environments may omit `TMPDIR`, while macOS `/tmp` is a
 symlink that hardened consumers correctly reject under `O_NOFOLLOW`. A shell
 profile export is not a durable fix for daemon-owned work.
 
+Self-update crosses a process boundary before daemon refresh: after verifying
+the exact installed version, the old updater invokes that installed binary's
+`daemon refresh` with explicit mode/global/state paths and requires its typed
+refresh receipt. This ensures a newly shipped daemon-spawn invariant (including
+the private `TMPDIR`) takes effect during the same rollout even when the command
+began in an older Shipyard process.
+
 When local validation is required, normal `shipyard run`, `shipyard ship`, and
 `shipyard pr` submissions persist their resolved request and exact
 checkout/configuration provenance, ensure the matching-version daemon is live,
