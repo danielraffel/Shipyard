@@ -207,7 +207,10 @@ where
     // Daemon control uses only explicit runtime paths and IPC. Resolving an
     // unrelated checkout here made `daemon status` block when an external
     // volume's cwd was temporarily unavailable.
-    let cwd = if matches!(&cli.command, Command::Daemon { .. }) {
+    let cwd = if matches!(
+        &cli.command,
+        Command::Daemon { .. } | Command::WriterDomainExec { .. }
+    ) {
         PathBuf::new()
     } else {
         cli_cwd_with(&cli, current_dir)
@@ -3816,6 +3819,31 @@ mod tests {
 
         assert!(stop_running(temp.path()));
         worker.join().expect("join");
+    }
+
+    #[test]
+    fn writer_domain_control_rejects_unprotected_path_without_resolving_process_cwd() {
+        let cli = Cli::parse_from([
+            "shipyard",
+            "writer-domain-exec",
+            "--path",
+            "/tmp/outside-shipyard-production-roots",
+            "--",
+            "/usr/bin/true",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with_cwd_provider(cli, &mut stdout, &mut stderr, || {
+            panic!("writer-domain control must not inspect the process cwd")
+        });
+
+        assert_ne!(code, ExitCode::SUCCESS);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf8")
+                .contains("outside protected roots")
+        );
     }
 
     #[cfg(unix)]
