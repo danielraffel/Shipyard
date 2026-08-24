@@ -341,7 +341,6 @@ def _wait_for_idle_writer_domain(
     timeout: float = 10.0,
     poll_interval: float = 0.1,
     stable_observations: int = 3,
-    require_no_holders: bool = False,
     verify_production: Optional[Callable[[float], object]] = None,
 ) -> None:
     """Distinguish a transient production mutation from a lifetime lock.
@@ -370,11 +369,6 @@ def _wait_for_idle_writer_domain(
         fail_if_expired()
         holders = _lock_holders(path, deadline=deadline)
         last_holders = holders
-        if require_no_holders and holders:
-            raise GuardianError(
-                "writer-domain holder appeared during the bounded idle wait: "
-                f"{holders!r}"
-            )
         foreign_holders = tuple(pid for pid in holders if pid != production_pid)
         if foreign_holders:
             raise GuardianError(
@@ -631,12 +625,12 @@ class Guardian:
             # lsof can briefly lag an advisory-lock owner. Treat this one
             # otherwise-unclassifiable state as a bounded observation window,
             # while continuously fencing the exact production identity and
-            # requiring the writer domain to remain holder-free. Every other
-            # ambiguous state still fails immediately in _select_transition.
+            # allowing only the exact production PID to finish a transient
+            # mutation. Every other ambiguous state still fails immediately in
+            # _select_transition.
             _wait_for_idle_writer_domain(
                 self.lock_path,
                 snapshot.pid,
-                require_no_holders=True,
                 verify_production=self.verify_unchanged_production,
             )
             self.transition_path = CORRECTED_TRANSITION

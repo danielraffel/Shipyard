@@ -223,7 +223,6 @@ class GuardianLifecycleTests(unittest.TestCase):
                 guardian._wait_for_idle_writer_domain(
                     path,
                     4242,
-                    require_no_holders=True,
                     verify_production=lambda _deadline: verified.append("verified"),
                 )
 
@@ -255,7 +254,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                     guardian.GuardianError, "retained the writer-domain lock"
                 ):
                     guardian._wait_for_idle_writer_domain(
-                        path, 4242, require_no_holders=True
+                        path, 4242
                     )
 
     def test_ambiguous_no_holder_wait_rejects_identity_drift(self) -> None:
@@ -275,24 +274,22 @@ class GuardianLifecycleTests(unittest.TestCase):
                     guardian._wait_for_idle_writer_domain(
                         path,
                         4242,
-                        require_no_holders=True,
                         verify_production=verify,
                     )
 
-    def test_ambiguous_no_holder_wait_rejects_appearing_holder(self) -> None:
+    def test_ambiguous_no_holder_wait_accepts_transient_production_holder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "writer.lock"
             with mock.patch.object(
-                guardian, "_lock_holders", side_effect=[(), (4242,)]
+                guardian,
+                "_lock_holders",
+                side_effect=[(), (4242,), (), (), ()],
             ), mock.patch.object(
-                guardian, "_exclusive_lock_is_contended", return_value=False
+                guardian,
+                "_exclusive_lock_is_contended",
+                side_effect=[False, True, False, False, False],
             ), mock.patch.object(guardian.time, "sleep"):
-                with self.assertRaisesRegex(
-                    guardian.GuardianError, "writer-domain holder appeared"
-                ):
-                    guardian._wait_for_idle_writer_domain(
-                        path, 4242, require_no_holders=True
-                    )
+                guardian._wait_for_idle_writer_domain(path, 4242)
 
     def test_finalize_wait_rejects_a_retained_lifetime_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -459,7 +456,6 @@ class GuardianLifecycleTests(unittest.TestCase):
             wait.assert_called_once_with(
                 active.lock_path,
                 snapshot.pid,
-                require_no_holders=True,
                 verify_production=active.verify_unchanged_production,
             )
             run.assert_not_called()
