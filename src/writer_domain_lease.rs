@@ -405,16 +405,17 @@ mod tests {
 
     #[test]
     fn absolute_protected_path_never_resolves_process_cwd() {
-        let resolved = canonicalize_with_missing_suffix_with(
-            Path::new("/tmp/shipyard-absolute-protected-path"),
-            || panic!("absolute path classification must not inspect the process cwd"),
-        )
+        let root = tempfile::tempdir().expect("tempdir");
+        let absolute = root.path().join("shipyard-absolute-protected-path");
+        let resolved = canonicalize_with_missing_suffix_with(&absolute, || {
+            panic!("absolute path classification must not inspect the process cwd")
+        })
         .expect("absolute path");
 
         assert_eq!(
             resolved,
-            fs::canonicalize("/tmp")
-                .expect("canonical /tmp")
+            fs::canonicalize(root.path())
+                .expect("canonical tempdir")
                 .join("shipyard-absolute-protected-path")
         );
     }
