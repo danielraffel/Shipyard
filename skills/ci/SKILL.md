@@ -1515,6 +1515,12 @@ installed binary's `daemon refresh` with explicit mode/global/state paths and
 requires the typed refresh receipt. Do not call old in-process refresh code or
 accept child exit zero without the exact receipt.
 
+Daemon-owned validation must not use the daemon's protected `TMPDIR` for test
+fixtures. When local validation inherits that state-owned path, Shipyard gives
+the validation subprocess a fresh owner-private directory under the platform's
+real temporary root and retains it for the run. Keep protected-path checks
+unchanged; explicit trusted validation environment remains authoritative.
+
 **Manual release fallback:** `./scripts/release.sh` still exists for emergencies but is no longer the happy path. Normal releases flow through `shipyard pr` → merge → auto-release workflow.
 
 **Local Linux lease liveness:** one `runner local-linux-lease` fleet

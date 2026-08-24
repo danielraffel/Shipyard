@@ -575,6 +575,13 @@ refresh receipt. This ensures a newly shipped daemon-spawn invariant (including
 the private `TMPDIR`) takes effect during the same rollout even when the command
 began in an older Shipyard process.
 
+The daemon keeps that protected `TMPDIR` for its own runtime files. A local
+validation subprocess that merely inherited it receives a separate
+owner-private ephemeral root outside the production writer domain, so test
+fixtures cannot become protected writes accidentally. Do not relax the writer
+domain predicate to accommodate fixtures, and do not replace an explicitly
+configured trusted validation `TMPDIR`.
+
 When local validation is required, normal `shipyard run`, `shipyard ship`, and
 `shipyard pr` submissions persist their resolved request and exact
 checkout/configuration provenance, ensure the matching-version daemon is live,

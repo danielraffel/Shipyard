@@ -89,11 +89,18 @@ impl Drop for ProductionWriterDomainLease {
 pub(crate) fn acquire_for_protected_path(
     path: &Path,
 ) -> io::Result<Option<ProductionWriterDomainLease>> {
-    let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
-    if !is_protected_path(path, &home_dir(), &runtime_paths)? {
+    if !is_current_protected_path(path)? {
         return Ok(None);
     }
+    let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
     acquire_thread_lease_at(&runtime_paths.state_dir, DEFAULT_ACQUIRE_TIMEOUT).map(Some)
+}
+
+/// Report whether a path belongs to the current machine's production writer
+/// domain without acquiring its lease.
+pub(crate) fn is_current_protected_path(path: &Path) -> io::Result<bool> {
+    let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
+    is_protected_path(path, &home_dir(), &runtime_paths)
 }
 
 fn acquire_thread_lease_at(
