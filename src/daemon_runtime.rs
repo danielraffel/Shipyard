@@ -185,18 +185,15 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     )?;
     let repos = normalize_repos(config.repos);
     let registrar_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let registrar = Arc::new(Mutex::new(Registrar::new_with_context(
-        config.mode,
-        &config.state_dir,
-        &registrar_cwd,
-    )));
+    let registrar = Registrar::new_with_context(config.mode, &config.state_dir, &registrar_cwd);
+    let registration = Arc::new(RegistrationState::new(registrar));
     let registration_error = Arc::new(Mutex::new(None::<String>));
     let execution_error = Arc::new(Mutex::new(None::<String>));
     let ship_dir = config.state_dir.join("ship");
     let ship_dir_for_list = ship_dir.clone();
 
     let status_provider = daemon_status_provider(
-        Arc::clone(&registrar),
+        Arc::clone(&registration),
         repos.clone(),
         Arc::clone(&registration_error),
         Arc::clone(&execution_error),
@@ -243,7 +240,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         );
         sync_tunnel_registration(
             &tunnel_runtime,
-            &registrar,
+            &registration,
             &registration_error,
             &repos,
             &mut registration_sync,
@@ -293,7 +290,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         thread::sleep(Duration::from_millis(100));
     }
 
-    unregister_webhooks(&registrar);
+    unregister_webhooks(&registration);
     tunnel_runtime.stop();
     server
         .stop()
@@ -302,8 +299,39 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
 }
 
 #[cfg(unix)]
+struct RegistrationState {
+    registrar: Mutex<Registrar>,
+    // Status must never wait behind synchronous GitHub webhook I/O. Publish a
+    // separate snapshot and refresh it only after registrar mutations finish.
+    published_repos: Mutex<Vec<String>>,
+}
+
+#[cfg(unix)]
+impl RegistrationState {
+    fn new(registrar: Registrar) -> Self {
+        let published_repos = registrar.all().keys().cloned().collect();
+        Self {
+            registrar: Mutex::new(registrar),
+            published_repos: Mutex::new(published_repos),
+        }
+    }
+
+    fn published_repos(&self) -> Vec<String> {
+        self.published_repos
+            .lock()
+            .map_or_else(|_| Vec::new(), |repos| repos.clone())
+    }
+
+    fn publish(&self, repos: Vec<String>) {
+        if let Ok(mut published) = self.published_repos.lock() {
+            *published = repos;
+        }
+    }
+}
+
+#[cfg(unix)]
 fn daemon_status_provider(
-    registrar: Arc<Mutex<Registrar>>,
+    registration: Arc<RegistrationState>,
     configured_repos: Vec<String>,
     registration_error: Arc<Mutex<Option<String>>>,
     execution_error: Arc<Mutex<Option<String>>>,
@@ -320,7 +348,7 @@ fn daemon_status_provider(
             tunnel_verified_at: tunnel.verified_at,
             subscribers: 0,
             last_event_at: last_event_at.lock().ok().and_then(|guard| *guard),
-            registered_repos: registered_repos_snapshot(&registrar),
+            registered_repos: registration.published_repos(),
             configured_repos: configured_repos.clone(),
             rate_limit: None,
             last_error: registration_error
@@ -418,7 +446,7 @@ fn archive_closed_pull_request_ship_state(
 #[cfg(unix)]
 fn sync_tunnel_registration(
     tunnel_runtime: &TunnelRuntime,
-    registrar: &Arc<Mutex<Registrar>>,
+    registration: &Arc<RegistrationState>,
     registration_error: &Arc<Mutex<Option<String>>>,
     repos: &[String],
     registration_sync: &mut RegistrationSyncState,
@@ -432,7 +460,7 @@ fn sync_tunnel_registration(
         if !registration_sync.should_attempt(url, now) {
             return;
         }
-        if register_webhooks(registrar, registration_error, repos, url, secret) {
+        if register_webhooks(registration, registration_error, repos, url, secret) {
             registration_sync.record_success(url);
         } else {
             registration_sync.record_failure(url, now);
@@ -1337,13 +1365,13 @@ fn public_webhook_url_for_snapshot(snapshot: &TunnelSnapshot) -> Option<String> 
 
 #[cfg(unix)]
 fn register_webhooks(
-    registrar: &Arc<Mutex<Registrar>>,
+    registration: &Arc<RegistrationState>,
     registration_error: &Arc<Mutex<Option<String>>>,
     repos: &[String],
     public_url: &str,
     secret: &str,
 ) -> bool {
-    let Ok(mut registrar) = registrar.lock() else {
+    let Ok(mut registrar) = registration.registrar.lock() else {
         return false;
     };
     let mut first_error = None;
@@ -1358,6 +1386,9 @@ fn register_webhooks(
             }
         }
     }
+    let repos_snapshot = registrar.all().keys().cloned().collect();
+    drop(registrar);
+    registration.publish(repos_snapshot);
     let succeeded = first_error.is_none();
     if let Ok(mut status_error) = registration_error.lock() {
         *status_error = first_error;
@@ -1381,8 +1412,8 @@ fn registration_error_message(repo: &str, error: &RegistrarError) -> String {
 }
 
 #[cfg(unix)]
-fn unregister_webhooks(registrar: &Arc<Mutex<Registrar>>) {
-    let Ok(mut registrar) = registrar.lock() else {
+fn unregister_webhooks(registration: &Arc<RegistrationState>) {
+    let Ok(mut registrar) = registration.registrar.lock() else {
         return;
     };
     if let Err(error) = registrar.unregister_all() {
@@ -1390,14 +1421,6 @@ fn unregister_webhooks(registrar: &Arc<Mutex<Registrar>>) {
             "shipyard daemon: failed to unregister webhooks: {error}"
         ));
     }
-}
-
-#[cfg(unix)]
-fn registered_repos_snapshot(registrar: &Arc<Mutex<Registrar>>) -> Vec<String> {
-    registrar.lock().map_or_else(
-        |_| Vec::new(),
-        |registrar| registrar.all().keys().cloned().collect(),
-    )
 }
 
 fn send_stop_request(socket_path: &Path) -> std::io::Result<()> {
@@ -1621,11 +1644,11 @@ mod tests {
     #[cfg(unix)]
     use std::process::{Command, ExitCode, Stdio};
     #[cfg(unix)]
-    use std::sync::Arc;
-    #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(unix)]
     use std::sync::mpsc;
+    #[cfg(unix)]
+    use std::sync::{Arc, Mutex};
     #[cfg(unix)]
     use std::thread;
     #[cfg(unix)]
@@ -1639,9 +1662,10 @@ mod tests {
     use super::resolve_repos;
     #[cfg(unix)]
     use super::{
-        DaemonRunConfig, DaemonRunError, RegistrationSyncState, WebhookRequest,
-        archive_closed_pull_request_ship_state, daemon_tunnel_config, handle_webhook_request,
-        load_or_create_webhook_secret, parse_tunnel_enabled, pid_alive, prepare_daemon_temp_dir,
+        DaemonRunConfig, DaemonRunError, RegistrationState, RegistrationSyncState, TunnelSnapshot,
+        WebhookRequest, archive_closed_pull_request_ship_state, daemon_status_provider,
+        daemon_tunnel_config, handle_webhook_request, load_or_create_webhook_secret,
+        parse_tunnel_enabled, pid_alive, prepare_daemon_temp_dir,
         process_looks_like_shipyard_daemon, reconcile_healed_event, run_blocking, ship_state_map,
         should_start_reconcile, start_tunnel_runtime, stop_running,
     };
@@ -1651,6 +1675,8 @@ mod tests {
     use crate::identity::RuntimeMode;
     #[cfg(unix)]
     use crate::reconcile::ReconcileTransition;
+    #[cfg(unix)]
+    use crate::registrar::Registrar;
     #[cfg(unix)]
     use crate::ship_state::DispatchedRun;
     use crate::ship_state::{ShipState, ShipStateStore};
@@ -1804,6 +1830,33 @@ mod tests {
 
         assert!(!state.should_attempt(url, now + Duration::from_mins(1)));
         assert!(state.should_attempt(url, now + super::WEBHOOK_REGISTRATION_RETRY_INTERVAL));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_does_not_wait_for_registrar_io_lock() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let registration = Arc::new(RegistrationState::new(Registrar::new(state_dir.path())));
+        registration.publish(vec!["owner/repo".to_owned()]);
+        let provider = daemon_status_provider(
+            Arc::clone(&registration),
+            vec!["owner/repo".to_owned(), "owner/pending".to_owned()],
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(TunnelSnapshot::inactive())),
+        );
+
+        let registrar_io = registration.registrar.lock().expect("registrar lock");
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || tx.send(provider()).expect("send status"));
+        let status = rx.recv_timeout(Duration::from_millis(250));
+        drop(registrar_io);
+        worker.join().expect("status worker");
+        let status = status.expect("status must not wait for registrar network I/O");
+
+        assert_eq!(status.registered_repos, vec!["owner/repo"]);
+        assert_eq!(status.configured_repos, vec!["owner/repo", "owner/pending"]);
     }
 
     #[cfg(unix)]
