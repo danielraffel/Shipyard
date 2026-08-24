@@ -86,6 +86,34 @@ class GuardianLifecycleTests(unittest.TestCase):
         ), self.assertRaisesRegex(guardian.GuardianError, "inconsistent lsof"):
             guardian._lock_holders(path)
 
+    def test_json_status_probe_does_not_inherit_protected_stdio_marker(self) -> None:
+        snapshot = guardian.ProcessSnapshot(
+            pid=4242,
+            executable="/tmp/shipyard",
+            argv=("/tmp/shipyard", "daemon", "run"),
+            environment={
+                "HOME": "/tmp/home",
+                guardian.PROTECTED_STDIO_PATH_ENV: "/tmp/daemon.log",
+            },
+            cwd="/tmp",
+            stdin_path="/dev/null",
+            stdout_path="/tmp/daemon.log",
+            stderr_path="/tmp/daemon.log",
+            start_time="Sat Aug 22 00:00:00 2026",
+        )
+        completed = mock.Mock(returncode=0, stdout='{"running":true}', stderr="")
+
+        with mock.patch.object(guardian, "_run", return_value=completed) as run:
+            self.assertEqual(
+                guardian._json_command(snapshot, Path("/tmp/shipyard"), "daemon", "status"),
+                {"running": True},
+            )
+
+        self.assertNotIn(
+            guardian.PROTECTED_STDIO_PATH_ENV,
+            run.call_args.kwargs["env"],
+        )
+
     def test_finalize_wait_accepts_a_transient_production_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "writer.lock"

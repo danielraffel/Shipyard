@@ -349,10 +349,15 @@ def _json_command(
     *args: str,
     deadline: Optional[float] = None,
 ) -> dict[str, object]:
+    foreground_environment = dict(snapshot.environment)
+    # This foreground verifier writes to a captured pipe, not the daemon log.
+    # Inheriting the daemon's marker can make a read-only status probe wait
+    # behind the very writer-domain audit the guardian is measuring.
+    foreground_environment.pop(PROTECTED_STDIO_PATH_ENV, None)
     result = _run(
         [str(installed), "--json", *args],
         cwd=snapshot.cwd,
-        env=snapshot.environment,
+        env=foreground_environment,
         timeout=_bounded_timeout(deadline),
     )
     value = json.loads(result.stdout)
