@@ -560,6 +560,14 @@ Full behavior: `docs/local-mac-pool.md` § Same-backend transient retry.
 
 ## Durable Queue: daemon-owned execution
 
+The detached daemon must own a trusted temporary root independent of the
+launching shell. `shipyard daemon start` creates a real owner-private
+`<state>/daemon/tmp` directory, rejects a symlink at that path, sets mode 0700
+on Unix, and exports it as `TMPDIR` before detaching. Preserve that invariant:
+launchd and minimal SSH environments may omit `TMPDIR`, while macOS `/tmp` is a
+symlink that hardened consumers correctly reject under `O_NOFOLLOW`. A shell
+profile export is not a durable fix for daemon-owned work.
+
 When local validation is required, normal `shipyard run`, `shipyard ship`, and
 `shipyard pr` submissions persist their resolved request and exact
 checkout/configuration provenance, ensure the matching-version daemon is live,

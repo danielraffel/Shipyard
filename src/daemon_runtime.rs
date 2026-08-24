@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
+use std::io;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
@@ -603,6 +604,7 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
     let daemon_dir = request.state_dir.join("daemon");
     crate::writer_domain_lease::ensure_protected_dir_all(&daemon_dir)
         .map_err(|error| io_spawn_error(&error))?;
+    let temp_dir = prepare_daemon_temp_dir(&daemon_dir).map_err(|error| io_spawn_error(&error))?;
 
     if read_daemon_status(&request.state_dir).is_some() {
         return Ok(read_pid_file(&daemon_dir.join("daemon.pid")).unwrap_or(0));
@@ -647,6 +649,7 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
 
     let mut command = Command::new(&request.binary);
     command.env("PATH", crate::paths::unattended_tool_path());
+    command.env("TMPDIR", &temp_dir);
     command.arg("--mode").arg(request.mode.as_str());
     if let Some(global_dir) = &request.global_dir_override {
         command.arg("--global-dir").arg(global_dir);
@@ -700,6 +703,28 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
         log_path.display(),
         read_log_tail(&log_path)
     )))
+}
+
+fn prepare_daemon_temp_dir(daemon_dir: &Path) -> io::Result<PathBuf> {
+    let temp_dir = daemon_dir.join("tmp");
+    crate::writer_domain_lease::ensure_protected_dir_all(&temp_dir)?;
+    let metadata = fs::symlink_metadata(&temp_dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "daemon temporary path must be a real directory: {}",
+                temp_dir.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(temp_dir)
 }
 
 /// Best-effort daemon shutdown via IPC stop request.
@@ -1616,7 +1641,7 @@ mod tests {
     use super::{
         DaemonRunConfig, DaemonRunError, RegistrationSyncState, WebhookRequest,
         archive_closed_pull_request_ship_state, daemon_tunnel_config, handle_webhook_request,
-        load_or_create_webhook_secret, parse_tunnel_enabled, pid_alive,
+        load_or_create_webhook_secret, parse_tunnel_enabled, pid_alive, prepare_daemon_temp_dir,
         process_looks_like_shipyard_daemon, reconcile_healed_event, run_blocking, ship_state_map,
         should_start_reconcile, start_tunnel_runtime, stop_running,
     };
@@ -1635,6 +1660,28 @@ mod tests {
     use crate::webhook::hmac_sha256_hex;
     #[cfg(unix)]
     use wait_timeout::ChildExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_temp_dir_is_real_and_owner_private() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let state = tempfile::tempdir().expect("state dir");
+        let daemon_dir = state.path().join("daemon");
+        std::fs::create_dir(&daemon_dir).expect("daemon dir");
+        let temp_dir = prepare_daemon_temp_dir(&daemon_dir).expect("daemon temp dir");
+        let metadata = std::fs::symlink_metadata(&temp_dir).expect("temp metadata");
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+
+        std::fs::remove_dir(&temp_dir).expect("remove temp dir");
+        let outside = state.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside dir");
+        symlink(&outside, &temp_dir).expect("symlink temp dir");
+        let error = prepare_daemon_temp_dir(&daemon_dir).expect_err("symlink rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[cfg(unix)]
     #[test]

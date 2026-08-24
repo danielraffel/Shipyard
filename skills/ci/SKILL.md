@@ -1499,6 +1499,15 @@ A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever the ma
 
 **Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `scripts/ci_matrix.py`, release packaging scripts, or `src/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.
 
+**Detached daemon temp roots must not depend on the launching shell.** A daemon
+started from launchd or a minimal SSH environment may inherit no `TMPDIR`.
+Platform libraries then fall back to `/tmp`, which is a symlink on macOS and is
+correctly rejected by hardened consumers that open parent directories with
+`O_NOFOLLOW`. `shipyard daemon start` therefore creates an owner-private real
+directory under its state-owned daemon root and exports that exact path as
+`TMPDIR` before detaching. Preserve the real-directory and mode-0700 checks;
+adding a shell-profile export does not fix unattended workers.
+
 **Manual release fallback:** `./scripts/release.sh` still exists for emergencies but is no longer the happy path. Normal releases flow through `shipyard pr` → merge → auto-release workflow.
 
 **Local Linux lease liveness:** one `runner local-linux-lease` fleet
