@@ -260,6 +260,56 @@ While a target runs, Shipyard checks the live PR head at a
 bounded interval and durably requests cancellation when it no longer matches
 the queued SHA; transient head-query failures do not manufacture cancellation.
 
+## Reading a shadow-comparison trial
+
+After a `shadow_compare` target finishes, inspect its immutable activation and
+adapter result without starting another build or changing policy:
+
+```bash
+shipyard --json changed-surface-trial-status \
+  --repo owner/repo \
+  --pr 123 \
+  --target mac \
+  --head "$EXACT_PR_HEAD"
+```
+
+The command is read-only and reports one stable state under `trial.state`:
+
+- `collecting` (exit 3): the exact shadow activation or its result has not
+  arrived;
+- `ready` (exit 0): exactly one result matches the activation's repository,
+  PR, target, base/head/tree, execution payload, policy, selection,
+  validation-contract, workflow, selected-test, and selected-build-target
+  identities; the selected and full return codes are zero; the full suite is
+  explicitly authoritative; and the comparison verdict is `matched_pass`;
+- `rejected` (exit 1): evidence is malformed, unsafe to read, non-passing,
+  identity/digest-inconsistent, or ambiguous. More than one append-only result
+  for the exact identity is intentionally ambiguous even if the files are
+  byte-equivalent.
+
+For a build-and-test plan, `trial.timing` preserves the verified input-check,
+selected-build, selected-test, incremental-full-build, estimated-total-full-
+build, and full-test durations from the adapter receipt. Shipyard recomputes
+the selected total (including receipt verification), estimated full total,
+seconds saved, and speedup ratio. The
+full-build estimate is deliberately the selected build plus the incremental
+remainder; treating the warm incremental remainder as a standalone full build
+would overstate savings. Missing, negative, non-finite, or internally
+inconsistent timing rejects the result. Legacy test-only trials remain
+verifiable without timing telemetry.
+
+`selection_receipt_digest` is the authoritative cross-receipt selection
+binding. Shipyard computes it over the complete exact selection receipt,
+including its changed-paths digest; the activation and adapter result must echo
+that same digest. The activation plan's standalone `changed_paths_digest` is a
+diagnostic duplicate that the adapter result schema does not emit, so trial
+status neither treats that duplicate as independent authority nor pretends to
+compare a field that is absent from the result.
+
+This status is comparison evidence only. It does not promote the selector,
+write a graduation decision, enqueue work, mutate a receipt, or replace any
+merge/release gate.
+
 ## Default-off supervised pre-push shadow receipt
 
 Shipyard can prepare the same protected-base changed-surface selection before

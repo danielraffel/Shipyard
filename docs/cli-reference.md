@@ -20,6 +20,7 @@ shipyard run --resume-from test    # skip setup/configure/build (where supported
 shipyard run --continue            # don't stop at first failure
 shipyard run command --target linux-vm --artifact 'build/linux-x64/lib/libv8.so' -- bash -lc './build-v8.py --target linux-x64'
 shipyard --json changed-surface-plan --repo OWNER/REPO --pr 123 --target mac  # shadow-only exact-head test plan
+shipyard --json changed-surface-trial-status --repo OWNER/REPO --pr 123 --target mac --head HEAD_SHA  # read-only shadow result verdict
 
 # Ship
 shipyard ship                  # PR → validate → merge on green

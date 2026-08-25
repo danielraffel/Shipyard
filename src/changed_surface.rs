@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod execution;
+pub mod trial;
 pub use execution::{
     AuthoritativeExecutionPlan, ChangedSurfaceExecutionPolicy, ExecutionCommandTransport,
     ExecutionDisposition, ExecutionMode, ExecutionPlanError, FullExecutionReason,
