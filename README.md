@@ -13,6 +13,7 @@ shipyard ship              # validate, open PR, merge on green
 shipyard watch             # live-tail an in-flight ship
 shipyard queue-observe     # read-only GitHub queue deltas with adaptive backoff
 shipyard changed-surface-plan --pr 123 --target mac  # fail-closed shadow test plan
+shipyard changed-surface-trial-status --repo owner/repo --pr 123 --target mac --head "$HEAD_SHA"  # verify shadow comparison
 shipyard wait pr 151 --state green  # wait on release / PR / run conditions
 shipyard auto-merge <pr>   # cron-friendly one-shot merge-on-green
 shipyard merge-queue status  # inspect the local queue-mutation hold

@@ -153,6 +153,17 @@ or ineligible, Shipyard preserves the original stages and resumes the ordinary
 test stage without a second observation or activation. Restart schema v3 from
 `build` or start a fresh validation.
 
+After a shadow comparison completes, use `shipyard --json
+changed-surface-trial-status --repo <owner/repo> --pr <n> --target <name>
+--head <sha>` to read its immutable activation and single adapter result. The
+command reports `collecting` (exit 3), `ready` (exit 0), or `rejected` (exit 1)
+and fails closed on ambiguous files, identity/digest drift, nonzero results, or
+invalid timing. For schema-v3 build-and-test trials, its selected total includes
+receipt verification and it reconstructs the full-build estimate from selected
+build plus the warm incremental remainder before reporting savings or speedup.
+The command is evidence inspection only: it never changes machine mode,
+accepted policy digests, queue state, or merge readiness.
+
 Prospective pre-push selection is only a transport optimization and is also
 machine-global default-off. Shipyard permits one non-delete branch update and
 authenticates the actual `core.hooksPath/pre-push` against the protected base:

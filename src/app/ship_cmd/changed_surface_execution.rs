@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::CliFailure;
 use super::super::changed_surface_cmd::{ChangedSurfacePlanArgs, observe_changed_surface_plan};
+use crate::changed_surface::trial::{TrialIdentity, result_directory};
 use crate::changed_surface::{
     ExecutionCommandTransport, ExecutionDisposition, plan_authoritative_execution,
 };
@@ -551,24 +552,15 @@ pub(super) fn apply_changed_surface_execution(
 }
 
 fn result_dir(state_dir: &Path, repo: &str, pr: u64, head: &str, target: &str) -> PathBuf {
-    state_dir
-        .join("changed-surface-results")
-        .join(path_component(repo))
-        .join(pr.to_string())
-        .join(path_component(head))
-        .join(path_component(target))
-}
-
-fn path_component(value: &str) -> String {
-    let canonical: String = value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => byte as char,
-            _ => '_',
-        })
-        .take(48)
-        .collect();
-    format!("{canonical}-{}", sha256(value.as_bytes()))
+    result_directory(
+        state_dir,
+        &TrialIdentity {
+            repository: repo.to_owned(),
+            pull_request: pr,
+            target: target.to_owned(),
+            head_sha: head.to_owned(),
+        },
+    )
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -711,13 +703,14 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic, path_component,
-        persist_fallback_diagnostic, selected_resume_block_reason, shell_quote,
+        FallbackDiagnostic, MachineMode, MachinePolicy, bounded_diagnostic,
+        persist_fallback_diagnostic, result_dir, selected_resume_block_reason, shell_quote,
         target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::Path;
 
     #[test]
     fn machine_mode_is_default_off_and_ignores_repo_layers() {
@@ -742,8 +735,15 @@ mod tests {
 
     #[test]
     fn path_inputs_are_bounded_before_shell_use() {
-        assert_ne!(path_component("a/b"), path_component("a_b"));
-        assert_eq!(path_component("a/b"), path_component("a/b"));
+        let state = Path::new("/state");
+        assert_ne!(
+            result_dir(state, "a/b", 1, "head", "mac"),
+            result_dir(state, "a_b", 1, "head", "mac")
+        );
+        assert_eq!(
+            result_dir(state, "a/b", 1, "head", "mac"),
+            result_dir(state, "a/b", 1, "head", "mac")
+        );
         assert_eq!(shell_quote(std::path::Path::new("a'b")), "'a'\"'\"'b'");
     }
 

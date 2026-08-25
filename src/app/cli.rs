@@ -203,6 +203,22 @@ pub(super) enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Verify one exact-head changed-surface shadow-comparison trial.
+    #[command(name = "changed-surface-trial-status")]
+    ChangedSurfaceTrialStatus {
+        /// Canonical owner/repo identity recorded by the activation plan.
+        #[arg(long = "repo")]
+        repository: String,
+        /// Pull request whose exact-head shadow result is inspected.
+        #[arg(long = "pr")]
+        pull_request: u64,
+        /// Target whose shadow-comparison receipt is inspected.
+        #[arg(long)]
+        target: String,
+        /// Exact 40-character lowercase pull-request head SHA.
+        #[arg(long = "head")]
+        head_sha: String,
+    },
     /// Clean up old logs, bundles, evidence, and optional ship-state.
     Cleanup {
         /// Indefinitely pin one job's logs for incident/audit preservation.
@@ -2027,6 +2043,47 @@ mod tests {
         assert!(
             Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "1",])
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn changed_surface_trial_status_requires_explicit_exact_identity() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "changed-surface-trial-status",
+            "--repo",
+            "owner/repo",
+            "--pr",
+            "42",
+            "--target",
+            "mac",
+            "--head",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .expect("trial status command");
+        assert!(matches!(
+            cli.command,
+            Command::ChangedSurfaceTrialStatus {
+                repository,
+                pull_request: 42,
+                target,
+                head_sha,
+            } if repository == "owner/repo"
+                && target == "mac"
+                && head_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "changed-surface-trial-status",
+                "--repo",
+                "owner/repo",
+                "--pr",
+                "42",
+                "--target",
+                "mac",
+            ])
+            .is_err()
         );
     }
 

@@ -44,6 +44,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
 | Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |
 | Shadow-plan changed-surface tests for an exact PR head | `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n> --target <name>` (base-owned literal tests only; full suite remains authoritative; identity mismatch hard-fails, ambiguity falls back full) |
+| Read one exact shadow-comparison result | `shipyard --json changed-surface-trial-status --repo <owner/repo> --pr <n> --target <name> --head <sha>` (read-only; exit 3 collecting, 0 ready, 1 rejected; validates exact receipt identity plus conservative timing/savings and never promotes policy or merge readiness) |
 | Show run logs | `shipyard logs <job_id> --json` |
 | **Runner watchdog: health check** | `shipyard runner status --repo <r> --runner-id <id>` |
 | **Runner watchdog: list stale queued runs (dry-run)** | `shipyard runner cleanup --dry-run` |

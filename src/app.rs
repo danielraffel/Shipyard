@@ -16,6 +16,7 @@ mod auto_merge_cmd;
 mod branch_cmd;
 mod capacity_cmd;
 mod changed_surface_cmd;
+mod changed_surface_trial_cmd;
 mod changelog_cmd;
 mod ci_cmd;
 mod cleanup_cmd;
@@ -62,6 +63,9 @@ use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
 use self::branch_cmd::branch_command;
 use self::changed_surface_cmd::{ChangedSurfacePlanArgs, changed_surface_plan_command};
+use self::changed_surface_trial_cmd::{
+    ChangedSurfaceTrialStatusArgs, changed_surface_trial_status_command,
+};
 use self::changelog_cmd::changelog_command;
 use self::ci_cmd::ci_command;
 use self::cleanup_cmd::{
@@ -418,6 +422,24 @@ where
                 stdout,
             );
         }
+        Command::ChangedSurfaceTrialStatus {
+            repository,
+            pull_request,
+            target,
+            head_sha,
+        } => {
+            return changed_surface_trial_status_command(
+                &ChangedSurfaceTrialStatusArgs {
+                    repository,
+                    pull_request,
+                    target,
+                    head_sha,
+                },
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
+        }
         Command::Wait { command } => {
             return handle_wait_command(
                 command,
@@ -509,6 +531,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Queue
         | Command::QueueObserve { .. }
         | Command::ChangedSurfacePlan { .. }
+        | Command::ChangedSurfaceTrialStatus { .. }
         | Command::Cleanup { .. }
         | Command::Targets { .. }
         | Command::Quarantine { .. }
