@@ -3709,6 +3709,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn packed_build_tree(temp: &TempDir) -> (PathBuf, ArtifactManifest) {
         let source = temp.path().join("configured-build");
         fs::create_dir_all(source.join("bin")).unwrap();
@@ -3725,6 +3726,41 @@ mod tests {
         (archive, outcome.manifest)
     }
 
+    fn restorable_build_tree(temp: &TempDir) -> (PathBuf, ArtifactManifest) {
+        let cache = b"configured";
+        let runner = b"executable";
+        let bytes = test_archive(&[
+            TestArchiveEntry::File("CMakeCache.txt", 0o644, cache),
+            TestArchiveEntry::Directory("bin", 0o755),
+            TestArchiveEntry::File("bin/test-runner", 0o755, runner),
+        ]);
+        let entries = vec![
+            LayoutEntry::File {
+                path: "CMakeCache.txt".into(),
+                mode: 0o644,
+                size_bytes: cache.len() as u64,
+                sha256: digest(cache),
+            },
+            LayoutEntry::Directory {
+                path: "bin".into(),
+                mode: 0o755,
+            },
+            LayoutEntry::File {
+                path: "bin/test-runner".into(),
+                mode: 0o755,
+                size_bytes: runner.len() as u64,
+                sha256: digest(runner),
+            },
+        ];
+        let mut manifest = archive_manifest(&bytes, entries);
+        manifest.root_mode = Some(0o750);
+        let archive = temp.path().join("configured-build.tar.zst");
+        fs::write(&archive, bytes).unwrap();
+        manifest.validate().unwrap();
+        (archive, manifest)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn build_tree_pack_round_trips_exact_layout_and_modes() {
         let temp = TempDir::new().unwrap();
@@ -3780,6 +3816,26 @@ mod tests {
         assert_eq!(fs::read(archive).unwrap(), b"sentinel");
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn build_tree_pack_fails_closed_without_no_follow_directory_handles() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("object.o"), b"object").unwrap();
+        let archive = temp.path().join("artifact.tar.zst");
+
+        let result = pack_verified_build_tree(&source, &archive, build_tree_inputs());
+
+        assert!(matches!(
+            result,
+            Err(Error::Invalid(message))
+                if message.contains("requires no-follow directory handles")
+        ));
+        assert!(!archive.exists());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn build_tree_pack_supports_ustar_paths_and_rejects_extension_records() {
         let temp = TempDir::new().unwrap();
@@ -3813,7 +3869,7 @@ mod tests {
     #[test]
     fn build_tree_restore_quarantines_and_replaces_existing_tree() {
         let temp = TempDir::new().unwrap();
-        let (archive, manifest) = packed_build_tree(&temp);
+        let (archive, manifest) = restorable_build_tree(&temp);
         let destination = temp.path().join("active-build");
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("stale"), b"old").unwrap();
@@ -3840,7 +3896,7 @@ mod tests {
     #[test]
     fn build_tree_restore_rolls_back_after_extraction_failure() {
         let temp = TempDir::new().unwrap();
-        let (archive, manifest) = packed_build_tree(&temp);
+        let (archive, manifest) = restorable_build_tree(&temp);
         let destination = temp.path().join("active-build");
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("sentinel"), b"old").unwrap();
@@ -3898,7 +3954,7 @@ mod tests {
     #[test]
     fn build_tree_restore_rejects_tamper_before_quarantine() {
         let temp = TempDir::new().unwrap();
-        let (archive, manifest) = packed_build_tree(&temp);
+        let (archive, manifest) = restorable_build_tree(&temp);
         let destination = temp.path().join("active-build");
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("sentinel"), b"old").unwrap();
@@ -3918,7 +3974,7 @@ mod tests {
         assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"old");
 
         let tampered_manifest_temp = TempDir::new().unwrap();
-        let (archive, mut manifest) = packed_build_tree(&tampered_manifest_temp);
+        let (archive, mut manifest) = restorable_build_tree(&tampered_manifest_temp);
         let LayoutEntry::File { sha256, .. } = manifest
             .entries
             .iter_mut()
@@ -4099,7 +4155,7 @@ mod tests {
     #[test]
     fn build_tree_restore_preserves_quarantine_when_destination_reappears() {
         let temp = TempDir::new().unwrap();
-        let (archive, manifest) = packed_build_tree(&temp);
+        let (archive, manifest) = restorable_build_tree(&temp);
         let destination = temp.path().join("active-build");
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("sentinel"), b"old").unwrap();
@@ -4136,7 +4192,7 @@ mod tests {
     #[test]
     fn build_tree_restore_retains_prior_tree_until_publication_is_durable() {
         let temp = TempDir::new().unwrap();
-        let (archive, manifest) = packed_build_tree(&temp);
+        let (archive, manifest) = restorable_build_tree(&temp);
         let destination = temp.path().join("active-build");
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("sentinel"), b"old").unwrap();
