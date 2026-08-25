@@ -30,7 +30,8 @@ pub const MAX_ATTEMPTS_PER_SHARD: usize = 32;
 pub const MAX_ATTEMPT_RECORDS: usize = 16_384;
 /// Maximum encoded size of any worker report or durable record.
 pub const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RELATIONS: usize = 1_000_000;
+/// Maximum topology and capability relations accepted by one inventory.
+pub const MAX_RELATIONS: usize = 1_000_000;
 const MAX_PAYLOAD_BYTES: usize = MAX_RECORD_BYTES - 4_096;
 const HMAC_BLOCK_BYTES: usize = 64;
 

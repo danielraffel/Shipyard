@@ -142,6 +142,18 @@ not meet both 120 seconds and 10 percent, or transfer/dispatch overhead above
 recovery is proven. No v1 canary decision dispatches work or satisfies merge
 readiness.
 
+The shadow inventory producer accepts only bounded CTest JSON-v1 observations.
+It requires controller-owned target/per-test capability declarations and an
+explicit host/fleet scope for every observed `RESOURCE_LOCK`; unused
+declarations, a filtered set that differs from the independent expected count
+or sorted-ID digest, a test whose emitted configuration differs from the exact
+controller-owned `CTest -C` configuration, ambiguous property types, duplicate
+properties, unsupported versions, disabled or non-executable tests, and
+nonempty `REQUIRED_FILES` without controller filesystem attestation, and
+`RESOURCE_GROUPS` fail closed. Capability expansion is bounded before per-test
+cloning. It is a pure translation boundary: it does not invoke CTest, dispatch
+work, or satisfy merge readiness.
+
 Bounded execution remains machine-global default-off. For a controlled canary,
 use `changed_surface_execution.mode = "shadow_compare"` in trusted global
 config; the repository cannot enable it, the queued command is exact-bound,
