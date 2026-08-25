@@ -2,15 +2,31 @@ use super::{
     GitHubActions, MutationApplyContext, ObservedPr, Path, RepoObservation, StewardDecision,
     StewardLedger, StewardPolicy, Value, acquire_pr_mutation_guard, attempt_key, attempts_for,
     classify_pr, enqueue_requirements_pending, gh_json, merge_queue_snapshot, parse_run,
-    pull_request_with_required_checks, record_audit, save_ledger,
+    pull_request_with_required_checks,
+    queue_priority_recovery::{
+        QueueRecoveryEvidence, final_mutable_authority_matches, receipt_key, recovery_evidence,
+    },
+    record_audit, save_ledger,
 };
 
+#[cfg(test)]
 pub(super) fn mutate_pr(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     policy: &StewardPolicy,
     decision: &StewardDecision,
     ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    mutate_pr_with_recovery(context, pr, policy, decision, ledger, false)
+}
+
+pub(super) fn mutate_pr_with_recovery(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    policy: &StewardPolicy,
+    decision: &StewardDecision,
+    ledger: &mut StewardLedger,
+    recover_hosted_setup_eviction_priority: bool,
 ) -> (Option<String>, Option<String>) {
     if !matches!(
         decision,
@@ -50,7 +66,13 @@ pub(super) fn mutate_pr(
     }
     let pr = &live_pr;
     match decision {
-        StewardDecision::ArmMergeQueue => enqueue_pull_request(context, pr, policy, ledger),
+        StewardDecision::ArmMergeQueue => enqueue_pull_request_with_recovery(
+            context,
+            pr,
+            policy,
+            ledger,
+            recover_hosted_setup_eviction_priority,
+        ),
         StewardDecision::RerunTransient { run_ids } => {
             mutate_transient_reruns(context, pr, policy, run_ids, ledger)
         }
@@ -58,17 +80,48 @@ pub(super) fn mutate_pr(
     }
 }
 
+#[cfg(test)]
 pub(super) fn enqueue_pull_request(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     policy: &StewardPolicy,
     ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
+    enqueue_pull_request_with_recovery(context, pr, policy, ledger, false)
+}
+
+fn enqueue_pull_request_with_recovery(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    policy: &StewardPolicy,
+    ledger: &mut StewardLedger,
+    recover_hosted_setup_eviction_priority: bool,
+) -> (Option<String>, Option<String>) {
+    let recovery = if recover_hosted_setup_eviction_priority {
+        match recovery_evidence(context.actions, context.observation, pr, ledger) {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                record_audit(
+                    ledger,
+                    &context.observation.repo,
+                    &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
+                    "queue_priority_recovery_unreadable_fell_back",
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let guard = match acquire_pr_mutation_guard(
         context.mutation_control,
         context.observation,
         pr,
-        "runner steward enqueue pull request",
+        if recovery.is_some() {
+            "runner steward restore hosted setup eviction priority"
+        } else {
+            "runner steward enqueue pull request"
+        },
     ) {
         Ok(guard) => guard,
         Err(error) => return (None, Some(error)),
@@ -85,7 +138,14 @@ pub(super) fn enqueue_pull_request(
             let Some(message) = message else {
                 // The exact-head observation proved this is an ordinary PR.
                 // Continue through the unchanged enqueue path below.
-                return enqueue_unstacked_pull_request(context, pr, policy, ledger, guard);
+                return enqueue_unstacked_pull_request(
+                    context,
+                    pr,
+                    policy,
+                    ledger,
+                    guard,
+                    recovery.as_ref(),
+                );
             };
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
             (
@@ -113,6 +173,7 @@ fn enqueue_unstacked_pull_request(
     policy: &StewardPolicy,
     ledger: &mut StewardLedger,
     guard: crate::merge_queue_control::MergeQueueMutationGuard,
+    recovery: Option<&QueueRecoveryEvidence>,
 ) -> (Option<String>, Option<String>) {
     let pr = match final_enqueue_revalidation(context, pr, policy, ledger) {
         Ok(Some(pr)) => pr,
@@ -138,7 +199,177 @@ fn enqueue_unstacked_pull_request(
             );
         }
     };
-    let query = "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}";
+    if let Some(observed_recovery) = recovery {
+        match recovery_evidence(context.actions, context.observation, &pr, ledger) {
+            Ok(Some(live_recovery)) if live_recovery == *observed_recovery => {}
+            Ok(_) => {
+                return match guard.finish("skipped_after_final_recovery_revalidation") {
+                    Ok(()) => (
+                        Some("skipped_after_final_recovery_revalidation".to_owned()),
+                        None,
+                    ),
+                    Err(error) => (
+                        Some("skipped_after_final_recovery_revalidation".to_owned()),
+                        Some(format!("recovery skip mutation audit failed: {error}")),
+                    ),
+                };
+            }
+            Err(error) => {
+                let audit_error = guard.finish("final_recovery_revalidation_failed").err();
+                return (
+                    None,
+                    Some(audit_error.map_or(error.clone(), |audit_error| {
+                        format!("{error}; mutation audit also failed: {audit_error}")
+                    })),
+                );
+            }
+        }
+        let pr = match final_enqueue_revalidation(context, &pr, policy, ledger) {
+            Ok(Some(pr)) => pr,
+            Ok(None) => {
+                return match guard.finish("skipped_after_final_management_authority") {
+                    Ok(()) => (
+                        Some("skipped_after_final_management_authority".to_owned()),
+                        None,
+                    ),
+                    Err(error) => (
+                        Some("skipped_after_final_management_authority".to_owned()),
+                        Some(format!("management skip mutation audit failed: {error}")),
+                    ),
+                };
+            }
+            Err(error) => {
+                let audit_error = guard.finish("final_management_authority_failed").err();
+                return (
+                    None,
+                    Some(audit_error.map_or(error.clone(), |audit_error| {
+                        format!("{error}; mutation audit also failed: {audit_error}")
+                    })),
+                );
+            }
+        };
+        match final_mutable_authority_matches(
+            context.actions,
+            context.observation,
+            &pr,
+            observed_recovery,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return match guard.finish("skipped_after_final_mutable_authority") {
+                    Ok(()) => (
+                        Some("skipped_after_final_mutable_authority".to_owned()),
+                        None,
+                    ),
+                    Err(error) => (
+                        Some("skipped_after_final_mutable_authority".to_owned()),
+                        Some(format!("authority skip mutation audit failed: {error}")),
+                    ),
+                };
+            }
+            Err(error) => {
+                let audit_error = guard.finish("final_mutable_authority_failed").err();
+                return (
+                    None,
+                    Some(audit_error.map_or(error.clone(), |audit_error| {
+                        format!("{error}; mutation audit also failed: {audit_error}")
+                    })),
+                );
+            }
+        }
+    }
+    if let Some(recovery) = recovery {
+        let key = receipt_key(recovery);
+        ledger.queue_recovery_receipts.insert(
+            key,
+            super::QueueRecoveryReceipt {
+                repo: context.observation.repo.clone(),
+                base: context.observation.base.clone(),
+                pr_number: pr.fact.number,
+                pr_head: pr.fact.head_sha.clone(),
+                base_sha: recovery.base_sha.clone(),
+                merge_group_head: recovery.merge_group_head.clone(),
+                removed_at: recovery.removed_at.clone(),
+                run_id: recovery.run_id,
+                job_id: recovery.job_id,
+                attempted_at: chrono::Utc::now().to_rfc3339(),
+                phase: super::QueueRecoveryPhase::Intent,
+            },
+        );
+        if let Err(error) = save_ledger(context.ledger_path, ledger) {
+            let message = format!(
+                "could not persist queue-recovery receipt: {}",
+                error.message
+            );
+            let audit_error = guard.finish("recovery_receipt_persistence_failed").err();
+            return (
+                None,
+                Some(audit_error.map_or(message.clone(), |audit_error| {
+                    format!("{message}; mutation audit also failed: {audit_error}")
+                })),
+            );
+        }
+        let post_receipt_pr = match final_enqueue_revalidation(context, &pr, policy, ledger) {
+            Ok(Some(pr)) => pr,
+            Ok(None) => {
+                return match guard.finish("skipped_after_recovery_receipt_authority") {
+                    Ok(()) => (
+                        Some("skipped_after_recovery_receipt_authority".to_owned()),
+                        None,
+                    ),
+                    Err(error) => (
+                        Some("skipped_after_recovery_receipt_authority".to_owned()),
+                        Some(format!("post-receipt skip mutation audit failed: {error}")),
+                    ),
+                };
+            }
+            Err(error) => {
+                let audit_error = guard.finish("recovery_receipt_authority_failed").err();
+                return (
+                    None,
+                    Some(audit_error.map_or(error.clone(), |audit_error| {
+                        format!("{error}; mutation audit also failed: {audit_error}")
+                    })),
+                );
+            }
+        };
+        match final_mutable_authority_matches(
+            context.actions,
+            context.observation,
+            &post_receipt_pr,
+            recovery,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return match guard.finish("skipped_after_recovery_receipt_mutable_authority") {
+                    Ok(()) => (
+                        Some("skipped_after_recovery_receipt_mutable_authority".to_owned()),
+                        None,
+                    ),
+                    Err(error) => (
+                        Some("skipped_after_recovery_receipt_mutable_authority".to_owned()),
+                        Some(format!("post-receipt authority audit failed: {error}")),
+                    ),
+                };
+            }
+            Err(error) => {
+                let audit_error = guard
+                    .finish("recovery_receipt_mutable_authority_failed")
+                    .err();
+                return (
+                    None,
+                    Some(audit_error.map_or(error.clone(), |audit_error| {
+                        format!("{error}; mutation audit also failed: {audit_error}")
+                    })),
+                );
+            }
+        }
+    }
+    let query = if recovery.is_some() {
+        "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,jump:true}){mergeQueueEntry{position}}}"
+    } else {
+        "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}"
+    };
     let result = context.actions.run_gh(&[
         "api".to_owned(),
         "graphql".to_owned(),
@@ -166,13 +397,37 @@ fn enqueue_unstacked_pull_request(
                     )),
                 );
             }
+            let action = if let Some(recovery) = recovery {
+                if let Some(receipt) = ledger
+                    .queue_recovery_receipts
+                    .get_mut(&receipt_key(recovery))
+                {
+                    receipt.phase = super::QueueRecoveryPhase::Accepted;
+                }
+                "enqueue_exact_head_jump_hosted_setup_eviction"
+            } else {
+                "enqueue_exact_head"
+            };
             record_audit(
                 ledger,
                 &context.observation.repo,
                 &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
-                "enqueue_exact_head",
+                action,
             );
-            (Some("enqueued".to_owned()), None)
+            if recovery.is_some() {
+                if let Err(error) = save_ledger(context.ledger_path, ledger) {
+                    return (
+                        Some("enqueued_priority_restored".to_owned()),
+                        Some(format!(
+                            "priority restoration succeeded but receipt persistence failed: {}",
+                            error.message
+                        )),
+                    );
+                }
+                (Some("enqueued_priority_restored".to_owned()), None)
+            } else {
+                (Some("enqueued".to_owned()), None)
+            }
         }
         Ok(raw) => {
             let audit_error = guard

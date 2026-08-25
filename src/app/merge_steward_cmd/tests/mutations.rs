@@ -14,9 +14,487 @@ use crate::app::merge_steward_cmd::capacity_cancellation::{
 };
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
+use crate::app::merge_steward_cmd::pr_mutations::mutate_pr_with_recovery;
 use crate::app::merge_steward_cmd::pr_mutations::rollback_transient_attempt;
 use crate::app::merge_steward_cmd::pr_mutations::run_attempt_allows_transient_rerun;
 use crate::merge_steward::StewardCheckSource;
+
+#[cfg(unix)]
+fn recovery_witness() -> QueueWitness {
+    let now = Utc::now();
+    QueueWitness {
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        base_sha: "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
+        pr_number: 42,
+        pr_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        merge_group_head: "cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+        position: 1,
+        enqueued_at: (now - chrono::Duration::minutes(20)).to_rfc3339(),
+        observed_at: (now - chrono::Duration::minutes(15)).to_rfc3339(),
+        required_checks: vec![WitnessRequiredCheck {
+            context: "macos".to_owned(),
+            app_id: None,
+        }],
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_witnesses_only_the_queue_front() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"repos/owner/repo/commits/main"*) printf '%s' '{"sha":"dddddddddddddddddddddddddddddddddddddddd"}' ;;
+  *"rules/branches/main --paginate --slurp"*) printf '%s' '[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos"}]}}]]' ;;
+  *"branches/main/protection/required_status_checks"*) printf '%s' '{"contexts":["macos"],"checks":[]}' ;;
+  *"mergeQueue"*) printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":2,"enqueuedAt":"2026-08-25T21:40:00Z","headCommit":{"oid":"cccccccccccccccccccccccccccccccccccccccc"},"pullRequest":{"number":42}}],"pageInfo":{"hasNextPage":false}}}}}}' ;;
+  *) printf '%s' '{}' ;;
+esac
+"#,
+    );
+    let mut pr = ready_pr();
+    pr.fact.queue_position = Some(2);
+    pr.fact.labels.push(MANAGED_LABEL.to_owned());
+    pr.fact.checks.push(StewardCheck {
+        name: HANDOFF_CONTEXT.to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-08-25T21:39:00Z".to_owned()),
+    });
+    let mut observation = observation_for(pr, true);
+    observation
+        .merge_group_heads
+        .insert(42, "cccccccccccccccccccccccccccccccccccccccc".to_owned());
+    observation
+        .merge_group_enqueued_at
+        .insert(42, "2026-08-25T21:40:00Z".to_owned());
+    let args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: true,
+        coalesce: true,
+        preempt_capacity: true,
+        max_preemptions_per_head: 1,
+        apply: true,
+        ledger: None,
+    };
+    let mut ledger = StewardLedger::default();
+
+    crate::app::merge_steward_cmd::queue_priority_recovery::record_queue_witnesses(
+        &actions,
+        &observation,
+        &args,
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+    )
+    .expect("witness scan");
+
+    assert!(ledger.queue_witnesses.is_empty());
+}
+
+#[cfg(unix)]
+fn queue_recovery_gh(
+    temp: &tempfile::TempDir,
+    setup_log: &str,
+    labels: &str,
+) -> (GitHubActions, PathBuf, QueueWitness) {
+    let log = temp.path().join("calls");
+    let base_reads = temp.path().join("base-reads");
+    let base_drift = temp.path().join("base-drift");
+    let admission_mismatch = temp.path().join("admission-mismatch");
+    let timeline_error = temp.path().join("timeline-error");
+    let final_requeued = temp.path().join("final-requeued");
+    let final_requeued_after_intent = temp.path().join("final-requeued-after-intent");
+    let final_authority_reads = temp.path().join("final-authority-reads");
+    let witness = recovery_witness();
+    let mismatch_admission = (DateTime::parse_from_rfc3339(&witness.enqueued_at)
+        .expect("enqueue time")
+        + chrono::Duration::minutes(1))
+    .to_rfc3339();
+    let run_created = (Utc::now() - chrono::Duration::minutes(18)).to_rfc3339();
+    let run_updated = (Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+    let removed_at = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+    let actions = fake_gh(
+        temp,
+        &format!(
+            r#"
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"repos/owner/repo/commits/main"*)
+    reads=0; test ! -f '{}' || reads=$(cat '{}'); reads=$((reads + 1)); printf '%s' "$reads" > '{}'
+    if test -f '{}' && test "$reads" -gt 1; then sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee; else sha=dddddddddddddddddddddddddddddddddddddddd; fi
+    printf '{{"sha":"%s"}}' "$sha" ;;
+  *"rules/branches/main --paginate --slurp"*) printf '%s' '[[{{"type":"required_status_checks","parameters":{{"required_status_checks":[{{"context":"macos"}}]}}}}]]' ;;
+  *"branches/main/protection/required_status_checks"*) printf '%s' '{{"contexts":["macos"],"checks":[]}}' ;;
+  *"timelineItems"*)
+    if test -f '{}'; then printf '%s' '{{"malformed":true}}'; exit 0; fi
+    if test -f '{}'; then admitted='{}'; else admitted='{}'; fi
+    printf '{{"data":{{"repository":{{"pullRequest":{{"timelineItems":{{"nodes":[{{"__typename":"AddedToMergeQueueEvent","createdAt":"%s"}},{{"__typename":"RemovedFromMergeQueueEvent","reason":"failed_checks","createdAt":"{}"}}],"pageInfo":{{"hasPreviousPage":false}}}}}}}}}}}}' "$admitted" ;;
+  *"actions/runs?event=merge_group"*) printf '%s' '{{"workflow_runs":[{{"id":32903260905,"event":"merge_group","status":"completed","conclusion":"failure","head_sha":"cccccccccccccccccccccccccccccccccccccccc","created_at":"{}","updated_at":"{}"}}]}}' ;;
+  *"commits/cccccccccccccccccccccccccccccccccccccccc/check-runs"*) printf '%s' '{{"check_runs":[{{"name":"macos","status":"completed","conclusion":"failure","details_url":"https://github.com/owner/repo/actions/runs/32903260905","completed_at":"{}","app":{{"id":15368}}}}]}}' ;;
+  *"commits/cccccccccccccccccccccccccccccccccccccccc/statuses"*) printf '%s' '[]' ;;
+  *"actions/runs/32903260905/jobs"*) printf '%s' '{{"jobs":[{{"id":97981596587,"conclusion":"failure","runner_group_name":"GitHub Actions","labels":{},"steps":[{{"name":"Set up job","status":"completed","conclusion":"failure"}}]}}]}}' ;;
+  *"actions/jobs/97981596587/logs"*) printf '%s' '{}' ;;
+  *"finalRecoveryAuthority"*)
+    reads=0; test ! -f '{}' || reads=$(cat '{}'); reads=$((reads + 1)); printf '%s' "$reads" > '{}'
+    if test -f '{}' || (test -f '{}' && test "$reads" -gt 1); then nodes='[{{"pullRequest":{{"number":42}}}}]'; else nodes='[]'; fi
+    printf '{{"data":{{"repository":{{"ref":{{"target":{{"oid":"dddddddddddddddddddddddddddddddddddddddd"}}}},"pullRequest":{{"state":"OPEN","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"mergeQueue":{{"entries":{{"nodes":%s,"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' "$nodes" ;;
+  *"query=query("*"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*) printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"stackConfig"*) printf '%s' '{{"data":{{"repository":{{"stackConfig":{{"text":"stacked_pr_mode = \"observe\"\n"}},"pullRequest":{{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":null,"stackEntry":null}}}}}}}}' ;;
+  *"stackEntry"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":null,"stackEntry":null}}}}}}}}' ;;
+  *"enqueuePullRequest"*) printf '%s' '{{"data":{{"enqueuePullRequest":{{"mergeQueueEntry":{{"position":1}}}}}}}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            log.display(),
+            base_reads.display(),
+            base_reads.display(),
+            base_reads.display(),
+            base_drift.display(),
+            timeline_error.display(),
+            admission_mismatch.display(),
+            mismatch_admission,
+            witness.enqueued_at,
+            removed_at,
+            run_created,
+            run_updated,
+            run_updated,
+            labels,
+            setup_log,
+            final_authority_reads.display(),
+            final_authority_reads.display(),
+            final_authority_reads.display(),
+            final_requeued.display(),
+            final_requeued_after_intent.display()
+        ),
+    );
+    (actions, log, witness)
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_refuses_jump_when_pr_reappears_in_final_queue_snapshot() {
+    let temp = tempfile::tempdir().expect("temp");
+    fs::write(temp.path().join("final-requeued"), "queued").expect("marker");
+    let (actions, calls_path, witness) = queue_recovery_gh(
+        &temp,
+        "Name or service not known (internal-api.service.iad.github.net:443); Failed to download archive after 3 attempts",
+        "[\"ubuntu-latest\"]",
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let mut ledger = StewardLedger::default();
+    ledger
+        .queue_witnesses
+        .insert("owner/repo#42".to_owned(), witness);
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+
+    let (mutation, error) = mutate_pr_with_recovery(
+        &context,
+        &pr,
+        &queue_policy(),
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+        true,
+    );
+
+    assert_eq!(
+        mutation.as_deref(),
+        Some("skipped_after_final_mutable_authority")
+    );
+    assert!(error.is_none(), "{error:?}");
+    assert!(ledger.queue_recovery_receipts.is_empty());
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(!calls.contains("jump:true"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_revalidates_queue_absence_after_persisting_the_intent() {
+    let temp = tempfile::tempdir().expect("temp");
+    fs::write(temp.path().join("final-requeued-after-intent"), "queued").expect("marker");
+    let (actions, calls_path, witness) = queue_recovery_gh(
+        &temp,
+        "Name or service not known (internal-api.service.iad.github.net:443); Failed to download archive after 3 attempts",
+        "[\"ubuntu-latest\"]",
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let mut ledger = StewardLedger::default();
+    ledger
+        .queue_witnesses
+        .insert("owner/repo#42".to_owned(), witness);
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+
+    let (mutation, error) = mutate_pr_with_recovery(
+        &context,
+        &pr,
+        &queue_policy(),
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+        true,
+    );
+
+    assert_eq!(
+        mutation.as_deref(),
+        Some("skipped_after_recovery_receipt_mutable_authority")
+    );
+    assert!(error.is_none(), "{error:?}");
+    assert!(
+        ledger
+            .queue_recovery_receipts
+            .values()
+            .all(|receipt| receipt.phase == QueueRecoveryPhase::Intent)
+    );
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(!calls.contains("jump:true"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_optional_recovery_proof_preserves_ordinary_exact_head_enqueue() {
+    let temp = tempfile::tempdir().expect("temp");
+    fs::write(temp.path().join("timeline-error"), "error").expect("marker");
+    let (actions, calls_path, witness) = queue_recovery_gh(
+        &temp,
+        "Name or service not known (internal-api.service.iad.github.net:443); Failed to download archive after 3 attempts",
+        "[\"ubuntu-latest\"]",
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let mut ledger = StewardLedger::default();
+    ledger
+        .queue_witnesses
+        .insert("owner/repo#42".to_owned(), witness);
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+
+    let (mutation, error) = mutate_pr_with_recovery(
+        &context,
+        &pr,
+        &queue_policy(),
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+        true,
+    );
+
+    assert_eq!(mutation.as_deref(), Some("enqueued"));
+    assert!(error.is_none(), "{error:?}");
+    assert!(ledger.queue_recovery_receipts.is_empty());
+    assert!(
+        ledger
+            .audit
+            .iter()
+            .any(|entry| { entry.action == "queue_priority_recovery_unreadable_fell_back" })
+    );
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(calls.contains("enqueuePullRequest"), "{calls}");
+    assert!(!calls.contains("jump:true"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_rejects_base_drift_at_the_final_guarded_evidence_read() {
+    let temp = tempfile::tempdir().expect("temp");
+    fs::write(temp.path().join("base-drift"), "drift").expect("drift marker");
+    let (actions, calls_path, witness) = queue_recovery_gh(
+        &temp,
+        "Name or service not known (internal-api.service.iad.github.net:443); Failed to download archive after 3 attempts",
+        "[\"ubuntu-latest\"]",
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let mut ledger = StewardLedger::default();
+    ledger
+        .queue_witnesses
+        .insert("owner/repo#42".to_owned(), witness);
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+
+    let (mutation, error) = mutate_pr_with_recovery(
+        &context,
+        &pr,
+        &queue_policy(),
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+        true,
+    );
+
+    assert_eq!(
+        mutation.as_deref(),
+        Some("skipped_after_final_recovery_revalidation")
+    );
+    assert!(error.is_none(), "{error:?}");
+    assert!(ledger.queue_recovery_receipts.is_empty());
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_rejects_a_failed_checks_removal_from_another_admission() {
+    let temp = tempfile::tempdir().expect("temp");
+    fs::write(temp.path().join("admission-mismatch"), "mismatch").expect("marker");
+    let (actions, calls_path, witness) = queue_recovery_gh(
+        &temp,
+        "Name or service not known (internal-api.service.iad.github.net:443); Failed to download archive after 3 attempts",
+        "[\"ubuntu-latest\"]",
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let mut ledger = StewardLedger::default();
+    ledger
+        .queue_witnesses
+        .insert("owner/repo#42".to_owned(), witness);
+
+    let evidence = crate::app::merge_steward_cmd::queue_priority_recovery::recovery_evidence(
+        &actions,
+        &observation,
+        &pr,
+        &ledger,
+    )
+    .expect("proof read succeeds");
+
+    assert!(evidence.is_none());
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(!calls.contains("actions/runs?event=merge_group"), "{calls}");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn hosted_precheckout_eviction_restores_priority_once_with_write_ahead_receipt() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (actions, calls_path, witness) = queue_recovery_gh(
+        &temp,
+        "Name or service not known (internal-api.service.iad.github.net:443); Failed to download archive after 3 attempts",
+        "[\"ubuntu-latest\"]",
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let policy = queue_policy();
+    let mut ledger = StewardLedger::default();
+    ledger
+        .queue_witnesses
+        .insert("owner/repo#42".to_owned(), witness);
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+
+    let (mutation, error) = mutate_pr_with_recovery(
+        &context,
+        &pr,
+        &policy,
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+        true,
+    );
+
+    assert_eq!(mutation.as_deref(), Some("enqueued_priority_restored"));
+    assert!(error.is_none(), "{error:?}");
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(calls.contains("jump:true"), "{calls}");
+    assert_eq!(calls.matches("enqueuePullRequest").count(), 1, "{calls}");
+    let saved: StewardLedger =
+        serde_json::from_slice(&fs::read(ledger_path).expect("ledger")).expect("valid ledger");
+    assert_eq!(saved.queue_recovery_receipts.len(), 1);
+    assert!(saved.queue_recovery_receipts.values().all(|receipt| {
+        receipt.phase == QueueRecoveryPhase::Accepted
+            && receipt.run_id == 32903260905
+            && receipt.job_id == 97981596587
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn hosted_precheckout_priority_recovery_obeys_central_hold_before_receipt_or_jump() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (actions, calls_path, witness) = queue_recovery_gh(
+        &temp,
+        "Name or service not known (internal-api.service.iad.github.net:443); Failed to download archive after 3 attempts",
+        "[\"ubuntu-latest\"]",
+    );
+    let pr = ready_pr();
+    let observation = observation_for(pr.clone(), true);
+    let mut ledger = StewardLedger::default();
+    ledger
+        .queue_witnesses
+        .insert("owner/repo#42".to_owned(), witness);
+    let control = mutation_control(&temp, "studio", "studio");
+    let state_root = control.store.path().parent().expect("state root");
+    crate::merge_queue_control::hold(state_root, "incident").expect("hold");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+
+    let (mutation, error) = mutate_pr_with_recovery(
+        &context,
+        &pr,
+        &queue_policy(),
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+        true,
+    );
+
+    assert!(mutation.is_none());
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|message| message.contains("centrally held")),
+        "{error:?}"
+    );
+    assert!(ledger.queue_recovery_receipts.is_empty());
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn generic_setup_failure_and_self_hosted_job_never_request_jump() {
+    for (setup_log, labels) in [
+        ("The action version does not exist", "[\"ubuntu-latest\"]"),
+        (
+            "Name or service not known (internal-api.service.iad.github.net:443); Failed to download archive after 3 attempts",
+            "[\"self-hosted\",\"linux\"]",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let (actions, calls_path, witness) = queue_recovery_gh(&temp, setup_log, labels);
+        let pr = ready_pr();
+        let observation = observation_for(pr.clone(), true);
+        let mut ledger = StewardLedger::default();
+        ledger
+            .queue_witnesses
+            .insert("owner/repo#42".to_owned(), witness);
+        let evidence = crate::app::merge_steward_cmd::queue_priority_recovery::recovery_evidence(
+            &actions,
+            &observation,
+            &pr,
+            &ledger,
+        )
+        .expect("proof read succeeds");
+        assert!(evidence.is_none());
+        let calls = fs::read_to_string(calls_path).expect("calls");
+        assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+    }
+}
 
 #[test]
 fn github_run_attempt_fences_lost_transient_retry_ledger() {
@@ -1237,6 +1715,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
         coalesce: true,
         preempt_capacity: true,
         max_preemptions_per_head: 1,
@@ -1305,6 +1784,7 @@ fn provenance_blocker_with_opt_out_and_steward_state_makes_no_github_write() {
         managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
         coalesce: true,
         preempt_capacity: true,
         max_preemptions_per_head: 1,
@@ -1353,6 +1833,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
         coalesce: true,
         preempt_capacity: true,
         max_preemptions_per_head: 1,
@@ -1393,6 +1874,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         managed_label: MANAGED_LABEL.to_owned(),
         handoff_context: HANDOFF_CONTEXT.to_owned(),
         max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
         coalesce: false,
         preempt_capacity: false,
         max_preemptions_per_head: 1,

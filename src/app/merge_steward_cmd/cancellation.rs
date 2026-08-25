@@ -5,10 +5,12 @@ use super::{
     RunCancellationReason, StewardCommandArgs, StewardDecision, StewardLedger, StewardPolicy,
     StewardRun, Utc, acquire_run_mutation_guard, apply_capacity_preemption, attempts_for,
     authoritative_head_still_superseded, classify_pr, coalescing_reason_authorizes,
-    current_pull_request_heads, exact_run_still_queued, merge_group_pr_number, mutate_pr,
+    current_pull_request_heads, exact_run_still_queued, merge_group_pr_number,
     opted_out_pull_requests, plan_capacity_preemptions, plan_run_coalescing,
-    pull_request_is_managed, pull_request_provenance_blocked, reconcile_management_label,
-    reconcile_recovery_signal, record_audit, revalidate_coalescing_cancellation,
+    pr_mutations::mutate_pr_with_recovery, pull_request_is_managed,
+    pull_request_provenance_blocked, queue_priority_recovery::record_queue_witnesses,
+    reconcile_management_label, reconcile_recovery_signal, record_audit,
+    revalidate_coalescing_cancellation,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -21,6 +23,11 @@ pub(super) fn apply_repo_plan(
     remaining_preemptions: usize,
     mutation_control: Option<&MutationControl>,
 ) -> (RepoReport, bool, usize) {
+    let recovery_witness_error = if args.apply && args.recover_hosted_setup_eviction_priority {
+        record_queue_witnesses(actions, observation, args, ledger_path, ledger).err()
+    } else {
+        None
+    };
     let policy = StewardPolicy {
         merge_queue: observation.merge_queue,
         native_auto_merge: observation.allow_auto_merge,
@@ -40,8 +47,9 @@ pub(super) fn apply_repo_plan(
         ledger,
         mutation_control,
     );
-    let mut unhealthy =
-        (args.preempt_capacity && observation.preemption_error.is_some()) || pr_mutation_failed;
+    let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
+        || pr_mutation_failed
+        || recovery_witness_error.is_some();
     let mut planned_cancellations = Vec::new();
     if args.coalesce {
         let current_heads = current_pull_request_heads(&observation.prs);
@@ -121,11 +129,13 @@ pub(super) fn apply_repo_plan(
                 .collect(),
             prs: reports,
             cancellations,
-            errors: if args.preempt_capacity {
-                observation.preemption_error.iter().cloned().collect()
-            } else {
-                Vec::new()
-            },
+            errors: observation
+                .preemption_error
+                .iter()
+                .filter(|_| args.preempt_capacity)
+                .cloned()
+                .chain(recovery_witness_error)
+                .collect(),
         },
         unhealthy,
         capacity_preemptions_planned,
@@ -195,7 +205,7 @@ pub(super) fn apply_pr_plans(
                 error = recovery_error;
             }
             if args.apply && error.is_none() {
-                let (pr_mutation, pr_error) = mutate_pr(
+                let (pr_mutation, pr_error) = mutate_pr_with_recovery(
                     mutation_context
                         .as_ref()
                         .expect("apply mode requires mutation control"),
@@ -203,6 +213,7 @@ pub(super) fn apply_pr_plans(
                     policy,
                     &decision,
                     ledger,
+                    args.recover_hosted_setup_eviction_priority,
                 );
                 if let Some(pr_mutation) = pr_mutation {
                     mutation = Some(mutation.map_or(pr_mutation.clone(), |prior| {

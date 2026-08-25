@@ -41,6 +41,7 @@ pub(super) struct StewardCommandArgs {
     pub(super) managed_label: String,
     pub(super) handoff_context: String,
     pub(super) max_transient_reruns: u32,
+    pub(super) recover_hosted_setup_eviction_priority: bool,
     pub(super) coalesce: bool,
     pub(super) preempt_capacity: bool,
     pub(super) max_preemptions_per_head: u32,
@@ -123,7 +124,53 @@ struct StewardLedger {
     #[serde(default)]
     pending_cancellations: BTreeMap<String, PendingCancellation>,
     #[serde(default)]
+    queue_witnesses: BTreeMap<String, QueueWitness>,
+    #[serde(default)]
+    queue_recovery_receipts: BTreeMap<String, QueueRecoveryReceipt>,
+    #[serde(default)]
     audit: Vec<LedgerAudit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct QueueWitness {
+    repo: String,
+    base: String,
+    base_sha: String,
+    pr_number: u64,
+    pr_head: String,
+    merge_group_head: String,
+    position: u64,
+    enqueued_at: String,
+    observed_at: String,
+    required_checks: Vec<WitnessRequiredCheck>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WitnessRequiredCheck {
+    context: String,
+    app_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct QueueRecoveryReceipt {
+    repo: String,
+    base: String,
+    pr_number: u64,
+    pr_head: String,
+    base_sha: String,
+    merge_group_head: String,
+    removed_at: String,
+    run_id: u64,
+    job_id: u64,
+    attempted_at: String,
+    phase: QueueRecoveryPhase,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QueueRecoveryPhase {
+    Intent,
+    Accepted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -980,6 +1027,7 @@ mod capacity_cancellation;
 mod ledger;
 mod observation;
 mod pr_mutations;
+mod queue_priority_recovery;
 mod render;
 
 use cancellation::{
@@ -1008,11 +1056,12 @@ use capacity_cancellation::{
 };
 use ledger::{attempt_key, load_ledger, record_audit, save_ledger};
 use observation::{
-    active_runs, fetch_run_jobs, fetch_run_jobs_before, gh_json, gh_json_before, gh_json_timeout,
-    hydrate_required_check_identities, hydrate_required_check_identities_before,
-    merge_queue_snapshot, merge_queue_snapshot_before, observe_repo, parse_job, parse_pr,
-    parse_run, pull_requests, resolve_repos,
+    active_runs, complete_checks_for_head, fetch_run_jobs, fetch_run_jobs_before, gh_json,
+    gh_json_before, gh_json_timeout, hydrate_required_check_identities,
+    hydrate_required_check_identities_before, merge_queue_snapshot, merge_queue_snapshot_before,
+    observe_repo, parse_job, parse_pr, parse_run, pull_requests, resolve_repos,
 };
+#[cfg(test)]
 use pr_mutations::mutate_pr;
 use render::{
     enqueue_requirements_pending, is_admin_protection_denied, is_private_free_entitlement,

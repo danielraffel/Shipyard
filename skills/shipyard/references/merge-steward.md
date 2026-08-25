@@ -229,3 +229,25 @@ reads prove terminal. Every apply pass resumes these records before candidate
 filtering, using a durable mutation intent to reconcile the exact correlation
 without exposing audit-log internals. A transient observation failure leaves
 the record pending and makes the pass unhealthy for a later retry.
+Queue order remains immutable by default. Operators may explicitly enable
+`--recover-hosted-setup-eviction-priority` for a narrow GitHub-infrastructure
+exception. Apply mode first persists the queue-front managed PR head, speculative
+merge-group head, base name and revision, enqueue time, and position. A later `jump: true`
+enqueue is permitted once per removal/run only after the latest queue lifecycle
+event is `failed_checks` within two hours, the speculative commit has the pinned base as a parent,
+the same speculative head has exactly one failed required GitHub Actions CheckRun,
+that removal immediately follows the witnessed admission, the
+base revision and required-check governance remain unchanged, and the run has
+exactly one failed GitHub-hosted `Set up job` whose log proves the
+provider-internal DNS signature. The exact PR head, base,
+ownership, absence from the queue, required checks, HOLD state, and configured
+mutation machine are re-read before the write; the receipt is durable before
+the GraphQL mutation. Generic setup failures, incomplete histories, multiple
+candidate runs/jobs, self-hosted runners, and drift preserve the ordinary
+non-jump behavior.
+
+This policy does not yet cancel still-running children of an ejected
+merge-group run. That fast-follow may ship only with the identical durable
+witness and failure proof plus a final exact nonterminal-run and absent-queue
+revalidation through the existing write-ahead cancellation guard. Queue
+removal alone is not cancellation authority.
