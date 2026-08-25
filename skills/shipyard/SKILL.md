@@ -127,6 +127,21 @@ provenance is captured, and prepared-state reuse must be disabled. Without a
 fresh, non-resumed execution of the full contract the plan is policy-blocked,
 not redirected into a known-incompatible full Debug run.
 See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
+
+The first build-once/shard-many surface is also shadow-only and default-off.
+Its pure canary admission accepts only Pulp's exact numeric repository identity
+and slug plus its mac target, with an M3 builder and a freshly observed M1 LAN
+worker. Preserve the bound exhaustive inventory,
+fixtures, dependencies, `RUN_SERIAL` fleet exclusivity, and resource locks;
+require exact host-local cache generations and authenticated persistent,
+normalized, non-temporary host-declared staging roots.
+Reject stale/offline/Tailnet-only observations, mismatched capabilities or
+cache identity, timing evidence from another exact manifest or target, savings that do
+not meet both 120 seconds and 10 percent, or transfer/dispatch overhead above
+15 percent of shard work. M5 remains optional and excluded until roaming
+recovery is proven. No v1 canary decision dispatches work or satisfies merge
+readiness.
+
 Bounded execution remains machine-global default-off. For a controlled canary,
 use `changed_surface_execution.mode = "shadow_compare"` in trusted global
 config; the repository cannot enable it, the queued command is exact-bound,
