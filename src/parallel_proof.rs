@@ -3234,6 +3234,10 @@ fn sync_directory(path: &Path) -> Result<(), ParallelProofError> {
 }
 
 #[cfg(windows)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "keep one fallible durability contract where Windows has no directory fsync"
+)]
 fn sync_directory(_path: &Path) -> Result<(), ParallelProofError> {
     Ok(())
 }
