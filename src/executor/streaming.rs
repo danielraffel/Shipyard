@@ -27,7 +27,7 @@ pub struct ProgressEvent {
     pub last_heartbeat_at: DateTime<Utc>,
     /// Seconds since the last decoded output line.
     pub quiet_for_secs: f64,
-    /// Liveness label: `active`, `quiet`, or `stuck`.
+    /// Output-activity label: `active` or `quiet`.
     pub liveness: String,
 }
 
@@ -92,7 +92,10 @@ pub struct StreamingCommand<'a> {
     pub phase: Option<String>,
     /// Idle heartbeat cadence.
     pub heartbeat_interval: Duration,
-    /// Idle duration after which liveness becomes `stuck`.
+    /// Legacy quiet-duration threshold retained for request compatibility.
+    ///
+    /// Output silence is not process-liveness evidence, so crossing this
+    /// threshold does not label a live process `stuck`.
     pub stuck_idle: Duration,
     /// Contract markers to scan as substrings in decoded output lines.
     pub required_contract_markers: Vec<String>,
@@ -368,7 +371,7 @@ impl StreamState {
         progress_callback: &mut Option<&mut dyn FnMut(ProgressEvent) -> ProgressAction>,
         start: Instant,
         heartbeat_interval: Duration,
-        stuck_idle: Duration,
+        _stuck_idle: Duration,
     ) -> ProgressAction {
         if self.last_heartbeat_instant.elapsed() < heartbeat_interval {
             return ProgressAction::Continue;
@@ -379,11 +382,6 @@ impl StreamState {
         } else {
             start.elapsed()
         };
-        let liveness = if quiet_duration >= stuck_idle {
-            "stuck"
-        } else {
-            "quiet"
-        };
         self.last_heartbeat_at = Some(now);
         self.last_heartbeat_instant = Instant::now();
         emit_progress(
@@ -393,7 +391,7 @@ impl StreamState {
                 last_output_at: self.last_output_at,
                 last_heartbeat_at: now,
                 quiet_for_secs: quiet_duration.as_secs_f64(),
-                liveness: liveness.to_owned(),
+                liveness: "quiet".to_owned(),
             },
         )
     }
@@ -695,20 +693,29 @@ mod tests {
     }
 
     #[test]
-    fn streaming_command_emits_stuck_heartbeat() {
+    fn output_quiet_heartbeat_does_not_claim_process_is_stuck() {
+        let mut state = super::StreamState::new(Some("test".to_owned()));
+        std::thread::sleep(Duration::from_millis(5));
         let mut events = Vec::<ProgressEvent>::new();
-        let mut request = StreamingCommand::shell("echo done");
-        request.heartbeat_interval = Duration::from_millis(1);
-        request.stuck_idle = Duration::from_millis(1);
         let mut callback = |event| {
             events.push(event);
             ProgressAction::Continue
         };
-        request.progress_callback = Some(&mut callback);
+        let mut callback: Option<&mut dyn FnMut(ProgressEvent) -> ProgressAction> =
+            Some(&mut callback);
 
-        let result = run_streaming_command(request).expect("run");
+        let action = state.emit_idle_heartbeat(
+            &mut callback,
+            std::time::Instant::now()
+                .checked_sub(Duration::from_mins(2))
+                .expect("two minutes before now is representable"),
+            Duration::ZERO,
+            Duration::from_secs(90),
+        );
 
-        assert_eq!(result.returncode, 0);
-        assert!(events.iter().any(|event| event.liveness == "active"));
+        assert_eq!(action, ProgressAction::Continue);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].liveness, "quiet");
+        assert!(events[0].quiet_for_secs >= 120.0);
     }
 }

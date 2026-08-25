@@ -483,8 +483,11 @@ Honors `NO_COLOR=1` (XDG) for piped output. JSON mode adds
 `last_heartbeat_at`, `phase`, and `elapsed_seconds` fields to each
 dispatched-run emission; existing consumers keep working.
 
-When a runner goes silent past the stale threshold, `FallbackChain`
-auto-demotes it to UNREACHABLE and continues with the next provider.
+When a runner's durable heartbeat goes stale past the configured threshold,
+`FallbackChain` auto-demotes it to UNREACHABLE and continues with the next
+provider. A process that remains alive and heartbeating but emits no output is
+reported as `quiet`; output silence alone never authorizes failover or an infra
+classification.
 Use `shipyard doctor --runners` to probe SSH targets without running
 a ship.
 

@@ -759,6 +759,8 @@ fn validate_gh_binary(path: &Path) -> Result<(), RegistrarError> {
 mod tests {
     use std::fs;
     #[cfg(unix)]
+    use std::io::Write as _;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
@@ -1249,9 +1251,19 @@ esac
                 _ => "cat \"$LOG_DIR/stdin-$COUNT\" ;;",
             },
         );
-        fs::write(&gh, script).expect("write gh stub");
-        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("chmod");
+        publish_executable_stub(temp, &gh, &script);
         gh
+    }
+
+    #[cfg(unix)]
+    fn publish_executable_stub(temp: &Path, destination: &Path, script: &str) {
+        // Publish only after the writer closes; opening the final executable
+        // immediately before exec can surface Linux ETXTBSY under coverage.
+        let mut staged = tempfile::NamedTempFile::new_in(temp).expect("stage gh stub");
+        staged.write_all(script.as_bytes()).expect("write gh stub");
+        staged.flush().expect("flush gh stub");
+        fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o755)).expect("chmod");
+        staged.persist(destination).expect("publish gh stub");
     }
 
     #[cfg(unix)]
