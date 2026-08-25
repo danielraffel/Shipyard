@@ -374,6 +374,12 @@ itself.
 | CI / headless server / someone without Tailscale | **Ignore it.** The daemon needs a public tunnel (Tailscale Funnel in v1) to receive webhooks. Without that, `shipyard watch` and everything else fall back to polling — behavior is unchanged from the pre-daemon CLI. |
 | Agent running one-shot `shipyard ship` + `watch --follow` | **Probably doesn't matter.** The daemon helps most when multiple sessions or the GUI are tracking the same state concurrently; a single session blocking on `watch --follow` already has its own connection. |
 
+On macOS, keep Shipyard's noninteractive Tailscale subprocess environment intact.
+The app-bundle CLI needs `TERM=dumb` when a LaunchAgent or stripped SSH shell
+provides neither `TERM` nor `TERM_PROGRAM`; otherwise it can attempt to launch
+the GUI and return non-JSON even though Tailscale itself is online. Diagnose the
+daemon environment, not an interactive shell that may mask this fleet failure.
+
 **When in doubt, don't start the daemon.** The daemon is an
 optimization, not a requirement. Polling is the correct fallback
 for everything it doesn't cover and is always safe. The `run` /

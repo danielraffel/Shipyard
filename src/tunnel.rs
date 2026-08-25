@@ -661,8 +661,7 @@ fn run_tailscale(
     args: &[&str],
     timeout: Duration,
 ) -> Result<CommandOutput, TunnelError> {
-    let mut child = Command::new(binary)
-        .args(args)
+    let mut child = tailscale_command(binary, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -703,10 +702,23 @@ fn run_tailscale(
     })
 }
 
+fn tailscale_command(binary: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        // The macOS app-bundle CLI attempts to launch its GUI and prints an
+        // error instead of JSON when invoked from Shipyard's stripped daemon
+        // environment without a terminal type. `dumb` is deterministic and
+        // sufficient for every non-interactive status/funnel command here.
+        .env("TERM", "dumb");
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::fs;
+    use std::path::Path;
     use std::time::Duration;
 
     #[cfg(unix)]
@@ -717,7 +729,7 @@ mod tests {
         TunnelInfo, TunnelSnapshot, TunnelSupervisorHooks, TunnelSupervisorPolicy,
         TunnelSupervisorState, TunnelWatchExit, decode_tailscale_status,
         probe_tailscale_with_retry, resolve_tailscale_binary_from, start_with_retry,
-        supervise_tunnel, watch_until_lost,
+        supervise_tunnel, tailscale_command, watch_until_lost,
     };
 
     #[derive(Default)]
@@ -1103,5 +1115,16 @@ mod tests {
             resolve_tailscale_binary_from(&[missing, executable.clone()]),
             Some(executable)
         );
+    }
+
+    #[test]
+    fn tailscale_commands_supply_a_noninteractive_terminal_type() {
+        let command = tailscale_command(Path::new("/usr/bin/tailscale"), &["status", "--json"]);
+        let term = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "TERM").then_some(value))
+            .flatten();
+
+        assert_eq!(term, Some(std::ffi::OsStr::new("dumb")));
     }
 }
