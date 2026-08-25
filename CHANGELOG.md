@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01180"></a>
+## [0.118.0] - 2026-08-25
+
+- fix(steward): recover hosted setup queue priority ([#477](https://github.com/danielraffel/Shipyard/pull/477))
+
 <a id="v01170"></a>
 ## [0.117.0] - 2026-08-25
 
@@ -1069,6 +1074,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.118.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.118.0
 [0.117.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.117.0
 [0.116.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.116.0
 [0.115.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.115.1
