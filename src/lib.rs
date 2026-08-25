@@ -89,6 +89,8 @@ pub mod output;
 pub mod parallel_proof;
 /// Default-off admission policy for the first Pulp macOS sharding canary.
 pub mod parallel_proof_canary;
+/// Default-off one-host build-once consumption proof for the Pulp M3 shadow canary.
+pub mod parallel_proof_one_host;
 /// Filesystem path resolution for isolated and compatible modes.
 pub mod paths;
 /// Consumer repository Shipyard pin helpers.
