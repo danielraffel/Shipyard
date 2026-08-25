@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use fs2::FileExt;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
@@ -1922,6 +1922,13 @@ impl ParallelProofStore {
     /// Create or reopen a controller-owned record-store root.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ParallelProofError> {
         let root = root.into();
+        if root.file_name().is_none()
+            || root
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(ParallelProofError::InvalidField("store root"));
+        }
         let parent = store_root_parent(&root)?;
         let parent_metadata = fs::symlink_metadata(parent).map_err(|parent_error| {
             if parent_error.kind() == std::io::ErrorKind::NotFound {
@@ -4452,6 +4459,16 @@ mod tests {
             Err(ParallelProofError::InvalidField("store root parent"))
         ));
         assert!(!temporary.path().join("missing").exists());
+
+        for invalid_root in [
+            temporary.path().join("proofs").join(".."),
+            PathBuf::from("./proof-store"),
+        ] {
+            assert!(matches!(
+                ParallelProofStore::open(invalid_root),
+                Err(ParallelProofError::InvalidField("store root"))
+            ));
+        }
     }
 
     #[test]

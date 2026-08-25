@@ -16,6 +16,28 @@ records what a future production controller must prove, but it has no queue,
 runner, GitHub, Check Run, or merge-authority integration. Consequently this
 slice alone produces no queue-time improvement.
 
+`src/parallel_proof_canary.rs` adds a second pure, default-off boundary for the
+first production experiment. It will admit only `generous-corp/pulp`'s exact
+numeric repository identity and `mac` target, built on M3 and shared over a
+freshly observed LAN route with M1. Both
+hosts must declare authenticated persistent, normalized, non-temporary staging
+roots, enough free space,
+the same exact required cache generations, current session generations, and
+the capabilities required by every bound test. M5 is intentionally excluded
+from this first canary: a roaming or Tailnet-only machine is never required for
+progress and can be considered by a later policy after route, cache, and
+disconnect recovery are measured.
+
+The canary accepts controller-owned timing evidence bound to the exact proof
+manifest and independently observed `mac` target only when the predicted
+wall-clock saving is at least 120 seconds and 10 percent, and transfer plus
+dispatch cost is no more than exactly 15 percent of shard execution time.
+Shared Skia, Dawn, V8, Three.js, FetchContent, and ccache
+payloads are represented by exact host-local cache generations; they are not
+part of the artifact-transfer contract. The decision does not schedule or
+dispatch anything, and both its disabled and eligible forms remain incapable
+of satisfying merge readiness.
+
 ## Authority boundary
 
 Every v1 manifest contains `shadow_only: true`. Construction and validation

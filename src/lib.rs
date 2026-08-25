@@ -85,6 +85,8 @@ mod native_executable;
 pub mod output;
 /// Shadow-only build-once and sharded-test proof invariants.
 pub mod parallel_proof;
+/// Default-off admission policy for the first Pulp macOS sharding canary.
+pub mod parallel_proof_canary;
 /// Filesystem path resolution for isolated and compatible modes.
 pub mod paths;
 /// Consumer repository Shipyard pin helpers.
