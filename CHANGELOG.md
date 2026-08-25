@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01160"></a>
+## [0.116.0] - 2026-08-25
+
+- feat: add one-host build-once shadow proof ([#475](https://github.com/danielraffel/Shipyard/pull/475))
+
 <a id="v01151"></a>
 ## [0.115.1] - 2026-08-25
 
@@ -1059,6 +1064,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.116.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.116.0
 [0.115.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.115.1
 [0.115.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.115.0
 [0.114.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.114.1
