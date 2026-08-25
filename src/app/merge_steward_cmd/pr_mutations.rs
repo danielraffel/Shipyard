@@ -80,7 +80,7 @@ pub(super) fn mutate_pr_with_recovery(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn enqueue_pull_request(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,

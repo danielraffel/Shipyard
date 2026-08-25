@@ -14,6 +14,7 @@ use crate::app::merge_steward_cmd::capacity_cancellation::{
 };
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
+#[cfg(unix)]
 use crate::app::merge_steward_cmd::pr_mutations::mutate_pr_with_recovery;
 use crate::app::merge_steward_cmd::pr_mutations::rollback_transient_attempt;
 use crate::app::merge_steward_cmd::pr_mutations::run_attempt_allows_transient_rerun;
