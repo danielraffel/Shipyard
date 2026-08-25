@@ -213,8 +213,28 @@ directory and tells the repository adapter to run the selected-target build
 and selected tests, then the original full build and tests; the full path's
 result remains authoritative. `authoritative` omits the full comparison and is
 reserved for a separately reviewed graduation after comparison evidence. It
-also requires machine-global `accepted_shadow_policy_digest` to match the exact
-protected policy digest; changing only `mode` cannot bypass shadow review.
+also requires an exact repository-and-target entry in trusted machine-global
+config:
+
+```toml
+[changed_surface_execution]
+mode = "authoritative"
+
+[changed_surface_execution.accepted_shadow_policy_digests."Generous-Corp/pulp"]
+mac = "<64-character lowercase policy SHA-256>"
+
+[changed_surface_execution.accepted_shadow_policy_digests."Generous-Corp/forge"]
+mac = "<different reviewed policy SHA-256>"
+```
+
+Repository matching is case-insensitive, while target matching is exact. An
+entry authorizes only that repository, target, and digest tuple. The legacy
+scalar `accepted_shadow_policy_digest` remains valid when it is the only
+accepted-digest setting, so existing single-policy machines continue to work.
+Migrate by replacing that scalar with the scoped table atomically. Configuring
+both forms, duplicate repository keys that differ only by case, malformed
+tables, or malformed digests fails closed before any target command changes.
+Changing only `mode` cannot bypass shadow review.
 
 Schema v2 accepts only a staged local POSIX target with an exact `test` stage.
 Schema v3 requires both exact `build` and `test` stages and the literal

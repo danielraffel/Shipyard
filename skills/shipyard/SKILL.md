@@ -132,8 +132,12 @@ use `changed_surface_execution.mode = "shadow_compare"` in trusted global
 config; the repository cannot enable it, the queued command is exact-bound,
 and the repository adapter must keep the full result authoritative while
 writing selected-vs-full receipts. Do not use `authoritative` without reviewed
-graduation evidence and a machine-global `accepted_shadow_policy_digest` that
-exactly matches the protected plan.
+graduation evidence and a machine-global
+`changed_surface_execution.accepted_shadow_policy_digests."<owner/repo>".<target>`
+entry that exactly matches the protected plan. Repository and target scope are
+both authorization boundaries. The legacy scalar remains compatible only by
+itself; replace it atomically when migrating because mixed scalar/scoped policy
+is ambiguous and fails closed.
 
 Schema v3 also binds nonempty baseline and per-family `CMake` producer-target
 lists. It may replace only the exact protected `build` and `test` stages as one

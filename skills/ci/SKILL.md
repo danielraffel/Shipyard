@@ -1104,7 +1104,11 @@ targets and runs selected tests before the original full build and test suite,
 returns the full result, and persists comparison evidence; `authoritative`
 requires a separate graduation review. Repository and local overlay config
 cannot activate either mode. Authoritative activation also requires the exact
-reviewed shadow policy digest in trusted machine-global config.
+reviewed shadow policy digest for the canonical repository and exact target in
+trusted machine-global
+`changed_surface_execution.accepted_shadow_policy_digests."<owner/repo>".<target>`.
+The legacy scalar remains supported only when the scoped table is absent;
+configuring both is ambiguous and fails closed.
 For `--resume-from test`, Shipyard authenticates all eligible target plans in a
 read-only preflight and refuses schema-v3 execution before activation
 persistence or substitution. It could skip producer builds and test stale warm
