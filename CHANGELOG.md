@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01150"></a>
+## [0.115.0] - 2026-08-25
+
+- feat: gate Pulp mac sharding shadow canary ([#472](https://github.com/danielraffel/Shipyard/pull/472))
+
 <a id="v01141"></a>
 ## [0.114.1] - 2026-08-25
 
@@ -1048,6 +1053,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.115.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.115.0
 [0.114.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.114.1
 [0.114.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.114.0
 [0.113.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.113.0
