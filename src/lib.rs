@@ -29,6 +29,8 @@ pub mod cloud;
 pub mod cloud_records;
 /// Layered configuration loading and worktree fallback behavior.
 pub mod config;
+/// Pure, fail-closed translation from CTest JSON-v1 metadata into a canonical test inventory.
+pub mod ctest_inventory;
 /// Unix socket IPC primitives for daemon subscribers and status reads.
 pub mod daemon_ipc;
 /// Minimal daemon runtime and lifecycle helpers.

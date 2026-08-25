@@ -121,11 +121,27 @@ observation, not worker JSON. They must come from the controller-comparable
 clock contract used by the eventual dispatcher; until that transport exists,
 these checks are shadow evidence only.
 
-The inventory producer is not part of this slice. A production producer must
-derive this metadata from the configured CTest graph without relying on
-`ctest --tests-from-file` as an existence check: CTest silently ignores unknown
-names there, and fixtures may add tests implicitly. The producer must compare
-the executed inventory back to the canonical declared set.
+`src/ctest_inventory.rs` is the first shadow-only inventory producer boundary.
+It purely translates bounded `ctest --show-only=json-v1` output into this
+canonical inventory. Runtime capabilities and every observed resource-lock
+scope come from explicit controller-owned classification: mutable test-side
+labels cannot grant worker eligibility, an unclassified lock fails closed, and
+unused test/lock declarations are rejected as probable typos. An independently
+controller-owned exhaustive test count and domain-separated sorted-ID digest
+must match, so output captured with `-R`, `-E`, `-L`, `-I`, or another filter
+cannot masquerade as the configured graph. Every emitted test must also match
+the controller-owned exact `CTest -C` configuration, including the intentional
+empty no-configuration case. Unsupported CTest JSON versions, duplicate
+relevant properties, ambiguous property types, disabled or non-executable
+tests, nonempty `REQUIRED_FILES` without controller filesystem attestation, and
+`RESOURCE_GROUPS` also fail closed. Input bytes and expanded capability
+relations are bounded before per-test cloning. The producer does not execute
+CTest, dispatch work, or satisfy merge readiness.
+
+A production executor must still compare the tests actually executed back to
+this canonical declared set. It must not rely on `ctest --tests-from-file` as
+an existence check: CTest silently ignores unknown names there, and fixtures
+may add tests implicitly.
 
 ## Authenticated assignment and retries
 
@@ -277,8 +293,9 @@ Unit tests exercise:
 This slice is a prerequisite, not the performance feature. Queue time improves
 only after all of the following are implemented and measured:
 
-1. A canonical inventory producer from the configured CTest graph, including
-   explicit classification for every resource lock and runtime capability.
+1. Wire the shadow CTest inventory producer to controller-owned, immutable
+   classification and compare the executed set back to the canonical declared
+   inventory. This wiring remains non-authoritative until separately reviewed.
 2. Build-once production on an isolated trusted builder, content-addressed
    artifact publication, and safe guest-only transfer for untrusted artifacts.
 3. Authenticated, replay-protected transport for controller sessions,
