@@ -498,6 +498,13 @@ mod tests {
         }
     }
 
+    fn enabled_policy() -> OneHostM3Policy {
+        OneHostM3Policy {
+            enabled: true,
+            ..OneHostM3Policy::default()
+        }
+    }
+
     #[test]
     fn default_is_disabled_and_full_gate_stays_authoritative() {
         let fixture = fixture();
@@ -518,8 +525,7 @@ mod tests {
     fn exact_m3_artifact_is_consumed_once_without_rebuilding() {
         let fixture = fixture();
         let receipt = receipt(&fixture);
-        let mut policy = OneHostM3Policy::default();
-        policy.enabled = true;
+        let policy = enabled_policy();
         let decision = assess_one_host_m3(
             proof(&fixture),
             &policy,
@@ -542,8 +548,7 @@ mod tests {
     fn rejects_reconfigure_or_rebuild_during_consumption() {
         let fixture = fixture();
         let receipt = receipt(&fixture);
-        let mut policy = OneHostM3Policy::default();
-        policy.enabled = true;
+        let policy = enabled_policy();
         let mut observed = observation(&fixture, &receipt);
         observed.build_invocations_during_consume = 1;
         assert!(matches!(
@@ -565,8 +570,7 @@ mod tests {
     #[test]
     fn rejects_source_build_artifact_and_receipt_mutation() {
         let fixture = fixture();
-        let mut policy = OneHostM3Policy::default();
-        policy.enabled = true;
+        let policy = enabled_policy();
 
         let valid_receipt = receipt(&fixture);
         let valid_observation = observation(&fixture, &valid_receipt);
@@ -613,8 +617,7 @@ mod tests {
     fn rejects_missing_extra_duplicate_or_reordered_executed_tests() {
         let fixture = fixture();
         let receipt = receipt(&fixture);
-        let mut policy = OneHostM3Policy::default();
-        policy.enabled = true;
+        let policy = enabled_policy();
 
         for ids in [
             vec!["audio".to_owned()],
@@ -632,8 +635,7 @@ mod tests {
     fn rejects_cross_host_session_and_scope_drift() {
         let fixture = fixture();
         let receipt = receipt(&fixture);
-        let mut policy = OneHostM3Policy::default();
-        policy.enabled = true;
+        let policy = enabled_policy();
         let mut observed = observation(&fixture, &receipt);
         observed.consumer_host_id = "m1".to_owned();
         assert!(matches!(
