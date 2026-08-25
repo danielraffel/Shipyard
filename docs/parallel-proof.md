@@ -143,6 +143,50 @@ this canonical declared set. It must not rely on `ctest --tests-from-file` as
 an existence check: CTest silently ignores unknown names there, and fixtures
 may add tests implicitly.
 
+`src/parallel_proof_one_host.rs` supplies the smallest executor-facing bridge
+before any cross-host dispatch. Its machine-global policy is default-off and
+admits only Pulp's exact numeric repository identity, `mac` target, Apple
+Silicon build contract, and M3 host. One controller-owned receipt records
+exactly one successful configure plus one successful build and binds their
+command/environment digests to the exact source, toolchain, canonical CTest
+inventory, proof manifest, and compact artifact content/layout/size identity.
+The matching consumption observation must come from the same authenticated M3
+session, verify that exact content address, observe zero configure or build
+invocations during test consumption, and report the sorted unique executed
+test IDs. Missing, extra, duplicate, reordered, or mutated IDs fail exact
+reconciliation against the canonical inventory.
+
+This v1 bridge is pure shadow evidence. It does not invoke a process, package
+or transfer bytes, dispatch a shard, publish a check, or alter validation. A
+matched result explicitly retains the existing full gate as authoritative and
+reports cross-host dispatch as false. It is not an operational canary or a
+speedup measurement.
+
+### Next executable one-host canary
+
+The existing supported wiring seam is
+`src/app/ship_cmd/changed_surface_execution.rs::apply_changed_surface_execution`,
+where trusted machine-global policy can default-off rewrite an exact target's
+stages while preserving the original full execution, feeding
+`src/executor/local.rs::LocalExecutor::run_stages` for the actual ordered stage
+processes. A follow-up may connect this proof only when it can meet all of the
+following acceptance conditions without changing the shared default path:
+
+1. an exact Pulp/`mac`/M3 machine-global opt-in selects the experiment;
+2. the ordinary local executor observes one real configure and one real build,
+   including exact command/environment digests and successful exits;
+3. the controller packages only the required runtime payload, verifies its
+   content/layout/size address, and constructs this validated build receipt;
+4. the test stage consumes that exact artifact and controller instrumentation
+   observes zero configure or build invocations during consumption;
+5. executed CTest IDs are captured independently and reconcile exactly to the
+   canonical inventory;
+6. an append-only shadow result is written beside, never instead of, the
+   unchanged full-gate result; and
+7. integration tests use stub stage counters and artifacts to prove the happy
+   path plus rebuild, artifact mutation, missing/extra/duplicate test, session,
+   and disabled-policy controls without launching a production build.
+
 ## Authenticated assignment and retries
 
 Only a controller-minted assignment authorizes a receipt. The assignment binds
@@ -287,6 +331,9 @@ Unit tests exercise:
 - single-level crash-durable store-root creation; and
 - the invariant that neither a manifest nor aggregate can satisfy merge
   readiness.
+- the default-off M3-only build-once bridge, exact configure/build receipt and
+  artifact bindings, no-rebuild consumption, exact executed-set reconciliation,
+  and source/build/artifact/session mutation controls.
 
 ## Required production follow-ups
 

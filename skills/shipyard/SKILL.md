@@ -166,6 +166,17 @@ both authorization boundaries. The legacy scalar remains compatible only by
 itself; replace it atomically when migrating because mixed scalar/scoped policy
 is ambiguous and fails closed.
 
+The first one-host build-once bridge is also library-only and machine-global
+default-off. It accepts only Pulp's exact numeric repository identity, `mac`
+target, Apple Silicon build contract, and M3. Bind one successful configure and
+one successful build receipt to the exact source, toolchain, canonical CTest
+inventory, proof manifest, and compact artifact content/layout/size identity.
+Consumption must remain in the same authenticated M3 session, verify that
+exact content address, observe zero configure/build invocations, and reconcile
+the sorted unique executed IDs exactly to the canonical inventory. It cannot
+run commands, dispatch cross-host work, publish a check, or replace the full
+authoritative gate.
+
 Schema v3 also binds nonempty baseline and per-family `CMake` producer-target
 lists. It may replace only the exact protected `build` and `test` stages as one
 `build_and_test` transaction. In `shadow_compare`, the repository adapter must
