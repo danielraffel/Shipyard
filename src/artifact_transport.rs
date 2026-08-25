@@ -17,7 +17,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 /// Current on-disk/wire manifest schema.
-pub const MANIFEST_SCHEMA: u32 = 2;
+pub const MANIFEST_SCHEMA: u32 = 3;
+const PREVIOUS_MANIFEST_SCHEMA: u32 = 2;
 const LEGACY_MANIFEST_SCHEMA: u32 = 1;
 /// Default chunk size for newly-created manifests.
 pub const DEFAULT_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
@@ -190,10 +191,36 @@ pub struct ArtifactManifest {
     pub artifact_size_bytes: u64,
     pub chunk_size_bytes: u64,
     pub layout_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_mode: Option<u32>,
     pub entries: Vec<LayoutEntry>,
     pub chunks: Vec<ArtifactChunk>,
     pub cache_generations: Vec<CacheGeneration>,
     pub producer: ProducerFence,
+}
+
+/// Controller-owned identities required to package one complete build tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildTreeArtifactInputs {
+    pub source: SourceIdentity,
+    pub build: BuildIdentity,
+    pub cache_generations: Vec<CacheGeneration>,
+    pub producer: ProducerFence,
+}
+
+/// Durable result of packaging a complete build tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildTreePackOutcome {
+    pub manifest: ArtifactManifest,
+    pub publication: PublicationOutcome,
+}
+
+/// Result of replacing a mutable build tree with a verified immutable tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildTreeRestoreOutcome {
+    pub publication: PublicationOutcome,
+    pub replaced_existing: bool,
+    pub quarantine_cleanup_pending: Option<PathBuf>,
 }
 
 /// Queue/lease authority for exactly one canonical manifest.
@@ -212,7 +239,10 @@ pub struct ManifestAuthority {
 impl ArtifactManifest {
     /// Validate structure, identity bindings, chunk coverage, and layout digest.
     pub fn validate(&self) -> Result<(), Error> {
-        if !matches!(self.schema, LEGACY_MANIFEST_SCHEMA | MANIFEST_SCHEMA) {
+        if !matches!(
+            self.schema,
+            LEGACY_MANIFEST_SCHEMA | PREVIOUS_MANIFEST_SCHEMA | MANIFEST_SCHEMA
+        ) {
             return Err(Error::Invalid(format!(
                 "unsupported manifest schema {}",
                 self.schema
@@ -237,6 +267,20 @@ impl ArtifactManifest {
         }
         validate_digest(&self.artifact_sha256, "artifact digest")?;
         validate_digest(&self.layout_sha256, "layout digest")?;
+        match (self.schema, self.root_mode) {
+            (MANIFEST_SCHEMA, Some(mode)) => validate_mode(mode)?,
+            (MANIFEST_SCHEMA, None) => {
+                return Err(Error::Invalid(
+                    "current manifest schema requires the build-tree root mode".into(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(Error::Invalid(
+                    "older manifest schemas must not declare a build-tree root mode".into(),
+                ));
+            }
+            (_, None) => {}
+        }
         if self.artifact_size_bytes == 0 {
             return Err(Error::Invalid("artifact must not be empty".into()));
         }
@@ -307,7 +351,7 @@ impl ArtifactManifest {
                 }
             }
         }
-        if self.schema >= MANIFEST_SCHEMA {
+        if self.schema >= PREVIOUS_MANIFEST_SCHEMA {
             let by_path: HashMap<&str, &LayoutEntry> = self
                 .entries
                 .iter()
@@ -473,6 +517,604 @@ impl ArtifactManifest {
         }
         Ok(())
     }
+}
+
+/// Package every regular file and directory in `source_root` into one
+/// deterministic, content-addressed tar+zstd artifact.
+///
+/// The source root and archive destination must be absolute. Links, special
+/// files, nonportable paths, concurrent tree mutation, and an existing archive
+/// destination fail closed. The returned manifest has already passed the same
+/// archive/layout verifier used by restoration.
+pub fn pack_verified_build_tree(
+    source_root: &Path,
+    archive_destination: &Path,
+    inputs: BuildTreeArtifactInputs,
+) -> Result<BuildTreePackOutcome, Error> {
+    validate_build_tree_root(source_root)?;
+    validate_new_archive_destination(archive_destination)?;
+    let observed = observe_build_tree(source_root)?;
+    let entries = observed.entries.clone();
+    let parent = archive_destination
+        .parent()
+        .ok_or_else(|| Error::Invalid("artifact destination has no parent".into()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".shipyard-build-tree-")
+        .tempfile_in(parent)?;
+    write_build_tree_archive(&observed, staging.as_file())?;
+    staging.as_file().sync_all()?;
+    validate_observed_build_tree(source_root, &observed, &entries)?;
+    let (artifact_sha256, artifact_size_bytes, chunks) =
+        digest_archive_chunks(staging.path(), DEFAULT_CHUNK_SIZE)?;
+    let manifest = ArtifactManifest {
+        schema: MANIFEST_SCHEMA,
+        source: inputs.source,
+        build: inputs.build,
+        format: ArtifactFormat::TarZstd,
+        artifact_sha256,
+        artifact_size_bytes,
+        chunk_size_bytes: DEFAULT_CHUNK_SIZE,
+        layout_sha256: sha256_bytes(&serde_json::to_vec(&entries)?),
+        root_mode: Some(observed.root_mode),
+        entries,
+        chunks,
+        cache_generations: inputs.cache_generations,
+        producer: inputs.producer,
+    };
+    manifest.validate()?;
+    verify_archive_layout(staging.path(), &manifest)?;
+    let staging_path = staging
+        .into_temp_path()
+        .keep()
+        .map_err(|error| error.error)?;
+    if let Err(error) = rename_no_replace(&staging_path, archive_destination) {
+        let _ = fs::remove_file(&staging_path);
+        return Err(error);
+    }
+    let publication = publication_outcome(archive_destination, parent, sync_directory);
+    Ok(BuildTreePackOutcome {
+        manifest,
+        publication,
+    })
+}
+
+/// Replace an existing mutable build tree with the exact verified archive.
+///
+/// The current tree is quarantined under the destination parent before the
+/// verified tree is published. Any extraction failure restores the prior tree
+/// before returning. A successfully displaced old tree remains quarantined and
+/// is returned to the caller; only a caller holding the production mutation
+/// fence may remove it after revalidating the installed destination.
+pub fn restore_verified_build_tree(
+    archive: &Path,
+    manifest: &ArtifactManifest,
+    authority: &ManifestAuthority,
+    destination: &Path,
+    space_policy: SpacePolicy,
+) -> Result<BuildTreeRestoreOutcome, Error> {
+    restore_verified_build_tree_with(
+        archive,
+        manifest,
+        authority,
+        destination,
+        space_policy,
+        extract_verified_archive_locked,
+    )
+}
+
+fn restore_verified_build_tree_with(
+    archive: &Path,
+    manifest: &ArtifactManifest,
+    authority: &ManifestAuthority,
+    destination: &Path,
+    space_policy: SpacePolicy,
+    extract: impl FnOnce(
+        &Path,
+        &ArtifactManifest,
+        &ManifestAuthority,
+        &Path,
+        SpacePolicy,
+    ) -> Result<PublicationOutcome, Error>,
+) -> Result<BuildTreeRestoreOutcome, Error> {
+    manifest.validate_authority(authority)?;
+    verify_archive_layout(archive, manifest)?;
+    let parent = validate_restore_destination(destination)?;
+    let _lock = acquire_extraction_lock(parent)?;
+    manifest.validate_authority(authority)?;
+    verify_archive_layout(archive, manifest)?;
+
+    let mut quarantine = None;
+    if destination.exists() {
+        let metadata = fs::symlink_metadata(destination)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Error::Invalid(
+                "existing build-tree destination must be a real directory".into(),
+            ));
+        }
+        let directory = tempfile::Builder::new()
+            .prefix(".shipyard-build-tree-quarantine-")
+            .tempdir_in(parent)?;
+        // Persist the quarantine before moving user data into it. A TempDir
+        // guard would recursively delete the prior build on any later error.
+        let directory = directory.keep();
+        if let Err(error) = sync_directory(parent) {
+            let _ = fs::remove_dir(&directory);
+            let _ = sync_directory(parent);
+            return Err(error);
+        }
+        let prior = directory.join("prior");
+        if let Err(error) = fs::rename(destination, &prior) {
+            let _ = fs::remove_dir(&directory);
+            return Err(error.into());
+        }
+        if let Err(error) = sync_directory(&directory).and_then(|()| sync_directory(parent)) {
+            rollback_quarantined_tree(destination, parent, &directory, &prior, &error)?;
+            return Err(error);
+        }
+        quarantine = Some((directory, prior));
+    }
+
+    let publication = match extract(archive, manifest, authority, destination, space_policy) {
+        Ok(publication) => publication,
+        Err(extract_error) => {
+            if let Some((directory, prior)) = quarantine.as_ref() {
+                if destination.exists() {
+                    return Err(Error::Invalid(format!(
+                        "verified restore failed ({extract_error}); destination reappeared before rollback; prior tree preserved at {}",
+                        prior.display()
+                    )));
+                }
+                rollback_quarantined_tree(destination, parent, directory, prior, &extract_error)?;
+            }
+            return Err(extract_error);
+        }
+    };
+
+    let replaced_existing = quarantine.is_some();
+    // This transport primitive does not own the production mutation fence, so
+    // it cannot prove that the published path still names this replacement at
+    // cleanup time. Preserve the prior tree for fenced caller reconciliation.
+    let quarantine_cleanup_pending = quarantine.map(|(directory, _)| directory);
+    Ok(BuildTreeRestoreOutcome {
+        publication,
+        replaced_existing,
+        quarantine_cleanup_pending,
+    })
+}
+
+fn rollback_quarantined_tree(
+    destination: &Path,
+    parent: &Path,
+    quarantine: &Path,
+    prior: &Path,
+    original_error: &Error,
+) -> Result<(), Error> {
+    rollback_quarantined_tree_with(
+        destination,
+        parent,
+        quarantine,
+        prior,
+        original_error,
+        rename_no_replace,
+    )
+}
+
+fn rollback_quarantined_tree_with(
+    destination: &Path,
+    parent: &Path,
+    quarantine: &Path,
+    prior: &Path,
+    original_error: &Error,
+    restore: impl FnOnce(&Path, &Path) -> Result<(), Error>,
+) -> Result<(), Error> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(Error::Invalid(format!(
+                "verified restore failed ({original_error}); destination reappeared before rollback; prior tree preserved at {}",
+                prior.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    restore(prior, destination).map_err(|rollback_error| {
+        Error::Invalid(format!(
+            "verified restore failed ({original_error}); rollback failed ({rollback_error}); prior tree preserved at {}",
+            prior.display()
+        ))
+    })?;
+    sync_directory(quarantine).map_err(|rollback_error| {
+        Error::Invalid(format!(
+            "verified restore failed ({original_error}); rollback quarantine sync failed ({rollback_error}); restored tree is visible at {} and quarantine remains at {}",
+            destination.display(),
+            quarantine.display()
+        ))
+    })?;
+    sync_directory(parent).map_err(|rollback_error| {
+        Error::Invalid(format!(
+            "verified restore failed ({original_error}); rollback directory sync failed ({rollback_error}); restored tree is visible at {}",
+            destination.display()
+        ))
+    })?;
+    fs::remove_dir(quarantine)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn validate_build_tree_root(root: &Path) -> Result<(), Error> {
+    if !root.is_absolute() {
+        return Err(Error::Invalid("build-tree root must be absolute".into()));
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::Invalid(
+            "build-tree root must be a real directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_observed_build_tree(
+    root_path: &Path,
+    observed: &ObservedBuildTree,
+    expected_entries: &[LayoutEntry],
+) -> Result<(), Error> {
+    if observe_pinned_build_tree(&observed.root)? != expected_entries
+        || portable_mode(&observed.root.metadata()?) != observed.root_mode
+        || same_file::Handle::from_file(open_pinned_root(root_path)?)? != observed.root_identity
+    {
+        return Err(Error::Invalid(
+            "build tree changed while it was being packaged".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_new_archive_destination(destination: &Path) -> Result<(), Error> {
+    if !destination.is_absolute() {
+        return Err(Error::Invalid(
+            "build-tree archive destination must be absolute".into(),
+        ));
+    }
+    reject_symlink(destination)?;
+    if destination.exists() {
+        return Err(Error::Invalid(
+            "build-tree archive destination already exists".into(),
+        ));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Error::Invalid("build-tree archive destination has no parent".into()))?;
+    reject_symlink(parent)?;
+    if !parent.metadata()?.is_dir() {
+        return Err(Error::Invalid(
+            "build-tree archive parent is not a directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_restore_destination(destination: &Path) -> Result<&Path, Error> {
+    if !destination.is_absolute() {
+        return Err(Error::Invalid(
+            "build-tree restore destination must be absolute".into(),
+        ));
+    }
+    reject_symlink(destination)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Error::Invalid("build-tree restore destination has no parent".into()))?;
+    reject_symlink(parent)?;
+    if !parent.metadata()?.is_dir() {
+        return Err(Error::Invalid(
+            "build-tree restore parent is not a directory".into(),
+        ));
+    }
+    Ok(parent)
+}
+
+struct ObservedBuildTree {
+    root: File,
+    root_identity: same_file::Handle,
+    root_mode: u32,
+    entries: Vec<LayoutEntry>,
+}
+
+#[cfg(unix)]
+fn observe_build_tree(root: &Path) -> Result<ObservedBuildTree, Error> {
+    let root = open_pinned_root(root)?;
+    let root_identity = same_file::Handle::from_file(root.try_clone()?)?;
+    let root_mode = portable_mode(&root.metadata()?);
+    let entries = observe_pinned_build_tree(&root)?;
+    Ok(ObservedBuildTree {
+        root,
+        root_identity,
+        root_mode,
+        entries,
+    })
+}
+
+#[cfg(unix)]
+fn open_pinned_root(root: &Path) -> Result<File, Error> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    Ok(File::from(
+        open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| Error::Io(error.into()))?,
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_pinned_root(_root: &Path) -> Result<File, Error> {
+    Err(Error::Invalid(
+        "verified build-tree packing requires no-follow directory handles on this platform".into(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn observe_build_tree(_root: &Path) -> Result<ObservedBuildTree, Error> {
+    Err(Error::Invalid(
+        "verified build-tree packing requires no-follow directory handles on this platform".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn observe_pinned_build_tree(root: &File) -> Result<Vec<LayoutEntry>, Error> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn visit(
+        directory: &File,
+        relative: &Path,
+        entries: &mut Vec<LayoutEntry>,
+    ) -> Result<(), Error> {
+        let mut children = rustix::fs::Dir::read_from(directory)
+            .map_err(|error| Error::Io(error.into()))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.file_name().to_bytes().to_vec())
+                    .map_err(|error| Error::Io(error.into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        children.retain(|name| name.as_slice() != b"." && name.as_slice() != b"..");
+        children.sort();
+        for name in children {
+            let name = OsStr::from_bytes(&name);
+            let child_relative = relative.join(name);
+            let portable = child_relative
+                .to_str()
+                .ok_or_else(|| Error::Invalid("build-tree path must be UTF-8".into()))?;
+            validate_relative_path(portable)?;
+            let stat = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| Error::Io(error.into()))?;
+            match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+                rustix::fs::FileType::Directory => {
+                    let child = open_pinned_child(directory, name, true)?;
+                    let mode = portable_mode(&child.metadata()?);
+                    entries.push(LayoutEntry::Directory {
+                        path: portable.to_owned(),
+                        mode,
+                    });
+                    visit(&child, &child_relative, entries)?;
+                }
+                rustix::fs::FileType::RegularFile => {
+                    let mut child = open_pinned_child(directory, name, false)?;
+                    let metadata = child.metadata()?;
+                    reject_hard_link(&metadata, portable)?;
+                    let mode = portable_mode(&metadata);
+                    let size_bytes = metadata.len();
+                    let sha256 = sha256_reader(&mut child)?;
+                    let final_metadata = child.metadata()?;
+                    reject_hard_link(&final_metadata, portable)?;
+                    if final_metadata.len() != size_bytes {
+                        return Err(Error::Invalid(format!(
+                            "build-tree file changed while reading {portable}"
+                        )));
+                    }
+                    entries.push(LayoutEntry::File {
+                        path: portable.to_owned(),
+                        mode,
+                        size_bytes,
+                        sha256,
+                    });
+                }
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "build tree contains link or special file {portable}"
+                    )));
+                }
+            }
+            if entries.len() > MAX_LAYOUT_ENTRIES {
+                return Err(Error::Invalid(
+                    "build tree exceeds the supported entry count".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let mut entries = Vec::new();
+    visit(root, Path::new(""), &mut entries)?;
+    entries.sort_by(|left, right| left.path().cmp(right.path()));
+    if entries.is_empty() {
+        return Err(Error::Invalid("build tree must not be empty".into()));
+    }
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn reject_hard_link(metadata: &fs::Metadata, path: &str) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.nlink() != 1 {
+        return Err(Error::Invalid(format!(
+            "build tree contains hard-linked file {path}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn observe_pinned_build_tree(_root: &File) -> Result<Vec<LayoutEntry>, Error> {
+    Err(Error::Invalid(
+        "verified build-tree packing requires no-follow directory handles on this platform".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn open_pinned_child(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    directory: bool,
+) -> Result<File, Error> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    let file = File::from(
+        openat(parent, name, flags, Mode::empty()).map_err(|error| Error::Io(error.into()))?,
+    );
+    let metadata = file.metadata()?;
+    if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+        return Err(Error::Invalid(
+            "build-tree entry changed type while opening".into(),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_pinned_entry(root: &File, relative: &Path) -> Result<File, Error> {
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => Ok(value),
+            _ => Err(Error::Invalid(
+                "build-tree archive path is not normalized".into(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut current = root.try_clone()?;
+    for (index, component) in components.iter().enumerate() {
+        current = open_pinned_child(&current, component, index + 1 != components.len())?;
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn portable_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn portable_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.is_dir() {
+        0o755
+    } else if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    }
+}
+
+#[cfg(unix)]
+fn write_build_tree_archive(observed: &ObservedBuildTree, output: &File) -> Result<(), Error> {
+    let output = output.try_clone()?;
+    output.set_len(0)?;
+    let encoder = zstd::stream::write::Encoder::new(output, 3)?;
+    let mut archive = tar::Builder::new(encoder);
+    for entry in &observed.entries {
+        let mut header = tar::Header::new_ustar();
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        match entry {
+            LayoutEntry::Directory { path, mode } => {
+                header.set_path(path).map_err(|error| {
+                    Error::Invalid(format!(
+                        "build-tree path cannot be represented without an archive extension record: {path}: {error}"
+                    ))
+                })?;
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_mode(*mode);
+                header.set_size(0);
+                header.set_cksum();
+                archive.append_data(&mut header, path, std::io::empty())?;
+            }
+            LayoutEntry::File {
+                path,
+                mode,
+                size_bytes,
+                ..
+            } => {
+                header.set_path(path).map_err(|error| {
+                    Error::Invalid(format!(
+                        "build-tree path cannot be represented without an archive extension record: {path}: {error}"
+                    ))
+                })?;
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(*mode);
+                header.set_size(*size_bytes);
+                header.set_cksum();
+                let mut file = open_pinned_entry(&observed.root, Path::new(path))?;
+                archive.append_data(&mut header, path, &mut file)?;
+            }
+        }
+    }
+    archive.finish()?;
+    let encoder = archive.into_inner()?;
+    let output = encoder.finish()?;
+    output.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_build_tree_archive(_observed: &ObservedBuildTree, _output: &File) -> Result<(), Error> {
+    Err(Error::Invalid(
+        "verified build-tree packing requires no-follow directory handles on this platform".into(),
+    ))
+}
+
+fn digest_archive_chunks(
+    path: &Path,
+    chunk_size_bytes: u64,
+) -> Result<(String, u64, Vec<ArtifactChunk>), Error> {
+    let chunk_size = usize::try_from(chunk_size_bytes)
+        .map_err(|_| Error::Invalid("chunk size does not fit memory".into()))?;
+    let mut file = File::open(path)?;
+    let mut aggregate = Sha256::new();
+    let mut buffer = vec![0_u8; chunk_size];
+    let mut offset = 0_u64;
+    let mut chunks = Vec::new();
+    loop {
+        let mut filled = 0_usize;
+        while filled < buffer.len() {
+            let read = file.read(&mut buffer[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+        aggregate.update(&buffer[..filled]);
+        chunks.push(ArtifactChunk {
+            offset,
+            size_bytes: filled as u64,
+            sha256: sha256_bytes(&buffer[..filled]),
+        });
+        offset = offset
+            .checked_add(filled as u64)
+            .ok_or_else(|| Error::Invalid("artifact size overflows u64".into()))?;
+    }
+    Ok((hex::encode(aggregate.finalize()), offset, chunks))
 }
 
 /// Read-only outcome of authenticating an interrupted partial artifact.
@@ -1191,26 +1833,17 @@ pub fn extract_verified_archive(
     // same exact authority fence required for object publication.
     manifest.validate_authority(authority)?;
     verify_archive_layout(path, manifest)?;
-    if !destination.is_absolute() {
-        return Err(Error::Invalid(
-            "artifact extraction destination must be absolute".into(),
-        ));
-    }
-    reject_symlink(destination)?;
+    let parent = validate_restore_destination(destination)?;
     if destination.exists() {
         return Err(Error::Invalid(
             "artifact extraction destination already exists".into(),
         ));
     }
-    let parent = destination
-        .parent()
-        .ok_or_else(|| Error::Invalid("artifact extraction destination has no parent".into()))?;
-    reject_symlink(parent)?;
-    if !parent.metadata()?.is_dir() {
-        return Err(Error::Invalid(
-            "artifact extraction parent is not a directory".into(),
-        ));
-    }
+    let _lock = acquire_extraction_lock(parent)?;
+    extract_verified_archive_locked(path, manifest, authority, destination, space_policy)
+}
+
+fn acquire_extraction_lock(parent: &Path) -> Result<File, Error> {
     let extraction_lock_path = parent.join(".shipyard-artifact-extract.lease");
     reject_symlink(&extraction_lock_path)?;
     let extraction_lock = OpenOptions::new()
@@ -1227,6 +1860,19 @@ pub fn extract_verified_archive(
             Error::Io(error)
         }
     })?;
+    Ok(extraction_lock)
+}
+
+fn extract_verified_archive_locked(
+    path: &Path,
+    manifest: &ArtifactManifest,
+    authority: &ManifestAuthority,
+    destination: &Path,
+    space_policy: SpacePolicy,
+) -> Result<PublicationOutcome, Error> {
+    manifest.validate_authority(authority)?;
+    verify_archive_layout(path, manifest)?;
+    let parent = validate_restore_destination(destination)?;
     if destination.exists() {
         return Err(Error::Invalid(
             "artifact extraction destination already exists".into(),
@@ -1244,7 +1890,10 @@ pub fn extract_verified_archive(
         remaining_bytes: allocation_budget,
         space_probe: &mut space_probe,
     };
-    let directory_modes = scan_archive(path, manifest, Some(&mut extraction))?;
+    let mut directory_modes = scan_archive(path, manifest, Some(&mut extraction))?;
+    if let Some(root_mode) = manifest.root_mode {
+        directory_modes.push((extraction.root.to_path_buf(), root_mode));
+    }
     extraction
         .space_policy
         .check_path(extraction.root, extraction.remaining_bytes, 0)?;
@@ -1915,6 +2564,7 @@ mod tests {
             artifact_size_bytes: bytes.len() as u64,
             chunk_size_bytes: MIN_CHUNK_SIZE,
             layout_sha256: digest(&serde_json::to_vec(&entries).unwrap()),
+            root_mode: Some(0o755),
             entries,
             chunks,
             cache_generations: vec![CacheGeneration {
@@ -2107,6 +2757,7 @@ mod tests {
                 .collect();
             let mut manifest = archive_manifest(&bytes, entries);
             manifest.schema = LEGACY_MANIFEST_SCHEMA;
+            manifest.root_mode = None;
             assert!(
                 matches!(manifest.validate(), Err(Error::Invalid(message)) if message.contains("case-insensitive"))
             );
@@ -2142,6 +2793,7 @@ mod tests {
         let mut manifest = archive_manifest(&bytes, entries);
         assert!(manifest.validate().is_err());
         manifest.schema = LEGACY_MANIFEST_SCHEMA;
+        manifest.root_mode = None;
         manifest.validate().unwrap();
         manifest.canonical_sha256().unwrap();
         let temp = TempDir::new().unwrap();
@@ -3036,6 +3688,443 @@ mod tests {
         assert!(serde_json::from_value::<ArtifactManifest>(value).is_err());
     }
 
+    #[test]
+    fn schema_two_manifest_without_root_mode_remains_readable() {
+        let mut value = serde_json::to_value(fixture(&vec![8; TEST_CHUNK_SIZE])).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("schema".into(), serde_json::json!(PREVIOUS_MANIFEST_SCHEMA));
+        object.remove("root_mode");
+        let manifest: ArtifactManifest = serde_json::from_value(value).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.root_mode, None);
+    }
+
+    fn build_tree_inputs() -> BuildTreeArtifactInputs {
+        let template = fixture(&vec![1; TEST_CHUNK_SIZE]);
+        BuildTreeArtifactInputs {
+            source: template.source,
+            build: template.build,
+            cache_generations: template.cache_generations,
+            producer: template.producer,
+        }
+    }
+
+    #[cfg(unix)]
+    fn packed_build_tree(temp: &TempDir) -> (PathBuf, ArtifactManifest) {
+        let source = temp.path().join("configured-build");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("CMakeCache.txt"), b"configured").unwrap();
+        fs::write(source.join("bin/test-runner"), b"executable").unwrap();
+        #[cfg(unix)]
+        {
+            set_portable_permissions(&source, 0o750).unwrap();
+            set_portable_permissions(&source.join("bin/test-runner"), 0o755).unwrap();
+        }
+        let archive = temp.path().join("configured-build.tar.zst");
+        let outcome = pack_verified_build_tree(&source, &archive, build_tree_inputs()).unwrap();
+        assert_eq!(outcome.publication, PublicationOutcome::Durable);
+        (archive, outcome.manifest)
+    }
+
+    fn restorable_build_tree(temp: &TempDir) -> (PathBuf, ArtifactManifest) {
+        let cache = b"configured";
+        let runner = b"executable";
+        let bytes = test_archive(&[
+            TestArchiveEntry::File("CMakeCache.txt", 0o644, cache),
+            TestArchiveEntry::Directory("bin", 0o755),
+            TestArchiveEntry::File("bin/test-runner", 0o755, runner),
+        ]);
+        let entries = vec![
+            LayoutEntry::File {
+                path: "CMakeCache.txt".into(),
+                mode: 0o644,
+                size_bytes: cache.len() as u64,
+                sha256: digest(cache),
+            },
+            LayoutEntry::Directory {
+                path: "bin".into(),
+                mode: 0o755,
+            },
+            LayoutEntry::File {
+                path: "bin/test-runner".into(),
+                mode: 0o755,
+                size_bytes: runner.len() as u64,
+                sha256: digest(runner),
+            },
+        ];
+        let mut manifest = archive_manifest(&bytes, entries);
+        manifest.root_mode = Some(0o750);
+        let archive = temp.path().join("configured-build.tar.zst");
+        fs::write(&archive, bytes).unwrap();
+        manifest.validate().unwrap();
+        (archive, manifest)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_tree_pack_round_trips_exact_layout_and_modes() {
+        let temp = TempDir::new().unwrap();
+        let (archive, manifest) = packed_build_tree(&temp);
+        verify_archive_layout(&archive, &manifest).unwrap();
+        let destination = temp.path().join("restored");
+        assert_eq!(
+            extract_verified_archive(
+                &archive,
+                &manifest,
+                &authority(&manifest),
+                &destination,
+                test_space_policy(),
+            )
+            .unwrap(),
+            PublicationOutcome::Durable
+        );
+        assert_eq!(
+            fs::read(destination.join("CMakeCache.txt")).unwrap(),
+            b"configured"
+        );
+        assert_eq!(
+            fs::read(destination.join("bin/test-runner")).unwrap(),
+            b"executable"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(destination.join("bin/test-runner"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o750
+            );
+        }
+    }
+
+    #[test]
+    fn build_tree_pack_is_no_replace() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("object.o"), b"object").unwrap();
+        let archive = temp.path().join("artifact.tar.zst");
+        fs::write(&archive, b"sentinel").unwrap();
+        assert!(pack_verified_build_tree(&source, &archive, build_tree_inputs()).is_err());
+        assert_eq!(fs::read(archive).unwrap(), b"sentinel");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn build_tree_pack_fails_closed_without_no_follow_directory_handles() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("object.o"), b"object").unwrap();
+        let archive = temp.path().join("artifact.tar.zst");
+
+        let result = pack_verified_build_tree(&source, &archive, build_tree_inputs());
+
+        assert!(matches!(
+            result,
+            Err(Error::Invalid(message))
+                if message.contains("requires no-follow directory handles")
+        ));
+        assert!(!archive.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_tree_pack_supports_ustar_paths_and_rejects_extension_records() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let first = "a".repeat(70);
+        let second = "b".repeat(70);
+        let long_relative = Path::new(&first).join(&second).join("object.o");
+        fs::create_dir_all(source.join(&first).join(&second)).unwrap();
+        fs::write(source.join(&long_relative), b"object").unwrap();
+        let archive = temp.path().join("ustar.tar.zst");
+        let outcome = pack_verified_build_tree(&source, &archive, build_tree_inputs()).unwrap();
+        verify_archive_layout(&archive, &outcome.manifest).unwrap();
+        assert!(
+            outcome
+                .manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path() == long_relative.to_str().unwrap())
+        );
+
+        let third = "c".repeat(70);
+        let fourth = "d".repeat(70);
+        let unsupported = source.join(&first).join(&second).join(&third).join(&fourth);
+        fs::create_dir_all(&unsupported).unwrap();
+        fs::write(unsupported.join("object.o"), b"object").unwrap();
+        let rejected = temp.path().join("longlink.tar.zst");
+        assert!(pack_verified_build_tree(&source, &rejected, build_tree_inputs()).is_err());
+        assert!(!rejected.exists());
+    }
+
+    #[test]
+    fn build_tree_restore_quarantines_and_replaces_existing_tree() {
+        let temp = TempDir::new().unwrap();
+        let (archive, manifest) = restorable_build_tree(&temp);
+        let destination = temp.path().join("active-build");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("stale"), b"old").unwrap();
+        let outcome = restore_verified_build_tree(
+            &archive,
+            &manifest,
+            &authority(&manifest),
+            &destination,
+            test_space_policy(),
+        )
+        .unwrap();
+        assert_eq!(outcome.publication, PublicationOutcome::Durable);
+        assert!(outcome.replaced_existing);
+        let quarantine = outcome.quarantine_cleanup_pending.unwrap();
+        assert_eq!(fs::read(quarantine.join("prior/stale")).unwrap(), b"old");
+        assert!(!destination.join("stale").exists());
+        assert_eq!(
+            fs::read(destination.join("CMakeCache.txt")).unwrap(),
+            b"configured"
+        );
+        fs::remove_dir_all(quarantine).unwrap();
+    }
+
+    #[test]
+    fn build_tree_restore_rolls_back_after_extraction_failure() {
+        let temp = TempDir::new().unwrap();
+        let (archive, manifest) = restorable_build_tree(&temp);
+        let destination = temp.path().join("active-build");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("sentinel"), b"old").unwrap();
+        let result = restore_verified_build_tree_with(
+            &archive,
+            &manifest,
+            &authority(&manifest),
+            &destination,
+            test_space_policy(),
+            |_, _, _, _, _| Err(Error::Invalid("injected extraction failure".into())),
+        );
+        assert!(
+            matches!(result, Err(Error::Invalid(message)) if message == "injected extraction failure")
+        );
+        assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"old");
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".shipyard-build-tree-quarantine-")
+        }));
+    }
+
+    #[test]
+    fn rollback_atomically_refuses_a_destination_recreated_after_preflight() {
+        let temp = TempDir::new().unwrap();
+        let destination = temp.path().join("active-build");
+        let quarantine = temp.path().join("quarantine");
+        let prior = quarantine.join("prior");
+        fs::create_dir_all(&prior).unwrap();
+        fs::write(prior.join("sentinel"), b"old").unwrap();
+        let original = Error::Invalid("injected extraction failure".into());
+
+        let result = rollback_quarantined_tree_with(
+            &destination,
+            temp.path(),
+            &quarantine,
+            &prior,
+            &original,
+            |source, target| {
+                fs::create_dir(target)?;
+                fs::write(target.join("contender"), b"new")?;
+                rename_no_replace(source, target)
+            },
+        );
+
+        assert!(
+            matches!(result, Err(Error::Invalid(message)) if message.contains("rollback failed"))
+        );
+        assert_eq!(fs::read(destination.join("contender")).unwrap(), b"new");
+        assert_eq!(fs::read(prior.join("sentinel")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn build_tree_restore_rejects_tamper_before_quarantine() {
+        let temp = TempDir::new().unwrap();
+        let (archive, manifest) = restorable_build_tree(&temp);
+        let destination = temp.path().join("active-build");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("sentinel"), b"old").unwrap();
+        let mut archive_bytes = fs::read(&archive).unwrap();
+        archive_bytes[0] ^= 1;
+        fs::write(&archive, archive_bytes).unwrap();
+        assert!(
+            restore_verified_build_tree(
+                &archive,
+                &manifest,
+                &authority(&manifest),
+                &destination,
+                test_space_policy(),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"old");
+
+        let tampered_manifest_temp = TempDir::new().unwrap();
+        let (archive, mut manifest) = restorable_build_tree(&tampered_manifest_temp);
+        let LayoutEntry::File { sha256, .. } = manifest
+            .entries
+            .iter_mut()
+            .find(|entry| matches!(entry, LayoutEntry::File { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        *sha256 = "0".repeat(64);
+        manifest.layout_sha256 = digest(&serde_json::to_vec(&manifest.entries).unwrap());
+        assert!(
+            restore_verified_build_tree(
+                &archive,
+                &manifest,
+                &authority(&manifest),
+                &destination,
+                test_space_policy(),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_tree_pack_and_restore_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("target"), b"target").unwrap();
+        symlink(source.join("target"), source.join("link")).unwrap();
+        assert!(
+            pack_verified_build_tree(
+                &source,
+                &temp.path().join("rejected.tar.zst"),
+                build_tree_inputs(),
+            )
+            .is_err()
+        );
+
+        fs::remove_file(source.join("link")).unwrap();
+        let archive = temp.path().join("accepted.tar.zst");
+        let manifest = pack_verified_build_tree(&source, &archive, build_tree_inputs())
+            .unwrap()
+            .manifest;
+        let destination_target = temp.path().join("destination-target");
+        fs::create_dir(&destination_target).unwrap();
+        let destination = temp.path().join("destination-link");
+        symlink(&destination_target, &destination).unwrap();
+        assert!(
+            restore_verified_build_tree(
+                &archive,
+                &manifest,
+                &authority(&manifest),
+                &destination,
+                test_space_policy(),
+            )
+            .is_err()
+        );
+        assert!(fs::read_dir(destination_target).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_tree_pack_rejects_hard_link_topology() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("first"), b"shared").unwrap();
+        fs::hard_link(source.join("first"), source.join("second")).unwrap();
+
+        let result = pack_verified_build_tree(
+            &source,
+            &temp.path().join("rejected.tar.zst"),
+            build_tree_inputs(),
+        );
+
+        assert!(matches!(result, Err(Error::Invalid(message)) if message.contains("hard-linked")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_tree_pack_reads_only_from_the_pinned_root() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("payload"), b"authorized").unwrap();
+        let observed = observe_build_tree(&source).unwrap();
+
+        let displaced = temp.path().join("displaced");
+        fs::rename(&source, &displaced).unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("payload"), b"secret").unwrap();
+        symlink(&external, &source).unwrap();
+
+        let archive_path = temp.path().join("pinned.tar.zst");
+        let archive = File::create(&archive_path).unwrap();
+        write_build_tree_archive(&observed, &archive).unwrap();
+        let decoded = zstd::stream::decode_all(File::open(archive_path).unwrap()).unwrap();
+        let mut tar = tar::Archive::new(decoded.as_slice());
+        let mut entry = tar.entries().unwrap().next().unwrap().unwrap();
+        let mut payload = Vec::new();
+        entry.read_to_end(&mut payload).unwrap();
+        assert_eq!(payload, b"authorized");
+        assert_ne!(
+            same_file::Handle::from_path(&source).unwrap(),
+            observed.root_identity
+        );
+        fs::remove_file(&source).unwrap();
+        symlink(&displaced, &source).unwrap();
+        assert!(validate_observed_build_tree(&source, &observed, &observed.entries).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_tree_pack_detects_root_mode_mutation() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("payload"), b"authorized").unwrap();
+        set_portable_permissions(&source, 0o755).unwrap();
+        let observed = observe_build_tree(&source).unwrap();
+        let expected = observed.entries.clone();
+        set_portable_permissions(&source, 0o700).unwrap();
+        assert!(validate_observed_build_tree(&source, &observed, &expected).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_child_open_rejects_special_file_without_blocking() {
+        use rustix::fs::{Mode, open};
+        let temp = TempDir::new().unwrap();
+        let socket = temp.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let parent = File::from(
+            open(
+                temp.path(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap(),
+        );
+        assert!(open_pinned_child(&parent, std::ffi::OsStr::new("socket"), false).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn store_rejects_symlink_components_and_partial() {
@@ -3061,5 +4150,76 @@ mod tests {
                 .publish_verified(&manifest, &authority(&manifest), transfer)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn build_tree_restore_preserves_quarantine_when_destination_reappears() {
+        let temp = TempDir::new().unwrap();
+        let (archive, manifest) = restorable_build_tree(&temp);
+        let destination = temp.path().join("active-build");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("sentinel"), b"old").unwrap();
+        let result = restore_verified_build_tree_with(
+            &archive,
+            &manifest,
+            &authority(&manifest),
+            &destination,
+            test_space_policy(),
+            |_, _, _, destination, _| {
+                fs::create_dir(destination)?;
+                Err(Error::Invalid("injected extraction failure".into()))
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::Invalid(message)) if message.contains("destination reappeared"))
+        );
+        let quarantine = fs::read_dir(temp.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".shipyard-build-tree-quarantine-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(fs::read(quarantine.join("prior/sentinel")).unwrap(), b"old");
+        fs::remove_dir(&destination).unwrap();
+        fs::remove_dir_all(quarantine).unwrap();
+    }
+
+    #[test]
+    fn build_tree_restore_retains_prior_tree_until_publication_is_durable() {
+        let temp = TempDir::new().unwrap();
+        let (archive, manifest) = restorable_build_tree(&temp);
+        let destination = temp.path().join("active-build");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("sentinel"), b"old").unwrap();
+        let outcome = restore_verified_build_tree_with(
+            &archive,
+            &manifest,
+            &authority(&manifest),
+            &destination,
+            test_space_policy(),
+            |_, _, _, destination, _| {
+                fs::create_dir(destination)?;
+                fs::write(destination.join("new"), b"new")?;
+                Ok(PublicationOutcome::PublishedParentSyncPending {
+                    destination: destination.to_path_buf(),
+                    message: "injected sync failure".into(),
+                })
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome.publication,
+            PublicationOutcome::PublishedParentSyncPending { .. }
+        ));
+        let quarantine = outcome.quarantine_cleanup_pending.unwrap();
+        assert_eq!(fs::read(quarantine.join("prior/sentinel")).unwrap(), b"old");
+        assert_eq!(fs::read(destination.join("new")).unwrap(), b"new");
+        fs::remove_dir_all(destination).unwrap();
+        fs::remove_dir_all(quarantine).unwrap();
     }
 }
