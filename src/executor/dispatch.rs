@@ -2127,9 +2127,8 @@ fn demote_stale_result(mut result: TargetResult, heartbeat_stale_secs: u64) -> T
 }
 
 fn should_evict_for_heartbeat(result: &TargetResult, heartbeat_stale_secs: u64) -> bool {
-    if result.liveness.as_deref() == Some("stuck") {
-        return true;
-    }
+    // Output can remain quiet for arbitrarily long while a test is healthy.
+    // Only the timestamped worker heartbeat is authoritative for failover.
     let Some(last_heartbeat_at) = result.last_heartbeat_at else {
         return false;
     };
@@ -2868,6 +2867,21 @@ backend = "local"
                 .as_deref()
                 .is_some_and(|message| message.contains("Runner went silent"))
         );
+    }
+
+    #[test]
+    fn fallback_quiet_label_with_fresh_heartbeat_does_not_demote_result() {
+        let mut result = TargetResult::new("linux", "linux-x64", TargetStatus::Error, "cloud");
+        let now = Utc::now();
+        result.completed_at = Some(now);
+        result.last_heartbeat_at = Some(now);
+        result.liveness = Some("stuck".to_owned());
+
+        let result = super::demote_stale_result(result, 90);
+
+        assert_eq!(result.status, TargetStatus::Error);
+        assert_eq!(result.failure_class, None);
+        assert_eq!(result.error_message, None);
     }
 
     #[test]

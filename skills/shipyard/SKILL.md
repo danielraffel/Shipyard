@@ -705,6 +705,10 @@ budget; auth, timeout, malformed JSON, and head drift all fail closed.
   worker dies before it goes through. That is intentional — it must not reap a
   slow-but-live worker. Don't shorten it below the ~15s heartbeat interval's
   safety margin.
+- Streamed output silence is not a dead-worker signal. A live subprocess may
+  remain output-quiet well past 90 seconds while its durable heartbeat stays
+  fresh; report that state as `quiet` and never promote it to `stuck`, infra,
+  or fallback eligibility without a stale heartbeat or dead ownership proof.
 - Do NOT launch a second `shipyard pr` for the same PR while the first is still
   alive. That is what strands a `running` job in the first place — one ship per
   PR at a time.
