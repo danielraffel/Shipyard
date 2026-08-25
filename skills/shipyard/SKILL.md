@@ -1533,6 +1533,12 @@ about the App Store Tailscale binary at
 `/Applications/Tailscale.app/Contents/MacOS/Tailscale`; do not assume a
 `tailscale` PATH shim exists.
 
+Shipyard itself launches every noninteractive Tailscale status, Serve, and
+Funnel command with `TERM=dumb`. Preserve that environment override: the macOS
+app-bundle CLI can otherwise attempt to start its GUI and emit non-JSON under a
+stripped LaunchAgent or SSH environment even while Tailscale is healthy. An
+interactive-shell success is not sufficient fleet proof.
+
 ## macOS GUI
 
 The GUI lives at `/Users/danielraffel/Code/shipyard-macos-gui`. Validate it

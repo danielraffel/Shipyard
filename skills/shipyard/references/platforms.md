@@ -8,6 +8,11 @@
   Tailscale on Daniel's Mac. `/usr/local/bin/tailscale` may be a symlink to
   that app binary and can crash with `BundleIdentifiers.swift:41` before command
   dispatch.
+- Shipyard's daemon launches Tailscale with `TERM=dumb`. The app-bundle CLI can
+  otherwise try to start its GUI and emit non-JSON when inherited service
+  environments omit both `TERM` and `TERM_PROGRAM`. Keep this behavior on every
+  noninteractive status, Serve, and Funnel invocation; do not rely on an
+  interactive SSH shell masking the fleet failure.
 - `scripts/validate_webhook_tunnel_live.py --json` is safe and non-mutating.
   It should prove Shipyard binary presence, `gh` auth, GitHub hook-read access,
   Tailscale readiness, and Funnel permission without starting a daemon.
