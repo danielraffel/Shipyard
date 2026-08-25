@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -12,11 +13,14 @@ use crate::changed_surface::{
     ExecutionCommandTransport, ExecutionDisposition, plan_authoritative_execution,
 };
 use crate::config::LoadedConfig;
+use crate::evidence::canonical_repository;
 use crate::executor::dispatch::{ResolvedTarget, ResolvedValidation};
 use crate::queue_request::validation_contract_digest;
 
 const MODE_KEY: &str = "changed_surface_execution.mode";
 const ACCEPTED_POLICY_DIGEST_KEY: &str = "changed_surface_execution.accepted_shadow_policy_digest";
+const ACCEPTED_POLICY_DIGESTS_KEY: &str =
+    "changed_surface_execution.accepted_shadow_policy_digests";
 const MAX_DIAGNOSTIC_CHARS: usize = 512;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,7 +45,8 @@ impl MachineMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MachinePolicy {
     mode: MachineMode,
-    accepted_shadow_policy_digest: Option<String>,
+    legacy_accepted_shadow_policy_digest: Option<String>,
+    accepted_shadow_policy_digests: BTreeMap<(String, String), String>,
 }
 
 impl MachinePolicy {
@@ -59,33 +64,152 @@ impl MachinePolicy {
                 format!("invalid trusted {MODE_KEY} value '{value}'"),
             ))?,
         };
-        let accepted_shadow_policy_digest = trusted
-            .get_str(ACCEPTED_POLICY_DIGEST_KEY)
-            .map(ToOwned::to_owned);
-        if accepted_shadow_policy_digest
+        let legacy_accepted_shadow_policy_digest = match trusted.get(ACCEPTED_POLICY_DIGEST_KEY) {
+            None => None,
+            Some(value) => Some(value.as_str().ok_or_else(|| {
+                CliFailure::new(
+                    2,
+                    format!("invalid trusted {ACCEPTED_POLICY_DIGEST_KEY}: expected a string"),
+                )
+            })?),
+        }
+        .map(ToOwned::to_owned);
+        if legacy_accepted_shadow_policy_digest
             .as_deref()
-            .is_some_and(|digest| {
-                digest.len() != 64
-                    || !digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
+            .is_some_and(|digest| !valid_policy_digest(digest))
         {
             return Err(CliFailure::new(
                 2,
                 format!("invalid trusted {ACCEPTED_POLICY_DIGEST_KEY}"),
             ));
         }
+        let scoped_policy_configured = trusted.get(ACCEPTED_POLICY_DIGESTS_KEY).is_some();
+        let accepted_shadow_policy_digests = parse_scoped_policy_digests(&trusted)?;
+        if legacy_accepted_shadow_policy_digest.is_some() && scoped_policy_configured {
+            return Err(CliFailure::new(
+                2,
+                format!(
+                    "ambiguous trusted changed-surface policy: configure either legacy {ACCEPTED_POLICY_DIGEST_KEY} or scoped {ACCEPTED_POLICY_DIGESTS_KEY}, not both"
+                ),
+            ));
+        }
         Ok(Self {
             mode,
-            accepted_shadow_policy_digest,
+            legacy_accepted_shadow_policy_digest,
+            accepted_shadow_policy_digests,
         })
     }
 
-    fn permits_authoritative(&self, policy_digest: &str) -> bool {
+    fn permits_authoritative(&self, repository: &str, target: &str, policy_digest: &str) -> bool {
         self.mode != MachineMode::Authoritative
-            || self.accepted_shadow_policy_digest.as_deref() == Some(policy_digest)
+            || if self.accepted_shadow_policy_digests.is_empty() {
+                self.legacy_accepted_shadow_policy_digest.as_deref() == Some(policy_digest)
+            } else {
+                self.accepted_shadow_policy_digests
+                    .get(&(canonical_repository(repository), target.to_owned()))
+                    .is_some_and(|accepted| accepted == policy_digest)
+            }
     }
+}
+
+fn parse_scoped_policy_digests(
+    trusted: &LoadedConfig,
+) -> Result<BTreeMap<(String, String), String>, CliFailure> {
+    let Some(value) = trusted.get(ACCEPTED_POLICY_DIGESTS_KEY) else {
+        return Ok(BTreeMap::new());
+    };
+    let repositories = value.as_table().ok_or_else(|| {
+        CliFailure::new(
+            2,
+            format!("invalid trusted {ACCEPTED_POLICY_DIGESTS_KEY}: expected a table"),
+        )
+    })?;
+    if repositories.is_empty() {
+        return Err(CliFailure::new(
+            2,
+            format!("invalid trusted {ACCEPTED_POLICY_DIGESTS_KEY}: table is empty"),
+        ));
+    }
+    let mut accepted = BTreeMap::new();
+    let mut canonical_repositories = BTreeSet::new();
+    for (repository, targets) in repositories {
+        if !valid_repository_slug(repository) {
+            return Err(CliFailure::new(
+                2,
+                format!("invalid trusted {ACCEPTED_POLICY_DIGESTS_KEY} repository '{repository}'"),
+            ));
+        }
+        let canonical = canonical_repository(repository);
+        if !canonical_repositories.insert(canonical.clone()) {
+            return Err(CliFailure::new(
+                2,
+                format!(
+                    "ambiguous trusted {ACCEPTED_POLICY_DIGESTS_KEY}: repository '{repository}' duplicates canonical repository '{canonical}'"
+                ),
+            ));
+        }
+        let targets = targets.as_table().ok_or_else(|| {
+            CliFailure::new(
+                2,
+                format!(
+                    "invalid trusted {ACCEPTED_POLICY_DIGESTS_KEY}.{repository}: expected a target table"
+                ),
+            )
+        })?;
+        if targets.is_empty() {
+            return Err(CliFailure::new(
+                2,
+                format!(
+                    "invalid trusted {ACCEPTED_POLICY_DIGESTS_KEY}.{repository}: target table is empty"
+                ),
+            ));
+        }
+        for (target, digest) in targets {
+            if target.is_empty() || target.trim() != target {
+                return Err(CliFailure::new(
+                    2,
+                    format!(
+                        "invalid trusted {ACCEPTED_POLICY_DIGESTS_KEY}.{repository} target '{target}'"
+                    ),
+                ));
+            }
+            let digest = digest.as_str().ok_or_else(|| {
+                CliFailure::new(
+                    2,
+                    format!(
+                        "invalid trusted {ACCEPTED_POLICY_DIGESTS_KEY}.{repository}.{target}: expected a string"
+                    ),
+                )
+            })?;
+            if !valid_policy_digest(digest) {
+                return Err(CliFailure::new(
+                    2,
+                    format!("invalid trusted {ACCEPTED_POLICY_DIGESTS_KEY}.{repository}.{target}"),
+                ));
+            }
+            accepted.insert((canonical.clone(), target.clone()), digest.to_owned());
+        }
+    }
+    Ok(accepted)
+}
+
+fn valid_repository_slug(repository: &str) -> bool {
+    let mut parts = repository.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !owner.is_empty()
+        && !name.is_empty()
+        && owner.chars().chain(name.chars()).all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+fn valid_policy_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Serialize)]
@@ -178,8 +302,9 @@ pub(super) fn apply_changed_surface_execution(
             ) else {
                 continue;
             };
-            let would_activate = machine.permits_authoritative(&plan.policy_digest)
-                && (plan.stage != "build_and_test" || validation.stages.contains_key("build"));
+            let would_activate =
+                machine.permits_authoritative(repo, &target.name, &plan.policy_digest)
+                    && (plan.stage != "build_and_test" || validation.stages.contains_key("build"));
             if let Some(reason) =
                 selected_resume_block_reason(&plan.stage, resume_from, would_activate)
             {
@@ -336,7 +461,7 @@ pub(super) fn apply_changed_surface_execution(
                 return Err(CliFailure::new(1, bounded_diagnostic(&reason)));
             }
         };
-        if !machine.permits_authoritative(&plan.policy_digest) {
+        if !machine.permits_authoritative(repo, &target.name, &plan.policy_digest) {
             persist_fallback_diagnostic(
                 &result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
                 &FallbackDiagnostic {
@@ -346,9 +471,8 @@ pub(super) fn apply_changed_surface_execution(
                     target: &target.name,
                     machine_mode: machine.mode,
                     category: "graduation_fence",
-                    diagnostic:
-                        "authoritative mode requires the exact reviewed shadow policy digest"
-                            .to_owned(),
+                    diagnostic: "authoritative mode requires the exact reviewed shadow policy digest for this repository and target"
+                        .to_owned(),
                 },
             )?;
             continue;
@@ -592,6 +716,7 @@ mod tests {
         target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
+    use std::collections::BTreeMap;
     use std::fs;
 
     #[test]
@@ -667,20 +792,145 @@ mod tests {
         let digest = "a".repeat(64);
         let missing = MachinePolicy {
             mode: MachineMode::Authoritative,
-            accepted_shadow_policy_digest: None,
+            legacy_accepted_shadow_policy_digest: None,
+            accepted_shadow_policy_digests: BTreeMap::new(),
         };
-        assert!(!missing.permits_authoritative(&digest));
+        assert!(!missing.permits_authoritative("Generous-Corp/pulp", "mac", &digest));
         let accepted = MachinePolicy {
             mode: MachineMode::Authoritative,
-            accepted_shadow_policy_digest: Some(digest.clone()),
+            legacy_accepted_shadow_policy_digest: Some(digest.clone()),
+            accepted_shadow_policy_digests: BTreeMap::new(),
         };
-        assert!(accepted.permits_authoritative(&digest));
-        assert!(!accepted.permits_authoritative(&"b".repeat(64)));
+        assert!(accepted.permits_authoritative("Generous-Corp/pulp", "mac", &digest));
+        assert!(!accepted.permits_authoritative("Generous-Corp/pulp", "mac", &"b".repeat(64)));
         let shadow = MachinePolicy {
             mode: MachineMode::ShadowCompare,
-            accepted_shadow_policy_digest: None,
+            legacy_accepted_shadow_policy_digest: None,
+            accepted_shadow_policy_digests: BTreeMap::new(),
         };
-        assert!(shadow.permits_authoritative(&digest));
+        assert!(shadow.permits_authoritative("Generous-Corp/pulp", "mac", &digest));
+    }
+
+    #[test]
+    fn legacy_scalar_config_remains_authoritative_without_scoped_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        fs::write(
+            temp.path().join("config.toml"),
+            format!(
+                "[changed_surface_execution]\nmode = 'authoritative'\naccepted_shadow_policy_digest = '{digest}'\n"
+            ),
+        )
+        .unwrap();
+        let config = LoadedConfig::load(
+            Some(temp.path().to_path_buf()),
+            None,
+            None,
+            LocalOverlaySource::None,
+        )
+        .unwrap();
+        let policy = MachinePolicy::from_global(&config).unwrap();
+
+        assert!(policy.permits_authoritative("Generous-Corp/pulp", "mac", &digest));
+        assert!(!policy.permits_authoritative("Generous-Corp/pulp", "mac", &"b".repeat(64)));
+    }
+
+    #[test]
+    fn scoped_digests_authorize_pulp_and_forge_without_cross_authorizing() {
+        let temp = tempfile::tempdir().unwrap();
+        let pulp_digest = "a".repeat(64);
+        let forge_digest = "b".repeat(64);
+        fs::write(
+            temp.path().join("config.toml"),
+            format!(
+                "[changed_surface_execution]\nmode = 'authoritative'\n\
+                 [changed_surface_execution.accepted_shadow_policy_digests.\"Generous-Corp/pulp\"]\nmac = '{pulp_digest}'\n\
+                 [changed_surface_execution.accepted_shadow_policy_digests.\"Generous-Corp/forge\"]\nmac = '{forge_digest}'\n"
+            ),
+        )
+        .unwrap();
+        let config = LoadedConfig::load(
+            Some(temp.path().to_path_buf()),
+            None,
+            None,
+            LocalOverlaySource::None,
+        )
+        .unwrap();
+        let policy = MachinePolicy::from_global(&config).unwrap();
+
+        assert!(policy.permits_authoritative("generous-corp/PULP", "mac", &pulp_digest));
+        assert!(policy.permits_authoritative("Generous-Corp/forge", "mac", &forge_digest));
+        assert!(!policy.permits_authoritative("Generous-Corp/pulp", "mac", &forge_digest));
+        assert!(!policy.permits_authoritative("Generous-Corp/forge", "mac", &pulp_digest));
+        assert!(!policy.permits_authoritative("Generous-Corp/pulp", "linux", &pulp_digest));
+        assert!(!policy.permits_authoritative("Generous-Corp/vellum", "mac", &pulp_digest));
+    }
+
+    #[test]
+    fn scalar_and_scoped_digests_are_rejected_as_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        fs::write(
+            temp.path().join("config.toml"),
+            format!(
+                "[changed_surface_execution]\nmode = 'authoritative'\naccepted_shadow_policy_digest = '{digest}'\n\
+                 [changed_surface_execution.accepted_shadow_policy_digests.\"Generous-Corp/pulp\"]\nmac = '{digest}'\n"
+            ),
+        )
+        .unwrap();
+        let config = LoadedConfig::load(
+            Some(temp.path().to_path_buf()),
+            None,
+            None,
+            LocalOverlaySource::None,
+        )
+        .unwrap();
+        let error = MachinePolicy::from_global(&config).unwrap_err();
+        assert!(error.message.contains("ambiguous trusted"));
+    }
+
+    #[test]
+    fn canonical_repository_collisions_are_rejected_as_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        fs::write(
+            temp.path().join("config.toml"),
+            format!(
+                "[changed_surface_execution]\nmode = 'authoritative'\n\
+                 [changed_surface_execution.accepted_shadow_policy_digests.\"Generous-Corp/pulp\"]\nmac = '{digest}'\n\
+                 [changed_surface_execution.accepted_shadow_policy_digests.\"generous-corp/PULP\"]\nlinux = '{digest}'\n"
+            ),
+        )
+        .unwrap();
+        let config = LoadedConfig::load(
+            Some(temp.path().to_path_buf()),
+            None,
+            None,
+            LocalOverlaySource::None,
+        )
+        .unwrap();
+        let error = MachinePolicy::from_global(&config).unwrap_err();
+        assert!(error.message.contains("duplicates canonical repository"));
+    }
+
+    #[test]
+    fn explicit_empty_scoped_digest_table_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "[changed_surface_execution]\nmode = 'authoritative'\n\
+             [changed_surface_execution.accepted_shadow_policy_digests]\n",
+        )
+        .unwrap();
+        let config = LoadedConfig::load(
+            Some(temp.path().to_path_buf()),
+            None,
+            None,
+            LocalOverlaySource::None,
+        )
+        .unwrap();
+        let error = MachinePolicy::from_global(&config).unwrap_err();
+        assert!(error.message.contains("table is empty"));
     }
 
     #[test]
