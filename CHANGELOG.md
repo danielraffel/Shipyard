@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01141"></a>
+## [0.114.1] - 2026-08-25
+
+- fix/tailscale stripped env 20260825 ([#471](https://github.com/danielraffel/Shipyard/pull/471))
+
 <a id="v01140"></a>
 ## [0.114.0] - 2026-08-25
 
@@ -1043,6 +1048,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.114.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.114.1
 [0.114.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.114.0
 [0.113.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.113.0
 [0.112.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.112.2
