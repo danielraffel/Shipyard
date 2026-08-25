@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01151"></a>
+## [0.115.1] - 2026-08-25
+
+- fix/quiet process not stuck 20260825 ([#474](https://github.com/danielraffel/Shipyard/pull/474))
+- feature/ctest inventory producer 20260825 ([#473](https://github.com/danielraffel/Shipyard/pull/473))
+
 <a id="v01150"></a>
 ## [0.115.0] - 2026-08-25
 
@@ -1053,6 +1059,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.115.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.115.1
 [0.115.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.115.0
 [0.114.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.114.1
 [0.114.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.114.0
