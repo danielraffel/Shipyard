@@ -92,7 +92,16 @@ Never treat queue absence alone as permission to rearm. The PR must first have
 been observed in the queue (durably recorded across restarts), and only an
 `invalid_merge_commit` removal may be re-enqueued automatically. Failed checks,
 manual/unknown removal, head drift, malformed authority data, or a
-403/rate-limit response stop fail-closed.
+403/rate-limit response stop fail-closed. The sole reviewed exception is the
+default-off steward flag `--recover-hosted-setup-eviction-priority`: it may use
+one write-ahead-audited `jump: true` enqueue for an absent same-head managed PR
+only from a durable queue-front pre-removal queue/base-revision witness whose speculative commit
+has that base as a parent, plus an exact `failed_checks` timeline event no more than two hours old
+and one linked failed required GitHub Actions CheckRun whose sole failure is a
+GitHub-hosted setup-only provider-internal DNS outage. Generic setup failures,
+self-hosted jobs, incomplete or ambiguous histories, intervening admissions,
+base/governance drift, and prior receipts
+never authorize the jump.
 
 Use `shipyard --json queue-observe --repo <owner/repo> [--follow]` when an
 agent needs a durable, read-only feed of base SHA, open PR heads/checks,

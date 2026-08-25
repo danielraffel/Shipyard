@@ -1193,6 +1193,10 @@ pub(super) enum RunnerCommand {
         /// Maximum reruns of the same transiently-failed run on one exact head.
         #[arg(long = "max-transient-reruns", default_value_t = 1)]
         max_transient_reruns: u32,
+        /// Restore queue-front priority after a narrowly proven GitHub-hosted
+        /// pre-checkout infrastructure eviction. Disabled by default.
+        #[arg(long = "recover-hosted-setup-eviction-priority")]
+        recover_hosted_setup_eviction_priority: bool,
         /// Disable queued-run superseded-head cleanup.
         #[arg(long = "no-coalesce")]
         no_coalesce: bool,

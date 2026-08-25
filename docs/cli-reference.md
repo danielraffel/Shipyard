@@ -101,6 +101,7 @@ shipyard runner fleet-status --json                 # periodic-monitor JSON + no
 shipyard runner steward --repo OWNER/pulp --repo OWNER/forge --repo OWNER/vellum
 shipyard runner steward --apply                     # exact-head, green-gated mutations
 shipyard runner steward --no-preempt-capacity       # disable bounded preamble preemption
+shipyard runner steward --recover-hosted-setup-eviction-priority --apply
 shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable authority blocker
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
@@ -138,6 +139,30 @@ repository without a GitHub-native merge queue receives a typed
 `direct_merge_refused` decision; Shipyard does not issue a client-side REST
 merge because that endpoint cannot atomically enforce complete check
 materialization and the validated base revision.
+
+Queue-priority recovery is separately default-off. When
+`--recover-hosted-setup-eviction-priority` is enabled on an apply pass, the
+steward durably records exact managed queue-front entries. If GitHub later removes
+that same PR head and unchanged base revision for `failed_checks` within two
+hours, with the speculative merge-group commit directly parented by the pinned base and the
+removal immediately following the witnessed admission, the steward uses
+`jump: true` exactly once only when the recorded merge-group head has one failed required GitHub Actions CheckRun
+run, its sole failed job ran in the `GitHub Actions` runner group, only `Set up
+job` failed, and the job log contains the narrow provider-internal DNS failure
+signature. It revalidates the absent queue entry, open PR, base, immutable head,
+ownership, required checks, and central mutation authority before enqueueing.
+Missing, stale, ambiguous, generic setup, or self-hosted evidence never grants
+priority recovery; the ordinary exact-head enqueue path is unchanged.
+
+An ejected merge-group can currently leave unrelated children in the same
+workflow run active after the hosted setup-only failure. Automatic cancellation
+is deliberately not inferred from queue-priority authority. The follow-up gate
+must reuse the same durable queue witness, latest `failed_checks` removal,
+exact merge-group head and required-run/job/log proof, then re-read the exact
+nonterminal run and absent queue entry under the central mutation guard before
+one write-ahead-audited cancellation. Any ambiguity, head/base drift, new queue
+entry, non-hosted job, or run-attempt change must refuse cancellation.
+
 Accepted capacity cancellations remain in the handoff ledger until an exact
 run/job read proves terminal; each apply pass resumes those records with an
 exact-run force-cancel before planning new work. Read failures keep the record

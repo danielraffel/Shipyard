@@ -166,7 +166,6 @@ fn gh_json_with_deadline(
     )
 }
 
-#[cfg(all(test, unix))]
 pub(super) fn required_checks(
     actions: &GitHubActions,
     repo: &str,
@@ -592,6 +591,18 @@ fn check_runs_for_head_with_deadline(
         }
     }
     Err("current-head check runs exceed 1000; refusing partial identity scan".to_owned())
+}
+
+pub(super) fn complete_checks_for_head(
+    actions: &GitHubActions,
+    repo: &str,
+    head_sha: &str,
+) -> Result<Vec<StewardCheck>, String> {
+    let mut checks = check_runs_for_head_with_deadline(actions, repo, head_sha, None)?;
+    checks.extend(commit_statuses_for_head_with_deadline(
+        actions, repo, head_sha, None,
+    )?);
+    Ok(checks)
 }
 
 fn commit_statuses_for_head_with_deadline(
