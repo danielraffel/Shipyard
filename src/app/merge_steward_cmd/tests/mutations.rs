@@ -418,8 +418,8 @@ fn hosted_precheckout_eviction_restores_priority_once_with_write_ahead_receipt()
     assert_eq!(saved.queue_recovery_receipts.len(), 1);
     assert!(saved.queue_recovery_receipts.values().all(|receipt| {
         receipt.phase == QueueRecoveryPhase::Accepted
-            && receipt.run_id == 32903260905
-            && receipt.job_id == 97981596587
+            && receipt.run_id == 32_903_260_905
+            && receipt.job_id == 97_981_596_587
     }));
 }
 

@@ -316,6 +316,7 @@ fn failed_checks_removal(
     Ok(Some(removed_at.to_owned()))
 }
 
+#[allow(clippy::too_many_lines)] // One fail-closed evidence chain validates run, check, job, and log.
 fn hosted_setup_failure(
     actions: &GitHubActions,
     observation: &RepoObservation,

@@ -98,18 +98,15 @@ fn enqueue_pull_request_with_recovery(
     recover_hosted_setup_eviction_priority: bool,
 ) -> (Option<String>, Option<String>) {
     let recovery = if recover_hosted_setup_eviction_priority {
-        match recovery_evidence(context.actions, context.observation, pr, ledger) {
-            Ok(evidence) => evidence,
-            Err(_) => {
-                record_audit(
-                    ledger,
-                    &context.observation.repo,
-                    &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
-                    "queue_priority_recovery_unreadable_fell_back",
-                );
-                None
-            }
-        }
+        recovery_evidence(context.actions, context.observation, pr, ledger).unwrap_or_else(|_| {
+            record_audit(
+                ledger,
+                &context.observation.repo,
+                &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
+                "queue_priority_recovery_unreadable_fell_back",
+            );
+            None
+        })
     } else {
         None
     };
@@ -167,6 +164,7 @@ fn enqueue_pull_request_with_recovery(
     }
 }
 
+#[allow(clippy::too_many_lines)] // One guarded transaction keeps revalidation and its receipt adjacent.
 fn enqueue_unstacked_pull_request(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,

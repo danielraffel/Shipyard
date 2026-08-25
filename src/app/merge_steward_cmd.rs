@@ -33,6 +33,7 @@ use crate::ship_state::{ShipState, ShipStateStore};
 pub(super) mod recovery_worker;
 
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)] // Flat flags mirror the steward CLI policy contract.
 pub(super) struct StewardCommandArgs {
     pub(super) repos: Vec<String>,
     pub(super) base: String,
