@@ -1429,6 +1429,13 @@ fails before the exact-head steward receipt, managed label, queue state, or
 validation dispatch. `shipyard ship --pr` never invokes it: a recovery session
 must not overwrite provenance captured by the original submitter.
 
+`shipyard ship --pr N` is recovery from the exact live PR worktree, not a way
+to bind the current checkout to another PR. Before any queue, ship-state, or
+validation mutation, Shipyard requires the current GitHub origin, branch, and
+full HEAD to equal the authenticated PR repository, head branch, and head SHA.
+Switch to the exact PR worktree when this guard rejects a stale, detached,
+fork-origin, or unrelated checkout.
+
 Never run `gh pr create` + release separately. Never run the gate scripts by hand.
 
 `shipyard cancel <job> --reason <why>` is an execution boundary, not only a
