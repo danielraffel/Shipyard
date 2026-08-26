@@ -112,7 +112,7 @@ pub struct ChangedSurfacePolicy {
     /// optional iOS/AUv3 compile lane. Shipyard binds this repository-owned
     /// projection into the policy digest but does not infer test selection
     /// from it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ios_compile_skip_safe_paths: Vec<String>,
     /// Reviewed high-risk surfaces that always require the full suite.
     #[serde(default)]
@@ -1709,6 +1709,8 @@ mod tests {
     #[test]
     fn repository_mobile_skip_projection_is_parsed_and_bound_into_policy_digest() {
         let original = policy();
+        let original_json = serde_json::to_value(&original).expect("serialize legacy policy");
+        assert!(original_json.get("ios_compile_skip_safe_paths").is_none());
         let mut projected = original.clone();
         projected.ios_compile_skip_safe_paths = vec!["docs/**".to_owned()];
         let encoded = toml::to_string(&projected).expect("encode policy");
