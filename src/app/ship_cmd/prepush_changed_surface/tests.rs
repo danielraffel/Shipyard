@@ -25,6 +25,7 @@ fn policy() -> ChangedSurfacePolicy {
         baseline_tests: vec!["baseline".to_owned()],
         baseline_build_targets: Vec::new(),
         baseline_only_paths: vec!["docs/**".to_owned()],
+        ios_compile_skip_safe_paths: Vec::new(),
         full_required_paths: vec!["cmake/**".to_owned()],
         policy_paths: vec![".shipyard/config.toml".to_owned()],
         test_topology_paths: vec!["tests/CMakeLists.txt".to_owned()],

@@ -227,6 +227,11 @@ pub enum AuditIssue {
     NameLabelClassMismatch,
     /// Advisory-only and required-work routing labels overlap on one runner.
     AdvisoryRequiredLabelOverlap,
+    /// A configured local runner's `.path` cannot be read.
+    RunnerPathUnreadable,
+    /// A configured local runner's `.path` differs from Shipyard's canonical,
+    /// system-first value.
+    NonCanonicalRunnerPath,
 }
 
 impl AuditIssue {
@@ -239,6 +244,8 @@ impl AuditIssue {
             Self::MissingHostClassLabel => "missing_host_class_label",
             Self::NameLabelClassMismatch => "name_label_class_mismatch",
             Self::AdvisoryRequiredLabelOverlap => "advisory_required_label_overlap",
+            Self::RunnerPathUnreadable => "runner_path_unreadable",
+            Self::NonCanonicalRunnerPath => "non_canonical_runner_path",
         }
     }
 
@@ -248,7 +255,10 @@ impl AuditIssue {
     pub fn is_drift(self) -> bool {
         matches!(
             self,
-            Self::NameLabelClassMismatch | Self::AdvisoryRequiredLabelOverlap
+            Self::NameLabelClassMismatch
+                | Self::AdvisoryRequiredLabelOverlap
+                | Self::RunnerPathUnreadable
+                | Self::NonCanonicalRunnerPath
         )
     }
 
@@ -263,6 +273,8 @@ impl AuditIssue {
             Self::AdvisoryRequiredLabelOverlap => {
                 "advisory and required-work routing labels overlap"
             }
+            Self::RunnerPathUnreadable => "local runner .path cannot be read",
+            Self::NonCanonicalRunnerPath => "local runner .path is not Shipyard-canonical",
         }
     }
 }

@@ -321,11 +321,31 @@ fn probe_hosts_concurrently_with_timeout(
 }
 
 fn probe_host_until(class: &HostClassConfig, deadline: Instant) -> HostProbeBundle {
-    HostProbeBundle {
-        capacity: probe_host_capacity_until(class, deadline),
-        doctor: probe_doctor_until(class, deadline),
-        storage: probe_storage_until(class, deadline),
-    }
+    thread::scope(|scope| {
+        let capacity = scope.spawn(|| probe_host_capacity_until(class, deadline));
+        let doctor = scope.spawn(|| probe_doctor_until(class, deadline));
+        let storage = scope.spawn(|| probe_storage_until(class, deadline));
+        HostProbeBundle {
+            capacity: capacity.join().unwrap_or_else(|_| HostCapacity {
+                class: class.class.clone(),
+                ssh: class.ssh.clone(),
+                cap: class.cap,
+                running: None,
+                source: "capacity probe panicked".to_owned(),
+            }),
+            doctor: doctor.join().unwrap_or_else(|_| DoctorProbe {
+                readable: false,
+                source: "doctor probe panicked".to_owned(),
+                digest: None,
+            }),
+            storage: storage.join().unwrap_or_else(|_| StorageProbe {
+                source: "storage probe panicked".to_owned(),
+                disk_path: class.tart_home.clone().unwrap_or_else(|| ".".to_owned()),
+                disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
+                ..StorageProbe::default()
+            }),
+        }
+    })
 }
 
 fn unreadable_host_bundle(class: &HostClassConfig, reason: &str) -> HostProbeBundle {

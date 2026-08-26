@@ -108,6 +108,12 @@ pub struct ChangedSurfacePolicy {
     /// Paths reviewed as safe to require baseline smoke only (for example docs).
     #[serde(default)]
     pub baseline_only_paths: Vec<String>,
+    /// Paths independently reviewed by the repository as safe to omit its
+    /// optional iOS/AUv3 compile lane. Shipyard binds this repository-owned
+    /// projection into the policy digest but does not infer test selection
+    /// from it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ios_compile_skip_safe_paths: Vec<String>,
     /// Reviewed high-risk surfaces that always require the full suite.
     #[serde(default)]
     pub full_required_paths: Vec<String>,
@@ -1176,6 +1182,7 @@ fn validate_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
         }
     }
     validate_patterns(&policy.baseline_only_paths)?;
+    validate_patterns(&policy.ios_compile_skip_safe_paths)?;
     validate_patterns(&policy.policy_paths)?;
     validate_patterns(&policy.test_topology_paths)?;
     if policy.baseline_only_paths.iter().any(|pattern| {
@@ -1421,6 +1428,7 @@ mod tests {
             baseline_tests: vec!["smoke boots".to_owned(), "smoke config".to_owned()],
             baseline_build_targets: Vec::new(),
             baseline_only_paths: vec!["docs/**".to_owned()],
+            ios_compile_skip_safe_paths: Vec::new(),
             full_required_paths: Vec::new(),
             policy_paths: vec!["schema/changed-surface.json".to_owned()],
             test_topology_paths: vec![
@@ -1696,6 +1704,19 @@ mod tests {
         })
         .expect("toml");
         assert!(policy_from_toml(&encoded, "mac").is_err());
+    }
+
+    #[test]
+    fn repository_mobile_skip_projection_is_parsed_and_bound_into_policy_digest() {
+        let original = policy();
+        let original_json = serde_json::to_value(&original).expect("serialize legacy policy");
+        assert!(original_json.get("ios_compile_skip_safe_paths").is_none());
+        let mut projected = original.clone();
+        projected.ios_compile_skip_safe_paths = vec!["docs/**".to_owned()];
+        let encoded = toml::to_string(&projected).expect("encode policy");
+        let decoded: ChangedSurfacePolicy = toml::from_str(&encoded).expect("decode policy");
+        assert_eq!(decoded.ios_compile_skip_safe_paths, vec!["docs/**"]);
+        assert_ne!(policy_digest(&original), policy_digest(&decoded));
     }
 
     #[test]

@@ -925,7 +925,15 @@ shipyard runner audit --repo danielraffel/Shipyard   # exit 1 on any drift
 and the class in the labels. It flags non-conforming names (e.g. a hand-named
 `daniels-macbook-shipyard`) and missing labels (e.g. a runner registered with a
 bespoke `--labels` that dropped `<repo>-build-<class>`), exiting non-zero so CI
-or a cron can gate on a clean fleet. This is the foundation for the M5 joining
+or a cron can gate on a clean fleet. For configured runners on the current
+machine, it also requires `.path` to match Shipyard's generated system-first
+value exactly. This rejects interactive/session PATH capture before a missing
+or ephemeral executable directory can wedge `Runner.Worker`. New and
+service-less registration runs `config.sh` under that canonical PATH and
+rewrites `.path` before service start. A service-installed runner remains
+fail-closed until it is drained, stopped/uninstalled with its own `svc.sh`, and
+reconciled by `runner register`; Shipyard never stops a live runner implicitly.
+This is the foundation for M5 joining
 by class with zero bespoke setup. Pure naming/label logic; physically
 confirming a `*-studio-*` runner is on the Studio is `runner capacity`'s job
 (reads the host machine tag over SSH). Full design:

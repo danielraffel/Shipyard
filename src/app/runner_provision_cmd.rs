@@ -21,9 +21,9 @@ use super::runner_cmd::{parse_github_repo_slug, resolve_repo_slug};
 use crate::cloud::GitHubActions;
 use crate::output::write_json_envelope;
 use crate::runner_provision::{
-    ApiRunner, AuditFinding, PoolRow, audit_runners, default_labels, format_audit_table,
-    format_pool_table, next_index, orphan_local_runners, pool_rows, runner_name, short_repo,
-    validate_machine_tag,
+    ApiRunner, AuditFinding, AuditIssue, PoolRow, audit_runners, default_labels,
+    format_audit_table, format_pool_table, next_index, orphan_local_runners, pool_rows,
+    runner_name, short_repo, validate_machine_tag,
 };
 
 /// Fetch every self-hosted runner for a repo across **all** pages. GitHub caps
@@ -187,6 +187,28 @@ fn default_ci_root() -> PathBuf {
 
 fn home_dir() -> PathBuf {
     std::env::var("HOME").map_or_else(|_| PathBuf::from("."), PathBuf::from)
+}
+
+fn strict_home_dir_from(value: Option<&OsStr>) -> Result<PathBuf, CliFailure> {
+    let Some(value) = value else {
+        return Err(CliFailure::new(
+            1,
+            "HOME is unavailable; refusing strict local runner audit",
+        ));
+    };
+    let path = PathBuf::from(value);
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return Err(CliFailure::new(
+            1,
+            "HOME must be a nonempty absolute path for strict local runner audit",
+        ));
+    }
+    Ok(path)
+}
+
+fn strict_home_dir() -> Result<PathBuf, CliFailure> {
+    let value = std::env::var_os("HOME");
+    strict_home_dir_from(value.as_deref())
 }
 
 fn cpu_count() -> usize {
@@ -1130,12 +1152,19 @@ pub(super) fn register_command<W: Write>(
 
             let config_args = runner_config_args(&slug, &token, entry, &labels_csv);
             let config_arg_refs: Vec<&str> = config_args.iter().map(String::as_str).collect();
-            run_in(
+            let canonical_path = runner_path_file(&entry.dir);
+            run_in_with_path(
                 &entry.dir,
                 "./config.sh",
                 &config_arg_refs,
+                canonical_path.trim(),
                 "configure runner",
             )?;
+            // Upstream config.sh snapshots its process PATH into `.path`.
+            // Rewrite after configuration as a defense against upstream
+            // implementation changes before the service can start.
+            fs::write(entry.dir.join(".path"), canonical_path)
+                .map_err(|e| CliFailure::new(1, format!("failed to write .path: {e}")))?;
             run_in(
                 &entry.dir,
                 "./svc.sh",
@@ -1408,9 +1437,11 @@ fn report_register<W: Write>(
 
 // ---------- list ----------
 
+#[derive(Debug)]
 struct LocalRunner {
     name: String,
     repo_slug: String,
+    dir: PathBuf,
 }
 
 /// Parse a runner `.runner` config file, returning `(agent_name, repo_slug)`.
@@ -1424,30 +1455,78 @@ fn parse_dot_runner(raw: &str) -> Option<(String, String)> {
     Some((name, slug))
 }
 
-/// Discover configured runners from this machine's `~/actions-runner*` dirs.
-fn scan_local_runners() -> Vec<LocalRunner> {
+fn scan_local_runners_in(home: &Path, strict: bool) -> Result<Vec<LocalRunner>, CliFailure> {
     let mut found = Vec::new();
-    let Ok(entries) = fs::read_dir(home_dir()) else {
-        return found;
+    let entries = match fs::read_dir(home) {
+        Ok(entries) => entries,
+        Err(error) if strict => {
+            return Err(CliFailure::new(
+                1,
+                format!(
+                    "failed to inspect local runner directories at {}: {error}",
+                    home.display()
+                ),
+            ));
+        }
+        Err(_) => return Ok(found),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if strict => {
+                return Err(CliFailure::new(
+                    1,
+                    format!("failed to inspect a local runner directory entry: {error}"),
+                ));
+            }
+            Err(_) => continue,
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.starts_with("actions-runner") {
             continue;
         }
         let dot = entry.path().join(".runner");
-        let Ok(raw) = fs::read_to_string(&dot) else {
+        let raw = match fs::read_to_string(&dot) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if strict => {
+                return Err(CliFailure::new(
+                    1,
+                    format!(
+                        "failed to read configured runner identity {}: {error}",
+                        dot.display()
+                    ),
+                ));
+            }
+            Err(_) => continue,
+        };
+        let Some((agent, slug)) = parse_dot_runner(&raw) else {
+            if strict {
+                return Err(CliFailure::new(
+                    1,
+                    format!("configured runner identity is malformed: {}", dot.display()),
+                ));
+            }
             continue;
         };
-        if let Some((agent, slug)) = parse_dot_runner(&raw) {
-            found.push(LocalRunner {
-                name: agent,
-                repo_slug: slug,
-            });
-        }
+        found.push(LocalRunner {
+            name: agent,
+            repo_slug: slug,
+            dir: entry.path(),
+        });
     }
-    found
+    Ok(found)
+}
+
+/// Discover configured runners for human-readable inventory. List remains
+/// best-effort; the safety-sensitive audit uses strict discovery below.
+fn scan_local_runners() -> Vec<LocalRunner> {
+    scan_local_runners_in(&home_dir(), false).unwrap_or_default()
+}
+
+fn scan_local_runners_strict() -> Result<Vec<LocalRunner>, CliFailure> {
+    scan_local_runners_in(&strict_home_dir()?, true)
 }
 
 /// `shipyard runner list`.
@@ -1571,9 +1650,48 @@ fn resolve_audit_slugs(cwd: &Path, repo: &[String]) -> Result<Vec<String>, CliFa
     Ok(slugs)
 }
 
-/// `shipyard runner audit` — flag host-class naming/label drift across a repo's
-/// runners. Exit 0 when every runner conforms; exit 1 when any drift is found
-/// (CI-friendly). Pure logic lives in [`crate::runner_provision::audit_runners`].
+fn local_runner_path_issue(local: &LocalRunner) -> Option<AuditIssue> {
+    let Ok(raw) = fs::read_to_string(local.dir.join(".path")) else {
+        return Some(AuditIssue::RunnerPathUnreadable);
+    };
+    (raw != runner_path_file(&local.dir)).then_some(AuditIssue::NonCanonicalRunnerPath)
+}
+
+fn append_local_path_findings(
+    slugs: &[String],
+    locals: &[LocalRunner],
+    findings: &mut Vec<(String, AuditFinding)>,
+) {
+    for local in locals.iter().filter(|local| {
+        slugs
+            .iter()
+            .any(|slug| slug.eq_ignore_ascii_case(&local.repo_slug))
+    }) {
+        let Some(issue) = local_runner_path_issue(local) else {
+            continue;
+        };
+        if let Some((_, finding)) = findings.iter_mut().find(|(repo, finding)| {
+            repo.eq_ignore_ascii_case(&local.repo_slug)
+                && finding.name.eq_ignore_ascii_case(&local.name)
+        }) {
+            finding.issues.push(issue);
+        } else {
+            findings.push((
+                local.repo_slug.clone(),
+                AuditFinding {
+                    name: local.name.clone(),
+                    name_class: None,
+                    label_class: None,
+                    issues: vec![issue],
+                },
+            ));
+        }
+    }
+}
+
+/// `shipyard runner audit` — flag host-class naming/label drift and unsafe
+/// local runner PATH capture. Exit 0 when every runner conforms; exit 1 when
+/// any drift is found (CI-friendly).
 pub(super) fn audit_command<W: Write>(
     cwd: &Path,
     actions: &GitHubActions,
@@ -1582,15 +1700,17 @@ pub(super) fn audit_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let slugs = resolve_audit_slugs(cwd, repo)?;
+    let locals = scan_local_runners_strict()?;
 
     let mut findings: Vec<(String, AuditFinding)> = Vec::new();
     for slug in &slugs {
         let runners = fetch_all_runners(actions, slug)?;
         let repo_short = short_repo(slug);
         for finding in audit_runners(repo_short, &runners) {
-            findings.push((repo_short.to_owned(), finding));
+            findings.push((slug.clone(), finding));
         }
     }
+    append_local_path_findings(&slugs, &locals, &mut findings);
 
     let with_issues = findings.iter().filter(|(_, f)| f.has_issues()).count();
     let drift = findings.iter().any(|(_, f)| f.is_drift());
@@ -1605,10 +1725,13 @@ pub(super) fn audit_command<W: Write>(
         data.insert("repos".to_owned(), Value::from(slugs.clone()));
         let finding_values: Vec<Value> = findings
             .iter()
-            .map(|(repo_short, f)| {
+            .map(|(repo_slug, f)| {
                 let mut m = serde_json::Map::new();
                 m.insert("name".to_owned(), Value::from(f.name.clone()));
-                m.insert("repo".to_owned(), Value::from(repo_short.clone()));
+                m.insert(
+                    "repo".to_owned(),
+                    Value::from(short_repo(repo_slug).to_owned()),
+                );
                 m.insert(
                     "name_class".to_owned(),
                     f.name_class.clone().map_or(Value::Null, Value::from),
@@ -1641,14 +1764,19 @@ pub(super) fn audit_command<W: Write>(
     let bare: Vec<AuditFinding> = findings.into_iter().map(|(_, f)| f).collect();
     writeln!(stdout, "{}", format_audit_table(&bare)).ok();
     if with_issues == 0 {
-        writeln!(stdout, "\n✓ All runners conform to the host-class scheme.").ok();
+        writeln!(
+            stdout,
+            "\n✓ All runners conform to the host-class and local PATH policies."
+        )
+        .ok();
     } else {
         writeln!(
             stdout,
-            "\n⚠︎ {with_issues} runner(s) drift from the host-class scheme \
-             (<repo>-<class>-NN + <repo>-build / <repo>-build-<class>).\n  \
-             Fix labels with `shipyard runner register --labels …` or re-tag/re-register \
-             the host; physical host class is confirmed by `shipyard runner capacity`."
+            "\n⚠︎ {with_issues} runner(s) drift from the host-class or local PATH policy.\n  \
+             Fix labels with `shipyard runner register --labels …`. For PATH drift, drain \
+             and stop/uninstall a service-installed runner before registration reconciles \
+             its canonical system-first `.path`. Physical host \
+             class is confirmed by `shipyard runner capacity`."
         )
         .ok();
     }
@@ -1762,6 +1890,29 @@ fn run_in(dir: &Path, program: &str, args: &[&str], what: &str) -> Result<(), Cl
     }
 }
 
+fn run_in_with_path(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    path: &str,
+    what: &str,
+) -> Result<(), CliFailure> {
+    let status = Command::new(program)
+        .current_dir(dir)
+        .args(args)
+        .env("PATH", path)
+        .status()
+        .map_err(|e| CliFailure::new(1, format!("failed to {what}: {e}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliFailure::new(
+            1,
+            format!("{what} failed (exit {:?})", status.code()),
+        ))
+    }
+}
+
 fn envelope<W: Write>(
     stdout: &mut W,
     command: &str,
@@ -1796,6 +1947,190 @@ mod tests {
     fn parse_dot_runner_rejects_missing_fields() {
         assert!(parse_dot_runner("{}").is_none());
         assert!(parse_dot_runner("not json").is_none());
+    }
+
+    #[test]
+    fn local_runner_path_audit_accepts_only_shipyard_canonical_path() {
+        let temp = tempfile::tempdir().expect("temp");
+        let local = LocalRunner {
+            name: "pulp-m5-01".to_owned(),
+            repo_slug: "Generous-Corp/pulp".to_owned(),
+            dir: temp.path().to_path_buf(),
+        };
+
+        assert_eq!(
+            local_runner_path_issue(&local),
+            Some(AuditIssue::RunnerPathUnreadable)
+        );
+
+        std::fs::write(local.dir.join(".path"), runner_path_file(&local.dir))
+            .expect("canonical path");
+        assert_eq!(local_runner_path_issue(&local), None);
+
+        std::fs::write(
+            local.dir.join(".path"),
+            "/var/folders/session/bin:/usr/bin:/bin:/usr/bin\n",
+        )
+        .expect("captured path");
+        assert_eq!(
+            local_runner_path_issue(&local),
+            Some(AuditIssue::NonCanonicalRunnerPath)
+        );
+    }
+
+    #[test]
+    fn strict_runner_discovery_rejects_malformed_identity() {
+        let temp = tempfile::tempdir().expect("temp");
+        let runner = temp.path().join("actions-runner-pulp-m5-01");
+        std::fs::create_dir(&runner).expect("runner dir");
+        std::fs::write(runner.join(".runner"), "not json\n").expect("identity");
+
+        assert!(
+            scan_local_runners_in(temp.path(), false)
+                .expect("best effort")
+                .is_empty()
+        );
+        let error = scan_local_runners_in(temp.path(), true).expect_err("strict failure");
+        assert!(error.message().contains("identity is malformed"));
+    }
+
+    #[test]
+    fn strict_runner_discovery_requires_an_absolute_home() {
+        assert!(strict_home_dir_from(None).is_err());
+        assert!(strict_home_dir_from(Some(OsStr::new(""))).is_err());
+        assert!(strict_home_dir_from(Some(OsStr::new("relative/home"))).is_err());
+
+        let temp = tempfile::tempdir().expect("temp");
+        assert_eq!(
+            strict_home_dir_from(Some(temp.path().as_os_str())).expect("absolute home"),
+            temp.path()
+        );
+    }
+
+    #[test]
+    fn local_path_audit_includes_runners_missing_from_github_inventory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let local = LocalRunner {
+            name: "pulp-m5-99".to_owned(),
+            repo_slug: "Generous-Corp/pulp".to_owned(),
+            dir: temp.path().to_path_buf(),
+        };
+        std::fs::write(local.dir.join(".path"), "/tmp/session/bin:/usr/bin\n")
+            .expect("unsafe path");
+
+        let mut findings = Vec::new();
+        append_local_path_findings(&["Generous-Corp/pulp".to_owned()], &[local], &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].1.name, "pulp-m5-99");
+        assert_eq!(
+            findings[0].1.issues,
+            vec![AuditIssue::NonCanonicalRunnerPath]
+        );
+    }
+
+    #[test]
+    fn local_path_audit_checks_every_duplicate_installation() {
+        let root = tempfile::tempdir().expect("temp");
+        let canonical_dir = root.path().join("canonical");
+        let unsafe_dir = root.path().join("unsafe");
+        std::fs::create_dir_all(&canonical_dir).expect("canonical dir");
+        std::fs::create_dir_all(&unsafe_dir).expect("unsafe dir");
+        std::fs::write(
+            canonical_dir.join(".path"),
+            runner_path_file(&canonical_dir),
+        )
+        .expect("canonical path");
+        std::fs::write(unsafe_dir.join(".path"), "/tmp/session/bin:/usr/bin\n")
+            .expect("unsafe path");
+        let local = |dir| LocalRunner {
+            name: "pulp-m5-01".to_owned(),
+            repo_slug: "Generous-Corp/pulp".to_owned(),
+            dir,
+        };
+        let mut findings = vec![(
+            "Generous-Corp/pulp".to_owned(),
+            AuditFinding {
+                name: "pulp-m5-01".to_owned(),
+                name_class: Some("m5".to_owned()),
+                label_class: Some("m5".to_owned()),
+                issues: Vec::new(),
+            },
+        )];
+
+        append_local_path_findings(
+            &["Generous-Corp/pulp".to_owned()],
+            &[local(canonical_dir), local(unsafe_dir)],
+            &mut findings,
+        );
+
+        assert_eq!(
+            findings[0].1.issues,
+            vec![AuditIssue::NonCanonicalRunnerPath]
+        );
+    }
+
+    #[test]
+    fn local_path_audit_keeps_same_named_repositories_separate() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(temp.path().join(".path"), "/tmp/session/bin:/usr/bin\n")
+            .expect("unsafe path");
+        let finding = |repo: &str| {
+            (
+                repo.to_owned(),
+                AuditFinding {
+                    name: "pulp-m5-01".to_owned(),
+                    name_class: Some("m5".to_owned()),
+                    label_class: Some("m5".to_owned()),
+                    issues: Vec::new(),
+                },
+            )
+        };
+        let mut findings = vec![finding("owner-a/pulp"), finding("owner-b/pulp")];
+        let local = LocalRunner {
+            name: "pulp-m5-01".to_owned(),
+            repo_slug: "owner-b/pulp".to_owned(),
+            dir: temp.path().to_path_buf(),
+        };
+
+        append_local_path_findings(
+            &["owner-a/pulp".to_owned(), "owner-b/pulp".to_owned()],
+            &[local],
+            &mut findings,
+        );
+
+        assert!(findings[0].1.issues.is_empty());
+        assert_eq!(
+            findings[1].1.issues,
+            vec![AuditIssue::NonCanonicalRunnerPath]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_configuration_receives_the_canonical_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let script = temp.path().join("config.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$PATH\" > .path\n").expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("executable");
+
+        let canonical = runner_path_file(temp.path());
+        run_in_with_path(
+            temp.path(),
+            "./config.sh",
+            &[],
+            canonical.trim(),
+            "configure fixture",
+        )
+        .expect("config");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".path")).expect("captured path"),
+            canonical
+        );
     }
 
     #[test]

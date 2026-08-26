@@ -490,6 +490,7 @@ mod tests {
             baseline_tests: vec!["smoke".to_owned()],
             baseline_build_targets: Vec::new(),
             baseline_only_paths: vec!["docs/**".to_owned()],
+            ios_compile_skip_safe_paths: Vec::new(),
             full_required_paths: vec!["CMakeLists.txt".to_owned()],
             policy_paths: vec!["policy.json".to_owned()],
             test_topology_paths: vec!["tests/**".to_owned()],
