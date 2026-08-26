@@ -338,6 +338,7 @@ impl ProcessTree {
         }
         #[cfg(windows)]
         {
+            let _ = deadline;
             if self.child.start_kill().is_ok() {
                 self.terminated = true;
             }
