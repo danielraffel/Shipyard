@@ -10,6 +10,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -19,8 +21,9 @@ use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use crate::capacity::{
-    HostCapacity, HostClassConfig, any_unreadable, gather_configured_host_capacities,
-    parse_host_classes, total_free,
+    HostCapacity, HostClassConfig, REMOTE_OBSERVER_PATH, any_unreadable,
+    observer_ssh_probe_options, parse_host_classes, probe_host_capacity_until,
+    remote_observer_command, total_free,
 };
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
@@ -30,6 +33,7 @@ use crate::merge_queue_liveness::{
     MergeQueueLivenessReport, assess_merge_queue_liveness, assess_release_liveness,
     parse_check_observations, parse_merge_queue_entries,
 };
+use crate::process::{BoundedOutputError, run_output_until};
 
 mod assessment;
 mod observation;
@@ -68,6 +72,7 @@ pub(in crate::app) use render::{render_fleet_assessment, render_fleet_watch_even
 
 const FLEET_LANE_TARGET: &str = "macos";
 const DEFAULT_DISK_FLOOR_KIBIBYTE: u64 = 25 * 1024 * 1024;
+const FLEET_HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(super) struct FleetStatusArgs {
     pub(super) repo: Option<String>,
@@ -122,8 +127,11 @@ pub(super) fn collect_fleet_assessment(
         ));
     }
 
-    let capacities =
-        gather_configured_host_capacities(&config.data).map_err(|e| CliFailure::new(2, e))?;
+    let host_probes = probe_hosts_concurrently(&classes);
+    let capacities = host_probes
+        .iter()
+        .map(|probe| probe.capacity.clone())
+        .collect::<Vec<_>>();
     // Observe repository runners once through the controller's authenticated
     // GitHub client. Host-local doctor probes can share an unauthenticated IP
     // rate limit, which must not make otherwise healthy capacity unroutable.
@@ -132,28 +140,15 @@ pub(super) fn collect_fleet_assessment(
         parse_expected_hosts(&config.data).map_err(|error| CliFailure::new(2, error))?;
     let expected_hosts = assess_expected_hosts(&expected_host_configs, &runners);
     let mut hosts = Vec::new();
-    for class in &classes {
-        let capacity = capacities
-            .iter()
-            .find(|host| host.class == class.class)
-            .cloned()
-            .unwrap_or_else(|| HostCapacity {
-                class: class.class.clone(),
-                ssh: class.ssh.clone(),
-                cap: class.cap,
-                running: None,
-                source: "capacity missing for host class".to_owned(),
-            });
-        let doctor = probe_doctor(class);
-        let storage = probe_storage(class);
+    for probe in host_probes {
         // `--target` is a GitHub job-name substring, not a TartCI routing
         // label. FleetStatus is the macOS VM fleet command, so host health is
         // always scoped to the macOS lane even for custom job names such as
         // `required-apple-tests`.
         hosts.push(analyze_host(
-            capacity,
-            doctor,
-            storage,
+            probe.capacity,
+            probe.doctor,
+            probe.storage,
             FLEET_LANE_TARGET,
             runners.readable,
         ));
@@ -293,6 +288,69 @@ pub(super) fn collect_fleet_assessment(
     })
 }
 
+struct HostProbeBundle {
+    capacity: HostCapacity,
+    doctor: DoctorProbe,
+    storage: StorageProbe,
+}
+
+fn probe_hosts_concurrently(classes: &[HostClassConfig]) -> Vec<HostProbeBundle> {
+    probe_hosts_concurrently_with_timeout(classes, FLEET_HOST_PROBE_TIMEOUT)
+}
+
+fn probe_hosts_concurrently_with_timeout(
+    classes: &[HostClassConfig],
+    timeout: Duration,
+) -> Vec<HostProbeBundle> {
+    let deadline = Instant::now() + timeout;
+    thread::scope(|scope| {
+        let handles = classes
+            .iter()
+            .map(|class| scope.spawn(move || probe_host_until(class, deadline)))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .zip(classes)
+            .map(|(handle, class)| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| unreadable_host_bundle(class, "host probe panicked"))
+            })
+            .collect()
+    })
+}
+
+fn probe_host_until(class: &HostClassConfig, deadline: Instant) -> HostProbeBundle {
+    HostProbeBundle {
+        capacity: probe_host_capacity_until(class, deadline),
+        doctor: probe_doctor_until(class, deadline),
+        storage: probe_storage_until(class, deadline),
+    }
+}
+
+fn unreadable_host_bundle(class: &HostClassConfig, reason: &str) -> HostProbeBundle {
+    HostProbeBundle {
+        capacity: HostCapacity {
+            class: class.class.clone(),
+            ssh: class.ssh.clone(),
+            cap: class.cap,
+            running: None,
+            source: reason.to_owned(),
+        },
+        doctor: DoctorProbe {
+            readable: false,
+            source: reason.to_owned(),
+            digest: None,
+        },
+        storage: StorageProbe {
+            source: reason.to_owned(),
+            disk_path: class.tart_home.clone().unwrap_or_else(|| ".".to_owned()),
+            disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
+            ..StorageProbe::default()
+        },
+    }
+}
+
 fn parse_expected_hosts(data: &toml::Table) -> Result<Vec<ExpectedHostConfig>, String> {
     let Some(value) = data
         .get("runner")
@@ -424,13 +482,15 @@ fn assess_expected_hosts(
         .collect()
 }
 
-fn probe_doctor(class: &HostClassConfig) -> DoctorProbe {
+fn probe_doctor_until(class: &HostClassConfig, deadline: Instant) -> DoctorProbe {
     let output = if let Some(host) = &class.ssh {
-        Command::new("ssh")
-            .args(ssh_probe_options())
+        let mut command = Command::new("ssh");
+        let remote = remote_observer_command(&remote_tartci_command(class), deadline);
+        command
+            .args(observer_ssh_probe_options())
             .arg(host)
-            .arg(remote_tartci_command(class))
-            .output()
+            .arg(remote);
+        run_output_until(&mut command, deadline, "ssh tartci doctor")
     } else {
         let mut command = Command::new(&class.tartci_bin);
         if let Some(github_cli) = &class.github_cli {
@@ -439,7 +499,8 @@ fn probe_doctor(class: &HostClassConfig) -> DoctorProbe {
         if let Some(tart_home) = &class.tart_home {
             command.env("TART_HOME", tart_home);
         }
-        command.args(["doctor", "--reap", "--json"]).output()
+        command.args(["doctor", "--reap", "--json"]);
+        run_output_until(&mut command, deadline, "tartci doctor")
     };
 
     let output = match output {
@@ -447,10 +508,17 @@ fn probe_doctor(class: &HostClassConfig) -> DoctorProbe {
         Err(error) => {
             return DoctorProbe {
                 readable: false,
-                source: if class.ssh.is_some() {
-                    format!("ssh spawn failed: {error}")
-                } else {
-                    format!("`{}` spawn failed: {error}", class.tartci_bin)
+                source: match error {
+                    BoundedOutputError::TimedOut { .. } if class.ssh.is_some() => {
+                        "ssh tartci doctor timed out".to_owned()
+                    }
+                    BoundedOutputError::TimedOut { .. } => "tartci doctor timed out".to_owned(),
+                    _ if class.ssh.is_some() => {
+                        format!("ssh tartci doctor unreadable: {error}")
+                    }
+                    _ => {
+                        format!("`{}` tartci doctor unreadable: {error}", class.tartci_bin)
+                    }
                 },
                 digest: None,
             };
@@ -618,26 +686,44 @@ fn storage_problems(storage: &StorageProbe) -> Vec<String> {
     problems
 }
 
-fn probe_storage(class: &HostClassConfig) -> StorageProbe {
+fn probe_storage_until(class: &HostClassConfig, deadline: Instant) -> StorageProbe {
     let disk_path = class.tart_home.as_deref().unwrap_or(".");
     let script = storage_probe_script(disk_path);
     let output = if let Some(host) = &class.ssh {
-        Command::new("ssh")
-            .args(ssh_probe_options())
-            .arg(host)
-            .arg(format!(
-                "env PATH={REMOTE_PROBE_PATH} sh -c {}",
+        let mut command = Command::new("ssh");
+        let remote = remote_observer_command(
+            &format!(
+                "env PATH={REMOTE_OBSERVER_PATH} sh -c {}",
                 shlex_quote(&script)
-            ))
-            .output()
+            ),
+            deadline,
+        );
+        command
+            .args(observer_ssh_probe_options())
+            .arg(host)
+            .arg(remote);
+        run_output_until(&mut command, deadline, "ssh storage probe")
     } else {
-        Command::new("sh").args(["-c", &script]).output()
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        run_output_until(&mut command, deadline, "storage probe")
     };
     let output = match output {
         Ok(output) => output,
         Err(error) => {
             return StorageProbe {
-                source: format!("storage probe spawn failed: {error}"),
+                source: match error {
+                    BoundedOutputError::TimedOut { .. } if class.ssh.is_some() => {
+                        "ssh storage probe timed out".to_owned()
+                    }
+                    BoundedOutputError::TimedOut { .. } => "storage probe timed out".to_owned(),
+                    _ if class.ssh.is_some() => {
+                        format!("ssh storage probe unreadable: {error}")
+                    }
+                    _ => {
+                        format!("storage probe unreadable: {error}")
+                    }
+                },
                 disk_path: disk_path.to_owned(),
                 disk_floor_kibibyte: DEFAULT_DISK_FLOOR_KIBIBYTE,
                 ..StorageProbe::default()
@@ -899,7 +985,7 @@ fn supervisor_is_fresh(supervisor: &Value, stale_after_secs: i64) -> bool {
 }
 
 fn remote_tartci_command(class: &HostClassConfig) -> String {
-    let mut parts = vec!["env".to_owned(), format!("PATH={REMOTE_PROBE_PATH}")];
+    let mut parts = vec!["env".to_owned(), format!("PATH={REMOTE_OBSERVER_PATH}")];
     if let Some(tart_home) = &class.tart_home {
         parts.push(format!("TART_HOME={}", shlex_quote(tart_home)));
     }
@@ -913,23 +999,6 @@ fn remote_tartci_command(class: &HostClassConfig) -> String {
             .map(|arg| shlex_quote(arg)),
     );
     parts.join(" ")
-}
-
-const REMOTE_PROBE_PATH: &str =
-    "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-
-fn ssh_probe_options() -> Vec<String> {
-    [
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=8",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect()
 }
 
 #[cfg(test)]

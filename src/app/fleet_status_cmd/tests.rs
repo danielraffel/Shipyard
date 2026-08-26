@@ -1,5 +1,154 @@
 use super::*;
 
+#[cfg(unix)]
+fn executable_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write fixture");
+    let mut permissions = std::fs::metadata(path)
+        .expect("fixture metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions).expect("fixture permissions");
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)] // One end-to-end mixed-host observer fixture.
+fn mixed_healthy_and_timed_out_hosts_finish_under_one_deadline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let hanging_tart = temp.path().join("hanging-tart");
+    let healthy_tart = temp.path().join("healthy-tart");
+    let healthy_tartci = temp.path().join("healthy-tartci");
+    executable_script(&hanging_tart, "sleep 30");
+    executable_script(&healthy_tart, "printf '[]'");
+    executable_script(
+        &healthy_tartci,
+        r#"printf '%s' '{"config":{"heartbeat_stale_secs":900},"problems":[],"supervisors":[{"labels":["self-hosted","macOS","ARM64"],"owner_pid_alive":true,"heartbeat_age_secs":1}]}'"#,
+    );
+    let classes = vec![
+        HostClassConfig {
+            class: "blocked".to_owned(),
+            ssh: None,
+            cap: 2,
+            tart_bin: hanging_tart.display().to_string(),
+            tartci_bin: healthy_tartci.display().to_string(),
+            shipyard_bin: None,
+            shipyard_mode: None,
+            shipyard_global_dir: None,
+            shipyard_state_dir: None,
+            github_cli: None,
+            tart_home: None,
+            labels: Vec::new(),
+        },
+        HostClassConfig {
+            class: "healthy".to_owned(),
+            ssh: None,
+            cap: 2,
+            tart_bin: healthy_tart.display().to_string(),
+            tartci_bin: healthy_tartci.display().to_string(),
+            shipyard_bin: None,
+            shipyard_mode: None,
+            shipyard_global_dir: None,
+            shipyard_state_dir: None,
+            github_cli: None,
+            tart_home: None,
+            labels: Vec::new(),
+        },
+    ];
+
+    let started = std::time::Instant::now();
+    let probes = probe_hosts_concurrently_with_timeout(&classes, FLEET_HOST_PROBE_TIMEOUT);
+
+    assert!(started.elapsed() < FLEET_HOST_PROBE_TIMEOUT + std::time::Duration::from_secs(2));
+    assert_eq!(probes.len(), 2);
+    assert!(!probes[0].capacity.readable());
+    assert_eq!(probes[0].capacity.free(), 0);
+    assert!(probes[0].capacity.source.contains("timed out"));
+    assert!(
+        probes[1].capacity.readable(),
+        "healthy capacity source: {}",
+        probes[1].capacity.source
+    );
+    assert_eq!(probes[1].capacity.free(), 2);
+    assert!(
+        probes[1].doctor.readable,
+        "healthy doctor source: {}",
+        probes[1].doctor.source
+    );
+    assert!(
+        probes[1].storage.readable,
+        "healthy storage source: {}",
+        probes[1].storage.source
+    );
+
+    let hosts = probes
+        .into_iter()
+        .map(|probe| {
+            analyze_host(
+                probe.capacity,
+                probe.doctor,
+                probe.storage,
+                FLEET_LANE_TARGET,
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!hosts[0].routable);
+    assert!(hosts[1].routable);
+    let assessment = FleetAssessment {
+        repo: "owner/repo".to_owned(),
+        target: "macos".to_owned(),
+        free: 2,
+        routable_free_slots: 2,
+        capacity_unreadable: true,
+        doctor_unreadable: true,
+        supervisor_unhealthy: false,
+        problem_hosts: true,
+        queued_age_threshold_secs: 900,
+        queue_run_limit: 50,
+        queued_age_with_capacity: false,
+        queue: QueuedSummary {
+            readable: true,
+            source: "github".to_owned(),
+            count: 0,
+            oldest_age_secs: None,
+        },
+        base: "main".to_owned(),
+        merge_queue_stall_threshold_secs: 900,
+        merge_queue: MergeQueueProbe {
+            readable: true,
+            source: "github".to_owned(),
+            report: None,
+            reason_codes: Vec::new(),
+        },
+        release_stale_threshold_secs: 86_400,
+        release: ReleaseProbe {
+            readable: true,
+            source: "github".to_owned(),
+            report: None,
+            reason_codes: Vec::new(),
+        },
+        hosts,
+        runners: RunnerInventory {
+            readable: true,
+            source: "github".to_owned(),
+            runners: Vec::new(),
+        },
+        expected_hosts: Vec::new(),
+        routing_mismatches: Vec::new(),
+        observation_reason_codes: Vec::new(),
+        observation_incomplete: false,
+        should_fail: true,
+    };
+    let mut rendered = Vec::new();
+    render_fleet_assessment(&assessment, true, &mut rendered).expect("mixed fleet JSON");
+    let document: Value = serde_json::from_slice(&rendered).expect("valid mixed fleet JSON");
+    assert_eq!(document["hosts"][0]["routable"], false);
+    assert_eq!(document["hosts"][1]["routable"], true);
+    assert_eq!(document["routable_free_slots"], 2);
+}
+
 #[test]
 fn assessment_renders_command_and_watch_json_without_round_trip() {
     let assessment = FleetAssessment {

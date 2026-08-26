@@ -26,14 +26,18 @@
 //! shelling `tart` is the impure edge in the CLI handler.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use toml::{Table, Value as TomlValue};
 
 use crate::executor::ssh::shlex_quote;
+use crate::process::{BoundedOutputError, run_output_until};
 
 /// Default macOS VM slots per host: the XNU kernel quota (Appendix D).
 pub const DEFAULT_CAP: u32 = 2;
+pub(crate) const REMOTE_OBSERVER_PATH: &str =
+    "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Parsed `[host_class.<name>]` config.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -364,6 +368,28 @@ pub fn probe_host_capacity(class: &HostClassConfig) -> HostCapacity {
     }
 }
 
+/// Probe one host class under a caller-owned total deadline.
+#[must_use]
+pub(crate) fn probe_host_capacity_until(
+    class: &HostClassConfig,
+    deadline: Instant,
+) -> HostCapacity {
+    let (running, source) = match read_running_until(class, deadline) {
+        Ok(count) => (
+            Some(count),
+            if class.ssh.is_some() { "ssh" } else { "local" }.to_owned(),
+        ),
+        Err(reason) => (None, reason),
+    };
+    HostCapacity {
+        class: class.class.clone(),
+        ssh: class.ssh.clone(),
+        cap: class.cap,
+        running,
+        source,
+    }
+}
+
 /// SSH options for non-interactive, fail-fast capacity probes.
 #[must_use]
 pub fn ssh_probe_options() -> Vec<String> {
@@ -378,6 +404,75 @@ pub fn ssh_probe_options() -> Vec<String> {
     .iter()
     .map(|s| (*s).to_owned())
     .collect()
+}
+
+/// SSH options for deadline-bound, read-only fleet observations.
+#[must_use]
+pub(crate) fn observer_ssh_probe_options() -> Vec<String> {
+    let mut options = ssh_probe_options();
+    options.extend(
+        ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]
+            .iter()
+            .map(|option| (*option).to_owned()),
+    );
+    options
+}
+
+/// Wrap one trusted read-only remote probe in a remote process-group watchdog.
+///
+/// The local SSH process remains supervised separately. Reserving a small
+/// cleanup window makes the remote watchdog fire first, so a stalled probe's
+/// process group is killed even if the SSH channel is then torn down.
+#[must_use]
+pub(crate) fn remote_observer_command(command: &str, deadline: Instant) -> String {
+    const REMOTE_CLEANUP_BUDGET: Duration = Duration::from_millis(750);
+    const SSH_SETUP_BUDGET: Duration = Duration::from_secs(9);
+    const WATCHDOG: &str = r"import os
+import signal
+import subprocess
+import sys
+
+blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+child = subprocess.Popen(['/bin/sh', '-c', sys.argv[2]], start_new_session=True)
+
+def stop():
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+
+def interrupted(signum, _frame):
+    stop()
+    os._exit(128 + signum)
+
+signal.signal(signal.SIGHUP, interrupted)
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGTERM, interrupted)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked_signals)
+try:
+    status = child.wait(timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    sys.stderr.write('shipyard remote observer timed out\n')
+    status = 124
+stop()
+sys.exit(status)
+";
+    let timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .saturating_sub(SSH_SETUP_BUDGET)
+        .saturating_sub(REMOTE_CLEANUP_BUDGET)
+        .as_secs_f64()
+        .max(0.001);
+    format!(
+        "env PATH={REMOTE_OBSERVER_PATH} python3 -c {} {timeout:.3} {}",
+        shlex_quote(WATCHDOG),
+        shlex_quote(command)
+    )
 }
 
 /// Render the remote `tart` command used for one host-class probe.
@@ -416,7 +511,49 @@ fn run_tart(class: &HostClassConfig, args: &[&str], label: &str) -> Result<Strin
             format!("`{}` spawn failed: {error}", class.tart_bin)
         }
     })?;
+    successful_tart_output(&output, label)
+}
 
+fn run_tart_until(
+    class: &HostClassConfig,
+    args: &[&str],
+    label: &str,
+    deadline: Instant,
+) -> Result<String, String> {
+    let output = if let Some(host) = &class.ssh {
+        let mut command = Command::new("ssh");
+        let remote = remote_observer_command(&remote_tart_command(class, args), deadline);
+        command
+            .args(observer_ssh_probe_options())
+            .arg(host)
+            .arg(remote);
+        run_output_until(&mut command, deadline, format!("ssh {label}"))
+    } else {
+        let mut command = Command::new(&class.tart_bin);
+        if let Some(tart_home) = &class.tart_home {
+            command.env("TART_HOME", tart_home);
+        }
+        command.args(args);
+        run_output_until(&mut command, deadline, label)
+    };
+
+    let output = output.map_err(|error| match error {
+        BoundedOutputError::TimedOut { .. } if class.ssh.is_some() => {
+            format!("ssh {label} timed out")
+        }
+        BoundedOutputError::TimedOut { .. } => format!("{label} timed out"),
+        _ if class.ssh.is_some() => {
+            format!("ssh {label} unreadable: {error}")
+        }
+        _ => {
+            format!("`{}` {label} unreadable: {error}", class.tart_bin)
+        }
+    })?;
+
+    successful_tart_output(&output, label)
+}
+
+fn successful_tart_output(output: &std::process::Output, label: &str) -> Result<String, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
@@ -432,6 +569,27 @@ fn run_tart(class: &HostClassConfig, args: &[&str], label: &str) -> Result<Strin
 }
 
 /// Read the running macOS-VM count for one host class.
+fn read_running_until(class: &HostClassConfig, deadline: Instant) -> Result<u32, String> {
+    let list_stdout = run_tart_until(class, &["list", "--format", "json"], "tart list", deadline)?;
+    let running_names = parse_tart_running_names(&list_stdout)?;
+    let mut running_macos: u32 = 0;
+    for name in running_names {
+        let get_stdout = run_tart_until(
+            class,
+            &["get", &name, "--format", "json"],
+            "tart get",
+            deadline,
+        )?;
+        let os = parse_tart_get_os(&get_stdout)?;
+        if is_macos_os(&os) {
+            running_macos = running_macos
+                .checked_add(1)
+                .ok_or_else(|| "implausibly many running macOS VMs".to_owned())?;
+        }
+    }
+    Ok(running_macos)
+}
+
 fn read_running(class: &HostClassConfig) -> Result<u32, String> {
     let list_stdout = run_tart(class, &["list", "--format", "json"], "tart list")?;
     let running_names = parse_tart_running_names(&list_stdout)?;
@@ -668,6 +826,79 @@ mod tests {
         let opts = ssh_probe_options();
         assert!(opts.iter().any(|o| o == "BatchMode=yes"));
         assert!(opts.iter().any(|o| o.starts_with("ConnectTimeout")));
+    }
+
+    #[test]
+    fn observer_ssh_probe_options_add_liveness_detection() {
+        let opts = observer_ssh_probe_options();
+        assert!(opts.iter().any(|o| o == "ServerAliveInterval=5"));
+        assert!(opts.iter().any(|o| o == "ServerAliveCountMax=2"));
+        let wrapped = remote_observer_command(
+            "printf ok",
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+        );
+        assert!(wrapped.starts_with(&format!("env PATH={REMOTE_OBSERVER_PATH} python3 ")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_observer_watchdog_kills_the_probe_process_group() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("remote-descendant.pid");
+        let command = format!(
+            "sleep 30 & echo $! > {}; wait",
+            shlex_quote(&pid_path.display().to_string())
+        );
+        let wrapped = remote_observer_command(&command, Instant::now() + Duration::from_secs(11));
+        let started = Instant::now();
+        let status = Command::new("sh")
+            .args(["-c", &wrapped])
+            .status()
+            .expect("run remote observer watchdog fixture");
+
+        assert_eq!(status.code(), Some(124));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid = std::fs::read_to_string(pid_path).expect("descendant pid");
+        let alive = Command::new("kill")
+            .args(["-0", "--", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!alive, "remote probe descendant survived watchdog timeout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_observer_watchdog_cleans_descendant_after_leader_success() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("successful-leader-descendant.pid");
+        let command = format!(
+            "sleep 30 & echo $! > {}",
+            shlex_quote(&pid_path.display().to_string())
+        );
+        let wrapped = remote_observer_command(&command, Instant::now() + Duration::from_secs(20));
+        let status = Command::new("sh")
+            .args(["-c", &wrapped])
+            .status()
+            .expect("run successful remote observer fixture");
+
+        assert!(status.success());
+        let pid = std::fs::read_to_string(pid_path).expect("descendant pid");
+        let alive = Command::new("kill")
+            .args(["-0", "--", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            !alive,
+            "remote probe descendant survived successful leader cleanup"
+        );
     }
 
     #[test]
