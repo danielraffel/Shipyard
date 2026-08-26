@@ -1,7 +1,8 @@
 //! Cross-platform child-process tree supervision.
 
-use std::io;
-use std::process::{ChildStderr, ChildStdout, Command, ExitStatus};
+use std::fmt;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -14,6 +15,176 @@ const TERMINATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(not(windows))]
 const TERMINATION_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BOUNDED_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(unix)]
+const DEADLINE_TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
+
+/// Failure from a descendant-safe command observation bounded by one deadline.
+#[derive(Debug)]
+pub(crate) enum BoundedOutputError {
+    /// The shared deadline elapsed before the command completed.
+    TimedOut { label: String },
+    /// The command could not be spawned, waited, or captured.
+    Unreadable {
+        label: String,
+        operation: &'static str,
+        source: io::Error,
+    },
+    /// A probe exceeded the observer's fixed capture budget.
+    OutputLimit { label: String, stream: &'static str },
+}
+
+impl fmt::Display for BoundedOutputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut { label } => write!(formatter, "{label} timed out"),
+            Self::Unreadable {
+                label,
+                operation,
+                source,
+            } => write!(formatter, "{label} {operation} failed: {source}"),
+            Self::OutputLimit { label, stream } => write!(
+                formatter,
+                "{label} {stream} exceeded {MAX_BOUNDED_OUTPUT_BYTES} byte capture limit"
+            ),
+        }
+    }
+}
+
+/// Capture a command under an absolute deadline without pipe-reader wedges.
+///
+/// Regular-file capture keeps an escaped descendant that inherited stdout or
+/// stderr from blocking this process. The complete supervised tree is reaped
+/// on success, timeout, and error.
+pub(crate) fn run_output_until(
+    command: &mut Command,
+    deadline: Instant,
+    label: impl Into<String>,
+) -> Result<Output, BoundedOutputError> {
+    let label = label.into();
+    if Instant::now() >= deadline {
+        return Err(BoundedOutputError::TimedOut { label });
+    }
+    let mut stdout = tempfile::tempfile().map_err(|source| BoundedOutputError::Unreadable {
+        label: label.clone(),
+        operation: "stdout capture",
+        source,
+    })?;
+    let mut stderr = tempfile::tempfile().map_err(|source| BoundedOutputError::Unreadable {
+        label: label.clone(),
+        operation: "stderr capture",
+        source,
+    })?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.try_clone().map_err(|source| {
+            BoundedOutputError::Unreadable {
+                label: label.clone(),
+                operation: "stdout clone",
+                source,
+            }
+        })?))
+        .stderr(Stdio::from(stderr.try_clone().map_err(|source| {
+            BoundedOutputError::Unreadable {
+                label: label.clone(),
+                operation: "stderr clone",
+                source,
+            }
+        })?));
+    let mut tree =
+        ProcessTree::spawn(command).map_err(|source| BoundedOutputError::Unreadable {
+            label: label.clone(),
+            operation: "spawn",
+            source,
+        })?;
+    #[cfg(unix)]
+    let execution_deadline = {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        deadline
+            .checked_sub(DEADLINE_TEARDOWN_BUDGET.min(remaining / 4))
+            .unwrap_or(deadline)
+    };
+    #[cfg(not(unix))]
+    let execution_deadline = deadline;
+    let status = loop {
+        for (stream, file) in [("stdout", &stdout), ("stderr", &stderr)] {
+            let length = match file.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(source) => {
+                    tree.terminate_until(deadline);
+                    return Err(BoundedOutputError::Unreadable {
+                        label,
+                        operation: "capture metadata",
+                        source,
+                    });
+                }
+            };
+            if length > MAX_BOUNDED_OUTPUT_BYTES {
+                tree.terminate_until(deadline);
+                return Err(BoundedOutputError::OutputLimit { label, stream });
+            }
+        }
+        match tree.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < execution_deadline => {
+                std::thread::sleep(
+                    WAIT_POLL_INTERVAL
+                        .min(execution_deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Ok(None) => {
+                tree.terminate_until(deadline);
+                return Err(BoundedOutputError::TimedOut { label });
+            }
+            Err(source) => {
+                tree.terminate_until(deadline);
+                return Err(BoundedOutputError::Unreadable {
+                    label,
+                    operation: "wait",
+                    source,
+                });
+            }
+        }
+    };
+    // The leader can exit while a grandchild retains its stdio. Always reap
+    // the process group before reading the regular captures.
+    tree.terminate_until(deadline);
+    let stdout = read_bounded_capture(&mut stdout, &label, "stdout")?;
+    let stderr = read_bounded_capture(&mut stderr, &label, "stderr")?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded_capture(
+    file: &mut std::fs::File,
+    label: &str,
+    stream: &'static str,
+) -> Result<Vec<u8>, BoundedOutputError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| BoundedOutputError::Unreadable {
+            label: label.to_owned(),
+            operation: "capture seek",
+            source,
+        })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BOUNDED_OUTPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| BoundedOutputError::Unreadable {
+            label: label.to_owned(),
+            operation: "capture read",
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_BOUNDED_OUTPUT_BYTES {
+        return Err(BoundedOutputError::OutputLimit {
+            label: label.to_owned(),
+            stream,
+        });
+    }
+    Ok(bytes)
+}
 
 /// A supervised child process tree.
 ///
@@ -159,6 +330,49 @@ impl ProcessTree {
             let _ = self.wait_timeout(TERMINATION_REAP_TIMEOUT);
         }
     }
+
+    /// Best-effort complete-tree termination without waiting past `deadline`.
+    pub(crate) fn terminate_until(&mut self, deadline: Instant) {
+        if self.terminated {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            if self.child.start_kill().is_ok() {
+                self.terminated = true;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.terminated = true;
+        }
+        #[cfg(unix)]
+        {
+            if let Ok(mut terminator) = termination_command(self.child.id()).spawn() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero()
+                    && !matches!(terminator.wait_timeout(remaining), Ok(Some(_)))
+                {
+                    let _ = terminator.kill();
+                }
+            } else {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.kill();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                let _ = self.wait_timeout(remaining);
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = self.child.kill();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                let _ = self.wait_timeout(remaining);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -200,6 +414,104 @@ mod tests {
 
     #[cfg(unix)]
     use super::termination_command;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_output_times_out_hanging_leaf() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let result = super::run_output_until(
+            Command::new("sh").args(["-c", "sleep 30"]),
+            Instant::now() + Duration::from_millis(150),
+            "local tart probe",
+        );
+
+        assert!(matches!(
+            result,
+            Err(super::BoundedOutputError::TimedOut { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_output_rejects_post_exit_capture_over_limit() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let result = super::run_output_until(
+            Command::new("sh").args(["-c", "head -c 8388609 /dev/zero"]),
+            Instant::now() + Duration::from_secs(3),
+            "oversize probe",
+        );
+
+        assert!(matches!(
+            result,
+            Err(super::BoundedOutputError::OutputLimit {
+                stream: "stdout",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_output_reaps_descendant_that_retains_capture() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("descendant.pid");
+        let output = super::run_output_until(
+            Command::new("sh")
+                .args([
+                    "-c",
+                    "sleep 30 & echo $! > \"$SHIPYARD_DESCENDANT_PID\"; printf ok",
+                ])
+                .env("SHIPYARD_DESCENDANT_PID", &pid_path),
+            Instant::now() + Duration::from_secs(2),
+            "descendant capture probe",
+        )
+        .expect("leader should finish without waiting on inherited stdout");
+        assert_eq!(output.stdout, b"ok");
+        let pid = std::fs::read_to_string(pid_path).expect("descendant pid");
+        let alive = Command::new("kill")
+            .args(["-0", "--", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            !alive,
+            "descendant retaining stdout survived probe teardown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_output_stops_ssh_connect_then_stall() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let connected = temp.path().join("connected");
+        let started = Instant::now();
+        let result = super::run_output_until(
+            Command::new("sh")
+                .args(["-c", "touch \"$SHIPYARD_SSH_CONNECTED\"; sleep 30"])
+                .env("SHIPYARD_SSH_CONNECTED", &connected),
+            Instant::now() + Duration::from_millis(200),
+            "ssh capacity probe",
+        );
+
+        assert!(connected.exists(), "fixture must reach connected state");
+        assert!(matches!(
+            result,
+            Err(super::BoundedOutputError::TimedOut { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     #[cfg(unix)]
     #[test]
