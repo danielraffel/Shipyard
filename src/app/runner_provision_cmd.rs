@@ -189,6 +189,28 @@ fn home_dir() -> PathBuf {
     std::env::var("HOME").map_or_else(|_| PathBuf::from("."), PathBuf::from)
 }
 
+fn strict_home_dir_from(value: Option<&OsStr>) -> Result<PathBuf, CliFailure> {
+    let Some(value) = value else {
+        return Err(CliFailure::new(
+            1,
+            "HOME is unavailable; refusing strict local runner audit",
+        ));
+    };
+    let path = PathBuf::from(value);
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return Err(CliFailure::new(
+            1,
+            "HOME must be a nonempty absolute path for strict local runner audit",
+        ));
+    }
+    Ok(path)
+}
+
+fn strict_home_dir() -> Result<PathBuf, CliFailure> {
+    let value = std::env::var_os("HOME");
+    strict_home_dir_from(value.as_deref())
+}
+
 fn cpu_count() -> usize {
     Command::new("sysctl")
         .args(["-n", "hw.ncpu"])
@@ -1504,7 +1526,7 @@ fn scan_local_runners() -> Vec<LocalRunner> {
 }
 
 fn scan_local_runners_strict() -> Result<Vec<LocalRunner>, CliFailure> {
-    scan_local_runners_in(&home_dir(), true)
+    scan_local_runners_in(&strict_home_dir()?, true)
 }
 
 /// `shipyard runner list`.
@@ -1970,6 +1992,19 @@ mod tests {
         );
         let error = scan_local_runners_in(temp.path(), true).expect_err("strict failure");
         assert!(error.message().contains("identity is malformed"));
+    }
+
+    #[test]
+    fn strict_runner_discovery_requires_an_absolute_home() {
+        assert!(strict_home_dir_from(None).is_err());
+        assert!(strict_home_dir_from(Some(OsStr::new(""))).is_err());
+        assert!(strict_home_dir_from(Some(OsStr::new("relative/home"))).is_err());
+
+        let temp = tempfile::tempdir().expect("temp");
+        assert_eq!(
+            strict_home_dir_from(Some(temp.path().as_os_str())).expect("absolute home"),
+            temp.path()
+        );
     }
 
     #[test]

@@ -610,6 +610,7 @@ mod tests {
             baseline_tests: vec!["smoke".to_owned()],
             baseline_build_targets: Vec::new(),
             baseline_only_paths: Vec::new(),
+            ios_compile_skip_safe_paths: Vec::new(),
             full_required_paths: Vec::new(),
             policy_paths: Vec::new(),
             test_topology_paths: vec!["tests/**".to_owned()],
