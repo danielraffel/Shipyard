@@ -168,6 +168,25 @@ Windows QEMU on Apple Silicon is Windows ARM64; x64 MSVC/Prism execution is
 smoke/debug until proven and should not replace `windows-latest` authority.
 Coverage must use dedicated ephemeral labels, not warm bare-metal build pools.
 
+Keep non-macOS failure work bounded when the active objective is macOS delivery.
+Capture the exact head, run/job identity, failing test, and a short causal log
+excerpt; allow one focused reproduction or targeted retry. If the result is
+unrelated or intermittent, record it in the durable workstream and continue the
+macOS-critical path instead of broadening the active PR. Keep the failure and
+its repair lane-scoped: it may block only the artifact or release contract that
+explicitly depends on that lane. Globally block unrelated lanes only for rare,
+proven shared-integrity risks such as artifact corruption, schema
+incompatibility, or false-green merge authority. Routine status monitoring is
+model-free.
+
+Make platform focus repository-scoped rather than a global Shipyard
+assumption. Pulp, Forge, and Vellum currently treat macOS as the primary
+delivery lane and Linux/Windows as independently repaired compatibility lanes.
+Other repositories may select different primary, artifact-required, advisory,
+or globally coupled platforms through trusted repository policy. Do not infer a
+cross-lane block when that policy is missing or ambiguous; fail closed only for
+the affected artifact contract and surface the configuration gap.
+
 For local x64 Linux, keep selector policy in the checked-in `normal-local-fast`
 profile and run the external Shipyard health operator documented in
 `docs/pulp-local-linux-lease.md`. The trusted merge-group namespace renews
