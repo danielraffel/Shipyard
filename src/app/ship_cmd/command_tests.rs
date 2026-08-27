@@ -34,6 +34,64 @@ fn auto_create_base_default_matches_python_patterns() {
 }
 
 #[test]
+fn explicit_pr_checkout_identity_accepts_only_the_exact_worktree() {
+    let head = "a".repeat(40);
+    super::validate_explicit_pr_checkout(
+        42,
+        super::CheckoutIdentity {
+            repo: "Generous-Corp/pulp",
+            branch: "feature/exact",
+            head: &head,
+        },
+        Some("generous-corp/PULP"),
+        "feature/exact",
+        &head.to_ascii_uppercase(),
+    )
+    .expect("GitHub repository and SHA comparisons are case insensitive");
+
+    for (repo, branch, local_head) in [
+        ("Generous-Corp/forge", "feature/exact", head.as_str()),
+        ("Generous-Corp/pulp", "feature/unrelated", head.as_str()),
+        (
+            "Generous-Corp/pulp",
+            "feature/exact",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    ] {
+        let error = super::validate_explicit_pr_checkout(
+            42,
+            super::CheckoutIdentity {
+                repo,
+                branch,
+                head: local_head,
+            },
+            Some("Generous-Corp/pulp"),
+            "feature/exact",
+            &head,
+        )
+        .expect_err("repository, branch, and head are independent fail-closed gates");
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("refusing ship --pr 42"));
+    }
+}
+
+#[test]
+fn pull_request_url_parser_requires_an_exact_github_pr_url() {
+    assert_eq!(
+        super::pull_request_repo_slug("https://github.com/Generous-Corp/pulp/pull/7823"),
+        Some("Generous-Corp/pulp".to_owned())
+    );
+    for malformed in [
+        "https://example.com/Generous-Corp/pulp/pull/7823",
+        "https://github.com/Generous-Corp/pulp/issues/7823",
+        "https://github.com/Generous-Corp/pulp/pull/not-a-number",
+        "https://github.com/Generous-Corp/pulp/pull/7823/files",
+    ] {
+        assert_eq!(super::pull_request_repo_slug(malformed), None);
+    }
+}
+
+#[test]
 fn daemon_ship_rejects_env_auth_before_remote_resolution() {
     let error = super::validate_daemon_ship_submission(true, false, Some("env"))
         .expect_err("env auth must be rejected");
@@ -57,7 +115,11 @@ fn ship_command_runs_local_target_merges_and_archives_state() {
     // so the happy-path merge proceeds.
     let head = git_capture(&["rev-parse", "HEAD"], &repo);
     let snapshot = temp.path().join("pr.json");
-    std::fs::write(&snapshot, format!(r#"{{"headRefOid":"{head}"}}"#)).expect("write snapshot");
+    std::fs::write(
+        &snapshot,
+        format!(r#"{{"headRefName":"feature/test","headRefOid":"{head}"}}"#),
+    )
+    .expect("write snapshot");
     let mut stdout = Vec::new();
 
     let code = ship_command(
@@ -140,7 +202,7 @@ fn ship_command_green_merge_failure_keeps_active_state_and_exits_success() {
     let snapshot = temp.path().join("pr.json");
     std::fs::write(
         &snapshot,
-        format!(r#"{{"state":"OPEN","headRefOid":"{head}"}}"#),
+        format!(r#"{{"state":"OPEN","headRefName":"feature/test","headRefOid":"{head}"}}"#),
     )
     .expect("write snapshot");
     let mut stdout = Vec::new();
@@ -544,6 +606,141 @@ fn ship_command_preflight_failure_happens_before_state_mutation() {
 }
 
 #[test]
+#[cfg(unix)]
+fn ship_command_explicit_pr_rejects_unrelated_checkout_before_state_mutation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    seed_repo(&repo);
+    let paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
+    let local_head = git_capture(&["rev-parse", "HEAD"], &repo);
+    let pr_head = "b".repeat(40);
+    assert_ne!(
+        local_head, pr_head,
+        "fixture must model a different PR head"
+    );
+    let gh = temp.path().join("gh");
+    fake_gh(
+        &gh,
+        &format!(
+            r#"
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{{"number":7823,"url":"https://github.com/danielraffel/pulp/pull/7823","title":"SIMD bank","state":"OPEN","headRefName":"feature/simd-bank","headRefOid":"{pr_head}","baseRefName":"main"}}'
+  exit 0
+fi
+echo "unexpected gh args: $@" >&2
+exit 2
+"#,
+        ),
+    );
+    let mut stdout = Vec::new();
+
+    let error = ship_command(
+        ShipCommandArgs {
+            pr: Some(7823),
+            base: "main".to_owned(),
+            auto_create_base: None,
+            no_warm: true,
+            resume_from: None,
+            merge_command: None,
+            merge_result: Some(MergeResult::Success),
+            gh_command: Some(gh),
+            pr_snapshot_file: None,
+            allow_unreachable_targets: false,
+            allow_fleet_epoch_drift: false,
+            skip_targets: Vec::new(),
+            adopt_head: false,
+            steward_handoff: None,
+            invocation: ShipInvocation::Direct,
+            foreground: true,
+        },
+        &loaded_config(temp.path()),
+        &repo,
+        &paths,
+        true,
+        &mut stdout,
+    )
+    .expect_err("an unrelated checkout must not bind work to an explicit PR");
+
+    assert_eq!(error.code, 2);
+    assert!(error.message.contains("refusing ship --pr 7823"));
+    assert!(error.message.contains("local branch feature/test"));
+    assert!(error.message.contains("PR head branch feature/simd-bank"));
+    assert!(error.message.contains(&format!("local HEAD {local_head}")));
+    assert!(error.message.contains(&format!("PR head {pr_head}")));
+    assert!(stdout.is_empty());
+    assert!(!paths.state_dir.join("queue.json").exists());
+    assert!(!paths.state_dir.join("ship").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn explicit_pr_context_accepts_exact_live_pr_worktree() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    seed_repo(&repo);
+    let head = git_capture(&["rev-parse", "HEAD"], &repo);
+    let gh = temp.path().join("gh");
+    fake_gh(
+        &gh,
+        &format!(
+            r#"
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{{"number":7823,"url":"https://github.com/danielraffel/pulp/pull/7823","title":"SIMD bank","state":"OPEN","headRefName":"feature/test","headRefOid":"{head}","baseRefName":"main"}}'
+  exit 0
+fi
+echo "unexpected gh args: $@" >&2
+exit 2
+"#,
+        ),
+    );
+    let config = loaded_config(temp.path());
+    let lane_policy = crate::lane_policy::resolve_lane_policy(&config, &repo);
+    let args = ShipCommandArgs {
+        pr: Some(7823),
+        base: "main".to_owned(),
+        auto_create_base: None,
+        no_warm: true,
+        resume_from: None,
+        merge_command: None,
+        merge_result: Some(MergeResult::Success),
+        gh_command: Some(gh),
+        pr_snapshot_file: None,
+        allow_unreachable_targets: false,
+        allow_fleet_epoch_drift: false,
+        skip_targets: Vec::new(),
+        adopt_head: false,
+        steward_handoff: None,
+        invocation: ShipInvocation::Direct,
+        foreground: true,
+    };
+
+    let context = super::resolve_pr_context(
+        &config,
+        &args,
+        &repo,
+        super::CheckoutIdentity {
+            repo: "danielraffel/pulp",
+            branch: "feature/test",
+            head: &head,
+        },
+        &lane_policy,
+        None,
+    )
+    .expect("the exact live PR worktree remains supported");
+
+    assert_eq!(context.number, 7823);
+    assert_eq!(context.base_branch, "main");
+    assert_eq!(
+        context.pr_url.as_deref(),
+        Some("https://github.com/danielraffel/pulp/pull/7823")
+    );
+}
+
+#[test]
 fn ship_command_skip_target_excludes_unreachable_target_before_preflight() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
@@ -557,7 +754,7 @@ fn ship_command_skip_target_excludes_unreachable_target_before_preflight() {
     let snapshot = temp.path().join("pr.json");
     std::fs::write(
         &snapshot,
-        format!(r#"{{"headRefOid":"{head}","baseRefName":"main"}}"#),
+        format!(r#"{{"headRefName":"feature/test","headRefOid":"{head}","baseRefName":"main"}}"#),
     )
     .expect("write snapshot");
     let mut stdout = Vec::new();
@@ -618,13 +815,15 @@ fn ship_command_without_pr_finds_existing_pr_after_preflight_and_push() {
             r#"
 echo "$@" >> "{}"
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":88,"url":"https://github.com/o/r/pull/88","title":"Existing PR","state":"OPEN","headRefName":"feature/test","baseRefName":"main"}}]'
+  head=$(git -C "{}" rev-parse HEAD)
+  echo '[{{"number":88,"url":"https://github.com/o/r/pull/88","title":"Existing PR","state":"OPEN","headRefName":"feature/test","headRefOid":"'"$head"'","baseRefName":"main"}}]'
   exit 0
 fi
 echo "unexpected gh args: $@" >&2
 exit 2
 "#,
-            gh_log.display()
+            gh_log.display(),
+            repo.display()
         ),
     );
     let paths = RuntimePaths::current_with_overrides(
@@ -723,13 +922,15 @@ if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  echo '{{"number":89,"url":"https://github.com/o/r/pull/89","title":"Add autopilot","state":"OPEN","headRefName":"feature/test","baseRefName":"develop/test"}}'
+  head=$(git -C "{}" rev-parse HEAD)
+  echo '{{"number":89,"url":"https://github.com/o/r/pull/89","title":"Add autopilot","state":"OPEN","headRefName":"feature/test","headRefOid":"'"$head"'","baseRefName":"develop/test"}}'
   exit 0
 fi
 echo "unexpected gh args: $@" >&2
 exit 2
 "#,
-            gh_log.display()
+            gh_log.display(),
+            repo.display()
         ),
     );
     let paths = RuntimePaths::current_with_overrides(

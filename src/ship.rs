@@ -2429,6 +2429,31 @@ fn load_or_create_state(
     Ok(state)
 }
 
+/// Reject validation-identity drift before a daemon-owned request enters the queue.
+///
+/// The worker repeats this check under the per-PR ship-state lock because state can
+/// change after submission. This earlier check is deliberately advisory with
+/// respect to races but authoritative for state that is already stale: a request
+/// that needs explicit `--adopt-head` must not wait behind unrelated work only to
+/// be cancelled when it finally receives a worker.
+pub(crate) fn validate_ship_state_for_submission(
+    request: &ShipExecutionRequest,
+    store: &ShipStateStore,
+) -> Result<(), ShipExecutionError> {
+    let target_names = target_names(&request.targets);
+    let policy = policy_signature(&request.targets, &target_names, request.mode);
+    if let Some(existing) = store.get_scoped(&request.repo, request.pr) {
+        validate_existing_state(
+            &existing,
+            &request.sha,
+            &request.base_branch,
+            &policy,
+            request.adopt_head,
+        )?;
+    }
+    Ok(())
+}
+
 fn refresh_pr_metadata(state: &mut ShipState, request: &ShipExecutionRequest) {
     if let Some(pr_url) = request.pr_url.as_deref().filter(|value| !value.is_empty()) {
         pr_url.clone_into(&mut state.pr_url);
@@ -5491,6 +5516,38 @@ mod tests {
             super::validate_existing_state(&state, "new", "main", "different-policy", true),
             Err(ShipExecutionError::PolicyDrift { .. })
         ));
+    }
+
+    #[test]
+    fn submission_preflight_rejects_stale_ship_state_before_queueing() {
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("ship");
+        let request = ship_request(vec![target]);
+        let names = super::target_names(&request.targets);
+        store
+            .save(&ShipState::new(
+                request.pr,
+                request.repo.clone(),
+                request.branch.clone(),
+                request.base_branch.clone(),
+                "old-head",
+                super::policy_signature(&request.targets, &names, request.mode),
+            ))
+            .expect("save stale state");
+
+        let error = super::validate_ship_state_for_submission(&request, &store)
+            .expect_err("stale state must be rejected before queue submission");
+        assert!(matches!(
+            error,
+            ShipExecutionError::ShaDrift { existing, current }
+                if existing == "old-head" && current == request.sha
+        ));
+
+        let mut adopted = request;
+        adopted.adopt_head = true;
+        super::validate_ship_state_for_submission(&adopted, &store)
+            .expect("explicit head adoption remains supported");
     }
 
     #[test]

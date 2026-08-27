@@ -32,7 +32,9 @@ use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
 use crate::lane_policy::{LanePolicy, resolve_lane_policy};
 use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
-use crate::pr::{PrInfo, create_pr, find_pr_for_branch, get_pr_status, push_branch_with_env};
+use crate::pr::{
+    PrInfo, create_pr, find_pr_for_branch, get_pr_checkout_status, push_branch_with_env,
+};
 use crate::pr_text::{compose_pr_body_with_policy, compose_pr_title};
 use crate::preflight::{
     EXIT_BACKEND_UNREACHABLE, EXIT_FLEET_EPOCH_DRIFT, EXIT_HOST_UNHEALTHY, ShipPreflightError,
@@ -43,6 +45,7 @@ use crate::queue::Queue;
 use crate::reconcile::fetch_head_and_status_check_rollup_with_cwd;
 use crate::ship::{
     ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_ship, submit_ship_daemon,
+    validate_ship_state_for_submission,
 };
 use crate::ship_state::ShipStateStore;
 use crate::warm_pool::{WarmPool, default_pool_path};
@@ -168,7 +171,11 @@ pub(super) fn ship_command<W: Write>(
         config,
         &args,
         cwd,
-        &branch,
+        CheckoutIdentity {
+            repo: &repo,
+            branch: &branch,
+            head: &sha,
+        },
         &lane_policy,
         prospective_push.as_mut(),
     )?;
@@ -266,6 +273,13 @@ pub(super) fn ship_command<W: Write>(
         pr_snapshot_file: args.pr_snapshot_file.clone(),
         targets,
     };
+
+    // Fail a known stale validation identity synchronously. The worker repeats
+    // this under the per-PR lock, but deferring the first check until execution
+    // can waste minutes behind unrelated repositories before the request is
+    // inevitably cancelled for missing explicit `--adopt-head` authority.
+    validate_ship_state_for_submission(&request, &ship_state)
+        .map_err(|error| CliFailure::new(2, error.to_string()))?;
 
     if daemon_owned
         && crate::queue_request::ExecutionProvenance::capture_with_config(
@@ -635,11 +649,18 @@ struct ResolvedPrContext {
     pr_title: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct CheckoutIdentity<'a> {
+    repo: &'a str,
+    branch: &'a str,
+    head: &'a str,
+}
+
 fn resolve_pr_context(
     config: &LoadedConfig,
     args: &ShipCommandArgs,
     cwd: &Path,
-    branch: &str,
+    checkout: CheckoutIdentity<'_>,
     lane_policy: &LanePolicy,
     mut prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
 ) -> Result<ResolvedPrContext, CliFailure> {
@@ -659,6 +680,17 @@ fn resolve_pr_context(
                 .or_else(|| value.pointer("/base/ref").and_then(Value::as_str))
                 .unwrap_or(&args.base)
                 .to_owned();
+            let pr_branch = value
+                .get("headRefName")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| CliFailure::new(2, "PR snapshot omitted the exact head branch"))?;
+            let pr_head = value
+                .get("headRefOid")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| CliFailure::new(2, "PR snapshot omitted the exact head SHA"))?;
+            validate_explicit_pr_checkout(number, checkout, None, pr_branch, pr_head)?;
             return Ok(ResolvedPrContext {
                 number,
                 base_branch,
@@ -666,8 +698,26 @@ fn resolve_pr_context(
                 pr_title: None,
             });
         }
-        let info = get_pr_status(config, cwd, args.gh_command.as_deref(), &number.to_string())
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let checkout_info =
+            get_pr_checkout_status(config, cwd, args.gh_command.as_deref(), &number.to_string())
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let info = checkout_info.info;
+        let pr_repo = pull_request_repo_slug(&info.url).ok_or_else(|| {
+            CliFailure::new(
+                2,
+                format!(
+                    "refusing ship --pr {number}: live pull request URL does not identify an exact GitHub repository: {}",
+                    info.url
+                ),
+            )
+        })?;
+        validate_explicit_pr_checkout(
+            number,
+            checkout,
+            Some(&pr_repo),
+            &info.branch,
+            &checkout_info.head_sha,
+        )?;
         return Ok(ResolvedPrContext {
             number,
             base_branch: info.base,
@@ -683,7 +733,7 @@ fn resolve_pr_context(
             push.handoff_writer_domain_to_child();
             environment
         });
-    push_branch_with_env(cwd, branch, environment)
+    push_branch_with_env(cwd, checkout.branch, environment)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     if let Some(push) = prospective_push {
         // This private state transition is the pass authority. The hook result
@@ -691,7 +741,7 @@ fn resolve_pr_context(
         // nonzero/aborted git push into this parent-observed state.
         push.mark_supervised_push_succeeded();
     }
-    let info = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), branch)
+    let info = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), checkout.branch)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .map_or_else(
             || {
@@ -699,14 +749,14 @@ fn resolve_pr_context(
                     config,
                     cwd,
                     args.gh_command.as_deref(),
-                    branch,
+                    checkout.branch,
                     &args.base,
                     lane_policy,
                 )
             },
             Ok::<PrInfo, CliFailure>,
         )?;
-    if info.branch != branch {
+    if info.branch != checkout.branch {
         return Err(CliFailure::new(
             1,
             "authenticated pull-request head ref differs from the supervised branch",
@@ -718,6 +768,53 @@ fn resolve_pr_context(
         pr_url: Some(info.url),
         pr_title: Some(info.title),
     })
+}
+
+fn validate_explicit_pr_checkout(
+    number: u64,
+    checkout: CheckoutIdentity<'_>,
+    pr_repo: Option<&str>,
+    pr_branch: &str,
+    pr_head: &str,
+) -> Result<(), CliFailure> {
+    let repo_matches = pr_repo.is_none_or(|value| value.eq_ignore_ascii_case(checkout.repo));
+    if !checkout.repo.is_empty()
+        && repo_matches
+        && checkout.branch == pr_branch
+        && checkout.head.eq_ignore_ascii_case(pr_head)
+    {
+        return Ok(());
+    }
+
+    Err(CliFailure::new(
+        2,
+        format!(
+            "refusing ship --pr {number}: current checkout does not match live pull request; local repo {local_repo}, local branch {local_branch}, local HEAD {local_head}; PR repo {}, PR head branch {pr_branch}, PR head {pr_head}. Run this command from the exact PR worktree.",
+            pr_repo.unwrap_or("<snapshot-scoped>"),
+            local_repo = checkout.repo,
+            local_branch = checkout.branch,
+            local_head = checkout.head,
+        ),
+    ))
+}
+
+fn pull_request_repo_slug(url: &str) -> Option<String> {
+    let path = url
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("https://github.com/")?;
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty()
+        || repo.is_empty()
+        || parts.next()? != "pull"
+        || parts.next()?.parse::<u64>().is_err()
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
 }
 
 fn create_current_branch_pr(

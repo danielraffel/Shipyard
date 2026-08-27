@@ -28,6 +28,13 @@ pub struct PrInfo {
     pub base: String,
 }
 
+/// Pull request metadata plus the exact immutable head needed for submission guards.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PrCheckoutInfo {
+    pub(crate) info: PrInfo,
+    pub(crate) head_sha: String,
+}
+
 /// Error returned by PR shell helpers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrError {
@@ -189,6 +196,29 @@ pub fn get_pr_status(
     get_pr_status_with_client(&client, cwd, gh_command, selector)
 }
 
+/// Return normalized PR metadata plus its exact live head SHA.
+pub(crate) fn get_pr_checkout_status(
+    config: &LoadedConfig,
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    selector: &str,
+) -> Result<PrCheckoutInfo, PrError> {
+    let client = gh_client(config)?;
+    let output = gh(&client, cwd, gh_command)?
+        .args(["pr", "view", selector, "--json", PR_CHECKOUT_JSON_FIELDS])
+        .output()
+        .map_err(|error| PrError::new(format!("gh pr view failed to start: {error}")))?;
+    if !output.status.success() {
+        let message = stderr_or_stdout(&output);
+        if is_graphql_rate_limited(&message) {
+            report_rate_limit_fallback_with_client(&client, "gh pr view", cwd);
+            return get_pr_checkout_status_rest(&client, cwd, gh_command, selector);
+        }
+        return Err(PrError::new(format!("gh pr view failed: {message}")));
+    }
+    parse_pr_checkout_info(&String::from_utf8_lossy(&output.stdout))
+}
+
 fn get_pr_status_with_client(
     client: &GhClient,
     cwd: &Path,
@@ -211,6 +241,7 @@ fn get_pr_status_with_client(
 }
 
 const PR_JSON_FIELDS: &str = "number,url,title,state,headRefName,baseRefName";
+const PR_CHECKOUT_JSON_FIELDS: &str = "number,url,title,state,headRefName,headRefOid,baseRefName";
 
 fn gh_client(config: &LoadedConfig) -> Result<GhClient, PrError> {
     // Build the gh client from the caller's already-resolved config (not a
@@ -386,6 +417,29 @@ fn get_pr_status_rest(
     parse_pr_rest_info(&String::from_utf8_lossy(&output.stdout))
 }
 
+fn get_pr_checkout_status_rest(
+    client: &GhClient,
+    cwd: &Path,
+    gh_command: Option<&Path>,
+    selector: &str,
+) -> Result<PrCheckoutInfo, PrError> {
+    let repo = repo_slug(cwd)?;
+    let number = selector_pr_number(selector)
+        .ok_or_else(|| PrError::new(format!("could not parse PR selector {selector:?}")))?;
+    let endpoint = format!("repos/{repo}/pulls/{number}");
+    let output = gh(client, cwd, gh_command)?
+        .args(["api", &endpoint])
+        .output()
+        .map_err(|error| PrError::new(format!("gh REST PR view failed to start: {error}")))?;
+    if !output.status.success() {
+        return Err(PrError::new(format!(
+            "gh REST PR view failed after GraphQL rate limit: {}",
+            stderr_or_stdout(&output)
+        )));
+    }
+    parse_pr_checkout_rest_info(&String::from_utf8_lossy(&output.stdout))
+}
+
 fn repo_slug(cwd: &Path) -> Result<String, PrError> {
     let output = crate::supervised::git_supervised()
         .args(["config", "--get", "remote.origin.url"])
@@ -532,6 +586,15 @@ fn parse_pr_rest_info(text: &str) -> Result<PrInfo, PrError> {
     parse_pr_rest_value(&value)
 }
 
+fn parse_pr_checkout_rest_info(text: &str) -> Result<PrCheckoutInfo, PrError> {
+    let value = serde_json::from_str::<Value>(text)
+        .map_err(|error| PrError::new(format!("failed to parse REST PR JSON: {error}")))?;
+    Ok(PrCheckoutInfo {
+        info: parse_pr_rest_value(&value)?,
+        head_sha: nested_string_field(&value, &["head", "sha"])?,
+    })
+}
+
 fn parse_pr_rest_value(value: &Value) -> Result<PrInfo, PrError> {
     Ok(PrInfo {
         number: value
@@ -550,6 +613,15 @@ fn parse_pr_info(text: &str) -> Result<PrInfo, PrError> {
     let value = serde_json::from_str::<Value>(text)
         .map_err(|error| PrError::new(format!("failed to parse gh pr view JSON: {error}")))?;
     parse_pr_value(&value)
+}
+
+fn parse_pr_checkout_info(text: &str) -> Result<PrCheckoutInfo, PrError> {
+    let value = serde_json::from_str::<Value>(text)
+        .map_err(|error| PrError::new(format!("failed to parse gh pr view JSON: {error}")))?;
+    Ok(PrCheckoutInfo {
+        info: parse_pr_value(&value)?,
+        head_sha: string_field(&value, "headRefOid")?,
+    })
 }
 
 fn parse_pr_value(value: &Value) -> Result<PrInfo, PrError> {
@@ -591,23 +663,33 @@ fn nested_string_field(value: &Value, path: &[&str]) -> Result<String, PrError> 
 mod tests {
     use super::{
         PrInfo, is_graphql_pr_create_integration_blocked, is_graphql_rate_limited,
-        is_integration_blocked, parse_github_remote_slug, parse_pr_info, parse_pr_list,
-        parse_pr_rest_info, parse_pr_rest_list, selector_pr_number, url_encode,
+        is_integration_blocked, parse_github_remote_slug, parse_pr_checkout_info,
+        parse_pr_checkout_rest_info, parse_pr_info, parse_pr_list, parse_pr_rest_info,
+        parse_pr_rest_list, selector_pr_number, url_encode,
     };
+
+    const GRAPHQL_PR: &str = r#"{
+        "number": 42,
+        "url": "https://github.com/o/r/pull/42",
+        "title": "Fix thing",
+        "state": "OPEN",
+        "headRefName": "feature/test",
+        "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "baseRefName": "main"
+    }"#;
+
+    const REST_PR: &str = r#"{
+        "number": 273,
+        "html_url": "https://github.com/danielraffel/Shipyard/pull/273",
+        "title": "REST fallback",
+        "state": "open",
+        "head": {"ref": "feature/rest-fallback", "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+        "base": {"ref": "main"}
+    }"#;
 
     #[test]
     fn parses_pr_view_payload() {
-        let info = parse_pr_info(
-            r#"{
-                "number": 42,
-                "url": "https://github.com/o/r/pull/42",
-                "title": "Fix thing",
-                "state": "OPEN",
-                "headRefName": "feature/test",
-                "baseRefName": "main"
-            }"#,
-        )
-        .expect("pr info");
+        let info = parse_pr_info(GRAPHQL_PR).expect("pr info");
 
         assert_eq!(
             info,
@@ -620,6 +702,9 @@ mod tests {
                 base: "main".to_owned(),
             }
         );
+        let checkout = parse_pr_checkout_info(GRAPHQL_PR).expect("checkout info");
+        assert_eq!(checkout.info, info);
+        assert_eq!(checkout.head_sha, "a".repeat(40));
     }
 
     #[test]
@@ -633,6 +718,7 @@ mod tests {
                     "title": "Ship it",
                     "state": "OPEN",
                     "headRefName": "feature/a",
+                    "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "baseRefName": "develop"
                 }]"#,
             )
@@ -709,17 +795,7 @@ mod tests {
 
     #[test]
     fn parses_rest_pr_payloads() {
-        let info = parse_pr_rest_info(
-            r#"{
-                "number": 273,
-                "html_url": "https://github.com/danielraffel/Shipyard/pull/273",
-                "title": "REST fallback",
-                "state": "open",
-                "head": {"ref": "feature/rest-fallback"},
-                "base": {"ref": "main"}
-            }"#,
-        )
-        .expect("rest pr");
+        let info = parse_pr_rest_info(REST_PR).expect("rest pr");
 
         assert_eq!(
             info,
@@ -732,6 +808,9 @@ mod tests {
                 base: "main".to_owned(),
             }
         );
+        let checkout = parse_pr_checkout_rest_info(REST_PR).expect("REST checkout info");
+        assert_eq!(checkout.info, info);
+        assert_eq!(checkout.head_sha, "b".repeat(40));
         assert_eq!(parse_pr_rest_list("[]").expect("empty"), None);
         assert_eq!(
             parse_pr_rest_list(
@@ -740,7 +819,7 @@ mod tests {
                     "html_url": "https://github.com/o/r/pull/274",
                     "title": "Focus profile",
                     "state": "open",
-                    "head": {"ref": "feature/focus"},
+                    "head": {"ref": "feature/focus", "sha": "cccccccccccccccccccccccccccccccccccccccc"},
                     "base": {"ref": "main"}
                 }]"#
             )
