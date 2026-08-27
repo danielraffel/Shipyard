@@ -104,6 +104,7 @@ shipyard runner steward --no-preempt-capacity       # disable bounded preamble p
 shipyard runner steward --recover-hosted-setup-eviction-priority --apply
 shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable authority blocker
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
+shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
 shipyard runner recovery-worker --drain --apply     # process one bounded pending snapshot (maximum 32)
@@ -121,6 +122,11 @@ head, revalidates that the PR still has that head, and then adds
 `shipyard:managed` and removes `shipyard:unmanaged`. Apply-mode `runner steward`
 adds that explanatory label to unhanded PRs, but only heads carrying both
 management signals may be queued, rerun, cancelled, or recovery-signalled.
+The transfer form is the explicit recovery path when the original agent
+session is unavailable. It preserves the exact head/workstream/context and
+increments a private ownership generation; ambient sessions cannot silently
+adopt a receipt. Machine identity is persisted privately on first use rather
+than recomputed from mutable host environment variables.
 Semantic blockers receive one deduplicated `shipyard:needs-agent` label and
 failed `shipyard/steward-recovery` status, which are cleared after recovery.
 The current PR's case-insensitive `5·unresolved` label blocks every steward

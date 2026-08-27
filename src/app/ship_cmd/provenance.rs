@@ -7,6 +7,7 @@ use super::{
     steward_handoff_command,
 };
 use crate::cloud::GitHubActions;
+use crate::paths::RuntimePaths;
 
 #[derive(Clone, Debug)]
 pub(super) struct AppliedStewardHandoff {
@@ -156,12 +157,21 @@ pub(super) fn apply_requested_steward_handoff<W: Write>(
     pr: &ResolvedPrContext,
     config: &LoadedConfig,
     cwd: &Path,
+    runtime_paths: &RuntimePaths,
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<Option<AppliedStewardHandoff>, CliFailure> {
     let actions = GitHubActions::from_loaded_config(cwd, config);
     apply_requested_steward_handoff_with_actions(
-        request, repo, head, pr, cwd, &actions, json_mode, stdout,
+        request,
+        repo,
+        head,
+        pr,
+        cwd,
+        runtime_paths,
+        &actions,
+        json_mode,
+        stdout,
     )
 }
 
@@ -172,6 +182,7 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
     head: &str,
     pr: &ResolvedPrContext,
     cwd: &Path,
+    runtime_paths: &RuntimePaths,
     actions: &GitHubActions,
     json_mode: bool,
     stdout: &mut W,
@@ -192,9 +203,17 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
             head: head.to_owned(),
             workstream_id: workstream_id.clone(),
             context_url: context_url.clone(),
+            agent_provider: None,
+            agent_session_id: None,
+            agent_parent_session_id: None,
+            agent_surface_id: None,
+            goal_managed: false,
+            after_handoff: "continue".to_owned(),
+            transfer_agent_owner: false,
             apply: true,
         },
         cwd,
+        runtime_paths,
         actions,
         false,
         &mut sink,

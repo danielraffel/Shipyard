@@ -236,6 +236,7 @@ pub(super) fn ship_command<W: Write>(
         &pr_context,
         config,
         cwd,
+        runtime_paths,
         json_mode,
         stdout,
     )?;

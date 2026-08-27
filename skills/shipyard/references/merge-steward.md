@@ -48,6 +48,16 @@ signals are reported as `unmanaged` or `handoff_missing` and receive no queue,
 rerun, cancellation, or recovery mutation. Add `shipyard:no-auto-merge` to opt
 an otherwise managed PR out.
 
+The origin machine gets one private persisted identity. Mutable hostname and
+launcher environment values are not replay authority. When the recorded agent
+session is gone, transfer is an explicit local operation: repeat the command
+with the same exact head, workstream, context, and disposition plus explicit
+`--agent-provider`, `--agent-session-id`, and `--transfer-agent-owner`. Shipyard
+increments the ownership generation and preserves prior immutable work facts;
+without that flag, a different session or changed explicit fallback surface
+fails closed. The same explicit transfer flag may update a diagnosed cmux
+surface for the recorded session without changing immutable work identity.
+
 Unresolved provenance is a separate fail-closed authority boundary. By default,
 any case-insensitive `5·unresolved` label produces `provenance_blocked` and
 forbids queue, rerun, cancellation, preemption, recovery-signal, and

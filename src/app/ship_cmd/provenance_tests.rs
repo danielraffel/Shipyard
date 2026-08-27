@@ -11,6 +11,10 @@ use super::test_support::{fake_gh, loaded_config};
 use super::{ResolvedPrContext, ShipStewardHandoff};
 #[cfg(unix)]
 use crate::cloud::GitHubActions;
+#[cfg(unix)]
+use crate::identity::RuntimeMode;
+#[cfg(unix)]
+use crate::paths::RuntimePaths;
 
 #[test]
 fn provenance_hook_config_is_argv_only_and_required_by_default() {
@@ -151,6 +155,7 @@ case "$*" in
   *"repos/danielraffel/pulp/pulls/42"*)
 printf '%s\n' '{{"state":"open","head":{{"sha":"{head}"}}}}'
 ;;
+  *"repos/danielraffel/pulp/commits/"*"/statuses?"*) printf '%s\n' '[]' ;;
   *) printf '%s\n' '{{}}' ;;
 esac"#,
             log.display()
@@ -159,6 +164,11 @@ esac"#,
     let config = loaded_config(temp.path());
     let actions =
         GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(&gh);
+    let runtime_paths = RuntimePaths::current_with_overrides(
+        RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().join("state")),
+    );
     let request = ShipStewardHandoff {
         workstream_id: None,
         context_url: None,
@@ -176,6 +186,7 @@ esac"#,
         &head,
         &pr,
         temp.path(),
+        &runtime_paths,
         &actions,
         true,
         &mut Vec::new(),
@@ -189,7 +200,9 @@ esac"#,
         Some(pr.pr_url.as_deref().unwrap())
     );
     let calls = std::fs::read_to_string(log).expect("gh log");
-    let status = calls.find("statuses/").expect("status call");
+    let status = calls
+        .find("-X POST repos/danielraffel/pulp/statuses/")
+        .expect("status POST");
     let label = calls.find("issues/42/labels").expect("label call");
     assert!(status < label, "status receipt must precede managed label");
 }
