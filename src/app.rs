@@ -15,7 +15,7 @@ mod auth_cmd;
 mod auto_merge_cmd;
 mod branch_cmd;
 mod capacity_cmd;
-mod changed_surface_cmd;
+pub(crate) mod changed_surface_cmd;
 mod changed_surface_trial_cmd;
 mod changelog_cmd;
 mod ci_cmd;

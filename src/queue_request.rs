@@ -35,8 +35,9 @@ use crate::ship_state::ShipState;
 use crate::warm_pool::{is_backend_eligible, warm_host_key};
 
 /// Current queued-execution schema.
-pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 2;
+pub const QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 3;
 const LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 1;
+const TRUSTED_ENVIRONMENT_QUEUED_EXECUTION_SCHEMA_VERSION: u32 = 2;
 const MAX_SHIP_POST_VALIDATION_DETAIL_BYTES: usize = 1_200;
 
 /// Durable submitter ownership. Running ownership is derived by admitting
@@ -291,6 +292,22 @@ pub struct QueuedExecutionEnvelope {
 }
 
 impl QueuedExecutionEnvelope {
+    /// Whether this request is controller-only metadata authority and therefore
+    /// consumes no native target-worker capacity.
+    #[must_use]
+    pub(crate) fn is_metadata_authority_controller(&self) -> bool {
+        matches!(
+            &self.request,
+            QueuedExecutionRequest::Ship(request)
+                if request.metadata_authority_receipt.is_some()
+                    && request.targets.is_empty()
+                    && self.resource_plan.targets.is_empty()
+                    && self.resource_plan.cloud_targets.is_empty()
+                    && self.resource_plan.host_pools.is_empty()
+                    && self.resource_plan.vm_slots.is_empty()
+        )
+    }
+
     /// Whether this request carries the configuration provenance required for
     /// daemon-owned execution. Foreground requests deliberately omit that
     /// signature; missing or unreadable envelopes must be treated separately
@@ -580,6 +597,7 @@ pub enum QueuedExecutionKind {
 }
 
 /// Queued execution request payload.
+#[allow(clippy::large_enum_variant)] // Stable schema keeps ship payload inline for backward-compatible v1/v2 decoding.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum QueuedExecutionRequest {
@@ -676,6 +694,9 @@ pub struct QueuedShipRequest {
     /// clearing prior evidence so the new head re-validates. See Shipyard #346.
     #[serde(default)]
     pub adopt_head: bool,
+    /// Exact trusted authority for a ship with no native validation targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_authority_receipt: Option<crate::metadata_authority::MetadataAuthorityReceipt>,
     /// Ordered resolved target snapshots.
     pub targets: Vec<QueuedResolvedTarget>,
 }
@@ -698,6 +719,7 @@ impl From<&ShipExecutionRequest> for QueuedShipRequest {
             resume_from: request.resume_from.clone(),
             advisory_targets: request.advisory_targets.clone(),
             adopt_head: request.adopt_head,
+            metadata_authority_receipt: request.metadata_authority_receipt.clone(),
             targets: snapshot_targets(&request.targets),
         }
     }
@@ -723,6 +745,7 @@ impl QueuedShipRequest {
             advisory_targets: self.advisory_targets.clone(),
             adopt_head: self.adopt_head,
             pr_snapshot_file: None,
+            metadata_authority_receipt: self.metadata_authority_receipt.clone(),
             targets: restore_targets(&self.targets)?,
         })
     }
@@ -1936,7 +1959,11 @@ fn upgrade_legacy_request(
     if envelope.schema_version == QUEUED_EXECUTION_SCHEMA_VERSION {
         return Ok(envelope);
     }
-    if envelope.schema_version != LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION {
+    if !matches!(
+        envelope.schema_version,
+        LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION
+            | TRUSTED_ENVIRONMENT_QUEUED_EXECUTION_SCHEMA_VERSION
+    ) {
         return Err(QueueRequestError::UnsupportedSchema {
             version: envelope.schema_version,
         });
@@ -1945,9 +1972,18 @@ fn upgrade_legacy_request(
         QueuedExecutionRequest::Run(request) => &request.targets,
         QueuedExecutionRequest::Ship(request) => &request.targets,
     };
-    if targets.iter().any(target_has_trusted_environment) {
+    if envelope.schema_version == LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION
+        && targets.iter().any(target_has_trusted_environment)
+    {
         return Err(invalid_snapshot(
             "legacy v1 request contains v2 trusted-environment fields",
+        ));
+    }
+    if let QueuedExecutionRequest::Ship(request) = &envelope.request
+        && (request.metadata_authority_receipt.is_some() || request.targets.is_empty())
+    {
+        return Err(invalid_snapshot(
+            "legacy request cannot carry or imply zero-target metadata authority",
         ));
     }
     envelope.schema_version = QUEUED_EXECUTION_SCHEMA_VERSION;
@@ -2309,6 +2345,7 @@ mod tests {
             advisory_targets: BTreeSet::from(["mac".to_owned()]),
             adopt_head: false,
             pr_snapshot_file: None,
+            metadata_authority_receipt: None,
             targets: vec![local_target()],
         }
     }
@@ -2327,6 +2364,50 @@ mod tests {
         assert_eq!(loaded.kind, QueuedExecutionKind::Run);
         assert!(matches!(loaded.request, QueuedExecutionRequest::Run(_)));
         assert_eq!(loaded.to_run_request().expect("restore run"), run_request());
+    }
+
+    #[test]
+    fn metadata_authority_ship_round_trips_without_worker_capacity() {
+        let mut request = ship_request();
+        request.targets.clear();
+        request.metadata_authority_receipt =
+            Some(crate::metadata_authority::MetadataAuthorityReceipt {
+                schema_version: 1,
+                repository: "danielraffel/shipyard".to_owned(),
+                pull_request: 42,
+                base_ref: "main".to_owned(),
+                base_sha: "a".repeat(40),
+                head_sha: request.sha.clone(),
+                tree_sha: "b".repeat(40),
+                observation_target: "mac".to_owned(),
+                policy_digest: "c".repeat(64),
+                changed_paths_digest: "d".repeat(64),
+                required_checks_digest: "e".repeat(64),
+                changed_paths: vec!["docs/guide.md".to_owned()],
+                required_checks: vec!["docs".to_owned()],
+                hosted_checks: vec![crate::metadata_authority::HostedCheckObservation {
+                    name: "docs".to_owned(),
+                    status: "COMPLETED".to_owned(),
+                    conclusion: "SUCCESS".to_owned(),
+                    producer: "app:15368".to_owned(),
+                }],
+            });
+        let envelope =
+            QueuedExecutionEnvelope::from_ship_request("metadata", "/work/repo", &request);
+        assert!(envelope.resource_plan.targets.is_empty());
+        assert!(envelope.resource_plan.cloud_targets.is_empty());
+        assert!(envelope.resource_plan.host_pools.is_empty());
+        assert!(envelope.resource_plan.vm_slots.is_empty());
+        assert_eq!(
+            envelope.to_ship_request().expect("restore metadata ship"),
+            request
+        );
+
+        let mut downgraded = serde_json::to_value(&envelope).expect("serialize metadata request");
+        downgraded["schema_version"] = json!(2);
+        let decoded: QueuedExecutionEnvelope =
+            serde_json::from_value(downgraded).expect("decode downgraded metadata request");
+        assert!(super::upgrade_legacy_request(decoded).is_err());
     }
 
     #[test]
@@ -2386,23 +2467,41 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_reader_rejects_current_v2_request() {
+    fn legacy_v2_reader_rejects_current_v3_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let envelope =
+            QueuedExecutionEnvelope::from_run_request("job-v3", "/work/repo", &run_request());
+        store.save(&envelope).expect("save v3");
+
+        let error = super::read_versioned_json_through::<QueuedExecutionEnvelope>(
+            &store.path_for("job-v3"),
+            2,
+        )
+        .expect_err("v2 reader must reject v3");
+
+        assert!(matches!(
+            error,
+            QueueRequestError::UnsupportedSchema { version: 3 }
+        ));
+    }
+
+    #[test]
+    fn current_reader_upgrades_an_ordinary_v2_request() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = QueueRequestStore::new(temp.path()).expect("store");
         let envelope =
             QueuedExecutionEnvelope::from_run_request("job-v2", "/work/repo", &run_request());
-        store.save(&envelope).expect("save v2");
-
-        let error = super::read_versioned_json_through::<QueuedExecutionEnvelope>(
-            &store.path_for("job-v2"),
-            1,
+        let mut value = serde_json::to_value(envelope).expect("serialize request");
+        value["schema_version"] = json!(2);
+        std::fs::write(
+            store.path_for("job-v2"),
+            serde_json::to_vec_pretty(&value).expect("encode v2"),
         )
-        .expect_err("v1 reader must reject v2");
+        .expect("write v2");
 
-        assert!(matches!(
-            error,
-            QueueRequestError::UnsupportedSchema { version: 2 }
-        ));
+        let loaded = store.load("job-v2").expect("load v2").expect("present");
+        assert_eq!(loaded.schema_version, QUEUED_EXECUTION_SCHEMA_VERSION);
     }
 
     #[cfg(unix)]

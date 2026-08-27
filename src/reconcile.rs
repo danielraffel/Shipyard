@@ -365,6 +365,92 @@ pub fn fetch_head_and_status_check_rollup_with_config(
     )
 }
 
+/// Fetch an exact PR head plus complete hosted-check producer provenance.
+///
+/// Metadata-only authority must bind configured contexts to the GitHub App or
+/// status creator that produced them. The ordinary `gh pr view` rollup omits
+/// that identity, so this stricter query fails closed when more than one page
+/// would be required.
+pub fn fetch_head_and_provenanced_status_check_rollup_with_config(
+    config: &LoadedConfig,
+    cwd: &Path,
+    repo: &str,
+    pr: u64,
+) -> Result<(String, Vec<Value>), ReconcileFetchError> {
+    const QUERY: &str = r"query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name status conclusion checkSuite{app{databaseId slug}}} ... on StatusContext{context state creator{__typename login ... on User{databaseId} ... on Bot{databaseId} ... on Organization{databaseId}}}}}}}}}";
+    let (owner, name) = repo.split_once('/').ok_or_else(|| {
+        ReconcileFetchError::Prepare(format!("invalid repository identity '{repo}'"))
+    })?;
+    let gh_client = GhClient::from_loaded_config(config).map_err(|error| {
+        ReconcileFetchError::Prepare(format!(
+            "failed to load GitHub auth config while reconciling PR #{pr} ({repo}): {error}"
+        ))
+    })?;
+    let mut command = gh_client
+        .prepare_command(
+            cwd,
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .map_err(|error| ReconcileFetchError::Prepare(error.to_string()))?;
+    command.args([
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={QUERY}"),
+        "-F",
+        &format!("owner={owner}"),
+        "-F",
+        &format!("name={name}"),
+        "-F",
+        &format!("number={pr}"),
+    ]);
+    let capture = run_capture(command, RECONCILE_FETCH_TIMEOUT)?;
+    if capture.timed_out {
+        return Err(ReconcileFetchError::Timeout(format!(
+            "provenanced hosted-check query timed out for PR #{pr} ({repo})"
+        )));
+    }
+    if capture.returncode != Some(0) {
+        return Err(ReconcileFetchError::Command(format!(
+            "provenanced hosted-check query failed for PR #{pr} ({repo}): {}",
+            capture.stderr_or_stdout()
+        )));
+    }
+    let value: Value = serde_json::from_str(&capture.stdout)
+        .map_err(|error| ReconcileFetchError::Parse(error.to_string()))?;
+    let pull = value
+        .pointer("/data/repository/pullRequest")
+        .ok_or_else(|| {
+            ReconcileFetchError::Parse("provenanced hosted-check response omitted PR".to_owned())
+        })?;
+    let head = pull
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let contexts = pull.pointer("/statusCheckRollup/contexts").ok_or_else(|| {
+        ReconcileFetchError::Parse("provenanced hosted-check response omitted contexts".to_owned())
+    })?;
+    if contexts
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        return Err(ReconcileFetchError::Parse(
+            "provenanced hosted-check observation is not exhaustive".to_owned(),
+        ));
+    }
+    let nodes = contexts
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| {
+            ReconcileFetchError::Parse("provenanced hosted-check nodes are invalid".to_owned())
+        })?;
+    Ok((head.to_owned(), nodes))
+}
+
 fn fetch_head_and_status_check_rollup_with_client(
     gh_client: &GhClient,
     cwd: &Path,

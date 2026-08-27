@@ -1016,6 +1016,7 @@ mod tests {
                 advisory_targets: BTreeSet::new(),
                 adopt_head: false,
                 pr_snapshot_file: None,
+                metadata_authority_receipt: None,
                 targets: Vec::new(),
             };
             let source_job_id = "lost-source".to_owned();
@@ -1390,8 +1391,8 @@ mod tests {
     fn normal_submitter_and_recovery_share_the_precommit_ownership_fence() {
         let fixture = Fixture::new();
         let live = fixture.live();
-        let (claimed_tx, claimed_rx) = mpsc::sync_channel(0);
-        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (claimed_tx, claimed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         let (submit_started_tx, submit_started_rx) = mpsc::sync_channel(0);
         let (submit_done_tx, submit_done_rx) = mpsc::channel();
 
@@ -1400,7 +1401,9 @@ mod tests {
             let recovery = scope.spawn(move || {
                 recovery_fixture.sweep(live, |_| {
                     claimed_tx.send(()).expect("announce claim");
-                    release_rx.recv().expect("release recovery");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("release recovery");
                     Ok(())
                 })
             });

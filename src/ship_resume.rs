@@ -228,6 +228,7 @@ mod tests {
             advisory_targets: std::collections::BTreeSet::new(),
             adopt_head: false,
             pr_snapshot_file: None,
+            metadata_authority_receipt: None,
             targets: Vec::new(),
         };
         QueueRequestStore::new(state_dir)

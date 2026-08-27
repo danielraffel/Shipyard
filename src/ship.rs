@@ -104,6 +104,8 @@ pub struct ShipExecutionRequest {
     /// PR state from this path instead of shelling out to `gh` — mirroring the
     /// `auto_merge` escape-hatch pattern so tests do not hit the network.
     pub pr_snapshot_file: Option<PathBuf>,
+    /// Exact trusted authority for a ship with no native validation targets.
+    pub metadata_authority_receipt: Option<crate::metadata_authority::MetadataAuthorityReceipt>,
     /// Ordered target list.
     pub targets: Vec<ResolvedTarget>,
 }
@@ -481,6 +483,7 @@ fn submit_ship_with_config_and_persist<P>(
 where
     P: FnOnce(&QueueRequestStore, &QueuedExecutionEnvelope, bool) -> QueueRequestResult<()>,
 {
+    metadata_authority_receipt_for_request(request)?;
     let workload_scope = format!(
         "ship:{}:pr-{}",
         canonical_repository(&request.repo),
@@ -492,7 +495,7 @@ where
     // insertion so neither side can miss the other's pre-commit window.
     let _ownership_lock = queue.acquire_workload_admission_lock(&workload_scope)?;
     refuse_same_pr_running_ship(queue, state_dir, request)?;
-    let target_names = target_names(&request.targets);
+    let target_names = effective_ship_target_names(request);
     let job = Job::create(
         request.sha.clone(),
         request.branch.clone(),
@@ -708,6 +711,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
     } = stores;
     let reclassify_vitals_path = crate::host_health::incident_reclassify_path(config);
     let transient_retry = crate::ship_retry::transient_local_retry_policy(config);
+    validate_metadata_authority_request(request, cwd, state_dir, config)?;
     if let Some(requested) = durable_cancelled_job(queue, &job)? {
         let cancelled =
             if requested.status == JobStatus::Cancelled || defer_host_pool_lease_unavailable {
@@ -768,6 +772,17 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         },
     )?
     .into_completed()?;
+    if request.metadata_authority_receipt.is_some() {
+        let mut result = TargetResult::new(
+            "metadata-authority",
+            "hosted-checks",
+            TargetStatus::Pass,
+            "metadata-authority",
+        );
+        result.provider = Some("hosted-checks".to_owned());
+        result.phase = Some("metadata-authority".to_owned());
+        job = job.with_result(result);
+    }
     if job.cancel_requested_at.is_some() {
         if !defer_host_pool_lease_unavailable && job.status != JobStatus::Cancelled {
             job = job.cancel_with_reason(job.cancellation_reason.clone())?;
@@ -819,6 +834,224 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         resumed_existing_state,
         post_validation: Some(post_validation),
     })
+}
+
+fn validate_metadata_authority_request(
+    request: &ShipExecutionRequest,
+    cwd: &Path,
+    state_dir: &Path,
+    config: &LoadedConfig,
+) -> Result<(), ShipExecutionError> {
+    let Some(receipt) = metadata_authority_receipt_for_request(request)? else {
+        return Ok(());
+    };
+    let policy = crate::metadata_authority::trusted_policy(config, &request.repo)
+        .map_err(ShipExecutionError::WorkerSetup)?
+        .ok_or_else(|| {
+            ShipExecutionError::WorkerSetup(
+                "trusted metadata authority is no longer active".to_owned(),
+            )
+        })?;
+    validate_metadata_authority_execution(request, receipt, &policy, cwd, state_dir, config)
+}
+
+fn metadata_authority_receipt_for_request(
+    request: &ShipExecutionRequest,
+) -> Result<Option<&crate::metadata_authority::MetadataAuthorityReceipt>, ShipExecutionError> {
+    let Some(receipt) = request.metadata_authority_receipt.as_ref() else {
+        // An empty explicit target list has always meant "use the configured
+        // native target set" for ordinary ship requests. Only an attached,
+        // validated metadata receipt opts into zero-native execution.
+        return Ok(None);
+    };
+    if !request.targets.is_empty() {
+        return Err(ShipExecutionError::WorkerSetup(
+            "metadata authority receipt cannot accompany native targets".to_owned(),
+        ));
+    }
+    Ok(Some(receipt))
+}
+
+#[allow(clippy::too_many_lines)] // One ordered revalidation chain binds every receipt identity before execution.
+fn validate_metadata_authority_execution(
+    request: &ShipExecutionRequest,
+    receipt: &crate::metadata_authority::MetadataAuthorityReceipt,
+    policy: &crate::metadata_authority::MetadataAuthorityPolicy,
+    cwd: &Path,
+    state_dir: &Path,
+    config: &LoadedConfig,
+) -> Result<(), ShipExecutionError> {
+    let reobserved = crate::app::changed_surface_cmd::observe_changed_surface_plan(
+        &crate::app::changed_surface_cmd::ChangedSurfacePlanArgs {
+            target: receipt.observation_target.clone(),
+            pr: request.pr,
+            repo: Some(request.repo.clone()),
+        },
+        config,
+        cwd,
+        state_dir,
+    )
+    .map_err(|error| {
+        ShipExecutionError::WorkerSetup(format!(
+            "refresh metadata authority base/path identity: {}",
+            error.message()
+        ))
+    })?;
+    let local_head = git_output(cwd, &["rev-parse", "HEAD"])?;
+    let local_tree = git_output(cwd, &["rev-parse", "HEAD^{tree}"])?;
+    let (live_head, _) =
+        crate::reconcile::fetch_head_and_provenanced_status_check_rollup_with_config(
+            config,
+            cwd,
+            &request.repo,
+            request.pr,
+        )
+        .map_err(|error| {
+            ShipExecutionError::WorkerSetup(format!(
+                "refresh metadata authority hosted checks: {error}"
+            ))
+        })?;
+    if live_head != request.sha {
+        return Err(ShipExecutionError::WorkerSetup(
+            "metadata authority remote head drifted".to_owned(),
+        ));
+    }
+    let stable = crate::app::changed_surface_cmd::observe_changed_surface_plan(
+        &crate::app::changed_surface_cmd::ChangedSurfacePlanArgs {
+            target: receipt.observation_target.clone(),
+            pr: request.pr,
+            repo: Some(request.repo.clone()),
+        },
+        config,
+        cwd,
+        state_dir,
+    )
+    .map_err(|error| {
+        ShipExecutionError::WorkerSetup(format!(
+            "confirm metadata authority protected base: {}",
+            error.message()
+        ))
+    })?;
+    if stable.input.pr_base_sha != reobserved.input.pr_base_sha
+        || stable.input.protected_ref_sha != reobserved.input.protected_ref_sha
+    {
+        return Err(ShipExecutionError::WorkerSetup(
+            "metadata authority protected base drifted while hosted checks were observed"
+                .to_owned(),
+        ));
+    }
+    let (final_head, rollup) =
+        crate::reconcile::fetch_head_and_provenanced_status_check_rollup_with_config(
+            config,
+            cwd,
+            &request.repo,
+            request.pr,
+        )
+        .map_err(|error| {
+            ShipExecutionError::WorkerSetup(format!(
+                "final metadata authority hosted checks: {error}"
+            ))
+        })?;
+    let sealed = crate::app::changed_surface_cmd::observe_changed_surface_plan(
+        &crate::app::changed_surface_cmd::ChangedSurfacePlanArgs {
+            target: receipt.observation_target.clone(),
+            pr: request.pr,
+            repo: Some(request.repo.clone()),
+        },
+        config,
+        cwd,
+        state_dir,
+    )
+    .map_err(|error| {
+        ShipExecutionError::WorkerSetup(format!(
+            "seal metadata authority protected base: {}",
+            error.message()
+        ))
+    })?;
+    if final_head != live_head
+        || sealed.input.pr_head_sha != final_head
+        || sealed.input.pr_base_sha != stable.input.pr_base_sha
+        || sealed.input.protected_ref_sha != stable.input.protected_ref_sha
+    {
+        return Err(ShipExecutionError::WorkerSetup(
+            "metadata authority remote head drifted during final observation".to_owned(),
+        ));
+    }
+    let input = &sealed.input;
+    let current_observation = crate::metadata_authority::MetadataAuthorityObservation {
+        repository: input.repository.clone(),
+        pull_request: input.pull_request,
+        base_ref: input.base_ref.clone(),
+        base_sha: input.pr_base_sha.clone(),
+        protected_ref_sha: input.protected_ref_sha.clone(),
+        protected_ref_protected: input.protected_ref_status
+            == crate::changed_surface::ProtectedRefStatus::Protected,
+        remote_head_sha: live_head,
+        remote_tree_sha: input.remote_tree_sha.clone(),
+        local_head_sha: input.local_head_sha.clone(),
+        local_tree_sha: input.local_tree_sha.clone(),
+        local_merge_base_sha: input.local_merge_base_sha.clone(),
+        remote_merge_base_sha: input.remote_merge_base_sha.clone(),
+        merge_base_is_ancestor: input.merge_base_is_ancestor,
+        checkout_clean: input.checkout_clean,
+        remote_changed_paths: input.remote_changed_paths.clone(),
+        remote_changed_paths_complete: input.remote_changed_paths_status
+            == crate::changed_surface::ObservationStatus::Complete,
+        local_changed_paths: input.local_changed_paths.clone(),
+        local_changed_paths_complete: input.local_changed_paths_status
+            == crate::changed_surface::ObservationStatus::Complete,
+        hosted_checks: crate::metadata_authority::parse_hosted_checks(&rollup),
+    };
+    let crate::metadata_authority::MetadataAuthorityDecision::Authorized(current_receipt) =
+        crate::metadata_authority::authorize_metadata_only(
+            policy,
+            &current_observation,
+            &receipt.observation_target,
+        )
+    else {
+        return Err(ShipExecutionError::WorkerSetup(
+            "metadata authority no longer satisfies exact base/path/check policy".to_owned(),
+        ));
+    };
+    if &current_receipt != receipt {
+        return Err(ShipExecutionError::WorkerSetup(
+            "metadata authority receipt drifted during queue wait".to_owned(),
+        ));
+    }
+    crate::metadata_authority::verify_receipt(
+        receipt,
+        policy,
+        &request.repo,
+        request.pr,
+        &request.base_branch,
+        &request.sha,
+        &local_tree,
+        &receipt.observation_target,
+    )
+    .map_err(ShipExecutionError::WorkerSetup)?;
+    if local_head != request.sha {
+        return Err(ShipExecutionError::WorkerSetup(
+            "metadata authority checkout HEAD drifted".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Result<String, ShipExecutionError> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| ShipExecutionError::WorkerSetup(format!("run git: {error}")))?;
+    if !output.status.success() {
+        return Err(ShipExecutionError::WorkerSetup(format!(
+            "git {} failed",
+            args.join(" ")
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|error| ShipExecutionError::WorkerSetup(format!("decode git output: {error}")))
 }
 
 /// Execute configured targets for `shipyard run` without PR/ship-state mutation.
@@ -1058,6 +1291,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         advisory_targets: BTreeSet::new(),
         adopt_head: false,
         pr_snapshot_file: None,
+        metadata_authority_receipt: None,
         targets: request.targets.clone(),
     };
     job = ensure_worker_running_job(queue, &job)?;
@@ -1919,7 +2153,7 @@ fn terminal_ship_outcome(
             }
             Ok(Some(ShipExecutionOutcome {
                 job,
-                ship_state: unsaved_ship_state(request, &target_names(&request.targets)),
+                ship_state: unsaved_ship_state(request, &effective_ship_target_names(request)),
                 resumed_existing_state: false,
                 post_validation: None,
             }))
@@ -2048,7 +2282,12 @@ fn unsaved_ship_state(request: &ShipExecutionRequest, target_names: &[String]) -
         request.branch.clone(),
         request.base_branch.clone(),
         request.sha.clone(),
-        policy_signature(&request.targets, target_names, request.mode),
+        policy_signature(
+            &request.targets,
+            target_names,
+            request.mode,
+            request.metadata_authority_receipt.as_ref(),
+        ),
     );
     refresh_pr_metadata(&mut state, request);
     state
@@ -2368,7 +2607,12 @@ fn load_or_create_state(
     store: &ShipStateStore,
     lock: Option<&ShipStatePrLock>,
 ) -> Result<ShipState, ShipExecutionError> {
-    let policy = policy_signature(&request.targets, target_names, request.mode);
+    let policy = policy_signature(
+        &request.targets,
+        target_names,
+        request.mode,
+        request.metadata_authority_receipt.as_ref(),
+    );
     let existing = lock.map_or_else(
         || store.get_scoped(&request.repo, request.pr),
         |lock| store.get_locked_scoped(&request.repo, request.pr, lock),
@@ -2440,8 +2684,13 @@ pub(crate) fn validate_ship_state_for_submission(
     request: &ShipExecutionRequest,
     store: &ShipStateStore,
 ) -> Result<(), ShipExecutionError> {
-    let target_names = target_names(&request.targets);
-    let policy = policy_signature(&request.targets, &target_names, request.mode);
+    let target_names = effective_ship_target_names(request);
+    let policy = policy_signature(
+        &request.targets,
+        &target_names,
+        request.mode,
+        request.metadata_authority_receipt.as_ref(),
+    );
     if let Some(existing) = store.get_scoped(&request.repo, request.pr) {
         validate_existing_state(
             &existing,
@@ -2452,6 +2701,14 @@ pub(crate) fn validate_ship_state_for_submission(
         )?;
     }
     Ok(())
+}
+
+fn effective_ship_target_names(request: &ShipExecutionRequest) -> Vec<String> {
+    if request.metadata_authority_receipt.is_some() {
+        vec!["metadata-authority".to_owned()]
+    } else {
+        target_names(&request.targets)
+    }
 }
 
 fn refresh_pr_metadata(state: &mut ShipState, request: &ShipExecutionRequest) {
@@ -3110,8 +3367,94 @@ mod tests {
             advisory_targets: BTreeSet::new(),
             adopt_head: false,
             pr_snapshot_file: None,
+            metadata_authority_receipt: None,
             targets,
         }
+    }
+
+    fn metadata_receipt() -> crate::metadata_authority::MetadataAuthorityReceipt {
+        crate::metadata_authority::MetadataAuthorityReceipt {
+            schema_version: 1,
+            repository: "danielraffel/pulp".to_owned(),
+            pull_request: 42,
+            base_ref: "main".to_owned(),
+            base_sha: "a".repeat(40),
+            head_sha: "b".repeat(40),
+            tree_sha: "c".repeat(40),
+            observation_target: "mac".to_owned(),
+            policy_digest: "d".repeat(64),
+            changed_paths_digest: "e".repeat(64),
+            required_checks_digest: "f".repeat(64),
+            changed_paths: vec!["docs/guide.md".to_owned()],
+            required_checks: vec!["docs".to_owned()],
+            hosted_checks: vec![crate::metadata_authority::HostedCheckObservation {
+                name: "docs".to_owned(),
+                status: "COMPLETED".to_owned(),
+                conclusion: "SUCCESS".to_owned(),
+                producer: "app:15368".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn metadata_authority_request_shape_requires_receipt_only_for_metadata_mode() {
+        let ordinary = ship_request(vec![local_target_without_cwd("mac", "macos-arm64")]);
+        assert!(
+            super::metadata_authority_receipt_for_request(&ordinary)
+                .expect("ordinary native request")
+                .is_none()
+        );
+
+        let mut mixed = ordinary.clone();
+        mixed.metadata_authority_receipt = Some(metadata_receipt());
+        assert!(super::metadata_authority_receipt_for_request(&mixed).is_err());
+
+        let default_native = ship_request(Vec::new());
+        assert!(
+            super::metadata_authority_receipt_for_request(&default_native)
+                .expect("ordinary request with configured native defaults")
+                .is_none()
+        );
+
+        let mut authorized = default_native;
+        authorized.metadata_authority_receipt = Some(metadata_receipt());
+        assert!(
+            super::metadata_authority_receipt_for_request(&authorized)
+                .expect("authorized zero-target request")
+                .is_some()
+        );
+        let state_dir = tempfile::tempdir().expect("state");
+        let mut queue = Queue::new(state_dir.path()).expect("queue");
+        let queued =
+            super::submit_ship(&authorized, &mut queue, state_dir.path(), state_dir.path())
+                .expect("queue authorized zero-target request");
+        assert_eq!(queued.target_names, ["metadata-authority"]);
+
+        let uncertain = queued.start().expect("start uncertain controller");
+        queue
+            .update(&uncertain)
+            .expect("persist running controller");
+        let uncertain = queue
+            .complete_running_uncertain(&queued.id, "revalidation failed")
+            .expect("complete uncertain controller")
+            .expect("running controller exists");
+        assert!(!uncertain.passed());
+
+        let completed = queued
+            .start()
+            .expect("start metadata authority job")
+            .with_result(TargetResult::new(
+                "metadata-authority",
+                "hosted-checks",
+                TargetStatus::Pass,
+                "metadata-authority",
+            ))
+            .complete()
+            .expect("complete metadata authority job");
+        let mut state = super::unsaved_ship_state(&authorized, &[]);
+        super::update_ship_state_from_job(&mut state, &authorized, &completed);
+        assert_eq!(state.evidence_snapshot["metadata-authority"], "pass");
+        assert_eq!(crate::watch::ship_terminal_verdict(&state), Some(true));
     }
 
     #[test]
@@ -5532,7 +5875,7 @@ mod tests {
                 request.branch.clone(),
                 request.base_branch.clone(),
                 "old-head",
-                super::policy_signature(&request.targets, &names, request.mode),
+                super::policy_signature(&request.targets, &names, request.mode, None),
             ))
             .expect("save stale state");
 
@@ -5582,7 +5925,7 @@ mod tests {
         let target_names = vec![request.targets[0].name.clone()];
         let mut seeded = store.get(42).expect("seeded present");
         seeded.policy_signature =
-            super::policy_signature(&request.targets, &target_names, request.mode);
+            super::policy_signature(&request.targets, &target_names, request.mode, None);
         store.save(&seeded).expect("re-save with matching policy");
 
         let reconciled = super::load_or_create_state(&request, &target_names, &store, None)
@@ -5620,7 +5963,7 @@ mod tests {
             &request.branch,
             &request.base_branch,
             &request.sha,
-            super::policy_signature(&request.targets, &target_names, request.mode),
+            super::policy_signature(&request.targets, &target_names, request.mode, None),
         );
         seeded.mark_abandoned(AbandonRecord {
             reason: "orphaned".to_owned(),
