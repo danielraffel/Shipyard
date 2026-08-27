@@ -281,6 +281,11 @@ def _bounded_timeout(deadline: Optional[float], default: float = 15.0) -> float:
     return min(default, remaining)
 
 
+LOCK_HOLDER_ATTEMPT_TIMEOUT = 7.0
+LOCK_HOLDER_TOTAL_TIMEOUT = 15.0
+LOCK_HOLDER_KERNEL_TIMEOUT = "2"
+
+
 def _process_start(pid: int, *, deadline: Optional[float] = None) -> Optional[str]:
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "lstart="],
@@ -294,15 +299,80 @@ def _process_start(pid: int, *, deadline: Optional[float] = None) -> Optional[st
 
 
 def _lock_holders(
-    path: Path, *, deadline: Optional[float] = None
+    path: Path,
+    *,
+    deadline: Optional[float] = None,
+    retry_after_timeout: Optional[Callable[[float], object]] = None,
+    diagnostic_root: Optional[Path] = None,
 ) -> tuple[int, ...]:
-    result = subprocess.run(
-        ["/usr/sbin/lsof", "-t", str(path)],
-        capture_output=True,
-        text=True,
-        timeout=_bounded_timeout(deadline),
-        check=False,
-    )
+    argv = [
+        "/usr/sbin/lsof",
+        "-nP",
+        "-S",
+        LOCK_HOLDER_KERNEL_TIMEOUT,
+        "-F",
+        "pf",
+        "--",
+        str(path),
+    ]
+    operation_deadline = deadline or (time.monotonic() + LOCK_HOLDER_TOTAL_TIMEOUT)
+    attempts = 2 if retry_after_timeout is not None else 1
+    result: Optional[subprocess.CompletedProcess[str]] = None
+    for attempt in range(1, attempts + 1):
+        timeout = _bounded_timeout(
+            operation_deadline, default=LOCK_HOLDER_ATTEMPT_TIMEOUT
+        )
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            break
+        except subprocess.TimeoutExpired as error:
+            if diagnostic_root is not None:
+                try:
+                    lock_stat = path.stat()
+                    _atomic_json(
+                        diagnostic_root
+                        / f"lock-holder-timeout-{time.time_ns()}-{attempt}.json",
+                        {
+                            "schema_version": 1,
+                            "argv": argv,
+                            "attempt": attempt,
+                            "timeout_seconds": timeout,
+                            "partial_stdout": error.stdout.decode(errors="replace")
+                            if isinstance(error.stdout, bytes)
+                            else (error.stdout or ""),
+                            "partial_stderr": error.stderr.decode(errors="replace")
+                            if isinstance(error.stderr, bytes)
+                            else (error.stderr or ""),
+                            "lock_device": lock_stat.st_dev,
+                            "lock_inode": lock_stat.st_ino,
+                            "lock_mode": lock_stat.st_mode,
+                            "lock_contended_after_timeout": (
+                                _exclusive_lock_is_contended(path)
+                            ),
+                        },
+                    )
+                except Exception:
+                    # Diagnostic capture must never replace the authoritative
+                    # timeout or exact-identity revalidation outcome.
+                    pass
+            if attempt == attempts:
+                raise GuardianError(
+                    f"timed out inspecting writer-domain holders for {path} "
+                    f"after {attempt} attempt(s)"
+                ) from error
+            # A second observation is safe only after the exact production
+            # process, start time, installed binary, argv, environment, and
+            # repository/worker authority have all been revalidated.
+            assert retry_after_timeout is not None
+            retry_after_timeout(operation_deadline)
+
+    assert result is not None
     diagnostic = result.stderr.strip()
     if result.returncode not in (0, 1) or diagnostic:
         raise GuardianError(
@@ -310,11 +380,29 @@ def _lock_holders(
             f"returncode={result.returncode}, stderr={diagnostic!r}"
         )
     holders: list[int] = []
-    for value in result.stdout.split():
-        try:
-            holders.append(int(value))
-        except ValueError as error:
-            raise GuardianError(f"invalid lsof pid for {path}: {value!r}") from error
+    current_pid: Optional[int] = None
+    current_has_file = False
+    for field in result.stdout.splitlines():
+        if field.startswith("p") and field[1:].isdigit():
+            if current_pid is not None and not current_has_file:
+                raise GuardianError(
+                    f"incomplete lsof holder result for {path}: pid {current_pid} "
+                    "has no file record"
+                )
+            current_pid = int(field[1:])
+            current_has_file = False
+            holders.append(current_pid)
+        elif field.startswith("f") and len(field) > 1 and current_pid is not None:
+            current_has_file = True
+        else:
+            raise GuardianError(
+                f"invalid structured lsof field for {path}: {field!r}"
+            )
+    if current_pid is not None and not current_has_file:
+        raise GuardianError(
+            f"incomplete lsof holder result for {path}: pid {current_pid} "
+            "has no file record"
+        )
     observed = tuple(sorted(set(holders)))
     if (result.returncode == 0) != bool(observed):
         raise GuardianError(
@@ -342,6 +430,7 @@ def _wait_for_idle_writer_domain(
     poll_interval: float = 0.1,
     stable_observations: int = 3,
     verify_production: Optional[Callable[[float], object]] = None,
+    diagnostic_root: Optional[Path] = None,
 ) -> None:
     """Distinguish a transient production mutation from a lifetime lock.
 
@@ -367,7 +456,16 @@ def _wait_for_idle_writer_domain(
         if verify_production is not None:
             verify_production(deadline)
         fail_if_expired()
-        holders = _lock_holders(path, deadline=deadline)
+        holders = _lock_holders(
+            path,
+            deadline=deadline,
+            retry_after_timeout=(
+                (lambda retry_deadline: verify_production(retry_deadline))
+                if verify_production is not None
+                else None
+            ),
+            diagnostic_root=diagnostic_root,
+        )
         last_holders = holders
         foreign_holders = tuple(pid for pid in holders if pid != production_pid)
         if foreign_holders:
@@ -435,7 +533,10 @@ def _json_command(
     probe_cwd = "/"
     argv = [str(installed), "--cwd", probe_cwd, "--json", *args]
     timeout = _bounded_timeout(deadline)
-    if diagnostic_root is None:
+    # Deadline-bound retry revalidation must not enter the richer timeout
+    # diagnostics below: those intentionally run several independent probes
+    # and could outlive the single aggregate holder-observation deadline.
+    if diagnostic_root is None or deadline is not None:
         result = _run(
             argv,
             cwd=probe_cwd,
@@ -619,7 +720,11 @@ class Guardian:
                 f"refusing canary transition with active workers: {self.worker_ids!r}"
             )
         self.lock_path = self.production_pid_file.parent.parent / ".sandbox-writer-domain.lock"
-        old_holders = _lock_holders(self.lock_path)
+        old_holders = _lock_holders(
+            self.lock_path,
+            retry_after_timeout=self.verify_unchanged_production,
+            diagnostic_root=self.root,
+        )
         old_contended = _exclusive_lock_is_contended(self.lock_path)
         if not old_holders and old_contended:
             # lsof can briefly lag an advisory-lock owner. Treat this one
@@ -632,6 +737,7 @@ class Guardian:
                 self.lock_path,
                 snapshot.pid,
                 verify_production=self.verify_unchanged_production,
+                diagnostic_root=self.root,
             )
             self.transition_path = CORRECTED_TRANSITION
         else:
@@ -661,7 +767,7 @@ class Guardian:
         # Set this immediately after observing death.  Every later fallible
         # assertion is then covered by the outer restoration path.
         self.production_quiesced = True
-        holders = _lock_holders(self.lock_path)
+        holders = _lock_holders(self.lock_path, diagnostic_root=self.root)
         if holders or _exclusive_lock_is_contended(self.lock_path):
             raise GuardianError(f"old Shipyard processes still own writer domain: {holders!r}")
 
@@ -838,7 +944,11 @@ class Guardian:
                 "mutation proof paths already exist: "
                 f"guard={self.mutation_guard_path}, output={self.mutation_probe_output}"
             )
-        holders = _lock_holders(self.lock_path)
+        holders = _lock_holders(
+            self.lock_path,
+            retry_after_timeout=self.verify_unchanged_production,
+            diagnostic_root=self.root,
+        )
         audit_holders = tuple(pid for pid in holders if pid != snapshot.pid)
         if not audit_holders or not _exclusive_lock_is_contended(self.lock_path):
             raise GuardianError(
@@ -991,6 +1101,7 @@ class Guardian:
             self.lock_path,
             snapshot.pid,
             verify_production=self.verify_unchanged_production,
+            diagnostic_root=self.root,
         )
         current = self.verify_unchanged_production()
         self.restored_pid = current.pid
@@ -1054,7 +1165,7 @@ class Guardian:
             != self.worker_ids
         ):
             raise GuardianError("restored active worker ownership differs")
-        restored_holders = _lock_holders(self.lock_path)
+        restored_holders = _lock_holders(self.lock_path, diagnostic_root=self.root)
         if restored_holders != (process.pid,) or not _exclusive_lock_is_contended(
             self.lock_path
         ):
