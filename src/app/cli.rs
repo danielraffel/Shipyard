@@ -1165,6 +1165,31 @@ pub(super) enum RunnerCommand {
         /// Durable context URL, such as a Linear issue or planning document.
         #[arg(long = "context-url")]
         context_url: Option<String>,
+        /// Agent provider that owns the handed-off workstream. When omitted,
+        /// Shipyard captures a supported provider from the current process.
+        #[arg(long = "agent-provider", value_parser = ["codex", "claude"])]
+        agent_provider: Option<String>,
+        /// Durable provider session identifier used for a later targeted wake.
+        #[arg(long = "agent-session-id")]
+        agent_session_id: Option<String>,
+        /// Optional parent/coordinator session for a swarmed workstream.
+        #[arg(long = "agent-parent-session-id")]
+        agent_parent_session_id: Option<String>,
+        /// Optional cmux surface used only as a diagnosed fallback transport.
+        #[arg(long = "agent-surface-id")]
+        agent_surface_id: Option<String>,
+        /// Declare that the owning session has a persistent goal which can be
+        /// resumed when Shipyard returns actionable work.
+        #[arg(long = "goal-managed")]
+        goal_managed: bool,
+        /// What the owner should do after monitoring transfers. Continue is the
+        /// default; pause only when this PR is its remaining blocker.
+        #[arg(long = "after-handoff", value_parser = ["continue", "pause"], default_value = "continue")]
+        after_handoff: String,
+        /// Explicitly transfer an existing exact-head receipt to a replacement
+        /// provider session, incrementing its durable ownership generation.
+        #[arg(long = "transfer-agent-owner")]
+        transfer_agent_owner: bool,
         /// Write the receipt and managed label. Without this flag, only audit.
         #[arg(long)]
         apply: bool,

@@ -13,6 +13,55 @@ the daily implementation as of `v0.51.0` / `v0.51.1`, but do not replace
 Pulp pins, reset Tailscale Funnel, or merge GUI cutover support without a clear
 go/no-go for that operation.
 
+## Durable work handoff
+
+Do not spend an agent session polling a pull request, build, benchmark, release,
+or other bounded script after its inputs and completion contract are fixed.
+Hand that work to Shipyard when the installed version supports the required
+stewardship mode. The handoff must bind immutable inputs (repository and exact
+head when applicable), command or controller identity, owner/coordinator,
+deadline, heartbeat/stall policy, artifact and log locations, success criteria,
+the success continuation, and the failure conditions that require agent
+judgment. A handoff with only a success trigger is invalid: terminal failure,
+head drift, cancellation, timeout, and ambiguous process loss each need an
+explicit disposition or wake owner.
+
+Until the receipt reports `wake_consumer_available=true`, the originating
+agent retains the last monitoring obligation and must not park solely in
+reliance on Shipyard. The current durable receipt foundation records a safe
+route but deliberately reports that the wake consumer is unavailable.
+
+After an acknowledged handoff whose receipt proves the wake consumer is
+available:
+
+- Shipyard owns process lifetime, monitoring, bounded deterministic retries,
+  transition-only logs, terminal receipts, and recovery after its own restart.
+- The agent stops monitor-only children and continues independent runnable work
+  by default. It parks only when the handed-off work is its remaining blocker.
+- A swarm child never becomes a permanent monitor. Shipyard wakes the logical
+  coordinator, or one explicitly promoted owner, when interpretation or repair
+  is required.
+- A normal success should flow directly to the next deterministic action. An
+  actionable failure should wake exactly one owner with the exact failure,
+  inputs, logs, and smallest legal next action; ownership returns to Shipyard
+  after a repaired immutable input is published.
+- A provider timeout with an uncertain dispatch outcome is recorded and is not
+  blindly repeated. Session death, quota exhaustion, host reboot, and
+  offline/rejoin must not erase an acknowledged obligation.
+
+This contract applies to bounded jobs as well as PRs: CMake/CTest proofs,
+artifact builds, release publication, notarization, benchmark matrices, cache
+prewarming, and fleet canaries are examples. Do not hand Shipyard open-ended
+design or debugging. A job without a deterministic completion condition,
+bounded timeout, durable log/receipt, and safe cancellation rule remains
+agent-owned until those are defined.
+
+Shipyard's protected local ledger and live provider/GitHub state are execution
+authority. Linear may receive an asynchronous, idempotent projection for human
+visibility and planning, but Linear failure must never block execution, wake,
+repair routing, queue admission, or merge. Never project provider session IDs,
+credentials, private paths, or raw prompts.
+
 ## First Steps
 
 1. Confirm the active repo and dirty state with `git status --short`.
@@ -1098,6 +1147,13 @@ For an already-created PR, the submitting agent must run
 --workstream-id ID [--context-url URL] --apply`. That command writes a
 successful `shipyard/steward-handoff` status on the expected head, re-reads the
 PR, and only then adds `shipyard:managed` and removes `shipyard:unmanaged`.
+Shipyard persists a stable private machine identity on first use; later host
+renames, launcher environments, or machine-tag changes cannot strand replay.
+If the original provider session expires, a replacement agent must explicitly
+take the same immutable work item with `--transfer-agent-owner` plus explicit
+`--agent-provider` and `--agent-session-id`. The transfer cannot change the
+head, workstream, context, or disposition and increments the durable ownership
+generation; ordinary invocations never adopt another session implicitly.
 The apply-mode steward inventories all other open PRs as `unmanaged`, adds the
 explanatory `shipyard:unmanaged` label, but never enqueues, reruns, cancels, or
 signals recovery for them. A managed semantic blocker receives one deduplicated

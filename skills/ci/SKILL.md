@@ -978,6 +978,25 @@ GitHub mutation. Its state file, append-only transition log, and exclusive lock
 provide a durable handoff boundary for queue-monitor agents. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
 
+### Durable agent handoff boundary
+
+`shipyard pr` and `shipyard runner steward-handoff` persist a private,
+crash-consistent route receipt for the exact repository, PR, head, workstream,
+and context before publishing the public handoff status. Dry-run remains
+read-only. Apply mode uses a stable machine identity, keeps provider/session/
+surface details private, and exposes only an opaque public route identifier.
+An intentional replacement must use the explicit transfer option with the same
+immutable work identity; Shipyard increments the ownership generation and
+rejects ambiguous provider context, head drift, or competing route ownership.
+
+This receipt foundation does **not** yet wake or resume an agent. Until a
+deployed consumer reports `wake_consumer_available=true`, apply-mode pause is
+rejected, `monitoring_transferred` remains false, and the originating agent
+retains the last monitor. Do not terminate a goal or claim Shipyard owns the
+watch solely because the receipt exists. Status reconciliation is bounded and
+paginated, selects the newest matching status, and reconciles uncertain writes
+before retrying so a restart cannot blindly duplicate the public handoff.
+
 ## Target configuration
 
 Targets are defined in `.shipyard/config.toml`:
