@@ -1429,12 +1429,6 @@ fn verify_launch_profile_worktree(profile: &LaunchProfileV1) -> Result<(), CliFa
             format!("launch profile worktree path is unavailable: {error}"),
         )
     })?;
-    if claimed_path != canonical_path {
-        return Err(CliFailure::new(
-            1,
-            "launch profile worktree path must be its canonical filesystem path",
-        ));
-    }
 
     let top_level = git_worktree_value(&canonical_path, &["rev-parse", "--show-toplevel"])?;
     let canonical_top_level = Path::new(&top_level).canonicalize().map_err(|error| {

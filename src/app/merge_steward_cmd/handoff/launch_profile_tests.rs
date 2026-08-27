@@ -154,6 +154,17 @@ fn nonexistent_worktree_provenance_fails_before_publication() {
 }
 
 #[test]
+fn equivalent_path_forms_are_compared_after_filesystem_canonicalization() {
+    let fixture = active_worktree();
+    let nested = fixture.temp.path().join("normalization-probe");
+    std::fs::create_dir_all(&nested).expect("normalization probe directory");
+    let mut candidate = profile("-r");
+    candidate.worktree.path = nested.join("..").to_string_lossy().into_owned();
+    prepare_launch_profile_candidate(candidate, "owner/repo", &fixture.head)
+        .expect("equivalent path syntax must resolve to the verified worktree root");
+}
+
+#[test]
 fn claimed_repository_and_head_require_matching_live_git_evidence() {
     let mut wrong_repo = profile("-r");
     wrong_repo.worktree.repository = "owner/forged".into();
