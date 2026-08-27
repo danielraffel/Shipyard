@@ -597,6 +597,7 @@ pub enum QueuedExecutionKind {
 }
 
 /// Queued execution request payload.
+#[allow(clippy::large_enum_variant)] // Stable schema keeps ship payload inline for backward-compatible v1/v2 decoding.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum QueuedExecutionRequest {

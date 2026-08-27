@@ -47,7 +47,7 @@ pub struct MetadataAuthorityPolicy {
 pub struct HostedCheckObservation {
     /// Check context/name.
     pub name: String,
-    /// GitHub status (`COMPLETED` for CheckRun, terminal state for contexts).
+    /// GitHub status (`COMPLETED` for `CheckRun`, terminal state for contexts).
     pub status: String,
     /// GitHub conclusion/state.
     pub conclusion: String,
@@ -56,6 +56,7 @@ pub struct HostedCheckObservation {
 }
 
 /// Exact observation supplied to the pure authority decision.
+#[allow(clippy::struct_excessive_bools)] // Flat facts preserve the auditable GitHub/git snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MetadataAuthorityObservation {
     /// Canonical `owner/repository` identity.
@@ -133,6 +134,7 @@ pub struct MetadataAuthorityReceipt {
 }
 
 /// Conservative decision: authorize zero-native execution or preserve full.
+#[allow(clippy::large_enum_variant)] // The successful value is an immutable receipt, not a hot collection element.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetadataAuthorityDecision {
     /// Exact metadata-only authority is proven.
@@ -144,7 +146,7 @@ pub enum MetadataAuthorityDecision {
     },
 }
 
-/// Normalize GitHub CheckRun and StatusContext nodes without promoting a
+/// Normalize GitHub `CheckRun` and `StatusContext` nodes without promoting a
 /// pending context to terminal success.
 #[must_use]
 pub fn parse_hosted_checks(values: &[Value]) -> Vec<HostedCheckObservation> {
@@ -277,6 +279,7 @@ pub fn trusted_policy(
 
 /// Decide whether one exact observation may use zero-native authority.
 #[must_use]
+#[allow(clippy::too_many_lines)] // Keep the fail-closed decision chain in one auditable order.
 pub fn authorize_metadata_only(
     policy: &MetadataAuthorityPolicy,
     observation: &MetadataAuthorityObservation,
@@ -397,6 +400,7 @@ pub fn authorize_metadata_only(
 }
 
 /// Revalidate the immutable receipt against the request and trusted policy.
+#[allow(clippy::too_many_arguments)] // Every exact identity component is deliberately explicit.
 pub fn verify_receipt(
     receipt: &MetadataAuthorityReceipt,
     policy: &MetadataAuthorityPolicy,

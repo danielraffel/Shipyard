@@ -872,6 +872,7 @@ fn metadata_authority_receipt_for_request(
     Ok(Some(receipt))
 }
 
+#[allow(clippy::too_many_lines)] // One ordered revalidation chain binds every receipt identity before execution.
 fn validate_metadata_authority_execution(
     request: &ShipExecutionRequest,
     receipt: &crate::metadata_authority::MetadataAuthorityReceipt,

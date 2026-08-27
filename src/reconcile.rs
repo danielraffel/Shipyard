@@ -377,6 +377,7 @@ pub fn fetch_head_and_provenanced_status_check_rollup_with_config(
     repo: &str,
     pr: u64,
 ) -> Result<(String, Vec<Value>), ReconcileFetchError> {
+    const QUERY: &str = r"query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name status conclusion checkSuite{app{databaseId slug}}} ... on StatusContext{context state creator{__typename login ... on User{databaseId} ... on Bot{databaseId} ... on Organization{databaseId}}}}}}}}}";
     let (owner, name) = repo.split_once('/').ok_or_else(|| {
         ReconcileFetchError::Prepare(format!("invalid repository identity '{repo}'"))
     })?;
@@ -393,7 +394,6 @@ pub fn fetch_head_and_provenanced_status_check_rollup_with_config(
             GhAuthPolicy::Default,
         )
         .map_err(|error| ReconcileFetchError::Prepare(error.to_string()))?;
-    const QUERY: &str = r#"query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name status conclusion checkSuite{app{databaseId slug}}} ... on StatusContext{context state creator{__typename login ... on User{databaseId} ... on Bot{databaseId} ... on Organization{databaseId}}}}}}}}}"#;
     command.args([
         "api",
         "graphql",

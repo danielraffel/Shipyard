@@ -24,6 +24,7 @@ struct MetadataAuthorityFallback<'a> {
     reason: &'a str,
 }
 
+#[allow(clippy::too_many_lines)] // One ordered fail-closed observation and receipt boundary.
 pub(super) fn observe_and_authorize(
     config: &LoadedConfig,
     cwd: &Path,

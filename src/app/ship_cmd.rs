@@ -513,6 +513,7 @@ fn collect_failure_diagnostics(
     out
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit CLI/preflight dependencies keep authority testable.
 fn prepare_ship_targets<W: Write>(
     config: &LoadedConfig,
     cwd: &Path,

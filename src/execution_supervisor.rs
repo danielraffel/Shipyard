@@ -624,6 +624,7 @@ impl ExecutionSupervisor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // One scan owns cancellation, resource, and controller capacity decisions.
     fn admit_pending(&mut self) -> Result<(), SupervisorError> {
         let mut queue = Queue::new(&self.state_dir)?;
         let Some(lock) = queue.acquire_drain_lock()? else {
@@ -710,10 +711,8 @@ impl ExecutionSupervisor {
                 if live_metadata_count + selected_metadata_count >= MAX_METADATA_CONTROLLERS {
                     continue;
                 }
-            } else {
-                if live_native_count + selected_native_count >= MAX_WORKERS {
-                    continue;
-                }
+            } else if live_native_count + selected_native_count >= MAX_WORKERS {
+                continue;
             }
             if !admissible(&envelope, &occupied) {
                 continue;
@@ -1535,6 +1534,7 @@ mod tests {
         job
     }
 
+    #[allow(dead_code)] // Exercised by Unix controller-process tests; Windows still compiles the shared fixture.
     fn queued_metadata_job(state_dir: &Path, job_id: &str) -> Job {
         let mut job = Job::create(
             "b".repeat(40),
