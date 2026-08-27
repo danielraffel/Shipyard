@@ -1,11 +1,68 @@
 use super::{
-    CliFailure, ResumeAdapterV1, ResumeRecordPhase, ResumeRecordV1, ResumeRoutingDisposition,
-    StewardLedger, TerminalHandoff, TerminalHandoffOutcome, TerminalHandoffPhase, Utc,
+    CliFailure, StewardLedger, TerminalHandoff, TerminalHandoffOutcome, TerminalHandoffPhase, Utc,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_RESUME_RECORDS: usize = 1_000;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ResumeRecordV1 {
+    pub(super) schema_version: u32,
+    pub(super) resume_id: String,
+    pub(super) terminal_handoff_key: String,
+    pub(super) repo: String,
+    pub(super) base: String,
+    pub(super) pr_number: u64,
+    pub(super) head_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) owner_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ownership_generation: Option<u64>,
+    pub(super) routing_disposition: ResumeRoutingDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) terminal_adapter: Option<TerminalAdapterV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) agent_adapter: Option<AgentAdapterV1>,
+    pub(super) dispatch_enabled: bool,
+    pub(super) phase: ResumeRecordPhase,
+    pub(super) created_at: String,
+    pub(super) updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum TerminalAdapterV1 {
+    Cmux { route_id: String },
+    HerdR { route_id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum AgentAdapterV1 {
+    Native {
+        provider: String,
+        transport: String,
+        route_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ResumeRoutingDisposition {
+    OriginalOwner,
+    FreshCheckpointRequired,
+    RouteRegistryRequired,
+    UnroutablePrivateRoute,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ResumeRecordPhase {
+    Recorded,
+    Resolved,
+}
 
 /// Rebuild the inert resume-intent projection from authoritative terminal handoffs.
 ///
@@ -47,8 +104,8 @@ pub(super) fn reconcile_resume_records(ledger: &mut StewardLedger) -> Result<boo
 }
 
 fn record_for(handoff: &TerminalHandoff) -> Result<ResumeRecordV1, CliFailure> {
-    let (routing_disposition, adapter) = route(handoff)?;
-    let resume_id = resume_id(handoff, adapter.as_ref());
+    let (routing_disposition, terminal_adapter, agent_adapter) = route(handoff)?;
+    let resume_id = resume_id(handoff, terminal_adapter.as_ref(), agent_adapter.as_ref());
     let now = Utc::now().to_rfc3339();
     Ok(ResumeRecordV1 {
         schema_version: 1,
@@ -61,7 +118,8 @@ fn record_for(handoff: &TerminalHandoff) -> Result<ResumeRecordV1, CliFailure> {
         owner_id: handoff.owner_id.clone(),
         ownership_generation: handoff.ownership_generation,
         routing_disposition,
-        adapter,
+        terminal_adapter,
+        agent_adapter,
         dispatch_enabled: false,
         phase: if handoff.phase == TerminalHandoffPhase::Resolved {
             ResumeRecordPhase::Resolved
@@ -75,7 +133,14 @@ fn record_for(handoff: &TerminalHandoff) -> Result<ResumeRecordV1, CliFailure> {
 
 fn route(
     handoff: &TerminalHandoff,
-) -> Result<(ResumeRoutingDisposition, Option<ResumeAdapterV1>), CliFailure> {
+) -> Result<
+    (
+        ResumeRoutingDisposition,
+        Option<TerminalAdapterV1>,
+        Option<AgentAdapterV1>,
+    ),
+    CliFailure,
+> {
     let disposition = match handoff.owner_disposition.as_str() {
         "original_owner" => ResumeRoutingDisposition::OriginalOwner,
         "fresh_agent_only" => ResumeRoutingDisposition::FreshCheckpointRequired,
@@ -89,18 +154,27 @@ fn route(
         }
     };
     if disposition != ResumeRoutingDisposition::OriginalOwner {
-        return Ok((disposition, None));
+        return Ok((disposition, None, None));
     }
 
     let Some(route_id) = handoff.owner_route_id.as_deref() else {
-        return Ok((ResumeRoutingDisposition::UnroutablePrivateRoute, None));
+        return Ok((ResumeRoutingDisposition::UnroutablePrivateRoute, None, None));
     };
-    let native = match (
+    let terminal_adapter = match handoff.owner_terminal_provenance {
+        Some(super::TerminalProvenanceKind::Cmux) => Some(TerminalAdapterV1::Cmux {
+            route_id: route_id.to_owned(),
+        }),
+        Some(super::TerminalProvenanceKind::HerdR) => Some(TerminalAdapterV1::HerdR {
+            route_id: route_id.to_owned(),
+        }),
+        Some(super::TerminalProvenanceKind::Absent) | None => None,
+    };
+    let agent_adapter = match (
         handoff.owner_provider.as_deref(),
         handoff.resume_transport.as_deref(),
     ) {
         (Some("codex"), Some("codex_queue")) | (Some("claude"), Some("claude_resume")) => {
-            Some(ResumeAdapterV1::ProviderNative {
+            Some(AgentAdapterV1::Native {
                 provider: handoff.owner_provider.clone().expect("matched provider"),
                 transport: handoff.resume_transport.clone().expect("matched transport"),
                 route_id: route_id.to_owned(),
@@ -108,21 +182,17 @@ fn route(
         }
         _ => None,
     };
-    if native.is_some() {
-        return Ok((disposition, native));
+    if terminal_adapter.is_none() && agent_adapter.is_none() {
+        return Ok((ResumeRoutingDisposition::UnroutablePrivateRoute, None, None));
     }
-    if handoff.owner_terminal_provenance == Some(super::TerminalProvenanceKind::Cmux) {
-        return Ok((
-            disposition,
-            Some(ResumeAdapterV1::Cmux {
-                route_id: route_id.to_owned(),
-            }),
-        ));
-    }
-    Ok((ResumeRoutingDisposition::UnroutablePrivateRoute, None))
+    Ok((disposition, terminal_adapter, agent_adapter))
 }
 
-fn resume_id(handoff: &TerminalHandoff, adapter: Option<&ResumeAdapterV1>) -> String {
+fn resume_id(
+    handoff: &TerminalHandoff,
+    terminal_adapter: Option<&TerminalAdapterV1>,
+    agent_adapter: Option<&AgentAdapterV1>,
+) -> String {
     let mut digest = Sha256::new();
     digest.update(b"shipyard-resume-record-v1\0");
     for field in [
@@ -139,24 +209,32 @@ fn resume_id(handoff: &TerminalHandoff, adapter: Option<&ResumeAdapterV1>) -> St
             .unwrap_or_default()
             .to_be_bytes(),
     );
-    match adapter {
-        Some(ResumeAdapterV1::ProviderNative {
+    match terminal_adapter {
+        Some(TerminalAdapterV1::Cmux { route_id }) => {
+            digest.update(b"terminal_cmux\0");
+            digest.update(route_id.len().to_be_bytes());
+            digest.update(route_id.as_bytes());
+        }
+        Some(TerminalAdapterV1::HerdR { route_id }) => {
+            digest.update(b"terminal_herdr\0");
+            digest.update(route_id.len().to_be_bytes());
+            digest.update(route_id.as_bytes());
+        }
+        None => digest.update(b"terminal_absent\0"),
+    }
+    match agent_adapter {
+        Some(AgentAdapterV1::Native {
             provider,
             transport,
             route_id,
         }) => {
-            digest.update(b"provider_native\0");
+            digest.update(b"agent_native\0");
             for field in [provider, transport, route_id] {
                 digest.update(field.len().to_be_bytes());
                 digest.update(field.as_bytes());
             }
         }
-        Some(ResumeAdapterV1::Cmux { route_id }) => {
-            digest.update(b"cmux\0");
-            digest.update(route_id.len().to_be_bytes());
-            digest.update(route_id.as_bytes());
-        }
-        None => digest.update(b"unroutable\0"),
+        None => digest.update(b"agent_absent\0"),
     }
     format!("resume-{}", hex::encode(digest.finalize()))
 }
@@ -210,7 +288,8 @@ fn same_payload(existing: &ResumeRecordV1, incoming: &ResumeRecordV1) -> bool {
         && existing.owner_id == incoming.owner_id
         && existing.ownership_generation == incoming.ownership_generation
         && existing.routing_disposition == incoming.routing_disposition
-        && existing.adapter == incoming.adapter
+        && existing.terminal_adapter == incoming.terminal_adapter
+        && existing.agent_adapter == incoming.agent_adapter
         && existing.dispatch_enabled == incoming.dispatch_enabled
         && existing.phase == incoming.phase
 }

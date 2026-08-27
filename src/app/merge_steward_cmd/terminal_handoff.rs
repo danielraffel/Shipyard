@@ -3,7 +3,7 @@ use super::{
     TerminalProvenanceKind, Utc,
     handoff::TerminalOwnerRoute,
     ledger::{load_existing_ledger, save_ledger},
-    resume_record::reconcile_resume_records,
+    resume_record::{ResumeRecordV1, reconcile_resume_records},
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -296,13 +296,17 @@ fn update_handoffs(
 ) -> Result<bool, CliFailure> {
     let original = ledger.terminal_handoffs.clone();
     let original_resume_records = ledger.resume_records.clone();
-    if !update(&mut ledger.terminal_handoffs) {
+    let handoffs_changed = update(&mut ledger.terminal_handoffs);
+    let resume_changed = match reconcile_resume_records(ledger) {
+        Ok(changed) => changed,
+        Err(error) => {
+            ledger.terminal_handoffs = original;
+            ledger.resume_records = original_resume_records;
+            return Err(error);
+        }
+    };
+    if !handoffs_changed && !resume_changed {
         return Ok(false);
-    }
-    if let Err(error) = reconcile_resume_records(ledger) {
-        ledger.terminal_handoffs = original;
-        ledger.resume_records = original_resume_records;
-        return Err(error);
     }
     if let Err(error) = save_ledger(ledger_path, ledger) {
         reconcile_after_ambiguous_save(ledger_path, ledger, original, original_resume_records);
@@ -494,7 +498,7 @@ fn reconcile_after_ambiguous_save(
     ledger_path: &Path,
     ledger: &mut StewardLedger,
     fallback_handoffs: BTreeMap<String, TerminalHandoff>,
-    fallback_resume_records: BTreeMap<String, super::ResumeRecordV1>,
+    fallback_resume_records: BTreeMap<String, ResumeRecordV1>,
 ) {
     // `save_ledger` may fail after the atomic rename if only directory sync
     // failed. Reloading distinguishes the published old/new image and prevents

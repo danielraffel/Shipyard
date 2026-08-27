@@ -1,7 +1,9 @@
 use super::*;
 use crate::app::merge_steward_cmd::TerminalProvenanceKind;
 use crate::app::merge_steward_cmd::ledger::load_ledger;
-use crate::app::merge_steward_cmd::{ResumeAdapterV1, ResumeRecordPhase};
+use crate::app::merge_steward_cmd::resume_record::{
+    AgentAdapterV1, ResumeRecordPhase, TerminalAdapterV1,
+};
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -141,6 +143,35 @@ fn legacy_terminal_record_without_typed_provenance_replays_idempotently() {
 }
 
 #[test]
+fn no_op_terminal_reconciliation_backfills_legacy_resume_record() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("merge-steward.json");
+    let mut ledger = StewardLedger::default();
+    persist_actionable_failure(
+        &path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        HEAD,
+        Some(owner("legacy-route")),
+        vec!["windows@app=9".to_owned()],
+    )
+    .expect("seed current ledger");
+    ledger.resume_records.clear();
+    save_ledger(&path, &ledger).expect("seed legacy ledger without resume projection");
+
+    let mut restarted = load_ledger(&path).expect("restart legacy ledger");
+    resolve_terminal_handoffs(&path, &mut restarted, "different/repo", "main", 99, HEAD)
+        .expect("no-op terminal reconciliation backfills projection");
+
+    assert_eq!(restarted.terminal_handoffs.len(), 1);
+    assert_eq!(restarted.resume_records.len(), 1);
+    let persisted = load_ledger(&path).expect("reload migrated ledger");
+    assert_eq!(persisted.resume_records, restarted.resume_records);
+}
+
+#[test]
 fn legacy_absent_provenance_enriches_to_cmux_without_weakening_route_fences() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("merge-steward.json");
@@ -165,7 +196,7 @@ fn legacy_absent_provenance_enriches_to_cmux_without_weakening_route_fences() {
             .values()
             .next()
             .expect("legacy resume")
-            .adapter,
+            .terminal_adapter,
         None
     );
 
@@ -188,8 +219,8 @@ fn legacy_absent_provenance_enriches_to_cmux_without_weakening_route_fences() {
     );
     let resume = ledger.resume_records.values().next().expect("resume");
     assert!(matches!(
-        resume.adapter,
-        Some(ResumeAdapterV1::Cmux { ref route_id }) if route_id == "cmux-route"
+        resume.terminal_adapter,
+        Some(TerminalAdapterV1::Cmux { ref route_id }) if route_id == "cmux-route"
     ));
     assert!(!resume.dispatch_enabled);
 
@@ -664,6 +695,24 @@ fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
     );
     assert!(!record.wake_consumer_available);
     assert_eq!(record.phase, TerminalHandoffPhase::Recorded);
+    let resume = restarted
+        .resume_records
+        .values()
+        .next()
+        .expect("HerdR resume");
+    assert!(matches!(
+        resume.terminal_adapter,
+        Some(TerminalAdapterV1::HerdR { ref route_id }) if route_id == "herdr-route"
+    ));
+    assert!(matches!(
+        resume.agent_adapter,
+        Some(AgentAdapterV1::Native {
+            ref provider,
+            ref transport,
+            ref route_id,
+        }) if provider == "codex" && transport == "codex_queue" && route_id == "herdr-route"
+    ));
+    assert!(!resume.dispatch_enabled);
 }
 
 #[test]
@@ -696,8 +745,8 @@ fn resume_intent_survives_restart_and_failed_replacement_as_one_ledger_image() {
     assert_eq!(resume.phase, ResumeRecordPhase::Recorded);
     assert!(!resume.dispatch_enabled);
     assert!(matches!(
-        resume.adapter,
-        Some(ResumeAdapterV1::ProviderNative {
+        resume.agent_adapter,
+        Some(AgentAdapterV1::Native {
             ref provider,
             ref transport,
             ref route_id,

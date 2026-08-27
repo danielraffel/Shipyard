@@ -34,7 +34,7 @@ fn handoff(
 }
 
 #[test]
-fn provider_native_route_precedes_cmux_fallback() {
+fn terminal_and_agent_adapters_are_orthogonal() {
     let record = record_for(&handoff(
         Some("codex"),
         Some("codex_queue"),
@@ -42,8 +42,12 @@ fn provider_native_route_precedes_cmux_fallback() {
     ))
     .expect("record");
     assert!(matches!(
-        record.adapter,
-        Some(ResumeAdapterV1::ProviderNative {
+        record.terminal_adapter,
+        Some(TerminalAdapterV1::Cmux { ref route_id }) if route_id == "route-exact"
+    ));
+    assert!(matches!(
+        record.agent_adapter,
+        Some(AgentAdapterV1::Native {
             ref provider,
             ref transport,
             ref route_id,
@@ -53,7 +57,33 @@ fn provider_native_route_precedes_cmux_fallback() {
 }
 
 #[test]
-fn cmux_is_only_a_fallback_adapter() {
+fn herdr_terminal_does_not_replace_native_agent_transport() {
+    let mut terminal = handoff(Some("codex"), Some("codex_queue"), None);
+    terminal.owner_terminal_provenance = Some(TerminalProvenanceKind::HerdR);
+    let record = record_for(&terminal).expect("HerdR record");
+    assert!(matches!(
+        record.terminal_adapter,
+        Some(TerminalAdapterV1::HerdR {
+            ref route_id,
+        }) if route_id == "route-exact"
+    ));
+    assert!(matches!(
+        record.agent_adapter,
+        Some(AgentAdapterV1::Native {
+            ref provider,
+            ref transport,
+            ref route_id,
+        }) if provider == "codex" && transport == "codex_queue" && route_id == "route-exact"
+    ));
+    assert_eq!(
+        record.routing_disposition,
+        ResumeRoutingDisposition::OriginalOwner
+    );
+    assert!(!record.dispatch_enabled);
+}
+
+#[test]
+fn cmux_terminal_route_can_exist_without_native_agent_transport() {
     let record = record_for(&handoff(
         Some("future-provider"),
         Some("unsupported-native-route"),
@@ -61,11 +91,12 @@ fn cmux_is_only_a_fallback_adapter() {
     ))
     .expect("record");
     assert!(matches!(
-        record.adapter,
-        Some(ResumeAdapterV1::Cmux {
+        record.terminal_adapter,
+        Some(TerminalAdapterV1::Cmux {
             ref route_id,
         }) if route_id == "route-exact"
     ));
+    assert_eq!(record.agent_adapter, None);
     assert_eq!(
         record.routing_disposition,
         ResumeRoutingDisposition::OriginalOwner
@@ -83,7 +114,8 @@ fn missing_route_stays_recorded_and_unroutable() {
         record.routing_disposition,
         ResumeRoutingDisposition::RouteRegistryRequired
     );
-    assert_eq!(record.adapter, None);
+    assert_eq!(record.terminal_adapter, None);
+    assert_eq!(record.agent_adapter, None);
     assert!(!record.dispatch_enabled);
 }
 

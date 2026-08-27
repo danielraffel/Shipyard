@@ -131,7 +131,7 @@ struct StewardLedger {
     #[serde(default)]
     terminal_handoffs: BTreeMap<String, TerminalHandoff>,
     #[serde(default)]
-    resume_records: BTreeMap<String, ResumeRecordV1>,
+    resume_records: BTreeMap<String, resume_record::ResumeRecordV1>,
     #[serde(default)]
     audit: Vec<LedgerAudit>,
 }
@@ -192,57 +192,6 @@ enum TerminalProvenanceKind {
     Absent,
     Cmux,
     HerdR,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct ResumeRecordV1 {
-    schema_version: u32,
-    resume_id: String,
-    terminal_handoff_key: String,
-    repo: String,
-    base: String,
-    pr_number: u64,
-    head_sha: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    owner_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ownership_generation: Option<u64>,
-    routing_disposition: ResumeRoutingDisposition,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    adapter: Option<ResumeAdapterV1>,
-    dispatch_enabled: bool,
-    phase: ResumeRecordPhase,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ResumeAdapterV1 {
-    ProviderNative {
-        provider: String,
-        transport: String,
-        route_id: String,
-    },
-    Cmux {
-        route_id: String,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ResumeRoutingDisposition {
-    OriginalOwner,
-    FreshCheckpointRequired,
-    RouteRegistryRequired,
-    UnroutablePrivateRoute,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ResumeRecordPhase {
-    Recorded,
-    Resolved,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
