@@ -622,6 +622,131 @@ fn handoff_path(directory: &Path, head: &str) -> std::path::PathBuf {
     directory.join(format!("{}.json", head.to_ascii_lowercase()))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TerminalOwnerRoute {
+    pub(super) origin_machine: String,
+    pub(super) owner_id: String,
+    pub(super) ownership_generation: u64,
+    pub(super) owner_disposition: String,
+    pub(super) route_id: Option<String>,
+    pub(super) provider: Option<String>,
+    pub(super) resume_transport: Option<String>,
+}
+
+pub(super) fn terminal_owner_route(
+    state_dir: &Path,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<Option<TerminalOwnerRoute>, CliFailure> {
+    let path = state_dir
+        .join("merge-steward")
+        .join("handoffs")
+        .join(encode_path_segment(&repo.to_ascii_lowercase()))
+        .join(format!("pr-{pr}"))
+        .join(format!("{}.json", head.to_ascii_lowercase()));
+    let Some(receipt) = load_handoff(&path)? else {
+        return Ok(None);
+    };
+    validate_handoff_receipt_integrity(&receipt, repo, pr, head)?;
+    if receipt.phase != HandoffPhase::Managed {
+        return Ok(None);
+    }
+    let route = receipt.agent_route;
+    let owner_id = if let Some(route) = route.as_ref() {
+        let stored_path = state_dir
+            .join("merge-steward")
+            .join("agent-routes")
+            .join(format!("{}.json", route.route_id));
+        let stored = load_agent_route(&stored_path)?
+            .ok_or_else(|| CliFailure::new(1, "managed handoff lost its private agent route"))?;
+        let recomputed = agent_route_reference(&stored.agent, &stored.origin_machine);
+        if stored.schema_version != 2
+            || stored.revision == 0
+            || stored.route_id != route.route_id
+            || stored.owner_id != route.owner_id
+            || stored.origin_machine != receipt.origin_machine
+            || recomputed != *route
+        {
+            return Err(CliFailure::new(
+                1,
+                "managed handoff and private agent route identity disagree",
+            ));
+        }
+        opaque_id(
+            "owner",
+            &[
+                &stored.agent.provider,
+                stored
+                    .agent
+                    .parent_session_id
+                    .as_deref()
+                    .unwrap_or(&stored.agent.session_id),
+            ],
+        )
+    } else {
+        receipt.owner_id.clone()
+    };
+    Ok(Some(TerminalOwnerRoute {
+        origin_machine: receipt.origin_machine,
+        owner_id,
+        ownership_generation: receipt.ownership_generation,
+        owner_disposition: if route.is_some() {
+            "original_owner"
+        } else {
+            "fresh_agent_only"
+        }
+        .to_owned(),
+        route_id: route.as_ref().map(|route| route.route_id.clone()),
+        provider: route.as_ref().map(|route| route.provider.clone()),
+        resume_transport: route.map(|route| route.resume_transport),
+    }))
+}
+
+pub(super) fn terminal_owner_route_or_unresolved(
+    state_dir: &Path,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Option<TerminalOwnerRoute> {
+    // Route transport is not deployed authority. Corrupt, missing, or stale
+    // private state therefore remains an unroutable ledger obligation instead
+    // of blocking deterministic stewardship or authorizing a fresh agent.
+    match terminal_owner_route(state_dir, repo, pr, head) {
+        Ok(owner) => owner,
+        Err(_) => unresolved_terminal_owner(state_dir, repo, pr, head),
+    }
+}
+
+fn unresolved_terminal_owner(
+    state_dir: &Path,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Option<TerminalOwnerRoute> {
+    let path = state_dir
+        .join("merge-steward")
+        .join("handoffs")
+        .join(encode_path_segment(&repo.to_ascii_lowercase()))
+        .join(format!("pr-{pr}"))
+        .join(format!("{}.json", head.to_ascii_lowercase()));
+    let receipt = load_handoff(&path).ok().flatten()?;
+    if validate_handoff_receipt_integrity(&receipt, repo, pr, head).is_err()
+        || receipt.phase != HandoffPhase::Managed
+    {
+        return None;
+    }
+    Some(TerminalOwnerRoute {
+        origin_machine: receipt.origin_machine,
+        owner_id: receipt.owner_id,
+        ownership_generation: receipt.ownership_generation,
+        owner_disposition: "unroutable_private_route".to_owned(),
+        route_id: None,
+        provider: None,
+        resume_transport: None,
+    })
+}
+
 fn agent_route_path(runtime_paths: &RuntimePaths, route_id: &str) -> std::path::PathBuf {
     runtime_paths
         .state_dir
@@ -832,19 +957,55 @@ fn validate_existing_handoff(
     normalized_repo: &str,
     normalized_head: &str,
 ) -> Result<(), CliFailure> {
-    if existing.schema_version != 2
-        || !existing.repo.eq_ignore_ascii_case(normalized_repo)
-        || existing.pr != args.pr
-        || !existing.head_sha.eq_ignore_ascii_case(normalized_head)
-        || existing.ownership_generation == 0
-        || existing.revision == 0
-        || existing.wake_consumer_available
+    validate_handoff_receipt_integrity(existing, normalized_repo, args.pr, normalized_head)
+}
+
+fn validate_handoff_receipt_integrity(
+    receipt: &DurableStewardHandoff,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<(), CliFailure> {
+    let route_consistent = receipt.agent_route.as_ref().map_or_else(
+        || {
+            receipt.repair_route == RepairRoute::FreshAgentOnly
+                && receipt.owner_id == "fresh-agent-only"
+                && receipt.goal_lifecycle == GoalLifecycle::Unmanaged
+                && receipt.goal_status == GoalStatus::Unmanaged
+                && receipt.goal_status_provenance == GoalStatusProvenance::NotObserved
+        },
+        |route| {
+            receipt.repair_route == RepairRoute::OriginalAgent
+                && receipt.owner_id == route.owner_id
+                && receipt.origin_machine == route.origin_machine
+                && receipt.goal_lifecycle == route.goal_lifecycle
+                && receipt.goal_status == route.goal_status
+                && receipt.goal_status_provenance == route.goal_status_provenance
+        },
+    );
+    let pause_consistent = receipt.pause_required
+        == (receipt.agent_disposition == "pause"
+            && receipt
+                .agent_route
+                .as_ref()
+                .is_some_and(|route| route.goal_managed));
+    if receipt.schema_version != 2
+        || !receipt.repo.eq_ignore_ascii_case(repo)
+        || receipt.pr != pr
+        || !receipt.head_sha.eq_ignore_ascii_case(head)
+        || receipt.ownership_generation == 0
+        || receipt.revision == 0
+        || receipt.wake_consumer_available
+        || !matches!(receipt.agent_disposition.as_str(), "continue" | "pause")
+        || !route_consistent
+        || !pause_consistent
     {
         return Err(CliFailure::new(
             1,
             "durable handoff receipt is incompatible or does not match its exact-head path",
         ));
     }
+    validate_agent_identifier("origin machine", &receipt.origin_machine)?;
     Ok(())
 }
 
@@ -1823,6 +1984,11 @@ fn main() {{
         assert_eq!(replayed_intent.phase, HandoffPhase::Ready);
         assert_eq!(replayed_intent.revision, 3);
         assert_eq!(replayed_intent.ownership_generation, 1);
+        assert_eq!(
+            terminal_owner_route(&paths.state_dir, "owner/repo", managed.pr, &managed.head)
+                .expect("ready receipt is valid but not wake authority"),
+            None
+        );
         let receipt = persist_handoff(&path, replayed_intent, HandoffPhase::Managed)
             .expect("persist managed");
         assert_eq!(receipt.phase, HandoffPhase::Managed);
@@ -1833,6 +1999,28 @@ fn main() {{
         assert!(!receipt.wake_consumer_available);
         assert_eq!(receipt.goal_lifecycle, GoalLifecycle::Managed);
         assert_eq!(receipt.goal_status, GoalStatus::Unknown);
+        let terminal_owner =
+            terminal_owner_route(&paths.state_dir, "owner/repo", managed.pr, &managed.head)
+                .expect("read terminal owner after restart")
+                .expect("terminal owner");
+        assert_eq!(terminal_owner.origin_machine, "m3");
+        assert_eq!(
+            terminal_owner.owner_id,
+            opaque_id("owner", &["claude", "coordinator-1"])
+        );
+        assert_ne!(terminal_owner.owner_id, receipt.owner_id);
+        assert_eq!(
+            terminal_owner.route_id.as_deref(),
+            receipt
+                .agent_route
+                .as_ref()
+                .map(|route| route.route_id.as_str())
+        );
+        assert_eq!(terminal_owner.provider.as_deref(), Some("claude"));
+        assert_eq!(
+            terminal_owner.resume_transport.as_deref(),
+            Some("claude_resume")
+        );
 
         let public_bytes = std::fs::read_to_string(&path).expect("read receipt");
         assert!(!public_bytes.contains("session-7"));
@@ -1842,6 +2030,64 @@ fn main() {{
         assert!(private_bytes.contains("session-7"));
         assert!(private_bytes.contains("coordinator-1"));
         assert!(private_bytes.contains("surface-7"));
+
+        let mut tampered = load_agent_route(&route_path)
+            .expect("load route")
+            .expect("stored route");
+        tampered.agent.parent_session_id = Some("attacker-session".to_owned());
+        save_private_json(&route_path, &tampered, "tampered test route").expect("tamper route");
+        assert!(
+            terminal_owner_route(&paths.state_dir, "owner/repo", managed.pr, &managed.head)
+                .expect_err("tampered coordinator identity must fail")
+                .message
+                .contains("identity disagree")
+        );
+        let unresolved = terminal_owner_route_or_unresolved(
+            &paths.state_dir,
+            "owner/repo",
+            managed.pr,
+            &managed.head,
+        )
+        .expect("retain exact origin without trusting tampered route");
+        assert_eq!(unresolved.origin_machine, "m3");
+        assert_eq!(unresolved.owner_disposition, "unroutable_private_route");
+        assert_eq!(unresolved.route_id, None);
+
+        let valid_receipt = load_handoff(&path)
+            .expect("load receipt")
+            .expect("stored receipt");
+        let mut zero_generation = valid_receipt.clone();
+        zero_generation.ownership_generation = 0;
+        let mut zero_revision = valid_receipt.clone();
+        zero_revision.revision = 0;
+        let mut enabled_consumer = valid_receipt.clone();
+        enabled_consumer.wake_consumer_available = true;
+        let mut inconsistent_repair = valid_receipt;
+        inconsistent_repair.repair_route = RepairRoute::FreshAgentOnly;
+        for (case, invalid_receipt) in [
+            ("zero generation", zero_generation),
+            ("zero revision", zero_revision),
+            ("enabled consumer", enabled_consumer),
+            ("inconsistent repair", inconsistent_repair),
+        ] {
+            save_private_json(&path, &invalid_receipt, "invalid test receipt")
+                .expect("tamper receipt");
+            assert!(
+                terminal_owner_route(&paths.state_dir, "owner/repo", managed.pr, &managed.head)
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(
+                terminal_owner_route_or_unresolved(
+                    &paths.state_dir,
+                    "owner/repo",
+                    managed.pr,
+                    &managed.head
+                ),
+                None,
+                "{case}"
+            );
+        }
 
         #[cfg(unix)]
         {

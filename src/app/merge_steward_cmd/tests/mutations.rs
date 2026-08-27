@@ -12,13 +12,29 @@ use crate::app::merge_steward_cmd::cancellation_terminalization::force_cancel_no
 use crate::app::merge_steward_cmd::capacity_cancellation::{
     pending_cancellation_key, start_capacity_preemption,
 };
+use crate::app::merge_steward_cmd::handoff::TerminalOwnerRoute;
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::pr_mutations::mutate_pr_with_recovery;
 use crate::app::merge_steward_cmd::pr_mutations::rollback_transient_attempt;
 use crate::app::merge_steward_cmd::pr_mutations::run_attempt_allows_transient_rerun;
+use crate::app::merge_steward_cmd::terminal_handoff::{
+    persist_actionable_failure, persist_success_continuation, resolve_terminal_handoffs,
+};
 use crate::merge_steward::StewardCheckSource;
+
+fn terminal_owner_route(route_id: &str) -> Option<TerminalOwnerRoute> {
+    Some(TerminalOwnerRoute {
+        origin_machine: "m3".to_owned(),
+        owner_id: "owner-exact".to_owned(),
+        ownership_generation: 1,
+        owner_disposition: "original_owner".to_owned(),
+        route_id: Some(route_id.to_owned()),
+        provider: Some("codex".to_owned()),
+        resume_transport: Some("codex_queue".to_owned()),
+    })
+}
 
 #[cfg(unix)]
 fn recovery_witness() -> QueueWitness {
@@ -592,6 +608,104 @@ fn final_ledger_failure_is_renderable_and_marks_tick_unhealthy() {
     );
 }
 
+#[test]
+fn failed_terminal_handoff_write_restores_prior_in_memory_obligation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("merge-steward.json");
+    let mut ledger = StewardLedger::default();
+    let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    persist_actionable_failure(
+        &path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        head,
+        terminal_owner_route("route-a"),
+        vec!["windows@app=9".to_owned()],
+    )
+    .expect("first");
+    let blocked_parent = temp.path().join("not-a-directory");
+    fs::write(&blocked_parent, "occupied").expect("blocked parent");
+    let blocked_ledger = blocked_parent.join("ledger.json");
+    resolve_terminal_handoffs(&blocked_ledger, &mut ledger, "owner/repo", "main", 7, head)
+        .expect_err("resolution save fails");
+    assert_eq!(
+        ledger
+            .terminal_handoffs
+            .values()
+            .next()
+            .expect("still recorded")
+            .phase,
+        TerminalHandoffPhase::Recorded
+    );
+    persist_actionable_failure(
+        &blocked_ledger,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        head,
+        terminal_owner_route("route-a"),
+        vec!["macos@app=42".to_owned()],
+    )
+    .expect_err("replacement save fails");
+    assert_eq!(ledger.terminal_handoffs.len(), 1);
+    assert_eq!(
+        ledger
+            .terminal_handoffs
+            .values()
+            .next()
+            .expect("prior failure")
+            .failure_contexts,
+        vec!["windows@app=9"]
+    );
+}
+
+#[test]
+fn restart_preserves_success_and_failure_terminal_handoffs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("merge-steward.json");
+    let mut ledger = StewardLedger::default();
+    let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    persist_success_continuation(
+        &path,
+        &mut ledger,
+        "Owner/Repo",
+        "main",
+        7,
+        head,
+        terminal_owner_route("route-success"),
+    )
+    .expect("success continuation");
+    persist_actionable_failure(
+        &path,
+        &mut ledger,
+        "Owner/Repo",
+        "main",
+        8,
+        head,
+        terminal_owner_route("route-failure"),
+        vec!["macos@app=42".to_owned()],
+    )
+    .expect("failure wake");
+
+    let restarted = crate::app::merge_steward_cmd::ledger::load_ledger(&path).expect("restart");
+    assert_eq!(restarted.terminal_handoffs.len(), 2);
+    assert!(restarted.terminal_handoffs.values().any(|record| {
+        record.outcome == TerminalHandoffOutcome::SuccessContinuation
+            && record.phase == TerminalHandoffPhase::Pending
+            && !record.wake_consumer_available
+    }));
+    assert!(restarted.terminal_handoffs.values().any(|record| {
+        record.outcome == TerminalHandoffOutcome::ActionableFailure
+            && record.phase == TerminalHandoffPhase::Recorded
+            && record.owner_route_id.as_deref() == Some("route-failure")
+            && record.ownership_generation == Some(1)
+            && !record.wake_consumer_available
+    }));
+}
+
 #[cfg(unix)]
 #[test]
 fn enqueue_transport_mutates_only_after_live_queue_and_head_revalidation() {
@@ -638,6 +752,17 @@ esac
     assert!(calls.contains("mergeQueue"), "{calls}");
     assert!(calls.contains("pr view 42"), "{calls}");
     assert!(calls.contains("enqueuePullRequest"), "{calls}");
+    let handoff = ledger
+        .terminal_handoffs
+        .values()
+        .next()
+        .expect("durable success continuation");
+    assert_eq!(handoff.repo, "owner/repo");
+    assert_eq!(handoff.pr_number, 42);
+    assert_eq!(handoff.head_sha, pr.fact.head_sha);
+    assert_eq!(handoff.phase, TerminalHandoffPhase::Applied);
+    assert_eq!(handoff.owner_disposition, "route_registry_required");
+    assert!(!handoff.wake_consumer_available);
 }
 
 #[cfg(unix)]
@@ -2012,6 +2137,16 @@ esac
 
     assert_eq!(mutation.as_deref(), Some("waiting_enqueue_requirements"));
     assert!(error.is_none(), "{error:?}");
+    assert_eq!(ledger.terminal_handoffs.len(), 1);
+    assert_eq!(
+        ledger
+            .terminal_handoffs
+            .values()
+            .next()
+            .expect("resolved continuation")
+            .phase,
+        TerminalHandoffPhase::Resolved
+    );
     assert!(!enqueue_requirements_pending(
         "HTTP 403: Resource not accessible by integration: required review"
     ));

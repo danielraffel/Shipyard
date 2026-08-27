@@ -7,6 +7,10 @@ use super::{
         QueueRecoveryEvidence, final_mutable_authority_matches, receipt_key, recovery_evidence,
     },
     record_audit, save_ledger,
+    terminal_handoff::{
+        mark_success_continuation_applied, persist_success_continuation,
+        resolve_success_continuation,
+    },
 };
 
 #[cfg(test)]
@@ -363,6 +367,35 @@ fn enqueue_unstacked_pull_request(
             }
         }
     }
+    // Route metadata is advisory until a trusted wake consumer exists. Missing
+    // or corrupt private route state must remain explicitly unresolved in the
+    // outbox, never gain queue-mutation authority.
+    let owner = super::handoff::terminal_owner_route_or_unresolved(
+        &context.mutation_control.state_dir,
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+    );
+    if let Err(error) = persist_success_continuation(
+        context.ledger_path,
+        ledger,
+        &context.observation.repo,
+        &context.observation.base,
+        pr.fact.number,
+        &pr.fact.head_sha,
+        owner,
+    ) {
+        let audit_error = guard.finish("continuation_persistence_failed").err();
+        return (
+            None,
+            Some(audit_error.map_or(error.message.clone(), |audit_error| {
+                format!(
+                    "{}; mutation audit also failed: {audit_error}",
+                    error.message
+                )
+            })),
+        );
+    }
     let query = if recovery.is_some() {
         "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,jump:true}){mergeQueueEntry{position}}}"
     } else {
@@ -392,6 +425,22 @@ fn enqueue_unstacked_pull_request(
                     Some("enqueued".to_owned()),
                     Some(format!(
                         "enqueue succeeded but mutation audit failed: {error}"
+                    )),
+                );
+            }
+            if let Err(error) = mark_success_continuation_applied(
+                context.ledger_path,
+                ledger,
+                &context.observation.repo,
+                &context.observation.base,
+                pr.fact.number,
+                &pr.fact.head_sha,
+            ) {
+                return (
+                    Some("enqueued".to_owned()),
+                    Some(format!(
+                        "enqueue succeeded but terminal continuation persistence failed: {}",
+                        error.message
                     )),
                 );
             }
@@ -437,21 +486,44 @@ fn enqueue_unstacked_pull_request(
             (
                 None,
                 Some(format!(
-                    "GitHub enqueue returned no mergeQueueEntry: {raw}{audit_error}"
+                    "GitHub enqueue returned no mergeQueueEntry: {raw}{audit_error}; terminal continuation retained pending exact-head reconciliation"
                 )),
             )
         }
         Err(error) => {
             let message = error.to_string();
             if enqueue_requirements_pending(&message) {
-                match guard.finish("rejected_requirements") {
-                    Ok(()) => (Some("waiting_enqueue_requirements".to_owned()), None),
-                    Err(error) => (
-                        Some("waiting_enqueue_requirements".to_owned()),
-                        Some(format!(
-                            "enqueue requirements rejected but mutation audit failed: {error}"
-                        )),
-                    ),
+                let audit_error = guard.finish("rejected_requirements").err();
+                let continuation_error = resolve_success_continuation(
+                    context.ledger_path,
+                    ledger,
+                    &context.observation.repo,
+                    &context.observation.base,
+                    pr.fact.number,
+                    &pr.fact.head_sha,
+                )
+                .err();
+                match (audit_error, continuation_error) {
+                    (None, None) => (Some("waiting_enqueue_requirements".to_owned()), None),
+                    (audit_error, continuation_error) => {
+                        let mut errors = Vec::new();
+                        if let Some(error) = audit_error {
+                            errors.push(format!("mutation audit failed: {error}"));
+                        }
+                        if let Some(error) = continuation_error {
+                            errors.push(format!(
+                                "terminal continuation resolution failed: {}",
+                                error.message
+                            ));
+                        }
+                        (
+                            Some("waiting_enqueue_requirements".to_owned()),
+                            Some(format!(
+                                "enqueue requirements rejected but {}",
+                                errors.join("; ")
+                            )),
+                        )
+                    }
                 }
             } else {
                 (None, Some(message))
