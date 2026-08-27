@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01240"></a>
+## [0.124.0] - 2026-08-27
+
+- feat: persist provider-neutral launch profiles ([#484](https://github.com/danielraffel/Shipyard/pull/484))
+
 <a id="v01230"></a>
 ## [0.123.0] - 2026-08-27
 
@@ -1104,6 +1109,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.124.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.124.0
 [0.123.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.123.0
 [0.122.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.122.0
 [0.121.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.121.0
