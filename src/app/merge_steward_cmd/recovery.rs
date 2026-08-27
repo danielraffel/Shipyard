@@ -244,7 +244,15 @@ fn enqueue_recovery_after_revalidation(
     let publication_lease =
         match acquire_recovery_publication_lease(&context.mutation_control.state_dir) {
             Ok(lease) => lease,
-            Err(error) => return deferred_recovery_request(error.message()),
+            Err(error) => {
+                return (
+                    None,
+                    Some(format!(
+                        "mandatory terminal handoff publication lease failed: {}",
+                        error.message()
+                    )),
+                );
+            }
         };
     let deadline = recovery_revalidation_deadline();
     let live =

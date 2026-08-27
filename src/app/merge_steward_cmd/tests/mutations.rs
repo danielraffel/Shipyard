@@ -838,6 +838,56 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn contended_terminal_publication_lease_cannot_report_healthy_without_an_obligation() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, r#"echo "unexpected GitHub call: $*" >&2; exit 90"#);
+    let mut pr = ready_pr();
+    pr.fact.labels.push(NEEDS_AGENT_LABEL.to_owned());
+    pr.fact.checks[0].conclusion = Some("FAILURE".to_owned());
+    pr.fact.checks.push(StewardCheck {
+        name: RECOVERY_CONTEXT.to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("FAILURE".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-08-27T00:00:01Z".to_owned()),
+    });
+    let observation = observation_for(pr.clone(), true);
+    let policy = queue_policy();
+    let decision = StewardDecision::RequiredFailed {
+        contexts: vec!["macos".to_owned()],
+    };
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+    let publication_lease =
+        crate::app::merge_steward_cmd::recovery_worker::acquire_recovery_publication_lease(
+            &mutation_control.state_dir,
+        )
+        .expect("first publication lease");
+
+    let (mutation, error) =
+        reconcile_recovery_signal(&context, &pr, &policy, &decision, &mut ledger);
+
+    drop(publication_lease);
+    assert!(mutation.is_none(), "{mutation:?}");
+    assert!(
+        error.as_deref().is_some_and(
+            |error| error.contains("mandatory terminal handoff publication lease failed")
+        ),
+        "{error:?}"
+    );
+    assert!(
+        ledger.terminal_handoffs.is_empty(),
+        "the error is mandatory precisely because no durable wake could be recorded"
+    );
+    assert!(!ledger_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn enqueue_transport_mutates_only_after_live_queue_and_head_revalidation() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
