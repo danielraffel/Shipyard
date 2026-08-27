@@ -157,6 +157,8 @@ struct TerminalHandoff {
     owner_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resume_transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_terminal_provenance: Option<TerminalProvenanceKind>,
     wake_consumer_available: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     failure_contexts: Vec<String>,
@@ -179,6 +181,14 @@ enum TerminalHandoffPhase {
     Recorded,
     Applied,
     Resolved,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalProvenanceKind {
+    #[default]
+    Absent,
+    HerdR,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -1,6 +1,7 @@
 use super::{
-    CliFailure, GitHubActions, HANDOFF_CONTEXT, MANAGED_LABEL, Path, UNMANAGED_LABEL, Value, Write,
-    gh_json, is_full_sha, observation::encode_path_segment, resolve_repos, write_json_envelope,
+    CliFailure, GitHubActions, HANDOFF_CONTEXT, MANAGED_LABEL, Path, TerminalProvenanceKind,
+    UNMANAGED_LABEL, Value, Write, gh_json, is_full_sha, observation::encode_path_segment,
+    resolve_repos, write_json_envelope,
 };
 use chrono::Utc;
 use fs2::FileExt;
@@ -66,6 +67,8 @@ struct AgentResumeContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     surface_id: Option<String>,
     surface_provenance: SurfaceProvenance,
+    #[serde(default)]
+    terminal_provenance: TerminalProvenance,
     goal_managed: bool,
     goal_lifecycle: GoalLifecycle,
     goal_status: GoalStatus,
@@ -84,6 +87,8 @@ struct AgentRouteReference {
     goal_status: GoalStatus,
     goal_status_provenance: GoalStatusProvenance,
     resume_transport: String,
+    #[serde(default)]
+    terminal_provenance: TerminalProvenanceKind,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -117,6 +122,35 @@ enum SurfaceProvenance {
     Absent,
     Explicit,
     AmbientCmux,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TerminalProvenance {
+    #[default]
+    Absent,
+    Cmux {
+        surface_id: String,
+    },
+    HerdR {
+        session_id: String,
+        workspace_id: String,
+        tab_id: String,
+        pane_id: String,
+        provider_session_id: String,
+    },
+}
+
+impl TerminalProvenance {
+    const fn kind(&self) -> TerminalProvenanceKind {
+        match self {
+            // Existing cmux surface provenance is advisory and may appear or
+            // move without changing the immutable owner route. HerdR is the
+            // only typed terminal contract introduced by this slice.
+            Self::Absent | Self::Cmux { .. } => TerminalProvenanceKind::Absent,
+            Self::HerdR { .. } => TerminalProvenanceKind::HerdR,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -311,12 +345,17 @@ fn validate_args(args: &StewardHandoffArgs) -> Result<(), CliFailure> {
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AgentEnvironment {
     codex_session: Option<String>,
     claude_session: Option<String>,
     surface_id: Option<String>,
     goal_managed: bool,
+    herdr_env: Option<String>,
+    herdr_session: Option<String>,
+    herdr_workspace_id: Option<String>,
+    herdr_tab_id: Option<String>,
+    herdr_pane_id: Option<String>,
 }
 
 fn resolve_agent_context(
@@ -335,6 +374,11 @@ fn resolve_agent_context(
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             goal_managed: env::var("SHIPYARD_GOAL_MANAGED").as_deref() == Ok("1"),
+            herdr_env: env::var("HERDR_ENV").ok(),
+            herdr_session: env::var("HERDR_SESSION").ok(),
+            herdr_workspace_id: env::var("HERDR_WORKSPACE_ID").ok(),
+            herdr_tab_id: env::var("HERDR_TAB_ID").ok(),
+            herdr_pane_id: env::var("HERDR_PANE_ID").ok(),
         },
     )
 }
@@ -374,6 +418,12 @@ fn resolve_agent_context_with_environment(
         _ => unreachable!("provider/session parity checked above"),
     };
     let Some((provider, session_id)) = captured else {
+        if herdr_route_input_present(environment) {
+            return Err(CliFailure::new(
+                1,
+                "HerdR terminal route input requires a resumable agent session",
+            ));
+        }
         if args.agent_parent_session_id.is_some() || args.agent_surface_id.is_some() {
             return Err(CliFailure::new(
                 1,
@@ -406,6 +456,8 @@ fn resolve_agent_context_with_environment(
     if let Some(surface) = surface_id.as_deref() {
         validate_agent_identifier("agent surface", surface)?;
     }
+    let terminal_provenance =
+        resolve_terminal_provenance(environment, &session_id, surface_id.as_deref())?;
     Ok(Some(AgentResumeContext {
         resume_transport: match provider.as_str() {
             "codex" => "codex_queue".to_owned(),
@@ -419,6 +471,7 @@ fn resolve_agent_context_with_environment(
         parent_session_id: args.agent_parent_session_id.clone(),
         surface_id,
         surface_provenance,
+        terminal_provenance,
         goal_managed,
         goal_lifecycle: if goal_managed {
             GoalLifecycle::Managed
@@ -432,6 +485,80 @@ fn resolve_agent_context_with_environment(
         },
         goal_status_provenance: GoalStatusProvenance::NotObserved,
     }))
+}
+
+fn herdr_route_input_present(environment: &AgentEnvironment) -> bool {
+    environment.herdr_env.is_some()
+        || environment.herdr_session.is_some()
+        || environment.herdr_workspace_id.is_some()
+        || environment.herdr_tab_id.is_some()
+        || environment.herdr_pane_id.is_some()
+}
+
+fn resolve_terminal_provenance(
+    environment: &AgentEnvironment,
+    provider_session_id: &str,
+    surface_id: Option<&str>,
+) -> Result<TerminalProvenance, CliFailure> {
+    let herdr_route_fields = [
+        environment.herdr_workspace_id.as_deref(),
+        environment.herdr_tab_id.as_deref(),
+        environment.herdr_pane_id.as_deref(),
+    ];
+    match environment.herdr_env.as_deref() {
+        Some("1") => {
+            if surface_id.is_some() {
+                return Err(CliFailure::new(
+                    1,
+                    "HerdR and cmux terminal routes cannot be combined",
+                ));
+            }
+            let [Some(workspace_id), Some(tab_id), Some(pane_id)] = herdr_route_fields else {
+                return Err(CliFailure::new(
+                    1,
+                    "HERDR_ENV=1 requires workspace, tab, and pane identifiers; HERDR_SESSION is optional and defaults to default",
+                ));
+            };
+            let session_id = environment.herdr_session.as_deref().unwrap_or("default");
+            for (label, value) in [
+                ("HerdR session", session_id),
+                ("HerdR workspace", workspace_id),
+                ("HerdR tab", tab_id),
+                ("HerdR pane", pane_id),
+                ("agent session", provider_session_id),
+            ] {
+                validate_agent_identifier(label, value)?;
+            }
+            // HerdR 0.8.2 exports terminal routing identity, but not the provider
+            // session. Preserve the already-resolved Shipyard agent provenance as
+            // the sole provider-session authority instead of trusting an invented
+            // ambient variable.
+            Ok(TerminalProvenance::HerdR {
+                session_id: session_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                tab_id: tab_id.to_owned(),
+                pane_id: pane_id.to_owned(),
+                provider_session_id: provider_session_id.to_owned(),
+            })
+        }
+        Some(_) => Err(CliFailure::new(
+            1,
+            "HERDR_ENV must be exactly 1 when present",
+        )),
+        None if environment.herdr_session.is_some()
+            || herdr_route_fields.iter().any(Option::is_some) =>
+        {
+            Err(CliFailure::new(
+                1,
+                "HerdR route fields require explicit HERDR_ENV=1",
+            ))
+        }
+        None => Ok(surface_id.map_or(TerminalProvenance::Absent, |surface| {
+            TerminalProvenance::Cmux {
+                surface_id: surface.to_owned(),
+            }
+        })),
+    }
 }
 
 fn validate_agent_identifier(label: &str, value: &str) -> Result<(), CliFailure> {
@@ -581,21 +708,57 @@ fn opaque_id(prefix: &str, fields: &[&str]) -> String {
 
 fn agent_route_reference(agent: &AgentResumeContext, origin_machine: &str) -> AgentRouteReference {
     let owner_id = opaque_id("owner", &[&agent.provider, &agent.session_id]);
-    let route_id = opaque_id(
-        "route",
-        &[
-            origin_machine,
-            &agent.provider,
-            &agent.session_id,
-            agent.parent_session_id.as_deref().unwrap_or_default(),
-            if agent.goal_managed {
-                "goal"
-            } else {
-                "session"
-            },
-            &agent.resume_transport,
-        ],
-    );
+    let route_id = match &agent.terminal_provenance {
+        TerminalProvenance::HerdR {
+            session_id,
+            workspace_id,
+            tab_id,
+            pane_id,
+            provider_session_id,
+        } => {
+            let terminal_binding = opaque_id(
+                "herdr",
+                &[
+                    session_id,
+                    workspace_id,
+                    tab_id,
+                    pane_id,
+                    provider_session_id,
+                ],
+            );
+            opaque_id(
+                "route",
+                &[
+                    origin_machine,
+                    &agent.provider,
+                    &agent.session_id,
+                    agent.parent_session_id.as_deref().unwrap_or_default(),
+                    if agent.goal_managed {
+                        "goal"
+                    } else {
+                        "session"
+                    },
+                    &agent.resume_transport,
+                    &terminal_binding,
+                ],
+            )
+        }
+        TerminalProvenance::Absent | TerminalProvenance::Cmux { .. } => opaque_id(
+            "route",
+            &[
+                origin_machine,
+                &agent.provider,
+                &agent.session_id,
+                agent.parent_session_id.as_deref().unwrap_or_default(),
+                if agent.goal_managed {
+                    "goal"
+                } else {
+                    "session"
+                },
+                &agent.resume_transport,
+            ],
+        ),
+    };
     AgentRouteReference {
         route_id,
         owner_id,
@@ -606,6 +769,7 @@ fn agent_route_reference(agent: &AgentResumeContext, origin_machine: &str) -> Ag
         goal_status: agent.goal_status,
         goal_status_provenance: agent.goal_status_provenance,
         resume_transport: agent.resume_transport.clone(),
+        terminal_provenance: agent.terminal_provenance.kind(),
     }
 }
 
@@ -631,6 +795,7 @@ pub(super) struct TerminalOwnerRoute {
     pub(super) route_id: Option<String>,
     pub(super) provider: Option<String>,
     pub(super) resume_transport: Option<String>,
+    pub(super) terminal_provenance: Option<TerminalProvenanceKind>,
 }
 
 pub(super) fn terminal_owner_route(
@@ -699,6 +864,7 @@ pub(super) fn terminal_owner_route(
         .to_owned(),
         route_id: route.as_ref().map(|route| route.route_id.clone()),
         provider: route.as_ref().map(|route| route.provider.clone()),
+        terminal_provenance: route.as_ref().map(|route| route.terminal_provenance),
         resume_transport: route.map(|route| route.resume_transport),
     }))
 }
@@ -744,6 +910,7 @@ fn unresolved_terminal_owner(
         route_id: None,
         provider: None,
         resume_transport: None,
+        terminal_provenance: None,
     })
 }
 
@@ -1166,6 +1333,18 @@ fn same_immutable_agent_contract(
         && existing.goal_status == incoming.goal_status
         && existing.goal_status_provenance == incoming.goal_status_provenance
         && existing.resume_transport == incoming.resume_transport
+        && match (&existing.terminal_provenance, &incoming.terminal_provenance) {
+            (
+                TerminalProvenance::Absent | TerminalProvenance::Cmux { .. },
+                TerminalProvenance::Absent,
+            )
+            | (TerminalProvenance::Cmux { .. }, TerminalProvenance::Cmux { .. }) => true,
+            (TerminalProvenance::Absent, TerminalProvenance::Cmux { surface_id }) => {
+                existing.surface_id.as_deref() == Some(surface_id)
+            }
+            (left @ TerminalProvenance::HerdR { .. }, right) => left == right,
+            _ => false,
+        }
 }
 
 fn reconcile_surface_route(
@@ -1199,6 +1378,11 @@ fn reconcile_surface_route(
             }
         }
         SurfaceProvenance::Absent => {}
+    }
+    if let TerminalProvenance::Cmux { surface_id } = &incoming.terminal_provenance {
+        reconciled.terminal_provenance = TerminalProvenance::Cmux {
+            surface_id: surface_id.clone(),
+        };
     }
     Ok(reconciled)
 }
@@ -1832,6 +2016,166 @@ fn main() {{
     }
 
     #[test]
+    fn herdr_route_uses_real_environment_contract_and_private_agent_provenance() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = RuntimePaths::current_with_overrides(
+            crate::identity::RuntimeMode::Isolated,
+            Some(temp.path().join("global")),
+            Some(temp.path().join("state")),
+        );
+        let agent_args = explicit_agent_args("codex", "provider-session-7");
+        let environment = AgentEnvironment {
+            herdr_env: Some("1".to_owned()),
+            herdr_session: Some("herdr-session-1".to_owned()),
+            herdr_workspace_id: Some("workspace-2".to_owned()),
+            herdr_tab_id: Some("tab-3".to_owned()),
+            herdr_pane_id: Some("pane-4".to_owned()),
+            ..AgentEnvironment::default()
+        };
+        let no_agent = args();
+        assert!(
+            resolve_agent_context_with_environment(&no_agent, &environment)
+                .expect_err("HerdR route cannot be discarded without an agent session")
+                .message()
+                .contains("resumable agent session")
+        );
+        let agent = resolve_agent_context_with_environment(&agent_args, &environment)
+            .expect("typed HerdR route")
+            .expect("agent");
+        assert_eq!(
+            agent.terminal_provenance,
+            TerminalProvenance::HerdR {
+                session_id: "herdr-session-1".to_owned(),
+                workspace_id: "workspace-2".to_owned(),
+                tab_id: "tab-3".to_owned(),
+                pane_id: "pane-4".to_owned(),
+                provider_session_id: "provider-session-7".to_owned(),
+            }
+        );
+        let route = agent_route_reference(&agent, "m3");
+        assert_eq!(route.terminal_provenance, TerminalProvenanceKind::HerdR);
+        let route_path = agent_route_path(&paths, &route.route_id);
+        persist_agent_route(&route_path, &route, &agent).expect("durable private route");
+        let durable = load_agent_route(&route_path)
+            .expect("load route")
+            .expect("stored route");
+        assert_eq!(durable.agent.terminal_provenance, agent.terminal_provenance);
+        let private_json = std::fs::read_to_string(route_path).expect("private route JSON");
+        for identity in [
+            "herdr-session-1",
+            "workspace-2",
+            "tab-3",
+            "pane-4",
+            "provider-session-7",
+        ] {
+            assert!(private_json.contains(identity), "missing {identity}");
+        }
+        let receipt_path = handoff_path(
+            &handoff_directory(&paths, "owner/repo", agent_args.pr),
+            &agent_args.head,
+        );
+        let receipt =
+            prepare_handoff_receipt(None, &agent_args, "owner/repo", "m3", Some(route.clone()))
+                .expect("HerdR receipt");
+        persist_handoff(&receipt_path, receipt, HandoffPhase::Managed).expect("managed receipt");
+        let terminal = terminal_owner_route(
+            &paths.state_dir,
+            "owner/repo",
+            agent_args.pr,
+            &agent_args.head,
+        )
+        .expect("valid route")
+        .expect("terminal owner");
+        assert_eq!(
+            terminal.terminal_provenance,
+            Some(TerminalProvenanceKind::HerdR)
+        );
+        let public_json = std::fs::read_to_string(receipt_path).expect("public receipt JSON");
+        for private_identity in [
+            "herdr-session-1",
+            "workspace-2",
+            "tab-3",
+            "pane-4",
+            "provider-session-7",
+        ] {
+            assert!(!public_json.contains(private_identity));
+        }
+    }
+
+    #[test]
+    fn herdr_route_defaults_the_absent_optional_session_name() {
+        let agent_args = explicit_agent_args("claude", "provider-session-8");
+        let environment = AgentEnvironment {
+            herdr_env: Some("1".to_owned()),
+            herdr_workspace_id: Some("workspace-2".to_owned()),
+            herdr_tab_id: Some("tab-3".to_owned()),
+            herdr_pane_id: Some("pane-4".to_owned()),
+            ..AgentEnvironment::default()
+        };
+        let agent = resolve_agent_context_with_environment(&agent_args, &environment)
+            .expect("default HerdR session route")
+            .expect("agent");
+        assert_eq!(
+            agent.terminal_provenance,
+            TerminalProvenance::HerdR {
+                session_id: "default".to_owned(),
+                workspace_id: "workspace-2".to_owned(),
+                tab_id: "tab-3".to_owned(),
+                pane_id: "pane-4".to_owned(),
+                provider_session_id: "provider-session-8".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn herdr_route_rejects_partial_unmarked_and_conflicting_inputs() {
+        let agent_args = explicit_agent_args("codex", "provider-session-7");
+        let complete = AgentEnvironment {
+            herdr_env: Some("1".to_owned()),
+            herdr_session: Some("herdr-session-1".to_owned()),
+            herdr_workspace_id: Some("workspace-2".to_owned()),
+            herdr_tab_id: Some("tab-3".to_owned()),
+            herdr_pane_id: Some("pane-4".to_owned()),
+            ..AgentEnvironment::default()
+        };
+        let mut partial = complete.clone();
+        partial.herdr_pane_id = None;
+        assert!(
+            resolve_agent_context_with_environment(&agent_args, &partial)
+                .expect_err("partial route")
+                .message()
+                .contains("requires workspace, tab, and pane")
+        );
+
+        let mut unmarked = complete.clone();
+        unmarked.herdr_env = None;
+        assert!(
+            resolve_agent_context_with_environment(&agent_args, &unmarked)
+                .expect_err("unmarked HerdR fields are unknown route input")
+                .message()
+                .contains("HERDR_ENV=1")
+        );
+
+        let mut wrong_marker = complete.clone();
+        wrong_marker.herdr_env = Some("true".to_owned());
+        assert!(
+            resolve_agent_context_with_environment(&agent_args, &wrong_marker)
+                .expect_err("non-literal marker")
+                .message()
+                .contains("exactly 1")
+        );
+
+        let mut conflicting = complete;
+        conflicting.surface_id = Some("cmux-surface".to_owned());
+        assert!(
+            resolve_agent_context_with_environment(&agent_args, &conflicting)
+                .expect_err("HerdR and cmux routes conflict")
+                .message()
+                .contains("cannot be combined")
+        );
+    }
+
+    #[test]
     fn applied_pause_fails_before_transport_and_dry_run_is_truthful() {
         let temp = tempfile::tempdir().expect("temp");
         let paths = RuntimePaths::current_with_overrides(
@@ -1879,6 +2223,7 @@ fn main() {{
             claude_session: Some("claude-session".to_owned()),
             surface_id: None,
             goal_managed: false,
+            ..AgentEnvironment::default()
         };
         let error = resolve_agent_context_with_environment(&args(), &environment)
             .expect_err("ambiguous providers must fail");
@@ -2421,6 +2766,60 @@ fn main() {{
         assert_eq!(pinned.agent.surface_provenance, SurfaceProvenance::Explicit);
         assert_eq!(pinned.agent.surface_id.as_deref(), Some("surface-two"));
         assert_eq!(pinned.revision, 3);
+    }
+
+    #[test]
+    fn legacy_cmux_route_without_typed_provenance_upgrades_on_replay() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = RuntimePaths::current_with_overrides(
+            crate::identity::RuntimeMode::Isolated,
+            Some(temp.path().join("global")),
+            Some(temp.path().join("state")),
+        );
+        let agent_args = explicit_agent_args("codex", "legacy-cmux-session");
+        let environment = AgentEnvironment {
+            surface_id: Some("legacy-surface".to_owned()),
+            ..AgentEnvironment::default()
+        };
+        let agent = resolve_agent_context_with_environment(&agent_args, &environment)
+            .expect("agent context")
+            .expect("agent");
+        let route = agent_route_reference(&agent, "m3");
+        assert_eq!(
+            route.route_id,
+            "route-e5c34af7af87a08e42cd9b47ff6487a331dd64e2bee59b943dded14873e298cf",
+            "Absent/cmux routes must retain the pre-provenance hash contract"
+        );
+        let route_path = agent_route_path(&paths, &route.route_id);
+        persist_agent_route(&route_path, &route, &agent).expect("current route");
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&route_path).expect("read current route"))
+                .expect("route JSON");
+        legacy["agent"]
+            .as_object_mut()
+            .expect("agent object")
+            .remove("terminal_provenance");
+        std::fs::write(
+            &route_path,
+            serde_json::to_vec_pretty(&legacy).expect("legacy JSON"),
+        )
+        .expect("write legacy route");
+
+        persist_agent_route(&route_path, &route, &agent)
+            .expect("legacy route replay must upgrade in place");
+        let upgraded = load_agent_route(&route_path)
+            .expect("load upgraded route")
+            .expect("stored route");
+        assert_eq!(upgraded.route_id, route.route_id);
+        assert_eq!(upgraded.owner_id, route.owner_id);
+        assert_eq!(upgraded.revision, 2);
+        assert_eq!(
+            upgraded.agent.terminal_provenance,
+            TerminalProvenance::Cmux {
+                surface_id: "legacy-surface".to_owned(),
+            }
+        );
     }
 
     #[test]

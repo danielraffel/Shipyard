@@ -31,6 +31,18 @@ agent retains the last monitoring obligation and must not park solely in
 reliance on Shipyard. The current durable receipt foundation records a safe
 route but deliberately reports that the wake consumer is unavailable.
 
+Shipyard records terminal provenance using explicit terminal contracts. A
+HerdR handoff requires `HERDR_ENV=1` plus workspace, tab, and pane identity;
+the optional `HERDR_SESSION` name defaults to `default`. The provider session
+comes from Shipyard's resolved agent provenance, because HerdR does not export
+one. Partial or conflicting metadata fails closed. Existing cmux handoffs
+preserve their legacy route hash, while an ordinary terminal remains
+terminal-agnostic. Raw terminal
+and provider-session identifiers stay in Shipyard's private ledger and are not
+published to GitHub. Typed provenance is only a future wake address: until a
+trusted consumer advertises availability, it does not authorize pausing,
+resuming, or transferring monitoring.
+
 After an acknowledged handoff whose receipt proves the wake consumer is
 available:
 

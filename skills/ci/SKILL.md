@@ -997,6 +997,18 @@ watch solely because the receipt exists. Status reconciliation is bounded and
 paginated, selects the newest matching status, and reconciles uncertain writes
 before retrying so a restart cannot blindly duplicate the public handoff.
 
+Terminal provenance is typed rather than inferred from a generic process
+environment. A complete HerdR route requires `HERDR_ENV=1` plus workspace,
+tab, and pane identity; optional `HERDR_SESSION` defaults to `default`. The
+provider session comes from Shipyard's resolved agent provenance because HerdR
+does not export one. Partial or conflicting HerdR metadata is rejected. A
+complete cmux route keeps the established legacy route identity, and a plain
+terminal records no terminal-specific route.
+Shipyard stores raw terminal identifiers only in its private ledger and never
+publishes them in GitHub status. These records remain inactive while the typed
+wake consumer is unavailable; recording a HerdR or cmux route is not proof
+that Shipyard can resume it.
+
 ## Target configuration
 
 Targets are defined in `.shipyard/config.toml`:

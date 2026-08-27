@@ -33,6 +33,7 @@ fn terminal_owner_route(route_id: &str) -> Option<TerminalOwnerRoute> {
         route_id: Some(route_id.to_owned()),
         provider: Some("codex".to_owned()),
         resume_transport: Some("codex_queue".to_owned()),
+        terminal_provenance: Some(TerminalProvenanceKind::Absent),
     })
 }
 
@@ -2129,7 +2130,43 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
 #[test]
 fn provenance_blocker_with_opt_out_and_steward_state_makes_no_github_write() {
     let temp = tempfile::tempdir().expect("temp");
-    let actions = fake_gh(&temp, r#"echo "unexpected GitHub call: $*" >&2; exit 90"#);
+    let actions = fake_gh(
+        &temp,
+        r#"
+calls_path=$(dirname "$0")/calls
+queue_query='query=query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage}}}}}'
+pr_fields='id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup'
+if test "$#" -eq 10 \
+  && test "$1" = api \
+  && test "$2" = graphql \
+  && test "$3" = -f \
+  && test "$4" = "$queue_query" \
+  && test "$5" = -F \
+  && test "$6" = owner=owner \
+  && test "$7" = -F \
+  && test "$8" = name=repo \
+  && test "$9" = -F \
+  && test "${10}" = branch=main
+then
+  printf '%s:%s\n' "$#" "$*" >> "$calls_path"
+  printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}'
+elif test "$#" -eq 7 \
+  && test "$1" = pr \
+  && test "$2" = view \
+  && test "$3" = 42 \
+  && test "$4" = --repo \
+  && test "$5" = owner/repo \
+  && test "$6" = --json \
+  && test "$7" = "$pr_fields"
+then
+  printf '%s:%s\n' "$#" "$*" >> "$calls_path"
+  printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{"name":"shipyard:no-auto-merge"},{"name":"5·UNRESOLVED"},{"name":"shipyard:managed"},{"name":"shipyard:unmanaged"},{"name":"shipyard:needs-agent"}],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-07-26T00:00:00Z","detailsUrl":"https://github.com/owner/repo/actions/runs/100"},{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-22T00:00:00Z"},{"__typename":"StatusContext","context":"shipyard/recovery","state":"FAILURE","createdAt":"2026-08-22T00:00:01Z"}]}'
+else
+  echo "unexpected GitHub invocation argc=$# argv=$*" >&2
+  exit 90
+fi
+"#,
+    );
     let mut pr = ready_pr();
     pr.fact.labels.extend([
         "shipyard:no-auto-merge".to_owned(),
@@ -2187,13 +2224,22 @@ fn provenance_blocker_with_opt_out_and_steward_state_makes_no_github_write() {
         Some(&control),
     );
 
-    assert!(!failed);
+    assert!(!failed, "{reports:?}");
     assert_eq!(
         serde_json::to_value(&reports[0].decision).expect("serialize"),
         serde_json::json!({"action":"provenance_blocked","labels":["5·unresolved"]})
     );
     assert!(reports[0].mutation.is_none());
     assert!(reports[0].error.is_none());
+    let calls = fs::read_to_string(temp.path().join("calls")).expect("revalidation calls");
+    assert_eq!(
+        calls,
+        concat!(
+            "10:api graphql -f query=query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage}}}}} -F owner=owner -F name=repo -F branch=main\n",
+            "7:pr view 42 --repo owner/repo --json id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup\n",
+        ),
+        "only the ordered fenced revalidation reads are allowed"
+    );
 }
 
 #[cfg(unix)]
