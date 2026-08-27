@@ -3,6 +3,7 @@ use super::{
     TerminalProvenanceKind, Utc,
     handoff::TerminalOwnerRoute,
     ledger::{load_existing_ledger, save_ledger},
+    resume_record::reconcile_resume_records,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -294,11 +295,17 @@ fn update_handoffs(
     update: impl FnOnce(&mut BTreeMap<String, TerminalHandoff>) -> bool,
 ) -> Result<bool, CliFailure> {
     let original = ledger.terminal_handoffs.clone();
+    let original_resume_records = ledger.resume_records.clone();
     if !update(&mut ledger.terminal_handoffs) {
         return Ok(false);
     }
+    if let Err(error) = reconcile_resume_records(ledger) {
+        ledger.terminal_handoffs = original;
+        ledger.resume_records = original_resume_records;
+        return Err(error);
+    }
     if let Err(error) = save_ledger(ledger_path, ledger) {
-        reconcile_after_ambiguous_save(ledger_path, ledger, original);
+        reconcile_after_ambiguous_save(ledger_path, ledger, original, original_resume_records);
         return Err(error);
     }
     Ok(true)
@@ -311,18 +318,29 @@ fn persist(
     rearm_applied: bool,
 ) -> Result<(), CliFailure> {
     let original = ledger.terminal_handoffs.clone();
-    let changed = match persist_inner(ledger, incoming, rearm_applied) {
+    let original_resume_records = ledger.resume_records.clone();
+    let handoff_changed = match persist_inner(ledger, incoming, rearm_applied) {
         Ok(changed) => changed,
         Err(error) => {
             ledger.terminal_handoffs = original;
+            ledger.resume_records = original_resume_records;
             return Err(error);
         }
     };
+    let resume_changed = match reconcile_resume_records(ledger) {
+        Ok(changed) => changed,
+        Err(error) => {
+            ledger.terminal_handoffs = original;
+            ledger.resume_records = original_resume_records;
+            return Err(error);
+        }
+    };
+    let changed = handoff_changed || resume_changed;
     if !changed {
         return Ok(());
     }
     if let Err(error) = save_ledger(ledger_path, ledger) {
-        reconcile_after_ambiguous_save(ledger_path, ledger, original);
+        reconcile_after_ambiguous_save(ledger_path, ledger, original, original_resume_records);
         return Err(error);
     }
     Ok(())
@@ -351,6 +369,7 @@ fn persist_inner(
             && incoming.ownership_generation > existing.ownership_generation;
         let route_degraded = existing.owner_disposition == "original_owner"
             && incoming.owner_disposition == "unroutable_private_route";
+        let cmux_provenance_enriched = cmux_provenance_can_enrich(existing, &incoming);
         let owner_can_change = route_can_resolve || ownership_can_transfer;
         let owner_may_differ = owner_can_change || route_degraded;
         if existing.repo != incoming.repo
@@ -369,6 +388,7 @@ fn persist_inner(
             || (!owner_may_differ && existing.owner_provider != incoming.owner_provider)
             || (!owner_may_differ && existing.resume_transport != incoming.resume_transport)
             || (!owner_may_differ
+                && !cmux_provenance_enriched
                 && !same_terminal_provenance(
                     existing.owner_terminal_provenance,
                     incoming.owner_terminal_provenance,
@@ -383,6 +403,7 @@ fn persist_inner(
         }
         let record_changed = owner_can_change
             || route_degraded
+            || cmux_provenance_enriched
             || (rearm_applied && existing_phase != TerminalHandoffPhase::Pending)
             || rearm_actionable;
         if record_changed {
@@ -404,6 +425,8 @@ fn persist_inner(
                 record.owner_route_id = incoming.owner_route_id;
                 record.owner_provider = incoming.owner_provider;
                 record.resume_transport = incoming.resume_transport;
+                record.owner_terminal_provenance = incoming.owner_terminal_provenance;
+            } else if cmux_provenance_enriched {
                 record.owner_terminal_provenance = incoming.owner_terminal_provenance;
             }
             if rearm_applied && existing_phase != TerminalHandoffPhase::Pending {
@@ -436,6 +459,13 @@ fn same_terminal_provenance(
     existing.unwrap_or_default() == incoming.unwrap_or_default()
 }
 
+fn cmux_provenance_can_enrich(existing: &TerminalHandoff, incoming: &TerminalHandoff) -> bool {
+    matches!(
+        existing.owner_terminal_provenance,
+        None | Some(TerminalProvenanceKind::Absent)
+    ) && incoming.owner_terminal_provenance == Some(TerminalProvenanceKind::Cmux)
+}
+
 fn resolve_conflicting_success(ledger: &mut StewardLedger, incoming: &TerminalHandoff) -> bool {
     if incoming.outcome != TerminalHandoffOutcome::ActionableFailure {
         return false;
@@ -464,13 +494,16 @@ fn reconcile_after_ambiguous_save(
     ledger_path: &Path,
     ledger: &mut StewardLedger,
     fallback_handoffs: BTreeMap<String, TerminalHandoff>,
+    fallback_resume_records: BTreeMap<String, super::ResumeRecordV1>,
 ) {
     // `save_ledger` may fail after the atomic rename if only directory sync
     // failed. Reloading distinguishes the published old/new image and prevents
     // a later final save from overwriting it with a guessed in-memory state.
-    match load_existing_ledger(ledger_path) {
-        Ok(Some(published)) => *ledger = published,
-        Ok(None) | Err(_) => ledger.terminal_handoffs = fallback_handoffs,
+    if let Ok(Some(published)) = load_existing_ledger(ledger_path) {
+        *ledger = published;
+    } else {
+        ledger.terminal_handoffs = fallback_handoffs;
+        ledger.resume_records = fallback_resume_records;
     }
 }
 

@@ -1,6 +1,7 @@
 use super::*;
 use crate::app::merge_steward_cmd::TerminalProvenanceKind;
 use crate::app::merge_steward_cmd::ledger::load_ledger;
+use crate::app::merge_steward_cmd::{ResumeAdapterV1, ResumeRecordPhase};
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -137,6 +138,80 @@ fn legacy_terminal_record_without_typed_provenance_replays_idempotently() {
         .expect("terminal record");
     assert_eq!(record.owner_terminal_provenance, None);
     assert!(!record.wake_consumer_available);
+}
+
+#[test]
+fn legacy_absent_provenance_enriches_to_cmux_without_weakening_route_fences() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("merge-steward.json");
+    let mut ledger = StewardLedger::default();
+    let mut legacy = owner("cmux-route");
+    legacy.provider = Some("future-provider".to_owned());
+    legacy.resume_transport = Some("future-native".to_owned());
+    persist_actionable_failure(
+        &path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        HEAD,
+        Some(legacy.clone()),
+        vec!["windows@app=9".to_owned()],
+    )
+    .expect("legacy absent provenance");
+    assert_eq!(
+        ledger
+            .resume_records
+            .values()
+            .next()
+            .expect("legacy resume")
+            .adapter,
+        None
+    );
+
+    legacy.terminal_provenance = Some(TerminalProvenanceKind::Cmux);
+    persist_actionable_failure(
+        &path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        HEAD,
+        Some(legacy),
+        vec!["windows@app=9".to_owned()],
+    )
+    .expect("compatible cmux enrichment");
+    let handoff = ledger.terminal_handoffs.values().next().expect("handoff");
+    assert_eq!(
+        handoff.owner_terminal_provenance,
+        Some(TerminalProvenanceKind::Cmux)
+    );
+    let resume = ledger.resume_records.values().next().expect("resume");
+    assert!(matches!(
+        resume.adapter,
+        Some(ResumeAdapterV1::Cmux { ref route_id }) if route_id == "cmux-route"
+    ));
+    assert!(!resume.dispatch_enabled);
+
+    let mut drifted = owner("different-route");
+    drifted.provider = Some("future-provider".to_owned());
+    drifted.resume_transport = Some("future-native".to_owned());
+    drifted.terminal_provenance = Some(TerminalProvenanceKind::Cmux);
+    assert!(
+        persist_actionable_failure(
+            &path,
+            &mut ledger,
+            "owner/repo",
+            "main",
+            7,
+            HEAD,
+            Some(drifted),
+            vec!["windows@app=9".to_owned()],
+        )
+        .expect_err("route drift remains fenced")
+        .message()
+        .contains("identity changed")
+    );
 }
 
 #[test]
@@ -533,19 +608,29 @@ fn ambiguous_save_distinguishes_absent_target_from_published_empty_ledger() {
     )
     .expect("fallback obligation");
     let fallback = ledger.terminal_handoffs.clone();
+    let fallback_resume_records = ledger.resume_records.clone();
 
     ledger.terminal_handoffs.clear();
+    ledger.resume_records.clear();
     reconcile_after_ambiguous_save(
         &temp.path().join("absent.json"),
         &mut ledger,
         fallback.clone(),
+        fallback_resume_records.clone(),
     );
     assert_eq!(ledger.terminal_handoffs, fallback);
+    assert_eq!(ledger.resume_records, fallback_resume_records);
 
     let published_empty = temp.path().join("published-empty.json");
     save_ledger(&published_empty, &StewardLedger::default()).expect("published empty ledger");
-    reconcile_after_ambiguous_save(&published_empty, &mut ledger, fallback);
+    reconcile_after_ambiguous_save(
+        &published_empty,
+        &mut ledger,
+        fallback,
+        fallback_resume_records,
+    );
     assert!(ledger.terminal_handoffs.is_empty());
+    assert!(ledger.resume_records.is_empty());
 }
 
 #[test]
@@ -579,6 +664,55 @@ fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
     );
     assert!(!record.wake_consumer_available);
     assert_eq!(record.phase, TerminalHandoffPhase::Recorded);
+}
+
+#[test]
+fn resume_intent_survives_restart_and_failed_replacement_as_one_ledger_image() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("merge-steward.json");
+    let mut ledger = StewardLedger::default();
+    persist_actionable_failure(
+        &path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        HEAD,
+        Some(owner("route-a")),
+        vec!["windows@app=9".to_owned()],
+    )
+    .expect("durable actionable handoff and resume intent");
+
+    let mut restarted = load_ledger(&path).expect("restart ledger");
+    assert_eq!(restarted.terminal_handoffs.len(), 1);
+    assert_eq!(restarted.resume_records.len(), 1);
+    let resume = restarted
+        .resume_records
+        .values()
+        .next()
+        .expect("resume intent");
+    assert_eq!(resume.head_sha, HEAD);
+    assert_eq!(resume.ownership_generation, Some(1));
+    assert_eq!(resume.phase, ResumeRecordPhase::Recorded);
+    assert!(!resume.dispatch_enabled);
+    assert!(matches!(
+        resume.adapter,
+        Some(ResumeAdapterV1::ProviderNative {
+            ref provider,
+            ref transport,
+            ref route_id,
+        }) if provider == "codex" && transport == "codex_queue" && route_id == "route-a"
+    ));
+
+    let before_handoffs = restarted.terminal_handoffs.clone();
+    let before_resumes = restarted.resume_records.clone();
+    let blocked_parent = temp.path().join("not-a-directory");
+    std::fs::write(&blocked_parent, "occupied").expect("block ledger parent");
+    let blocked_path = blocked_parent.join("ledger.json");
+    resolve_terminal_handoffs(&blocked_path, &mut restarted, "owner/repo", "main", 7, HEAD)
+        .expect_err("atomic ledger publication fails");
+    assert_eq!(restarted.terminal_handoffs, before_handoffs);
+    assert_eq!(restarted.resume_records, before_resumes);
 }
 
 #[test]
