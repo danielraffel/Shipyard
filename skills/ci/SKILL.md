@@ -1599,6 +1599,16 @@ A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever the ma
 
 **Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `scripts/ci_matrix.py`, release packaging scripts, or `src/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.
 
+**Durable resume projections are two-dimensional and inert until activation.**
+Keep terminal runtime (`cmux` or optional HerdR) separate from agent/provider
+transport (native Codex/Claude plus any launch-profile router such as
+Subrouter). A terminal adapter must not replace or imply the provider route,
+and missing Subrouter provenance must never fall back to direct `codex`.
+Reconcile resume records even when the authoritative terminal-handoff update is
+a no-op so legacy ledgers backfill on restart. Publish or roll back both maps as
+one crash-consistent ledger image, and keep `dispatch_enabled=false` until the
+outbox, acknowledgment, and physical canary gates are separately complete.
+
 **Detached daemon temp roots must not depend on the launching shell.** A daemon
 started from launchd or a minimal SSH environment may inherit no `TMPDIR`.
 Platform libraries then fall back to `/tmp`, which is a symlink on macOS and is
