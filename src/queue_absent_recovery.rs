@@ -1016,6 +1016,7 @@ mod tests {
                 advisory_targets: BTreeSet::new(),
                 adopt_head: false,
                 pr_snapshot_file: None,
+                metadata_authority_receipt: None,
                 targets: Vec::new(),
             };
             let source_job_id = "lost-source".to_owned();

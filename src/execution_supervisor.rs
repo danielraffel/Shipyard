@@ -31,6 +31,7 @@ use crate::queue_scheduler::{AlreadyMergedCancellation, AlreadyMergedObserver};
 use crate::ship::persist_terminal_outcome;
 
 const MAX_WORKERS: usize = 1;
+const MAX_METADATA_CONTROLLERS: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkerObservation {
@@ -632,10 +633,21 @@ impl ExecutionSupervisor {
         let running = queue.get_running()?;
         let running_resources = running_resource_claims(&running, &request_store)?;
         let mut occupied = running_resources.claims;
-        let live_count = running.len();
+        let mut live_native_count = 0usize;
+        let mut live_metadata_count = 0usize;
+        for job in &running {
+            match request_store.load(&job.id) {
+                Ok(Some(envelope)) if envelope.is_metadata_authority_controller() => {
+                    live_metadata_count += 1;
+                }
+                _ => live_native_count += 1,
+            }
+        }
 
         let pending = queue.get_pending()?;
         let mut selected = Vec::new();
+        let mut selected_native_count = 0usize;
+        let mut selected_metadata_count = 0usize;
         let mut cancellations = Vec::new();
         let now = Utc::now();
         for job in pending {
@@ -693,11 +705,23 @@ impl ExecutionSupervisor {
             // Keep scanning after worker capacity is full so malformed or
             // legacy pending envelopes cannot linger indefinitely behind a
             // valid job selected earlier in this tick.
-            if live_count + selected.len() >= MAX_WORKERS {
-                continue;
+            let metadata_controller = envelope.is_metadata_authority_controller();
+            if metadata_controller {
+                if live_metadata_count + selected_metadata_count >= MAX_METADATA_CONTROLLERS {
+                    continue;
+                }
+            } else {
+                if live_native_count + selected_native_count >= MAX_WORKERS {
+                    continue;
+                }
             }
             if !admissible(&envelope, &occupied) {
                 continue;
+            }
+            if metadata_controller {
+                selected_metadata_count += 1;
+            } else {
+                selected_native_count += 1;
             }
             occupied.extend(resource_claims(&envelope));
             selected.push(job.id);
@@ -1501,6 +1525,71 @@ mod tests {
             resume_from: None,
             advisory_targets: BTreeSet::new(),
             adopt_head: false,
+            metadata_authority_receipt: None,
+            targets: Vec::new(),
+        });
+        QueueRequestStore::new(state_dir)
+            .expect("store")
+            .save(&request)
+            .expect("request");
+        job
+    }
+
+    fn queued_metadata_job(state_dir: &Path, job_id: &str) -> Job {
+        let mut job = Job::create(
+            "b".repeat(40),
+            "docs/fast-path",
+            Vec::new(),
+            ValidationMode::Full,
+            Priority::Normal,
+        )
+        .with_kind(JobKind::Ship);
+        job.id = job_id.to_owned();
+        Queue::new(state_dir)
+            .expect("queue")
+            .enqueue(job.clone())
+            .expect("enqueue");
+        let mut request = envelope(&[], true);
+        request.job_id = job_id.to_owned();
+        request.kind = QueuedExecutionKind::Ship;
+        request.resource_plan = JobResourcePlan::default();
+        request.request = QueuedExecutionRequest::Ship(QueuedShipRequest {
+            pr: 42,
+            repo: "owner/repo".to_owned(),
+            branch: "docs/fast-path".to_owned(),
+            base_branch: "main".to_owned(),
+            sha: "b".repeat(40),
+            commit_subject: "docs".to_owned(),
+            pr_url: None,
+            pr_title: None,
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            advisory_targets: BTreeSet::new(),
+            adopt_head: false,
+            metadata_authority_receipt: Some(crate::metadata_authority::MetadataAuthorityReceipt {
+                schema_version: 1,
+                repository: "owner/repo".to_owned(),
+                pull_request: 42,
+                base_ref: "main".to_owned(),
+                base_sha: "a".repeat(40),
+                head_sha: "b".repeat(40),
+                tree_sha: "c".repeat(40),
+                observation_target: "mac".to_owned(),
+                policy_digest: "d".repeat(64),
+                changed_paths_digest: "e".repeat(64),
+                required_checks_digest: "f".repeat(64),
+                changed_paths: vec!["docs/guide.md".to_owned()],
+                required_checks: vec!["docs".to_owned()],
+                hosted_checks: vec![crate::metadata_authority::HostedCheckObservation {
+                    name: "docs".to_owned(),
+                    status: "COMPLETED".to_owned(),
+                    conclusion: "SUCCESS".to_owned(),
+                    producer: "app:15368".to_owned(),
+                }],
+            }),
             targets: Vec::new(),
         });
         QueueRequestStore::new(state_dir)
@@ -2178,6 +2267,38 @@ mod tests {
         let mut child = supervisor.children.remove("valid").expect("valid worker");
         terminate_process_group(child.id());
         let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_metadata_controller_does_not_consume_native_worker_slot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_metadata_job(temp.path(), "metadata");
+        let mut supervisor = ExecutionSupervisor::new(
+            fake_worker(temp.path()),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor.tick().expect("start metadata controller");
+        queued_job(temp.path(), "native");
+
+        supervisor.admit_pending().expect("admit native worker");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        assert_eq!(
+            queue.get("metadata").expect("read").expect("job").status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            queue.get("native").expect("read").expect("job").status,
+            JobStatus::Running
+        );
+        for job_id in ["metadata", "native"] {
+            let mut child = supervisor.children.remove(job_id).expect("controller");
+            terminate_process_group(child.id());
+            let _ = child.wait();
+        }
     }
 
     #[cfg(unix)]

@@ -95,6 +95,7 @@ pub(super) struct ShipStewardHandoff {
 }
 
 mod changed_surface_execution;
+mod metadata_authority;
 mod prepush_changed_surface;
 mod provenance;
 use changed_surface_execution::apply_changed_surface_execution;
@@ -117,6 +118,20 @@ pub(super) fn ship_command<W: Write>(
             || args.pr_snapshot_file.is_some(),
         config.get_str("github.auth.source"),
     )?;
+    let branch = git_required(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let sha = git_required(cwd, &["rev-parse", "HEAD"])?;
+    let commit_subject =
+        git_optional(cwd, &["log", "-1", "--format=%s", "HEAD"]).unwrap_or_default();
+    let repo = git_repo_slug(cwd).unwrap_or_default();
+    let defer_native_preflight = match crate::metadata_authority::trusted_policy(config, &repo) {
+        Ok(policy) => policy.is_some(),
+        Err(error) => {
+            let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                "warning: metadata authority policy unavailable; preserving ordinary full validation: {error}"
+            ));
+            false
+        }
+    };
     let preflight_dispatcher = ExecutorDispatcher::new(None);
     let mut targets = prepare_ship_targets(
         config,
@@ -126,13 +141,8 @@ pub(super) fn ship_command<W: Write>(
         &args,
         json_mode,
         stdout,
+        !defer_native_preflight,
     )?;
-
-    let branch = git_required(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let sha = git_required(cwd, &["rev-parse", "HEAD"])?;
-    let commit_subject =
-        git_optional(cwd, &["log", "-1", "--format=%s", "HEAD"]).unwrap_or_default();
-    let repo = git_repo_slug(cwd).unwrap_or_default();
     if should_auto_create_base(&args.base, args.auto_create_base) {
         maybe_auto_create_base_branch(cwd, &args.base, config, args.gh_command.as_deref());
     }
@@ -230,15 +240,40 @@ pub(super) fn ship_command<W: Write>(
         stdout,
     )?;
 
-    apply_changed_surface_execution(
+    let metadata_authority_receipt = metadata_authority::observe_and_authorize(
         config,
         cwd,
         &runtime_paths.state_dir,
         &repo,
-        Some(pr_context.number),
-        args.resume_from.as_deref(),
-        &mut targets,
+        pr_context.number,
+        &sha,
+        &targets,
     )?;
+    if metadata_authority_receipt.is_some() {
+        targets.clear();
+    } else {
+        if defer_native_preflight {
+            targets = prepare_ship_targets(
+                config,
+                cwd,
+                runtime_paths,
+                &preflight_dispatcher,
+                &args,
+                json_mode,
+                stdout,
+                true,
+            )?;
+        }
+        apply_changed_surface_execution(
+            config,
+            cwd,
+            &runtime_paths.state_dir,
+            &repo,
+            Some(pr_context.number),
+            args.resume_from.as_deref(),
+            &mut targets,
+        )?;
+    }
 
     let mut queue = Queue::new(runtime_paths.state_dir.clone())
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -271,6 +306,7 @@ pub(super) fn ship_command<W: Write>(
         advisory_targets: lane_policy.advisory_targets.clone(),
         adopt_head: args.adopt_head,
         pr_snapshot_file: args.pr_snapshot_file.clone(),
+        metadata_authority_receipt,
         targets,
     };
 
@@ -485,6 +521,7 @@ fn prepare_ship_targets<W: Write>(
     args: &ShipCommandArgs,
     json_mode: bool,
     stdout: &mut W,
+    perform_preflight: bool,
 ) -> Result<Vec<ResolvedTarget>, CliFailure> {
     let resolved = resolve_targets(config, ValidationMode::Full)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -495,6 +532,9 @@ fn prepare_ship_targets<W: Write>(
             2,
             "No targets remain after --skip-target filtering.",
         ));
+    }
+    if !perform_preflight {
+        return Ok(targets);
     }
     let mut preflight = collect_ship_preflight_with_options(
         config,

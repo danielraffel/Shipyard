@@ -288,6 +288,7 @@ fn daemon_finish_selects_repository_when_pr_numbers_collide() {
         advisory_targets: std::collections::BTreeSet::new(),
         adopt_head: false,
         pr_snapshot_file: None,
+        metadata_authority_receipt: None,
         targets: Vec::new(),
     };
     let job = Job::create(
@@ -393,6 +394,7 @@ fn daemon_finish_preserves_green_validation_when_ship_state_is_missing() {
         advisory_targets: std::collections::BTreeSet::new(),
         adopt_head: false,
         pr_snapshot_file: Some(snapshot),
+        metadata_authority_receipt: None,
         targets: Vec::new(),
     };
     let job = Job::create(
@@ -478,6 +480,7 @@ fn daemon_finish_refuses_same_head_replacement_validation_identity() {
         advisory_targets: std::collections::BTreeSet::new(),
         adopt_head: false,
         pr_snapshot_file: None,
+        metadata_authority_receipt: None,
         targets: Vec::new(),
     };
     let job = Job::create(

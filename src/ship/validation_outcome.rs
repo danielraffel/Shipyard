@@ -138,7 +138,12 @@ fn validation_proof_metadata_matches(
     job: &Job,
     state: &ShipState,
 ) -> bool {
-    let validation_policy = policy_signature(&request.targets, &job.target_names, request.mode);
+    let validation_policy = policy_signature(
+        &request.targets,
+        &job.target_names,
+        request.mode,
+        request.metadata_authority_receipt.as_ref(),
+    );
     state.pr == request.pr
         && state.repo.eq_ignore_ascii_case(&request.repo)
         && state.branch == request.branch
@@ -151,12 +156,20 @@ pub(super) fn policy_signature(
     targets: &[ResolvedTarget],
     target_names: &[String],
     mode: ValidationMode,
+    metadata_receipt: Option<&crate::metadata_authority::MetadataAuthorityReceipt>,
 ) -> String {
     let platforms = targets
         .iter()
         .map(|target| target.platform.clone())
         .collect::<Vec<_>>();
-    compute_policy_signature(&platforms, target_names, policy_mode_label(mode))
+    let mut identity_names = target_names.to_vec();
+    if let Some(receipt) = metadata_receipt {
+        identity_names.push(format!(
+            "metadata-receipt:{}:{}:{}",
+            receipt.policy_digest, receipt.changed_paths_digest, receipt.required_checks_digest
+        ));
+    }
+    compute_policy_signature(&platforms, &identity_names, policy_mode_label(mode))
 }
 
 fn policy_mode_label(mode: ValidationMode) -> &'static str {
@@ -232,6 +245,7 @@ mod tests {
             advisory_targets: BTreeSet::new(),
             adopt_head: false,
             pr_snapshot_file: None,
+            metadata_authority_receipt: None,
             targets: Vec::new(),
         };
         let (job, log_dir) = terminal_ship_job_with_missing_manifest(&state_dir, &request);
@@ -283,7 +297,7 @@ mod tests {
         assert!(!resumed_existing_state);
         assert_eq!(
             ship_state.policy_signature,
-            policy_signature(&request.targets, &job.target_names, request.mode)
+            policy_signature(&request.targets, &job.target_names, request.mode, None)
         );
         assert_eq!(ship_state.pr_title, request.pr_title.as_deref().unwrap());
         assert_eq!(ship_state.evidence_snapshot["local"], "pass");

@@ -137,6 +137,16 @@ fresh, non-resumed execution of the full contract the plan is policy-blocked,
 not redirected into a known-incompatible full Debug run.
 See [`docs/changed-surface-selection.md`](../../docs/changed-surface-selection.md).
 
+Metadata/docs-only authority is a separate trusted machine-global fast path.
+It may clear native targets only for a complete exact base/head/tree/path
+closure covered by narrow repository globs and exact required contexts bound
+to their GitHub App or status-actor database identity. Only terminal
+`SUCCESS` counts. Shipyard reobserves the protected base, PR head, and hosted
+checks at worker start, carries an immutable crash-consistent receipt, and
+runs the controller outside native-worker capacity. Unknown paths, incomplete
+pagination, stale or replaced checks, producer/policy/SHA drift, malformed
+config, or receipt uncertainty retain ordinary full validation.
+
 The first build-once/shard-many surface is also shadow-only and default-off.
 Its pure canary admission accepts only Pulp's exact numeric repository identity
 and slug plus its mac target, with an M3 builder and a freshly observed M1 LAN

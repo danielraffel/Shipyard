@@ -26,17 +26,17 @@ use crate::output::write_json_envelope;
 const FILES_PER_PAGE: usize = 100;
 const MAX_FILE_PAGES: usize = 100;
 
-pub(super) struct ChangedSurfacePlanArgs {
-    pub(super) target: String,
-    pub(super) pr: u64,
-    pub(super) repo: Option<String>,
+pub(crate) struct ChangedSurfacePlanArgs {
+    pub(crate) target: String,
+    pub(crate) pr: u64,
+    pub(crate) repo: Option<String>,
 }
 
-pub(super) struct ChangedSurfaceObservation {
-    pub(super) receipt: SelectionReceipt,
-    pub(super) input: ExactHeadInput,
-    pub(super) policy: Result<ChangedSurfacePolicy, String>,
-    pub(super) workflow_digest: String,
+pub(crate) struct ChangedSurfaceObservation {
+    pub(crate) receipt: SelectionReceipt,
+    pub(crate) input: ExactHeadInput,
+    pub(crate) policy: Result<ChangedSurfacePolicy, String>,
+    pub(crate) workflow_digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,7 +119,7 @@ pub(super) fn changed_surface_plan_command<W: Write>(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) fn observe_changed_surface_plan(
+pub(crate) fn observe_changed_surface_plan(
     args: &ChangedSurfacePlanArgs,
     config: &LoadedConfig,
     cwd: &Path,

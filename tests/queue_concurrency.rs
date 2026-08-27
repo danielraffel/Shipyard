@@ -95,6 +95,7 @@ fn ship_request_for_repo(
         advisory_targets: BTreeSet::new(),
         adopt_head: false,
         pr_snapshot_file: None,
+        metadata_authority_receipt: None,
         targets: vec![target],
     }
 }

@@ -1164,6 +1164,7 @@ mod tests {
             advisory_targets: BTreeSet::new(),
             adopt_head: false,
             pr_snapshot_file: None,
+            metadata_authority_receipt: None,
             targets: vec![target],
         };
         QueuedExecutionEnvelope::from_ship_request(job_id, "/repo", &request)
@@ -1296,6 +1297,7 @@ mod tests {
                     resume_from: None,
                     advisory_targets: std::collections::BTreeSet::default(),
                     adopt_head: false,
+                    metadata_authority_receipt: None,
                     targets: Vec::new(),
                 }),
             })

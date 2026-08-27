@@ -44,6 +44,7 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
 | Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |
 | Shadow-plan changed-surface tests for an exact PR head | `shipyard --json changed-surface-plan --repo <owner/repo> --pr <n> --target <name>` (base-owned literal tests only; full suite remains authoritative; identity mismatch hard-fails, ambiguity falls back full) |
+| Authorize an exact metadata-only PR without a native worker | Configure trusted machine-global `[metadata_authority]` plus one repository entry containing a narrow path allowlist and exact required hosted checks. `shipyard pr` emits an immutable exact base/head/tree/path/check/policy receipt and queues zero native targets only when every observation agrees; unknown paths, stale/pending checks, SHA drift, or policy ambiguity preserve full validation or refuse execution. Project config cannot activate or widen this tier. |
 | Read one exact shadow-comparison result | `shipyard --json changed-surface-trial-status --repo <owner/repo> --pr <n> --target <name> --head <sha>` (read-only; exit 3 collecting, 0 ready, 1 rejected; validates exact receipt identity plus conservative timing/savings and never promotes policy or merge readiness) |
 | Assess the first Pulp macOS sharding canary | Library-only and default-off: the pure `parallel_proof_canary` contract accepts only Pulp's exact numeric repository identity and slug plus an independently observed `mac` target, M3 build + fresh M1 LAN eligibility, authenticated persistent normalized staging roots, exact host-local cache generations, preserved CTest topology, manifest-bound timing evidence, material predicted savings, and an exact non-rounded transfer-overhead ceiling. It cannot dispatch work or authorize a merge; M5 remains optional and excluded until roaming recovery is separately proven. |
 | Produce a canonical shadow CTest inventory | Library-only: translate bounded CTest JSON-v1 with an independent exhaustive count/sorted-ID digest, exact configuration, bounded controller-owned capabilities, and explicit host/fleet scope for every resource lock. Filtered, ambiguous, disabled, non-executable, `REQUIRED_FILES`-dependent, or unsupported graphs fail closed. This does not invoke CTest, dispatch work, or authorize a merge. |
@@ -1079,6 +1080,40 @@ Do not copy a full repository, build tree, Skia/Dawn cache, or other heavyweight
 cache to feed a shard; prefer an exact cache-generation reference, basis-aware
 Git objects, then a compressed immutable artifact. See
 [`docs/artifact-transport.md`](../../docs/artifact-transport.md).
+
+## Exact-head metadata-only authority
+
+This tier is deliberately machine-global because a pull request must never
+authorize itself to skip native validation. Configure each repository
+explicitly in the machine-global `config.toml` reported by `shipyard paths`:
+
+```toml
+[metadata_authority]
+mode = "authoritative"
+
+[metadata_authority.repositories."generous-corp/pulp"]
+schema_version = 1
+repository = "generous-corp/pulp"
+base_ref = "main"
+allowed_paths = ["docs/**"]
+required_checks = ["Docs consistency@app:15368", "CodeQL@app:15368"]
+```
+
+Use each exact hosted context name plus its GitHub App or status-creator
+database identity (`name@app:<database-id>` or
+`name@actor:<actor-type>:<database-id>`). Keep the
+path list narrow: repository-wide patterns such as `**` are rejected. If the
+PR changes any non-allowed path, either changed-path source is incomplete, the
+protected base or merge base moved, a required check is missing/pending/red or
+duplicated, or the daemon cannot reproduce the receipt identity, Shipyard does
+not spend native capacity under this tier. Submission falls back to the normal
+full target set when it can do so safely; stale execution is refused.
+
+An authorized queue envelope has an empty target/resource plan. Its durable
+`metadata-authority/<repo>/pr-<n>/<head>/receipt.json` binds the exact base,
+head, tree, complete changed paths, successful hosted-check observations, and
+trusted policy digest. This is authority only for zero-native validation; it
+does not relax protected GitHub checks or merge governance.
 
 ## Exact-head changed-surface shadow planning
 
