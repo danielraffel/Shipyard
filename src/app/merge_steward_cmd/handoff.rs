@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use crate::paths::RuntimePaths;
 use crate::queue::replace_file_with_windows_retry;
@@ -1414,10 +1414,140 @@ fn prepare_launch_profile_candidate(
             "launch profile worktree provenance must match the exact handoff repository and head",
         ));
     }
+    verify_launch_profile_worktree(&profile)?;
     Ok(LaunchProfileCandidateV1 {
         profile_digest: launch_profile_digest(&profile)?,
         profile,
     })
+}
+
+fn verify_launch_profile_worktree(profile: &LaunchProfileV1) -> Result<(), CliFailure> {
+    let claimed_path = Path::new(&profile.worktree.path);
+    let canonical_path = claimed_path.canonicalize().map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("launch profile worktree path is unavailable: {error}"),
+        )
+    })?;
+    if claimed_path != canonical_path {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree path must be its canonical filesystem path",
+        ));
+    }
+
+    let top_level = git_worktree_value(&canonical_path, &["rev-parse", "--show-toplevel"])?;
+    let canonical_top_level = Path::new(&top_level).canonicalize().map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("launch profile Git top-level path is unavailable: {error}"),
+        )
+    })?;
+    if canonical_top_level != canonical_path {
+        return Err(CliFailure::new(
+            1,
+            "launch profile path must name the exact Git worktree root",
+        ));
+    }
+
+    let observed_head = git_worktree_value(&canonical_path, &["rev-parse", "HEAD"])?;
+    if !observed_head.eq_ignore_ascii_case(&profile.worktree.head_sha) {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree HEAD does not match its claimed exact head",
+        ));
+    }
+    let remote = git_worktree_value(&canonical_path, &["remote", "get-url", "origin"])?;
+    let observed_repo = crate::gh::parse_github_remote_slug(&remote).ok_or_else(|| {
+        CliFailure::new(
+            1,
+            "launch profile worktree origin is not a canonical GitHub repository",
+        )
+    })?;
+    if !observed_repo.eq_ignore_ascii_case(&profile.worktree.repository) {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree origin does not match its claimed repository",
+        ));
+    }
+
+    let branch = git_worktree_value(
+        &canonical_path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )?;
+    if profile.worktree.lineage_id != branch {
+        return Err(CliFailure::new(
+            1,
+            "launch profile lineage ID must match the worktree's exact branch",
+        ));
+    }
+    let lineage_key = format!("branch.{branch}.pulpWorktree");
+    let status = git_worktree_value(
+        &canonical_path,
+        &[
+            "config",
+            "--local",
+            "--get",
+            &format!("{lineage_key}Status"),
+        ],
+    )?;
+    let durable_head = git_worktree_value(
+        &canonical_path,
+        &[
+            "config",
+            "--local",
+            "--get",
+            &format!("{lineage_key}DurableSha"),
+        ],
+    )?;
+    let last_path = git_worktree_value(
+        &canonical_path,
+        &[
+            "config",
+            "--local",
+            "--get",
+            &format!("{lineage_key}LastPath"),
+        ],
+    )?;
+    let canonical_last_path = Path::new(&last_path).canonicalize().map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("launch profile lineage path is unavailable: {error}"),
+        )
+    })?;
+    if status != "active"
+        || !durable_head.eq_ignore_ascii_case(&observed_head)
+        || canonical_last_path != canonical_path
+    {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree lineage is not active at the exact path and head",
+        ));
+    }
+    Ok(())
+}
+
+fn git_worktree_value(path: &Path, args: &[&str]) -> Result<String, CliFailure> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .map_err(|error| {
+            CliFailure::new(
+                1,
+                format!("failed to inspect launch profile worktree: {error}"),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree or lineage authority could not be verified",
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| CliFailure::new(1, "launch profile Git metadata was not UTF-8"))
 }
 
 fn bind_launch_profile(

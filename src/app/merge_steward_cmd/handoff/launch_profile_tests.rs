@@ -3,12 +3,77 @@ use crate::app::merge_steward_cmd::launch_profile::{
     CheckpointProvenanceV1, LaunchProfileV1, ProviderMetadataV1, RecoveryPolicyV1,
     SessionProvenanceV1, WorktreeProvenanceV1,
 };
+use std::process::Command;
+use std::sync::OnceLock;
+
+struct ActiveWorktreeFixture {
+    temp: tempfile::TempDir,
+    path: String,
+    head: String,
+    branch: String,
+}
+
+fn active_worktree() -> &'static ActiveWorktreeFixture {
+    static FIXTURE: OnceLock<ActiveWorktreeFixture> = OnceLock::new();
+    FIXTURE.get_or_init(make_worktree_fixture)
+}
+
+fn make_worktree_fixture() -> ActiveWorktreeFixture {
+    let temp = tempfile::tempdir().expect("temp Git repository");
+    let path = temp.path().canonicalize().expect("canonical temp path");
+    let run = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(args)
+            .output()
+            .expect("run Git fixture command");
+        assert!(
+            output.status.success(),
+            "Git fixture command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("Git fixture output")
+            .trim()
+            .to_owned()
+    };
+    run(&["init", "-b", "launch-profile-test"]);
+    run(&["config", "user.name", "Shipyard Test"]);
+    run(&["config", "user.email", "shipyard-test@example.invalid"]);
+    run(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/owner/repo.git",
+    ]);
+    std::fs::write(path.join("fixture"), "launch profile\n").expect("fixture file");
+    run(&["add", "fixture"]);
+    run(&["commit", "-m", "fixture"]);
+    let head = run(&["rev-parse", "HEAD"]);
+    let branch = run(&["branch", "--show-current"]);
+    let prefix = format!("branch.{branch}.pulpWorktree");
+    run(&["config", &format!("{prefix}Status"), "active"]);
+    run(&["config", &format!("{prefix}DurableSha"), &head]);
+    run(&[
+        "config",
+        &format!("{prefix}LastPath"),
+        path.to_str().expect("UTF-8 fixture path"),
+    ]);
+    ActiveWorktreeFixture {
+        temp,
+        path: path.to_string_lossy().into_owned(),
+        head,
+        branch,
+    }
+}
 
 fn handoff_args() -> StewardHandoffArgs {
+    let fixture = active_worktree();
     StewardHandoffArgs {
         repo: Some("owner/repo".into()),
         pr: 7,
-        head: "a".repeat(40),
+        head: fixture.head.clone(),
         workstream_id: "SY-LF-TEST".into(),
         context_url: Some("https://linear.example/SY-LF-TEST".into()),
         agent_provider: Some("codex".into()),
@@ -24,6 +89,7 @@ fn handoff_args() -> StewardHandoffArgs {
 }
 
 fn profile(resume_flag: &str) -> LaunchProfileV1 {
+    let fixture = active_worktree();
     LaunchProfileV1 {
         schema_version: 1,
         launch_argv: vec![
@@ -53,13 +119,9 @@ fn profile(resume_flag: &str) -> LaunchProfileV1 {
         },
         worktree: WorktreeProvenanceV1 {
             repository: "owner/repo".into(),
-            path: std::env::temp_dir()
-                .join("worktrees")
-                .join("exact-head")
-                .to_string_lossy()
-                .into_owned(),
-            head_sha: "a".repeat(40),
-            lineage_id: "lineage-current-main-7".into(),
+            path: fixture.path.clone(),
+            head_sha: fixture.head.clone(),
+            lineage_id: fixture.branch.clone(),
         },
         recovery_policy: RecoveryPolicyV1::ExactSessionThenFreshCheckpoint,
     }
@@ -74,6 +136,58 @@ fn route_at(args: &StewardHandoffArgs, origin: &str) -> AgentRouteReference {
         .expect("resolve agent")
         .expect("agent route");
     agent_route_reference(&agent, origin)
+}
+
+#[test]
+fn nonexistent_worktree_provenance_fails_before_publication() {
+    let args = handoff_args();
+    let mut candidate = profile("-r");
+    candidate.worktree.path = active_worktree()
+        .temp
+        .path()
+        .join("missing")
+        .to_string_lossy()
+        .into_owned();
+    let error = prepare_launch_profile_candidate(candidate, "owner/repo", &args.head)
+        .expect_err("nonexistent worktree must fail closed");
+    assert!(error.message().contains("path is unavailable"));
+}
+
+#[test]
+fn claimed_repository_and_head_require_matching_live_git_evidence() {
+    let mut wrong_repo = profile("-r");
+    wrong_repo.worktree.repository = "owner/forged".into();
+    let head = wrong_repo.worktree.head_sha.clone();
+    let error = prepare_launch_profile_candidate(wrong_repo, "owner/forged", &head)
+        .expect_err("claimed repository cannot override the live origin");
+    assert!(error.message().contains("origin does not match"));
+
+    let mut wrong_head = profile("-r");
+    wrong_head.worktree.head_sha = "a".repeat(40);
+    let error = prepare_launch_profile_candidate(wrong_head, "owner/repo", &"a".repeat(40))
+        .expect_err("claimed head cannot override the live worktree HEAD");
+    assert!(error.message().contains("HEAD does not match"));
+}
+
+#[test]
+fn superseded_worktree_provenance_fails_before_publication() {
+    let fixture = make_worktree_fixture();
+    let prefix = format!("branch.{}.pulpWorktreeStatus", fixture.branch);
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.path)
+        .args(["config", &prefix, "superseded"])
+        .status()
+        .expect("mark fixture superseded");
+    assert!(status.success());
+    let mut candidate = profile("-r");
+    candidate.worktree.path = fixture.path;
+    candidate.worktree.head_sha = fixture.head;
+    candidate.worktree.lineage_id = fixture.branch;
+    let expected_head = candidate.worktree.head_sha.clone();
+    let error = prepare_launch_profile_candidate(candidate, "owner/repo", &expected_head)
+        .expect_err("superseded worktree must fail closed");
+    assert!(error.message().contains("lineage is not active"));
 }
 
 #[test]

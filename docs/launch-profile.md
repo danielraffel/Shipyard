@@ -45,7 +45,7 @@ provenance, and a recovery-policy enum:
     "repository": "owner/repo",
     "path": "/absolute/private/worktree/path",
     "head_sha": "0123456789abcdef0123456789abcdef01234567",
-    "lineage_id": "current-main-lineage-7"
+    "lineage_id": "feature/exact-worktree-branch"
   },
   "recovery_policy": "exact_session_then_fresh_checkpoint"
 }
@@ -64,6 +64,13 @@ and sometimes incompatible resume flags, so Shipyard never canonicalizes them
 or reconstructs a command from provider/model metadata. Empty or oversized
 argv, unknown JSON fields, relative worktree paths, zero checkpoint generations,
 invalid digests, and repository/head mismatches fail closed.
+
+Before publishing a profile, Shipyard resolves the worktree path and verifies
+that it is the canonical Git root, its `origin` is the claimed GitHub
+repository, and its live `HEAD` is the claimed commit. `lineage_id` is the
+worktree's exact branch name and must have an `active` worktree-lineage record
+whose durable SHA and last path match that same checkout. Missing, detached,
+superseded, merged, archived, moved, or stale lineage records fail closed.
 
 The profile is stored inside the exact repository/PR/head handoff receipt under
 Shipyard's protected private state. Its envelope has its own generation,
