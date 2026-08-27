@@ -327,6 +327,7 @@ fn persist_inner(
     incoming: TerminalHandoff,
     rearm_applied: bool,
 ) -> Result<bool, CliFailure> {
+    let superseded_success = resolve_conflicting_success(ledger, &incoming);
     let key = incoming.dedupe_key.clone();
     if let Some(existing) = ledger.terminal_handoffs.get(&key) {
         let existing_phase = existing.phase;
@@ -399,7 +400,7 @@ fn persist_inner(
             }
             record.updated_at = Utc::now().to_rfc3339();
         }
-        return Ok(record_changed);
+        return Ok(record_changed || superseded_success);
     }
     if incoming.outcome == TerminalHandoffOutcome::ActionableFailure {
         ledger.terminal_handoffs.retain(|_, record| {
@@ -413,6 +414,30 @@ fn persist_inner(
     make_capacity_for_terminal_handoff(ledger)?;
     ledger.terminal_handoffs.insert(key, incoming);
     Ok(true)
+}
+
+fn resolve_conflicting_success(ledger: &mut StewardLedger, incoming: &TerminalHandoff) -> bool {
+    if incoming.outcome != TerminalHandoffOutcome::ActionableFailure {
+        return false;
+    }
+    let mut changed = false;
+    let now = Utc::now().to_rfc3339();
+    for record in ledger.terminal_handoffs.values_mut().filter(|record| {
+        record.outcome == TerminalHandoffOutcome::SuccessContinuation
+            && record.repo == incoming.repo
+            && record.base == incoming.base
+            && record.pr_number == incoming.pr_number
+            && record.head_sha == incoming.head_sha
+            && !matches!(
+                record.phase,
+                TerminalHandoffPhase::Applied | TerminalHandoffPhase::Resolved
+            )
+    }) {
+        record.phase = TerminalHandoffPhase::Resolved;
+        record.updated_at.clone_from(&now);
+        changed = true;
+    }
+    changed
 }
 
 fn reconcile_after_ambiguous_save(
@@ -846,6 +871,93 @@ mod tests {
                 .expect("record")
                 .phase,
             TerminalHandoffPhase::Recorded
+        );
+    }
+
+    #[test]
+    fn same_head_failure_supersedes_ambiguous_pending_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("merge-steward.json");
+        let mut ledger = StewardLedger::default();
+        persist_success_continuation(
+            &path,
+            &mut ledger,
+            "owner/repo",
+            "main",
+            7,
+            HEAD,
+            owner("route-a"),
+        )
+        .expect("durable intent precedes ambiguous enqueue response");
+        assert_eq!(
+            ledger
+                .terminal_handoffs
+                .values()
+                .next()
+                .expect("pending continuation")
+                .phase,
+            TerminalHandoffPhase::Pending
+        );
+
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "occupied").expect("blocked parent");
+        persist_actionable_failure(
+            &blocked_parent.join("ledger.json"),
+            &mut ledger,
+            "owner/repo",
+            "main",
+            7,
+            HEAD,
+            owner("route-a"),
+            vec!["macos@app=42".to_owned()],
+        )
+        .expect_err("failed publication rolls back both outcome changes");
+        assert_eq!(ledger.terminal_handoffs.len(), 1);
+        assert_eq!(
+            ledger
+                .terminal_handoffs
+                .values()
+                .next()
+                .expect("original continuation")
+                .phase,
+            TerminalHandoffPhase::Pending
+        );
+
+        persist_actionable_failure(
+            &path,
+            &mut ledger,
+            "owner/repo",
+            "main",
+            7,
+            HEAD,
+            owner("route-a"),
+            vec!["macos@app=42".to_owned()],
+        )
+        .expect("same-head required failure");
+
+        let restarted = load_ledger(&path).expect("restart");
+        let unresolved = restarted
+            .terminal_handoffs
+            .values()
+            .filter(|record| {
+                !matches!(
+                    record.phase,
+                    TerminalHandoffPhase::Applied | TerminalHandoffPhase::Resolved
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(
+            unresolved[0].outcome,
+            TerminalHandoffOutcome::ActionableFailure
+        );
+        assert_eq!(unresolved[0].phase, TerminalHandoffPhase::Recorded);
+        assert!(
+            restarted.terminal_handoffs.values().any(|record| {
+                record.outcome == TerminalHandoffOutcome::SuccessContinuation
+                    && record.phase == TerminalHandoffPhase::Resolved
+            }),
+            "the ambiguous success intent remains as resolved audit history"
         );
     }
 
