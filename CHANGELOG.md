@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v01250"></a>
+## [0.125.0] - 2026-08-27
+
+- Persist inert durable resume records ([#485](https://github.com/danielraffel/Shipyard/pull/485))
+
 <a id="v01240"></a>
 ## [0.124.0] - 2026-08-27
 
@@ -1109,6 +1114,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.125.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.125.0
 [0.124.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.124.0
 [0.123.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.123.0
 [0.122.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.122.0
