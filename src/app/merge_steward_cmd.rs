@@ -131,6 +131,8 @@ struct StewardLedger {
     #[serde(default)]
     terminal_handoffs: BTreeMap<String, TerminalHandoff>,
     #[serde(default)]
+    resume_records: BTreeMap<String, resume_record::ResumeRecordV1>,
+    #[serde(default)]
     audit: Vec<LedgerAudit>,
 }
 
@@ -159,6 +161,8 @@ struct TerminalHandoff {
     resume_transport: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner_terminal_provenance: Option<TerminalProvenanceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_route: Option<handoff::ProviderRouteReferenceV1>,
     wake_consumer_available: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     failure_contexts: Vec<String>,
@@ -188,6 +192,7 @@ enum TerminalHandoffPhase {
 enum TerminalProvenanceKind {
     #[default]
     Absent,
+    Cmux,
     HerdR,
 }
 
@@ -1090,6 +1095,7 @@ mod observation;
 mod pr_mutations;
 mod queue_priority_recovery;
 mod render;
+mod resume_record;
 mod terminal_handoff;
 
 use cancellation::{

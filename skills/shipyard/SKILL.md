@@ -1779,6 +1779,17 @@ hot-loop back into the slot it just released. If refill admission itself fails,
 Shipyard preserves that error but still drains active worker completions and
 durably requeues any deferred jobs before returning.
 
+Durable agent resume has independent terminal and provider-routing axes. cmux
+is the current default terminal; HerdR is an optional terminal adapter, while
+Subrouter is provider-routing provenance carried by the exact launch/resume
+profile. Preserve both dimensions concurrently. Never infer one from the other
+or silently translate a missing Subrouter route into direct `codex`. During the
+inert projection phase, reconcile legacy terminal handoffs even on a no-op
+transition, atomically publish/roll back terminal and resume maps together, and
+verify that every record keeps dispatch disabled. Activation additionally
+requires a generation-fenced transactional outbox, durable acknowledgment,
+uncertain-delivery refusal, and physical original/fresh-owner canaries.
+
 For Pulp/tartci macOS VM work, prefer local queueing over hosted overflow: a
 full local fleet should leave jobs queued on the self-hosted VM labels until a
 controller/secondary Mac slot opens. Add GitHub-hosted macOS only as an

@@ -3,6 +3,7 @@ use super::{
     TerminalProvenanceKind, Utc,
     handoff::TerminalOwnerRoute,
     ledger::{load_existing_ledger, save_ledger},
+    resume_record::{ResumeRecordV1, reconcile_resume_records},
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -71,7 +72,8 @@ pub(super) fn persist_success_continuation(
             resume_transport: owner
                 .as_ref()
                 .and_then(|owner| owner.resume_transport.clone()),
-            owner_terminal_provenance: owner.and_then(|owner| owner.terminal_provenance),
+            owner_terminal_provenance: owner.as_ref().and_then(|owner| owner.terminal_provenance),
+            provider_route: owner.and_then(|owner| owner.provider_route),
             wake_consumer_available: false,
             failure_contexts: Vec::new(),
             phase: TerminalHandoffPhase::Pending,
@@ -128,7 +130,8 @@ pub(super) fn persist_actionable_failure(
             resume_transport: owner
                 .as_ref()
                 .and_then(|owner| owner.resume_transport.clone()),
-            owner_terminal_provenance: owner.and_then(|owner| owner.terminal_provenance),
+            owner_terminal_provenance: owner.as_ref().and_then(|owner| owner.terminal_provenance),
+            provider_route: owner.and_then(|owner| owner.provider_route),
             wake_consumer_available: false,
             failure_contexts,
             phase: TerminalHandoffPhase::Recorded,
@@ -294,11 +297,21 @@ fn update_handoffs(
     update: impl FnOnce(&mut BTreeMap<String, TerminalHandoff>) -> bool,
 ) -> Result<bool, CliFailure> {
     let original = ledger.terminal_handoffs.clone();
-    if !update(&mut ledger.terminal_handoffs) {
+    let original_resume_records = ledger.resume_records.clone();
+    let handoffs_changed = update(&mut ledger.terminal_handoffs);
+    let resume_changed = match reconcile_resume_records(ledger) {
+        Ok(changed) => changed,
+        Err(error) => {
+            ledger.terminal_handoffs = original;
+            ledger.resume_records = original_resume_records;
+            return Err(error);
+        }
+    };
+    if !handoffs_changed && !resume_changed {
         return Ok(false);
     }
     if let Err(error) = save_ledger(ledger_path, ledger) {
-        reconcile_after_ambiguous_save(ledger_path, ledger, original);
+        reconcile_after_ambiguous_save(ledger_path, ledger, original, original_resume_records);
         return Err(error);
     }
     Ok(true)
@@ -311,18 +324,29 @@ fn persist(
     rearm_applied: bool,
 ) -> Result<(), CliFailure> {
     let original = ledger.terminal_handoffs.clone();
-    let changed = match persist_inner(ledger, incoming, rearm_applied) {
+    let original_resume_records = ledger.resume_records.clone();
+    let handoff_changed = match persist_inner(ledger, incoming, rearm_applied) {
         Ok(changed) => changed,
         Err(error) => {
             ledger.terminal_handoffs = original;
+            ledger.resume_records = original_resume_records;
             return Err(error);
         }
     };
+    let resume_changed = match reconcile_resume_records(ledger) {
+        Ok(changed) => changed,
+        Err(error) => {
+            ledger.terminal_handoffs = original;
+            ledger.resume_records = original_resume_records;
+            return Err(error);
+        }
+    };
+    let changed = handoff_changed || resume_changed;
     if !changed {
         return Ok(());
     }
     if let Err(error) = save_ledger(ledger_path, ledger) {
-        reconcile_after_ambiguous_save(ledger_path, ledger, original);
+        reconcile_after_ambiguous_save(ledger_path, ledger, original, original_resume_records);
         return Err(error);
     }
     Ok(())
@@ -339,18 +363,17 @@ fn persist_inner(
         let existing_phase = existing.phase;
         let rearm_actionable = incoming.outcome == TerminalHandoffOutcome::ActionableFailure
             && existing_phase == TerminalHandoffPhase::Resolved;
-        let route_can_resolve = (existing.owner_disposition == "route_registry_required"
-            && incoming.owner_disposition != "route_registry_required")
-            || (existing.owner_disposition == "unroutable_private_route"
-                && incoming.owner_disposition == "original_owner"
-                && incoming.ownership_generation >= existing.ownership_generation);
-        let ownership_can_transfer = matches!(
-            existing.owner_disposition.as_str(),
-            "original_owner" | "fresh_agent_only"
-        ) && incoming.owner_disposition == "original_owner"
-            && incoming.ownership_generation > existing.ownership_generation;
+        let route_can_resolve = route_can_resolve(existing, &incoming);
+        let ownership_can_transfer = ownership_can_transfer(existing, &incoming);
         let route_degraded = existing.owner_disposition == "original_owner"
             && incoming.owner_disposition == "unroutable_private_route";
+        let cmux_provenance_enriched = cmux_provenance_can_enrich(existing, &incoming);
+        let provider_route_enriched = provider_route_can_enrich(existing, &incoming);
+        let degradation_provider_route = if route_degraded {
+            Some(provider_route_for_degradation(existing, &incoming)?)
+        } else {
+            None
+        };
         let owner_can_change = route_can_resolve || ownership_can_transfer;
         let owner_may_differ = owner_can_change || route_degraded;
         if existing.repo != incoming.repo
@@ -369,6 +392,10 @@ fn persist_inner(
             || (!owner_may_differ && existing.owner_provider != incoming.owner_provider)
             || (!owner_may_differ && existing.resume_transport != incoming.resume_transport)
             || (!owner_may_differ
+                && !provider_route_enriched
+                && existing.provider_route != incoming.provider_route)
+            || (!owner_may_differ
+                && !cmux_provenance_enriched
                 && !same_terminal_provenance(
                     existing.owner_terminal_provenance,
                     incoming.owner_terminal_provenance,
@@ -383,6 +410,8 @@ fn persist_inner(
         }
         let record_changed = owner_can_change
             || route_degraded
+            || cmux_provenance_enriched
+            || provider_route_enriched
             || (rearm_applied && existing_phase != TerminalHandoffPhase::Pending)
             || rearm_actionable;
         if record_changed {
@@ -391,20 +420,19 @@ fn persist_inner(
                 .get_mut(&key)
                 .expect("existing terminal handoff key");
             if route_degraded {
-                "unroutable_private_route".clone_into(&mut record.owner_disposition);
-                record.owner_route_id = None;
-                record.owner_provider = None;
-                record.resume_transport = None;
-                record.owner_terminal_provenance = None;
+                clear_owner_route(
+                    record,
+                    degradation_provider_route.expect("route degradation was classified"),
+                );
             } else if owner_can_change {
-                record.origin_machine = incoming.origin_machine;
-                record.owner_id = incoming.owner_id;
-                record.ownership_generation = incoming.ownership_generation;
-                record.owner_disposition = incoming.owner_disposition;
-                record.owner_route_id = incoming.owner_route_id;
-                record.owner_provider = incoming.owner_provider;
-                record.resume_transport = incoming.resume_transport;
-                record.owner_terminal_provenance = incoming.owner_terminal_provenance;
+                replace_owner_route(record, incoming);
+            } else {
+                if cmux_provenance_enriched {
+                    record.owner_terminal_provenance = incoming.owner_terminal_provenance;
+                }
+                if provider_route_enriched {
+                    record.provider_route = incoming.provider_route;
+                }
             }
             if rearm_applied && existing_phase != TerminalHandoffPhase::Pending {
                 record.phase = TerminalHandoffPhase::Pending;
@@ -429,11 +457,98 @@ fn persist_inner(
     Ok(true)
 }
 
+fn route_can_resolve(existing: &TerminalHandoff, incoming: &TerminalHandoff) -> bool {
+    (existing.owner_disposition == "route_registry_required"
+        && incoming.owner_disposition != "route_registry_required")
+        || (existing.owner_disposition == "unroutable_private_route"
+            && incoming.owner_disposition == "original_owner"
+            && incoming.ownership_generation >= existing.ownership_generation)
+}
+
+fn ownership_can_transfer(existing: &TerminalHandoff, incoming: &TerminalHandoff) -> bool {
+    matches!(
+        existing.owner_disposition.as_str(),
+        "original_owner" | "fresh_agent_only"
+    ) && incoming.owner_disposition == "original_owner"
+        && incoming.ownership_generation > existing.ownership_generation
+}
+
+fn clear_owner_route(
+    record: &mut TerminalHandoff,
+    provider_route: Option<super::handoff::ProviderRouteReferenceV1>,
+) {
+    "unroutable_private_route".clone_into(&mut record.owner_disposition);
+    record.owner_route_id = None;
+    record.owner_provider = None;
+    record.resume_transport = None;
+    record.owner_terminal_provenance = None;
+    record.provider_route = provider_route;
+}
+
+fn provider_route_for_degradation(
+    existing: &TerminalHandoff,
+    incoming: &TerminalHandoff,
+) -> Result<Option<super::handoff::ProviderRouteReferenceV1>, CliFailure> {
+    match (&existing.provider_route, &incoming.provider_route) {
+        (Some(stored), Some(observed)) if stored != observed => Err(CliFailure::new(
+            1,
+            "terminal handoff provider route changed during route degradation",
+        )),
+        (Some(stored), _) => Ok(Some(stored.clone())),
+        (None, Some(observed))
+            if Some(observed.generation) == existing.ownership_generation
+                && observed.revision > 0
+                && valid_sha256(&observed.profile_digest)
+                && valid_sha256(&observed.integrity_hash) =>
+        {
+            Ok(Some(observed.clone()))
+        }
+        (None, Some(_)) => Err(CliFailure::new(
+            1,
+            "terminal handoff provider route is invalid during route degradation",
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+fn replace_owner_route(record: &mut TerminalHandoff, incoming: TerminalHandoff) {
+    record.origin_machine = incoming.origin_machine;
+    record.owner_id = incoming.owner_id;
+    record.ownership_generation = incoming.ownership_generation;
+    record.owner_disposition = incoming.owner_disposition;
+    record.owner_route_id = incoming.owner_route_id;
+    record.owner_provider = incoming.owner_provider;
+    record.resume_transport = incoming.resume_transport;
+    record.owner_terminal_provenance = incoming.owner_terminal_provenance;
+    record.provider_route = incoming.provider_route;
+}
+
 fn same_terminal_provenance(
     existing: Option<TerminalProvenanceKind>,
     incoming: Option<TerminalProvenanceKind>,
 ) -> bool {
     existing.unwrap_or_default() == incoming.unwrap_or_default()
+}
+
+fn cmux_provenance_can_enrich(existing: &TerminalHandoff, incoming: &TerminalHandoff) -> bool {
+    matches!(
+        existing.owner_terminal_provenance,
+        None | Some(TerminalProvenanceKind::Absent)
+    ) && incoming.owner_terminal_provenance == Some(TerminalProvenanceKind::Cmux)
+}
+
+fn provider_route_can_enrich(existing: &TerminalHandoff, incoming: &TerminalHandoff) -> bool {
+    existing.provider_route.is_none()
+        && incoming.provider_route.as_ref().is_some_and(|route| {
+            Some(route.generation) == incoming.ownership_generation
+                && route.revision > 0
+                && valid_sha256(&route.profile_digest)
+                && valid_sha256(&route.integrity_hash)
+        })
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn resolve_conflicting_success(ledger: &mut StewardLedger, incoming: &TerminalHandoff) -> bool {
@@ -464,13 +579,16 @@ fn reconcile_after_ambiguous_save(
     ledger_path: &Path,
     ledger: &mut StewardLedger,
     fallback_handoffs: BTreeMap<String, TerminalHandoff>,
+    fallback_resume_records: BTreeMap<String, ResumeRecordV1>,
 ) {
     // `save_ledger` may fail after the atomic rename if only directory sync
     // failed. Reloading distinguishes the published old/new image and prevents
     // a later final save from overwriting it with a guessed in-memory state.
-    match load_existing_ledger(ledger_path) {
-        Ok(Some(published)) => *ledger = published,
-        Ok(None) | Err(_) => ledger.terminal_handoffs = fallback_handoffs,
+    if let Ok(Some(published)) = load_existing_ledger(ledger_path) {
+        *ledger = published;
+    } else {
+        ledger.terminal_handoffs = fallback_handoffs;
+        ledger.resume_records = fallback_resume_records;
     }
 }
 

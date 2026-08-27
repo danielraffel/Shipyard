@@ -23,6 +23,7 @@ use crate::merge_queue_control::MergeQueueMutationGuard;
 use crate::output::write_json_envelope;
 use crate::ship_state::{ShipState, ShipStatePrLock, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
+use crate::writer_domain_lease::ProductionWriterDomainLease;
 
 pub(super) struct AutoMergeRequest {
     pub(super) mode: RuntimeMode,
@@ -2464,14 +2465,9 @@ fn delete_head_branch(
 ) -> Result<(), String> {
     let git_authority = branch_cleanup_git_authority(client, cwd, global_dir)?;
     let isolated = if let Some(git_authority) = git_authority.as_ref() {
-        let parent = tempfile::tempdir()
-            .map_err(|error| format!("failed to create isolated Git cleanup root: {error}"))?;
-        let repository = parent.path().join("repository");
-        std::fs::create_dir(&repository).map_err(|error| {
-            format!("failed to create isolated Git cleanup repository: {error}")
-        })?;
+        let cleanup = isolated_branch_cleanup_repository(&std::env::temp_dir())?;
         let output = git_authority
-            .prepare_privileged_git_command(&repository)
+            .prepare_privileged_git_command(cleanup.repository())
             .map_err(|error| format!("failed to prepare trusted Git cleanup: {error}"))?
             .args(["init", "--quiet", "--bare"])
             .output()
@@ -2482,13 +2478,13 @@ fn delete_head_branch(
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        Some((parent, repository))
+        Some(cleanup)
     } else {
         None
     };
     let git_cwd = isolated
         .as_ref()
-        .map_or(cwd, |(_, repository)| repository.as_path());
+        .map_or(cwd, IsolatedBranchCleanup::repository);
     let mut command = if let Some(git_authority) = git_authority.as_ref() {
         client.prepare_git_command_with_binary_authority(git_cwd, git_authority)
     } else {
@@ -2519,6 +2515,45 @@ fn delete_head_branch(
         "PR merged but failed to atomically delete branch {repo}:{head_ref} at validated SHA {}: {stderr}",
         short_sha(expected_sha)
     ))
+}
+
+struct IsolatedBranchCleanup {
+    // Drop explicitly consumes this field before the writer-domain lease.
+    parent: Option<tempfile::TempDir>,
+    repository: PathBuf,
+    _writer_domain: Option<ProductionWriterDomainLease>,
+}
+
+impl IsolatedBranchCleanup {
+    fn repository(&self) -> &Path {
+        &self.repository
+    }
+}
+
+impl Drop for IsolatedBranchCleanup {
+    fn drop(&mut self) {
+        drop(self.parent.take());
+    }
+}
+
+fn isolated_branch_cleanup_repository(temp_root: &Path) -> Result<IsolatedBranchCleanup, String> {
+    // The daemon deliberately points TMPDIR into its protected state tree.
+    // Acquire the production writer domain before tempfile creates anything,
+    // and retain it until the TempDir has removed the isolated repository.
+    let writer_domain = crate::writer_domain_lease::acquire_for_protected_path(temp_root)
+        .map_err(|error| format!("failed to fence isolated Git cleanup root: {error}"))?;
+    let parent = tempfile::Builder::new()
+        .prefix("branch-cleanup-")
+        .tempdir_in(temp_root)
+        .map_err(|error| format!("failed to create isolated Git cleanup root: {error}"))?;
+    let repository = parent.path().join("repository");
+    std::fs::create_dir(&repository)
+        .map_err(|error| format!("failed to create isolated Git cleanup repository: {error}"))?;
+    Ok(IsolatedBranchCleanup {
+        parent: Some(parent),
+        repository,
+        _writer_domain: writer_domain,
+    })
 }
 
 /// Issue the PUT /repos/:r/pulls/:n/merge call with the merge method
@@ -2861,6 +2896,24 @@ mod tests {
             !require_branch_cleanup_git(&mut ambient, Path::new("/tmp"), global.path())
                 .expect("ambient cleanup retains its existing Git authority")
         );
+    }
+
+    #[test]
+    fn isolated_branch_cleanup_repository_stays_under_explicit_temp_root() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let cleanup =
+            isolated_branch_cleanup_repository(temp.path()).expect("isolated cleanup root");
+        assert!(cleanup.repository().starts_with(temp.path()));
+        assert_eq!(
+            cleanup.repository(),
+            cleanup
+                .parent
+                .as_ref()
+                .expect("tempdir")
+                .path()
+                .join("repository")
+        );
+        assert!(cleanup.repository().is_dir());
     }
 
     #[test]

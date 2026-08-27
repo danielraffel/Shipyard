@@ -207,16 +207,32 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
     let args = handoff_args();
     let profile = prepare_launch_profile_candidate(profile("-r"), "owner/repo", &args.head)
         .expect("valid profile");
+    let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
+        .expect("resolve agent")
+        .expect("agent route");
+    let route = agent_route_reference(&agent, "m3");
+    let route_path = temp
+        .path()
+        .join("merge-steward")
+        .join("agent-routes")
+        .join(format!("{}.json", route.route_id));
+    persist_agent_route(&route_path, &route, &agent).expect("persist private route");
     let receipt = prepare_handoff_receipt_with_profile(
         None,
         &args,
         "owner/repo",
         "m3",
-        Some(route(&args)),
+        Some(route),
         Some(profile.clone()),
     )
     .expect("receipt");
-    let path = temp.path().join("handoff.json");
+    let path = temp
+        .path()
+        .join("merge-steward")
+        .join("handoffs")
+        .join(encode_path_segment("owner/repo"))
+        .join(format!("pr-{}", args.pr))
+        .join(format!("{}.json", args.head));
     persist_handoff(&path, receipt, HandoffPhase::Managed).expect("durable receipt");
 
     let restarted = load_handoff(&path)
@@ -231,12 +247,45 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
     assert_eq!(
         restarted
             .launch_profile
+            .as_ref()
             .expect("profile")
             .profile
             .resume_argv,
         vec!["/opt/provider-router", "agent", "-r", "provider-session-7"]
     );
     assert!(!restarted.wake_consumer_available);
+    let terminal = terminal_owner_route(temp.path(), "owner/repo", args.pr, &args.head)
+        .expect("valid terminal owner")
+        .expect("managed owner");
+    let provider_route = terminal.provider_route.expect("provider route");
+    assert_eq!(provider_route.profile_digest, stored.profile_digest);
+    assert_eq!(provider_route.integrity_hash, stored.integrity_hash);
+    assert_eq!(provider_route.generation, 1);
+    assert_eq!(provider_route.revision, 1);
+    assert_eq!(provider_route.provider, "opaque-provider");
+    assert_eq!(provider_route.account.as_deref(), Some("subscription-a"));
+    assert_eq!(provider_route.model.as_deref(), Some("model-tier-a"));
+
+    std::fs::remove_file(&route_path).expect("remove private agent route");
+    let unresolved =
+        terminal_owner_route_or_unresolved(temp.path(), "owner/repo", args.pr, &args.head)
+            .expect("validated public receipt remains an unresolved obligation");
+    assert_eq!(unresolved.owner_disposition, "unroutable_private_route");
+    assert_eq!(unresolved.route_id, None);
+    assert_eq!(unresolved.provider, None);
+    assert_eq!(unresolved.terminal_provenance, None);
+    assert_eq!(
+        unresolved.provider_route,
+        Some(ProviderRouteReferenceV1 {
+            profile_digest: stored.profile_digest.clone(),
+            integrity_hash: stored.integrity_hash.clone(),
+            generation: stored.generation,
+            revision: stored.revision,
+            provider: "opaque-provider".to_owned(),
+            account: Some("subscription-a".to_owned()),
+            model: Some("model-tier-a".to_owned()),
+        })
+    );
 }
 
 #[test]

@@ -168,6 +168,25 @@ Windows QEMU on Apple Silicon is Windows ARM64; x64 MSVC/Prism execution is
 smoke/debug until proven and should not replace `windows-latest` authority.
 Coverage must use dedicated ephemeral labels, not warm bare-metal build pools.
 
+Keep non-macOS failure work bounded when the active objective is macOS delivery.
+Capture the exact head, run/job identity, failing test, and a short causal log
+excerpt; allow one focused reproduction or targeted retry. If the result is
+unrelated or intermittent, record it in the durable workstream and continue the
+macOS-critical path instead of broadening the active PR. Keep the failure and
+its repair lane-scoped: it may block only the artifact or release contract that
+explicitly depends on that lane. Globally block unrelated lanes only for rare,
+proven shared-integrity risks such as artifact corruption, schema
+incompatibility, or false-green merge authority. Routine status monitoring is
+model-free.
+
+Make platform focus repository-scoped rather than a global Shipyard
+assumption. Pulp, Forge, and Vellum currently treat macOS as the primary
+delivery lane and Linux/Windows as independently repaired compatibility lanes.
+Other repositories may select different primary, artifact-required, advisory,
+or globally coupled platforms through trusted repository policy. Do not infer a
+cross-lane block when that policy is missing or ambiguous; fail closed only for
+the affected artifact contract and surface the configuration gap.
+
 For local x64 Linux, keep selector policy in the checked-in `normal-local-fast`
 profile and run the external Shipyard health operator documented in
 `docs/pulp-local-linux-lease.md`. The trusted merge-group namespace renews
@@ -1598,6 +1617,16 @@ A doc-sync gate enforces that `docs/ship-state-machine.md` moves whenever the ma
 **`Version-Bump` is authoritative when set.** The override wins against both the path-based heuristic and the conventional-commit subject ceiling. If you want a bug fix to ship as `cli=patch` even though it touches many public-API files, write `Version-Bump: cli=patch reason="bug fix"` — the trailer is the author's explicit accountability, and the reason string is reviewable. Two escape hatches stay in place: `skip` zeroes the level, and an override on a surface that wasn't actually touched is ignored (no rubber-stamping unrelated bumps).
 
 **Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `scripts/ci_matrix.py`, release packaging scripts, or `src/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.
+
+**Durable resume projections are two-dimensional and inert until activation.**
+Keep terminal runtime (`cmux` or optional HerdR) separate from agent/provider
+transport (native Codex/Claude plus any launch-profile router such as
+Subrouter). A terminal adapter must not replace or imply the provider route,
+and missing Subrouter provenance must never fall back to direct `codex`.
+Reconcile resume records even when the authoritative terminal-handoff update is
+a no-op so legacy ledgers backfill on restart. Publish or roll back both maps as
+one crash-consistent ledger image, and keep `dispatch_enabled=false` until the
+outbox, acknowledgment, and physical canary gates are separately complete.
 
 **Detached daemon temp roots must not depend on the launching shell.** A daemon
 started from launchd or a minimal SSH environment may inherit no `TMPDIR`.

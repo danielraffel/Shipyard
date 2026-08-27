@@ -165,8 +165,8 @@ impl TerminalProvenance {
     const fn kind(&self) -> TerminalProvenanceKind {
         match self {
             // Existing cmux surface provenance is advisory and may appear or
-            // move without changing the immutable owner route. HerdR is the
-            // only typed terminal contract introduced by this slice.
+            // move without changing the immutable owner route. Keep its stored
+            // route-reference contract compatible with pre-adapter receipts.
             Self::Absent | Self::Cmux { .. } => TerminalProvenanceKind::Absent,
             Self::HerdR { .. } => TerminalProvenanceKind::HerdR,
         }
@@ -827,6 +827,20 @@ pub(super) struct TerminalOwnerRoute {
     pub(super) provider: Option<String>,
     pub(super) resume_transport: Option<String>,
     pub(super) terminal_provenance: Option<TerminalProvenanceKind>,
+    pub(super) provider_route: Option<ProviderRouteReferenceV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ProviderRouteReferenceV1 {
+    pub(super) profile_digest: String,
+    pub(super) integrity_hash: String,
+    pub(super) generation: u64,
+    pub(super) revision: u64,
+    pub(super) provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) model: Option<String>,
 }
 
 pub(super) fn terminal_owner_route(
@@ -848,8 +862,9 @@ pub(super) fn terminal_owner_route(
     if receipt.phase != HandoffPhase::Managed {
         return Ok(None);
     }
+    let provider_route = provider_route_reference(&receipt);
     let route = receipt.agent_route;
-    let owner_id = if let Some(route) = route.as_ref() {
+    let (owner_id, terminal_provenance) = if let Some(route) = route.as_ref() {
         let stored_path = state_dir
             .join("merge-steward")
             .join("agent-routes")
@@ -869,19 +884,26 @@ pub(super) fn terminal_owner_route(
                 "managed handoff and private agent route identity disagree",
             ));
         }
-        opaque_id(
-            "owner",
-            &[
-                &stored.agent.provider,
-                stored
-                    .agent
-                    .parent_session_id
-                    .as_deref()
-                    .unwrap_or(&stored.agent.session_id),
-            ],
+        (
+            opaque_id(
+                "owner",
+                &[
+                    &stored.agent.provider,
+                    stored
+                        .agent
+                        .parent_session_id
+                        .as_deref()
+                        .unwrap_or(&stored.agent.session_id),
+                ],
+            ),
+            Some(match stored.agent.terminal_provenance {
+                TerminalProvenance::Absent => TerminalProvenanceKind::Absent,
+                TerminalProvenance::Cmux { .. } => TerminalProvenanceKind::Cmux,
+                TerminalProvenance::HerdR { .. } => TerminalProvenanceKind::HerdR,
+            }),
         )
     } else {
-        receipt.owner_id.clone()
+        (receipt.owner_id.clone(), None)
     };
     Ok(Some(TerminalOwnerRoute {
         origin_machine: receipt.origin_machine,
@@ -895,8 +917,9 @@ pub(super) fn terminal_owner_route(
         .to_owned(),
         route_id: route.as_ref().map(|route| route.route_id.clone()),
         provider: route.as_ref().map(|route| route.provider.clone()),
-        terminal_provenance: route.as_ref().map(|route| route.terminal_provenance),
+        terminal_provenance,
         resume_transport: route.map(|route| route.resume_transport),
+        provider_route,
     }))
 }
 
@@ -933,6 +956,7 @@ fn unresolved_terminal_owner(
     {
         return None;
     }
+    let provider_route = provider_route_reference(&receipt);
     Some(TerminalOwnerRoute {
         origin_machine: receipt.origin_machine,
         owner_id: receipt.owner_id,
@@ -942,7 +966,23 @@ fn unresolved_terminal_owner(
         provider: None,
         resume_transport: None,
         terminal_provenance: None,
+        provider_route,
     })
+}
+
+fn provider_route_reference(receipt: &DurableStewardHandoff) -> Option<ProviderRouteReferenceV1> {
+    receipt
+        .launch_profile
+        .as_ref()
+        .map(|stored| ProviderRouteReferenceV1 {
+            profile_digest: stored.profile_digest.clone(),
+            integrity_hash: stored.integrity_hash.clone(),
+            generation: stored.generation,
+            revision: stored.revision,
+            provider: stored.profile.provider.provider.clone(),
+            account: stored.profile.provider.account.clone(),
+            model: stored.profile.provider.model.clone(),
+        })
 }
 
 fn agent_route_path(runtime_paths: &RuntimePaths, route_id: &str) -> std::path::PathBuf {
@@ -2734,6 +2774,10 @@ fn main() {{
         assert_eq!(
             terminal_owner.resume_transport.as_deref(),
             Some("claude_resume")
+        );
+        assert_eq!(
+            terminal_owner.terminal_provenance,
+            Some(TerminalProvenanceKind::Cmux)
         );
 
         let public_bytes = std::fs::read_to_string(&path).expect("read receipt");
