@@ -22,6 +22,18 @@ fn owner(route: &str) -> TerminalOwnerRoute {
     }
 }
 
+fn subrouter_provider_route(generation: u64) -> ProviderRouteReferenceV1 {
+    ProviderRouteReferenceV1 {
+        profile_digest: "a".repeat(64),
+        integrity_hash: "b".repeat(64),
+        generation,
+        revision: 2,
+        provider: "subrouter".to_owned(),
+        account: Some("account-a".to_owned()),
+        model: Some("gpt-5.6-sol".to_owned()),
+    }
+}
+
 fn fresh_agent_owner() -> TerminalOwnerRoute {
     TerminalOwnerRoute {
         origin_machine: "m3".to_owned(),
@@ -246,6 +258,78 @@ fn legacy_absent_provenance_enriches_to_cmux_without_weakening_route_fences() {
         .message()
         .contains("identity changed")
     );
+}
+
+#[test]
+fn legacy_handoff_accepts_only_fenced_provider_route_enrichment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("merge-steward.json");
+    let mut ledger = StewardLedger::default();
+    persist_actionable_failure(
+        &path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        HEAD,
+        Some(owner("route-a")),
+        vec!["windows@app=9".to_owned()],
+    )
+    .expect("legacy handoff");
+
+    let mut mismatched = owner("route-a");
+    mismatched.provider_route = Some(subrouter_provider_route(2));
+    persist_actionable_failure(
+        &path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        HEAD,
+        Some(mismatched),
+        vec!["windows@app=9".to_owned()],
+    )
+    .expect_err("provider generation cannot exceed the unchanged owner generation");
+    assert!(
+        ledger
+            .terminal_handoffs
+            .values()
+            .all(|handoff| handoff.provider_route.is_none())
+    );
+
+    let mut enriched = owner("route-a");
+    enriched.provider_route = Some(subrouter_provider_route(1));
+    persist_actionable_failure(
+        &path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        HEAD,
+        Some(enriched),
+        vec!["windows@app=9".to_owned()],
+    )
+    .expect("validated provider route enriches the legacy handoff");
+    let restarted = load_ledger(&path).expect("restart enriched ledger");
+    assert!(
+        restarted
+            .terminal_handoffs
+            .values()
+            .all(|handoff| handoff.provider_route.is_some())
+    );
+    assert!(matches!(
+        restarted
+            .resume_records
+            .values()
+            .next()
+            .expect("resume")
+            .provider_adapter,
+        Some(ProviderAdapterV1::LaunchProfile {
+            ref provider,
+            generation: 1,
+            ..
+        }) if provider == "subrouter"
+    ));
 }
 
 #[test]
@@ -674,15 +758,7 @@ fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
     let mut ledger = StewardLedger::default();
     let mut herdr_owner = owner("herdr-route");
     herdr_owner.terminal_provenance = Some(TerminalProvenanceKind::HerdR);
-    herdr_owner.provider_route = Some(ProviderRouteReferenceV1 {
-        profile_digest: "a".repeat(64),
-        integrity_hash: "b".repeat(64),
-        generation: 1,
-        revision: 2,
-        provider: "subrouter".to_owned(),
-        account: Some("account-a".to_owned()),
-        model: Some("gpt-5.6-sol".to_owned()),
-    });
+    herdr_owner.provider_route = Some(subrouter_provider_route(1));
     persist_actionable_failure(
         &path,
         &mut ledger,

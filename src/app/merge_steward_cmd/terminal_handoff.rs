@@ -376,6 +376,7 @@ fn persist_inner(
         let route_degraded = existing.owner_disposition == "original_owner"
             && incoming.owner_disposition == "unroutable_private_route";
         let cmux_provenance_enriched = cmux_provenance_can_enrich(existing, &incoming);
+        let provider_route_enriched = provider_route_can_enrich(existing, &incoming);
         let owner_can_change = route_can_resolve || ownership_can_transfer;
         let owner_may_differ = owner_can_change || route_degraded;
         if existing.repo != incoming.repo
@@ -393,7 +394,9 @@ fn persist_inner(
             || (!owner_may_differ && existing.owner_route_id != incoming.owner_route_id)
             || (!owner_may_differ && existing.owner_provider != incoming.owner_provider)
             || (!owner_may_differ && existing.resume_transport != incoming.resume_transport)
-            || (!owner_may_differ && existing.provider_route != incoming.provider_route)
+            || (!owner_may_differ
+                && !provider_route_enriched
+                && existing.provider_route != incoming.provider_route)
             || (!owner_may_differ
                 && !cmux_provenance_enriched
                 && !same_terminal_provenance(
@@ -411,6 +414,7 @@ fn persist_inner(
         let record_changed = owner_can_change
             || route_degraded
             || cmux_provenance_enriched
+            || provider_route_enriched
             || (rearm_applied && existing_phase != TerminalHandoffPhase::Pending)
             || rearm_actionable;
         if record_changed {
@@ -422,8 +426,13 @@ fn persist_inner(
                 clear_owner_route(record);
             } else if owner_can_change {
                 replace_owner_route(record, incoming);
-            } else if cmux_provenance_enriched {
-                record.owner_terminal_provenance = incoming.owner_terminal_provenance;
+            } else {
+                if cmux_provenance_enriched {
+                    record.owner_terminal_provenance = incoming.owner_terminal_provenance;
+                }
+                if provider_route_enriched {
+                    record.provider_route = incoming.provider_route;
+                }
             }
             if rearm_applied && existing_phase != TerminalHandoffPhase::Pending {
                 record.phase = TerminalHandoffPhase::Pending;
@@ -481,6 +490,20 @@ fn cmux_provenance_can_enrich(existing: &TerminalHandoff, incoming: &TerminalHan
         existing.owner_terminal_provenance,
         None | Some(TerminalProvenanceKind::Absent)
     ) && incoming.owner_terminal_provenance == Some(TerminalProvenanceKind::Cmux)
+}
+
+fn provider_route_can_enrich(existing: &TerminalHandoff, incoming: &TerminalHandoff) -> bool {
+    existing.provider_route.is_none()
+        && incoming.provider_route.as_ref().is_some_and(|route| {
+            Some(route.generation) == incoming.ownership_generation
+                && route.revision > 0
+                && valid_sha256(&route.profile_digest)
+                && valid_sha256(&route.integrity_hash)
+        })
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn resolve_conflicting_success(ledger: &mut StewardLedger, incoming: &TerminalHandoff) -> bool {

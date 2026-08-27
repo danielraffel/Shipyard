@@ -35,6 +35,18 @@ fn handoff(
     }
 }
 
+fn subrouter_route(generation: u64) -> ProviderRouteReferenceV1 {
+    ProviderRouteReferenceV1 {
+        profile_digest: "a".repeat(64),
+        integrity_hash: "b".repeat(64),
+        generation,
+        revision: 2,
+        provider: "subrouter".to_owned(),
+        account: Some("account-a".to_owned()),
+        model: Some("gpt-5.6-sol".to_owned()),
+    }
+}
+
 #[test]
 fn terminal_and_agent_adapters_are_orthogonal() {
     let record = record_for(&handoff(
@@ -87,15 +99,7 @@ fn herdr_terminal_does_not_replace_native_agent_transport() {
 #[test]
 fn launch_profile_route_is_preserved_beside_native_agent_transport() {
     let mut terminal = handoff(Some("codex"), Some("codex_queue"), Some("surface-7"));
-    terminal.provider_route = Some(ProviderRouteReferenceV1 {
-        profile_digest: "a".repeat(64),
-        integrity_hash: "b".repeat(64),
-        generation: 4,
-        revision: 2,
-        provider: "subrouter".to_owned(),
-        account: Some("account-a".to_owned()),
-        model: Some("gpt-5.6-sol".to_owned()),
-    });
+    terminal.provider_route = Some(subrouter_route(4));
     let record = record_for(&terminal).expect("routed record");
 
     assert!(matches!(
@@ -117,6 +121,31 @@ fn launch_profile_route_is_preserved_beside_native_agent_transport() {
             && account.as_deref() == Some("account-a")
             && model.as_deref() == Some("gpt-5.6-sol")
     ));
+    assert!(!record.dispatch_enabled);
+}
+
+#[test]
+fn fresh_checkpoint_preserves_launch_profile_provider_route() {
+    let mut terminal = handoff(None, None, None);
+    terminal.owner_disposition = "fresh_agent_only".to_owned();
+    terminal.owner_route_id = None;
+    terminal.provider_route = Some(subrouter_route(4));
+    let record = record_for(&terminal).expect("fresh checkpoint record");
+
+    assert_eq!(record.terminal_adapter, None);
+    assert_eq!(record.agent_adapter, None);
+    assert!(matches!(
+        record.provider_adapter,
+        Some(ProviderAdapterV1::LaunchProfile {
+            ref provider,
+            generation: 4,
+            ..
+        }) if provider == "subrouter"
+    ));
+    assert_eq!(
+        record.routing_disposition,
+        ResumeRoutingDisposition::FreshCheckpointRequired
+    );
     assert!(!record.dispatch_enabled);
 }
 

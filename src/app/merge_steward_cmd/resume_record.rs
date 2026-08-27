@@ -175,12 +175,13 @@ fn route(handoff: &TerminalHandoff) -> Result<ResumeRouteV1, CliFailure> {
             ));
         }
     };
+    let provider_adapter = provider_adapter(handoff);
     if disposition != ResumeRoutingDisposition::OriginalOwner {
         return Ok(ResumeRouteV1 {
             disposition,
             terminal_adapter: None,
             agent_adapter: None,
-            provider_adapter: None,
+            provider_adapter,
         });
     }
 
@@ -189,7 +190,7 @@ fn route(handoff: &TerminalHandoff) -> Result<ResumeRouteV1, CliFailure> {
             disposition: ResumeRoutingDisposition::UnroutablePrivateRoute,
             terminal_adapter: None,
             agent_adapter: None,
-            provider_adapter: None,
+            provider_adapter,
         });
     };
     let terminal_adapter = match handoff.owner_terminal_provenance {
@@ -214,19 +215,6 @@ fn route(handoff: &TerminalHandoff) -> Result<ResumeRouteV1, CliFailure> {
         }
         _ => None,
     };
-    let provider_adapter =
-        handoff
-            .provider_route
-            .as_ref()
-            .map(|route| ProviderAdapterV1::LaunchProfile {
-                profile_digest: route.profile_digest.clone(),
-                integrity_hash: route.integrity_hash.clone(),
-                generation: route.generation,
-                revision: route.revision,
-                provider: route.provider.clone(),
-                account: route.account.clone(),
-                model: route.model.clone(),
-            });
     if terminal_adapter.is_none() && agent_adapter.is_none() && provider_adapter.is_none() {
         return Ok(ResumeRouteV1 {
             disposition: ResumeRoutingDisposition::UnroutablePrivateRoute,
@@ -241,6 +229,21 @@ fn route(handoff: &TerminalHandoff) -> Result<ResumeRouteV1, CliFailure> {
         agent_adapter,
         provider_adapter,
     })
+}
+
+fn provider_adapter(handoff: &TerminalHandoff) -> Option<ProviderAdapterV1> {
+    handoff
+        .provider_route
+        .as_ref()
+        .map(|route| ProviderAdapterV1::LaunchProfile {
+            profile_digest: route.profile_digest.clone(),
+            integrity_hash: route.integrity_hash.clone(),
+            generation: route.generation,
+            revision: route.revision,
+            provider: route.provider.clone(),
+            account: route.account.clone(),
+            model: route.model.clone(),
+        })
 }
 
 fn resume_id(
