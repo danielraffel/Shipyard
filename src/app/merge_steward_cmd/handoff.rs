@@ -862,18 +862,7 @@ pub(super) fn terminal_owner_route(
     if receipt.phase != HandoffPhase::Managed {
         return Ok(None);
     }
-    let provider_route = receipt
-        .launch_profile
-        .as_ref()
-        .map(|stored| ProviderRouteReferenceV1 {
-            profile_digest: stored.profile_digest.clone(),
-            integrity_hash: stored.integrity_hash.clone(),
-            generation: stored.generation,
-            revision: stored.revision,
-            provider: stored.profile.provider.provider.clone(),
-            account: stored.profile.provider.account.clone(),
-            model: stored.profile.provider.model.clone(),
-        });
+    let provider_route = provider_route_reference(&receipt);
     let route = receipt.agent_route;
     let (owner_id, terminal_provenance) = if let Some(route) = route.as_ref() {
         let stored_path = state_dir
@@ -967,6 +956,7 @@ fn unresolved_terminal_owner(
     {
         return None;
     }
+    let provider_route = provider_route_reference(&receipt);
     Some(TerminalOwnerRoute {
         origin_machine: receipt.origin_machine,
         owner_id: receipt.owner_id,
@@ -976,8 +966,23 @@ fn unresolved_terminal_owner(
         provider: None,
         resume_transport: None,
         terminal_provenance: None,
-        provider_route: None,
+        provider_route,
     })
+}
+
+fn provider_route_reference(receipt: &DurableStewardHandoff) -> Option<ProviderRouteReferenceV1> {
+    receipt
+        .launch_profile
+        .as_ref()
+        .map(|stored| ProviderRouteReferenceV1 {
+            profile_digest: stored.profile_digest.clone(),
+            integrity_hash: stored.integrity_hash.clone(),
+            generation: stored.generation,
+            revision: stored.revision,
+            provider: stored.profile.provider.provider.clone(),
+            account: stored.profile.provider.account.clone(),
+            model: stored.profile.provider.model.clone(),
+        })
 }
 
 fn agent_route_path(runtime_paths: &RuntimePaths, route_id: &str) -> std::path::PathBuf {

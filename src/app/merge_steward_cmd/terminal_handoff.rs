@@ -363,20 +363,17 @@ fn persist_inner(
         let existing_phase = existing.phase;
         let rearm_actionable = incoming.outcome == TerminalHandoffOutcome::ActionableFailure
             && existing_phase == TerminalHandoffPhase::Resolved;
-        let route_can_resolve = (existing.owner_disposition == "route_registry_required"
-            && incoming.owner_disposition != "route_registry_required")
-            || (existing.owner_disposition == "unroutable_private_route"
-                && incoming.owner_disposition == "original_owner"
-                && incoming.ownership_generation >= existing.ownership_generation);
-        let ownership_can_transfer = matches!(
-            existing.owner_disposition.as_str(),
-            "original_owner" | "fresh_agent_only"
-        ) && incoming.owner_disposition == "original_owner"
-            && incoming.ownership_generation > existing.ownership_generation;
+        let route_can_resolve = route_can_resolve(existing, &incoming);
+        let ownership_can_transfer = ownership_can_transfer(existing, &incoming);
         let route_degraded = existing.owner_disposition == "original_owner"
             && incoming.owner_disposition == "unroutable_private_route";
         let cmux_provenance_enriched = cmux_provenance_can_enrich(existing, &incoming);
         let provider_route_enriched = provider_route_can_enrich(existing, &incoming);
+        let degradation_provider_route = if route_degraded {
+            Some(provider_route_for_degradation(existing, &incoming)?)
+        } else {
+            None
+        };
         let owner_can_change = route_can_resolve || ownership_can_transfer;
         let owner_may_differ = owner_can_change || route_degraded;
         if existing.repo != incoming.repo
@@ -423,7 +420,10 @@ fn persist_inner(
                 .get_mut(&key)
                 .expect("existing terminal handoff key");
             if route_degraded {
-                clear_owner_route(record);
+                clear_owner_route(
+                    record,
+                    degradation_provider_route.expect("route degradation was classified"),
+                );
             } else if owner_can_change {
                 replace_owner_route(record, incoming);
             } else {
@@ -457,13 +457,58 @@ fn persist_inner(
     Ok(true)
 }
 
-fn clear_owner_route(record: &mut TerminalHandoff) {
+fn route_can_resolve(existing: &TerminalHandoff, incoming: &TerminalHandoff) -> bool {
+    (existing.owner_disposition == "route_registry_required"
+        && incoming.owner_disposition != "route_registry_required")
+        || (existing.owner_disposition == "unroutable_private_route"
+            && incoming.owner_disposition == "original_owner"
+            && incoming.ownership_generation >= existing.ownership_generation)
+}
+
+fn ownership_can_transfer(existing: &TerminalHandoff, incoming: &TerminalHandoff) -> bool {
+    matches!(
+        existing.owner_disposition.as_str(),
+        "original_owner" | "fresh_agent_only"
+    ) && incoming.owner_disposition == "original_owner"
+        && incoming.ownership_generation > existing.ownership_generation
+}
+
+fn clear_owner_route(
+    record: &mut TerminalHandoff,
+    provider_route: Option<super::handoff::ProviderRouteReferenceV1>,
+) {
     "unroutable_private_route".clone_into(&mut record.owner_disposition);
     record.owner_route_id = None;
     record.owner_provider = None;
     record.resume_transport = None;
     record.owner_terminal_provenance = None;
-    record.provider_route = None;
+    record.provider_route = provider_route;
+}
+
+fn provider_route_for_degradation(
+    existing: &TerminalHandoff,
+    incoming: &TerminalHandoff,
+) -> Result<Option<super::handoff::ProviderRouteReferenceV1>, CliFailure> {
+    match (&existing.provider_route, &incoming.provider_route) {
+        (Some(stored), Some(observed)) if stored != observed => Err(CliFailure::new(
+            1,
+            "terminal handoff provider route changed during route degradation",
+        )),
+        (Some(stored), _) => Ok(Some(stored.clone())),
+        (None, Some(observed))
+            if Some(observed.generation) == existing.ownership_generation
+                && observed.revision > 0
+                && valid_sha256(&observed.profile_digest)
+                && valid_sha256(&observed.integrity_hash) =>
+        {
+            Ok(Some(observed.clone()))
+        }
+        (None, Some(_)) => Err(CliFailure::new(
+            1,
+            "terminal handoff provider route is invalid during route degradation",
+        )),
+        (None, None) => Ok(None),
+    }
 }
 
 fn replace_owner_route(record: &mut TerminalHandoff, incoming: TerminalHandoff) {

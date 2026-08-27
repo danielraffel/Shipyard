@@ -436,6 +436,8 @@ fn route_resolution_and_owner_transfer_are_monotonic() {
     )
     .expect("validated route resolves unroutable snapshot");
 
+    let mut trusted = owner("trusted-route");
+    trusted.provider_route = Some(subrouter_provider_route(1));
     persist_actionable_failure(
         &path,
         &mut ledger,
@@ -443,7 +445,7 @@ fn route_resolution_and_owner_transfer_are_monotonic() {
         "main",
         9,
         HEAD,
-        Some(owner("trusted-route")),
+        Some(trusted),
         vec!["linux@app=3".to_owned()],
     )
     .expect("trusted route");
@@ -475,6 +477,23 @@ fn route_resolution_and_owner_transfer_are_monotonic() {
         "unroutable_private_route"
     );
     assert_eq!(degraded_record.owner_route_id, None);
+    assert_eq!(
+        degraded_record.provider_route,
+        Some(subrouter_provider_route(1))
+    );
+    let degraded_resume = ledger
+        .resume_records
+        .values()
+        .find(|record| record.pr_number == 9)
+        .expect("degraded resume record");
+    assert!(matches!(
+        degraded_resume.provider_adapter,
+        Some(ProviderAdapterV1::LaunchProfile {
+            ref provider,
+            generation: 1,
+            ..
+        }) if provider == "subrouter"
+    ));
 }
 
 #[test]

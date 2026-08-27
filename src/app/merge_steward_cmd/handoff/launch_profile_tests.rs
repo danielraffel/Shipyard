@@ -265,6 +265,27 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
     assert_eq!(provider_route.provider, "opaque-provider");
     assert_eq!(provider_route.account.as_deref(), Some("subscription-a"));
     assert_eq!(provider_route.model.as_deref(), Some("model-tier-a"));
+
+    std::fs::remove_file(&route_path).expect("remove private agent route");
+    let unresolved =
+        terminal_owner_route_or_unresolved(temp.path(), "owner/repo", args.pr, &args.head)
+            .expect("validated public receipt remains an unresolved obligation");
+    assert_eq!(unresolved.owner_disposition, "unroutable_private_route");
+    assert_eq!(unresolved.route_id, None);
+    assert_eq!(unresolved.provider, None);
+    assert_eq!(unresolved.terminal_provenance, None);
+    assert_eq!(
+        unresolved.provider_route,
+        Some(ProviderRouteReferenceV1 {
+            profile_digest: stored.profile_digest.clone(),
+            integrity_hash: stored.integrity_hash.clone(),
+            generation: stored.generation,
+            revision: stored.revision,
+            provider: "opaque-provider".to_owned(),
+            account: Some("subscription-a".to_owned()),
+            model: Some("model-tier-a".to_owned()),
+        })
+    );
 }
 
 #[test]
