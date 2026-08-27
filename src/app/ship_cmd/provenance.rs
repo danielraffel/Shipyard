@@ -207,6 +207,7 @@ pub(super) fn apply_requested_steward_handoff_with_actions<W: Write>(
             agent_session_id: None,
             agent_parent_session_id: None,
             agent_surface_id: None,
+            launch_profile: None,
             goal_managed: false,
             after_handoff: "continue".to_owned(),
             transfer_agent_owner: false,

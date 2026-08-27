@@ -43,6 +43,15 @@ published to GitHub. Typed provenance is only a future wake address: until a
 trusted consumer advertises availability, it does not authorize pausing,
 resuming, or transferring monitoring.
 
+When an exact wrapper or provider-specific resume command must survive the
+handoff, pass a private `LaunchProfileV1` JSON file with `--launch-profile`.
+Preserve launch and resume argv as exact arrays; never translate provider flags
+or put credentials in the profile. The contract also binds opaque
+provider/account/model metadata, checkpoint generation/digest, and exact
+repository/worktree/head/lineage provenance. Shipyard stores but does not
+execute this contract, and it must continue to report
+`wake_consumer_available=false`. See `docs/launch-profile.md`.
+
 After an acknowledged handoff whose receipt proves the wake consumer is
 available:
 
