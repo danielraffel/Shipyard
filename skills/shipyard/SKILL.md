@@ -1079,7 +1079,9 @@ compares the current GitHub origin, branch, and full HEAD with the authenticated
 PR repository, head branch, and head SHA before it writes queue, ship-state, or
 validation state. A detached, stale, fork-origin, or unrelated checkout is
 rejected; switch to the exact PR worktree instead of using `--pr` as a retarget
-override.
+override. A verified intentional head/base change still requires explicit
+`--adopt-head`, and known drift is rejected before queue insertion so it cannot
+wait behind unrelated work only to fail at worker start. Never auto-adopt.
 
 For an already-created PR, the submitting agent must run
 `shipyard runner steward-handoff --repo OWNER/REPO --pr N --head SHA

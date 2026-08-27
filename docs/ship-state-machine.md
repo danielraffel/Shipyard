@@ -238,6 +238,10 @@ authoritative even when an unrelated hosted check has a similar target name.
     ship-state, evidence, or validation work. *Recovery: switch to the exact
     lineage-classified PR worktree and rerun; never adopt the unrelated
     checkout as the PR head.*
+  - The exact checkout matches the live PR, but existing scoped ship-state
+    records a different head or base → Shipyard rejects synchronously before
+    queue insertion. *Recovery: first prove the head change is intentional,
+    then rerun with explicit `--adopt-head`; never enable automatic adoption.*
   - Configured PR provenance is malformed, cannot start, or exits nonzero while required → `shipyard pr` exits before the steward status/label or queue/validation state is created. The argv is executed directly, exact PR facts are expanded and exported as `SHIPYARD_PR_*`, and the submitting process environment supplies agent/router context. *Recovery: repair provenance and rerun `shipyard pr`; do not use a recovery agent to overwrite submitter attribution.*
   - Requested steward handoff fails (invalid workstream/context, GitHub write denial, closed PR, or exact-head mismatch) → `shipyard pr` exits before queue or validation state is created. The status is written before the label and the head is re-read between them; therefore a concurrent head move can leave only a harmless stale-head status, never a managed label authorized by that stale receipt. *Recovery: resolve the failure and resubmit the current exact head.*
   - `git push` fails silently → `find_pr_for_branch` may still find an existing PR; the local SHA may not match the remote. A fresh state is saved for a branch whose tip may not be pushed. *Recovery: none automatic — the drift check on the next resume will catch it, but between the stale push and the next resume the state claims a SHA that doesn't exist on the remote.*

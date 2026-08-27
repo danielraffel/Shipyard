@@ -1434,7 +1434,10 @@ to bind the current checkout to another PR. Before any queue, ship-state, or
 validation mutation, Shipyard requires the current GitHub origin, branch, and
 full HEAD to equal the authenticated PR repository, head branch, and head SHA.
 Switch to the exact PR worktree when this guard rejects a stale, detached,
-fork-origin, or unrelated checkout.
+fork-origin, or unrelated checkout. If that exact worktree intentionally moved
+since the previous ship attempt, Shipyard also rejects the stale scoped
+ship-state before queue insertion; verify the new head, then acknowledge it
+with explicit `--adopt-head`. Never automate that flag.
 
 Never run `gh pr create` + release separately. Never run the gate scripts by hand.
 

@@ -45,6 +45,7 @@ use crate::queue::Queue;
 use crate::reconcile::fetch_head_and_status_check_rollup_with_cwd;
 use crate::ship::{
     ShipExecutionRequest, ShipStores, drain_or_wait_ship, submit_ship, submit_ship_daemon,
+    validate_ship_state_for_submission,
 };
 use crate::ship_state::ShipStateStore;
 use crate::warm_pool::{WarmPool, default_pool_path};
@@ -272,6 +273,13 @@ pub(super) fn ship_command<W: Write>(
         pr_snapshot_file: args.pr_snapshot_file.clone(),
         targets,
     };
+
+    // Fail a known stale validation identity synchronously. The worker repeats
+    // this under the per-PR lock, but deferring the first check until execution
+    // can waste minutes behind unrelated repositories before the request is
+    // inevitably cancelled for missing explicit `--adopt-head` authority.
+    validate_ship_state_for_submission(&request, &ship_state)
+        .map_err(|error| CliFailure::new(2, error.to_string()))?;
 
     if daemon_owned
         && crate::queue_request::ExecutionProvenance::capture_with_config(
