@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use super::recovery_worker::{
     RecoveryEnqueueDisposition, RecoveryEnqueueLease, acquire_recovery_publication_lease,
     enqueue_recovery_request, recovery_publication_is_enabled, with_recovery_clear_fence,
+    with_recovery_clear_fence_held,
 };
+use super::terminal_handoff::{persist_actionable_failure, resolve_terminal_handoffs};
 
 const RECOVERY_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -133,14 +135,19 @@ pub(super) fn reconcile_recovery_signal(
         | StewardDecision::OptedOut
         | StewardDecision::ProvenanceBlocked { .. }
         | StewardDecision::Draft
-        | StewardDecision::InvalidHead => return (None, None),
+        | StewardDecision::InvalidHead => {
+            // These exact-head states explicitly remove recovery authority.
+            // Fence both model work and any previously recorded owner wake so
+            // a later dispatcher cannot resurrect opted-out or invalid work.
+            return revalidate_excluded_recovery_clear(context, observed, policy, decision, ledger);
+        }
         _ => false,
     };
     if signal_is_converged(observed, needs_agent) {
         return if needs_agent {
             enqueue_recovery_after_revalidation(context, observed, policy, decision, ledger)
         } else {
-            fence_converged_recovery_clear(context, observed)
+            fence_converged_recovery_clear(context, observed, ledger)
         };
     }
 
@@ -159,7 +166,7 @@ pub(super) fn reconcile_recovery_signal(
         return if needs_agent {
             enqueue_recovery_after_revalidation(context, &live, policy, decision, ledger)
         } else {
-            fence_converged_recovery_clear(context, &live)
+            fence_converged_recovery_clear(context, &live, ledger)
         };
     }
 
@@ -172,38 +179,93 @@ pub(super) fn reconcile_recovery_signal(
     (combine_mutations(mutation, enqueue_mutation), enqueue_error)
 }
 
+fn revalidate_excluded_recovery_clear(
+    context: &MutationApplyContext<'_>,
+    observed: &ObservedPr,
+    policy: &StewardPolicy,
+    decision: &StewardDecision,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    // Exclusion was observed before this mutation pass. Hold the same lease
+    // that orders recovery publication while proving the exact head still has
+    // the same exclusion decision, then clear both durable surfaces without
+    // releasing that fence in between.
+    let lease = match acquire_recovery_publication_lease(&context.mutation_control.state_dir) {
+        Ok(lease) => lease,
+        Err(error) => return (None, Some(error.message().to_owned())),
+    };
+    let live = match revalidate_recovery_target(
+        context,
+        observed,
+        policy,
+        decision,
+        ledger,
+        recovery_revalidation_deadline(),
+    ) {
+        Ok(live) => live,
+        Err(result) => return result,
+    };
+    match with_recovery_clear_fence_held(
+        &context.mutation_control.state_dir,
+        &context.observation.repo,
+        live.fact.number,
+        &live.fact.head_sha,
+        &lease,
+        || {
+            resolve_terminal_handoffs(
+                context.ledger_path,
+                ledger,
+                &context.observation.repo,
+                &context.observation.base,
+                live.fact.number,
+                &live.fact.head_sha,
+            )
+            .map_err(|error| error.message)
+        },
+    ) {
+        Ok(()) => (None, None),
+        Err(error) => (None, Some(error)),
+    }
+}
+
 fn enqueue_recovery_after_revalidation(
     context: &MutationApplyContext<'_>,
     observed: &ObservedPr,
     policy: &StewardPolicy,
     decision: &StewardDecision,
-    ledger: &StewardLedger,
+    ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
-    match recovery_publication_is_enabled(
-        &context.mutation_control.global_dir,
-        &context.mutation_control.state_dir,
-        &context.observation.repo,
-    ) {
-        Ok(true) => {}
-        Ok(false) => return (None, None),
-        Err(error) => return deferred_recovery_request(error.message()),
-    }
-    // Publication and deterministic clear share this exclusive lease. A clear
-    // that acquires first completes before this final live read; a clear that
-    // overlaps the read waits and supersedes any record published afterward.
-    let deadline = recovery_revalidation_deadline();
+    // Publication and deterministic clear share this exclusive lease. Hold it
+    // across the final live read and durable publication so a clear that wins
+    // first is visible to revalidation, while a clear that loses waits and
+    // resolves the newly published exact-head record afterward. This applies
+    // even when model-driven recovery is disabled: the terminal handoff is
+    // itself recovery publication.
     let publication_lease =
         match acquire_recovery_publication_lease(&context.mutation_control.state_dir) {
             Ok(lease) => lease,
-            Err(error) => return deferred_recovery_request(error.message()),
+            Err(error) => {
+                return (
+                    None,
+                    Some(format!(
+                        "mandatory terminal handoff publication lease failed: {}",
+                        error.message()
+                    )),
+                );
+            }
         };
+    let deadline = recovery_revalidation_deadline();
     let live =
         match revalidate_recovery_target(context, observed, policy, decision, ledger, deadline) {
             Ok(live) => live,
             Err((mutation, None)) => return (mutation, None),
             Err((mutation, Some(error))) => {
-                let (deferred, _) = deferred_recovery_request(&error);
-                return (combine_mutations(mutation, deferred), None);
+                return (
+                    mutation,
+                    Some(format!(
+                        "mandatory terminal handoff live revalidation failed: {error}"
+                    )),
+                );
             }
         };
     if !signal_is_converged(&live, true) {
@@ -212,12 +274,47 @@ fn enqueue_recovery_after_revalidation(
             None,
         );
     }
+    let failure_contexts = match normalized_recovery_facts(decision, policy, &live.fact.checks) {
+        Ok(Some((_, facts))) => facts.iter().map(failure_fact_component).collect(),
+        Ok(None) => Vec::new(),
+        Err(error) => return (None, Some(error)),
+    };
+    // Route corruption cannot suppress the durable failure fact. Preserve it
+    // as unresolved; the future authenticated registry decides routability.
+    let owner = super::handoff::terminal_owner_route_or_unresolved(
+        &context.mutation_control.state_dir,
+        &context.observation.repo,
+        live.fact.number,
+        &live.fact.head_sha,
+    );
+    if let Err(error) = persist_actionable_failure(
+        context.ledger_path,
+        ledger,
+        &context.observation.repo,
+        &context.observation.base,
+        live.fact.number,
+        &live.fact.head_sha,
+        owner,
+        failure_contexts,
+    ) {
+        return (None, Some(error.message));
+    }
+    match recovery_publication_is_enabled(
+        &context.mutation_control.global_dir,
+        &context.mutation_control.state_dir,
+        &context.observation.repo,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return (Some("actionable_failure_persisted".to_owned()), None),
+        Err(error) => return deferred_recovery_request(error.message()),
+    }
     enqueue_recovery(context, &live, policy, decision, publication_lease)
 }
 
 fn fence_converged_recovery_clear(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
+    ledger: &mut StewardLedger,
 ) -> (Option<String>, Option<String>) {
     // Always fence the durable target, even when no witness exists. Enqueue
     // persists its record before its witness, and a crash in that gap must not
@@ -227,7 +324,17 @@ fn fence_converged_recovery_clear(
         &context.observation.repo,
         pr.fact.number,
         &pr.fact.head_sha,
-        || Ok(()),
+        || {
+            resolve_terminal_handoffs(
+                context.ledger_path,
+                ledger,
+                &context.observation.repo,
+                &context.observation.base,
+                pr.fact.number,
+                &pr.fact.head_sha,
+            )
+            .map_err(|error| error.message)
+        },
     ) {
         Ok(()) => (None, None),
         Err(error) => (None, Some(error)),
@@ -544,7 +651,19 @@ fn apply_recovery_signal(
             &context.observation.repo,
             live.fact.number,
             &live.fact.head_sha,
-            || clear_needs_agent(context, live),
+            || {
+                let action = clear_needs_agent(context, live)?;
+                resolve_terminal_handoffs(
+                    context.ledger_path,
+                    ledger,
+                    &context.observation.repo,
+                    &context.observation.base,
+                    live.fact.number,
+                    &live.fact.head_sha,
+                )
+                .map_err(|error| error.message)?;
+                Ok(action)
+            },
         )
     };
     match result {

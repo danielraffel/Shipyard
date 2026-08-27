@@ -129,7 +129,66 @@ struct StewardLedger {
     #[serde(default)]
     queue_recovery_receipts: BTreeMap<String, QueueRecoveryReceipt>,
     #[serde(default)]
+    terminal_handoffs: BTreeMap<String, TerminalHandoff>,
+    #[serde(default)]
     audit: Vec<LedgerAudit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct TerminalHandoff {
+    dedupe_key: String,
+    repo: String,
+    base: String,
+    pr_number: u64,
+    head_sha: String,
+    outcome: TerminalHandoffOutcome,
+    trigger: String,
+    next_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin_machine: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ownership_generation: Option<u64>,
+    owner_disposition: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_route_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_terminal_provenance: Option<TerminalProvenanceKind>,
+    wake_consumer_available: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    failure_contexts: Vec<String>,
+    phase: TerminalHandoffPhase,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalHandoffOutcome {
+    SuccessContinuation,
+    ActionableFailure,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalHandoffPhase {
+    Pending,
+    Recorded,
+    Applied,
+    Resolved,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalProvenanceKind {
+    #[default]
+    Absent,
+    HerdR,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1030,6 +1089,7 @@ mod observation;
 mod pr_mutations;
 mod queue_priority_recovery;
 mod render;
+mod terminal_handoff;
 
 use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,

@@ -7,10 +7,14 @@ use super::{
     authoritative_head_still_superseded, classify_pr, coalescing_reason_authorizes,
     current_pull_request_heads, exact_run_still_queued, merge_group_pr_number,
     opted_out_pull_requests, plan_capacity_preemptions, plan_run_coalescing,
-    pr_mutations::mutate_pr_with_recovery, pull_request_is_managed,
-    pull_request_provenance_blocked, queue_priority_recovery::record_queue_witnesses,
+    pr_mutations::mutate_pr_with_recovery,
+    pull_request_is_managed, pull_request_provenance_blocked,
+    queue_priority_recovery::record_queue_witnesses,
     reconcile_management_label, reconcile_recovery_signal, record_audit,
     revalidate_coalescing_cancellation,
+    terminal_handoff::{
+        reconcile_queued_success_continuation, resolve_superseded_terminal_handoffs,
+    },
 };
 
 #[allow(clippy::too_many_lines)]
@@ -23,6 +27,24 @@ pub(super) fn apply_repo_plan(
     remaining_preemptions: usize,
     mutation_control: Option<&MutationControl>,
 ) -> (RepoReport, bool, usize) {
+    let terminal_handoff_reconcile_error = if args.apply {
+        let current_heads = observation
+            .prs
+            .iter()
+            .map(|pr| (pr.fact.number, pr.fact.head_sha.clone()))
+            .collect();
+        resolve_superseded_terminal_handoffs(
+            ledger_path,
+            ledger,
+            &observation.repo,
+            &observation.base,
+            &current_heads,
+        )
+        .err()
+        .map(|error| error.message)
+    } else {
+        None
+    };
     let recovery_witness_error = if args.apply && args.recover_hosted_setup_eviction_priority {
         record_queue_witnesses(actions, observation, args, ledger_path, ledger).err()
     } else {
@@ -49,7 +71,8 @@ pub(super) fn apply_repo_plan(
     );
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
         || pr_mutation_failed
-        || recovery_witness_error.is_some();
+        || recovery_witness_error.is_some()
+        || terminal_handoff_reconcile_error.is_some();
     let mut planned_cancellations = Vec::new();
     if args.coalesce {
         let current_heads = current_pull_request_heads(&observation.prs);
@@ -135,6 +158,7 @@ pub(super) fn apply_repo_plan(
                 .filter(|_| args.preempt_capacity)
                 .cloned()
                 .chain(recovery_witness_error)
+                .chain(terminal_handoff_reconcile_error)
                 .collect(),
         },
         unhealthy,
@@ -164,17 +188,28 @@ pub(super) fn apply_pr_plans(
         .map(|pr| {
             let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
             let decision = classify_pr(&pr.fact, policy, &attempts);
-            if matches!(decision, StewardDecision::ProvenanceBlocked { .. }) {
-                return PrReport {
-                    number: pr.fact.number,
-                    head_sha: pr.fact.head_sha.clone(),
-                    decision,
-                    mutation: None,
-                    error: None,
-                };
+            if let Some(report) =
+                provenance_blocked_report(mutation_context.as_ref(), pr, policy, &decision, ledger)
+            {
+                unhealthy |= report.error.is_some();
+                return report;
             }
             let (mut mutation, mut error) = (None, None);
-            if args.apply {
+            if args.apply && matches!(decision, StewardDecision::Queued { .. }) {
+                match reconcile_queued_success_continuation(
+                    ledger_path,
+                    ledger,
+                    &observation.repo,
+                    &observation.base,
+                    pr.fact.number,
+                    &pr.fact.head_sha,
+                ) {
+                    Ok(true) => mutation = Some("success_continuation_reconciled".to_owned()),
+                    Ok(false) => {}
+                    Err(failure) => error = Some(failure.message),
+                }
+            }
+            if args.apply && error.is_none() {
                 let (management_mutation, management_error) = reconcile_management_label(
                     mutation_context
                         .as_ref()
@@ -184,7 +219,11 @@ pub(super) fn apply_pr_plans(
                     &decision,
                     ledger,
                 );
-                mutation = management_mutation;
+                if let Some(management_mutation) = management_mutation {
+                    mutation = Some(mutation.map_or(management_mutation.clone(), |prior| {
+                        format!("{prior},{management_mutation}")
+                    }));
+                }
                 error = management_error;
             }
             if args.apply && error.is_none() {
@@ -233,6 +272,28 @@ pub(super) fn apply_pr_plans(
         })
         .collect();
     (reports, unhealthy)
+}
+
+fn provenance_blocked_report(
+    mutation_context: Option<&MutationApplyContext<'_>>,
+    pr: &ObservedPr,
+    policy: &StewardPolicy,
+    decision: &StewardDecision,
+    ledger: &mut StewardLedger,
+) -> Option<PrReport> {
+    if !matches!(decision, StewardDecision::ProvenanceBlocked { .. }) {
+        return None;
+    }
+    let (mutation, error) = mutation_context.map_or((None, None), |context| {
+        reconcile_recovery_signal(context, pr, policy, decision, ledger)
+    });
+    Some(PrReport {
+        number: pr.fact.number,
+        head_sha: pr.fact.head_sha.clone(),
+        decision: decision.clone(),
+        mutation,
+        error,
+    })
 }
 
 pub(super) fn plan_repo_capacity_preemptions(

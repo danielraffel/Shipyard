@@ -1,6 +1,7 @@
 use super::{
-    CliFailure, Path, PathBuf, RecoveryRequest, RecoveryStore, RecoveryWitness, Write,
-    acquire_recovery_enqueue_lease, fs, recovery_lease_deadline, recovery_store_root,
+    CliFailure, Path, PathBuf, RecoveryEnqueueLease, RecoveryRequest, RecoveryStore,
+    RecoveryWitness, Write, acquire_recovery_enqueue_lease, fs, recovery_lease_deadline,
+    recovery_store_root,
 };
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -144,9 +145,31 @@ pub(in crate::app::merge_steward_cmd) fn with_recovery_clear_fence<T>(
     head_sha: &str,
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    fence_recovery_state(state_dir, repo, pr, head_sha)?;
+    let store_root = recovery_store_root(state_dir);
+    let store = RecoveryStore::new(&store_root)
+        .map_err(|error| format!("failed to open recovery store for clear fence: {error}"))?;
+    let lease = acquire_recovery_enqueue_lease(store.root(), recovery_lease_deadline()).map_err(
+        |error| {
+            format!(
+                "failed to acquire recovery clear fence: {}",
+                error.message()
+            )
+        },
+    )?;
+    with_recovery_clear_fence_held(state_dir, repo, pr, head_sha, &lease, operation)
+}
+
+pub(in crate::app::merge_steward_cmd) fn with_recovery_clear_fence_held<T>(
+    state_dir: &Path,
+    repo: &str,
+    pr: u64,
+    head_sha: &str,
+    lease: &RecoveryEnqueueLease,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    fence_recovery_state_held(state_dir, repo, pr, head_sha, lease)?;
     let operation_result = operation();
-    let final_fence = fence_recovery_state(state_dir, repo, pr, head_sha);
+    let final_fence = fence_recovery_state_held(state_dir, repo, pr, head_sha, lease);
     match (operation_result, final_fence) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -156,22 +179,19 @@ pub(in crate::app::merge_steward_cmd) fn with_recovery_clear_fence<T>(
     }
 }
 
-fn fence_recovery_state(
+fn fence_recovery_state_held(
     state_dir: &Path,
     repo: &str,
     pr: u64,
     head_sha: &str,
+    lease: &RecoveryEnqueueLease,
 ) -> Result<(), String> {
-    let store = RecoveryStore::new(recovery_store_root(state_dir))
+    let store_root = recovery_store_root(state_dir);
+    if !lease.covers(&store_root) {
+        return Err("recovery clear fence lease does not cover this state directory".to_owned());
+    }
+    let store = RecoveryStore::new(store_root)
         .map_err(|error| format!("failed to open recovery store for clear fence: {error}"))?;
-    let _lease = acquire_recovery_enqueue_lease(store.root(), recovery_lease_deadline()).map_err(
-        |error| {
-            format!(
-                "failed to acquire recovery clear fence: {}",
-                error.message()
-            )
-        },
-    )?;
     store
         .supersede_active_target(
             repo,

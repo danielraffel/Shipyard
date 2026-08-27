@@ -3,9 +3,12 @@ from __future__ import annotations
 import importlib.util
 import contextlib
 import fcntl
+import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -86,6 +89,115 @@ class GuardianLifecycleTests(unittest.TestCase):
         ), self.assertRaisesRegex(guardian.GuardianError, "inconsistent lsof"):
             guardian._lock_holders(path)
 
+    def test_holder_probe_revalidates_before_one_timeout_retry(self) -> None:
+        path = Path("/tmp/writer.lock")
+        revalidate = mock.Mock()
+        timeout = subprocess.TimeoutExpired(["lsof"], 7)
+        success = mock.Mock(returncode=0, stdout="p4242\nf3\n", stderr="")
+        with mock.patch.object(
+            guardian.subprocess, "run", side_effect=[timeout, success]
+        ) as run:
+            self.assertEqual(
+                guardian._lock_holders(
+                    path,
+                    retry_after_timeout=revalidate,
+                ),
+                (4242,),
+            )
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [
+                "/usr/sbin/lsof",
+                "-nP",
+                "-S",
+                "2",
+                "-F",
+                "pf",
+                "--",
+                str(path),
+            ],
+        )
+        revalidate.assert_called_once()
+        retry_deadline = revalidate.call_args.args[0]
+        self.assertGreater(retry_deadline, time.monotonic())
+        self.assertLessEqual(
+            retry_deadline - time.monotonic(), guardian.LOCK_HOLDER_TOTAL_TIMEOUT
+        )
+
+    def test_holder_probe_does_not_retry_when_revalidation_fails(self) -> None:
+        path = Path("/tmp/writer.lock")
+        timeout = subprocess.TimeoutExpired(["lsof"], 7)
+        revalidation_failure = guardian.GuardianError("identity changed")
+        revalidate = mock.Mock(side_effect=revalidation_failure)
+        with mock.patch.object(
+            guardian.subprocess, "run", side_effect=[timeout]
+        ) as run, self.assertRaisesRegex(guardian.GuardianError, "identity changed"):
+            guardian._lock_holders(path, retry_after_timeout=revalidate)
+        run.assert_called_once()
+        revalidate.assert_called_once()
+
+    def test_holder_probe_retry_uses_remaining_aggregate_deadline(self) -> None:
+        path = Path("/tmp/writer.lock")
+        timeout = subprocess.TimeoutExpired(["lsof"], 7)
+        success = mock.Mock(returncode=1, stdout="", stderr="")
+        revalidate = mock.Mock()
+        with mock.patch.object(
+            guardian.time, "monotonic", side_effect=[100.0, 100.0, 110.0]
+        ), mock.patch.object(
+            guardian.subprocess, "run", side_effect=[timeout, success]
+        ) as run:
+            self.assertEqual(
+                guardian._lock_holders(path, retry_after_timeout=revalidate), ()
+            )
+        revalidate.assert_called_once_with(115.0)
+        self.assertEqual(run.call_args_list[0].kwargs["timeout"], 7.0)
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], 5.0)
+
+    def test_holder_probe_repeated_timeout_fails_closed_with_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "writer.lock"
+            path.touch()
+            revalidate = mock.Mock()
+            timeout = subprocess.TimeoutExpired(["lsof"], 7)
+            with mock.patch.object(
+                guardian.subprocess, "run", side_effect=[timeout, timeout]
+            ), self.assertRaisesRegex(
+                guardian.GuardianError, "after 2 attempt"
+            ):
+                guardian._lock_holders(
+                    path,
+                    retry_after_timeout=revalidate,
+                    diagnostic_root=root,
+                )
+            revalidate.assert_called_once()
+            diagnostics = sorted(root.glob("lock-holder-timeout-*.json"))
+            self.assertEqual(len(diagnostics), 2)
+            payloads = [json.loads(item.read_text()) for item in diagnostics]
+            self.assertEqual({payload["attempt"] for payload in payloads}, {1, 2})
+            self.assertTrue(
+                all(payload["lock_inode"] == path.stat().st_ino for payload in payloads)
+            )
+
+    def test_holder_probe_rejects_incomplete_structured_output(self) -> None:
+        path = Path("/tmp/writer.lock")
+        incomplete = mock.Mock(returncode=0, stdout="p4242\n", stderr="")
+        with mock.patch.object(
+            guardian.subprocess, "run", return_value=incomplete
+        ), self.assertRaisesRegex(guardian.GuardianError, "incomplete lsof"):
+            guardian._lock_holders(path)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS lsof proof")
+    def test_holder_probe_observes_real_macos_holder_and_no_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "writer.lock"
+            with path.open("a+b") as holder:
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+                self.assertEqual(guardian._lock_holders(path), (os.getpid(),))
+                fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+            self.assertEqual(guardian._lock_holders(path), ())
+
     def test_json_status_probe_does_not_inherit_protected_stdio_marker(self) -> None:
         snapshot = guardian.ProcessSnapshot(
             pid=4242,
@@ -118,6 +230,33 @@ class GuardianLifecycleTests(unittest.TestCase):
             run.call_args.args[0][:4],
             ["/tmp/shipyard", "--cwd", "/", "--json"],
         )
+
+    def test_deadline_bound_status_skips_unbounded_timeout_diagnostics(self) -> None:
+        snapshot = guardian.ProcessSnapshot(
+            pid=4242,
+            executable="/tmp/shipyard",
+            argv=("/tmp/shipyard", "daemon", "run"),
+            environment={"HOME": "/tmp/home"},
+            cwd="/tmp",
+            stdin_path="/dev/null",
+            stdout_path="/tmp/daemon.log",
+            stderr_path="/tmp/daemon.log",
+            start_time="Sat Aug 22 00:00:00 2026",
+        )
+        completed = mock.Mock(returncode=0, stdout='{"running":true}', stderr="")
+        with mock.patch.object(
+            guardian, "_run", return_value=completed
+        ) as bounded_run, mock.patch.object(guardian, "_run_status_probe") as diagnostic:
+            guardian._json_command(
+                snapshot,
+                Path("/tmp/shipyard"),
+                "daemon",
+                "status",
+                deadline=time.monotonic() + 5,
+                diagnostic_root=Path("/tmp/diagnostics"),
+            )
+        bounded_run.assert_called_once()
+        diagnostic.assert_not_called()
 
     def test_timed_out_status_captures_live_processes_before_terminating_child(self) -> None:
         process = mock.Mock(pid=7331, returncode=None)
@@ -457,6 +596,7 @@ class GuardianLifecycleTests(unittest.TestCase):
                 active.lock_path,
                 snapshot.pid,
                 verify_production=active.verify_unchanged_production,
+                diagnostic_root=active.root,
             )
             run.assert_not_called()
 
