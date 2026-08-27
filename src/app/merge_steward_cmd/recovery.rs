@@ -260,8 +260,12 @@ fn enqueue_recovery_after_revalidation(
             Ok(live) => live,
             Err((mutation, None)) => return (mutation, None),
             Err((mutation, Some(error))) => {
-                let (deferred, _) = deferred_recovery_request(&error);
-                return (combine_mutations(mutation, deferred), None);
+                return (
+                    mutation,
+                    Some(format!(
+                        "mandatory terminal handoff live revalidation failed: {error}"
+                    )),
+                );
             }
         };
     if !signal_is_converged(&live, true) {

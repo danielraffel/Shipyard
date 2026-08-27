@@ -888,6 +888,83 @@ fn contended_terminal_publication_lease_cannot_report_healthy_without_an_obligat
 
 #[cfg(unix)]
 #[test]
+fn terminal_revalidation_failure_stays_unhealthy_until_retry_publishes_the_wake() {
+    let temp = tempfile::tempdir().expect("temp");
+    let failed_once = temp.path().join("failed-once");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    if [ ! -f '{failed_once}' ]; then
+      : > '{failed_once}'
+      echo "temporary GitHub read failure" >&2
+      exit 1
+    fi
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{{"name":"shipyard:needs-agent"}}],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-08-27T00:00:00Z","detailsUrl":"https://github.com/owner/repo/actions/runs/101"}},{{"__typename":"StatusContext","context":"shipyard/steward-recovery","state":"FAILURE","createdAt":"2026-08-27T00:00:01Z"}}]}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            failed_once = failed_once.display(),
+        ),
+    );
+    let mut pr = ready_pr();
+    pr.fact.labels.push(NEEDS_AGENT_LABEL.to_owned());
+    pr.fact.checks[0].conclusion = Some("FAILURE".to_owned());
+    pr.fact.checks.push(StewardCheck {
+        name: RECOVERY_CONTEXT.to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("FAILURE".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-08-27T00:00:01Z".to_owned()),
+    });
+    let observation = observation_for(pr.clone(), true);
+    let policy = queue_policy();
+    let decision = StewardDecision::RequiredFailed {
+        contexts: vec!["macos".to_owned()],
+    };
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+    let first = reconcile_recovery_signal(&context, &pr, &policy, &decision, &mut ledger);
+    assert!(first.0.is_none(), "{first:?}");
+    assert!(
+        first.1.as_deref().is_some_and(
+            |error| error.contains("mandatory terminal handoff live revalidation failed")
+        ),
+        "{first:?}"
+    );
+    assert!(ledger.terminal_handoffs.is_empty());
+    assert!(!ledger_path.exists());
+
+    let second = reconcile_recovery_signal(&context, &pr, &policy, &decision, &mut ledger);
+    assert!(
+        second
+            .0
+            .as_deref()
+            .is_some_and(|mutation| mutation.starts_with("recovery_request_deferred:")),
+        "optional model recovery may defer only after the wake is durable: {second:?}"
+    );
+    assert!(second.1.is_none(), "{second:?}");
+    let wake = ledger
+        .terminal_handoffs
+        .values()
+        .next()
+        .expect("durable retry wake");
+    assert_eq!(wake.phase, TerminalHandoffPhase::Recorded);
+    assert!(!wake.wake_consumer_available);
+    assert!(ledger_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn enqueue_transport_mutates_only_after_live_queue_and_head_revalidation() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
