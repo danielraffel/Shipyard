@@ -2,7 +2,7 @@ use super::{
     CliFailure, Path, StewardLedger, TerminalHandoff, TerminalHandoffOutcome, TerminalHandoffPhase,
     TerminalProvenanceKind, Utc,
     handoff::TerminalOwnerRoute,
-    ledger::{load_ledger, save_ledger},
+    ledger::{load_existing_ledger, save_ledger},
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -468,9 +468,9 @@ fn reconcile_after_ambiguous_save(
     // `save_ledger` may fail after the atomic rename if only directory sync
     // failed. Reloading distinguishes the published old/new image and prevents
     // a later final save from overwriting it with a guessed in-memory state.
-    match load_ledger(ledger_path) {
-        Ok(published) => *ledger = published,
-        Err(_) => ledger.terminal_handoffs = fallback_handoffs,
+    match load_existing_ledger(ledger_path) {
+        Ok(Some(published)) => *ledger = published,
+        Ok(None) | Err(_) => ledger.terminal_handoffs = fallback_handoffs,
     }
 }
 

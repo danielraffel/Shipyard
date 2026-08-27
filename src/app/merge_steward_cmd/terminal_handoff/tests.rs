@@ -517,6 +517,38 @@ fn same_head_failure_supersedes_ambiguous_pending_success() {
 }
 
 #[test]
+fn ambiguous_save_distinguishes_absent_target_from_published_empty_ledger() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("source.json");
+    let mut ledger = StewardLedger::default();
+    persist_actionable_failure(
+        &source,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        7,
+        HEAD,
+        Some(owner("route-a")),
+        vec!["windows@app=9".to_owned()],
+    )
+    .expect("fallback obligation");
+    let fallback = ledger.terminal_handoffs.clone();
+
+    ledger.terminal_handoffs.clear();
+    reconcile_after_ambiguous_save(
+        &temp.path().join("absent.json"),
+        &mut ledger,
+        fallback.clone(),
+    );
+    assert_eq!(ledger.terminal_handoffs, fallback);
+
+    let published_empty = temp.path().join("published-empty.json");
+    save_ledger(&published_empty, &StewardLedger::default()).expect("published empty ledger");
+    reconcile_after_ambiguous_save(&published_empty, &mut ledger, fallback);
+    assert!(ledger.terminal_handoffs.is_empty());
+}
+
+#[test]
 fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("merge-steward.json");

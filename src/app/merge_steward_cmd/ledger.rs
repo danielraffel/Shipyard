@@ -45,10 +45,15 @@ pub(super) fn persist_pending_mutation_correlation(
 }
 
 pub(super) fn load_ledger(path: &Path) -> Result<StewardLedger, CliFailure> {
+    Ok(load_existing_ledger(path)?.unwrap_or_default())
+}
+
+pub(super) fn load_existing_ledger(path: &Path) -> Result<Option<StewardLedger>, CliFailure> {
     match fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str(&raw)
+            .map(Some)
             .map_err(|error| CliFailure::new(1, format!("invalid steward ledger: {error}"))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(StewardLedger::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(CliFailure::new(
             1,
             format!("could not read steward ledger {}: {error}", path.display()),
