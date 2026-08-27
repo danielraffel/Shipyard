@@ -2287,6 +2287,10 @@ fn main() {{
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "privacy, restart, tamper, and permission assertions form one lifecycle scenario"
+    )]
     fn durable_handoff_is_private_exact_head_scoped_and_restart_monotonic() {
         let temp = tempfile::tempdir().expect("temp");
         let paths = RuntimePaths::current_with_overrides(

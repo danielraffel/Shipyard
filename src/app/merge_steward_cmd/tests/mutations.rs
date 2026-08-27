@@ -24,8 +24,8 @@ use crate::app::merge_steward_cmd::terminal_handoff::{
 };
 use crate::merge_steward::StewardCheckSource;
 
-fn terminal_owner_route(route_id: &str) -> Option<TerminalOwnerRoute> {
-    Some(TerminalOwnerRoute {
+fn terminal_owner_route(route_id: &str) -> TerminalOwnerRoute {
+    TerminalOwnerRoute {
         origin_machine: "m3".to_owned(),
         owner_id: "owner-exact".to_owned(),
         ownership_generation: 1,
@@ -34,7 +34,7 @@ fn terminal_owner_route(route_id: &str) -> Option<TerminalOwnerRoute> {
         provider: Some("codex".to_owned()),
         resume_transport: Some("codex_queue".to_owned()),
         terminal_provenance: Some(TerminalProvenanceKind::Absent),
-    })
+    }
 }
 
 #[cfg(unix)]
@@ -622,7 +622,7 @@ fn failed_terminal_handoff_write_restores_prior_in_memory_obligation() {
         "main",
         7,
         head,
-        terminal_owner_route("route-a"),
+        Some(terminal_owner_route("route-a")),
         vec!["windows@app=9".to_owned()],
     )
     .expect("first");
@@ -647,7 +647,7 @@ fn failed_terminal_handoff_write_restores_prior_in_memory_obligation() {
         "main",
         7,
         head,
-        terminal_owner_route("route-a"),
+        Some(terminal_owner_route("route-a")),
         vec!["macos@app=42".to_owned()],
     )
     .expect_err("replacement save fails");
@@ -676,7 +676,7 @@ fn restart_preserves_success_and_failure_terminal_handoffs() {
         "main",
         7,
         head,
-        terminal_owner_route("route-success"),
+        Some(terminal_owner_route("route-success")),
     )
     .expect("success continuation");
     persist_actionable_failure(
@@ -686,7 +686,7 @@ fn restart_preserves_success_and_failure_terminal_handoffs() {
         "main",
         8,
         head,
-        terminal_owner_route("route-failure"),
+        Some(terminal_owner_route("route-failure")),
         vec!["macos@app=42".to_owned()],
     )
     .expect("failure wake");
@@ -736,7 +736,7 @@ esac
         "main",
         pr.fact.number,
         &pr.fact.head_sha,
-        terminal_owner_route("route-failure"),
+        Some(terminal_owner_route("route-failure")),
         vec!["macos@app=unbound".to_owned()],
     )
     .expect("failure wake");
@@ -809,7 +809,7 @@ esac
         "main",
         pr.fact.number,
         &pr.fact.head_sha,
-        terminal_owner_route("route-failure"),
+        Some(terminal_owner_route("route-failure")),
         vec!["macos@app=unbound".to_owned()],
     )
     .expect("failure wake");
@@ -2128,6 +2128,10 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exact read-only GitHub transcript is intentionally kept beside its scenario"
+)]
 fn provenance_blocker_with_opt_out_and_steward_state_makes_no_github_write() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(

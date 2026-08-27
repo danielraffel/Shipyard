@@ -4,8 +4,8 @@ use crate::app::merge_steward_cmd::ledger::load_ledger;
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-fn owner(route: &str) -> Option<TerminalOwnerRoute> {
-    Some(TerminalOwnerRoute {
+fn owner(route: &str) -> TerminalOwnerRoute {
+    TerminalOwnerRoute {
         origin_machine: "m3".to_owned(),
         owner_id: "owner-exact".to_owned(),
         ownership_generation: 1,
@@ -14,11 +14,11 @@ fn owner(route: &str) -> Option<TerminalOwnerRoute> {
         provider: Some("codex".to_owned()),
         resume_transport: Some("codex_queue".to_owned()),
         terminal_provenance: Some(TerminalProvenanceKind::Absent),
-    })
+    }
 }
 
-fn fresh_agent_owner() -> Option<TerminalOwnerRoute> {
-    Some(TerminalOwnerRoute {
+fn fresh_agent_owner() -> TerminalOwnerRoute {
+    TerminalOwnerRoute {
         origin_machine: "m3".to_owned(),
         owner_id: "fresh-agent-only".to_owned(),
         ownership_generation: 1,
@@ -27,7 +27,7 @@ fn fresh_agent_owner() -> Option<TerminalOwnerRoute> {
         provider: None,
         resume_transport: None,
         terminal_provenance: None,
-    })
+    }
 }
 
 #[test]
@@ -42,7 +42,7 @@ fn replay_is_idempotent_but_owner_drift_fails_closed() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
         vec!["windows@app=9".to_owned()],
     )
     .expect("first");
@@ -53,7 +53,7 @@ fn replay_is_idempotent_but_owner_drift_fails_closed() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
         vec!["windows@app=9".to_owned()],
     )
     .expect("replay");
@@ -64,7 +64,7 @@ fn replay_is_idempotent_but_owner_drift_fails_closed() {
         "main",
         7,
         HEAD,
-        owner("route-b"),
+        Some(owner("route-b")),
         vec!["windows@app=9".to_owned()],
     )
     .expect_err("owner drift");
@@ -77,7 +77,7 @@ fn replay_is_idempotent_but_owner_drift_fails_closed() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
         vec!["macos@app=42".to_owned()],
     )
     .expect("a distinct exact failure trigger supersedes stale same-head evidence");
@@ -105,7 +105,7 @@ fn legacy_terminal_record_without_typed_provenance_replays_idempotently() {
         "main",
         7,
         HEAD,
-        owner("legacy-route"),
+        Some(owner("legacy-route")),
         vec!["windows@app=9".to_owned()],
     )
     .expect("current record");
@@ -125,7 +125,7 @@ fn legacy_terminal_record_without_typed_provenance_replays_idempotently() {
         "main",
         7,
         HEAD,
-        owner("legacy-route"),
+        Some(owner("legacy-route")),
         vec!["windows@app=9".to_owned()],
     )
     .expect("legacy replay");
@@ -140,6 +140,10 @@ fn legacy_terminal_record_without_typed_provenance_replays_idempotently() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the monotonic route lifecycle is clearer as one ordered scenario"
+)]
 fn route_resolution_and_owner_transfer_are_monotonic() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("merge-steward.json");
@@ -162,11 +166,11 @@ fn route_resolution_and_owner_transfer_are_monotonic() {
         "main",
         7,
         HEAD,
-        fresh_agent_owner(),
+        Some(fresh_agent_owner()),
         vec!["macos@app=42".to_owned()],
     )
     .expect("resolve known route-less fallback");
-    let mut generation_two = owner("route-generation-2").expect("owner");
+    let mut generation_two = owner("route-generation-2");
     generation_two.owner_id = "replacement-owner".to_owned();
     generation_two.ownership_generation = 2;
     persist_actionable_failure(
@@ -192,13 +196,13 @@ fn route_resolution_and_owner_transfer_are_monotonic() {
         "main",
         7,
         HEAD,
-        owner("route-generation-1"),
+        Some(owner("route-generation-1")),
         vec!["macos@app=42".to_owned()],
     )
     .expect_err("stale generation");
     assert!(error.message().contains("identity changed"));
 
-    let mut unroutable = owner("discarded-route").expect("owner");
+    let mut unroutable = owner("discarded-route");
     unroutable.owner_disposition = "unroutable_private_route".to_owned();
     unroutable.route_id = None;
     unroutable.provider = None;
@@ -234,7 +238,7 @@ fn route_resolution_and_owner_transfer_are_monotonic() {
         "main",
         8,
         HEAD,
-        owner("validated-route"),
+        Some(owner("validated-route")),
         vec!["windows@app=9".to_owned()],
     )
     .expect("validated route resolves unroutable snapshot");
@@ -246,11 +250,11 @@ fn route_resolution_and_owner_transfer_are_monotonic() {
         "main",
         9,
         HEAD,
-        owner("trusted-route"),
+        Some(owner("trusted-route")),
         vec!["linux@app=3".to_owned()],
     )
     .expect("trusted route");
-    let mut degraded = owner("discarded-route").expect("owner");
+    let mut degraded = owner("discarded-route");
     degraded.owner_id = "untrusted-fallback-owner".to_owned();
     degraded.owner_disposition = "unroutable_private_route".to_owned();
     degraded.route_id = None;
@@ -292,7 +296,7 @@ fn base_scoped_observation_resolves_only_proven_head_supersession() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
     )
     .expect("success");
     persist_success_continuation(
@@ -302,7 +306,7 @@ fn base_scoped_observation_resolves_only_proven_head_supersession() {
         "MAIN",
         7,
         HEAD,
-        owner("route-case-distinct"),
+        Some(owner("route-case-distinct")),
     )
     .expect("case-distinct base");
     persist_actionable_failure(
@@ -312,7 +316,7 @@ fn base_scoped_observation_resolves_only_proven_head_supersession() {
         "main",
         8,
         HEAD,
-        owner("route-b"),
+        Some(owner("route-b")),
         vec!["macos@app=42".to_owned()],
     )
     .expect("failure");
@@ -323,7 +327,7 @@ fn base_scoped_observation_resolves_only_proven_head_supersession() {
         "release",
         9,
         HEAD,
-        owner("route-release"),
+        Some(owner("route-release")),
         vec!["windows@app=9".to_owned()],
     )
     .expect("other base failure");
@@ -381,7 +385,7 @@ fn deterministic_convergence_resolves_recorded_failure() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
         vec!["macos@app=42".to_owned()],
     )
     .expect("failure");
@@ -392,7 +396,7 @@ fn deterministic_convergence_resolves_recorded_failure() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
     )
     .expect("pending success");
     resolve_terminal_handoffs(&path, &mut ledger, "owner/repo", "main", 7, HEAD).expect("resolve");
@@ -409,7 +413,7 @@ fn deterministic_convergence_resolves_recorded_failure() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
         vec!["macos@app=42".to_owned()],
     )
     .expect("recur");
@@ -437,7 +441,7 @@ fn same_head_failure_supersedes_ambiguous_pending_success() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
     )
     .expect("durable intent precedes ambiguous enqueue response");
     assert_eq!(
@@ -459,7 +463,7 @@ fn same_head_failure_supersedes_ambiguous_pending_success() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
         vec!["macos@app=42".to_owned()],
     )
     .expect_err("failed publication rolls back both outcome changes");
@@ -481,7 +485,7 @@ fn same_head_failure_supersedes_ambiguous_pending_success() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
         vec!["macos@app=42".to_owned()],
     )
     .expect("same-head required failure");
@@ -517,7 +521,7 @@ fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("merge-steward.json");
     let mut ledger = StewardLedger::default();
-    let mut herdr_owner = owner("herdr-route").expect("owner");
+    let mut herdr_owner = owner("herdr-route");
     herdr_owner.terminal_provenance = Some(TerminalProvenanceKind::HerdR);
     persist_actionable_failure(
         &path,
@@ -561,7 +565,7 @@ fn queued_reconciliation_completes_uncertain_success_once() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
     )
     .expect("intent");
     assert!(
@@ -579,7 +583,7 @@ fn queued_reconciliation_completes_uncertain_success_once() {
         "main",
         7,
         HEAD,
-        owner("route-a"),
+        Some(owner("route-a")),
     )
     .expect("rearm exact-head continuation");
     assert_eq!(
