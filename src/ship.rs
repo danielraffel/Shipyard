@@ -858,23 +858,18 @@ fn validate_metadata_authority_request(
 fn metadata_authority_receipt_for_request(
     request: &ShipExecutionRequest,
 ) -> Result<Option<&crate::metadata_authority::MetadataAuthorityReceipt>, ShipExecutionError> {
-    if !request.targets.is_empty() {
-        if request.metadata_authority_receipt.is_some() {
-            return Err(ShipExecutionError::WorkerSetup(
-                "metadata authority receipt cannot accompany native targets".to_owned(),
-            ));
-        }
+    let Some(receipt) = request.metadata_authority_receipt.as_ref() else {
+        // An empty explicit target list has always meant "use the configured
+        // native target set" for ordinary ship requests. Only an attached,
+        // validated metadata receipt opts into zero-native execution.
         return Ok(None);
+    };
+    if !request.targets.is_empty() {
+        return Err(ShipExecutionError::WorkerSetup(
+            "metadata authority receipt cannot accompany native targets".to_owned(),
+        ));
     }
-    request
-        .metadata_authority_receipt
-        .as_ref()
-        .map(Some)
-        .ok_or_else(|| {
-            ShipExecutionError::WorkerSetup(
-                "zero-target ship request is missing metadata authority".to_owned(),
-            )
-        })
+    Ok(Some(receipt))
 }
 
 fn validate_metadata_authority_execution(
@@ -3401,7 +3396,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_authority_request_shape_rejects_mixed_or_unproven_zero_targets() {
+    fn metadata_authority_request_shape_requires_receipt_only_for_metadata_mode() {
         let ordinary = ship_request(vec![local_target_without_cwd("mac", "macos-arm64")]);
         assert!(
             super::metadata_authority_receipt_for_request(&ordinary)
@@ -3413,20 +3408,22 @@ mod tests {
         mixed.metadata_authority_receipt = Some(metadata_receipt());
         assert!(super::metadata_authority_receipt_for_request(&mixed).is_err());
 
-        let zero = ship_request(Vec::new());
-        assert!(super::metadata_authority_receipt_for_request(&zero).is_err());
+        let default_native = ship_request(Vec::new());
+        assert!(
+            super::metadata_authority_receipt_for_request(&default_native)
+                .expect("ordinary request with configured native defaults")
+                .is_none()
+        );
 
-        let state_dir = tempfile::tempdir().expect("state");
-        let mut queue = Queue::new(state_dir.path()).expect("queue");
-        assert!(super::submit_ship(&zero, &mut queue, state_dir.path(), state_dir.path()).is_err());
-
-        let mut authorized = zero;
+        let mut authorized = default_native;
         authorized.metadata_authority_receipt = Some(metadata_receipt());
         assert!(
             super::metadata_authority_receipt_for_request(&authorized)
                 .expect("authorized zero-target request")
                 .is_some()
         );
+        let state_dir = tempfile::tempdir().expect("state");
+        let mut queue = Queue::new(state_dir.path()).expect("queue");
         let queued =
             super::submit_ship(&authorized, &mut queue, state_dir.path(), state_dir.path())
                 .expect("queue authorized zero-target request");
