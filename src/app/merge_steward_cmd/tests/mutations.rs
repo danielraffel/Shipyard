@@ -708,6 +708,136 @@ fn restart_preserves_success_and_failure_terminal_handoffs() {
 
 #[cfg(unix)]
 #[test]
+fn stale_exclusion_cannot_resolve_a_newly_actionable_terminal_handoff() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-08-27T00:00:00Z","detailsUrl":"https://github.com/owner/repo/actions/runs/101"}]}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let mut pr = ready_pr();
+    pr.fact.labels.push("steward:skip".to_owned());
+    let observation = observation_for(pr.clone(), true);
+    let policy = queue_policy();
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    persist_actionable_failure(
+        &ledger_path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        pr.fact.number,
+        &pr.fact.head_sha,
+        terminal_owner_route("route-failure"),
+        vec!["macos@app=unbound".to_owned()],
+    )
+    .expect("failure wake");
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+    let (mutation, error) = reconcile_recovery_signal(
+        &context,
+        &pr,
+        &policy,
+        &StewardDecision::OptedOut,
+        &mut ledger,
+    );
+
+    assert_eq!(
+        mutation.as_deref(),
+        Some("recovery_skipped_after_live_revalidation")
+    );
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(
+        ledger
+            .terminal_handoffs
+            .values()
+            .next()
+            .expect("failure remains actionable")
+            .phase,
+        TerminalHandoffPhase::Recorded
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn github_recovery_clear_resolves_terminal_handoff_inside_the_clear_fence() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{"name":"shipyard:needs-agent"}],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-08-27T00:00:00Z","detailsUrl":"https://github.com/owner/repo/actions/runs/101"},{"__typename":"StatusContext","context":"shipyard/recovery","state":"FAILURE","createdAt":"2026-08-27T00:00:01Z"}]}' ;;
+  *"statuses/"*) printf '%s' '{}' ;;
+  "api repos/owner/repo/pulls/42")
+    printf '%s' '{"state":"open","head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' ;;
+  *"issues/42/labels/shipyard%3Aneeds-agent"*) printf '%s' '{}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let mut pr = ready_pr();
+    pr.fact.labels.push(NEEDS_AGENT_LABEL.to_owned());
+    pr.fact.checks.push(StewardCheck {
+        name: RECOVERY_CONTEXT.to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("FAILURE".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-08-27T00:00:01Z".to_owned()),
+    });
+    let observation = observation_for(pr.clone(), true);
+    let policy = queue_policy();
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    persist_actionable_failure(
+        &ledger_path,
+        &mut ledger,
+        "owner/repo",
+        "main",
+        pr.fact.number,
+        &pr.fact.head_sha,
+        terminal_owner_route("route-failure"),
+        vec!["macos@app=unbound".to_owned()],
+    )
+    .expect("failure wake");
+    let mutation_control = mutation_control(&temp, "studio", "studio");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+    let (mutation, error) = reconcile_recovery_signal(
+        &context,
+        &pr,
+        &policy,
+        &StewardDecision::ArmMergeQueue,
+        &mut ledger,
+    );
+
+    assert!(error.is_none(), "mutation={mutation:?} error={error:?}");
+    assert_eq!(mutation.as_deref(), Some("needs_agent_cleared"));
+    assert_eq!(
+        ledger
+            .terminal_handoffs
+            .values()
+            .next()
+            .expect("resolved wake")
+            .phase,
+        TerminalHandoffPhase::Resolved
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn enqueue_transport_mutates_only_after_live_queue_and_head_revalidation() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");

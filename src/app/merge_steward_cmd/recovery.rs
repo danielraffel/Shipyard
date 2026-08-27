@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use super::recovery_worker::{
     RecoveryEnqueueDisposition, RecoveryEnqueueLease, acquire_recovery_publication_lease,
     enqueue_recovery_request, recovery_publication_is_enabled, with_recovery_clear_fence,
+    with_recovery_clear_fence_held,
 };
 use super::terminal_handoff::{persist_actionable_failure, resolve_terminal_handoffs};
 
@@ -138,7 +139,7 @@ pub(super) fn reconcile_recovery_signal(
             // These exact-head states explicitly remove recovery authority.
             // Fence both model work and any previously recorded owner wake so
             // a later dispatcher cannot resurrect opted-out or invalid work.
-            return fence_converged_recovery_clear(context, observed, ledger);
+            return revalidate_excluded_recovery_clear(context, observed, policy, decision, ledger);
         }
         _ => false,
     };
@@ -176,6 +177,55 @@ pub(super) fn reconcile_recovery_signal(
     let (enqueue_mutation, enqueue_error) =
         enqueue_recovery_after_revalidation(context, &live, policy, decision, ledger);
     (combine_mutations(mutation, enqueue_mutation), enqueue_error)
+}
+
+fn revalidate_excluded_recovery_clear(
+    context: &MutationApplyContext<'_>,
+    observed: &ObservedPr,
+    policy: &StewardPolicy,
+    decision: &StewardDecision,
+    ledger: &mut StewardLedger,
+) -> (Option<String>, Option<String>) {
+    // Exclusion was observed before this mutation pass. Hold the same lease
+    // that orders recovery publication while proving the exact head still has
+    // the same exclusion decision, then clear both durable surfaces without
+    // releasing that fence in between.
+    let lease = match acquire_recovery_publication_lease(&context.mutation_control.state_dir) {
+        Ok(lease) => lease,
+        Err(error) => return (None, Some(error.message().to_owned())),
+    };
+    let live = match revalidate_recovery_target(
+        context,
+        observed,
+        policy,
+        decision,
+        ledger,
+        recovery_revalidation_deadline(),
+    ) {
+        Ok(live) => live,
+        Err(result) => return result,
+    };
+    match with_recovery_clear_fence_held(
+        &context.mutation_control.state_dir,
+        &context.observation.repo,
+        live.fact.number,
+        &live.fact.head_sha,
+        &lease,
+        || {
+            resolve_terminal_handoffs(
+                context.ledger_path,
+                ledger,
+                &context.observation.repo,
+                &context.observation.base,
+                live.fact.number,
+                &live.fact.head_sha,
+            )
+            .map_err(|error| error.message)
+        },
+    ) {
+        Ok(()) => (None, None),
+        Err(error) => (None, Some(error)),
+    }
 }
 
 fn enqueue_recovery_after_revalidation(
@@ -589,7 +639,19 @@ fn apply_recovery_signal(
             &context.observation.repo,
             live.fact.number,
             &live.fact.head_sha,
-            || clear_needs_agent(context, live),
+            || {
+                let action = clear_needs_agent(context, live)?;
+                resolve_terminal_handoffs(
+                    context.ledger_path,
+                    ledger,
+                    &context.observation.repo,
+                    &context.observation.base,
+                    live.fact.number,
+                    &live.fact.head_sha,
+                )
+                .map_err(|error| error.message)?;
+                Ok(action)
+            },
         )
     };
     match result {

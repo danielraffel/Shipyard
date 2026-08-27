@@ -390,8 +390,8 @@ pub(super) fn enqueue_recovery_request(
 mod witness;
 #[cfg(test)]
 pub(super) use witness::has_recovery_witness;
-pub(super) use witness::with_recovery_clear_fence;
 use witness::{verify_recovery_witness, write_recovery_witness};
+pub(super) use witness::{with_recovery_clear_fence, with_recovery_clear_fence_held};
 mod lease;
 use lease::{
     GlobalModelLease, acquire_global_model_lease, acquire_recovery_enqueue_read_lease,
