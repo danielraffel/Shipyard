@@ -1,3 +1,7 @@
+use super::launch_profile::{
+    LaunchProfileV1, launch_profile_digest, launch_profile_integrity_hash, load_launch_profile,
+    validate_launch_profile,
+};
 use super::{
     CliFailure, GitHubActions, HANDOFF_CONTEXT, MANAGED_LABEL, Path, TerminalProvenanceKind,
     UNMANAGED_LABEL, Value, Write, gh_json, is_full_sha, observation::encode_path_segment,
@@ -10,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use crate::paths::RuntimePaths;
 use crate::queue::replace_file_with_windows_retry;
@@ -26,6 +30,7 @@ pub(crate) struct StewardHandoffArgs {
     pub(crate) agent_session_id: Option<String>,
     pub(crate) agent_parent_session_id: Option<String>,
     pub(crate) agent_surface_id: Option<String>,
+    pub(crate) launch_profile: Option<std::path::PathBuf>,
     pub(crate) goal_managed: bool,
     pub(crate) after_handoff: String,
     pub(crate) transfer_agent_owner: bool,
@@ -101,6 +106,21 @@ struct StoredAgentRoute {
     revision: u64,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StoredLaunchProfileV1 {
+    generation: u64,
+    revision: u64,
+    profile_digest: String,
+    integrity_hash: String,
+    profile: LaunchProfileV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LaunchProfileCandidateV1 {
+    profile_digest: String,
+    profile: LaunchProfileV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -198,6 +218,8 @@ struct DurableStewardHandoff {
     repair_route: RepairRoute,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_route: Option<AgentRouteReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_profile: Option<StoredLaunchProfileV1>,
     goal_lifecycle: GoalLifecycle,
     goal_status: GoalStatus,
     goal_status_provenance: GoalStatusProvenance,
@@ -224,6 +246,13 @@ pub(crate) fn steward_handoff_command<W: Write>(
         .ok_or_else(|| CliFailure::new(1, "repository was not resolved"))?;
     verify_exact_open_pr(actions, &repo, args.pr, &args.head)?;
     let agent = resolve_agent_context(args)?;
+    let launch_profile = args
+        .launch_profile
+        .as_deref()
+        .map(load_launch_profile)
+        .transpose()?
+        .map(|profile| prepare_launch_profile_candidate(profile, &repo, &args.head))
+        .transpose()?;
     let origin_machine = if args.apply {
         resolve_origin_machine(runtime_paths)?
     } else {
@@ -232,6 +261,7 @@ pub(crate) fn steward_handoff_command<W: Write>(
     let agent_route = agent
         .as_ref()
         .map(|agent| agent_route_reference(agent, &origin_machine));
+    validate_launch_profile_route(launch_profile.as_ref(), agent_route.as_ref())?;
 
     if args.apply {
         let directory = handoff_directory(runtime_paths, &repo, args.pr);
@@ -241,12 +271,13 @@ pub(crate) fn steward_handoff_command<W: Write>(
         let route_path = agent_route
             .as_ref()
             .map(|route| agent_route_path(runtime_paths, &route.route_id));
-        let mut receipt = prepare_handoff_receipt(
+        let mut receipt = prepare_handoff_receipt_with_profile(
             load_handoff(&path)?,
             args,
             &repo,
             &origin_machine,
             agent_route.clone(),
+            launch_profile,
         )?;
         let starting_phase = receipt.phase;
         if let (Some(agent), Some(route), Some(route_path)) =
@@ -979,12 +1010,24 @@ fn load_handoff(path: &Path) -> Result<Option<DurableStewardHandoff>, CliFailure
     }
 }
 
+#[cfg(test)]
 fn prepare_handoff_receipt(
     existing: Option<DurableStewardHandoff>,
     args: &StewardHandoffArgs,
     repo: &str,
     origin_machine: &str,
     agent_route: Option<AgentRouteReference>,
+) -> Result<DurableStewardHandoff, CliFailure> {
+    prepare_handoff_receipt_with_profile(existing, args, repo, origin_machine, agent_route, None)
+}
+
+fn prepare_handoff_receipt_with_profile(
+    existing: Option<DurableStewardHandoff>,
+    args: &StewardHandoffArgs,
+    repo: &str,
+    origin_machine: &str,
+    agent_route: Option<AgentRouteReference>,
+    launch_profile: Option<LaunchProfileCandidateV1>,
 ) -> Result<DurableStewardHandoff, CliFailure> {
     let normalized_repo = repo.to_ascii_lowercase();
     let normalized_head = args.head.to_ascii_lowercase();
@@ -1005,6 +1048,7 @@ fn prepare_handoff_receipt(
         });
     let pause_required = args.after_handoff == "pause"
         && agent_route.as_ref().is_some_and(|route| route.goal_managed);
+    validate_launch_profile_route(launch_profile.as_ref(), agent_route.as_ref())?;
     if let Some(existing) = existing {
         validate_existing_handoff(&existing, args, &normalized_repo, &normalized_head)?;
         if args.transfer_agent_owner {
@@ -1018,6 +1062,7 @@ fn prepare_handoff_receipt(
                 goal_status,
                 goal_status_provenance,
                 pause_required,
+                launch_profile,
             );
         }
         if existing.owner_id != owner_id {
@@ -1030,6 +1075,12 @@ fn prepare_handoff_receipt(
             return Err(CliFailure::new(
                 1,
                 "same-owner handoff route metadata changed; explicit ownership transfer is required",
+            ));
+        }
+        if !same_launch_profile_replay(existing.launch_profile.as_ref(), launch_profile.as_ref()) {
+            return Err(CliFailure::new(
+                1,
+                "same-owner handoff cannot change or omit its launch profile",
             ));
         }
         if existing.workstream_id != args.workstream_id || existing.context_url != args.context_url
@@ -1072,7 +1123,51 @@ fn prepare_handoff_receipt(
         goal_status,
         goal_status_provenance,
         pause_required,
+        launch_profile,
     ))
+}
+
+fn validate_launch_profile_route(
+    profile: Option<&LaunchProfileCandidateV1>,
+    route: Option<&AgentRouteReference>,
+) -> Result<(), CliFailure> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    if let Some(route) = route {
+        let Some(session) = profile.profile.session.as_ref() else {
+            return Err(CliFailure::new(
+                1,
+                "an exact-session launch profile requires provider-session provenance",
+            ));
+        };
+        if opaque_id(
+            "owner",
+            &[&session.agent_provider, &session.provider_session_id],
+        ) != route.owner_id
+        {
+            return Err(CliFailure::new(
+                1,
+                "launch profile provider-session provenance does not match the durable agent route",
+            ));
+        }
+        return Ok(());
+    }
+    if profile.profile.recovery_policy
+        != super::launch_profile::RecoveryPolicyV1::FreshCheckpointOnly
+    {
+        return Err(CliFailure::new(
+            1,
+            "an exact-session launch profile requires a durable agent route",
+        ));
+    }
+    if profile.profile.session.is_some() {
+        return Err(CliFailure::new(
+            1,
+            "a fresh-checkpoint-only profile cannot claim existing provider-session provenance",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1087,8 +1182,11 @@ fn new_handoff_receipt(
     goal_status: GoalStatus,
     goal_status_provenance: GoalStatusProvenance,
     pause_required: bool,
+    launch_profile: Option<LaunchProfileCandidateV1>,
 ) -> DurableStewardHandoff {
     let now = Utc::now().to_rfc3339();
+    let launch_profile =
+        launch_profile.map(|profile| bind_launch_profile(profile, agent_route.as_ref(), 1, 1));
     DurableStewardHandoff {
         schema_version: 2,
         repo: normalized_repo,
@@ -1106,6 +1204,7 @@ fn new_handoff_receipt(
             RepairRoute::FreshAgentOnly
         },
         agent_route,
+        launch_profile,
         goal_lifecycle,
         goal_status,
         goal_status_provenance,
@@ -1156,6 +1255,33 @@ fn validate_handoff_receipt_integrity(
                 .agent_route
                 .as_ref()
                 .is_some_and(|route| route.goal_managed));
+    let launch_profile_consistent = receipt.launch_profile.as_ref().is_none_or(|stored| {
+        stored.generation > 0
+            && stored.revision > 0
+            && validate_launch_profile(&stored.profile).is_ok()
+            && launch_profile_digest(&stored.profile)
+                .is_ok_and(|digest| digest == stored.profile_digest)
+            && launch_profile_integrity_hash(
+                &stored.profile_digest,
+                stored.generation,
+                stored.revision,
+                receipt
+                    .agent_route
+                    .as_ref()
+                    .map(|route| route.route_id.as_str()),
+            ) == stored.integrity_hash
+            && stored.generation == receipt.ownership_generation
+            && launch_profile_session_matches_route(&stored.profile, receipt.agent_route.as_ref())
+            && stored
+                .profile
+                .worktree
+                .repository
+                .eq_ignore_ascii_case(repo)
+            && stored.profile.worktree.head_sha.eq_ignore_ascii_case(head)
+            && (receipt.agent_route.is_some()
+                || stored.profile.recovery_policy
+                    == super::launch_profile::RecoveryPolicyV1::FreshCheckpointOnly)
+    });
     if receipt.schema_version != 2
         || !receipt.repo.eq_ignore_ascii_case(repo)
         || receipt.pr != pr
@@ -1166,6 +1292,7 @@ fn validate_handoff_receipt_integrity(
         || !matches!(receipt.agent_disposition.as_str(), "continue" | "pause")
         || !route_consistent
         || !pause_consistent
+        || !launch_profile_consistent
     {
         return Err(CliFailure::new(
             1,
@@ -1174,6 +1301,24 @@ fn validate_handoff_receipt_integrity(
     }
     validate_agent_identifier("origin machine", &receipt.origin_machine)?;
     Ok(())
+}
+
+fn launch_profile_session_matches_route(
+    profile: &LaunchProfileV1,
+    route: Option<&AgentRouteReference>,
+) -> bool {
+    match (profile.session.as_ref(), route) {
+        (Some(session), Some(route)) => {
+            opaque_id(
+                "owner",
+                &[&session.agent_provider, &session.provider_session_id],
+            ) == route.owner_id
+        }
+        (None, None) => {
+            profile.recovery_policy == super::launch_profile::RecoveryPolicyV1::FreshCheckpointOnly
+        }
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1187,6 +1332,7 @@ fn transfer_handoff_owner(
     goal_status: GoalStatus,
     goal_status_provenance: GoalStatusProvenance,
     pause_required: bool,
+    launch_profile: Option<LaunchProfileCandidateV1>,
 ) -> Result<DurableStewardHandoff, CliFailure> {
     if agent_route.is_none() {
         return Err(CliFailure::new(
@@ -1204,8 +1350,17 @@ fn transfer_handoff_owner(
             "ownership transfer cannot change workstream, context, or disposition",
         ));
     }
-    if existing.owner_id == owner_id && existing.agent_route == agent_route {
+    if existing.owner_id == owner_id
+        && existing.agent_route == agent_route
+        && same_launch_profile_replay(existing.launch_profile.as_ref(), launch_profile.as_ref())
+    {
         return Ok(existing);
+    }
+    if existing.owner_id == owner_id && existing.agent_route == agent_route {
+        return Err(CliFailure::new(
+            1,
+            "launch profile replacement requires a replacement agent owner",
+        ));
     }
     existing.owner_id = owner_id;
     existing.agent_route = agent_route;
@@ -1214,11 +1369,220 @@ fn transfer_handoff_owner(
     existing.goal_lifecycle = goal_lifecycle;
     existing.goal_status = goal_status;
     existing.goal_status_provenance = goal_status_provenance;
-    existing.ownership_generation = existing
+    let next_generation = existing
         .ownership_generation
         .checked_add(1)
         .ok_or_else(|| CliFailure::new(1, "handoff ownership generation overflow"))?;
+    existing.launch_profile = match (existing.launch_profile.as_ref(), launch_profile) {
+        (Some(previous), Some(profile)) => Some(bind_launch_profile(
+            profile,
+            existing.agent_route.as_ref(),
+            next_generation,
+            previous
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| CliFailure::new(1, "launch-profile revision overflow"))?,
+        )),
+        (None, Some(profile)) => Some(bind_launch_profile(
+            profile,
+            existing.agent_route.as_ref(),
+            next_generation,
+            1,
+        )),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(CliFailure::new(
+                1,
+                "ownership transfer cannot omit an existing launch profile",
+            ));
+        }
+    };
+    existing.ownership_generation = next_generation;
     Ok(existing)
+}
+
+fn prepare_launch_profile_candidate(
+    profile: LaunchProfileV1,
+    repo: &str,
+    head: &str,
+) -> Result<LaunchProfileCandidateV1, CliFailure> {
+    if !profile.worktree.repository.eq_ignore_ascii_case(repo)
+        || !profile.worktree.head_sha.eq_ignore_ascii_case(head)
+    {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree provenance must match the exact handoff repository and head",
+        ));
+    }
+    verify_launch_profile_worktree(&profile)?;
+    Ok(LaunchProfileCandidateV1 {
+        profile_digest: launch_profile_digest(&profile)?,
+        profile,
+    })
+}
+
+fn verify_launch_profile_worktree(profile: &LaunchProfileV1) -> Result<(), CliFailure> {
+    let claimed_path = Path::new(&profile.worktree.path);
+    let canonical_path = claimed_path.canonicalize().map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("launch profile worktree path is unavailable: {error}"),
+        )
+    })?;
+
+    let top_level = git_worktree_value(&canonical_path, &["rev-parse", "--show-toplevel"])?;
+    let canonical_top_level = Path::new(&top_level).canonicalize().map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("launch profile Git top-level path is unavailable: {error}"),
+        )
+    })?;
+    if canonical_top_level != canonical_path {
+        return Err(CliFailure::new(
+            1,
+            "launch profile path must name the exact Git worktree root",
+        ));
+    }
+
+    let observed_head = git_worktree_value(&canonical_path, &["rev-parse", "HEAD"])?;
+    if !observed_head.eq_ignore_ascii_case(&profile.worktree.head_sha) {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree HEAD does not match its claimed exact head",
+        ));
+    }
+    let remote = git_worktree_value(&canonical_path, &["remote", "get-url", "origin"])?;
+    let observed_repo = crate::gh::parse_github_remote_slug(&remote).ok_or_else(|| {
+        CliFailure::new(
+            1,
+            "launch profile worktree origin is not a canonical GitHub repository",
+        )
+    })?;
+    if !observed_repo.eq_ignore_ascii_case(&profile.worktree.repository) {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree origin does not match its claimed repository",
+        ));
+    }
+
+    let branch = git_worktree_value(
+        &canonical_path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )?;
+    if profile.worktree.lineage_id != branch {
+        return Err(CliFailure::new(
+            1,
+            "launch profile lineage ID must match the worktree's exact branch",
+        ));
+    }
+    let lineage_key = format!("branch.{branch}.pulpWorktree");
+    let status = git_worktree_value(
+        &canonical_path,
+        &[
+            "config",
+            "--local",
+            "--get",
+            &format!("{lineage_key}Status"),
+        ],
+    )?;
+    let durable_head = git_worktree_value(
+        &canonical_path,
+        &[
+            "config",
+            "--local",
+            "--get",
+            &format!("{lineage_key}DurableSha"),
+        ],
+    )?;
+    let last_path = git_worktree_value(
+        &canonical_path,
+        &[
+            "config",
+            "--local",
+            "--get",
+            &format!("{lineage_key}LastPath"),
+        ],
+    )?;
+    let canonical_last_path = Path::new(&last_path).canonicalize().map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("launch profile lineage path is unavailable: {error}"),
+        )
+    })?;
+    if status != "active"
+        || !durable_head.eq_ignore_ascii_case(&observed_head)
+        || canonical_last_path != canonical_path
+    {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree lineage is not active at the exact path and head",
+        ));
+    }
+    Ok(())
+}
+
+fn git_worktree_value(path: &Path, args: &[&str]) -> Result<String, CliFailure> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .map_err(|error| {
+            CliFailure::new(
+                1,
+                format!("failed to inspect launch profile worktree: {error}"),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            "launch profile worktree or lineage authority could not be verified",
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| CliFailure::new(1, "launch profile Git metadata was not UTF-8"))
+}
+
+fn bind_launch_profile(
+    candidate: LaunchProfileCandidateV1,
+    route: Option<&AgentRouteReference>,
+    generation: u64,
+    revision: u64,
+) -> StoredLaunchProfileV1 {
+    StoredLaunchProfileV1 {
+        integrity_hash: launch_profile_integrity_hash(
+            &candidate.profile_digest,
+            generation,
+            revision,
+            route.map(|route| route.route_id.as_str()),
+        ),
+        generation,
+        revision,
+        profile_digest: candidate.profile_digest,
+        profile: candidate.profile,
+    }
+}
+
+fn same_launch_profile(
+    existing: Option<&StoredLaunchProfileV1>,
+    incoming: Option<&LaunchProfileCandidateV1>,
+) -> bool {
+    match (existing, incoming) {
+        (None, None) => true,
+        (Some(existing), Some(incoming)) => {
+            existing.profile_digest == incoming.profile_digest
+                && existing.profile == incoming.profile
+        }
+        _ => false,
+    }
+}
+
+fn same_launch_profile_replay(
+    existing: Option<&StoredLaunchProfileV1>,
+    incoming: Option<&LaunchProfileCandidateV1>,
+) -> bool {
+    incoming.is_none() && existing.is_some() || same_launch_profile(existing, incoming)
 }
 
 fn persist_handoff(
@@ -1953,6 +2317,7 @@ fn main() {{
             agent_session_id: None,
             agent_parent_session_id: None,
             agent_surface_id: None,
+            launch_profile: None,
             goal_managed: false,
             after_handoff: "continue".to_owned(),
             transfer_agent_owner: false,
@@ -3170,3 +3535,7 @@ fn main() {{
         assert_eq!(std::fs::read_to_string(count).expect("count"), "1");
     }
 }
+
+#[cfg(test)]
+#[path = "handoff/launch_profile_tests.rs"]
+mod launch_profile_tests;

@@ -348,6 +348,7 @@ pub(super) const NEEDS_AGENT_LABEL: &str = "shipyard:needs-agent";
 
 mod handoff;
 pub(crate) use handoff::{StewardHandoffArgs, steward_handoff_command};
+mod launch_profile;
 mod recovery;
 use recovery::{reconcile_management_label, reconcile_recovery_signal};
 

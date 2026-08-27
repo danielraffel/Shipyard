@@ -1178,6 +1178,10 @@ pub(super) enum RunnerCommand {
         /// Optional cmux surface used only as a diagnosed fallback transport.
         #[arg(long = "agent-surface-id")]
         agent_surface_id: Option<String>,
+        /// Private JSON `LaunchProfileV1` containing exact argv and provenance.
+        /// Shipyard stores this contract but never executes it.
+        #[arg(long = "launch-profile")]
+        launch_profile: Option<PathBuf>,
         /// Declare that the owning session has a persistent goal which can be
         /// resumed when Shipyard returns actionable work.
         #[arg(long = "goal-managed")]
