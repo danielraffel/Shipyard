@@ -827,6 +827,20 @@ pub(super) struct TerminalOwnerRoute {
     pub(super) provider: Option<String>,
     pub(super) resume_transport: Option<String>,
     pub(super) terminal_provenance: Option<TerminalProvenanceKind>,
+    pub(super) provider_route: Option<ProviderRouteReferenceV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ProviderRouteReferenceV1 {
+    pub(super) profile_digest: String,
+    pub(super) integrity_hash: String,
+    pub(super) generation: u64,
+    pub(super) revision: u64,
+    pub(super) provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) model: Option<String>,
 }
 
 pub(super) fn terminal_owner_route(
@@ -848,6 +862,18 @@ pub(super) fn terminal_owner_route(
     if receipt.phase != HandoffPhase::Managed {
         return Ok(None);
     }
+    let provider_route = receipt
+        .launch_profile
+        .as_ref()
+        .map(|stored| ProviderRouteReferenceV1 {
+            profile_digest: stored.profile_digest.clone(),
+            integrity_hash: stored.integrity_hash.clone(),
+            generation: stored.generation,
+            revision: stored.revision,
+            provider: stored.profile.provider.provider.clone(),
+            account: stored.profile.provider.account.clone(),
+            model: stored.profile.provider.model.clone(),
+        });
     let route = receipt.agent_route;
     let (owner_id, terminal_provenance) = if let Some(route) = route.as_ref() {
         let stored_path = state_dir
@@ -904,6 +930,7 @@ pub(super) fn terminal_owner_route(
         provider: route.as_ref().map(|route| route.provider.clone()),
         terminal_provenance,
         resume_transport: route.map(|route| route.resume_transport),
+        provider_route,
     }))
 }
 
@@ -949,6 +976,7 @@ fn unresolved_terminal_owner(
         provider: None,
         resume_transport: None,
         terminal_provenance: None,
+        provider_route: None,
     })
 }
 

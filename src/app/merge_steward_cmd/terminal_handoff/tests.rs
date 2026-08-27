@@ -1,8 +1,9 @@
 use super::*;
 use crate::app::merge_steward_cmd::TerminalProvenanceKind;
+use crate::app::merge_steward_cmd::handoff::ProviderRouteReferenceV1;
 use crate::app::merge_steward_cmd::ledger::load_ledger;
 use crate::app::merge_steward_cmd::resume_record::{
-    AgentAdapterV1, ResumeRecordPhase, TerminalAdapterV1,
+    AgentAdapterV1, ProviderAdapterV1, ResumeRecordPhase, TerminalAdapterV1,
 };
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -17,6 +18,7 @@ fn owner(route: &str) -> TerminalOwnerRoute {
         provider: Some("codex".to_owned()),
         resume_transport: Some("codex_queue".to_owned()),
         terminal_provenance: Some(TerminalProvenanceKind::Absent),
+        provider_route: None,
     }
 }
 
@@ -30,6 +32,7 @@ fn fresh_agent_owner() -> TerminalOwnerRoute {
         provider: None,
         resume_transport: None,
         terminal_provenance: None,
+        provider_route: None,
     }
 }
 
@@ -671,6 +674,15 @@ fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
     let mut ledger = StewardLedger::default();
     let mut herdr_owner = owner("herdr-route");
     herdr_owner.terminal_provenance = Some(TerminalProvenanceKind::HerdR);
+    herdr_owner.provider_route = Some(ProviderRouteReferenceV1 {
+        profile_digest: "a".repeat(64),
+        integrity_hash: "b".repeat(64),
+        generation: 1,
+        revision: 2,
+        provider: "subrouter".to_owned(),
+        account: Some("account-a".to_owned()),
+        model: Some("gpt-5.6-sol".to_owned()),
+    });
     persist_actionable_failure(
         &path,
         &mut ledger,
@@ -711,6 +723,16 @@ fn typed_terminal_provenance_is_durable_but_never_enables_wake() {
             ref transport,
             ref route_id,
         }) if provider == "codex" && transport == "codex_queue" && route_id == "herdr-route"
+    ));
+    assert!(matches!(
+        resume.provider_adapter,
+        Some(ProviderAdapterV1::LaunchProfile {
+            ref profile_digest,
+            generation: 1,
+            revision: 2,
+            ref provider,
+            ..
+        }) if profile_digest == &"a".repeat(64) && provider == "subrouter"
     ));
     assert!(!resume.dispatch_enabled);
 }
@@ -840,6 +862,7 @@ fn retention_discards_only_applied_records_and_fails_closed_on_pending_capacity(
                 owner_provider: None,
                 resume_transport: None,
                 owner_terminal_provenance: None,
+                provider_route: None,
                 wake_consumer_available: false,
                 failure_contexts: Vec::new(),
                 phase: TerminalHandoffPhase::Pending,

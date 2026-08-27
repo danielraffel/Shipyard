@@ -72,7 +72,8 @@ pub(super) fn persist_success_continuation(
             resume_transport: owner
                 .as_ref()
                 .and_then(|owner| owner.resume_transport.clone()),
-            owner_terminal_provenance: owner.and_then(|owner| owner.terminal_provenance),
+            owner_terminal_provenance: owner.as_ref().and_then(|owner| owner.terminal_provenance),
+            provider_route: owner.and_then(|owner| owner.provider_route),
             wake_consumer_available: false,
             failure_contexts: Vec::new(),
             phase: TerminalHandoffPhase::Pending,
@@ -129,7 +130,8 @@ pub(super) fn persist_actionable_failure(
             resume_transport: owner
                 .as_ref()
                 .and_then(|owner| owner.resume_transport.clone()),
-            owner_terminal_provenance: owner.and_then(|owner| owner.terminal_provenance),
+            owner_terminal_provenance: owner.as_ref().and_then(|owner| owner.terminal_provenance),
+            provider_route: owner.and_then(|owner| owner.provider_route),
             wake_consumer_available: false,
             failure_contexts,
             phase: TerminalHandoffPhase::Recorded,
@@ -391,6 +393,7 @@ fn persist_inner(
             || (!owner_may_differ && existing.owner_route_id != incoming.owner_route_id)
             || (!owner_may_differ && existing.owner_provider != incoming.owner_provider)
             || (!owner_may_differ && existing.resume_transport != incoming.resume_transport)
+            || (!owner_may_differ && existing.provider_route != incoming.provider_route)
             || (!owner_may_differ
                 && !cmux_provenance_enriched
                 && !same_terminal_provenance(
@@ -416,20 +419,9 @@ fn persist_inner(
                 .get_mut(&key)
                 .expect("existing terminal handoff key");
             if route_degraded {
-                "unroutable_private_route".clone_into(&mut record.owner_disposition);
-                record.owner_route_id = None;
-                record.owner_provider = None;
-                record.resume_transport = None;
-                record.owner_terminal_provenance = None;
+                clear_owner_route(record);
             } else if owner_can_change {
-                record.origin_machine = incoming.origin_machine;
-                record.owner_id = incoming.owner_id;
-                record.ownership_generation = incoming.ownership_generation;
-                record.owner_disposition = incoming.owner_disposition;
-                record.owner_route_id = incoming.owner_route_id;
-                record.owner_provider = incoming.owner_provider;
-                record.resume_transport = incoming.resume_transport;
-                record.owner_terminal_provenance = incoming.owner_terminal_provenance;
+                replace_owner_route(record, incoming);
             } else if cmux_provenance_enriched {
                 record.owner_terminal_provenance = incoming.owner_terminal_provenance;
             }
@@ -454,6 +446,27 @@ fn persist_inner(
     make_capacity_for_terminal_handoff(ledger)?;
     ledger.terminal_handoffs.insert(key, incoming);
     Ok(true)
+}
+
+fn clear_owner_route(record: &mut TerminalHandoff) {
+    "unroutable_private_route".clone_into(&mut record.owner_disposition);
+    record.owner_route_id = None;
+    record.owner_provider = None;
+    record.resume_transport = None;
+    record.owner_terminal_provenance = None;
+    record.provider_route = None;
+}
+
+fn replace_owner_route(record: &mut TerminalHandoff, incoming: TerminalHandoff) {
+    record.origin_machine = incoming.origin_machine;
+    record.owner_id = incoming.owner_id;
+    record.ownership_generation = incoming.ownership_generation;
+    record.owner_disposition = incoming.owner_disposition;
+    record.owner_route_id = incoming.owner_route_id;
+    record.owner_provider = incoming.owner_provider;
+    record.resume_transport = incoming.resume_transport;
+    record.owner_terminal_provenance = incoming.owner_terminal_provenance;
+    record.provider_route = incoming.provider_route;
 }
 
 fn same_terminal_provenance(

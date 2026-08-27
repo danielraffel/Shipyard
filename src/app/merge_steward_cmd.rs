@@ -161,6 +161,8 @@ struct TerminalHandoff {
     resume_transport: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner_terminal_provenance: Option<TerminalProvenanceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_route: Option<handoff::ProviderRouteReferenceV1>,
     wake_consumer_available: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     failure_contexts: Vec<String>,
