@@ -726,7 +726,7 @@ in `[runner.watchdog]` (`reap_in_progress_max_min` /
 
 ## Waiting on conditions (`shipyard wait`)
 
-Whenever you'd otherwise write a polling loop around `gh` — wait for a release to upload, wait for a PR's required checks to go green, wait for a dispatched workflow run to finish — reach for `shipyard wait` instead. It opens a daemon subscription first (if one's running), takes one authoritative `gh` snapshot, and either exits 0 immediately or keeps re-evaluating on real webhook events (no extra REST budget). When the daemon isn't running, it falls back to polling transparently — safe to use on headless CI too.
+Whenever you'd otherwise write a polling loop around `gh` — wait for a release to upload, wait for a PR's required checks to go green, wait for a dispatched workflow run to finish — reach for `shipyard wait` instead. It opens a daemon subscription first (if one's running), takes one authoritative `gh` snapshot, and either exits 0 immediately or keeps re-evaluating immediately on relevant webhook events. While the daemon remains connected, it also reconciles an authoritative snapshot on `--poll-interval` so a missed event cannot strand the wait; this remains daemon transport, not fallback. When the daemon isn't running or disconnects, it falls back to polling transparently — safe to use on headless CI too.
 
 The waiter does not drop ownership on a brief token-helper or network
 preparation failure. It retries only classified transient failures with bounded
@@ -797,7 +797,13 @@ when `wait run --success` stops early with exit 4 on a terminal failed run.
 }
 ```
 
-Branch on `matched` + `transport`. `transport == "daemon"` means a webhook woke the wait; `transport == "polling"` means the daemon wasn't reachable and you got the fallback (which is fine — still correct, just slower).
+Branch on `matched` and the condition-specific `observed` fields.
+`transport == "daemon"` records that the daemon subscription remained
+available; it does not prove an event caused the match. Use
+`events_received > 0` only as evidence that at least one relevant event
+triggered a refresh. Zero events can still match through the initial or
+periodic authoritative snapshot. `transport == "polling"` means the daemon was
+unavailable or disconnected and polling fallback was used.
 
 ### Always set `--timeout`
 
