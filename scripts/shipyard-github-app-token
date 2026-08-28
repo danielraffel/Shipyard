@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
+import hashlib
 import json
 import os
+import re
 import ssl
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +35,16 @@ SYSTEM_CA_FILES = (
     Path("/opt/homebrew/etc/openssl@3/cert.pem"),
     Path("/usr/local/etc/openssl@3/cert.pem"),
 )
+OPENSSL_CANDIDATES = (
+    Path("/usr/bin/openssl"),
+    Path("/opt/homebrew/bin/openssl"),
+    Path("/usr/local/bin/openssl"),
+)
+OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+INSTALLATION_ID_RE = re.compile(r"^[1-9][0-9]*$")
+RETRYABLE_HTTP_STATUS = frozenset({429, 502, 503, 504})
+API_RETRY_DELAYS_SECONDS = (1, 2, 3)
 
 
 class HelperError(Exception):
@@ -48,21 +63,36 @@ def main() -> int:
             )
         )
         api_url = args.api_url.rstrip("/")
-        jwt = build_jwt(app_id, key_path)
-        installation_id = args.installation_id or os.environ.get(
-            "SHIPYARD_GITHUB_APP_INSTALLATION_ID"
+        validate_private_key(key_path)
+        cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir else None
+        validate_cache_platform(cache_dir, sys.platform)
+        cached = load_cached_token(
+            cache_dir,
+            api_url,
+            app_id,
+            args.repo,
+            args.installation_id,
+            os.environ.get("SHIPYARD_GITHUB_APP_INSTALLATION_ID"),
         )
-        if not installation_id:
-            if not args.repo:
-                raise HelperError(
-                    "provide --installation-id, set SHIPYARD_GITHUB_APP_INSTALLATION_ID, "
-                    "or pass --repo owner/name for installation lookup"
-                )
-            installation_id = lookup_repo_installation(api_url, jwt, args.repo)
+        if cached is not None:
+            print(json.dumps(public_token_payload(cached), separators=(",", ":")))
+            return 0
+        jwt = build_jwt(app_id, key_path)
+        installation_id = resolve_installation_id(
+            api_url,
+            jwt,
+            args.repo,
+            args.installation_id,
+            os.environ.get("SHIPYARD_GITHUB_APP_INSTALLATION_ID"),
+        )
         token_payload = create_installation_token(api_url, jwt, installation_id)
         token = token_payload.get("token")
         expires_at = token_payload.get("expires_at")
-        if not isinstance(token, str) or not token.strip():
+        if (
+            not isinstance(token, str)
+            or not token.strip()
+            or any(ord(character) <= 32 or ord(character) == 127 for character in token)
+        ):
             raise HelperError("GitHub response did not include an installation token")
         output: dict[str, Any] = {
             "token": token,
@@ -70,6 +100,23 @@ def main() -> int:
         }
         if isinstance(expires_at, str) and expires_at:
             output["expires_at"] = expires_at
+        cache_payload = dict(output)
+        cache_payload.update(
+            {
+                "app_id": app_id,
+                "api_url": api_url,
+                "installation_id": installation_id,
+                "repository": args.repo,
+            }
+        )
+        store_cached_token(
+            cache_dir,
+            api_url,
+            app_id,
+            args.repo,
+            installation_id,
+            cache_payload,
+        )
         print(json.dumps(output, separators=(",", ":")))
         return 0
     except HelperError as error:
@@ -77,9 +124,18 @@ def main() -> int:
         return 1
 
 
+def validate_cache_platform(cache_dir: Path | None, platform: str) -> None:
+    """Refuse disk tokens where this helper cannot prove private ACLs."""
+    if cache_dir is not None and platform == "win32":
+        raise HelperError(
+            "disk token cache is unavailable on Windows until private ACL validation exists"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Mint a GitHub App installation token for Shipyard."
+        description="Mint a GitHub App installation token for Shipyard.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--app-id",
@@ -87,7 +143,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--installation-id",
-        help="GitHub App installation ID. Defaults to SHIPYARD_GITHUB_APP_INSTALLATION_ID.",
+        help=(
+            "Repo-less GitHub App installation ID. With --repo, an explicit "
+            "value is checked against GitHub's repository lookup; the legacy "
+            "SHIPYARD_GITHUB_APP_INSTALLATION_ID fallback is ignored."
+        ),
     )
     parser.add_argument(
         "--private-key",
@@ -101,6 +161,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "owner/name repo slug used to look up the installation id when one "
             "is not supplied."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=os.environ.get("SHIPYARD_GITHUB_APP_CACHE_DIR"),
+        help=(
+            "Optional private directory for repo-partitioned token caching. "
+            "Defaults to SHIPYARD_GITHUB_APP_CACHE_DIR; no disk cache when unset."
         ),
     )
     parser.add_argument(
@@ -119,8 +187,8 @@ def required_value(value: str | None, env_name: str, flag_name: str) -> str:
 
 
 def build_jwt(app_id: str, private_key: Path) -> str:
-    if not private_key.exists():
-        raise HelperError(f"private key not found: {private_key}")
+    validate_private_key(private_key)
+    openssl = resolve_openssl()
     now = int(time.time())
     header = {"alg": "RS256", "typ": "JWT"}
     payload = {
@@ -133,7 +201,7 @@ def build_jwt(app_id: str, private_key: Path) -> str:
     ).encode()
     try:
         signed = subprocess.run(
-            ["openssl", "dgst", "-sha256", "-sign", str(private_key)],
+            [str(openssl), "dgst", "-sha256", "-sign", str(private_key)],
             input=signing_input,
             capture_output=True,
             check=False,
@@ -146,6 +214,51 @@ def build_jwt(app_id: str, private_key: Path) -> str:
     return f"{signing_input.decode()}.{base64url_bytes(signed.stdout)}"
 
 
+def resolve_openssl() -> Path:
+    configured = os.environ.get("SHIPYARD_GITHUB_APP_OPENSSL")
+    candidates = (Path(configured),) if configured else openssl_candidates()
+    for candidate in candidates:
+        if candidate.is_absolute() and candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    raise HelperError(
+        "set SHIPYARD_GITHUB_APP_OPENSSL to an absolute openssl executable"
+    )
+
+
+def openssl_candidates() -> tuple[Path, ...]:
+    if os.name != "nt":
+        return OPENSSL_CANDIDATES
+    program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+    program_files_x86 = Path(
+        os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")
+    )
+    return (
+        program_files / "Git/usr/bin/openssl.exe",
+        program_files / "OpenSSL-Win64/bin/openssl.exe",
+        program_files_x86 / "Git/usr/bin/openssl.exe",
+        Path("C:/OpenSSL-Win64/bin/openssl.exe"),
+    )
+
+
+def validate_private_key(private_key: Path) -> None:
+    if not private_key.exists():
+        raise HelperError(f"private key not found: {private_key}")
+    if private_key.is_symlink() or not private_key.is_file():
+        raise HelperError("private key must be a regular file, not a symlink")
+    if os.name == "nt":
+        return
+    key_mode = stat.S_IMODE(private_key.stat().st_mode)
+    if key_mode != 0o600:
+        raise HelperError("private key must have mode 0600")
+    if private_key.stat().st_uid != os.getuid():
+        raise HelperError("private key must be owned by the current user")
+    parent_mode = stat.S_IMODE(private_key.parent.stat().st_mode)
+    if parent_mode & 0o077:
+        raise HelperError("private key directory must have mode 0700 or stricter")
+    if private_key.parent.stat().st_uid != os.getuid():
+        raise HelperError("private key directory must be owned by the current user")
+
+
 def base64url_json(value: dict[str, Any]) -> str:
     return base64url_bytes(json.dumps(value, separators=(",", ":")).encode())
 
@@ -155,13 +268,227 @@ def base64url_bytes(value: bytes) -> str:
 
 
 def lookup_repo_installation(api_url: str, jwt: str, repo: str) -> str:
-    if "/" not in repo:
-        raise HelperError("--repo must be an owner/name slug")
+    validate_repo_slug(repo)
     payload = api_get(api_url, f"/repos/{repo}/installation", jwt)
     installation_id = payload.get("id")
-    if not isinstance(installation_id, int):
+    if type(installation_id) is not int or installation_id <= 0:
         raise HelperError(f"GitHub did not return an installation id for {repo}")
     return str(installation_id)
+
+
+def validate_repo_slug(repo: str) -> None:
+    parts = repo.split("/")
+    if len(parts) != 2:
+        raise HelperError("--repo must be an exact owner/name slug")
+    owner, name = parts
+    if (
+        not OWNER_RE.fullmatch(owner)
+        or not REPOSITORY_RE.fullmatch(name)
+        or name in {".", ".."}
+    ):
+        raise HelperError("--repo must be an exact owner/name slug")
+
+
+def resolve_installation_id(
+    api_url: str,
+    jwt: str,
+    repo: str | None,
+    explicit_installation_id: str | None,
+    environment_installation_id: str | None,
+) -> str:
+    """Bind a repository target to the installation GitHub reports for it.
+
+    A repository slug is authoritative. The legacy environment installation id
+    remains a repo-less fallback, but can never override repo routing. An
+    explicit flag used together with --repo acts as a fail-closed assertion.
+    """
+    if repo is not None:
+        repository_installation_id = lookup_repo_installation(api_url, jwt, repo)
+        if (
+            explicit_installation_id
+            and explicit_installation_id != repository_installation_id
+        ):
+            raise HelperError(
+                "--installation-id does not match the installation GitHub reports "
+                f"for {repo}"
+            )
+        return repository_installation_id
+
+    installation_id = explicit_installation_id or environment_installation_id
+    if not installation_id:
+        raise HelperError(
+            "provide --repo owner/name for repository-bound routing, or provide "
+            "--installation-id for an intentionally repo-less request"
+        )
+    if not INSTALLATION_ID_RE.fullmatch(installation_id):
+        raise HelperError("installation id must be a positive integer")
+    return installation_id
+
+
+def cache_route(
+    repo: str | None,
+    explicit_installation_id: str | None,
+    environment_installation_id: str | None,
+) -> tuple[str, str | None]:
+    if repo is not None:
+        validate_repo_slug(repo)
+        return f"repo:{repo}", explicit_installation_id
+    installation_id = explicit_installation_id or environment_installation_id
+    if not installation_id or not INSTALLATION_ID_RE.fullmatch(installation_id):
+        raise HelperError(
+            "provide --repo owner/name for repository-bound routing, or provide "
+            "a positive-integer --installation-id for an intentionally repo-less request"
+        )
+    return f"installation:{installation_id}", installation_id
+
+
+def cache_file(cache_dir: Path, api_url: str, app_id: str, route: str) -> Path:
+    digest = hashlib.sha256(f"{api_url}\0{app_id}\0{route}".encode()).hexdigest()
+    return cache_dir / f"installation-token-{digest}.json"
+
+
+def ensure_private_cache_dir(cache_dir: Path) -> None:
+    if cache_dir.exists():
+        if cache_dir.is_symlink() or not cache_dir.is_dir():
+            raise HelperError("token cache path must be a private directory")
+    else:
+        try:
+            cache_dir.mkdir(parents=True, mode=0o700)
+        except FileExistsError:
+            # Another helper may have won first-use creation. The ownership,
+            # type, and mode checks below still decide whether it is safe.
+            pass
+        except OSError as error:
+            raise HelperError("token cache path is unavailable") from error
+        if os.name != "nt":
+            try:
+                cache_dir.chmod(0o700)
+            except OSError as error:
+                raise HelperError("token cache path is unavailable") from error
+    if cache_dir.is_symlink() or not cache_dir.is_dir():
+        raise HelperError("token cache path must be a private directory")
+    if os.name != "nt" and stat.S_IMODE(cache_dir.stat().st_mode) & 0o077:
+        raise HelperError("token cache directory must have mode 0700 or stricter")
+    if os.name != "nt" and cache_dir.stat().st_uid != os.getuid():
+        raise HelperError("token cache directory must be owned by the current user")
+
+
+def load_cached_token(
+    cache_dir: Path | None,
+    api_url: str,
+    app_id: str,
+    repo: str | None,
+    explicit_installation_id: str | None,
+    environment_installation_id: str | None,
+) -> dict[str, Any] | None:
+    if cache_dir is None:
+        return None
+    route, asserted_installation_id = cache_route(
+        repo,
+        explicit_installation_id,
+        environment_installation_id,
+    )
+    ensure_private_cache_dir(cache_dir)
+    path = cache_file(cache_dir, api_url, app_id, route)
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise HelperError(
+            "token cache entry must be a regular file, not a symlink"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HelperError("token cache entry must be a regular file")
+        if os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise HelperError("token cache entry must have mode 0600")
+        if os.name != "nt" and metadata.st_uid != os.getuid():
+            raise HelperError("token cache entry must be owned by the current user")
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            descriptor = -1
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise HelperError("token cache entry is unreadable or malformed") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(payload, dict):
+        raise HelperError("token cache entry is malformed")
+    if (
+        payload.get("api_url") != api_url
+        or payload.get("app_id") != app_id
+        or payload.get("repository") != repo
+    ):
+        raise HelperError("token cache provenance does not match the requested repository")
+    cached_installation_id = payload.get("installation_id")
+    if not isinstance(cached_installation_id, str):
+        raise HelperError("token cache installation provenance is missing")
+    if asserted_installation_id and asserted_installation_id != cached_installation_id:
+        raise HelperError("cached installation does not match --installation-id")
+    token = payload.get("token")
+    expires_at = payload.get("expires_at")
+    if payload.get("kind") != "github-app-installation":
+        raise HelperError("token cache kind provenance is missing")
+    if (
+        not isinstance(token, str)
+        or not token.strip()
+        or any(ord(character) <= 32 or ord(character) == 127 for character in token)
+        or not isinstance(expires_at, str)
+    ):
+        raise HelperError("token cache entry is malformed")
+    try:
+        expires = datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise HelperError("token cache expiry is malformed") from error
+    if expires.tzinfo is None:
+        raise HelperError("token cache expiry is malformed")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if expires <= now + datetime.timedelta(minutes=10):
+        return None
+    return payload
+
+
+def store_cached_token(
+    cache_dir: Path | None,
+    api_url: str,
+    app_id: str,
+    repo: str | None,
+    installation_id: str,
+    payload: dict[str, Any],
+) -> None:
+    if cache_dir is None:
+        return
+    route, _ = cache_route(repo, installation_id if repo is None else None, None)
+    ensure_private_cache_dir(cache_dir)
+    destination = cache_file(cache_dir, api_url, app_id, route)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".token-", dir=cache_dir)
+    temporary = Path(temporary_name)
+    try:
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        if os.name != "nt":
+            destination.chmod(0o600)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def public_token_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    output = {
+        "token": payload["token"],
+        "kind": payload.get("kind", "github-app-installation"),
+    }
+    if payload.get("expires_at"):
+        output["expires_at"] = payload["expires_at"]
+    return output
 
 
 def create_installation_token(
@@ -190,6 +517,7 @@ def api_request(request: urllib.request.Request, jwt: str) -> dict[str, Any]:
     request.add_header("X-GitHub-Api-Version", API_VERSION)
     context = ssl.create_default_context()
     retried_with_platform_ca = False
+    transient_retries = 0
     while True:
         try:
             with urllib.request.urlopen(
@@ -201,6 +529,13 @@ def api_request(request: urllib.request.Request, jwt: str) -> dict[str, Any]:
             break
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace").strip()
+            if (
+                error.code in RETRYABLE_HTTP_STATUS
+                and transient_retries < len(API_RETRY_DELAYS_SECONDS)
+            ):
+                time.sleep(API_RETRY_DELAYS_SECONDS[transient_retries])
+                transient_retries += 1
+                continue
             raise HelperError(
                 f"GitHub API returned HTTP {error.code}: {detail}"
             ) from error
@@ -212,6 +547,13 @@ def api_request(request: urllib.request.Request, jwt: str) -> dict[str, Any]:
             ):
                 context = add_platform_ca_files(context)
                 retried_with_platform_ca = True
+                continue
+            if (
+                not isinstance(error.reason, ssl.SSLCertVerificationError)
+                and transient_retries < len(API_RETRY_DELAYS_SECONDS)
+            ):
+                time.sleep(API_RETRY_DELAYS_SECONDS[transient_retries])
+                transient_retries += 1
                 continue
             raise HelperError(f"GitHub API request failed: {error.reason}") from error
     try:

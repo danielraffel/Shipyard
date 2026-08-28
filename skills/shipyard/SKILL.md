@@ -491,6 +491,22 @@ on the machine — not the tracked project config. The same App private key work
 across multiple Macs (M1/Studio/M5). Full setup, permissions, and the
 additional-client steps: [`docs/github-app-quota.md`](../../docs/github-app-quota.md).
 
+For multi-account App installations, `{repo_slug}` is the authority boundary:
+the helper must look up that repository's installation and must not let a fixed
+environment installation id override it. Shipyard partitions its in-memory
+token cache by the fully expanded command, preserving separate repo/installation
+entries. Keep the fleet's absolute `ghapp` wrapper as `token_command[0]` when
+tartci policy pins it; use its reviewed `token --repo {repo_slug}` mode for
+Shipyard while the audited `shipyard-v1` CLI surface remains available to
+tartci. Remove the old fixed installation id. Missing repo provenance fails
+closed. The privileged wrapper is not a
+general native-`gh` drop-in, and unknown commands or flags fail before minting.
+The wrapper/helper must resolve trusted Python, `openssl`, and native `gh` through
+absolute paths, preserve the installed merge/queue/close guards, and never put
+the token in process argv. Guards that query GitHub must receive the same
+repo-routed token and exact native binary as the guarded command and still run
+before native `gh`; the PR-close guard inspects every command shape itself.
+
 The standalone App helper must remain usable from stripped SSH/daemon
 environments without weakening TLS. It first uses Python's default trust store.
 Only after a real certificate-verification failure and proof that there is no

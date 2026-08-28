@@ -285,6 +285,24 @@ PR merge should stay on the configured token: if GitHub rejects the App token's
 GraphQL merge probe, Shipyard falls back to its REST merge path with the same
 configured token.
 
+When one App has installations on multiple accounts, require an exact
+`{repo_slug}` in the configured token command. The helper must resolve that
+repository's installation; a fleet-wide fixed installation id is not valid
+routing. Shipyard caches helper results under the expanded repo-specific argv,
+and absent repo provenance must fail closed. Preserve an absolute policy-pinned
+`ghapp` wrapper as `token_command[0]` and update its implementation in place.
+Shipyard's remaining argv must select the wrapper's `token --repo {repo_slug}`
+mode; the audited `shipyard-v1` tartci CLI commands and guards remain intact.
+The wrapper is not a general `gh` drop-in; use ambient native `gh` for an
+operator command outside its explicit command/subcommand/flag grammar. Keep
+the App key and cache current-user-owned at `0600` inside current-user-owned
+`0700` directories, and keep token material in environment/stdin rather than
+process argv. Run live-evidence guards with that exact repo-routed App token,
+after mint/cache resolution but before native `gh` executes the command. Bind
+their `GHAPP_REAL_GH`/merge probe to the wrapper's selected native binary, and
+dispatch the PR-close guard for every command so its REST/GraphQL/issue aliases
+cannot bypass inspection.
+
 ## Supervised-Push Signal (`SHIPYARD_PR_RUNNING=1`)
 
 Every `git` / `gh` subprocess spawned by `shipyard pr` / `ship` /

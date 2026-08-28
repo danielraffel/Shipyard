@@ -769,12 +769,108 @@ fn repo_placeholder_falls_back_to_hint_when_cwd_is_not_a_repo() {
 }
 
 #[test]
+fn repo_placeholder_honors_gh_default_remote_and_rejects_ambiguity() {
+    let repo = TempDir::new().expect("tempdir");
+    git(repo.path(), &["init", "--quiet", "--initial-branch=main"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "git@github.com:me/fork.git"],
+    );
+    git(
+        repo.path(),
+        &["remote", "add", "upstream", "git@github.com:org/up.git"],
+    );
+    let command = vec!["helper".to_owned(), "{repo_slug}".to_owned()];
+    assert!(matches!(
+        expand_token_command(&command, repo.path(), None, None),
+        Err(GhPrepareError::RepoRemoteAmbiguous)
+    ));
+
+    let hint = RepoIdentity::from_slug("hint/repo").expect("hint");
+    assert!(matches!(
+        expand_token_command(&command, repo.path(), Some(&hint), None),
+        Err(GhPrepareError::RepoRemoteAmbiguous)
+    ));
+
+    git(
+        repo.path(),
+        &["config", "remote.upstream.gh-resolved", "base"],
+    );
+    let expanded = expand_token_command(&command, repo.path(), None, None).expect("default remote");
+    assert_eq!(expanded[1], "org/up");
+}
+
+#[test]
 fn repo_identity_from_slug_rejects_malformed() {
     assert!(RepoIdentity::from_slug("owner/name").is_some());
     assert!(RepoIdentity::from_slug("nope").is_none());
     assert!(RepoIdentity::from_slug("owner/").is_none());
     assert!(RepoIdentity::from_slug("/name").is_none());
     assert!(RepoIdentity::from_slug("a/b/c").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn command_token_cache_is_partitioned_by_expanded_repository() {
+    let temp = TempDir::new().expect("tempdir");
+    let helper = temp.path().join("repo-token-helper");
+    let one_count = temp.path().join("one-count");
+    let two_count = temp.path().join("two-count");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n  owner/one) printf x >> '{}'; token=ghs_one ;;\n  owner/two) printf x >> '{}'; token=ghs_two ;;\n  *) exit 88 ;;\nesac\nprintf '{{\"token\":\"%s\",\"expires_at\":\"2099-01-01T00:00:00Z\"}}\\n' \"$token\"\n",
+            one_count.display(),
+            two_count.display(),
+        ),
+    );
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}", "{{repo_slug}}"]
+            "#,
+        helper.display()
+    ));
+    let client = GhClient::from_loaded_config(&config).expect("client");
+    let one = client
+        .clone()
+        .with_repo_override("owner/one")
+        .expect("first repo");
+    let two = client
+        .clone()
+        .with_repo_override("owner/two")
+        .expect("second repo");
+
+    assert_eq!(
+        one.resolve_token(temp.path())
+            .expect("first token")
+            .expect("configured token")
+            .token,
+        "ghs_one"
+    );
+    assert_eq!(
+        two.resolve_token(temp.path())
+            .expect("second token")
+            .expect("configured token")
+            .token,
+        "ghs_two"
+    );
+    assert_eq!(
+        one.resolve_token(temp.path())
+            .expect("cached first token")
+            .expect("configured token")
+            .token,
+        "ghs_one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(one_count).expect("first count"),
+        "x"
+    );
+    assert_eq!(
+        std::fs::read_to_string(two_count).expect("second count"),
+        "x"
+    );
 }
 
 #[test]

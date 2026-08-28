@@ -7,6 +7,7 @@ pub use config::{
     GhAuthPolicy, GhAuthSourceSummary, GhAuthSummary, GhConfigError, GhPrepareError, GhSupervision,
 };
 
+use std::collections::HashMap;
 use std::env;
 use std::fmt::{Debug, Formatter};
 use std::io::{Read, Seek, SeekFrom};
@@ -30,7 +31,7 @@ const PR_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Clone)]
 pub struct GhClient {
     auth: GhAuthConfig,
-    cache: Arc<Mutex<Option<CachedToken>>>,
+    cache: Arc<Mutex<HashMap<Vec<String>, CachedToken>>>,
     // Some security-sensitive operations must prove one exact helper token's
     // authority before using it. Once pinned, every command prepared by this
     // client uses that same token or fails when its lifetime ends.
@@ -378,7 +379,7 @@ impl GhClient {
     fn new(auth: GhAuthConfig) -> Self {
         Self {
             auth,
-            cache: Arc::new(Mutex::new(None)),
+            cache: Arc::new(Mutex::new(HashMap::new())),
             pinned_token: None,
             repo_hint: None,
             repo_override: None,
@@ -492,9 +493,10 @@ impl GhClient {
             .cache
             .lock()
             .map_err(|_| GhPrepareError::TokenCachePoisoned)?;
-        Ok(cache.as_ref().and_then(|cached| {
-            (cached.key == key && cached.is_valid(now)).then(|| cached.token.clone())
-        }))
+        Ok(cache
+            .get(key)
+            .filter(|cached| cached.is_valid(now))
+            .map(|cached| cached.token.clone()))
     }
 
     fn store_cached_token(
@@ -513,11 +515,14 @@ impl GhClient {
             .cache
             .lock()
             .map_err(|_| GhPrepareError::TokenCachePoisoned)?;
-        *cache = Some(CachedToken {
+        cache.retain(|_, cached| cached.is_valid(now));
+        cache.insert(
             key,
-            token: token.clone(),
-            valid_until,
-        });
+            CachedToken {
+                token: token.clone(),
+                valid_until,
+            },
+        );
         Ok(())
     }
 }
@@ -673,7 +678,6 @@ struct TokenResolution {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CachedToken {
-    key: Vec<String>,
     token: TokenResolution,
     valid_until: DateTime<Utc>,
 }
@@ -865,8 +869,40 @@ impl RepoIdentity {
 }
 
 fn resolve_repo_identity(cwd: &Path) -> Result<RepoIdentity, GhPrepareError> {
+    let remotes_output = Command::new("git")
+        .arg("remote")
+        .current_dir(cwd)
+        .output()
+        .map_err(|source| GhPrepareError::RepoProbeFailed { source })?;
+    if !remotes_output.status.success() {
+        return Err(GhPrepareError::RepoSlugRequired);
+    }
+    let remotes: Vec<_> = String::from_utf8_lossy(&remotes_output.stdout)
+        .lines()
+        .filter(|remote| !remote.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut resolved = Vec::new();
+    for remote in &remotes {
+        let key = format!("remote.{remote}.gh-resolved");
+        let output = Command::new("git")
+            .args(["config", "--get", &key])
+            .current_dir(cwd)
+            .output()
+            .map_err(|source| GhPrepareError::RepoProbeFailed { source })?;
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "base" {
+            resolved.push(remote.as_str());
+        }
+    }
+    let remote_name = match (resolved.as_slice(), remotes.as_slice()) {
+        ([remote], _) => *remote,
+        ([], [remote]) => remote.as_str(),
+        ([], []) => return Err(GhPrepareError::RepoSlugRequired),
+        _ => return Err(GhPrepareError::RepoRemoteAmbiguous),
+    };
+    let key = format!("remote.{remote_name}.url");
     let output = Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
+        .args(["config", "--get", &key])
         .current_dir(cwd)
         .output()
         .map_err(|source| GhPrepareError::RepoProbeFailed { source })?;

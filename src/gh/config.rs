@@ -299,6 +299,8 @@ pub enum GhPrepareError {
     TokenExpired,
     /// Repo placeholder expansion needed a GitHub remote.
     RepoSlugRequired,
+    /// Checkout has multiple remotes without one unambiguous gh default.
+    RepoRemoteAmbiguous,
     /// An explicit repository override was not an exact `OWNER/REPO` slug.
     InvalidRepoSlug {
         /// Rejected repository slug.
@@ -380,6 +382,10 @@ impl Display for GhPrepareError {
                 f,
                 "token_command placeholder requires remote.origin.url to be a GitHub remote"
             ),
+            Self::RepoRemoteAmbiguous => write!(
+                f,
+                "token_command repository is ambiguous across checkout remotes; set gh repo default or use an explicit repo override"
+            ),
             Self::InvalidRepoSlug { slug } => write!(
                 f,
                 "invalid explicit GitHub repository slug {slug:?}; expected OWNER/REPO"
@@ -431,6 +437,7 @@ impl GhPrepareError {
             | Self::HelperStdoutMalformed
             | Self::TokenExpired
             | Self::RepoSlugRequired
+            | Self::RepoRemoteAmbiguous
             | Self::InvalidRepoSlug { .. }
             | Self::RepoProbeFailed { .. }
             | Self::TokenCachePoisoned => false,
