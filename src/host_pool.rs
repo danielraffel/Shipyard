@@ -344,6 +344,27 @@ impl HostPoolLeaseStore {
         })
     }
 
+    /// Release every lease owned by one queue job.
+    ///
+    /// A daemon supervisor uses this after proving that the worker's complete
+    /// process tree is dead. The operation is idempotent so restart recovery
+    /// can safely repeat it before acknowledging terminal queue state.
+    pub(crate) fn release_for_job(&self, job_id: &str) -> HostPoolLeaseResult<usize> {
+        self.with_lock(|_| {
+            let leases = self.read_leases()?;
+            let original_len = leases.len();
+            let leases = leases
+                .into_iter()
+                .filter(|lease| lease.job_id.as_deref() != Some(job_id))
+                .collect::<Vec<_>>();
+            let removed = original_len - leases.len();
+            if removed > 0 {
+                self.save_leases(&leases)?;
+            }
+            Ok(removed)
+        })
+    }
+
     /// Drop stale leases and return the count removed.
     pub fn prune_stale(&self, now: DateTime<Utc>) -> HostPoolLeaseResult<usize> {
         self.with_lock(|_| {
@@ -604,6 +625,30 @@ mod tests {
 
         assert_eq!(removed, 1);
         assert!(store.leases().expect("leases").is_empty());
+    }
+
+    #[test]
+    fn lease_store_releases_all_job_leases_idempotently() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        let job_lease = store
+            .acquire(&lease_request("mac-studio"))
+            .expect("acquire job lease")
+            .expect("job lease");
+        let mut other_request = lease_request("other-mac");
+        other_request.job_id = Some("job-2".to_owned());
+        let other_lease = store
+            .acquire(&other_request)
+            .expect("acquire other lease")
+            .expect("other lease");
+
+        assert_eq!(store.release_for_job("job-1").expect("release"), 1);
+        assert_eq!(store.release_for_job("job-1").expect("repeat release"), 0);
+        assert_eq!(store.leases().expect("leases"), vec![other_lease]);
+        assert_ne!(
+            job_lease.lease_id,
+            store.leases().expect("leases")[0].lease_id
+        );
     }
 
     fn lease_request(member_id: &str) -> HostPoolLeaseRequest {

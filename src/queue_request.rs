@@ -1388,6 +1388,8 @@ impl From<&ContractConfig> for QueuedContract {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueuedShipDispositionKind {
+    /// The exact submitted pull-request head merged while validation was running.
+    AlreadyMerged,
     /// One or more locally supervised validation targets failed.
     ValidationFailed,
     /// The pull request merged after validation.
