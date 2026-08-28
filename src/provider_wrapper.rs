@@ -361,13 +361,9 @@ fn validate_request(
     ] {
         validate_digest(digest)?;
     }
-    if resume.root_revision == 0
-        || resume.material_revision == 0
-        || resume.projection_revision == 0
-        || resume.checkpoint_generation == 0
-    {
+    if resume.projection_revision == 0 || resume.checkpoint_generation == 0 {
         return Err(refusal(
-            "fresh-resume root, material, and projection revisions must be nonzero",
+            "fresh-resume projection revision and checkpoint generation must be nonzero",
         ));
     }
     if resume.head_sha.len() != 40
@@ -987,6 +983,28 @@ mod tests {
                 run_provider_wrapper(&config, &ProviderWrapperEnvironment::default(), &request)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn empty_root_and_material_history_are_valid_but_authority_revisions_are_nonzero() {
+        let config = config(Path::new("/does/not/matter"), digest("unused"));
+        let mut empty_material = request(ProviderWrapperOperationV1::Submit);
+        empty_material.resume_expectation.root_revision = 0;
+        empty_material.resume_expectation.material_revision = 0;
+        assert!(validate_request(&config, &empty_material).is_ok());
+
+        for mutate in [
+            |request: &mut ProviderWrapperRequestV1| {
+                request.resume_expectation.projection_revision = 0;
+            },
+            |request: &mut ProviderWrapperRequestV1| {
+                request.resume_expectation.checkpoint_generation = 0;
+            },
+        ] {
+            let mut invalid = request(ProviderWrapperOperationV1::Submit);
+            mutate(&mut invalid);
+            assert!(validate_request(&config, &invalid).is_err());
         }
     }
 
