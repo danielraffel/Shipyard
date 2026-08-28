@@ -15,12 +15,26 @@ platforms = ["macos", "linux", "windows"]
 # is broken on some hosts after partial rustup updates), then exec the
 # pipeline through that.
 [validation.default]
-command = "_sy_find_cargo_bin() { for c in cargo \"$HOME/.cargo/bin/cargo\"; do command -v \"$c\" >/dev/null 2>&1 && \"$c\" fmt --version >/dev/null 2>&1 && { dirname \"$(command -v \"$c\")\"; return 0; }; done; for c in \"$HOME\"/.rustup/toolchains/*/bin/cargo; do [ -x \"$c\" ] && \"$c\" --version >/dev/null 2>&1 && { dirname \"$c\"; return 0; }; done; return 1; }; CARGO_BIN=$(_sy_find_cargo_bin) || { echo 'shipyard validation: could not locate a working cargo (with rustfmt + clippy) binary' >&2; exit 1; }; export PATH=\"$CARGO_BIN:$PATH\"; cargo fmt --all --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --all-targets --locked"
+command = "tools/gen42-blocking-canary.sh"
 
 [targets.mac]
-backend = "local"
+backend = "host-pool"
+pool = "gen42_m5"
 platform = "macos-arm64"
 validation_build_type = "debug"
+requires = ["macos", "arm64", "gen42-canary"]
+timeout_secs = 300
+
+[host_pools.gen42_m5]
+strategy = "ordered"
+lease_stale_seconds = 180
+heartbeat_interval_seconds = 5
+
+[[host_pools.gen42_m5.members]]
+id = "m5-gen42"
+type = "local"
+max_concurrency = 1
+capabilities = ["macos", "arm64", "gen42-canary"]
 
 [release.changelog]
 enabled    = true
