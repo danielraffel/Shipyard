@@ -25,6 +25,11 @@ use super::{
     verify_integrity, verify_supported_schema,
 };
 
+/// A wake may consume at most this many provider delivery attempts. A
+/// retryable outcome on the final attempt is terminal so a permanently
+/// unavailable provider cannot grow attempts and protected receipts forever.
+const MAX_PROVIDER_DELIVERY_ATTEMPTS: u64 = 3;
+
 /// Runtime switches are intentionally unavailable through the CLI in this phase.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WakeConsumerPolicy {
@@ -192,6 +197,41 @@ pub(crate) enum WakeDeliveryResult {
     Retrying,
     Uncertain,
     Failed,
+}
+
+fn classify_provider_outcome(
+    attempt: u64,
+    outcome: ProviderOutcome,
+    rejection_event: &'static str,
+) -> (
+    &'static str,
+    WakeDeliveryResult,
+    Vec<u8>,
+    Option<&'static str>,
+) {
+    match outcome {
+        ProviderOutcome::Delivered { receipt } => {
+            ("delivered", WakeDeliveryResult::Delivered, receipt, None)
+        }
+        ProviderOutcome::Retryable { evidence } if attempt >= MAX_PROVIDER_DELIVERY_ATTEMPTS => (
+            "failed",
+            WakeDeliveryResult::Failed,
+            evidence,
+            Some("provider_retry_exhausted"),
+        ),
+        ProviderOutcome::Retryable { evidence } => {
+            ("retry", WakeDeliveryResult::Retrying, evidence, None)
+        }
+        ProviderOutcome::Uncertain { evidence } => {
+            ("uncertain", WakeDeliveryResult::Uncertain, evidence, None)
+        }
+        ProviderOutcome::Rejected { evidence } => (
+            "failed",
+            WakeDeliveryResult::Failed,
+            evidence,
+            Some(rejection_event),
+        ),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -609,20 +649,8 @@ impl WorkLedger {
         fence: &DeliveryFence,
         outcome: ProviderOutcome,
     ) -> WorkLedgerResult<WakeDeliveryResult> {
-        let (state, result, response_bytes) = match outcome {
-            ProviderOutcome::Delivered { receipt } => {
-                ("delivered", WakeDeliveryResult::Delivered, receipt)
-            }
-            ProviderOutcome::Retryable { evidence } => {
-                ("retry", WakeDeliveryResult::Retrying, evidence)
-            }
-            ProviderOutcome::Uncertain { evidence } => {
-                ("uncertain", WakeDeliveryResult::Uncertain, evidence)
-            }
-            ProviderOutcome::Rejected { evidence } => {
-                ("failed", WakeDeliveryResult::Failed, evidence)
-            }
-        };
+        let (state, result, response_bytes, failure_event) =
+            classify_provider_outcome(fence.attempt, outcome, "provider_reconciliation_failed");
         let outcome_digest = digest(&response_bytes);
         let response = self.put_protected_object(
             &fence.work_item_id,
@@ -700,14 +728,8 @@ impl WorkLedger {
                 "uncertain delivery changed during evidence reconciliation".to_owned(),
             ));
         }
-        if state == "failed" {
-            transition_dispatch_failure(
-                &transaction,
-                fence,
-                &outcome_digest,
-                &now,
-                "provider_reconciliation_failed",
-            )?;
+        if let Some(event_kind) = failure_event {
+            transition_dispatch_failure(&transaction, fence, &outcome_digest, &now, event_kind)?;
         }
         transaction.commit()?;
         Ok(result)
@@ -1052,20 +1074,8 @@ impl WorkLedger {
         fence: &DeliveryFence,
         outcome: ProviderOutcome,
     ) -> WorkLedgerResult<WakeDeliveryResult> {
-        let (state, result, response_bytes) = match outcome {
-            ProviderOutcome::Delivered { receipt } => {
-                ("delivered", WakeDeliveryResult::Delivered, receipt)
-            }
-            ProviderOutcome::Retryable { evidence } => {
-                ("retry", WakeDeliveryResult::Retrying, evidence)
-            }
-            ProviderOutcome::Uncertain { evidence } => {
-                ("uncertain", WakeDeliveryResult::Uncertain, evidence)
-            }
-            ProviderOutcome::Rejected { evidence } => {
-                ("failed", WakeDeliveryResult::Failed, evidence)
-            }
-        };
+        let (state, result, response_bytes, failure_event) =
+            classify_provider_outcome(fence.attempt, outcome, "provider_delivery_failed");
         let outcome_digest = digest(&response_bytes);
         let response = self.put_protected_object(
             &fence.work_item_id,
@@ -1177,14 +1187,8 @@ impl WorkLedger {
                 "provider activation no longer matches during finalization".to_owned(),
             ));
         }
-        if state == "failed" {
-            transition_dispatch_failure(
-                &transaction,
-                fence,
-                &outcome_digest,
-                &now,
-                "provider_delivery_failed",
-            )?;
+        if let Some(event_kind) = failure_event {
+            transition_dispatch_failure(&transaction, fence, &outcome_digest, &now, event_kind)?;
         }
         transaction.commit()?;
         Ok(result)

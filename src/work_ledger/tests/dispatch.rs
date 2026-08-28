@@ -996,6 +996,161 @@ fn retry_is_durable_and_uses_a_new_attempt_without_changing_generation() {
 }
 
 #[test]
+fn retry_ceiling_fails_closed_without_allocating_an_unbounded_attempt() {
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut adapter = Adapter::successful(true);
+    adapter.launch_outcomes = vec![
+        ProviderOutcome::Retryable {
+            evidence: b"first temporary provider refusal".to_vec(),
+        },
+        ProviderOutcome::Retryable {
+            evidence: b"second temporary provider refusal".to_vec(),
+        },
+        ProviderOutcome::Retryable {
+            evidence: b"permanent provider refusal".to_vec(),
+        },
+        ProviderOutcome::Delivered {
+            receipt: b"must never launch a fourth attempt".to_vec(),
+        },
+    ];
+
+    for expected in [WakeDeliveryResult::Retrying, WakeDeliveryResult::Retrying] {
+        assert_eq!(
+            ledger
+                .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+                .expect("bounded retry"),
+            expected
+        );
+        assert_eq!(outbox_state(&ledger, &wake_id), "pending");
+    }
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+            .expect("exhausted retry"),
+        WakeDeliveryResult::Failed
+    );
+    assert_eq!(outbox_state(&ledger, &wake_id), "failed");
+    assert_eq!(adapter.launch_outcomes.len(), 1);
+
+    let connection = ledger.connect_read_only().expect("connection");
+    let attempts: Vec<(u64, String)> = {
+        let mut query = connection
+            .prepare("SELECT attempt, state FROM wake_attempts ORDER BY attempt")
+            .expect("query");
+        query
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("collect")
+    };
+    assert_eq!(
+        attempts,
+        vec![
+            (1, "retry".to_owned()),
+            (2, "retry".to_owned()),
+            (3, "failed".to_owned()),
+        ]
+    );
+    let work: (String, u64) = connection
+        .query_row(
+            "SELECT phase, work_generation FROM work_items WHERE id = ?1",
+            [&work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("actionable work");
+    assert_eq!(work, ("actionable".to_owned(), 7));
+    let provider_receipts: u64 = connection
+        .query_row(
+            "SELECT count(*) FROM protected_objects
+             WHERE work_item_id = ?1 AND kind = 'provider_receipt'",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("bounded provider receipts");
+    assert_eq!(provider_receipts, 3);
+    let terminal_event: String = connection
+        .query_row(
+            "SELECT kind FROM events
+             WHERE work_item_id = ?1 AND work_generation = 7",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("retry exhaustion event");
+    assert_eq!(terminal_event, "provider_retry_exhausted");
+}
+
+#[test]
+fn retry_ceiling_also_applies_when_the_final_attempt_is_reconciled() {
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut adapter = Adapter::successful(true);
+    adapter.launch_outcomes = vec![
+        ProviderOutcome::Retryable {
+            evidence: b"first temporary provider refusal".to_vec(),
+        },
+        ProviderOutcome::Retryable {
+            evidence: b"second temporary provider refusal".to_vec(),
+        },
+        ProviderOutcome::Uncertain {
+            evidence: b"final attempt outcome unknown".to_vec(),
+        },
+    ];
+    adapter.reconcile_outcome = ProviderOutcome::Retryable {
+        evidence: b"final attempt remained retryable".to_vec(),
+    };
+
+    for _ in 0..2 {
+        assert_eq!(
+            ledger
+                .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+                .expect("bounded retry"),
+            WakeDeliveryResult::Retrying
+        );
+    }
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+            .expect("uncertain final attempt"),
+        WakeDeliveryResult::Uncertain
+    );
+    assert_eq!(
+        ledger
+            .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut adapter)
+            .expect("terminal reconciliation"),
+        WakeDeliveryResult::Failed
+    );
+    assert_eq!(outbox_state(&ledger, &wake_id), "failed");
+
+    let connection = ledger.connect_read_only().expect("connection");
+    let work: (String, u64) = connection
+        .query_row(
+            "SELECT phase, work_generation FROM work_items WHERE id = ?1",
+            [&work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("actionable work");
+    assert_eq!(work, ("actionable".to_owned(), 7));
+    let attempts: u64 = connection
+        .query_row(
+            "SELECT count(*) FROM wake_attempts WHERE wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("bounded attempt count");
+    assert_eq!(attempts, 3);
+    let terminal_event: String = connection
+        .query_row(
+            "SELECT kind FROM events
+             WHERE work_item_id = ?1 AND work_generation = 7",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("reconciled retry exhaustion event");
+    assert_eq!(terminal_event, "provider_retry_exhausted");
+}
+
+#[test]
 fn definitive_provider_rejection_returns_work_to_actionable() {
     let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
     let mut resolver = Resolver { profile, calls: 0 };
