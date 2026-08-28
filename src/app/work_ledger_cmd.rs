@@ -61,8 +61,12 @@ pub(super) fn work_ledger_command<W: Write>(
                     operational.continuation_runtime
                 )
                 .map_err(failure)?;
-                if let Some(reason_code) = &operational.reason_code {
-                    writeln!(stdout, "Continuation reason: {reason_code}").map_err(failure)?;
+                if let Some(reason_code) = &operational.activation_reason_code {
+                    writeln!(stdout, "Activation reason: {reason_code}").map_err(failure)?;
+                }
+                if let Some(reason_code) = &operational.runtime_reason_code {
+                    writeln!(stdout, "Continuation runtime reason: {reason_code}")
+                        .map_err(failure)?;
                 }
             }
         }
@@ -274,7 +278,8 @@ struct WorkLedgerOperationalStatus {
     activation_state: String,
     dispatch_state: String,
     continuation_runtime: String,
-    reason_code: Option<String>,
+    activation_reason_code: Option<String>,
+    runtime_reason_code: Option<String>,
 }
 
 fn work_ledger_operational_status(runtime_paths: &RuntimePaths) -> WorkLedgerOperationalStatus {
@@ -310,7 +315,11 @@ fn operational_status(
         .and_then(|continuation| continuation.get("reason_code"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let continuation_runtime = runtime_state.unwrap_or_else(|| "daemon_not_running".to_owned());
+    let continuation_runtime = match (daemon_status.is_some(), runtime_state) {
+        (false, _) => "daemon_not_running".to_owned(),
+        (true, Some(state)) => state,
+        (true, None) => "status_unavailable".to_owned(),
+    };
 
     match activation {
         WorkstreamActivationState::Ready(_) => WorkLedgerOperationalStatus {
@@ -319,7 +328,8 @@ fn operational_status(
             activation_state: "enabled".to_owned(),
             dispatch_state: "enabled".to_owned(),
             continuation_runtime,
-            reason_code: runtime_reason,
+            activation_reason_code: None,
+            runtime_reason_code: runtime_reason,
         },
         WorkstreamActivationState::Disabled => WorkLedgerOperationalStatus {
             activation_enabled: false,
@@ -327,7 +337,8 @@ fn operational_status(
             activation_state: "disabled".to_owned(),
             dispatch_state: "disabled".to_owned(),
             continuation_runtime,
-            reason_code: runtime_reason,
+            activation_reason_code: None,
+            runtime_reason_code: runtime_reason,
         },
         WorkstreamActivationState::Refused(reason) => WorkLedgerOperationalStatus {
             activation_enabled: false,
@@ -335,7 +346,8 @@ fn operational_status(
             activation_state: "refused".to_owned(),
             dispatch_state: "refused".to_owned(),
             continuation_runtime,
-            reason_code: Some(reason.code().to_owned()),
+            activation_reason_code: Some(reason.code().to_owned()),
+            runtime_reason_code: runtime_reason,
         },
     }
 }
@@ -368,9 +380,15 @@ fn work_ledger_status_json(
         "continuation_runtime".to_owned(),
         Value::String(operational.continuation_runtime.clone()),
     );
-    if let Some(reason_code) = &operational.reason_code {
+    if let Some(reason_code) = &operational.activation_reason_code {
         fields.insert(
-            "continuation_reason_code".to_owned(),
+            "activation_reason_code".to_owned(),
+            Value::String(reason_code.clone()),
+        );
+    }
+    if let Some(reason_code) = &operational.runtime_reason_code {
+        fields.insert(
+            "runtime_reason_code".to_owned(),
             Value::String(reason_code.clone()),
         );
     }
@@ -778,7 +796,11 @@ mod tests {
         assert_eq!(operational.activation_state, "enabled");
         assert_eq!(operational.dispatch_state, "enabled");
         assert_eq!(operational.continuation_runtime, "idle");
-        assert_eq!(operational.reason_code.as_deref(), Some("provider_waiting"));
+        assert_eq!(operational.activation_reason_code, None);
+        assert_eq!(
+            operational.runtime_reason_code.as_deref(),
+            Some("provider_waiting")
+        );
 
         let rendered = work_ledger_status_json(&absent_status(), &operational)
             .expect("render operational status");
@@ -787,7 +809,8 @@ mod tests {
         assert_eq!(rendered["activation_state"], "enabled");
         assert_eq!(rendered["dispatch_state"], "enabled");
         assert_eq!(rendered["continuation_runtime"], "idle");
-        assert_eq!(rendered["continuation_reason_code"], "provider_waiting");
+        assert!(rendered.get("activation_reason_code").is_none());
+        assert_eq!(rendered["runtime_reason_code"], "provider_waiting");
         let bytes = serde_json::to_vec(&rendered).expect("serialize rendered status");
         assert!(
             !bytes
@@ -809,7 +832,20 @@ mod tests {
         assert_eq!(disabled.activation_state, "disabled");
         assert_eq!(disabled.dispatch_state, "disabled");
         assert_eq!(disabled.continuation_runtime, "daemon_not_running");
-        assert_eq!(disabled.reason_code, None);
+        assert_eq!(disabled.activation_reason_code, None);
+        assert_eq!(disabled.runtime_reason_code, None);
+
+        let old_daemon = operational_status(
+            WorkstreamActivationState::Ready(ready_activation()),
+            Some(serde_json::json!({
+                "pid": 123,
+                "shipyard_version": "0.126.2"
+            })),
+        );
+        assert!(old_daemon.activation_enabled);
+        assert!(old_daemon.dispatch_enabled);
+        assert_eq!(old_daemon.continuation_runtime, "status_unavailable");
+        assert_ne!(old_daemon.continuation_runtime, "daemon_not_running");
 
         let refused = operational_status(
             WorkstreamActivationState::Refused(
@@ -828,9 +864,17 @@ mod tests {
         assert_eq!(refused.dispatch_state, "refused");
         assert_eq!(refused.continuation_runtime, "refused");
         assert_eq!(
-            refused.reason_code.as_deref(),
+            refused.activation_reason_code.as_deref(),
             Some("invalid_machine_policy")
         );
+        assert_eq!(
+            refused.runtime_reason_code.as_deref(),
+            Some("stale_daemon_reason")
+        );
+        let rendered = work_ledger_status_json(&absent_status(), &refused)
+            .expect("render simultaneous refusal status");
+        assert_eq!(rendered["activation_reason_code"], "invalid_machine_policy");
+        assert_eq!(rendered["runtime_reason_code"], "stale_daemon_reason");
     }
 
     #[test]
