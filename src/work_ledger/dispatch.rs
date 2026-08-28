@@ -30,6 +30,11 @@ use super::{
 /// unavailable provider cannot grow attempts and protected receipts forever.
 const MAX_PROVIDER_DELIVERY_ATTEMPTS: u64 = 3;
 
+/// Includes the initial uncertain submit observation. Once this durable budget
+/// is exhausted, automatic reconciliation stops while the wake remains
+/// uncertain for explicit operator investigation.
+const MAX_PROVIDER_UNCERTAIN_OBSERVATIONS: u64 = 3;
+
 /// Runtime switches are intentionally unavailable through the CLI in this phase.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WakeConsumerPolicy {
@@ -563,6 +568,11 @@ impl WorkLedger {
                AND work.phase = 'dispatching'
                AND work.work_generation = wake.work_generation
                AND work.owner_generation = wake.owner_generation
+               AND (SELECT count(*)
+                      FROM provider_delivery_observations observation
+                     WHERE observation.delivery_id = delivery.delivery_id
+                       AND observation.to_state = 'uncertain')
+                   < {MAX_PROVIDER_UNCERTAIN_OBSERVATIONS}
                AND lower(work.repo) IN ({placeholders})
              ORDER BY wake.updated_at, wake.wake_id LIMIT 1"
         );
@@ -590,6 +600,23 @@ impl WorkLedger {
         let connection = self.connect_read_only()?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
+        let uncertain_observations: u64 = connection.query_row(
+            "SELECT count(*)
+               FROM provider_delivery_observations observation
+               JOIN provider_deliveries delivery
+                 ON delivery.delivery_id = observation.delivery_id
+              WHERE delivery.wake_id = ?1
+                AND delivery.state = 'uncertain'
+                AND observation.to_state = 'uncertain'",
+            [wake_id],
+            |row| row.get(0),
+        )?;
+        if uncertain_observations >= MAX_PROVIDER_UNCERTAIN_OBSERVATIONS {
+            return Err(WorkLedgerError::Refused(
+                "uncertain delivery reconciliation budget exhausted; manual intervention required"
+                    .to_owned(),
+            ));
+        }
         connection
             .query_row(
                 "SELECT wake.work_item_id, wake.work_generation, wake.owner_generation,

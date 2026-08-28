@@ -1453,6 +1453,87 @@ fn pre_v3_claim_without_attempt_proof_becomes_uncertain() {
 }
 
 #[test]
+fn permanent_uncertainty_quiesces_durably_across_reopen_without_more_receipts() {
+    let (temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut adapter = Adapter::successful(true);
+    adapter.launch_outcomes = vec![ProviderOutcome::Uncertain {
+        evidence: b"persistent uncertainty 1".to_vec(),
+    }];
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+            .expect("initial uncertainty"),
+        WakeDeliveryResult::Uncertain
+    );
+    for evidence in [
+        b"persistent uncertainty 2".as_slice(),
+        b"persistent uncertainty 3".as_slice(),
+    ] {
+        adapter.reconcile_outcome = ProviderOutcome::Uncertain {
+            evidence: evidence.to_vec(),
+        };
+        assert_eq!(
+            ledger
+                .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut adapter)
+                .expect("bounded uncertainty observation"),
+            WakeDeliveryResult::Uncertain
+        );
+    }
+    assert_eq!(adapter.launch_count, 1);
+    assert_eq!(adapter.reconcile_fences.len(), 2);
+    assert_eq!(outbox_state(&ledger, &wake_id), "uncertain");
+
+    let provider_receipts_before: u64 = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT count(*) FROM protected_objects
+             WHERE work_item_id = ?1 AND kind = 'provider_receipt'",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("provider receipt count");
+    assert_eq!(provider_receipts_before, 3);
+
+    for _ in 0..5 {
+        let reopened = WorkLedger::open(temp.path()).expect("reopen uncertain ledger");
+        assert_eq!(
+            reopened
+                .next_uncertain_wake_id(&active_policy())
+                .expect("quiescent selection"),
+            None
+        );
+        let mut restarted = Adapter::successful(true);
+        restarted.reconcile_outcome = ProviderOutcome::Uncertain {
+            evidence: b"must not be persisted".to_vec(),
+        };
+        let refusal = reopened
+            .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut restarted)
+            .expect_err("automatic reconciliation must quiesce");
+        assert!(
+            refusal.to_string().contains(
+                "uncertain delivery reconciliation budget exhausted; manual intervention required"
+            ),
+            "unexpected refusal: {refusal}"
+        );
+        assert!(restarted.reconcile_fences.is_empty());
+        let provider_receipts_after: u64 = reopened
+            .connect_read_only()
+            .expect("connection")
+            .query_row(
+                "SELECT count(*) FROM protected_objects
+                 WHERE work_item_id = ?1 AND kind = 'provider_receipt'",
+                [&work_id],
+                |row| row.get(0),
+            )
+            .expect("stable provider receipt count");
+        assert_eq!(provider_receipts_after, provider_receipts_before);
+        assert_eq!(outbox_state(&reopened, &wake_id), "uncertain");
+    }
+}
+
+#[test]
 fn stale_generation_refuses_before_provider_launch() {
     let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
     ledger
