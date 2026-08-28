@@ -125,12 +125,18 @@ not participate at all; drain them and prove exact-binary fleet convergence
 before trusting the audit.
 
 On macOS, advisory-lock contention can briefly appear before `lsof` reports its
-holder. The guardian may observe only that exact no-holder/contended state for a
-bounded stable-idle window while continuously fencing the production PID/start
-identity, binary hash, configuration, and active-worker set. Any reported holder,
-identity drift, new worker, persistent contention, or deadline remains a hard
-failure. Sandbox failure artifacts must stay inside the explicit canary or
-runner temp root; never glob protected system temp trees.
+holder. The guardian observes only no holder or the exact production PID through
+a bounded stable-idle window while continuously fencing PID/start identity,
+binary hash, configuration, and active-worker set. Persistent contention is the
+legacy lifetime-lock protocol only when the exact production PID held the lock
+and no uncontended sample occurred anywhere in the window; otherwise the
+guardian fails closed without stopping production. A restoration retry adopts
+an already-live daemon only after revalidating its exact process identity,
+running status, repository/worker authority, and sole lifetime-lock ownership;
+it never starts a competing writer beside a live ambiguous process. Foreign
+holders, identity drift, new workers, and deadlines remain hard failures.
+Sandbox failure artifacts must stay inside the explicit canary or runner temp
+root; never glob protected system temp trees.
 
 After cleanup, treat a single daemon IPC status miss as an observation rather
 than proof of death: use a bounded status window that continuously rechecks the

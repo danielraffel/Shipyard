@@ -29,6 +29,10 @@ class GuardianError(RuntimeError):
     """Fail-closed canary transaction error."""
 
 
+class RetainedLifetimeLock(GuardianError):
+    """Exact production daemon retained the writer lock for the full window."""
+
+
 class OwnerEnded(RuntimeError):
     """The Actions owner exited or was cancelled before writing done."""
 
@@ -443,13 +447,17 @@ def _wait_for_idle_writer_domain(
     deadline = time.monotonic() + timeout
     stable = 0
     last_holders: tuple[int, ...] = ()
+    saw_uncontended = False
 
     def fail_if_expired() -> None:
         if time.monotonic() >= deadline:
-            raise GuardianError(
+            error = (
                 "corrected daemon retained the writer-domain lock through the "
                 f"bounded idle wait: {last_holders!r}"
             )
+            if last_holders == (production_pid,) and not saw_uncontended:
+                raise RetainedLifetimeLock(error)
+            raise GuardianError(error)
 
     while True:
         fail_if_expired()
@@ -474,6 +482,7 @@ def _wait_for_idle_writer_domain(
                 f"{foreign_holders!r}"
             )
         if not _exclusive_lock_is_contended(path):
+            saw_uncontended = True
             stable += 1
             if stable >= stable_observations:
                 fail_if_expired()
@@ -726,20 +735,23 @@ class Guardian:
             diagnostic_root=self.root,
         )
         old_contended = _exclusive_lock_is_contended(self.lock_path)
-        if not old_holders and old_contended:
-            # lsof can briefly lag an advisory-lock owner. Treat this one
-            # otherwise-unclassifiable state as a bounded observation window,
-            # while continuously fencing the exact production identity and
-            # allowing only the exact production PID to finish a transient
-            # mutation. Every other ambiguous state still fails immediately in
-            # _select_transition.
-            _wait_for_idle_writer_domain(
-                self.lock_path,
-                snapshot.pid,
-                verify_production=self.verify_unchanged_production,
-                diagnostic_root=self.root,
-            )
-            self.transition_path = CORRECTED_TRANSITION
+        if old_contended and old_holders in ((), (snapshot.pid,)):
+            # A corrected daemon can briefly hold this lock while mutating, and
+            # lsof can briefly lag either acquisition or release. Observe the
+            # exact production identity through a bounded window. Only an exact
+            # production-PID holder that remains contended for the whole window
+            # is classified as the legacy lifetime-lock protocol.
+            try:
+                _wait_for_idle_writer_domain(
+                    self.lock_path,
+                    snapshot.pid,
+                    verify_production=self.verify_unchanged_production,
+                    diagnostic_root=self.root,
+                )
+            except RetainedLifetimeLock:
+                self.transition_path = LEGACY_TRANSITION
+            else:
+                self.transition_path = CORRECTED_TRANSITION
         else:
             self.transition_path = _select_transition(
                 snapshot.pid,
@@ -1109,12 +1121,61 @@ class Guardian:
         self.production_preserved = True
         self.production_identity_verified = True
 
+    def verify_restored_legacy_production(self, pid: int) -> ProcessSnapshot:
+        """Verify and adopt one exact restored legacy daemon, or fail closed."""
+        snapshot = self.snapshot
+        if snapshot is None:
+            raise GuardianError("production snapshot is unavailable")
+        restored = snapshot_process(pid)
+        self.assert_process_identity(restored, require_same_pid=False)
+        status = _json_command(snapshot, self.installed, "daemon", "status")
+        if status.get("running") is not True:
+            raise GuardianError("restored daemon status is not running")
+        if (
+            _configured_repos(restored, self.installed, diagnostic_root=self.root)
+            != self.configured_repos
+        ):
+            raise GuardianError("restored configured repository authority differs")
+        if (
+            _active_runs(restored, self.installed, diagnostic_root=self.root)
+            != self.worker_ids
+        ):
+            raise GuardianError("restored active worker ownership differs")
+        restored_holders = _lock_holders(self.lock_path, diagnostic_root=self.root)
+        if restored_holders != (pid,) or not _exclusive_lock_is_contended(
+            self.lock_path
+        ):
+            raise GuardianError(
+                f"restored daemon pid {pid} is not the sole lifetime-lock owner: "
+                f"{restored_holders!r}"
+            )
+        self.restored_pid = pid
+        self.final_production_start_time = restored.start_time
+        self.production_restored = True
+        self.production_identity_verified = True
+        return restored
+
     def restore_legacy_production(self) -> None:
         snapshot = self.snapshot
         if snapshot is None:
             return
         if _sha256(self.installed) != self.installed_hash:
             raise GuardianError("installed production binary changed during canary")
+
+        try:
+            recorded_pid = int(
+                self.production_pid_file.read_text(encoding="utf-8").strip()
+            )
+        except (FileNotFoundError, ValueError):
+            recorded_pid = None
+        if recorded_pid is not None and _pid_alive(recorded_pid):
+            # A prior restoration attempt may have successfully started the
+            # exact daemon and then failed during post-spawn verification. The
+            # lifecycle retry must adopt that process instead of starting a
+            # competing writer. Any live identity mismatch fails closed.
+            self.verify_restored_legacy_production(recorded_pid)
+            return
+
         stdin = open(snapshot.stdin_path, "rb", buffering=0)
         stdout = open(snapshot.stdout_path, "ab", buffering=0)
         stderr = stdout if snapshot.stderr_path == snapshot.stdout_path else open(
@@ -1130,6 +1191,10 @@ class Guardian:
             stderr=stderr,
             start_new_session=True,
         )
+        stdin.close()
+        stdout.close()
+        if stderr is not stdout:
+            stderr.close()
         deadline = time.monotonic() + 15.0
         restored_pid = None
         while time.monotonic() < deadline:
@@ -1151,31 +1216,7 @@ class Guardian:
             time.sleep(0.1)
         if restored_pid != process.pid:
             raise GuardianError("restored daemon did not own the production pid file")
-        restored = snapshot_process(process.pid)
-        self.assert_process_identity(restored, require_same_pid=False)
-        if (
-            _configured_repos(
-                restored, self.installed, diagnostic_root=self.root
-            )
-            != self.configured_repos
-        ):
-            raise GuardianError("restored configured repository authority differs")
-        if (
-            _active_runs(restored, self.installed, diagnostic_root=self.root)
-            != self.worker_ids
-        ):
-            raise GuardianError("restored active worker ownership differs")
-        restored_holders = _lock_holders(self.lock_path, diagnostic_root=self.root)
-        if restored_holders != (process.pid,) or not _exclusive_lock_is_contended(
-            self.lock_path
-        ):
-            raise GuardianError(
-                f"restored daemon pid {process.pid} is not the sole lifetime-lock owner: {restored_holders!r}"
-            )
-        self.restored_pid = process.pid
-        self.final_production_start_time = restored.start_time
-        self.production_restored = True
-        self.production_identity_verified = True
+        self.verify_restored_legacy_production(process.pid)
 
     def release(self) -> None:
         if self.lease_owned:
