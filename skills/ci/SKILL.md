@@ -1570,7 +1570,9 @@ requires typed repository/PR/exact-head proof, durably freezes and proves the
 whole process tree dead before releasing capacity, and generation-CAS removes
 only the terminating worker's receipt. A restart resumes that transaction; it
 does not require the separate receipt after the exact frozen-tree transaction
-is durable, but it must preserve and refuse any present replacement generation.
+is durable, but recovery must match the persisted process start identity as
+well as PID and command before signaling, and it must preserve and refuse any
+present replacement generation.
 A missing receipt without a durable termination transaction remains fenced for
 agent recovery because root absence cannot prove reparented descendants dead.
 Once an exact AlreadyMerged cancellation proof is stored, the daemon stops

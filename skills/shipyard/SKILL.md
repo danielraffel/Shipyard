@@ -807,8 +807,9 @@ missing typed outcome from the winning terminal record.
 Once a matching termination transaction has durably frozen the exact worker
 tree, daemon restart must resume that transaction even if the separate worker
 receipt has disappeared. The transaction's job, generation, root PID, and
-phase are the recovery authority; a live mismatched replacement receipt remains
-a hard CAS fence. Do not generalize this to legacy `Running` rows that have
+kernel-observed process start identity are the recovery authority; command text
+alone is not sufficient because a PID can be reused. A live mismatched
+replacement receipt remains a hard CAS fence. Do not generalize this to legacy `Running` rows that have
 neither a receipt nor a termination transaction: root-process absence cannot
 prove reparented descendants dead, so those rows require an audited one-time
 disposition and must continue to reserve capacity until then.
@@ -1265,6 +1266,10 @@ age, and reserved/actual rolling-hour request accounting. Read it under
 `shadow_observer` in `shipyard daemon status --json`; `stalled=true` means the
 recorded in-flight age exceeded the complete-pass deadline. Status is local and
 free of GitHub/model calls, and unchanged passes still emit no event.
+The detached daemon and its foreground runtime use the persistent
+`state_dir/daemon` directory for registrar and observer child-process cwd; never
+retain a launch worktree as daemon runtime authority because normal worktree
+cleanup would turn later token-helper or native `gh` spawns into `ENOENT`.
 shared one-minute deadline covers auth preparation and reads so a slow endpoint
 cannot starve later triggers.
 Multiple ledger records for one

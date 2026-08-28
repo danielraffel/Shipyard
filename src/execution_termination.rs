@@ -16,7 +16,7 @@ use wait_timeout::ChildExt;
 
 use crate::execution_supervisor::WorkerReceipt;
 
-const TERMINATION_SCHEMA_VERSION: u32 = 1;
+const TERMINATION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +40,7 @@ pub(crate) struct TerminationTransaction {
     pub(crate) worker_generation: String,
     pub(crate) root_pid: u32,
     root_command: String,
+    root_start_identity: String,
     descendants: Vec<FrozenProcessIdentity>,
     pub(crate) action: TerminationAction,
     pub(crate) phase: TerminationPhase,
@@ -57,6 +58,7 @@ impl TerminationTransaction {
 struct FrozenProcessIdentity {
     pid: u32,
     command: String,
+    start_identity: String,
 }
 
 pub(crate) struct TerminationStore {
@@ -84,6 +86,11 @@ impl TerminationStore {
             || transaction.job_id != job_id
             || transaction.worker_generation.is_empty()
             || transaction.root_pid == 0
+            || transaction.root_start_identity.is_empty()
+            || transaction
+                .descendants
+                .iter()
+                .any(|identity| identity.pid == 0 || identity.start_identity.is_empty())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -139,13 +146,14 @@ impl TerminationStore {
             }
             return Ok(existing);
         }
-        let (root_command, descendants) = freeze_complete_tree(receipt)?;
+        let (root_command, root_start_identity, descendants) = freeze_complete_tree(receipt)?;
         let transaction = TerminationTransaction {
             schema_version: TERMINATION_SCHEMA_VERSION,
             job_id: receipt.job_id.clone(),
             worker_generation: receipt.generation.clone(),
             root_pid: receipt.pid,
             root_command,
+            root_start_identity,
             descendants,
             action,
             phase: TerminationPhase::Frozen,
@@ -261,7 +269,7 @@ fn validate_job_id(job_id: &str) -> io::Result<()> {
 #[cfg(unix)]
 fn freeze_complete_tree(
     receipt: &WorkerReceipt,
-) -> io::Result<(String, Vec<FrozenProcessIdentity>)> {
+) -> io::Result<(String, String, Vec<FrozenProcessIdentity>)> {
     freeze_complete_tree_with_hook(receipt, |_| {})
 }
 
@@ -269,7 +277,7 @@ fn freeze_complete_tree(
 fn freeze_complete_tree_with_hook(
     receipt: &WorkerReceipt,
     mut during_scan: impl FnMut(usize),
-) -> io::Result<(String, Vec<FrozenProcessIdentity>)> {
+) -> io::Result<(String, String, Vec<FrozenProcessIdentity>)> {
     signal(receipt.pid, "-STOP")?;
     let mut known = BTreeSet::from([receipt.pid]);
     let mut stable_scans = 0_u8;
@@ -314,6 +322,11 @@ fn freeze_complete_tree_with_hook(
                     .expect("exact stopped worker remains in stable snapshot")
                     .command
                     .clone();
+                let root_start_identity = processes
+                    .get(&receipt.pid)
+                    .expect("exact stopped worker remains in stable snapshot")
+                    .start_identity
+                    .clone();
                 let descendants = known
                     .into_iter()
                     .filter(|pid| *pid != receipt.pid)
@@ -321,10 +334,11 @@ fn freeze_complete_tree_with_hook(
                         processes.get(&pid).map(|process| FrozenProcessIdentity {
                             pid,
                             command: process.command.clone(),
+                            start_identity: process.start_identity.clone(),
                         })
                     })
                     .collect();
-                return Ok((root_command, descendants));
+                return Ok((root_command, root_start_identity, descendants));
             }
         } else {
             stable_scans = 0;
@@ -340,7 +354,7 @@ fn freeze_complete_tree_with_hook(
 #[cfg(not(unix))]
 fn freeze_complete_tree(
     _receipt: &WorkerReceipt,
-) -> io::Result<(String, Vec<FrozenProcessIdentity>)> {
+) -> io::Result<(String, String, Vec<FrozenProcessIdentity>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "durable daemon tree termination is unavailable on this platform",
@@ -350,15 +364,29 @@ fn freeze_complete_tree(
 #[cfg(unix)]
 fn frozen_snapshot_is_safe(transaction: &TerminationTransaction) -> io::Result<bool> {
     let processes = process_snapshot()?;
+    Ok(frozen_snapshot_matches_processes(transaction, &processes))
+}
+
+#[cfg(unix)]
+fn frozen_snapshot_matches_processes(
+    transaction: &TerminationTransaction,
+    processes: &BTreeMap<u32, ProcessSnapshot>,
+) -> bool {
     let root_safe = processes.get(&transaction.root_pid).is_none_or(|process| {
-        process.zombie || (process.stopped && process.command == transaction.root_command)
+        process.zombie
+            || (process.stopped
+                && process.command == transaction.root_command
+                && process.start_identity == transaction.root_start_identity)
     });
     let descendants_safe = transaction.descendants.iter().all(|identity| {
         processes.get(&identity.pid).is_none_or(|process| {
-            process.zombie || (process.stopped && process.command == identity.command)
+            process.zombie
+                || (process.stopped
+                    && process.command == identity.command
+                    && process.start_identity == identity.start_identity)
         })
     });
-    Ok(root_safe && descendants_safe)
+    root_safe && descendants_safe
 }
 
 #[cfg(not(unix))]
@@ -436,12 +464,13 @@ struct ProcessSnapshot {
     stopped: bool,
     zombie: bool,
     command: String,
+    start_identity: String,
 }
 
 #[cfg(unix)]
 fn process_snapshot() -> io::Result<BTreeMap<u32, ProcessSnapshot>> {
     let output = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,stat=,command="])
+        .args(["-axo", "pid=,ppid=,lstart=,stat=,command="])
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other("process-tree observation failed"));
@@ -452,6 +481,14 @@ fn process_snapshot() -> io::Result<BTreeMap<u32, ProcessSnapshot>> {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse().ok()?;
             let parent = fields.next()?.parse().ok()?;
+            let start_identity = [
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            ]
+            .join(" ");
             let state = fields.next()?;
             Some((
                 pid,
@@ -461,6 +498,7 @@ fn process_snapshot() -> io::Result<BTreeMap<u32, ProcessSnapshot>> {
                     stopped: state.starts_with('T'),
                     zombie: state.starts_with('Z'),
                     command: fields.collect::<Vec<_>>().join(" "),
+                    start_identity,
                 },
             ))
         })
@@ -505,6 +543,7 @@ mod tests {
             worker_generation: receipt.generation.clone(),
             root_pid: receipt.pid,
             root_command: "worker".to_owned(),
+            root_start_identity: "Fri Aug 28 12:00:00 2026".to_owned(),
             descendants: Vec::new(),
             action: TerminationAction::Cancel,
             phase: TerminationPhase::Frozen,
@@ -513,6 +552,51 @@ mod tests {
         let mut replacement = receipt;
         replacement.generation = "generation-b".to_owned();
         assert!(!transaction.matches_receipt(&replacement));
+    }
+
+    #[test]
+    fn frozen_snapshot_refuses_pid_reuse_with_same_command() {
+        let transaction = TerminationTransaction {
+            schema_version: TERMINATION_SCHEMA_VERSION,
+            job_id: "job".to_owned(),
+            worker_generation: "generation-a".to_owned(),
+            root_pid: 42,
+            root_command: "execution-worker job generation-a".to_owned(),
+            root_start_identity: "Fri Aug 28 12:00:00 2026".to_owned(),
+            descendants: vec![FrozenProcessIdentity {
+                pid: 43,
+                command: "/bin/sleep 300".to_owned(),
+                start_identity: "Fri Aug 28 12:00:01 2026".to_owned(),
+            }],
+            action: TerminationAction::Cancel,
+            phase: TerminationPhase::Frozen,
+        };
+        let processes = BTreeMap::from([
+            (
+                42,
+                ProcessSnapshot {
+                    pid: 42,
+                    parent: 1,
+                    stopped: true,
+                    zombie: false,
+                    command: transaction.root_command.clone(),
+                    start_identity: "Fri Aug 28 12:01:00 2026".to_owned(),
+                },
+            ),
+            (
+                43,
+                ProcessSnapshot {
+                    pid: 43,
+                    parent: 42,
+                    stopped: true,
+                    zombie: false,
+                    command: transaction.descendants[0].command.clone(),
+                    start_identity: transaction.descendants[0].start_identity.clone(),
+                },
+            ),
+        ]);
+
+        assert!(!frozen_snapshot_matches_processes(&transaction, &processes));
     }
 
     fn executable_script(temp: &Path, body: &str) -> PathBuf {
@@ -605,14 +689,15 @@ mod tests {
         wait_for_file(&ready);
         let receipt = receipt_for(&child, "fork-race", "g-fork");
         let mut triggered = false;
-        let (root_command, descendants) = freeze_complete_tree_with_hook(&receipt, |scan| {
-            if scan == 0 && !triggered {
-                fs::write(&trigger, b"go").expect("fork trigger");
-                wait_for_file(&forked_pid);
-                triggered = true;
-            }
-        })
-        .expect("freeze racing fork tree");
+        let (root_command, root_start_identity, descendants) =
+            freeze_complete_tree_with_hook(&receipt, |scan| {
+                if scan == 0 && !triggered {
+                    fs::write(&trigger, b"go").expect("fork trigger");
+                    wait_for_file(&forked_pid);
+                    triggered = true;
+                }
+            })
+            .expect("freeze racing fork tree");
         let forked = fs::read_to_string(&forked_pid)
             .expect("forked pid")
             .trim()
@@ -626,6 +711,7 @@ mod tests {
             worker_generation: receipt.generation.clone(),
             root_pid: receipt.pid,
             root_command,
+            root_start_identity,
             descendants,
             action: TerminationAction::Cancel,
             phase: TerminationPhase::Frozen,

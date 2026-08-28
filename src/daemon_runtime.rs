@@ -162,7 +162,7 @@ pub fn resolve_repos(state_dir: &Path, explicit_repos: &[String]) -> Vec<String>
 #[cfg(unix)]
 #[allow(clippy::too_many_lines)]
 pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
-    let daemon_dir = config.state_dir.join("daemon");
+    let daemon_dir = daemon_working_directory(&config.state_dir);
     crate::writer_domain_lease::ensure_protected_dir_all(&daemon_dir)?;
 
     if read_daemon_status(&config.state_dir).is_some() {
@@ -188,8 +188,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         webhook_tx,
     )?;
     let repos = normalize_repos(config.repos);
-    let registrar_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let registrar = Registrar::new_with_context(config.mode, &config.state_dir, &registrar_cwd);
+    let registrar = Registrar::new_with_context(config.mode, &config.state_dir, &daemon_dir);
     let registration = Arc::new(RegistrationState::new(registrar));
     let registration_error = Arc::new(Mutex::new(None::<String>));
     let execution_error = Arc::new(Mutex::new(None::<String>));
@@ -199,7 +198,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         config.mode,
         config.global_dir.clone(),
         config.state_dir.clone(),
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        daemon_dir.clone(),
         Instant::now(),
     );
     let shadow_health = shadow_lane.health_handle();
@@ -680,7 +679,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
 /// Spawn the daemon as a detached child process and verify the IPC socket
 /// becomes reachable before reporting success.
 pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedError> {
-    let daemon_dir = request.state_dir.join("daemon");
+    let daemon_dir = daemon_working_directory(&request.state_dir);
     crate::writer_domain_lease::ensure_protected_dir_all(&daemon_dir)
         .map_err(|error| io_spawn_error(&error))?;
     let temp_dir = prepare_daemon_temp_dir(&daemon_dir).map_err(|error| io_spawn_error(&error))?;
@@ -727,6 +726,7 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
     let stderr = stdout.try_clone().map_err(|error| io_spawn_error(&error))?;
 
     let mut command = Command::new(&request.binary);
+    set_daemon_working_directory(&mut command, &daemon_dir);
     command.env("PATH", crate::paths::unattended_tool_path());
     command.env("TMPDIR", &temp_dir);
     command.arg("--mode").arg(request.mode.as_str());
@@ -782,6 +782,14 @@ pub fn spawn_detached(request: &SpawnRequest) -> Result<u32, DaemonSpawnFailedEr
         log_path.display(),
         read_log_tail(&log_path)
     )))
+}
+
+fn daemon_working_directory(state_dir: &Path) -> PathBuf {
+    state_dir.join("daemon")
+}
+
+fn set_daemon_working_directory(command: &mut Command, daemon_dir: &Path) {
+    command.current_dir(daemon_dir);
 }
 
 fn prepare_daemon_temp_dir(daemon_dir: &Path) -> io::Result<PathBuf> {
@@ -1715,10 +1723,11 @@ mod tests {
     use super::{
         DaemonRunConfig, DaemonRunError, RegistrationState, RegistrationSyncState, TunnelSnapshot,
         WebhookRequest, archive_closed_pull_request_ship_state, daemon_status_provider,
-        daemon_tunnel_config, handle_webhook_request, load_or_create_webhook_secret,
-        parse_tunnel_enabled, pid_alive, prepare_daemon_temp_dir,
-        process_looks_like_shipyard_daemon, reconcile_healed_event, run_blocking, ship_state_map,
-        should_start_reconcile, start_tunnel_runtime, stop_running,
+        daemon_tunnel_config, daemon_working_directory, handle_webhook_request,
+        load_or_create_webhook_secret, parse_tunnel_enabled, pid_alive, prepare_daemon_temp_dir,
+        process_looks_like_shipyard_daemon, reconcile_healed_event, run_blocking,
+        set_daemon_working_directory, ship_state_map, should_start_reconcile, start_tunnel_runtime,
+        stop_running,
     };
     #[cfg(unix)]
     use crate::daemon_ipc::{read_daemon_ship_state_list, read_daemon_status};
@@ -1740,6 +1749,7 @@ mod tests {
     #[cfg(unix)]
     use wait_timeout::ChildExt;
 
+    #[cfg(unix)]
     #[cfg(unix)]
     #[test]
     fn daemon_temp_dir_is_real_and_owner_private() {
@@ -1821,6 +1831,19 @@ mod tests {
         let repos = resolve_repos(temp.path(), &[]);
 
         assert_eq!(repos, vec!["owner/repo".to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_commands_use_the_state_owned_working_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = daemon_working_directory(temp.path());
+        let mut command = Command::new("/usr/bin/true");
+
+        set_daemon_working_directory(&mut command, &daemon_dir);
+
+        assert_eq!(command.get_current_dir(), Some(daemon_dir.as_path()));
+        assert_eq!(daemon_dir, temp.path().join("daemon"));
     }
 
     #[cfg(unix)]
