@@ -155,3 +155,4 @@ mod dispatch;
 mod importer;
 mod lifecycle;
 mod persistence;
+mod protected_objects;

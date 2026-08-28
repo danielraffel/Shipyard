@@ -45,6 +45,7 @@ impl WorkLedger {
         configure_durable(&connection)?;
         migrate(&mut connection)?;
         verify_integrity(&connection)?;
+        ledger.reconcile_protected_object_storage()?;
         Ok(ledger)
     }
 
@@ -61,6 +62,8 @@ impl WorkLedger {
         validate_ledger_path(state_dir, &path, true)?;
         validate_protected_storage(&dir, &path)?;
         let ledger = Self { path };
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&dir)?;
+        ledger.reconcile_protected_object_storage()?;
         let connection = ledger.connect_read_only()?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
@@ -75,9 +78,16 @@ impl WorkLedger {
 
     /// Return redacted operational status.
     pub fn status(&self) -> WorkLedgerResult<LedgerStatus> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        self.reconcile_protected_object_storage()?;
         let connection = self.connect_read_only()?;
         verify_supported_schema(&connection)?;
         let integrity = verify_integrity(&connection)?;
+        self.verify_protected_object_storage(&connection)?;
         Ok(LedgerStatus {
             exists: true,
             schema_version: schema_version(&connection)?,
@@ -97,6 +107,10 @@ impl WorkLedger {
             pending_wakes: count_where(&connection, "outbox", "state", "pending")?,
             uncertain_wakes: count_where(&connection, "outbox", "state", "uncertain")?,
             imports: count(&connection, "imports")?,
+            protected_objects: count(&connection, "protected_objects")?,
+            provider_deliveries: count(&connection, "provider_deliveries")?,
+            agent_ownership: count(&connection, "agent_ownership")?,
+            activation_epochs: count(&connection, "activation_epochs")?,
             activation_enabled: false,
             dispatch_enabled: false,
         })

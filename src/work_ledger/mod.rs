@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -57,6 +57,8 @@ mod lifecycle;
 mod observation;
 mod persistence;
 mod policy;
+#[allow(dead_code)] // Production provider activation lands after the protected store.
+mod protected_objects;
 mod registry;
 #[allow(dead_code)] // Activated through the protected registry in a later phase.
 mod route;
@@ -69,6 +71,8 @@ pub use observation::ShadowPrTarget;
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
 pub use policy::RepoPolicy;
 pub(crate) use policy::validate_repo_policy;
+#[allow(unused_imports)] // The production provider slice consumes this internal boundary.
+pub(crate) use protected_objects::{ProtectedObjectKind, ProtectedObjectRecord};
 #[cfg(test)]
 use registry::{RouteRegistration, validated_route_exists};
 use route::{AdapterBindingRecord, RouteProvenanceRecord};
@@ -211,6 +215,14 @@ pub struct LedgerStatus {
     pub uncertain_wakes: u64,
     /// Imported source count.
     pub imports: u64,
+    /// Immutable protected-object metadata rows.
+    pub protected_objects: u64,
+    /// Durable provider-delivery rows.
+    pub provider_deliveries: u64,
+    /// Durable agent-ownership rows.
+    pub agent_ownership: u64,
+    /// Append-only activation ownership epochs.
+    pub activation_epochs: u64,
     /// Activation is deliberately unavailable in this phase.
     pub activation_enabled: bool,
     /// Dispatch is deliberately unavailable in this phase.

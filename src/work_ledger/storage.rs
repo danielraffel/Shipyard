@@ -23,6 +23,10 @@ pub fn absent_status() -> LedgerStatus {
         pending_wakes: 0,
         uncertain_wakes: 0,
         imports: 0,
+        protected_objects: 0,
+        provider_deliveries: 0,
+        agent_ownership: 0,
+        activation_epochs: 0,
         activation_enabled: false,
         dispatch_enabled: false,
     }
@@ -149,6 +153,10 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     if version == 3 {
         migrate_v3_to_v4(connection)?;
+        version = 4;
+    }
+    if version == 4 {
+        migrate_v4_to_v5(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
@@ -247,23 +255,42 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
            work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
            work_generation INTEGER NOT NULL,
            owner_generation INTEGER NOT NULL,
-           state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'acknowledged', 'uncertain', 'failed')),
+           state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'delivered',
+                                               'acknowledged', 'uncertain', 'failed')),
            route_ref TEXT NOT NULL,
+           profile_ref TEXT,
            payload_digest TEXT NOT NULL,
            transport_receipt_digest TEXT,
+           provider_delivery_id TEXT UNIQUE
+             REFERENCES provider_deliveries(delivery_id) DEFERRABLE INITIALLY DEFERRED,
            created_at TEXT NOT NULL,
            updated_at TEXT NOT NULL,
-           acknowledged_at TEXT
+           acknowledged_at TEXT,
+           CHECK(state NOT IN ('delivered', 'acknowledged')
+                 OR (provider_delivery_id IS NOT NULL
+                     AND profile_ref IS NOT NULL AND length(profile_ref) = 78
+                     AND substr(profile_ref, 1, 14) = 'opaque:sha256:'
+                     AND substr(profile_ref, 15) NOT GLOB '*[^0-9a-f]*'
+                     AND transport_receipt_digest IS NOT NULL
+                     AND length(transport_receipt_digest) = 64
+                     AND transport_receipt_digest NOT GLOB '*[^0-9a-f]*'
+                     AND ((state = 'delivered' AND acknowledged_at IS NULL)
+                          OR (state = 'acknowledged' AND acknowledged_at IS NOT NULL))))
          );
          CREATE TABLE wake_attempts (
            wake_id TEXT NOT NULL REFERENCES outbox(wake_id) ON DELETE RESTRICT,
            attempt INTEGER NOT NULL CHECK(attempt > 0),
-           state TEXT NOT NULL CHECK(state IN ('claimed', 'acknowledged', 'retry', 'uncertain', 'failed')),
+           state TEXT NOT NULL CHECK(state IN ('claimed', 'delivered', 'acknowledged',
+                                               'retry', 'uncertain', 'failed')),
            adapter_id TEXT NOT NULL,
            idempotent INTEGER NOT NULL CHECK(idempotent IN (0, 1)),
            outcome_digest TEXT,
            started_at TEXT NOT NULL,
            finished_at TEXT,
+           CHECK(state != 'delivered'
+                 OR (outcome_digest IS NOT NULL AND length(outcome_digest) = 64
+                     AND outcome_digest NOT GLOB '*[^0-9a-f]*'
+                     AND finished_at IS NOT NULL)),
            PRIMARY KEY(wake_id, attempt)
          );
          CREATE TABLE wake_claim_epochs (
@@ -298,7 +325,303 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
          CREATE INDEX outbox_delivery ON outbox(state, created_at, wake_id);
          CREATE INDEX wake_attempts_recovery ON wake_attempts(state, started_at, wake_id);
          CREATE INDEX wake_claim_epoch_owner ON wake_claim_epochs(owner_ref, epoch);
-         PRAGMA user_version = 4;",
+         CREATE TABLE protected_objects (
+           object_ref TEXT PRIMARY KEY
+             CHECK(length(object_ref) = 67 AND substr(object_ref, 1, 3) = 'po_'
+                   AND substr(object_ref, 4) NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           kind TEXT NOT NULL CHECK(kind IN ('launch_profile', 'provider_request',
+                                             'provider_receipt', 'agent_receipt')),
+           profile_ref TEXT,
+           storage_name TEXT NOT NULL UNIQUE
+             CHECK(length(storage_name) = 76
+                   AND substr(storage_name, 1, 7) = 'object-'
+                   AND substr(storage_name, 8, 64) NOT GLOB '*[^0-9a-f]*'
+                   AND substr(storage_name, 72, 5) = '.blob'),
+           content_digest TEXT NOT NULL
+             CHECK(length(content_digest) = 64
+                   AND content_digest NOT GLOB '*[^0-9a-f]*'),
+           byte_length INTEGER NOT NULL CHECK(byte_length >= 0 AND byte_length <= 1048576),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           CHECK((kind = 'launch_profile' AND profile_ref IS NOT NULL
+                  AND length(profile_ref) = 78
+                  AND substr(profile_ref, 1, 14) = 'opaque:sha256:'
+                  AND substr(profile_ref, 15) NOT GLOB '*[^0-9a-f]*')
+                 OR (kind != 'launch_profile' AND profile_ref IS NULL)),
+           UNIQUE(work_item_id, profile_ref)
+         );
+         CREATE TABLE activation_epochs (
+           activation_id TEXT PRIMARY KEY
+             CHECK(length(activation_id) = 67 AND substr(activation_id, 1, 3) = 'ae_'
+                   AND substr(activation_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           work_generation INTEGER NOT NULL CHECK(work_generation > 0),
+           owner_generation INTEGER NOT NULL CHECK(owner_generation > 0),
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           owner_ref TEXT NOT NULL CHECK(length(owner_ref) BETWEEN 65 AND 128),
+           state TEXT NOT NULL CHECK(state IN ('active', 'released', 'superseded')),
+           acquired_at TEXT NOT NULL CHECK(length(acquired_at) >= 20),
+           released_at TEXT,
+           CHECK((state = 'active' AND released_at IS NULL)
+                 OR (state != 'active' AND released_at IS NOT NULL)),
+           UNIQUE(work_item_id, work_generation, owner_generation, epoch)
+         );
+         CREATE TABLE provider_deliveries (
+           delivery_id TEXT PRIMARY KEY
+             CHECK(length(delivery_id) = 67 AND substr(delivery_id, 1, 3) = 'pd_'
+                   AND substr(delivery_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           wake_id TEXT NOT NULL,
+           attempt INTEGER NOT NULL CHECK(attempt > 0),
+           activation_id TEXT NOT NULL REFERENCES activation_epochs(activation_id) ON DELETE RESTRICT,
+           provider_id TEXT NOT NULL CHECK(length(provider_id) BETWEEN 1 AND 512),
+           adapter_id TEXT NOT NULL CHECK(length(adapter_id) BETWEEN 1 AND 512),
+           idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key) BETWEEN 1 AND 512),
+           request_object_ref TEXT NOT NULL REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           receipt_object_ref TEXT REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           state TEXT NOT NULL CHECK(state IN ('prepared', 'launched', 'delivered',
+                                               'retry', 'uncertain', 'failed')),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           updated_at TEXT NOT NULL CHECK(length(updated_at) >= 20),
+           delivered_at TEXT,
+           CHECK((state = 'delivered' AND receipt_object_ref IS NOT NULL
+                  AND delivered_at IS NOT NULL)
+                 OR (state != 'delivered' AND delivered_at IS NULL)),
+           UNIQUE(wake_id, attempt),
+           FOREIGN KEY(wake_id, attempt) REFERENCES wake_attempts(wake_id, attempt)
+             ON DELETE RESTRICT
+         );
+         CREATE TABLE agent_ownership (
+           ownership_id TEXT PRIMARY KEY
+             CHECK(length(ownership_id) = 67 AND substr(ownership_id, 1, 3) = 'ao_'
+                   AND substr(ownership_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           work_generation INTEGER NOT NULL CHECK(work_generation > 0),
+           owner_generation INTEGER NOT NULL CHECK(owner_generation > 0),
+           delivery_id TEXT NOT NULL UNIQUE REFERENCES provider_deliveries(delivery_id) ON DELETE RESTRICT,
+           launch_profile_object_ref TEXT NOT NULL REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           context_receipt_object_ref TEXT REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           state TEXT NOT NULL CHECK(state IN ('pending', 'acknowledged', 'returned',
+                                               'uncertain', 'failed')),
+           context_receipt_digest TEXT,
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           updated_at TEXT NOT NULL CHECK(length(updated_at) >= 20),
+           acknowledged_at TEXT,
+           returned_at TEXT,
+           CHECK((state IN ('acknowledged', 'returned')
+                  AND context_receipt_digest IS NOT NULL
+                  AND length(context_receipt_digest) = 64
+                  AND context_receipt_digest NOT GLOB '*[^0-9a-f]*'
+                  AND context_receipt_object_ref IS NOT NULL
+                  AND acknowledged_at IS NOT NULL)
+                 OR (state NOT IN ('acknowledged', 'returned')
+                     AND context_receipt_digest IS NULL
+                     AND context_receipt_object_ref IS NULL
+                     AND acknowledged_at IS NULL)),
+           CHECK((state = 'returned' AND returned_at IS NOT NULL)
+                 OR (state != 'returned' AND returned_at IS NULL)),
+           UNIQUE(work_item_id, work_generation, owner_generation)
+         );
+         CREATE INDEX protected_objects_work_kind
+           ON protected_objects(work_item_id, kind, created_at);
+         CREATE TRIGGER protected_object_capacity
+         BEFORE INSERT ON protected_objects
+         WHEN (SELECT COUNT(*) FROM protected_objects) >= 4096
+           OR (SELECT COALESCE(SUM(byte_length), 0) FROM protected_objects)
+                + NEW.byte_length > 16777216
+         BEGIN SELECT RAISE(ABORT, 'protected object store capacity exceeded'); END;
+         CREATE TRIGGER protected_object_immutable
+         BEFORE UPDATE ON protected_objects
+         BEGIN SELECT RAISE(ABORT, 'protected object metadata is immutable'); END;
+         CREATE TRIGGER protected_object_no_delete
+         BEFORE DELETE ON protected_objects
+         BEGIN SELECT RAISE(ABORT, 'protected objects cannot be deleted'); END;
+         CREATE INDEX activation_epochs_active
+           ON activation_epochs(state, acquired_at, work_item_id);
+         CREATE UNIQUE INDEX activation_epochs_one_active
+           ON activation_epochs(work_item_id) WHERE state = 'active';
+         CREATE TRIGGER activation_epoch_identity_immutable
+         BEFORE UPDATE OF activation_id, work_item_id, work_generation, owner_generation, epoch,
+                          owner_ref, acquired_at ON activation_epochs
+         BEGIN SELECT RAISE(ABORT, 'activation epoch identity is immutable'); END;
+         CREATE TRIGGER activation_epoch_no_delete
+         BEFORE DELETE ON activation_epochs
+         BEGIN SELECT RAISE(ABORT, 'activation epochs cannot be deleted'); END;
+         CREATE TRIGGER activation_epoch_release_fence
+         BEFORE UPDATE OF state, released_at ON activation_epochs
+         WHEN (OLD.state = 'active' AND NEW.state = 'active'
+               AND OLD.released_at IS NOT NEW.released_at)
+           OR (OLD.state != 'active'
+               AND (OLD.state != NEW.state OR OLD.released_at IS NOT NEW.released_at))
+           OR (OLD.state != NEW.state
+               AND (OLD.state != 'active' OR NEW.state NOT IN ('released', 'superseded')))
+           OR (OLD.state = 'active' AND NEW.state != 'active' AND EXISTS (
+               SELECT 1 FROM provider_deliveries delivery
+               WHERE delivery.activation_id = OLD.activation_id
+                 AND delivery.state IN ('prepared', 'launched')
+           ))
+         BEGIN SELECT RAISE(ABORT, 'activation epoch transition is unsafe'); END;
+         CREATE INDEX provider_deliveries_state
+           ON provider_deliveries(state, updated_at, wake_id);
+         CREATE INDEX agent_ownership_state
+           ON agent_ownership(state, updated_at, work_item_id);
+         CREATE TRIGGER provider_delivery_insert_fence
+         BEFORE INSERT ON provider_deliveries
+         WHEN NOT EXISTS (
+           SELECT 1 FROM wake_attempts attempt
+           JOIN outbox wake ON wake.wake_id = attempt.wake_id
+           JOIN activation_epochs activation
+             ON activation.activation_id = NEW.activation_id
+           WHERE attempt.wake_id = NEW.wake_id AND attempt.attempt = NEW.attempt
+             AND attempt.adapter_id = NEW.adapter_id
+             AND activation.state = 'active'
+             AND activation.work_item_id = wake.work_item_id
+             AND activation.work_generation = wake.work_generation
+             AND activation.owner_generation = wake.owner_generation
+         )
+         BEGIN SELECT RAISE(ABORT, 'provider delivery authority mismatch'); END;
+         CREATE TRIGGER provider_delivery_identity_immutable
+         BEFORE UPDATE OF delivery_id, wake_id, attempt, activation_id, provider_id, adapter_id,
+                          idempotency_key, request_object_ref ON provider_deliveries
+         BEGIN SELECT RAISE(ABORT, 'provider delivery identity is immutable'); END;
+         CREATE TRIGGER provider_delivery_no_delete
+         BEFORE DELETE ON provider_deliveries
+         BEGIN SELECT RAISE(ABORT, 'provider deliveries cannot be deleted'); END;
+         CREATE TRIGGER provider_delivery_state_fence_insert
+         BEFORE INSERT ON provider_deliveries
+         WHEN NOT EXISTS (
+           SELECT 1 FROM wake_attempts attempt
+           JOIN outbox wake ON wake.wake_id = attempt.wake_id
+           JOIN protected_objects request ON request.object_ref = NEW.request_object_ref
+           JOIN activation_epochs activation ON activation.activation_id = NEW.activation_id
+           LEFT JOIN protected_objects receipt ON receipt.object_ref = NEW.receipt_object_ref
+           WHERE attempt.wake_id = NEW.wake_id AND attempt.attempt = NEW.attempt
+             AND attempt.adapter_id = NEW.adapter_id
+             AND request.kind = 'provider_request'
+             AND request.work_item_id = wake.work_item_id
+             AND activation.work_item_id = wake.work_item_id
+             AND activation.work_generation = wake.work_generation
+             AND activation.owner_generation = wake.owner_generation
+             AND ((NEW.state IN ('prepared', 'launched') AND activation.state = 'active'
+                   AND attempt.state = 'claimed')
+                  OR (NEW.state = 'delivered' AND attempt.state = 'delivered'
+                      AND receipt.kind = 'provider_receipt'
+                      AND receipt.work_item_id = wake.work_item_id
+                      AND receipt.content_digest = attempt.outcome_digest)
+                  OR (NEW.state IN ('retry', 'uncertain', 'failed')
+                      AND attempt.state = NEW.state))
+         )
+         BEGIN SELECT RAISE(ABORT, 'provider delivery state mismatch'); END;
+         CREATE TRIGGER provider_delivery_state_fence_update
+         BEFORE UPDATE OF state, receipt_object_ref, delivered_at ON provider_deliveries
+         WHEN NOT EXISTS (
+           SELECT 1 FROM wake_attempts attempt
+           JOIN outbox wake ON wake.wake_id = attempt.wake_id
+           JOIN protected_objects request ON request.object_ref = NEW.request_object_ref
+           JOIN activation_epochs activation ON activation.activation_id = NEW.activation_id
+           LEFT JOIN protected_objects receipt ON receipt.object_ref = NEW.receipt_object_ref
+           WHERE attempt.wake_id = NEW.wake_id AND attempt.attempt = NEW.attempt
+             AND attempt.adapter_id = NEW.adapter_id
+             AND request.kind = 'provider_request'
+             AND request.work_item_id = wake.work_item_id
+             AND activation.work_item_id = wake.work_item_id
+             AND activation.work_generation = wake.work_generation
+             AND activation.owner_generation = wake.owner_generation
+             AND ((NEW.state IN ('prepared', 'launched') AND activation.state = 'active'
+                   AND attempt.state = 'claimed')
+                  OR (NEW.state = 'delivered' AND attempt.state = 'delivered'
+                      AND receipt.kind = 'provider_receipt'
+                      AND receipt.work_item_id = wake.work_item_id
+                      AND receipt.content_digest = attempt.outcome_digest)
+                  OR (NEW.state IN ('retry', 'uncertain', 'failed')
+                      AND attempt.state = NEW.state))
+         )
+         BEGIN SELECT RAISE(ABORT, 'provider delivery state mismatch'); END;
+         CREATE TRIGGER agent_ownership_insert_fence
+         BEFORE INSERT ON agent_ownership
+         WHEN NOT EXISTS (
+           SELECT 1 FROM provider_deliveries delivery
+           JOIN outbox wake ON wake.wake_id = delivery.wake_id
+           JOIN protected_objects profile
+             ON profile.object_ref = NEW.launch_profile_object_ref
+           WHERE delivery.delivery_id = NEW.delivery_id
+             AND delivery.state = 'delivered'
+             AND wake.work_item_id = NEW.work_item_id
+             AND wake.work_generation = NEW.work_generation
+             AND wake.owner_generation = NEW.owner_generation
+             AND profile.work_item_id = NEW.work_item_id
+             AND profile.kind = 'launch_profile'
+             AND profile.profile_ref = wake.profile_ref
+             AND profile.content_digest = wake.payload_digest
+             AND (NEW.state NOT IN ('acknowledged', 'returned') OR EXISTS (
+               SELECT 1 FROM protected_objects receipt
+               WHERE receipt.object_ref = NEW.context_receipt_object_ref
+                 AND receipt.work_item_id = NEW.work_item_id
+                 AND receipt.kind = 'agent_receipt'
+                 AND receipt.content_digest = NEW.context_receipt_digest
+             ))
+         )
+         BEGIN SELECT RAISE(ABORT, 'agent ownership authority mismatch'); END;
+         CREATE TRIGGER agent_ownership_identity_immutable
+         BEFORE UPDATE OF ownership_id, work_item_id, work_generation, owner_generation,
+                          delivery_id, launch_profile_object_ref, created_at ON agent_ownership
+         BEGIN SELECT RAISE(ABORT, 'agent ownership identity is immutable'); END;
+         CREATE TRIGGER agent_ownership_no_delete
+         BEFORE DELETE ON agent_ownership
+         BEGIN SELECT RAISE(ABORT, 'agent ownership cannot be deleted'); END;
+         CREATE TRIGGER agent_ownership_context_fence
+         BEFORE UPDATE OF state, context_receipt_digest, context_receipt_object_ref,
+                          acknowledged_at, returned_at ON agent_ownership
+         WHEN NEW.state IN ('acknowledged', 'returned') AND NOT EXISTS (
+           SELECT 1 FROM protected_objects receipt
+           WHERE receipt.object_ref = NEW.context_receipt_object_ref
+             AND receipt.work_item_id = NEW.work_item_id
+             AND receipt.kind = 'agent_receipt'
+             AND receipt.content_digest = NEW.context_receipt_digest
+         )
+         BEGIN SELECT RAISE(ABORT, 'agent ownership receipt mismatch'); END;
+         CREATE TRIGGER agent_ownership_state_fence
+         BEFORE UPDATE OF state ON agent_ownership
+         WHEN (OLD.state = 'pending' AND NEW.state NOT IN ('pending', 'acknowledged',
+                                                           'uncertain', 'failed'))
+            OR (OLD.state = 'acknowledged' AND NEW.state NOT IN ('acknowledged', 'returned'))
+            OR (OLD.state = 'uncertain'
+                AND NEW.state NOT IN ('uncertain', 'acknowledged', 'failed'))
+            OR (OLD.state IN ('returned', 'failed') AND NEW.state != OLD.state)
+         BEGIN SELECT RAISE(ABORT, 'agent ownership transition is not monotonic'); END;
+         CREATE TRIGGER agent_ownership_receipt_immutable
+         BEFORE UPDATE OF context_receipt_object_ref, context_receipt_digest,
+                          acknowledged_at ON agent_ownership
+         WHEN OLD.state IN ('acknowledged', 'returned')
+           AND (OLD.context_receipt_object_ref IS NOT NEW.context_receipt_object_ref
+                OR OLD.context_receipt_digest IS NOT NEW.context_receipt_digest
+                OR OLD.acknowledged_at IS NOT NEW.acknowledged_at)
+         BEGIN SELECT RAISE(ABORT, 'agent ownership receipt is immutable'); END;
+         CREATE TRIGGER outbox_acknowledged_fence
+         BEFORE UPDATE OF state ON outbox
+         WHEN NEW.state = 'acknowledged' AND NOT EXISTS (
+           SELECT 1 FROM agent_ownership ownership
+           WHERE ownership.delivery_id = NEW.provider_delivery_id
+             AND ownership.state IN ('acknowledged', 'returned')
+             AND ownership.work_item_id = NEW.work_item_id
+         )
+         BEGIN SELECT RAISE(ABORT, 'wake acknowledgement lacks agent ownership'); END;
+         CREATE TRIGGER outbox_acknowledged_insert_fence
+         BEFORE INSERT ON outbox WHEN NEW.state = 'acknowledged'
+         BEGIN SELECT RAISE(ABORT, 'wake cannot be created acknowledged'); END;
+         CREATE TRIGGER wake_attempt_acknowledged_insert_fence
+         BEFORE INSERT ON wake_attempts WHEN NEW.state = 'acknowledged'
+         BEGIN SELECT RAISE(ABORT, 'wake attempt cannot be created acknowledged'); END;
+         CREATE TRIGGER wake_attempt_acknowledged_update_fence
+         BEFORE UPDATE OF state ON wake_attempts
+         WHEN NEW.state = 'acknowledged' AND NOT EXISTS (
+           SELECT 1 FROM provider_deliveries delivery
+           JOIN agent_ownership ownership ON ownership.delivery_id = delivery.delivery_id
+           WHERE delivery.wake_id = NEW.wake_id AND delivery.attempt = NEW.attempt
+             AND delivery.state = 'delivered'
+             AND ownership.state IN ('acknowledged', 'returned')
+         )
+         BEGIN SELECT RAISE(ABORT, 'wake attempt acknowledgement lacks agent ownership'); END;
+         PRAGMA user_version = 5;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -424,6 +747,401 @@ fn migrate_v3_to_v4(connection: &mut Connection) -> WorkLedgerResult<()> {
     Ok(())
 }
 
+/// Add immutable protected objects and split provider delivery from resumed
+/// agent ownership. Historical v4 `acknowledged` rows remain byte-for-byte
+/// representable; new provider acceptance uses `delivered` and is fenced by an
+/// exact delivery row and receipt object.
+#[allow(clippy::too_many_lines)] // One audited transaction owns the cyclic FK rebuild.
+fn migrate_v4_to_v5(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    transaction.execute_batch(
+        "PRAGMA defer_foreign_keys = ON;
+         ALTER TABLE outbox RENAME TO outbox_v4;
+         ALTER TABLE wake_attempts RENAME TO wake_attempts_v4;
+         ALTER TABLE wake_claim_epochs RENAME TO wake_claim_epochs_v4;
+         CREATE TABLE protected_objects (
+           object_ref TEXT PRIMARY KEY
+             CHECK(length(object_ref) = 67 AND substr(object_ref, 1, 3) = 'po_'
+                   AND substr(object_ref, 4) NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           kind TEXT NOT NULL CHECK(kind IN ('launch_profile', 'provider_request',
+                                             'provider_receipt', 'agent_receipt')),
+           profile_ref TEXT,
+           storage_name TEXT NOT NULL UNIQUE
+             CHECK(length(storage_name) = 76
+                   AND substr(storage_name, 1, 7) = 'object-'
+                   AND substr(storage_name, 8, 64) NOT GLOB '*[^0-9a-f]*'
+                   AND substr(storage_name, 72, 5) = '.blob'),
+           content_digest TEXT NOT NULL
+             CHECK(length(content_digest) = 64
+                   AND content_digest NOT GLOB '*[^0-9a-f]*'),
+           byte_length INTEGER NOT NULL CHECK(byte_length >= 0 AND byte_length <= 1048576),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           CHECK((kind = 'launch_profile' AND profile_ref IS NOT NULL
+                  AND length(profile_ref) = 78
+                  AND substr(profile_ref, 1, 14) = 'opaque:sha256:'
+                  AND substr(profile_ref, 15) NOT GLOB '*[^0-9a-f]*')
+                 OR (kind != 'launch_profile' AND profile_ref IS NULL)),
+           UNIQUE(work_item_id, profile_ref)
+         );
+         CREATE TABLE activation_epochs (
+           activation_id TEXT PRIMARY KEY
+             CHECK(length(activation_id) = 67 AND substr(activation_id, 1, 3) = 'ae_'
+                   AND substr(activation_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           work_generation INTEGER NOT NULL CHECK(work_generation > 0),
+           owner_generation INTEGER NOT NULL CHECK(owner_generation > 0),
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           owner_ref TEXT NOT NULL CHECK(length(owner_ref) BETWEEN 65 AND 128),
+           state TEXT NOT NULL CHECK(state IN ('active', 'released', 'superseded')),
+           acquired_at TEXT NOT NULL CHECK(length(acquired_at) >= 20),
+           released_at TEXT,
+           CHECK((state = 'active' AND released_at IS NULL)
+                 OR (state != 'active' AND released_at IS NOT NULL)),
+           UNIQUE(work_item_id, work_generation, owner_generation, epoch)
+         );
+         CREATE TABLE outbox (
+           wake_id TEXT PRIMARY KEY,
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           work_generation INTEGER NOT NULL,
+           owner_generation INTEGER NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'delivered',
+                                               'acknowledged', 'uncertain', 'failed')),
+           route_ref TEXT NOT NULL,
+           profile_ref TEXT,
+           payload_digest TEXT NOT NULL,
+           transport_receipt_digest TEXT,
+           provider_delivery_id TEXT UNIQUE
+             REFERENCES provider_deliveries(delivery_id) DEFERRABLE INITIALLY DEFERRED,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           acknowledged_at TEXT,
+           CHECK(state NOT IN ('delivered', 'acknowledged')
+                 OR (provider_delivery_id IS NOT NULL
+                     AND profile_ref IS NOT NULL AND length(profile_ref) = 78
+                     AND substr(profile_ref, 1, 14) = 'opaque:sha256:'
+                     AND substr(profile_ref, 15) NOT GLOB '*[^0-9a-f]*'
+                     AND transport_receipt_digest IS NOT NULL
+                     AND length(transport_receipt_digest) = 64
+                     AND transport_receipt_digest NOT GLOB '*[^0-9a-f]*'
+                     AND ((state = 'delivered' AND acknowledged_at IS NULL)
+                          OR (state = 'acknowledged' AND acknowledged_at IS NOT NULL))))
+         );
+         CREATE TABLE wake_attempts (
+           wake_id TEXT NOT NULL REFERENCES outbox(wake_id) ON DELETE RESTRICT,
+           attempt INTEGER NOT NULL CHECK(attempt > 0),
+           state TEXT NOT NULL CHECK(state IN ('claimed', 'delivered', 'acknowledged',
+                                               'retry', 'uncertain', 'failed')),
+           adapter_id TEXT NOT NULL,
+           idempotent INTEGER NOT NULL CHECK(idempotent IN (0, 1)),
+           outcome_digest TEXT,
+           started_at TEXT NOT NULL,
+           finished_at TEXT,
+           CHECK(state != 'delivered'
+                 OR (outcome_digest IS NOT NULL AND length(outcome_digest) = 64
+                     AND outcome_digest NOT GLOB '*[^0-9a-f]*'
+                     AND finished_at IS NOT NULL)),
+           PRIMARY KEY(wake_id, attempt)
+         );
+         CREATE TABLE wake_claim_epochs (
+           wake_id TEXT NOT NULL,
+           attempt INTEGER NOT NULL,
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           owner_ref TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK(kind IN ('claim', 'recovery')),
+           acquired_at TEXT NOT NULL,
+           PRIMARY KEY(wake_id, attempt, epoch),
+           FOREIGN KEY(wake_id, attempt) REFERENCES wake_attempts(wake_id, attempt)
+             ON DELETE RESTRICT
+         );
+         CREATE TABLE provider_deliveries (
+           delivery_id TEXT PRIMARY KEY
+             CHECK(length(delivery_id) = 67 AND substr(delivery_id, 1, 3) = 'pd_'
+                   AND substr(delivery_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           wake_id TEXT NOT NULL,
+           attempt INTEGER NOT NULL CHECK(attempt > 0),
+           activation_id TEXT NOT NULL REFERENCES activation_epochs(activation_id) ON DELETE RESTRICT,
+           provider_id TEXT NOT NULL CHECK(length(provider_id) BETWEEN 1 AND 512),
+           adapter_id TEXT NOT NULL CHECK(length(adapter_id) BETWEEN 1 AND 512),
+           idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key) BETWEEN 1 AND 512),
+           request_object_ref TEXT NOT NULL REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           receipt_object_ref TEXT REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           state TEXT NOT NULL CHECK(state IN ('prepared', 'launched', 'delivered',
+                                               'retry', 'uncertain', 'failed')),
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           updated_at TEXT NOT NULL CHECK(length(updated_at) >= 20),
+           delivered_at TEXT,
+           CHECK((state = 'delivered' AND receipt_object_ref IS NOT NULL
+                  AND delivered_at IS NOT NULL)
+                 OR (state != 'delivered' AND delivered_at IS NULL)),
+           UNIQUE(wake_id, attempt),
+           FOREIGN KEY(wake_id, attempt) REFERENCES wake_attempts(wake_id, attempt)
+             ON DELETE RESTRICT
+         );
+         CREATE TABLE agent_ownership (
+           ownership_id TEXT PRIMARY KEY
+             CHECK(length(ownership_id) = 67 AND substr(ownership_id, 1, 3) = 'ao_'
+                   AND substr(ownership_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           work_generation INTEGER NOT NULL CHECK(work_generation > 0),
+           owner_generation INTEGER NOT NULL CHECK(owner_generation > 0),
+           delivery_id TEXT NOT NULL UNIQUE REFERENCES provider_deliveries(delivery_id) ON DELETE RESTRICT,
+           launch_profile_object_ref TEXT NOT NULL REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           context_receipt_object_ref TEXT REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           state TEXT NOT NULL CHECK(state IN ('pending', 'acknowledged', 'returned',
+                                               'uncertain', 'failed')),
+           context_receipt_digest TEXT,
+           created_at TEXT NOT NULL CHECK(length(created_at) >= 20),
+           updated_at TEXT NOT NULL CHECK(length(updated_at) >= 20),
+           acknowledged_at TEXT,
+           returned_at TEXT,
+           CHECK((state IN ('acknowledged', 'returned')
+                  AND context_receipt_digest IS NOT NULL
+                  AND length(context_receipt_digest) = 64
+                  AND context_receipt_digest NOT GLOB '*[^0-9a-f]*'
+                  AND context_receipt_object_ref IS NOT NULL
+                  AND acknowledged_at IS NOT NULL)
+                 OR (state NOT IN ('acknowledged', 'returned')
+                     AND context_receipt_digest IS NULL
+                     AND context_receipt_object_ref IS NULL
+                     AND acknowledged_at IS NULL)),
+           CHECK((state = 'returned' AND returned_at IS NOT NULL)
+                 OR (state != 'returned' AND returned_at IS NULL)),
+           UNIQUE(work_item_id, work_generation, owner_generation)
+         );
+         INSERT INTO outbox
+           (wake_id, work_item_id, work_generation, owner_generation, state,
+            route_ref, profile_ref, payload_digest, transport_receipt_digest,
+            provider_delivery_id, created_at, updated_at, acknowledged_at)
+         SELECT wake_id, work_item_id, work_generation, owner_generation,
+                CASE WHEN state = 'acknowledged' THEN 'uncertain' ELSE state END,
+                route_ref, NULL, payload_digest, transport_receipt_digest,
+                NULL, created_at, updated_at, acknowledged_at
+           FROM outbox_v4;
+         INSERT INTO wake_attempts
+           (wake_id, attempt, state, adapter_id, idempotent, outcome_digest,
+            started_at, finished_at)
+         SELECT wake_id, attempt,
+                CASE WHEN state = 'acknowledged' THEN 'uncertain' ELSE state END,
+                adapter_id, idempotent, outcome_digest,
+                started_at, finished_at FROM wake_attempts_v4;
+         INSERT INTO wake_claim_epochs
+           (wake_id, attempt, epoch, owner_ref, kind, acquired_at)
+         SELECT wake_id, attempt, epoch, owner_ref, kind, acquired_at
+           FROM wake_claim_epochs_v4;
+         DROP TABLE wake_claim_epochs_v4;
+         DROP TABLE wake_attempts_v4;
+         DROP TABLE outbox_v4;
+         CREATE INDEX outbox_delivery ON outbox(state, created_at, wake_id);
+         CREATE INDEX wake_attempts_recovery ON wake_attempts(state, started_at, wake_id);
+         CREATE INDEX wake_claim_epoch_owner ON wake_claim_epochs(owner_ref, epoch);
+         CREATE INDEX protected_objects_work_kind
+           ON protected_objects(work_item_id, kind, created_at);
+         CREATE TRIGGER protected_object_capacity
+         BEFORE INSERT ON protected_objects
+         WHEN (SELECT COUNT(*) FROM protected_objects) >= 4096
+           OR (SELECT COALESCE(SUM(byte_length), 0) FROM protected_objects)
+                + NEW.byte_length > 16777216
+         BEGIN SELECT RAISE(ABORT, 'protected object store capacity exceeded'); END;
+         CREATE TRIGGER protected_object_immutable
+         BEFORE UPDATE ON protected_objects
+         BEGIN SELECT RAISE(ABORT, 'protected object metadata is immutable'); END;
+         CREATE TRIGGER protected_object_no_delete
+         BEFORE DELETE ON protected_objects
+         BEGIN SELECT RAISE(ABORT, 'protected objects cannot be deleted'); END;
+         CREATE INDEX activation_epochs_active
+           ON activation_epochs(state, acquired_at, work_item_id);
+         CREATE UNIQUE INDEX activation_epochs_one_active
+           ON activation_epochs(work_item_id) WHERE state = 'active';
+         CREATE TRIGGER activation_epoch_identity_immutable
+         BEFORE UPDATE OF activation_id, work_item_id, work_generation, owner_generation, epoch,
+                          owner_ref, acquired_at ON activation_epochs
+         BEGIN SELECT RAISE(ABORT, 'activation epoch identity is immutable'); END;
+         CREATE TRIGGER activation_epoch_no_delete
+         BEFORE DELETE ON activation_epochs
+         BEGIN SELECT RAISE(ABORT, 'activation epochs cannot be deleted'); END;
+         CREATE TRIGGER activation_epoch_release_fence
+         BEFORE UPDATE OF state, released_at ON activation_epochs
+         WHEN (OLD.state = 'active' AND NEW.state = 'active'
+               AND OLD.released_at IS NOT NEW.released_at)
+           OR (OLD.state != 'active'
+               AND (OLD.state != NEW.state OR OLD.released_at IS NOT NEW.released_at))
+           OR (OLD.state != NEW.state
+               AND (OLD.state != 'active' OR NEW.state NOT IN ('released', 'superseded')))
+           OR (OLD.state = 'active' AND NEW.state != 'active' AND EXISTS (
+               SELECT 1 FROM provider_deliveries delivery
+               WHERE delivery.activation_id = OLD.activation_id
+                 AND delivery.state IN ('prepared', 'launched')
+           ))
+         BEGIN SELECT RAISE(ABORT, 'activation epoch transition is unsafe'); END;
+         CREATE INDEX provider_deliveries_state
+           ON provider_deliveries(state, updated_at, wake_id);
+         CREATE INDEX agent_ownership_state
+           ON agent_ownership(state, updated_at, work_item_id);
+         CREATE TRIGGER provider_delivery_insert_fence
+         BEFORE INSERT ON provider_deliveries
+         WHEN NOT EXISTS (
+           SELECT 1 FROM wake_attempts attempt
+           JOIN outbox wake ON wake.wake_id = attempt.wake_id
+           JOIN activation_epochs activation
+             ON activation.activation_id = NEW.activation_id
+           WHERE attempt.wake_id = NEW.wake_id AND attempt.attempt = NEW.attempt
+             AND attempt.adapter_id = NEW.adapter_id
+             AND activation.state = 'active'
+             AND activation.work_item_id = wake.work_item_id
+             AND activation.work_generation = wake.work_generation
+             AND activation.owner_generation = wake.owner_generation
+         )
+         BEGIN SELECT RAISE(ABORT, 'provider delivery authority mismatch'); END;
+         CREATE TRIGGER provider_delivery_identity_immutable
+         BEFORE UPDATE OF delivery_id, wake_id, attempt, activation_id, provider_id, adapter_id,
+                          idempotency_key, request_object_ref ON provider_deliveries
+         BEGIN SELECT RAISE(ABORT, 'provider delivery identity is immutable'); END;
+         CREATE TRIGGER provider_delivery_no_delete
+         BEFORE DELETE ON provider_deliveries
+         BEGIN SELECT RAISE(ABORT, 'provider deliveries cannot be deleted'); END;
+         CREATE TRIGGER provider_delivery_state_fence_insert
+         BEFORE INSERT ON provider_deliveries
+         WHEN NOT EXISTS (
+           SELECT 1 FROM wake_attempts attempt
+           JOIN outbox wake ON wake.wake_id = attempt.wake_id
+           JOIN protected_objects request ON request.object_ref = NEW.request_object_ref
+           JOIN activation_epochs activation ON activation.activation_id = NEW.activation_id
+           LEFT JOIN protected_objects receipt ON receipt.object_ref = NEW.receipt_object_ref
+           WHERE attempt.wake_id = NEW.wake_id AND attempt.attempt = NEW.attempt
+             AND attempt.adapter_id = NEW.adapter_id
+             AND request.kind = 'provider_request'
+             AND request.work_item_id = wake.work_item_id
+             AND activation.work_item_id = wake.work_item_id
+             AND activation.work_generation = wake.work_generation
+             AND activation.owner_generation = wake.owner_generation
+             AND ((NEW.state IN ('prepared', 'launched') AND activation.state = 'active'
+                   AND attempt.state = 'claimed')
+                  OR (NEW.state = 'delivered' AND attempt.state = 'delivered'
+                      AND receipt.kind = 'provider_receipt'
+                      AND receipt.work_item_id = wake.work_item_id
+                      AND receipt.content_digest = attempt.outcome_digest)
+                  OR (NEW.state IN ('retry', 'uncertain', 'failed')
+                      AND attempt.state = NEW.state))
+         )
+         BEGIN SELECT RAISE(ABORT, 'provider delivery state mismatch'); END;
+         CREATE TRIGGER provider_delivery_state_fence_update
+         BEFORE UPDATE OF state, receipt_object_ref, delivered_at ON provider_deliveries
+         WHEN NOT EXISTS (
+           SELECT 1 FROM wake_attempts attempt
+           JOIN outbox wake ON wake.wake_id = attempt.wake_id
+           JOIN protected_objects request ON request.object_ref = NEW.request_object_ref
+           JOIN activation_epochs activation ON activation.activation_id = NEW.activation_id
+           LEFT JOIN protected_objects receipt ON receipt.object_ref = NEW.receipt_object_ref
+           WHERE attempt.wake_id = NEW.wake_id AND attempt.attempt = NEW.attempt
+             AND attempt.adapter_id = NEW.adapter_id
+             AND request.kind = 'provider_request'
+             AND request.work_item_id = wake.work_item_id
+             AND activation.work_item_id = wake.work_item_id
+             AND activation.work_generation = wake.work_generation
+             AND activation.owner_generation = wake.owner_generation
+             AND ((NEW.state IN ('prepared', 'launched') AND activation.state = 'active'
+                   AND attempt.state = 'claimed')
+                  OR (NEW.state = 'delivered' AND attempt.state = 'delivered'
+                      AND receipt.kind = 'provider_receipt'
+                      AND receipt.work_item_id = wake.work_item_id
+                      AND receipt.content_digest = attempt.outcome_digest)
+                  OR (NEW.state IN ('retry', 'uncertain', 'failed')
+                      AND attempt.state = NEW.state))
+         )
+         BEGIN SELECT RAISE(ABORT, 'provider delivery state mismatch'); END;
+         CREATE TRIGGER agent_ownership_insert_fence
+         BEFORE INSERT ON agent_ownership
+         WHEN NOT EXISTS (
+           SELECT 1 FROM provider_deliveries delivery
+           JOIN outbox wake ON wake.wake_id = delivery.wake_id
+           JOIN protected_objects profile
+             ON profile.object_ref = NEW.launch_profile_object_ref
+           WHERE delivery.delivery_id = NEW.delivery_id
+             AND delivery.state = 'delivered'
+             AND wake.work_item_id = NEW.work_item_id
+             AND wake.work_generation = NEW.work_generation
+             AND wake.owner_generation = NEW.owner_generation
+             AND profile.work_item_id = NEW.work_item_id
+             AND profile.kind = 'launch_profile'
+             AND profile.profile_ref = wake.profile_ref
+             AND profile.content_digest = wake.payload_digest
+             AND (NEW.state NOT IN ('acknowledged', 'returned') OR EXISTS (
+               SELECT 1 FROM protected_objects receipt
+               WHERE receipt.object_ref = NEW.context_receipt_object_ref
+                 AND receipt.work_item_id = NEW.work_item_id
+                 AND receipt.kind = 'agent_receipt'
+                 AND receipt.content_digest = NEW.context_receipt_digest
+             ))
+         )
+         BEGIN SELECT RAISE(ABORT, 'agent ownership authority mismatch'); END;
+         CREATE TRIGGER agent_ownership_identity_immutable
+         BEFORE UPDATE OF ownership_id, work_item_id, work_generation, owner_generation,
+                          delivery_id, launch_profile_object_ref, created_at ON agent_ownership
+         BEGIN SELECT RAISE(ABORT, 'agent ownership identity is immutable'); END;
+         CREATE TRIGGER agent_ownership_no_delete
+         BEFORE DELETE ON agent_ownership
+         BEGIN SELECT RAISE(ABORT, 'agent ownership cannot be deleted'); END;
+         CREATE TRIGGER agent_ownership_context_fence
+         BEFORE UPDATE OF state, context_receipt_digest, context_receipt_object_ref,
+                          acknowledged_at, returned_at ON agent_ownership
+         WHEN NEW.state IN ('acknowledged', 'returned') AND NOT EXISTS (
+           SELECT 1 FROM protected_objects receipt
+           WHERE receipt.object_ref = NEW.context_receipt_object_ref
+             AND receipt.work_item_id = NEW.work_item_id
+             AND receipt.kind = 'agent_receipt'
+             AND receipt.content_digest = NEW.context_receipt_digest
+         )
+         BEGIN SELECT RAISE(ABORT, 'agent ownership receipt mismatch'); END;
+         CREATE TRIGGER agent_ownership_state_fence
+         BEFORE UPDATE OF state ON agent_ownership
+         WHEN (OLD.state = 'pending' AND NEW.state NOT IN ('pending', 'acknowledged',
+                                                           'uncertain', 'failed'))
+            OR (OLD.state = 'acknowledged' AND NEW.state NOT IN ('acknowledged', 'returned'))
+            OR (OLD.state = 'uncertain'
+                AND NEW.state NOT IN ('uncertain', 'acknowledged', 'failed'))
+            OR (OLD.state IN ('returned', 'failed') AND NEW.state != OLD.state)
+         BEGIN SELECT RAISE(ABORT, 'agent ownership transition is not monotonic'); END;
+         CREATE TRIGGER agent_ownership_receipt_immutable
+         BEFORE UPDATE OF context_receipt_object_ref, context_receipt_digest,
+                          acknowledged_at ON agent_ownership
+         WHEN OLD.state IN ('acknowledged', 'returned')
+           AND (OLD.context_receipt_object_ref IS NOT NEW.context_receipt_object_ref
+                OR OLD.context_receipt_digest IS NOT NEW.context_receipt_digest
+                OR OLD.acknowledged_at IS NOT NEW.acknowledged_at)
+         BEGIN SELECT RAISE(ABORT, 'agent ownership receipt is immutable'); END;
+         CREATE TRIGGER outbox_acknowledged_fence
+         BEFORE UPDATE OF state ON outbox
+         WHEN NEW.state = 'acknowledged' AND NOT EXISTS (
+           SELECT 1 FROM agent_ownership ownership
+           WHERE ownership.delivery_id = NEW.provider_delivery_id
+             AND ownership.state IN ('acknowledged', 'returned')
+             AND ownership.work_item_id = NEW.work_item_id
+         )
+         BEGIN SELECT RAISE(ABORT, 'wake acknowledgement lacks agent ownership'); END;
+         CREATE TRIGGER outbox_acknowledged_insert_fence
+         BEFORE INSERT ON outbox WHEN NEW.state = 'acknowledged'
+         BEGIN SELECT RAISE(ABORT, 'wake cannot be created acknowledged'); END;
+         CREATE TRIGGER wake_attempt_acknowledged_insert_fence
+         BEFORE INSERT ON wake_attempts WHEN NEW.state = 'acknowledged'
+         BEGIN SELECT RAISE(ABORT, 'wake attempt cannot be created acknowledged'); END;
+         CREATE TRIGGER wake_attempt_acknowledged_update_fence
+         BEFORE UPDATE OF state ON wake_attempts
+         WHEN NEW.state = 'acknowledged' AND NOT EXISTS (
+           SELECT 1 FROM provider_deliveries delivery
+           JOIN agent_ownership ownership ON ownership.delivery_id = delivery.delivery_id
+           WHERE delivery.wake_id = NEW.wake_id AND delivery.attempt = NEW.attempt
+             AND delivery.state = 'delivered'
+             AND ownership.state IN ('acknowledged', 'returned')
+         )
+         BEGIN SELECT RAISE(ABORT, 'wake attempt acknowledgement lacks agent ownership'); END;
+         PRAGMA user_version = 5;",
+    )?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 pub(super) fn verify_supported_schema(connection: &Connection) -> WorkLedgerResult<()> {
     let version = schema_version(connection)?;
     if version != SCHEMA_VERSION {
@@ -443,7 +1161,134 @@ pub(super) fn verify_integrity(connection: &Connection) -> WorkLedgerResult<Stri
             "integrity check returned {verdict}"
         )));
     }
+    validate_relational_integrity(connection)?;
     Ok(verdict)
+}
+
+fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()> {
+    let foreign_key_violations: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_violations != 0 {
+        return Err(WorkLedgerError::Refused(
+            "work ledger contains foreign-key violations".to_owned(),
+        ));
+    }
+    if schema_version(connection)? < 5 {
+        return Ok(());
+    }
+    let invalid_object_names: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM protected_objects
+          WHERE storage_name != 'object-' || substr(object_ref, 4) || '.blob'",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_object_names != 0 {
+        return Err(WorkLedgerError::Refused(
+            "protected object filename is not derived from its identity".to_owned(),
+        ));
+    }
+    let invalid_deliveries: i64 = connection.query_row(
+        "SELECT COUNT(*)
+           FROM outbox o
+           LEFT JOIN provider_deliveries d ON d.delivery_id = o.provider_delivery_id
+           LEFT JOIN protected_objects receipt ON receipt.object_ref = d.receipt_object_ref
+           LEFT JOIN protected_objects profile
+             ON profile.work_item_id = o.work_item_id AND profile.profile_ref = o.profile_ref
+          WHERE o.state = 'delivered'
+            AND (d.delivery_id IS NULL OR d.wake_id != o.wake_id
+                 OR d.state != 'delivered' OR receipt.kind != 'provider_receipt'
+                 OR receipt.work_item_id != o.work_item_id
+                 OR profile.kind != 'launch_profile'
+                 OR profile.content_digest != o.payload_digest
+                 OR o.transport_receipt_digest != receipt.content_digest
+                 OR NOT EXISTS (
+                     SELECT 1 FROM wake_attempts attempt
+                      WHERE attempt.wake_id = o.wake_id
+                        AND attempt.attempt = d.attempt
+                        AND attempt.state = 'delivered'
+                        AND attempt.outcome_digest = receipt.content_digest
+                 ))",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_deliveries != 0 {
+        return Err(WorkLedgerError::Refused(
+            "delivered wake lacks its exact provider delivery and receipt".to_owned(),
+        ));
+    }
+    let invalid_provider_bindings: i64 = connection.query_row(
+        "SELECT COUNT(*)
+           FROM provider_deliveries delivery
+           JOIN outbox wake ON wake.wake_id = delivery.wake_id
+           JOIN protected_objects request
+             ON request.object_ref = delivery.request_object_ref
+           JOIN activation_epochs activation
+             ON activation.activation_id = delivery.activation_id
+          WHERE request.kind != 'provider_request'
+             OR request.work_item_id != wake.work_item_id
+             OR delivery.adapter_id != (
+                 SELECT attempt.adapter_id FROM wake_attempts attempt
+                  WHERE attempt.wake_id = delivery.wake_id
+                    AND attempt.attempt = delivery.attempt
+             )
+             OR (delivery.state IN ('prepared', 'launched')
+                 AND activation.state != 'active')
+             OR (delivery.state IN ('prepared', 'launched') AND NOT EXISTS (
+                 SELECT 1 FROM wake_attempts attempt
+                  WHERE attempt.wake_id = delivery.wake_id
+                    AND attempt.attempt = delivery.attempt
+                    AND attempt.state = 'claimed'
+             ))
+             OR (delivery.state IN ('retry', 'uncertain', 'failed') AND NOT EXISTS (
+                 SELECT 1 FROM wake_attempts attempt
+                  WHERE attempt.wake_id = delivery.wake_id
+                    AND attempt.attempt = delivery.attempt
+                    AND attempt.state = delivery.state
+             ))
+             OR activation.work_item_id != wake.work_item_id
+             OR activation.work_generation != wake.work_generation
+             OR activation.owner_generation != wake.owner_generation",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_provider_bindings != 0 {
+        return Err(WorkLedgerError::Refused(
+            "provider delivery is not bound to its exact work and request".to_owned(),
+        ));
+    }
+    let invalid_ownership: i64 = connection.query_row(
+        "SELECT COUNT(*)
+           FROM agent_ownership ownership
+           JOIN provider_deliveries delivery
+             ON delivery.delivery_id = ownership.delivery_id
+           JOIN outbox wake ON wake.wake_id = delivery.wake_id
+           JOIN protected_objects profile
+             ON profile.object_ref = ownership.launch_profile_object_ref
+           LEFT JOIN protected_objects context_receipt
+             ON context_receipt.object_ref = ownership.context_receipt_object_ref
+          WHERE delivery.state != 'delivered'
+             OR profile.kind != 'launch_profile'
+             OR profile.work_item_id != ownership.work_item_id
+             OR profile.profile_ref != wake.profile_ref
+             OR profile.content_digest != wake.payload_digest
+             OR wake.work_item_id != ownership.work_item_id
+             OR wake.work_generation != ownership.work_generation
+             OR wake.owner_generation != ownership.owner_generation
+             OR (ownership.state IN ('acknowledged', 'returned')
+                 AND (context_receipt.kind != 'agent_receipt'
+                      OR context_receipt.work_item_id != ownership.work_item_id
+                      OR context_receipt.content_digest != ownership.context_receipt_digest))",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_ownership != 0 {
+        return Err(WorkLedgerError::Refused(
+            "agent ownership is not bound to a delivered launch profile".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn synchronous_name(connection: &Connection) -> WorkLedgerResult<String> {
@@ -463,6 +1308,10 @@ pub(super) fn count(connection: &Connection, table: &str) -> WorkLedgerResult<u6
     let sql = match table {
         "work_items" => "SELECT COUNT(*) FROM work_items",
         "imports" => "SELECT COUNT(*) FROM imports",
+        "protected_objects" => "SELECT COUNT(*) FROM protected_objects",
+        "provider_deliveries" => "SELECT COUNT(*) FROM provider_deliveries",
+        "agent_ownership" => "SELECT COUNT(*) FROM agent_ownership",
+        "activation_epochs" => "SELECT COUNT(*) FROM activation_epochs",
         _ => {
             return Err(WorkLedgerError::Refused(
                 "unsupported count table".to_owned(),
