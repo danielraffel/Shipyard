@@ -904,8 +904,7 @@ impl ExecutionSupervisor {
         }
         Ok(match process_liveness(&receipt) {
             ProcessLiveness::Alive => WorkerObservation::Alive(receipt),
-            ProcessLiveness::Dead => WorkerObservation::Unknown,
-            ProcessLiveness::Unknown => WorkerObservation::Unknown,
+            ProcessLiveness::Dead | ProcessLiveness::Unknown => WorkerObservation::Unknown,
         })
     }
 
@@ -2464,6 +2463,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
     fn assert_termination_crash_recovers(
         action: TerminationAction,
         boundary: TerminationCrashBoundary,

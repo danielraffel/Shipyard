@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -227,7 +227,6 @@ impl TerminationStore {
         let _writer = crate::writer_domain_lease::acquire_for_protected_path(&path)?;
         let mut temp = tempfile::NamedTempFile::new_in(&self.dir)?;
         serde_json::to_writer_pretty(&mut temp, transaction).map_err(io::Error::other)?;
-        use std::io::Write;
         temp.write_all(b"\n")?;
         temp.as_file().sync_all()?;
         temp.persist(&path).map_err(|error| error.error)?;
