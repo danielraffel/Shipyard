@@ -1217,7 +1217,7 @@ import is intended. Import is idempotent, redacted, and fail-closed: it selects
 canonical fields and opaque digests from legacy stores, leaves those stores
 authoritative and untouched, and cannot schedule, wake, call a model, mutate
 GitHub, or project to Linear. Both activation and dispatch remain disabled.
-The future transactional wake API derives a deterministic wake ID from the
+The transactional wake API derives a deterministic wake ID from the
 complete work/owner generation and delivery fence; a caller-supplied identity
 that does not match that derivation is rejected before commit.
 The route must also resolve to a protected, integrity-valid record for the same
@@ -1231,6 +1231,12 @@ the same versioned lifecycle boundary and require an active protected adapter
 record with exact generation, revision, and implementation/configuration/
 capability digests. Imported records remain inert until both continuation outcomes exist
 and a legal typed transition records its audit event transactionally.
+The internal wake-consumer seam holds a host-local exclusive lease, records
+append-only ownership epochs, binds the protected launch-profile and provider
+identities, and durably claims and finalizes exact-array provider launches. No
+CLI, daemon, or schedule can activate it. Restart may reconcile an idempotent
+claim only after the prior live lease is gone; ambiguous non-idempotent delivery
+stays `uncertain` and is never blindly repeated.
 Use `shipyard work-ledger policy set` to plan a per-repository platform policy;
 apply requires the exact current revision. The primary platform is explicit
 (use macOS for Pulp, Forge, and Vellum), with a complete repeatable

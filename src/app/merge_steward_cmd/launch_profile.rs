@@ -77,6 +77,33 @@ pub(super) enum RecoveryPolicyV1 {
     FreshCheckpointOnly,
 }
 
+impl crate::work_ledger::FreshAgentLaunchProfile for LaunchProfileV1 {
+    fn provider_id(&self) -> &str {
+        &self.provider.provider
+    }
+
+    fn launch_argv(&self) -> &[String] {
+        &self.launch_argv
+    }
+
+    fn profile_digest(&self) -> crate::work_ledger::WorkLedgerResult<String> {
+        launch_profile_digest(self).map_err(|error| {
+            crate::work_ledger::WorkLedgerError::Refused(format!(
+                "launch profile is invalid: {}",
+                error.message()
+            ))
+        })
+    }
+
+    fn permits_fresh_agent(&self) -> bool {
+        matches!(
+            self.recovery_policy,
+            RecoveryPolicyV1::ExactSessionThenFreshCheckpoint
+                | RecoveryPolicyV1::FreshCheckpointOnly
+        )
+    }
+}
+
 pub(super) fn load_launch_profile(path: &Path) -> Result<LaunchProfileV1, CliFailure> {
     let metadata = fs::metadata(path)
         .map_err(|error| CliFailure::new(1, format!("read launch profile metadata: {error}")))?;
@@ -292,6 +319,22 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&profile).expect("encode")).expect("decode");
         assert_eq!(decoded.launch_argv, profile.launch_argv);
         assert_eq!(decoded.resume_argv, profile.resume_argv);
+    }
+
+    #[test]
+    fn wake_consumer_reads_the_exact_launch_array_without_translation() {
+        use crate::work_ledger::FreshAgentLaunchProfile;
+
+        let profile = profile();
+        assert_eq!(
+            FreshAgentLaunchProfile::launch_argv(&profile),
+            profile.launch_argv.as_slice()
+        );
+        assert_eq!(
+            FreshAgentLaunchProfile::profile_digest(&profile).expect("consumer digest"),
+            launch_profile_digest(&profile).expect("stored digest")
+        );
+        assert!(FreshAgentLaunchProfile::permits_fresh_agent(&profile));
     }
 
     #[test]

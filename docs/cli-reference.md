@@ -207,6 +207,11 @@ eligible continuation contract. Native route records keep terminal, agent, and
 provider axes separate and integrity-bound; missing provider provenance never
 means Direct and cannot dispatch. Native transitions are closed/typed and
 commit their deterministic event with any outbox wake.
+The schema also contains durable per-attempt wake delivery records. An internal
+consumer contract can claim and finalize one canonical wake around an exact
+argv-array provider call, reconcile idempotent restart claims, and retain
+non-idempotent ambiguity as `uncertain`. It has no CLI or daemon activation
+surface; it cannot run under the default-off policy.
 Dry-run is byte-stable and creates no database. Apply is idempotent and leaves
 every legacy record authoritative and untouched. Apply holds a bounded
 exclusive production-writer snapshot barrier from legacy scan through the

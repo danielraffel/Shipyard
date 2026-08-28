@@ -125,7 +125,7 @@ fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, Adap
             route_ref: opaque("subrouter route"),
         }),
         LaunchProfileRecord::new(
-            opaque("profile"),
+            OpaqueRef::derive("launch-profile", digest(b"profile").as_bytes()),
             3,
             1,
             Sha256Digest::of_bytes(b"binary"),
@@ -151,6 +151,7 @@ fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, Adap
     (route, agent_adapter)
 }
 
+mod dispatch;
 mod importer;
 mod lifecycle;
 mod persistence;

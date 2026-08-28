@@ -750,6 +750,18 @@ back the state transition.
 Wake identity is derived from the work ID, transitioned work generation, owner
 generation, protected route reference, and payload digest; callers cannot
 substitute an arbitrary retry identity without failing the transaction.
+Schema v3 adds a durable attempt record for each wake claim; schema v4 adds
+append-only consumer ownership epochs. The inert consumer holds one host-local
+exclusive lease across profile resolution, claim, provider invocation, and
+finalization, so another live consumer cannot masquerade as restart recovery.
+The claim binds the route's protected launch-profile reference and provider
+identity before invoking a provider and finalizes acknowledgement, retry,
+failure, or uncertainty afterward. It passes the exact launch-profile argv
+array without shell translation, reconciles only an explicitly idempotent
+claimed delivery after restart once the previous consumer lease is gone, and
+never retries an ambiguous non-idempotent delivery. Successful acknowledgement
+and transition to agent-owned repair are one transaction. This contract remains
+inaccessible to the CLI and daemon.
 `activation_enabled=false` and `dispatch_enabled=false` are invariant CLI
 outputs until later scheduler, adapter, and physical canary gates land.
 The adjacent `work-ledger policy` surface stores per-repository primary-platform

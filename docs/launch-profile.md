@@ -90,15 +90,22 @@ never projected to GitHub or Linear. Do not put credentials, environment values,
 raw prompts, or tokens in a profile. Use wrapper-owned credential lookup and
 opaque account identifiers instead.
 
-## Executor boundary
+## Inert executor boundary
 
-A future trusted executor may consume a profile only after revalidating the
-canonical work item and owner generations. Executor-specific types do not live
-in this schema. For example, HerdR owns conversion of `resume_argv` into its
-`AgentRestoreOverride`, including the official provider-session binding hash,
-generation/revision fence, command hash, and inert-shell refusal on mismatch.
-Other terminal runtimes can implement equivalent adapters without changing the
-persisted Shipyard contract.
+Shipyard now contains an internal, default-off wake-consumer contract. It
+selects the canonical outbox, durably claims a generation-fenced wake, passes
+the stored `launch_argv` array directly to a capability-matched provider
+adapter, and durably records acknowledgement, retry, failure, or uncertainty.
+It never joins argv through a shell. Restart reconciliation may inspect an
+idempotent claim; an unproven non-idempotent claim becomes `uncertain` and is
+never blindly relaunched. A successful acknowledgement advances the same
+canonical work item to agent-owned repair in the final transaction.
+
+This is an implementation and deterministic-test seam, not an enabled daemon
+feature. No CLI or schedule can set its internal activation policy. A future
+trusted route resolver and provider adapter may use it only after revalidating
+the canonical work item, route, profile digest, and owner generations.
+Executor-specific types still do not live in `LaunchProfileV1`.
 
 `wake_consumer_available` remains `false`. Persisting a launch profile does not
 transfer monitoring, authorize pausing, start a process, or make Linear an

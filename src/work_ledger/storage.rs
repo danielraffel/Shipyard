@@ -135,15 +135,24 @@ pub(super) fn protect_ledger_directory(_path: &Path) -> WorkLedgerResult<()> {
 
 #[allow(clippy::too_many_lines)] // One atomic v1 DDL transaction is easier to audit intact.
 pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
-    let version = schema_version(connection)?;
+    let mut version = schema_version(connection)?;
     if version > SCHEMA_VERSION {
         return Err(WorkLedgerError::UnsupportedSchema(version));
     }
-    if version == SCHEMA_VERSION {
+    if version == 1 {
+        migrate_v1_to_v2(connection)?;
+        version = 2;
+    }
+    if version == 2 {
+        migrate_v2_to_v3(connection)?;
+        version = 3;
+    }
+    if version == 3 {
+        migrate_v3_to_v4(connection)?;
         return Ok(());
     }
-    if version == 1 {
-        return migrate_v1_to_v2(connection);
+    if version == SCHEMA_VERSION {
+        return Ok(());
     }
     if version != 0 {
         return Err(WorkLedgerError::UnsupportedSchema(version));
@@ -246,6 +255,28 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
            updated_at TEXT NOT NULL,
            acknowledged_at TEXT
          );
+         CREATE TABLE wake_attempts (
+           wake_id TEXT NOT NULL REFERENCES outbox(wake_id) ON DELETE RESTRICT,
+           attempt INTEGER NOT NULL CHECK(attempt > 0),
+           state TEXT NOT NULL CHECK(state IN ('claimed', 'acknowledged', 'retry', 'uncertain', 'failed')),
+           adapter_id TEXT NOT NULL,
+           idempotent INTEGER NOT NULL CHECK(idempotent IN (0, 1)),
+           outcome_digest TEXT,
+           started_at TEXT NOT NULL,
+           finished_at TEXT,
+           PRIMARY KEY(wake_id, attempt)
+         );
+         CREATE TABLE wake_claim_epochs (
+           wake_id TEXT NOT NULL,
+           attempt INTEGER NOT NULL,
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           owner_ref TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK(kind IN ('claim', 'recovery')),
+           acquired_at TEXT NOT NULL,
+           PRIMARY KEY(wake_id, attempt, epoch),
+           FOREIGN KEY(wake_id, attempt) REFERENCES wake_attempts(wake_id, attempt)
+             ON DELETE RESTRICT
+         );
          CREATE TABLE imports (
            source_ref TEXT NOT NULL,
            content_digest TEXT NOT NULL,
@@ -265,7 +296,9 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
          );
          CREATE INDEX work_items_nonterminal ON work_items(phase, updated_at, id);
          CREATE INDEX outbox_delivery ON outbox(state, created_at, wake_id);
-         PRAGMA user_version = 2;",
+         CREATE INDEX wake_attempts_recovery ON wake_attempts(state, started_at, wake_id);
+         CREATE INDEX wake_claim_epoch_owner ON wake_claim_epochs(owner_ref, epoch);
+         PRAGMA user_version = 4;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -309,6 +342,74 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> WorkLedgerResult<()> {
            FROM adapter_registry_v1;
          DROP TABLE adapter_registry_v1;
          PRAGMA user_version = 2;",
+    )?;
+    let foreign_key_violation: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_violation != 0 {
+        return Err(WorkLedgerError::Refused(
+            "work ledger migration would violate foreign keys".to_owned(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Add the append-only delivery attempt fence without changing any v2 route or
+/// wake identity. Existing pending wakes remain pending; an old `claimed` wake
+/// is deliberately not guessed safe and will reconcile as uncertain unless its
+/// provider proves idempotent delivery.
+fn migrate_v2_to_v3(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    transaction.execute_batch(
+        "CREATE TABLE wake_attempts (
+           wake_id TEXT NOT NULL REFERENCES outbox(wake_id) ON DELETE RESTRICT,
+           attempt INTEGER NOT NULL CHECK(attempt > 0),
+           state TEXT NOT NULL CHECK(state IN ('claimed', 'acknowledged', 'retry', 'uncertain', 'failed')),
+           adapter_id TEXT NOT NULL,
+           idempotent INTEGER NOT NULL CHECK(idempotent IN (0, 1)),
+           outcome_digest TEXT,
+           started_at TEXT NOT NULL,
+           finished_at TEXT,
+           PRIMARY KEY(wake_id, attempt)
+         );
+         CREATE INDEX wake_attempts_recovery
+           ON wake_attempts(state, started_at, wake_id);
+         PRAGMA user_version = 3;",
+    )?;
+    let foreign_key_violation: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_violation != 0 {
+        return Err(WorkLedgerError::Refused(
+            "work ledger migration would violate foreign keys".to_owned(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Add append-only consumer ownership epochs. The host-local exclusive
+/// consumer lock proves liveness; these rows distinguish an original claim
+/// from a later crash-recovery owner and fence stale finalizers.
+fn migrate_v3_to_v4(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    transaction.execute_batch(
+        "CREATE TABLE wake_claim_epochs (
+           wake_id TEXT NOT NULL,
+           attempt INTEGER NOT NULL,
+           epoch INTEGER NOT NULL CHECK(epoch > 0),
+           owner_ref TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK(kind IN ('claim', 'recovery')),
+           acquired_at TEXT NOT NULL,
+           PRIMARY KEY(wake_id, attempt, epoch),
+           FOREIGN KEY(wake_id, attempt) REFERENCES wake_attempts(wake_id, attempt)
+             ON DELETE RESTRICT
+         );
+         CREATE INDEX wake_claim_epoch_owner ON wake_claim_epochs(owner_ref, epoch);
+         PRAGMA user_version = 4;",
     )?;
     let foreign_key_violation: i64 =
         transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {

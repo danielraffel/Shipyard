@@ -51,6 +51,8 @@ fn install_exact_v1_registry_schema(
     transaction
         .execute_batch(
             "DROP TABLE adapter_registry_v2;
+             DROP TABLE wake_claim_epochs;
+             DROP TABLE wake_attempts;
              PRAGMA user_version = 1;",
         )
         .expect("finish v1 fixture");
@@ -174,7 +176,7 @@ fn v1_registry_migrates_transactionally_and_accepts_exact_agent_binding() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate exact v1 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 2);
+    assert_eq!(schema_version(&connection).expect("schema version"), 4);
     let preserved: Vec<(String, String, String)> = {
         let mut statement = connection
             .prepare(
@@ -236,6 +238,70 @@ fn v1_registry_migrates_transactionally_and_accepts_exact_agent_binding() {
     migrated
         .register_route(&route)
         .expect("route can proceed after v1 migration");
+}
+
+#[test]
+fn v2_outbox_migrates_through_durable_attempts_and_claim_epochs() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("create current ledger");
+    let candidate = sample_candidate();
+    let work_id = candidate.work_id.clone();
+    ledger.import(&[candidate]).expect("work fixture");
+    let connection = ledger.connect_read_write().expect("connection");
+    connection
+        .execute_batch(
+            "DROP TABLE wake_claim_epochs;
+             DROP TABLE wake_attempts;
+             PRAGMA user_version = 2;",
+        )
+        .expect("exact v2 schema");
+    drop(connection);
+    drop(ledger);
+
+    let migrated = WorkLedger::open(temp.path()).expect("migrate v2 ledger");
+    let connection = migrated.connect_read_only().expect("inspect migration");
+    assert_eq!(schema_version(&connection).expect("schema version"), 4);
+    let attempt_table: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'wake_attempts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("attempt table");
+    assert_eq!(attempt_table, 1);
+    let preserved_work: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM work_items WHERE id = ?1",
+            [&work_id],
+            |row| row.get(0),
+        )
+        .expect("preserved work");
+    assert_eq!(preserved_work, 1);
+}
+
+#[test]
+fn v3_attempts_migrate_to_claim_epochs_without_rewriting_attempts() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("create current ledger");
+    let connection = ledger.connect_read_write().expect("connection");
+    connection
+        .execute_batch("DROP TABLE wake_claim_epochs; PRAGMA user_version = 3;")
+        .expect("exact v3 schema");
+    drop(connection);
+    drop(ledger);
+
+    let migrated = WorkLedger::open(temp.path()).expect("migrate v3 ledger");
+    let connection = migrated.connect_read_only().expect("inspect migration");
+    assert_eq!(schema_version(&connection).expect("schema version"), 4);
+    let claim_table: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'wake_claim_epochs'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("claim table");
+    assert_eq!(claim_table, 1);
 }
 
 #[test]
