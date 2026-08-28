@@ -148,34 +148,13 @@ impl WorkLedger {
         expected_digest: &str,
         bytes: &[u8],
     ) -> WorkLedgerResult<ProtectedObjectRecord> {
-        validate_digest("protected object digest", expected_digest)?;
-        if bytes.len() > MAX_PROTECTED_OBJECT_BYTES {
-            return Err(WorkLedgerError::Refused(
-                "protected object exceeds the byte limit".to_owned(),
-            ));
-        }
-        if digest(bytes) != expected_digest {
-            return Err(WorkLedgerError::Refused(
-                "protected object digest does not match its bytes".to_owned(),
-            ));
-        }
-        validate_profile_ref(kind, profile_ref)?;
-        let object_ref = derive_object_ref(
+        let (record, storage_name) = prepare_protected_object_record(
             work_item_id,
             kind,
             profile_ref,
             expected_digest,
-            bytes.len(),
-        );
-        let storage_name = storage_name(&object_ref)?;
-        let record = ProtectedObjectRecord {
-            object_ref: object_ref.clone(),
-            work_item_id: work_item_id.to_owned(),
-            kind: kind.as_str().to_owned(),
-            profile_ref: profile_ref.map(ToOwned::to_owned),
-            content_digest: expected_digest.to_owned(),
-            byte_length: bytes.len() as u64,
-        };
+            bytes,
+        )?;
         let parent = self
             .path
             .parent()
@@ -186,7 +165,7 @@ impl WorkLedger {
         configure_durable(&connection)?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
-        let existing = protected_object_record(&connection, &object_ref)?;
+        let existing = protected_object_record(&connection, &record.object_ref)?;
         if let Some(existing) = existing {
             if existing != record {
                 return Err(WorkLedgerError::Refused(
@@ -225,24 +204,7 @@ impl WorkLedger {
                 ));
             }
         }
-        let current_count: u64 =
-            connection.query_row("SELECT COUNT(*) FROM protected_objects", [], |row| {
-                row.get(0)
-            })?;
-        let current_bytes: u64 = connection.query_row(
-            "SELECT COALESCE(SUM(byte_length), 0) FROM protected_objects",
-            [],
-            |row| row.get(0),
-        )?;
-        if current_count >= MAX_PROTECTED_OBJECT_ROWS as u64
-            || current_bytes
-                .checked_add(record.byte_length)
-                .is_none_or(|total| total > MAX_PROTECTED_OBJECT_TOTAL_BYTES)
-        {
-            return Err(WorkLedgerError::Refused(
-                "protected object store exceeds its aggregate bound".to_owned(),
-            ));
-        }
+        ensure_protected_object_capacity(&connection, record.byte_length)?;
         write_object_to_directory(&directory, &storage_name, &record, bytes)?;
         verify_directory_binding(parent, &directory)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -270,9 +232,10 @@ impl WorkLedger {
                 "committed protected object bytes differ".to_owned(),
             ));
         }
-        let committed = protected_object_record(&connection, &object_ref)?.ok_or_else(|| {
-            WorkLedgerError::Refused("protected object was not visible after commit".to_owned())
-        })?;
+        let committed =
+            protected_object_record(&connection, &record.object_ref)?.ok_or_else(|| {
+                WorkLedgerError::Refused("protected object was not visible after commit".to_owned())
+            })?;
         self.verify_protected_object_storage(&connection)?;
         Ok(committed)
     }
@@ -296,6 +259,71 @@ impl WorkLedger {
         let bytes = read_object_file(parent, &storage_name, &record)?;
         Ok((record, bytes))
     }
+}
+
+fn prepare_protected_object_record(
+    work_item_id: &str,
+    kind: ProtectedObjectKind,
+    profile_ref: Option<&str>,
+    expected_digest: &str,
+    bytes: &[u8],
+) -> WorkLedgerResult<(ProtectedObjectRecord, String)> {
+    validate_digest("protected object digest", expected_digest)?;
+    if bytes.len() > MAX_PROTECTED_OBJECT_BYTES {
+        return Err(WorkLedgerError::Refused(
+            "protected object exceeds the byte limit".to_owned(),
+        ));
+    }
+    if digest(bytes) != expected_digest {
+        return Err(WorkLedgerError::Refused(
+            "protected object digest does not match its bytes".to_owned(),
+        ));
+    }
+    validate_profile_ref(kind, profile_ref)?;
+    let object_ref = derive_object_ref(
+        work_item_id,
+        kind,
+        profile_ref,
+        expected_digest,
+        bytes.len(),
+    );
+    let storage_name = storage_name(&object_ref)?;
+    Ok((
+        ProtectedObjectRecord {
+            object_ref,
+            work_item_id: work_item_id.to_owned(),
+            kind: kind.as_str().to_owned(),
+            profile_ref: profile_ref.map(ToOwned::to_owned),
+            content_digest: expected_digest.to_owned(),
+            byte_length: bytes.len() as u64,
+        },
+        storage_name,
+    ))
+}
+
+fn ensure_protected_object_capacity(
+    connection: &rusqlite::Connection,
+    added_bytes: u64,
+) -> WorkLedgerResult<()> {
+    let current_count: u64 =
+        connection.query_row("SELECT COUNT(*) FROM protected_objects", [], |row| {
+            row.get(0)
+        })?;
+    let current_bytes: u64 = connection.query_row(
+        "SELECT COALESCE(SUM(byte_length), 0) FROM protected_objects",
+        [],
+        |row| row.get(0),
+    )?;
+    if current_count >= MAX_PROTECTED_OBJECT_ROWS as u64
+        || current_bytes
+            .checked_add(added_bytes)
+            .is_none_or(|total| total > MAX_PROTECTED_OBJECT_TOTAL_BYTES)
+    {
+        return Err(WorkLedgerError::Refused(
+            "protected object store exceeds its aggregate bound".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_profile_ref(
@@ -539,6 +567,8 @@ fn read_object_from_directory(
 #[cfg(unix)]
 fn reconcile_pending_objects(directory: &std::fs::File) -> WorkLedgerResult<()> {
     use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     let entries = rustix::fs::Dir::read_from(directory).map_err(std::io::Error::from)?;
     for entry in entries {
         let entry = entry.map_err(std::io::Error::from)?;
@@ -558,7 +588,6 @@ fn reconcile_pending_objects(directory: &std::fs::File) -> WorkLedgerResult<()> 
             )
             .map_err(std::io::Error::from)?,
         );
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let metadata = file.metadata()?;
         if !metadata.is_file()
             || metadata.permissions().mode() & 0o777 != 0o600
@@ -657,7 +686,7 @@ fn write_object_to_directory(
         )
     );
     let opened = openat(
-        &directory,
+        directory,
         &pending_name,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
@@ -671,9 +700,9 @@ fn write_object_to_directory(
                 file.sync_all()?;
                 validate_object_file(&file, record)?;
                 match renameat_with(
-                    &directory,
+                    directory,
                     &pending_name,
-                    &directory,
+                    directory,
                     name,
                     RenameFlags::NOREPLACE,
                 ) {
