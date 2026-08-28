@@ -589,7 +589,7 @@ struct LedgerProfile {
 }
 
 impl FreshAgentLaunchProfile for LedgerProfile {
-    fn provider_id(&self) -> &str {
+    fn provider_id(&self) -> &'static str {
         "codex"
     }
 

@@ -2158,7 +2158,7 @@ impl From<PathMode> for RuntimeMode {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use clap::Parser;
 
@@ -2367,7 +2367,7 @@ mod tests {
             acknowledge.command,
             Command::WorkLedger {
                 command: WorkLedgerCommand::AcknowledgeContext { receipt, .. }
-            } if receipt == PathBuf::from("-")
+            } if receipt == Path::new("-")
         ));
 
         let return_challenge = Cli::try_parse_from([

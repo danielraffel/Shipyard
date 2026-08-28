@@ -430,6 +430,7 @@ fn v5_migrates_to_append_only_provider_delivery_observations() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn v4_acknowledged_delivery_migrates_losslessly_to_split_v5_schema() {
     let temp = TempDir::new().expect("temp");
     let ledger = WorkLedger::open(temp.path()).expect("create current ledger");
@@ -575,6 +576,7 @@ fn v4_acknowledged_delivery_migrates_losslessly_to_split_v5_schema() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn delivered_state_requires_exact_provider_receipt_and_work_binding() {
     let temp = TempDir::new().expect("temp");
     let ledger = WorkLedger::open(temp.path()).expect("ledger");

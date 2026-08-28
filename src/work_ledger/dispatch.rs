@@ -361,6 +361,7 @@ fn is_exact_git_sha(value: &str) -> bool {
 impl WorkLedger {
     /// Consume at most one canonical wake. Claimed wakes are reconciled before
     /// new pending work so a restart cannot strand an ambiguous launch.
+    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn consume_one_wake<R, A>(
         &self,
         policy: WakeConsumerPolicy,
@@ -391,7 +392,7 @@ impl WorkLedger {
                 profile.provider_id(),
                 &profile_ref,
                 &consumer,
-                b"fresh-agent recovery is not authorized by the launch profile".to_vec(),
+                b"fresh-agent recovery is not authorized by the launch profile",
             );
         }
         let Some(capability) = adapter.capability(profile.provider_id()) else {
@@ -401,7 +402,7 @@ impl WorkLedger {
                 profile.provider_id(),
                 &profile_ref,
                 &consumer,
-                b"provider adapter capability is unavailable".to_vec(),
+                b"provider adapter capability is unavailable",
             );
         };
         validate_token("provider adapter ID", &capability.adapter_id)?;
@@ -412,7 +413,7 @@ impl WorkLedger {
                 profile.provider_id(),
                 &profile_ref,
                 &consumer,
-                b"provider adapter lacks fresh-agent capability".to_vec(),
+                b"provider adapter lacks fresh-agent capability",
             );
         }
 
@@ -808,7 +809,7 @@ impl WorkLedger {
         provider_kind: &str,
         profile_ref: &str,
         consumer: &ConsumerLease,
-        evidence: Vec<u8>,
+        evidence: &[u8],
     ) -> WorkLedgerResult<WakeDeliveryResult> {
         validate_token("provider adapter ID", adapter_id)?;
         let capability = ProviderCapability {
@@ -818,7 +819,7 @@ impl WorkLedger {
         };
         let (fence, _, _) =
             self.claim_wake(wake, &capability, profile_ref, provider_kind, consumer)?;
-        self.finalize_without_delivery(&fence, &evidence)
+        self.finalize_without_delivery(&fence, evidence)
     }
 
     /// Return `(fence, recovered_claim, claim_idempotent)`. `recovered_claim`
@@ -885,7 +886,11 @@ impl WorkLedger {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::type_complexity
+    )]
     fn prepare_delivery(
         &self,
         mut fence: DeliveryFence,
@@ -1090,12 +1095,13 @@ impl WorkLedger {
         fence.activation_id = activation_id;
         fence.delivery_id = delivery_id;
         fence.request_object_ref = request_object.object_ref;
-        fence.adapter_id = capability.adapter_id.clone();
-        fence.provider_id = provider_id.to_owned();
+        fence.adapter_id.clone_from(&capability.adapter_id);
+        provider_id.clone_into(&mut fence.provider_id);
         fence.idempotency_key = idempotency_key;
         Ok(fence)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn finalize_wake(
         &self,
         fence: &DeliveryFence,

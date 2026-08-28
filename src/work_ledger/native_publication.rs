@@ -318,6 +318,7 @@ impl WorkLedger {
             .map_err(Into::into)
     }
 
+    #[allow(clippy::type_complexity)]
     fn ensure_adapter(&self, adapter: &AdapterBindingRecord) -> WorkLedgerResult<()> {
         let connection = self.connect_read_only()?;
         let existing: Option<(String, String, u64, u64, String, String, String, String)> =
@@ -378,6 +379,7 @@ impl WorkLedger {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn publication_is_exact(
         &self,
         request: &NativePublicationRequest,
@@ -703,7 +705,7 @@ mod tests {
     }
 
     impl FreshAgentLaunchProfile for TestProfile {
-        fn provider_id(&self) -> &str {
+        fn provider_id(&self) -> &'static str {
             "provider"
         }
 

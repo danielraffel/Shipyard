@@ -314,6 +314,7 @@ impl WorkLedger {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn acknowledge_agent_context(
         &self,
         wake_id: &str,
@@ -480,7 +481,7 @@ impl WorkLedger {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(crate) fn return_agent_ownership(
         &self,
         ownership_id: &str,

@@ -20,6 +20,7 @@ use super::merge_steward_cmd::native_publication_request;
 
 const MAX_AGENT_RECEIPT_BYTES: u64 = 64 * 1024;
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn work_ledger_command<W: Write>(
     command: &WorkLedgerCommand,
     runtime_paths: &RuntimePaths,
@@ -299,6 +300,7 @@ fn work_ledger_operational_status(runtime_paths: &RuntimePaths) -> WorkLedgerOpe
     )
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn operational_status(
     activation: WorkstreamActivationState,
     daemon_status: Option<Value>,

@@ -486,6 +486,7 @@ fn repository_allowlist_skips_unauthorized_wake_without_mutation_or_starvation()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
     let (temp, ledger, profile, work_id, _wake_id) = setup_wake();
     let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
@@ -814,6 +815,7 @@ fn rejected_alternate_receipt_replays_do_not_grow_protected_storage() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn concurrent_differing_receipts_publish_only_the_cas_winner() {
     let (temp, ledger, profile, work_id, _wake_id) = setup_wake();
     let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
@@ -1323,6 +1325,7 @@ fn uncertain_reconciliation_rechecks_work_authority_after_provider_call() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn provider_observation_history_is_append_only_ordered_and_survives_reopen() {
     let (temp, ledger, profile, _work_id, wake_id) = setup_wake();
     let mut resolver = Resolver { profile, calls: 0 };

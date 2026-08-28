@@ -237,11 +237,8 @@ impl ProviderAdapter for WorkLedgerProviderAdapter<'_> {
 
 impl WorkLedgerProviderAdapter<'_> {
     fn run(&self, fence: &DeliveryFence, operation: ProviderWrapperOperationV1) -> ProviderOutcome {
-        let request = match self.wrapper_request(fence, operation) {
-            Ok(request) => request,
-            Err(()) => {
-                return preflight_refusal(operation);
-            }
+        let Ok(request) = self.wrapper_request(fence, operation) else {
+            return preflight_refusal(operation);
         };
         match run_provider_wrapper(&self.config.provider_wrapper, &self.environment, &request) {
             Ok(ProviderWrapperRunResult::Delivered {
@@ -528,21 +525,21 @@ impl WorkstreamContinuationRuntime {
         self.executor = Some(message.executor);
         match message.result {
             Ok(ContinuationTickResult::Empty) => {
-                self.set_status(ContinuationRuntimeState::Idle, None)
+                self.set_status(ContinuationRuntimeState::Idle, None);
             }
             Ok(ContinuationTickResult::Delivered) => {
-                self.set_status(ContinuationRuntimeState::Delivered, None)
+                self.set_status(ContinuationRuntimeState::Delivered, None);
             }
             Ok(ContinuationTickResult::Retrying) => {
                 self.action_not_before = Some(Instant::now() + self.action_cooldown);
-                self.set_status(ContinuationRuntimeState::Retrying, None)
+                self.set_status(ContinuationRuntimeState::Retrying, None);
             }
             Ok(ContinuationTickResult::Uncertain) => {
                 self.action_not_before = Some(Instant::now() + self.action_cooldown);
-                self.set_status(ContinuationRuntimeState::Uncertain, None)
+                self.set_status(ContinuationRuntimeState::Uncertain, None);
             }
             Ok(ContinuationTickResult::Failed) => {
-                self.set_status(ContinuationRuntimeState::Failed, None)
+                self.set_status(ContinuationRuntimeState::Failed, None);
             }
             Err(error) => self.set_status(ContinuationRuntimeState::Error, Some(error.0)),
         }
@@ -645,6 +642,7 @@ mod tests {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     fn runtime(
         states: Vec<WorkstreamActivationState>,
         action: Option<ContinuationAction>,
@@ -679,6 +677,7 @@ mod tests {
         (runtime, selections, executions, observed)
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn wait_for(runtime: &mut WorkstreamContinuationRuntime, expected: ContinuationRuntimeState) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while runtime.status().state != expected && Instant::now() < deadline {

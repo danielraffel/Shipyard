@@ -260,6 +260,7 @@ impl WorkstreamActivationLoader {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn provider_platform_supported(&self) -> bool {
         #[cfg(test)]
         if let Some(supported) = self.platform_support_override {
@@ -484,6 +485,7 @@ max_stderr_bytes = 65536
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn assert_refused(state: WorkstreamActivationState, expected: WorkstreamActivationRefusal) {
         assert_eq!(state, WorkstreamActivationState::Refused(expected));
         let rendered = expected.to_string();
@@ -582,7 +584,9 @@ max_stderr_bytes = 65536
         fixture.write_policy(&policy("m5", r#"["generous-corp/shipyard"]"#, DIGEST));
         fs::write(
             fixture.paths.state_dir.join("machine-tag"),
-            "m".repeat((MAX_MACHINE_TAG_BYTES + 1) as usize),
+            "m".repeat(
+                usize::try_from(MAX_MACHINE_TAG_BYTES + 1).expect("machine tag bound fits usize"),
+            ),
         )
         .expect("oversized tag");
         let mut loader = fixture.production_loader();

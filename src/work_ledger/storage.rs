@@ -1271,6 +1271,7 @@ pub(super) fn verify_integrity(connection: &Connection) -> WorkLedgerResult<Stri
     Ok(verdict)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()> {
     let foreign_key_violations: i64 =
         connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {

@@ -233,6 +233,7 @@ fn superseded_worktree_provenance_fails_before_publication() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn exact_launch_profile_survives_receipt_restart_without_translation() {
     let temp = tempfile::tempdir().expect("temp");
     let args = handoff_args();
