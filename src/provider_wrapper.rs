@@ -442,19 +442,25 @@ pub(crate) fn validate_request(
             "fresh-resume head must be an exact lowercase 40-hex commit",
         ));
     }
-    if let Some(model_id) = &request.launch_options.model_id {
-        if model_id.is_empty()
+    validate_launch_options(&request.launch_options)?;
+    Ok(())
+}
+
+fn validate_launch_options(
+    options: &ProviderLaunchOptionsV1,
+) -> Result<(), ProviderWrapperRefusal> {
+    if options.model_id.as_ref().is_some_and(|model_id| {
+        model_id.is_empty()
             || model_id.len() > 128
             || !model_id.bytes().all(|byte| {
                 byte.is_ascii_lowercase()
                     || byte.is_ascii_digit()
                     || matches!(byte, b'.' | b'_' | b'-' | b':')
             })
-        {
-            return Err(refusal(
-                "provider model ID must be a bounded canonical token",
-            ));
-        }
+    }) {
+        return Err(refusal(
+            "provider model ID must be a bounded canonical token",
+        ));
     }
     Ok(())
 }
@@ -570,6 +576,7 @@ fn validate_digest(value: &str) -> Result<(), ProviderWrapperRefusal> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)] // Keep the ordered snapshot, execution, and cleanup proof chain adjacent.
 fn run_provider_wrapper_unix(
     config: &ProviderWrapperConfig,
     environment: &ProviderWrapperEnvironment,
@@ -580,7 +587,7 @@ fn run_provider_wrapper_unix(
 
     let mut source = OpenOptions::new()
         .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
         .open(&config.executable_path)
         .map_err(|_| refusal("provider wrapper cannot be opened without following symlinks"))?;
     let metadata = source
@@ -603,7 +610,7 @@ fn run_provider_wrapper_unix(
         .map_err(|_| refusal("provider wrapper executable snapshot cannot be created"))?;
     let mut hasher = Sha256::new();
     let mut copied = 0u64;
-    let mut buffer = [0u8; 32 * 1024];
+    let mut buffer = vec![0u8; 32 * 1024].into_boxed_slice();
     loop {
         let read = source
             .read(&mut buffer)
@@ -676,9 +683,8 @@ fn run_provider_wrapper_unix(
         })?));
 
     let deadline = Instant::now() + Duration::from_secs(config.deadline_seconds);
-    let mut process = match ProcessTree::spawn(&mut command) {
-        Ok(process) => process,
-        Err(_) => return Ok(uncertain("verified-wrapper-launch-outcome-unknown")),
+    let Ok(mut process) = ProcessTree::spawn(&mut command) else {
+        return Ok(uncertain("verified-wrapper-launch-outcome-unknown"));
     };
     #[cfg(unix)]
     rustix::io::fcntl_setfd(&sentinel, rustix::io::FdFlags::CLOEXEC)
@@ -841,7 +847,7 @@ fn prepare_platform_executable(
     drop(named);
     let mut verified = OpenOptions::new()
         .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
         .open(&path)
         .map_err(|_| refusal("private wrapper snapshot cannot be reopened no-follow"))?;
     let metadata = verified
