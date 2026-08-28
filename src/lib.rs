@@ -135,6 +135,8 @@ pub mod reroute;
 pub mod runner_provision;
 /// Self-hosted runner watchdog detection logic.
 pub mod runner_watchdog;
+/// Subscriber-independent, read-only canonical-ledger shadow observation.
+pub mod shadow_scheduler;
 /// Ship execution orchestration helpers.
 pub mod ship;
 /// Read-only orphan/liveness classification for in-flight ship states.

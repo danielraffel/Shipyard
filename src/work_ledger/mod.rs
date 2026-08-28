@@ -54,6 +54,7 @@ mod dispatch;
 mod importer;
 pub(crate) use dispatch::FreshAgentLaunchProfile;
 mod lifecycle;
+mod observation;
 mod persistence;
 mod policy;
 mod registry;
@@ -64,6 +65,7 @@ use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};
 pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};
+pub use observation::ShadowPrTarget;
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
 pub use policy::RepoPolicy;
 pub(crate) use policy::validate_repo_policy;
