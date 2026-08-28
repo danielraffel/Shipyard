@@ -1544,8 +1544,15 @@ stage exits naturally. Automatic already-merged cancellation is stricter: it
 requires typed repository/PR/exact-head proof, durably freezes and proves the
 whole process tree dead before releasing capacity, and generation-CAS removes
 only the terminating worker's receipt. A restart resumes that transaction; it
-must preserve any replacement generation that appeared after a deferred job
-returned to pending.
+does not require the separate receipt after the exact frozen-tree transaction
+is durable, but it must preserve and refuse any present replacement generation.
+A missing receipt without a durable termination transaction remains fenced for
+agent recovery because root absence cannot prove reparented descendants dead.
+Once an exact AlreadyMerged cancellation proof is stored, the daemon stops
+repeating the remote merged-head observation and proceeds only through local
+termination recovery. A deferred transaction follows the same crash phases and
+returns the original job to pending exactly once after tree death and lease
+release.
 
 ### Gate-script path resolution
 

@@ -280,12 +280,23 @@ authoritative even when an unrelated hosted check has a similar target name.
   identity, so same-branch Forge Modular and Forge Sequencer ships can run
   concurrently without replacing one another's target evidence. Repository
   evidence display aggregates those PR namespaces newest-per-target. The
-  daemon applies the same exact-head observation to a running ship job: it first
-  commits an immutable terminal cancellation and typed outcome, then signals the
-  whole supervised process group. An open PR, a different merged head, an auth
+  daemon applies the same exact-head observation to a running ship job only
+  with typed `CancellationProof::AlreadyMerged` authority containing the exact
+  repository, pull request, and merged head SHA. It first requests cancellation,
+  then freezes the exact receipt generation and durably snapshots the complete
+  process tree. Termination advances monotonically through `Frozen`, `TreeDead`,
+  and `LeasesReleased`; only after tree death and lease release are durable may
+  the queue become terminal and the typed outcome be committed. Cleanup removes
+  the old receipt and transaction with a generation comparison, so it cannot
+  erase a replacement worker receipt. If a restart loses the separate receipt
+  after the `Frozen` transaction is durable, the transaction's exact process
+  snapshot remains sufficient to finish tree-death proof and release capacity.
+  A missing receipt without that transaction, or a present receipt for another
+  generation, remains fenced for agent review because detached descendants
+  cannot otherwise be proven dead. An open PR, a different merged head, an auth
   or network failure, or a malformed response is a no-op. Stale worker progress
-  cannot overwrite the winning terminal record, and a live terminal receipt
-  continues to reserve the sole execution slot until process-group death is
+  cannot overwrite the winning terminal record, and a live or unresolved worker
+  continues to reserve the sole execution slot until process-tree death is
   proven. Each daemon tick also repairs a missing typed outcome from terminal
   queue state, so a restart after a transient outcome-write failure preserves a
   durable disposition.
