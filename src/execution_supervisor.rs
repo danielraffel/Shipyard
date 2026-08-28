@@ -514,10 +514,11 @@ impl ExecutionSupervisor {
             .map(|job| job.id.clone())
             .collect::<BTreeSet<_>>();
         for job_id in &requested {
-            if self.complete_worker_termination(job_id, TerminationAction::Cancel)? {
+            if let Some(transaction) =
+                self.complete_worker_termination(job_id, TerminationAction::Cancel)?
+            {
                 self.acknowledge_cancelled_job(&mut queue, job_id)?;
-                self.remove_receipt_if_present(job_id)?;
-                TerminationStore::new(&self.state_dir).remove(job_id)?;
+                self.cleanup_termination_transaction(&transaction)?;
             }
         }
 
@@ -529,15 +530,23 @@ impl ExecutionSupervisor {
             .map(|job| job.id.clone())
             .collect::<BTreeSet<_>>();
         for job_id in &cancelled {
-            if self.complete_worker_termination(job_id, TerminationAction::Cancel)? {
-                self.remove_receipt_if_present(job_id)?;
-                TerminationStore::new(&self.state_dir).remove(job_id)?;
+            if let Some(transaction) =
+                self.complete_worker_termination(job_id, TerminationAction::Cancel)?
+            {
+                self.cleanup_termination_transaction(&transaction)?;
             }
         }
         Ok(())
     }
 
     fn terminate_deferred_workers(&mut self) -> Result<(), SupervisorError> {
+        self.terminate_deferred_workers_with_cleanup_hook(|_, _| {})
+    }
+
+    fn terminate_deferred_workers_with_cleanup_hook(
+        &mut self,
+        mut before_cleanup: impl FnMut(&str, &crate::execution_termination::TerminationTransaction),
+    ) -> Result<(), SupervisorError> {
         let mut queue = Queue::new(&self.state_dir)?;
         let deferred = queue
             .get_running()?
@@ -546,11 +555,13 @@ impl ExecutionSupervisor {
             .map(|job| job.id)
             .collect::<Vec<_>>();
         for job_id in deferred {
-            if self.complete_worker_termination(&job_id, TerminationAction::Defer)? {
+            if let Some(transaction) =
+                self.complete_worker_termination(&job_id, TerminationAction::Defer)?
+            {
                 let finalized = queue.finalize_deferred_daemon_worker(&job_id)?;
                 if finalized.is_some() {
-                    self.remove_receipt_if_present(&job_id)?;
-                    TerminationStore::new(&self.state_dir).remove(&job_id)?;
+                    before_cleanup(&job_id, &transaction);
+                    self.cleanup_termination_transaction(&transaction)?;
                 } else if queue.get(&job_id)?.is_some_and(|job| {
                     job.status == JobStatus::Running && job.cancel_requested_at.is_some()
                 }) {
@@ -559,8 +570,7 @@ impl ExecutionSupervisor {
                         .get(&job_id)?
                         .is_none_or(|job| job.status != JobStatus::Running)
                     {
-                        self.remove_receipt_if_present(&job_id)?;
-                        TerminationStore::new(&self.state_dir).remove(&job_id)?;
+                        self.cleanup_termination_transaction(&transaction)?;
                     }
                 }
             }
@@ -585,8 +595,7 @@ impl ExecutionSupervisor {
                 }
             };
             if finalized {
-                self.remove_receipt_if_present(&transaction.job_id)?;
-                store.remove(&transaction.job_id)?;
+                self.cleanup_termination_transaction(&transaction)?;
             }
         }
         Ok(())
@@ -923,11 +932,36 @@ impl ExecutionSupervisor {
         Ok(())
     }
 
+    fn cleanup_termination_transaction(
+        &self,
+        transaction: &crate::execution_termination::TerminationTransaction,
+    ) -> Result<(), SupervisorError> {
+        let _receipt_lock = acquire_worker_receipt_ownership_lock(&self.state_dir)?;
+        let path = self.receipt_path(&transaction.job_id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                TerminationStore::new(&self.state_dir).remove(&transaction.job_id)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let observed = serde_json::from_slice::<WorkerReceipt>(&bytes).ok();
+        if observed
+            .as_ref()
+            .is_some_and(|receipt| transaction.matches_receipt(receipt))
+        {
+            remove_if_present(&path)?;
+        }
+        TerminationStore::new(&self.state_dir).remove(&transaction.job_id)?;
+        Ok(())
+    }
+
     fn complete_worker_termination(
         &mut self,
         job_id: &str,
         action: TerminationAction,
-    ) -> Result<bool, SupervisorError> {
+    ) -> Result<Option<crate::execution_termination::TerminationTransaction>, SupervisorError> {
         let store = TerminationStore::new(&self.state_dir);
         let mut child = self.children.remove(job_id);
         let mut transaction = if let Some(transaction) = store.load(job_id)? {
@@ -973,7 +1007,7 @@ impl ExecutionSupervisor {
                     if let Some(child) = child {
                         self.children.insert(job_id.to_owned(), child);
                     }
-                    return Ok(false);
+                    return Ok(None);
                 }
             };
             store.begin(&receipt, action)?
@@ -982,13 +1016,13 @@ impl ExecutionSupervisor {
             if let Some(child) = child {
                 self.children.insert(job_id.to_owned(), child);
             }
-            return Ok(false);
+            return Ok(None);
         }
         if transaction.phase < TerminationPhase::LeasesReleased {
             self.release_host_pool_leases(job_id)?;
             store.mark_leases_released(&mut transaction)?;
         }
-        Ok(true)
+        Ok(Some(transaction))
     }
 
     fn observe_receipt_with_probe(
@@ -2338,6 +2372,95 @@ mod tests {
         );
         assert!(store.list().expect("transactions").is_empty());
         assert!(lease_store.leases().expect("leases").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gen42_issue_437_direct_defer_cleanup_preserves_replacement_generation() {
+        assert_defer_cleanup_preserves_replacement_generation(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gen42_issue_437_restart_defer_cleanup_preserves_replacement_generation() {
+        assert_defer_cleanup_preserves_replacement_generation(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_defer_cleanup_preserves_replacement_generation(restart_cleanup: bool) {
+        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let job_id = "defer-generation-cas";
+        queued_job(temp.path(), job_id);
+        let mut supervisor = ExecutionSupervisor::new(
+            fake_worker_tree(temp.path()),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor.tick().expect("start generation A");
+        wait_for_live_descendant(&temp.path().join("descendant.pid"));
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        queue
+            .requeue_deferred_daemon_worker(QueueDeferredRequeue {
+                job_id: job_id.to_owned(),
+                reason: "capacity unavailable".to_owned(),
+                defer_until: Some(Utc::now() + Duration::minutes(1)),
+            })
+            .expect("defer generation A")
+            .expect("running job");
+        let replacement = WorkerReceipt {
+            job_id: job_id.to_owned(),
+            generation: "generation-b".to_owned(),
+            pid: std::process::id(),
+            started_at: Utc::now(),
+        };
+        if restart_cleanup {
+            let transaction = supervisor
+                .complete_worker_termination(job_id, TerminationAction::Defer)
+                .expect("terminate generation A")
+                .expect("released transaction");
+            queue
+                .finalize_deferred_daemon_worker(job_id)
+                .expect("finalize defer")
+                .expect("pending job");
+            write_json_atomic(&supervisor.receipt_path(job_id), &replacement)
+                .expect("publish generation B");
+            assert_eq!(transaction.phase, TerminationPhase::LeasesReleased);
+            drop(supervisor);
+            let restarted = ExecutionSupervisor::new(
+                PathBuf::from("/does/not/exist"),
+                RuntimeMode::Isolated,
+                temp.path().into(),
+                temp.path().into(),
+            );
+            restarted
+                .reconcile_finalized_termination_transactions()
+                .expect("restart cleanup");
+        } else {
+            let receipt_path = supervisor.receipt_path(job_id);
+            supervisor
+                .terminate_deferred_workers_with_cleanup_hook(|observed_job, transaction| {
+                    assert_eq!(observed_job, job_id);
+                    assert_eq!(transaction.phase, TerminationPhase::LeasesReleased);
+                    write_json_atomic(&receipt_path, &replacement)
+                        .expect("publish generation B between finalize and cleanup");
+                })
+                .expect("direct defer finalization");
+        }
+
+        let retained: WorkerReceipt = serde_json::from_slice(
+            &fs::read(temp.path().join(format!("queue-workers/{job_id}.json")))
+                .expect("generation B retained"),
+        )
+        .expect("replacement receipt");
+        assert_eq!(retained, replacement);
+        assert!(
+            TerminationStore::new(temp.path())
+                .list()
+                .expect("transactions")
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
