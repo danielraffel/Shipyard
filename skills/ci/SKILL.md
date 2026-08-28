@@ -1540,7 +1540,12 @@ ledger mutation. A running local or SSH validation observes the durable
 cancellation through its progress callback and terminates the supervised
 process tree, including descendants. The returned job remains `cancelled` with
 the exact durable reason; it must not consume a runner until the current build
-stage exits naturally.
+stage exits naturally. Automatic already-merged cancellation is stricter: it
+requires typed repository/PR/exact-head proof, durably freezes and proves the
+whole process tree dead before releasing capacity, and generation-CAS removes
+only the terminating worker's receipt. A restart resumes that transaction; it
+must preserve any replacement generation that appeared after a deferred job
+returned to pending.
 
 ### Gate-script path resolution
 
