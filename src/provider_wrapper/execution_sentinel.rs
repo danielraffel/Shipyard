@@ -107,9 +107,8 @@ fn sentinel_processes(path: &Path, _deadline: Instant) -> Option<BTreeSet<u32>> 
         else {
             continue;
         };
-        let descriptors = match std::fs::read_dir(entry.path().join("fd")) {
-            Ok(descriptors) => descriptors,
-            Err(_) => continue,
+        let Ok(descriptors) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
         };
         if descriptors
             .filter_map(Result::ok)
