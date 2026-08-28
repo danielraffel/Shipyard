@@ -1270,6 +1270,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn assert_pid_eventually_gone(pid: &str, failure_message: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = Command::new("kill")
+                .args(["-0", "--", pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            if !status.success() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{failure_message}");
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
     fn response_program(request: &ProviderWrapperRequestV1, status: &str) -> String {
         let outcome = match status {
             "delivered" => ProviderWrapperOutcomeV1::Delivered {
@@ -1477,14 +1495,7 @@ mod tests {
             ProviderWrapperRunResult::Uncertain { .. }
         ));
         let child_pid = fs::read_to_string(directory.path().join("child.pid")).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        let status = Command::new("kill")
-            .args(["-0", child_pid.trim()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(!status.success(), "descendant survived timeout");
+        assert_pid_eventually_gone(&child_pid, "descendant survived timeout");
 
         let (_directory, path, sha) = wrapper_c(
             "char block[4096] = {0}; for (;;) { if (write(1, block, sizeof(block)) < 0) return 1; }",
@@ -1531,13 +1542,7 @@ mod tests {
             "timeout cleanup plus serialized fixture admission wedged"
         );
         let child_pid = fs::read_to_string(directory.path().join("detached.pid")).unwrap();
-        let status = Command::new("kill")
-            .args(["-0", "--", child_pid.trim()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(!status.success(), "setsid descendant survived timeout");
+        assert_pid_eventually_gone(&child_pid, "setsid descendant survived timeout");
     }
 
     #[cfg(unix)]
@@ -1564,15 +1569,9 @@ mod tests {
         .unwrap();
         assert!(matches!(result, ProviderWrapperRunResult::Uncertain { .. }));
         let child_pid = fs::read_to_string(&detached_pid).unwrap();
-        let status = Command::new("kill")
-            .args(["-0", "--", child_pid.trim()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(
-            !status.success(),
-            "setsid child survived successful wrapper-parent exit"
+        assert_pid_eventually_gone(
+            &child_pid,
+            "setsid child survived successful wrapper-parent exit",
         );
     }
 
