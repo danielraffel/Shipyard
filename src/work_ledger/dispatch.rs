@@ -604,7 +604,17 @@ impl WorkLedger {
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_uncertain_fence(&transaction, fence)?;
         let now = Utc::now().to_rfc3339();
+        append_delivery_observation(
+            &transaction,
+            fence,
+            "uncertain",
+            state,
+            &response.object_ref,
+            &outcome_digest,
+            &now,
+        )?;
         let attempt_changed = transaction.execute(
             "UPDATE wake_attempts SET state = ?1, outcome_digest = ?2, finished_at = ?3
              WHERE wake_id = ?4 AND attempt = ?5 AND state = 'uncertain'
@@ -1039,6 +1049,32 @@ impl WorkLedger {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_claim(&transaction, fence)?;
         let now = Utc::now().to_rfc3339();
+        let from_state: String = transaction.query_row(
+            "SELECT state FROM provider_deliveries
+             WHERE delivery_id = ?1 AND wake_id = ?2 AND attempt = ?3
+               AND activation_id = ?4 AND adapter_id = ?5
+               AND idempotency_key = ?6 AND request_object_ref = ?7
+               AND state IN ('prepared', 'launched')",
+            params![
+                fence.delivery_id,
+                fence.wake_id,
+                fence.attempt,
+                fence.activation_id,
+                fence.adapter_id,
+                fence.idempotency_key,
+                fence.request_object_ref,
+            ],
+            |row| row.get(0),
+        )?;
+        append_delivery_observation(
+            &transaction,
+            fence,
+            &from_state,
+            state,
+            &response.object_ref,
+            &outcome_digest,
+            &now,
+        )?;
         let outbox_state = if state == "retry" { "pending" } else { state };
         let attempt_changed = transaction.execute(
             "UPDATE wake_attempts SET state = ?1, outcome_digest = ?2, finished_at = ?3
@@ -1223,6 +1259,108 @@ fn transition_dispatch_failure(
         LifecycleState::Actionable,
         evidence_digest,
         now,
+    )?;
+    Ok(())
+}
+
+fn verify_uncertain_fence(
+    transaction: &Transaction<'_>,
+    fence: &DeliveryFence,
+) -> WorkLedgerResult<()> {
+    let exact: bool = transaction.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM outbox wake
+           JOIN work_items work ON work.id = wake.work_item_id
+           JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+           JOIN wake_attempts attempt
+             ON attempt.wake_id = delivery.wake_id AND attempt.attempt = delivery.attempt
+           JOIN activation_epochs activation
+             ON activation.activation_id = delivery.activation_id
+           WHERE wake.wake_id = ?1 AND wake.work_item_id = ?2
+             AND wake.work_generation = ?3 AND wake.owner_generation = ?4
+             AND wake.route_ref = ?5 AND wake.payload_digest = ?6
+             AND wake.state = 'uncertain' AND work.phase = 'dispatching'
+             AND work.work_generation = ?3 AND work.owner_generation = ?4
+             AND delivery.delivery_id = ?7 AND delivery.attempt = ?8
+             AND delivery.activation_id = ?9 AND delivery.request_object_ref = ?10
+             AND delivery.adapter_id = ?11 AND delivery.provider_id = ?12
+             AND delivery.idempotency_key = ?13 AND delivery.state = 'uncertain'
+             AND attempt.state = 'uncertain' AND attempt.adapter_id = ?11
+             AND activation.state = 'released'
+             AND EXISTS (
+               SELECT 1 FROM wake_claim_epochs claim
+                WHERE claim.wake_id = ?1 AND claim.attempt = ?8 AND claim.epoch = ?14
+                  AND claim.owner_ref = ?15
+                  AND claim.epoch = (SELECT max(latest.epoch) FROM wake_claim_epochs latest
+                                      WHERE latest.wake_id = ?1 AND latest.attempt = ?8)
+             ))",
+        params![
+            fence.wake_id,
+            fence.work_item_id,
+            fence.work_generation,
+            fence.owner_generation,
+            fence.route_ref,
+            fence.payload_digest,
+            fence.delivery_id,
+            fence.attempt,
+            fence.activation_id,
+            fence.request_object_ref,
+            fence.adapter_id,
+            fence.provider_id,
+            fence.idempotency_key,
+            fence.consumer_epoch,
+            fence.consumer_owner_ref,
+        ],
+        |row| row.get(0),
+    )?;
+    if !exact {
+        return Err(WorkLedgerError::Refused(
+            "uncertain provider authority changed during reconciliation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_delivery_observation(
+    transaction: &Transaction<'_>,
+    fence: &DeliveryFence,
+    from_state: &str,
+    to_state: &str,
+    receipt_object_ref: &str,
+    outcome_digest: &str,
+    observed_at: &str,
+) -> WorkLedgerResult<()> {
+    let sequence: u64 = transaction.query_row(
+        "SELECT coalesce(max(sequence), 0) + 1
+           FROM provider_delivery_observations WHERE delivery_id = ?1",
+        [&fence.delivery_id],
+        |row| row.get(0),
+    )?;
+    let observation_id = opaque_ref(
+        "ro",
+        &format!(
+            "shipyard-provider-delivery-observation-v1\n{}\n{}\n{}\n{}\n{}",
+            fence.delivery_id, sequence, from_state, to_state, outcome_digest
+        ),
+    );
+    transaction.execute(
+        "INSERT INTO provider_delivery_observations
+         (observation_id, delivery_id, sequence, work_generation, owner_generation,
+          from_state, to_state, receipt_object_ref, outcome_digest, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            observation_id,
+            fence.delivery_id,
+            sequence,
+            fence.work_generation,
+            fence.owner_generation,
+            from_state,
+            to_state,
+            receipt_object_ref,
+            outcome_digest,
+            observed_at,
+        ],
     )?;
     Ok(())
 }

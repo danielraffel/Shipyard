@@ -157,6 +157,10 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     }
     if version == 4 {
         migrate_v4_to_v5(connection)?;
+        version = 5;
+    }
+    if version == 5 {
+        migrate_v5_to_v6(connection)?;
         return Ok(());
     }
     if version == SCHEMA_VERSION {
@@ -621,7 +625,53 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
              AND ownership.state IN ('acknowledged', 'returned')
          )
          BEGIN SELECT RAISE(ABORT, 'wake attempt acknowledgement lacks agent ownership'); END;
-         PRAGMA user_version = 5;",
+         CREATE TABLE provider_delivery_observations (
+           observation_id TEXT PRIMARY KEY
+             CHECK(length(observation_id) = 67 AND substr(observation_id, 1, 3) = 'ro_'
+                   AND substr(observation_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           delivery_id TEXT NOT NULL REFERENCES provider_deliveries(delivery_id) ON DELETE RESTRICT,
+           sequence INTEGER NOT NULL CHECK(sequence > 0),
+           work_generation INTEGER NOT NULL CHECK(work_generation > 0),
+           owner_generation INTEGER NOT NULL CHECK(owner_generation > 0),
+           from_state TEXT NOT NULL CHECK(from_state IN ('prepared', 'launched', 'uncertain')),
+           to_state TEXT NOT NULL CHECK(to_state IN ('delivered', 'retry', 'uncertain', 'failed')),
+           receipt_object_ref TEXT NOT NULL REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           outcome_digest TEXT NOT NULL
+             CHECK(length(outcome_digest) = 64 AND outcome_digest NOT GLOB '*[^0-9a-f]*'),
+           observed_at TEXT NOT NULL CHECK(length(observed_at) >= 20),
+           UNIQUE(delivery_id, sequence)
+         );
+         CREATE INDEX provider_delivery_observations_delivery
+           ON provider_delivery_observations(delivery_id, sequence);
+         CREATE TRIGGER provider_delivery_observation_immutable
+         BEFORE UPDATE ON provider_delivery_observations
+         BEGIN SELECT RAISE(ABORT, 'provider delivery observations are immutable'); END;
+         CREATE TRIGGER provider_delivery_observation_no_delete
+         BEFORE DELETE ON provider_delivery_observations
+         BEGIN SELECT RAISE(ABORT, 'provider delivery observations cannot be deleted'); END;
+         CREATE TRIGGER provider_delivery_observation_insert_fence
+         BEFORE INSERT ON provider_delivery_observations
+         WHEN NOT EXISTS (
+           SELECT 1 FROM provider_deliveries delivery
+           JOIN outbox wake ON wake.wake_id = delivery.wake_id
+           JOIN protected_objects receipt ON receipt.object_ref = NEW.receipt_object_ref
+           WHERE delivery.delivery_id = NEW.delivery_id
+             AND delivery.state = NEW.from_state
+             AND ((NEW.from_state IN ('prepared', 'launched') AND wake.state = 'claimed')
+                  OR (NEW.from_state = 'uncertain' AND wake.state = 'uncertain'))
+             AND wake.work_generation = NEW.work_generation
+             AND wake.owner_generation = NEW.owner_generation
+             AND receipt.kind = 'provider_receipt'
+             AND receipt.work_item_id = wake.work_item_id
+             AND receipt.content_digest = NEW.outcome_digest
+             AND NEW.sequence = coalesce((
+               SELECT max(previous.sequence) + 1
+                 FROM provider_delivery_observations previous
+                WHERE previous.delivery_id = NEW.delivery_id
+             ), 1)
+         )
+         BEGIN SELECT RAISE(ABORT, 'provider delivery observation authority mismatch'); END;
+         PRAGMA user_version = 6;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -1142,6 +1192,62 @@ fn migrate_v4_to_v5(connection: &mut Connection) -> WorkLedgerResult<()> {
     Ok(())
 }
 
+fn migrate_v5_to_v6(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    transaction.execute_batch(
+        "CREATE TABLE provider_delivery_observations (
+           observation_id TEXT PRIMARY KEY
+             CHECK(length(observation_id) = 67 AND substr(observation_id, 1, 3) = 'ro_'
+                   AND substr(observation_id, 4) NOT GLOB '*[^0-9a-f]*'),
+           delivery_id TEXT NOT NULL REFERENCES provider_deliveries(delivery_id) ON DELETE RESTRICT,
+           sequence INTEGER NOT NULL CHECK(sequence > 0),
+           work_generation INTEGER NOT NULL CHECK(work_generation > 0),
+           owner_generation INTEGER NOT NULL CHECK(owner_generation > 0),
+           from_state TEXT NOT NULL CHECK(from_state IN ('prepared', 'launched', 'uncertain')),
+           to_state TEXT NOT NULL CHECK(to_state IN ('delivered', 'retry', 'uncertain', 'failed')),
+           receipt_object_ref TEXT NOT NULL REFERENCES protected_objects(object_ref) ON DELETE RESTRICT,
+           outcome_digest TEXT NOT NULL
+             CHECK(length(outcome_digest) = 64 AND outcome_digest NOT GLOB '*[^0-9a-f]*'),
+           observed_at TEXT NOT NULL CHECK(length(observed_at) >= 20),
+           UNIQUE(delivery_id, sequence)
+         );
+         CREATE INDEX provider_delivery_observations_delivery
+           ON provider_delivery_observations(delivery_id, sequence);
+         CREATE TRIGGER provider_delivery_observation_immutable
+         BEFORE UPDATE ON provider_delivery_observations
+         BEGIN SELECT RAISE(ABORT, 'provider delivery observations are immutable'); END;
+         CREATE TRIGGER provider_delivery_observation_no_delete
+         BEFORE DELETE ON provider_delivery_observations
+         BEGIN SELECT RAISE(ABORT, 'provider delivery observations cannot be deleted'); END;
+         CREATE TRIGGER provider_delivery_observation_insert_fence
+         BEFORE INSERT ON provider_delivery_observations
+         WHEN NOT EXISTS (
+           SELECT 1 FROM provider_deliveries delivery
+           JOIN outbox wake ON wake.wake_id = delivery.wake_id
+           JOIN protected_objects receipt ON receipt.object_ref = NEW.receipt_object_ref
+           WHERE delivery.delivery_id = NEW.delivery_id
+             AND delivery.state = NEW.from_state
+             AND ((NEW.from_state IN ('prepared', 'launched') AND wake.state = 'claimed')
+                  OR (NEW.from_state = 'uncertain' AND wake.state = 'uncertain'))
+             AND wake.work_generation = NEW.work_generation
+             AND wake.owner_generation = NEW.owner_generation
+             AND receipt.kind = 'provider_receipt'
+             AND receipt.work_item_id = wake.work_item_id
+             AND receipt.content_digest = NEW.outcome_digest
+             AND NEW.sequence = coalesce((
+               SELECT max(previous.sequence) + 1
+                 FROM provider_delivery_observations previous
+                WHERE previous.delivery_id = NEW.delivery_id
+             ), 1)
+         )
+         BEGIN SELECT RAISE(ABORT, 'provider delivery observation authority mismatch'); END;
+         PRAGMA user_version = 6;",
+    )?;
+    validate_relational_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 pub(super) fn verify_supported_schema(connection: &Connection) -> WorkLedgerResult<()> {
     let version = schema_version(connection)?;
     if version != SCHEMA_VERSION {
@@ -1287,6 +1393,34 @@ fn validate_relational_integrity(connection: &Connection) -> WorkLedgerResult<()
         return Err(WorkLedgerError::Refused(
             "agent ownership is not bound to a delivered launch profile".to_owned(),
         ));
+    }
+    if schema_version(connection)? >= 6 {
+        let invalid_observations: i64 = connection.query_row(
+            "SELECT COUNT(*)
+               FROM provider_delivery_observations observation
+               JOIN provider_deliveries delivery
+                 ON delivery.delivery_id = observation.delivery_id
+               JOIN outbox wake ON wake.wake_id = delivery.wake_id
+               JOIN protected_objects receipt
+                 ON receipt.object_ref = observation.receipt_object_ref
+              WHERE observation.work_generation != wake.work_generation
+                 OR observation.owner_generation != wake.owner_generation
+                 OR receipt.kind != 'provider_receipt'
+                 OR receipt.work_item_id != wake.work_item_id
+                 OR receipt.content_digest != observation.outcome_digest
+                 OR observation.sequence != (
+                   SELECT COUNT(*) FROM provider_delivery_observations prior
+                    WHERE prior.delivery_id = observation.delivery_id
+                      AND prior.sequence <= observation.sequence
+                 )",
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid_observations != 0 {
+            return Err(WorkLedgerError::Refused(
+                "provider delivery observation history is not exact".to_owned(),
+            ));
+        }
     }
     Ok(())
 }

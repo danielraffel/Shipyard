@@ -13,6 +13,14 @@ use super::{
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentContextReceipt {
+    pub(crate) schema_version: u32,
+    pub(crate) wake_id: String,
+    pub(crate) work_item_id: String,
+    pub(crate) work_generation: u64,
+    pub(crate) owner_generation: u64,
+    pub(crate) delivery_id: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) provider_receipt_digest: String,
     pub(crate) workstream_handle: String,
     pub(crate) context_url: Option<String>,
     pub(crate) plan_sha256: String,
@@ -33,24 +41,39 @@ pub(crate) struct AgentContextReceipt {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentReturnExpectation {
+    pub(crate) schema_version: u32,
+    pub(crate) work_item_id: String,
+    pub(crate) ownership_id: String,
+    pub(crate) delivery_id: String,
+    pub(crate) work_generation: u64,
+    pub(crate) owner_generation: u64,
+    pub(crate) context_receipt_digest: String,
     pub(crate) checkpoint_id: String,
     pub(crate) checkpoint_generation: u64,
     pub(crate) checkpoint_digest: String,
     pub(crate) repository: String,
     pub(crate) head_sha: String,
     pub(crate) evidence_digest: String,
+    pub(crate) remote_acknowledgement_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentReturnReceipt {
+    pub(crate) schema_version: u32,
+    pub(crate) work_item_id: String,
+    pub(crate) ownership_id: String,
+    pub(crate) delivery_id: String,
+    pub(crate) work_generation: u64,
+    pub(crate) owner_generation: u64,
+    pub(crate) context_receipt_digest: String,
     pub(crate) checkpoint_id: String,
     pub(crate) checkpoint_generation: u64,
     pub(crate) checkpoint_digest: String,
     pub(crate) repository: String,
     pub(crate) head_sha: String,
     pub(crate) evidence_digest: String,
-    pub(crate) remotely_acknowledged: bool,
+    pub(crate) remote_acknowledgement_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +85,7 @@ pub(crate) struct AgentOwnershipReceipt {
 
 #[derive(Clone, Debug)]
 struct DeliveredAuthority {
+    wake_id: String,
     work_item_id: String,
     work_generation: u64,
     owner_generation: u64,
@@ -69,6 +93,8 @@ struct DeliveredAuthority {
     attempt: u64,
     request_object_ref: String,
     profile_object_ref: String,
+    idempotency_key: String,
+    provider_receipt_digest: String,
 }
 
 impl WorkLedger {
@@ -86,7 +112,7 @@ impl WorkLedger {
         let receipt: AgentContextReceipt = serde_json::from_slice(receipt_bytes).map_err(|_| {
             WorkLedgerError::Refused("agent context receipt is malformed".to_owned())
         })?;
-        validate_context_receipt(&request.resume, &receipt)?;
+        validate_context_receipt(&authority, &request.resume, &receipt)?;
         let receipt_digest = digest(receipt_bytes);
         let receipt_object = self.put_protected_object(
             &authority.work_item_id,
@@ -218,13 +244,20 @@ impl WorkLedger {
         let receipt: AgentReturnReceipt = serde_json::from_slice(receipt_bytes).map_err(|_| {
             WorkLedgerError::Refused("agent return receipt is malformed".to_owned())
         })?;
-        if !receipt.remotely_acknowledged
+        if receipt.schema_version != expected.schema_version
+            || receipt.work_item_id != expected.work_item_id
+            || receipt.ownership_id != expected.ownership_id
+            || receipt.delivery_id != expected.delivery_id
+            || receipt.work_generation != expected.work_generation
+            || receipt.owner_generation != expected.owner_generation
+            || receipt.context_receipt_digest != expected.context_receipt_digest
             || receipt.checkpoint_id != expected.checkpoint_id
             || receipt.checkpoint_generation != expected.checkpoint_generation
             || receipt.checkpoint_digest != expected.checkpoint_digest
             || receipt.repository != expected.repository
             || receipt.head_sha != expected.head_sha
             || receipt.evidence_digest != expected.evidence_digest
+            || receipt.remote_acknowledgement_digest != expected.remote_acknowledgement_digest
         {
             return Err(WorkLedgerError::Refused(
                 "agent return receipt does not match reviewed final authority".to_owned(),
@@ -233,11 +266,12 @@ impl WorkLedger {
         let connection = self.connect_read_only()?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
-        let authority: (String, String, u64, u64, String, String, u64) = connection
+        let authority: (String, String, u64, u64, String, String, u64, String) = connection
             .query_row(
                 "SELECT ownership.work_item_id, ownership.delivery_id,
                         ownership.work_generation, ownership.owner_generation,
-                        ownership.state, delivery.request_object_ref, delivery.attempt
+                        ownership.state, delivery.request_object_ref, delivery.attempt,
+                        ownership.context_receipt_digest
                  FROM agent_ownership ownership
                  JOIN provider_deliveries delivery ON delivery.delivery_id = ownership.delivery_id
                  WHERE ownership.ownership_id = ?1",
@@ -251,13 +285,20 @@ impl WorkLedger {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
             .optional()?
             .ok_or_else(|| WorkLedgerError::Refused("agent ownership is missing".to_owned()))?;
-        if authority.1 != expected_delivery_id
+        if authority.0 != expected.work_item_id
+            || ownership_id != expected.ownership_id
+            || authority.1 != expected_delivery_id
+            || authority.1 != expected.delivery_id
             || authority.2.checked_add(1) != Some(expected_work_generation)
+            || expected_work_generation != expected.work_generation
+            || authority.3 != expected.owner_generation
+            || authority.7 != expected.context_receipt_digest
         {
             return Err(WorkLedgerError::Refused(
                 "agent return ownership CAS does not match".to_owned(),
@@ -376,13 +417,15 @@ impl WorkLedger {
             .query_row(
                 "SELECT wake.work_item_id, wake.work_generation, wake.owner_generation,
                         delivery.delivery_id, delivery.attempt, delivery.request_object_ref,
-                        profile.object_ref
+                        profile.object_ref, delivery.idempotency_key, receipt.content_digest
                  FROM outbox wake
                  JOIN provider_deliveries delivery
                    ON delivery.delivery_id = wake.provider_delivery_id
                  JOIN protected_objects profile
                    ON profile.work_item_id = wake.work_item_id
                   AND profile.profile_ref = wake.profile_ref
+                 JOIN protected_objects receipt
+                   ON receipt.object_ref = delivery.receipt_object_ref
                  JOIN work_items work ON work.id = wake.work_item_id
                  WHERE wake.wake_id = ?1 AND wake.state IN ('delivered', 'acknowledged')
                    AND delivery.state = 'delivered'
@@ -396,6 +439,7 @@ impl WorkLedger {
                 [wake_id],
                 |row| {
                     Ok(DeliveredAuthority {
+                        wake_id: wake_id.to_owned(),
                         work_item_id: row.get(0)?,
                         work_generation: row.get(1)?,
                         owner_generation: row.get(2)?,
@@ -403,6 +447,8 @@ impl WorkLedger {
                         attempt: row.get(4)?,
                         request_object_ref: row.get(5)?,
                         profile_object_ref: row.get(6)?,
+                        idempotency_key: row.get(7)?,
+                        provider_receipt_digest: row.get(8)?,
                     })
                 },
             )
@@ -412,10 +458,19 @@ impl WorkLedger {
 }
 
 fn validate_context_receipt(
+    authority: &DeliveredAuthority,
     expected: &StoredResumeExpectation,
     actual: &AgentContextReceipt,
 ) -> WorkLedgerResult<()> {
-    let exact = actual.workstream_handle == expected.workstream_handle
+    let exact = actual.schema_version == 1
+        && actual.wake_id == authority.wake_id
+        && actual.work_item_id == authority.work_item_id
+        && actual.work_generation == authority.work_generation
+        && actual.owner_generation == authority.owner_generation
+        && actual.delivery_id == authority.delivery_id
+        && actual.idempotency_key == authority.idempotency_key
+        && actual.provider_receipt_digest == authority.provider_receipt_digest
+        && actual.workstream_handle == expected.workstream_handle
         && actual.context_url == expected.context_url
         && actual.plan_sha256 == expected.plan_sha256
         && actual.root_revision == expected.root_revision
@@ -439,9 +494,23 @@ fn validate_context_receipt(
 }
 
 fn validate_return_expectation(expected: &AgentReturnExpectation) -> WorkLedgerResult<()> {
+    validate_digest(
+        "return context receipt digest",
+        &expected.context_receipt_digest,
+    )?;
     validate_digest("return checkpoint digest", &expected.checkpoint_digest)?;
     validate_digest("return evidence digest", &expected.evidence_digest)?;
-    if expected.checkpoint_id.is_empty()
+    validate_digest(
+        "return remote acknowledgement digest",
+        &expected.remote_acknowledgement_digest,
+    )?;
+    if expected.schema_version != 1
+        || expected.work_item_id.is_empty()
+        || expected.ownership_id.is_empty()
+        || expected.delivery_id.is_empty()
+        || expected.work_generation == 0
+        || expected.owner_generation == 0
+        || expected.checkpoint_id.is_empty()
         || expected.checkpoint_generation == 0
         || expected.repository.is_empty()
         || expected.head_sha.len() != 40

@@ -137,6 +137,33 @@ impl ProviderAdapter for Adapter {
     }
 }
 
+struct DriftingReconcileAdapter {
+    inner: Adapter,
+    database_path: std::path::PathBuf,
+    work_item_id: String,
+}
+
+impl ProviderAdapter for DriftingReconcileAdapter {
+    fn capability(&self, provider_id: &str) -> Option<ProviderCapability> {
+        self.inner.capability(provider_id)
+    }
+
+    fn launch(&mut self, request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
+        self.inner.launch(request)
+    }
+
+    fn reconcile(&mut self, fence: &DeliveryFence) -> ProviderOutcome {
+        rusqlite::Connection::open(&self.database_path)
+            .expect("concurrent connection")
+            .execute(
+                "UPDATE work_items SET work_generation = work_generation + 1 WHERE id = ?1",
+                [&self.work_item_id],
+            )
+            .expect("plant concurrent lifecycle change");
+        self.inner.reconcile(fence)
+    }
+}
+
 fn active_policy() -> WakeConsumerPolicy {
     WakeConsumerPolicy {
         activation_enabled: true,
@@ -226,8 +253,41 @@ fn outbox_state(ledger: &WorkLedger, wake_id: &str) -> String {
         .expect("outbox state")
 }
 
-fn context_receipt() -> AgentContextReceipt {
+fn context_receipt(ledger: &WorkLedger, wake_id: &str) -> AgentContextReceipt {
+    let authority: (String, u64, u64, String, String, String) = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT wake.work_item_id, wake.work_generation, wake.owner_generation,
+                    delivery.delivery_id, delivery.idempotency_key, receipt.content_digest
+             FROM outbox wake
+             JOIN provider_deliveries delivery
+               ON delivery.delivery_id = wake.provider_delivery_id
+             JOIN protected_objects receipt
+               ON receipt.object_ref = delivery.receipt_object_ref
+             WHERE wake.wake_id = ?1",
+            [wake_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("delivered authority");
     AgentContextReceipt {
+        schema_version: 1,
+        wake_id: wake_id.to_owned(),
+        work_item_id: authority.0,
+        work_generation: authority.1,
+        owner_generation: authority.2,
+        delivery_id: authority.3,
+        idempotency_key: authority.4,
+        provider_receipt_digest: authority.5,
         workstream_handle: "GEN-43".to_owned(),
         context_url: Some("https://linear.app/generous/issue/GEN-43".to_owned()),
         plan_sha256: "a".repeat(64),
@@ -243,6 +303,49 @@ fn context_receipt() -> AgentContextReceipt {
         resume_context_digest: "c".repeat(64),
         success_continuation_digest: "d".repeat(64),
         failure_continuation_digest: "e".repeat(64),
+    }
+}
+
+fn return_expectation(
+    work_item_id: &str,
+    ownership_id: &str,
+    context_receipt_digest: &str,
+    delivery_id: &str,
+) -> AgentReturnExpectation {
+    AgentReturnExpectation {
+        schema_version: 1,
+        work_item_id: work_item_id.to_owned(),
+        ownership_id: ownership_id.to_owned(),
+        delivery_id: delivery_id.to_owned(),
+        work_generation: 7,
+        owner_generation: 3,
+        context_receipt_digest: context_receipt_digest.to_owned(),
+        checkpoint_id: "wsc_returned".to_owned(),
+        checkpoint_generation: 2,
+        checkpoint_digest: "1".repeat(64),
+        repository: "danielraffel/pulp".to_owned(),
+        head_sha: "1234567890123456789012345678901234567890".to_owned(),
+        evidence_digest: "2".repeat(64),
+        remote_acknowledgement_digest: "3".repeat(64),
+    }
+}
+
+fn return_receipt(expected: &AgentReturnExpectation) -> AgentReturnReceipt {
+    AgentReturnReceipt {
+        schema_version: expected.schema_version,
+        work_item_id: expected.work_item_id.clone(),
+        ownership_id: expected.ownership_id.clone(),
+        delivery_id: expected.delivery_id.clone(),
+        work_generation: expected.work_generation,
+        owner_generation: expected.owner_generation,
+        context_receipt_digest: expected.context_receipt_digest.clone(),
+        checkpoint_id: expected.checkpoint_id.clone(),
+        checkpoint_generation: expected.checkpoint_generation,
+        checkpoint_digest: expected.checkpoint_digest.clone(),
+        repository: expected.repository.clone(),
+        head_sha: expected.head_sha.clone(),
+        evidence_digest: expected.evidence_digest.clone(),
+        remote_acknowledgement_digest: expected.remote_acknowledgement_digest.clone(),
     }
 }
 
@@ -354,7 +457,8 @@ fn repository_allowlist_skips_unauthorized_wake_without_mutation_or_starvation()
 fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
     let (_temp, ledger, profile, work_id, _wake_id) = setup_wake();
     let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
-    let context_bytes = serde_json::to_vec(&context_receipt()).expect("context receipt");
+    let context_bytes =
+        serde_json::to_vec(&context_receipt(&ledger, &wake_id)).expect("context receipt");
     let ownership = ledger
         .acknowledge_agent_context(&wake_id, &context_bytes)
         .expect("context acknowledgement");
@@ -364,24 +468,13 @@ fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
         .expect("ack replay");
     assert_eq!(replay, ownership);
 
-    let expected = AgentReturnExpectation {
-        checkpoint_id: "wsc_returned".to_owned(),
-        checkpoint_generation: 2,
-        checkpoint_digest: "1".repeat(64),
-        repository: "danielraffel/pulp".to_owned(),
-        head_sha: "1234567890123456789012345678901234567890".to_owned(),
-        evidence_digest: "2".repeat(64),
-    };
-    let return_bytes = serde_json::to_vec(&AgentReturnReceipt {
-        checkpoint_id: expected.checkpoint_id.clone(),
-        checkpoint_generation: expected.checkpoint_generation,
-        checkpoint_digest: expected.checkpoint_digest.clone(),
-        repository: expected.repository.clone(),
-        head_sha: expected.head_sha.clone(),
-        evidence_digest: expected.evidence_digest.clone(),
-        remotely_acknowledged: true,
-    })
-    .expect("return receipt");
+    let expected = return_expectation(
+        &work_id,
+        &ownership.ownership_id,
+        &ownership.receipt_digest,
+        &delivery_id,
+    );
+    let return_bytes = serde_json::to_vec(&return_receipt(&expected)).expect("return receipt");
     let returned = ledger
         .return_agent_ownership(
             &ownership.ownership_id,
@@ -415,9 +508,9 @@ fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
 
 #[test]
 fn context_and_return_receipts_refuse_drift_without_partial_transition() {
-    let (_temp, ledger, profile, _work_id, _wake_id) = setup_wake();
+    let (_temp, ledger, profile, work_id, _wake_id) = setup_wake();
     let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
-    let mut wrong_context = context_receipt();
+    let mut wrong_context = context_receipt(&ledger, &wake_id);
     wrong_context.checkpoint_digest = "f".repeat(64);
     assert!(
         ledger
@@ -428,27 +521,19 @@ fn context_and_return_receipts_refuse_drift_without_partial_transition() {
             .is_err()
     );
     assert_eq!(outbox_state(&ledger, &wake_id), "delivered");
-    let context_bytes = serde_json::to_vec(&context_receipt()).expect("context receipt");
+    let context_bytes =
+        serde_json::to_vec(&context_receipt(&ledger, &wake_id)).expect("context receipt");
     let ownership = ledger
         .acknowledge_agent_context(&wake_id, &context_bytes)
         .expect("valid acknowledgement");
-    let expected = AgentReturnExpectation {
-        checkpoint_id: "wsc_returned".to_owned(),
-        checkpoint_generation: 2,
-        checkpoint_digest: "1".repeat(64),
-        repository: "danielraffel/pulp".to_owned(),
-        head_sha: "1234567890123456789012345678901234567890".to_owned(),
-        evidence_digest: "2".repeat(64),
-    };
-    let mut wrong_return = AgentReturnReceipt {
-        checkpoint_id: expected.checkpoint_id.clone(),
-        checkpoint_generation: expected.checkpoint_generation,
-        checkpoint_digest: expected.checkpoint_digest.clone(),
-        repository: expected.repository.clone(),
-        head_sha: "2234567890123456789012345678901234567890".to_owned(),
-        evidence_digest: expected.evidence_digest.clone(),
-        remotely_acknowledged: true,
-    };
+    let expected = return_expectation(
+        &work_id,
+        &ownership.ownership_id,
+        &ownership.receipt_digest,
+        &delivery_id,
+    );
+    let mut wrong_return = return_receipt(&expected);
+    wrong_return.head_sha = "2234567890123456789012345678901234567890".to_owned();
     assert!(
         ledger
             .return_agent_ownership(
@@ -485,7 +570,7 @@ fn context_and_return_receipts_refuse_drift_without_partial_transition() {
             .is_err()
     );
     wrong_return.checkpoint_generation = expected.checkpoint_generation;
-    wrong_return.remotely_acknowledged = false;
+    wrong_return.remote_acknowledgement_digest = "0".repeat(64);
     assert!(
         ledger
             .return_agent_ownership(
@@ -497,6 +582,72 @@ fn context_and_return_receipts_refuse_drift_without_partial_transition() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn context_and_return_receipts_cannot_cross_delivery_or_ownership_authority() {
+    let (_temp_a, ledger_a, profile_a, work_a, _wake_a) = setup_wake();
+    let temp_b = tempfile::TempDir::new().expect("temp B");
+    let ledger_b = WorkLedger::open(temp_b.path()).expect("ledger B");
+    let mut candidate_b = sample_candidate();
+    candidate_b.work_id = opaque_ref("wi", "cross-authority work B");
+    candidate_b.source_ref = opaque_ref("src", "cross-authority work B");
+    candidate_b.content_digest = digest(b"cross-authority work B");
+    let (profile_b, work_b, _wake_b) = add_wake(&ledger_b, candidate_b);
+    let (wake_a, delivery_a) = deliver_wake(&ledger_a, profile_a);
+    let (wake_b, delivery_b) = deliver_wake(&ledger_b, profile_b);
+
+    let context_a = context_receipt(&ledger_a, &wake_a);
+    let context_b = context_receipt(&ledger_b, &wake_b);
+    let context_a_bytes = serde_json::to_vec(&context_a).expect("context A");
+    assert!(
+        ledger_b
+            .acknowledge_agent_context(&wake_b, &context_a_bytes)
+            .is_err(),
+        "a context acknowledgement must bind its exact delivery"
+    );
+    let ownership_a = ledger_a
+        .acknowledge_agent_context(&wake_a, &context_a_bytes)
+        .expect("ownership A");
+    let ownership_b = ledger_b
+        .acknowledge_agent_context(&wake_b, &serde_json::to_vec(&context_b).expect("context B"))
+        .expect("ownership B");
+
+    let expected_a = return_expectation(
+        &work_a,
+        &ownership_a.ownership_id,
+        &ownership_a.receipt_digest,
+        &delivery_a,
+    );
+    let expected_b = return_expectation(
+        &work_b,
+        &ownership_b.ownership_id,
+        &ownership_b.receipt_digest,
+        &delivery_b,
+    );
+    let receipt_a = serde_json::to_vec(&return_receipt(&expected_a)).expect("return A");
+    assert!(
+        ledger_b
+            .return_agent_ownership(
+                &ownership_b.ownership_id,
+                &delivery_b,
+                expected_b.work_generation,
+                &expected_b,
+                &receipt_a,
+            )
+            .is_err(),
+        "an agent return must bind its exact work, delivery, and ownership"
+    );
+    let state: String = ledger_b
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT state FROM agent_ownership WHERE ownership_id = ?1",
+            [&ownership_b.ownership_id],
+            |row| row.get(0),
+        )
+        .expect("ownership state");
+    assert_eq!(state, "acknowledged");
 }
 
 #[test]
@@ -673,6 +824,145 @@ fn non_idempotent_restart_becomes_uncertain_without_launch_or_reconcile() {
         original_idempotency
     );
     assert_eq!(outbox_state(&ledger, &wake_id), "delivered");
+}
+
+#[test]
+fn uncertain_reconciliation_rechecks_work_authority_after_provider_call() {
+    let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut first = Adapter::successful(true);
+    first.launch_outcomes = vec![ProviderOutcome::Uncertain {
+        evidence: b"initial ambiguity".to_vec(),
+    }];
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut first)
+            .expect("initial uncertainty"),
+        WakeDeliveryResult::Uncertain
+    );
+    let mut drifting = DriftingReconcileAdapter {
+        inner: Adapter::successful(true),
+        database_path: ledger.path.clone(),
+        work_item_id: work_id,
+    };
+    assert!(
+        ledger
+            .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut drifting)
+            .is_err(),
+        "stale work authority must refuse provider evidence finalization"
+    );
+    let states: (String, String, String) = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT wake.state, attempt.state, delivery.state
+             FROM outbox wake
+             JOIN provider_deliveries delivery ON delivery.wake_id = wake.wake_id
+             JOIN wake_attempts attempt
+               ON attempt.wake_id = delivery.wake_id AND attempt.attempt = delivery.attempt
+             WHERE wake.wake_id = ?1",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("states");
+    assert_eq!(
+        states,
+        (
+            "uncertain".to_owned(),
+            "uncertain".to_owned(),
+            "uncertain".to_owned(),
+        )
+    );
+}
+
+#[test]
+fn provider_observation_history_is_append_only_ordered_and_survives_reopen() {
+    let (temp, ledger, profile, _work_id, wake_id) = setup_wake();
+    let mut resolver = Resolver { profile, calls: 0 };
+    let mut adapter = Adapter::successful(true);
+    adapter.launch_outcomes = vec![ProviderOutcome::Uncertain {
+        evidence: b"observation A".to_vec(),
+    }];
+    assert_eq!(
+        ledger
+            .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
+            .expect("observation A"),
+        WakeDeliveryResult::Uncertain
+    );
+    adapter.reconcile_outcome = ProviderOutcome::Uncertain {
+        evidence: b"observation B".to_vec(),
+    };
+    assert_eq!(
+        ledger
+            .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut adapter)
+            .expect("observation B"),
+        WakeDeliveryResult::Uncertain
+    );
+
+    let reopened = WorkLedger::open(temp.path()).expect("reopen after uncertainty");
+    adapter.reconcile_outcome = ProviderOutcome::Delivered {
+        receipt: b"observation C".to_vec(),
+    };
+    assert_eq!(
+        reopened
+            .reconcile_uncertain_wake(&active_policy(), &wake_id, &mut adapter)
+            .expect("observation C"),
+        WakeDeliveryResult::Delivered
+    );
+    let reopened = WorkLedger::open(temp.path()).expect("reopen after delivery");
+    let rows: Vec<(u64, String, String, String, String)> = {
+        let connection = reopened.connect_read_only().expect("connection");
+        let mut statement = connection
+            .prepare(
+                "SELECT observation.sequence, observation.from_state, observation.to_state,
+                        observation.outcome_digest, receipt.content_digest
+                   FROM provider_delivery_observations observation
+                   JOIN protected_objects receipt
+                     ON receipt.object_ref = observation.receipt_object_ref
+                  ORDER BY observation.sequence",
+            )
+            .expect("observations");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("collect")
+    };
+    assert_eq!(
+        rows,
+        vec![
+            (
+                1,
+                "launched".to_owned(),
+                "uncertain".to_owned(),
+                digest(b"observation A"),
+                digest(b"observation A"),
+            ),
+            (
+                2,
+                "uncertain".to_owned(),
+                "uncertain".to_owned(),
+                digest(b"observation B"),
+                digest(b"observation B"),
+            ),
+            (
+                3,
+                "uncertain".to_owned(),
+                "delivered".to_owned(),
+                digest(b"observation C"),
+                digest(b"observation C"),
+            ),
+        ]
+    );
+    assert_eq!(reopened.status().expect("status").integrity, "ok");
 }
 
 #[test]

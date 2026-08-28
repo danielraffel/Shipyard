@@ -16,6 +16,9 @@ fn install_exact_v4_schema(connection: &Connection) {
              DROP TRIGGER provider_delivery_no_delete;
              DROP TRIGGER provider_delivery_state_fence_insert;
              DROP TRIGGER provider_delivery_state_fence_update;
+             DROP TRIGGER provider_delivery_observation_insert_fence;
+             DROP TRIGGER provider_delivery_observation_immutable;
+             DROP TRIGGER provider_delivery_observation_no_delete;
              DROP TRIGGER agent_ownership_insert_fence;
              DROP TRIGGER agent_ownership_identity_immutable;
              DROP TRIGGER agent_ownership_no_delete;
@@ -26,6 +29,7 @@ fn install_exact_v4_schema(connection: &Connection) {
              DROP TRIGGER outbox_acknowledged_insert_fence;
              DROP TRIGGER wake_attempt_acknowledged_insert_fence;
              DROP TRIGGER wake_attempt_acknowledged_update_fence;
+             DROP TABLE provider_delivery_observations;
              DROP TABLE agent_ownership;
              DROP TABLE provider_deliveries;
              DROP TABLE activation_epochs;
@@ -263,7 +267,7 @@ fn v1_registry_migrates_transactionally_and_accepts_exact_agent_binding() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate exact v1 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 5);
+    assert_eq!(schema_version(&connection).expect("schema version"), 6);
     let preserved: Vec<(String, String, String)> = {
         let mut statement = connection
             .prepare(
@@ -348,7 +352,7 @@ fn v2_outbox_migrates_through_durable_attempts_and_claim_epochs() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate v2 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 5);
+    assert_eq!(schema_version(&connection).expect("schema version"), 6);
     let attempt_table: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'wake_attempts'",
@@ -381,7 +385,7 @@ fn v3_attempts_migrate_to_claim_epochs_without_rewriting_attempts() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate v3 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 5);
+    assert_eq!(schema_version(&connection).expect("schema version"), 6);
     let claim_table: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_schema
@@ -391,6 +395,38 @@ fn v3_attempts_migrate_to_claim_epochs_without_rewriting_attempts() {
         )
         .expect("claim table");
     assert_eq!(claim_table, 1);
+}
+
+#[test]
+fn v5_migrates_to_append_only_provider_delivery_observations() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("create current ledger");
+    let connection = ledger.connect_read_write().expect("connection");
+    connection
+        .execute_batch(
+            "DROP TRIGGER provider_delivery_observation_insert_fence;
+             DROP TRIGGER provider_delivery_observation_no_delete;
+             DROP TRIGGER provider_delivery_observation_immutable;
+             DROP INDEX provider_delivery_observations_delivery;
+             DROP TABLE provider_delivery_observations;
+             PRAGMA user_version = 5;",
+        )
+        .expect("exact v5 surface");
+    drop(connection);
+    drop(ledger);
+
+    let migrated = WorkLedger::open(temp.path()).expect("migrate v5 ledger");
+    let connection = migrated.connect_read_only().expect("inspect migration");
+    assert_eq!(schema_version(&connection).expect("schema version"), 6);
+    let observation_table: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'provider_delivery_observations'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("observation table");
+    assert_eq!(observation_table, 1);
 }
 
 #[test]
@@ -450,7 +486,7 @@ fn v4_acknowledged_delivery_migrates_losslessly_to_split_v5_schema() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate exact v4 ledger");
     let connection = migrated.connect_read_only().expect("inspect v5");
-    assert_eq!(schema_version(&connection).expect("schema version"), 5);
+    assert_eq!(schema_version(&connection).expect("schema version"), 6);
     let outbox: (String, Option<String>, String) = connection
         .query_row(
             "SELECT state, provider_delivery_id, transport_receipt_digest
