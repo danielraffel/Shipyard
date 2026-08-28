@@ -60,6 +60,7 @@ pub(crate) use delivery_ownership::{
 };
 pub(crate) use dispatch::{FreshAgentLaunchProfile, FreshAgentResumeExpectation};
 mod lifecycle;
+mod native_publication;
 mod observation;
 mod persistence;
 mod policy;
@@ -73,6 +74,10 @@ use importer::import_report;
 #[cfg(test)]
 use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};
 pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};
+#[allow(unused_imports)] // Consumed by the CLI/runtime integration follow-up.
+pub(crate) use native_publication::{
+    ExactProtectedProfileResolver, NativePublicationReport, NativePublicationRequest,
+};
 pub use observation::ShadowPrTarget;
 pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
 pub use policy::RepoPolicy;
