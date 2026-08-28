@@ -529,6 +529,25 @@ fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
         )
         .expect("return replay");
     assert_eq!(return_replay, returned);
+    assert_eq!(
+        restarted
+            .agent_context_challenge(&wake_id, &["danielraffel/pulp".to_owned()])
+            .expect("CLI ack preflight after lost returned response"),
+        context
+    );
+    assert_eq!(
+        restarted
+            .acknowledge_agent_context(&wake_id, &context_bytes)
+            .expect("CLI ack replay after ownership returned"),
+        ownership
+    );
+    assert_eq!(
+        restarted
+            .agent_return_challenge(&ownership.ownership_id, &["danielraffel/pulp".to_owned()],)
+            .expect("CLI return preflight after lost returned response")
+            .ownership_id,
+        ownership.ownership_id
+    );
     let mut other_expected = expected.clone();
     other_expected.evidence_digest = "9".repeat(64);
     let other_receipt = serde_json::to_vec(&return_receipt(&other_expected)).expect("other return");
@@ -698,6 +717,79 @@ fn context_and_return_receipts_cannot_cross_delivery_or_ownership_authority() {
         )
         .expect("ownership state");
     assert_eq!(state, "acknowledged");
+}
+
+#[test]
+fn rejected_alternate_receipt_replays_do_not_grow_protected_storage() {
+    let (_temp, ledger, profile, work_id, _wake_id) = setup_wake();
+    let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
+    let context = context_receipt(&ledger, &wake_id);
+    let context_bytes = serde_json::to_vec(&context).expect("context receipt");
+    let ownership = ledger
+        .acknowledge_agent_context(&wake_id, &context_bytes)
+        .expect("acknowledge");
+    let after_ack = ledger.status().expect("status after ack").protected_objects;
+    let alternate_context = serde_json::to_vec_pretty(&context).expect("alternate context bytes");
+    assert_ne!(digest(&alternate_context), digest(&context_bytes));
+    for _ in 0..3 {
+        assert!(
+            ledger
+                .acknowledge_agent_context(&wake_id, &alternate_context)
+                .is_err()
+        );
+    }
+    assert_eq!(
+        ledger
+            .status()
+            .expect("status after refused ack")
+            .protected_objects,
+        after_ack
+    );
+
+    let expected = return_expectation(
+        &work_id,
+        &ownership.ownership_id,
+        &ownership.receipt_digest,
+        &delivery_id,
+    );
+    let return_receipt = return_receipt(&expected);
+    let return_bytes = serde_json::to_vec(&return_receipt).expect("return receipt");
+    ledger
+        .return_agent_ownership(
+            &ownership.ownership_id,
+            &delivery_id,
+            expected.work_generation,
+            &expected,
+            &return_bytes,
+        )
+        .expect("return");
+    let after_return = ledger
+        .status()
+        .expect("status after return")
+        .protected_objects;
+    let alternate_return =
+        serde_json::to_vec_pretty(&return_receipt).expect("alternate return bytes");
+    assert_ne!(digest(&alternate_return), digest(&return_bytes));
+    for _ in 0..3 {
+        assert!(
+            ledger
+                .return_agent_ownership(
+                    &ownership.ownership_id,
+                    &delivery_id,
+                    expected.work_generation,
+                    &expected,
+                    &alternate_return,
+                )
+                .is_err()
+        );
+    }
+    assert_eq!(
+        ledger
+            .status()
+            .expect("status after refused return")
+            .protected_objects,
+        after_return
+    );
 }
 
 #[test]

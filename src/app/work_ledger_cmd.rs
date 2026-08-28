@@ -127,7 +127,8 @@ pub(super) fn work_ledger_command<W: Write>(
             write_publication_report(stdout, &report, json)?;
         }
         WorkLedgerCommand::ContextChallenge { wake } => {
-            let ready = ready_production_activation(runtime_paths)?;
+            let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
+            let ready = activation.revalidate()?;
             let ledger = required_ledger(state_dir)?;
             let challenge = ledger
                 .agent_context_challenge(wake, &ready.config.repositories)
@@ -148,13 +149,18 @@ pub(super) fn work_ledger_command<W: Write>(
             }
         }
         WorkLedgerCommand::AcknowledgeContext { wake, receipt } => {
-            let ready = ready_production_activation(runtime_paths)?;
-            let bytes = read_private_input(receipt)?;
+            let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
+            let (bytes, ready) =
+                read_then_revalidate(&mut activation, || read_private_input(receipt))?;
             let ledger = required_ledger(state_dir)?;
-            // Authorize this wake before accepting caller-supplied receipt bytes.
             ledger
                 .agent_context_challenge(wake, &ready.config.repositories)
                 .map_err(failure)?;
+            let ready = activation.revalidate()?;
+            ledger
+                .agent_context_challenge(wake, &ready.config.repositories)
+                .map_err(failure)?;
+            activation.revalidate()?;
             let ownership = ledger
                 .acknowledge_agent_context(wake, &bytes)
                 .map_err(failure)?;
@@ -170,7 +176,8 @@ pub(super) fn work_ledger_command<W: Write>(
             )?;
         }
         WorkLedgerCommand::ReturnChallenge { ownership } => {
-            let ready = ready_production_activation(runtime_paths)?;
+            let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
+            let ready = activation.revalidate()?;
             let ledger = required_ledger(state_dir)?;
             let challenge = ledger
                 .agent_return_challenge(ownership, &ready.config.repositories)
@@ -200,9 +207,14 @@ pub(super) fn work_ledger_command<W: Write>(
                     "expectation and receipt cannot both read from stdin",
                 ));
             }
-            let ready = ready_production_activation(runtime_paths)?;
-            let expectation_bytes = read_private_input(expectation)?;
-            let receipt_bytes = read_private_input(receipt)?;
+            let mut activation = ProductionHandshakeActivation::new(runtime_paths)?;
+            let ((expectation_bytes, receipt_bytes), ready) =
+                read_then_revalidate(&mut activation, || {
+                    Ok((
+                        read_private_input(expectation)?,
+                        read_private_input(receipt)?,
+                    ))
+                })?;
             let expected: AgentReturnExpectation = serde_json::from_slice(&expectation_bytes)
                 .map_err(|_| {
                     CliFailure::new(1, "return expectation is not exact schema-v1 JSON")
@@ -217,6 +229,11 @@ pub(super) fn work_ledger_command<W: Write>(
             ledger
                 .agent_return_challenge(ownership, &ready.config.repositories)
                 .map_err(failure)?;
+            let ready = activation.revalidate()?;
+            ledger
+                .agent_return_challenge(ownership, &ready.config.repositories)
+                .map_err(failure)?;
+            activation.revalidate()?;
             let returned = ledger
                 .return_agent_ownership(
                     ownership,
@@ -235,31 +252,69 @@ pub(super) fn work_ledger_command<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
-fn ready_production_activation(
-    runtime_paths: &RuntimePaths,
-) -> Result<crate::workstream_activation_loader::ReadyWorkstreamActivation, CliFailure> {
-    let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
-    if runtime_paths != &production_paths {
-        return Err(CliFailure::new(
-            1,
-            "agent handshake is available only against canonical production roots",
-        ));
+trait HandshakeActivation {
+    fn revalidate(
+        &mut self,
+    ) -> Result<crate::workstream_activation_loader::ReadyWorkstreamActivation, CliFailure>;
+}
+
+struct ProductionHandshakeActivation {
+    loader: WorkstreamActivationLoader,
+}
+
+impl ProductionHandshakeActivation {
+    fn new(runtime_paths: &RuntimePaths) -> Result<Self, CliFailure> {
+        let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+        if runtime_paths != &production_paths {
+            return Err(CliFailure::new(
+                1,
+                "agent handshake is available only against canonical production roots",
+            ));
+        }
+        Ok(Self {
+            loader: WorkstreamActivationLoader::production(),
+        })
     }
-    let mut loader = WorkstreamActivationLoader::production();
-    match loader.revalidate_for_tick() {
-        WorkstreamActivationState::Ready(ready) => Ok(ready),
-        WorkstreamActivationState::Disabled => Err(CliFailure::new(
-            1,
-            "workstream continuation activation is disabled",
-        )),
-        WorkstreamActivationState::Refused(reason) => Err(CliFailure::new(
-            1,
-            format!(
-                "workstream continuation activation refused: {}",
-                reason.code()
-            ),
-        )),
+}
+
+impl HandshakeActivation for ProductionHandshakeActivation {
+    fn revalidate(
+        &mut self,
+    ) -> Result<crate::workstream_activation_loader::ReadyWorkstreamActivation, CliFailure> {
+        match self.loader.revalidate_for_tick() {
+            WorkstreamActivationState::Ready(ready) => Ok(ready),
+            WorkstreamActivationState::Disabled => Err(CliFailure::new(
+                1,
+                "workstream continuation activation is disabled",
+            )),
+            WorkstreamActivationState::Refused(reason) => Err(CliFailure::new(
+                1,
+                format!(
+                    "workstream continuation activation refused: {}",
+                    reason.code()
+                ),
+            )),
+        }
     }
+}
+
+fn read_then_revalidate<A, T>(
+    activation: &mut A,
+    read: impl FnOnce() -> Result<T, CliFailure>,
+) -> Result<
+    (
+        T,
+        crate::workstream_activation_loader::ReadyWorkstreamActivation,
+    ),
+    CliFailure,
+>
+where
+    A: HandshakeActivation,
+{
+    activation.revalidate()?;
+    let value = read()?;
+    let ready = activation.revalidate()?;
+    Ok((value, ready))
 }
 
 fn required_ledger(state_dir: &Path) -> Result<WorkLedger, CliFailure> {
@@ -538,9 +593,64 @@ fn failure(error: impl std::fmt::Display) -> CliFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+
     use super::*;
     use serde_json::Value;
     use tempfile::TempDir;
+
+    use crate::workstream_activation_loader::ReadyWorkstreamActivation;
+    use crate::workstream_continuation_config::{
+        ProviderWrapperConfig, WorkstreamContinuationConfig,
+    };
+
+    struct SequenceActivation(VecDeque<Result<ReadyWorkstreamActivation, &'static str>>);
+
+    impl HandshakeActivation for SequenceActivation {
+        fn revalidate(&mut self) -> Result<ReadyWorkstreamActivation, CliFailure> {
+            self.0
+                .pop_front()
+                .expect("activation sequence")
+                .map_err(|code| CliFailure::new(1, code))
+        }
+    }
+
+    fn ready_activation() -> ReadyWorkstreamActivation {
+        ReadyWorkstreamActivation {
+            machine_tag: "m5".to_owned(),
+            config: WorkstreamContinuationConfig {
+                origin_machine: "m5".to_owned(),
+                repositories: vec!["generous-corp/shipyard".to_owned()],
+                provider_wrapper: ProviderWrapperConfig {
+                    executable_path: PathBuf::from("/opt/wrapper"),
+                    executable_sha256: "a".repeat(64),
+                    provider_id: "codex".to_owned(),
+                    adapter_id: "cmux-workstream-v1".to_owned(),
+                    deadline_seconds: 30,
+                    max_stdout_bytes: 1024,
+                    max_stderr_bytes: 1024,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn planted_blocking_input_activation_drift_refuses_before_mutation_authority() {
+        let mut activation = SequenceActivation(VecDeque::from([
+            Ok(ready_activation()),
+            Err("activation_drift"),
+        ]));
+        let mut input_completed = false;
+        let error = read_then_revalidate(&mut activation, || {
+            input_completed = true;
+            Ok(vec![b'{', b'}'])
+        })
+        .expect_err("drift after blocked input");
+        assert!(input_completed);
+        assert_eq!(error.message(), "activation_drift");
+        assert!(activation.0.is_empty());
+    }
 
     #[test]
     fn policy_json_always_reports_shadow_activation_and_dispatch() {

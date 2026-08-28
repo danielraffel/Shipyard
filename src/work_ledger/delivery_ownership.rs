@@ -183,9 +183,12 @@ impl WorkLedger {
                      ON delivery.delivery_id = ownership.delivery_id
                    JOIN work_items work ON work.id = ownership.work_item_id
                   WHERE ownership.ownership_id = ?1
-                    AND ownership.state = 'acknowledged'
-                    AND work.phase = 'agent_owned_repair'
-                    AND work.work_generation = ownership.work_generation + 1
+                    AND ((ownership.state = 'acknowledged'
+                          AND work.phase = 'agent_owned_repair'
+                          AND work.work_generation = ownership.work_generation + 1)
+                      OR (ownership.state = 'returned'
+                          AND work.phase = 'returned'
+                          AND work.work_generation = ownership.work_generation + 2))
                     AND work.owner_generation = ownership.owner_generation",
                 [ownership_id],
                 |row| {
@@ -249,13 +252,6 @@ impl WorkLedger {
         })?;
         validate_context_receipt(&authority, &request.resume, &receipt)?;
         let receipt_digest = digest(receipt_bytes);
-        let receipt_object = self.put_protected_object(
-            &authority.work_item_id,
-            ProtectedObjectKind::AgentReceipt,
-            None,
-            &receipt_digest,
-            receipt_bytes,
-        )?;
         let ownership_id = opaque_ref(
             "ao",
             &format!(
@@ -269,6 +265,40 @@ impl WorkLedger {
             .parent()
             .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut preflight = self.connect_read_write()?;
+        configure_durable(&preflight)?;
+        verify_supported_schema(&preflight)?;
+        verify_integrity(&preflight)?;
+        let transaction = preflight.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT ownership_id, context_receipt_object_ref, context_receipt_digest
+                 FROM agent_ownership WHERE delivery_id = ?1",
+                [&authority.delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.0 == ownership_id && existing.2 == receipt_digest {
+                return Ok(AgentOwnershipReceipt {
+                    ownership_id,
+                    receipt_object_ref: existing.1,
+                    receipt_digest,
+                });
+            }
+            return Err(WorkLedgerError::Refused(
+                "provider delivery is already bound to different agent ownership".to_owned(),
+            ));
+        }
+        verify_delivered_authority(&transaction, wake_id, &authority)?;
+        transaction.commit()?;
+        let receipt_object = self.put_protected_object_with_writer_domain(
+            &authority.work_item_id,
+            ProtectedObjectKind::AgentReceipt,
+            None,
+            &receipt_digest,
+            receipt_bytes,
+        )?;
         let mut connection = self.connect_read_write()?;
         configure_durable(&connection)?;
         verify_supported_schema(&connection)?;
@@ -454,18 +484,70 @@ impl WorkLedger {
             ));
         }
         let receipt_digest = digest(receipt_bytes);
-        let receipt_object = self.put_protected_object(
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let mut preflight = self.connect_read_write()?;
+        configure_durable(&preflight)?;
+        verify_supported_schema(&preflight)?;
+        verify_integrity(&preflight)?;
+        let transaction = preflight.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: (String, String, u64, u64) = transaction.query_row(
+            "SELECT ownership.state, work.phase, work.work_generation, work.owner_generation
+             FROM agent_ownership ownership
+             JOIN work_items work ON work.id = ownership.work_item_id
+             WHERE ownership.ownership_id = ?1 AND ownership.delivery_id = ?2",
+            params![ownership_id, expected_delivery_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if current.0 == "returned" && current.1 == LifecycleState::Returned.as_str() {
+            let exact_object: Option<String> = transaction
+                .query_row(
+                    "SELECT object.object_ref FROM events event
+                     JOIN protected_objects object
+                       ON object.work_item_id = event.work_item_id
+                      AND object.kind = 'agent_receipt'
+                      AND object.content_digest = event.payload_digest
+                     WHERE event.work_item_id = ?1
+                       AND event.kind = 'agent_ownership_returned'
+                       AND event.payload_digest = ?2",
+                    params![authority.0, receipt_digest],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(receipt_object_ref) = exact_object {
+                return Ok(AgentOwnershipReceipt {
+                    ownership_id: ownership_id.to_owned(),
+                    receipt_object_ref,
+                    receipt_digest,
+                });
+            }
+            return Err(WorkLedgerError::Refused(
+                "agent ownership already returned with different authority".to_owned(),
+            ));
+        }
+        if current
+            != (
+                "acknowledged".to_owned(),
+                LifecycleState::AgentOwnedRepair.as_str().to_owned(),
+                expected_work_generation,
+                authority.3,
+            )
+        {
+            return Err(WorkLedgerError::Refused(
+                "agent ownership changed before return".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        let receipt_object = self.put_protected_object_with_writer_domain(
             &authority.0,
             ProtectedObjectKind::AgentReceipt,
             None,
             &receipt_digest,
             receipt_bytes,
         )?;
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
-        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
         let mut connection = self.connect_read_write()?;
         configure_durable(&connection)?;
         verify_supported_schema(&connection)?;

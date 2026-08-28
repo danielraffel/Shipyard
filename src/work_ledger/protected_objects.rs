@@ -125,6 +125,29 @@ impl WorkLedger {
         expected_digest: &str,
         bytes: &[u8],
     ) -> WorkLedgerResult<ProtectedObjectRecord> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        self.put_protected_object_with_writer_domain(
+            work_item_id,
+            kind,
+            profile_ref,
+            expected_digest,
+            bytes,
+        )
+    }
+
+    /// Persist while the caller already owns this ledger's writer domain.
+    pub(super) fn put_protected_object_with_writer_domain(
+        &self,
+        work_item_id: &str,
+        kind: ProtectedObjectKind,
+        profile_ref: Option<&str>,
+        expected_digest: &str,
+        bytes: &[u8],
+    ) -> WorkLedgerResult<ProtectedObjectRecord> {
         validate_digest("protected object digest", expected_digest)?;
         if bytes.len() > MAX_PROTECTED_OBJECT_BYTES {
             return Err(WorkLedgerError::Refused(
@@ -157,7 +180,6 @@ impl WorkLedger {
             .path
             .parent()
             .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
-        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
         let directory = open_object_directory(parent, true)?;
         reconcile_pending_objects(&directory)?;
         let mut connection = self.connect_read_write()?;
