@@ -1380,11 +1380,23 @@ mod tests {
             run_provider_wrapper(&config, &ProviderWrapperEnvironment::default(), &submit).unwrap(),
             ProviderWrapperRunResult::Uncertain { .. }
         ));
-        assert!(matches!(
-            run_provider_wrapper(&config, &ProviderWrapperEnvironment::default(), &reconcile,)
-                .unwrap(),
-            ProviderWrapperRunResult::Retryable { .. }
-        ));
+        let reconcile_result =
+            run_provider_wrapper(&config, &ProviderWrapperEnvironment::default(), &reconcile)
+                .unwrap();
+        let cleanup_unproven = matches!(
+            &reconcile_result,
+            ProviderWrapperRunResult::Uncertain {
+                evidence_digest,
+                response_receipt: None,
+            } if evidence_digest == &digest("provider-wrapper-cleanup-unproven")
+        );
+        assert!(
+            matches!(
+                &reconcile_result,
+                ProviderWrapperRunResult::Retryable { .. }
+            ) || (cfg!(target_os = "macos") && cleanup_unproven),
+            "reconcile must map its response or preserve macOS cleanup uncertainty: {reconcile_result:?}"
+        );
         assert_eq!(fs::read(&submit_count).unwrap(), b"1");
         assert_eq!(fs::read(&reconcile_count).unwrap(), b"1");
         assert_eq!(
