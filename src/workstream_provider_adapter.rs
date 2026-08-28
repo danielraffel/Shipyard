@@ -13,7 +13,9 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -78,6 +80,7 @@ trait CmuxRunner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunnerFailure {
     Unavailable,
+    #[cfg(any(target_os = "macos", test))]
     Untrusted,
 }
 
@@ -160,6 +163,7 @@ fn handle_request(
         return response(request, outcome);
     }
     match runner.verify() {
+        #[cfg(any(target_os = "macos", test))]
         Err(RunnerFailure::Untrusted) => {
             let outcome = match request.operation {
                 ProviderWrapperOperationV1::Submit => rejected("cmux-untrusted"),
