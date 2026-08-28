@@ -59,6 +59,72 @@ download_asset() {
     fi
 }
 
+checksum_for_asset() {
+    manifest="$1"
+    asset_name="$2"
+    awk -v wanted="${asset_name}" '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            digest = ""
+            filename = ""
+            if (length(line) >= 67 && substr(line, 65, 2) == "  ") {
+                digest = substr(line, 1, 64)
+                filename = substr(line, 67)
+            } else if (length(line) >= 66 && substr(line, 65, 2) == " *") {
+                digest = substr(line, 1, 64)
+                filename = substr(line, 67)
+            } else {
+                fields = split(line, parts, /[[:space:]]+/)
+                if (fields > 1 && parts[fields] == wanted) {
+                    invalid = 1
+                }
+                next
+            }
+            if (filename == wanted) {
+                matches += 1
+                if (length(digest) != 64 || digest !~ /^[0-9A-Fa-f]+$/) {
+                    invalid = 1
+                }
+                expected = tolower(digest)
+            }
+        }
+        END {
+            if (matches != 1 || invalid) {
+                exit 1
+            }
+            print expected
+        }
+    ' "${manifest}"
+}
+
+sha256_file() {
+    path="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "${path}" | awk '{ print tolower($1) }'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "${path}" | awk '{ print tolower($1) }'
+    else
+        echo "Neither shasum nor sha256sum is available; refusing an unverified install." >&2
+        return 1
+    fi
+}
+
+verify_release_asset() {
+    asset_path="$1"
+    asset_name="$2"
+    manifest="$3"
+    if ! expected_digest=$(checksum_for_asset "${manifest}" "${asset_name}"); then
+        echo "checksums.sha256 must contain exactly one valid entry for ${asset_name}." >&2
+        return 1
+    fi
+    actual_digest=$(sha256_file "${asset_path}") || return 1
+    if [ "${actual_digest}" != "${expected_digest}" ]; then
+        echo "SHA-256 verification failed for ${asset_name}; refusing to install." >&2
+        return 1
+    fi
+}
+
 ARTIFACT_PREFIX="${SHIPYARD_ARTIFACT_PREFIX:-shipyard}"
 BINARY_NAME="shipyard"
 ALIAS_NAME="sy"
@@ -200,6 +266,8 @@ DMG_URL=""
 DMG_URL_IS_API=0
 RELEASE_URL=""
 RELEASE_URL_IS_API=0
+CHECKSUM_URL=""
+CHECKSUM_URL_IS_API=0
 if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
     echo "Resolving ${VERSION_LABEL} from ${REPO}..."
     if ! RELEASE_RESPONSE="$(curl_shipyard -sSL -w '\n%{http_code}' "https://api.github.com/repos/${REPO}/${API_PATH}")"; then
@@ -258,21 +326,50 @@ if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
         echo "Check https://github.com/${REPO}/releases for available builds." >&2
         exit 1
     fi
+    CHECKSUM_URL=$(printf '%s' "${RELEASE_JSON}" \
+        | select_asset_url "checksums.sha256" "${PREFER_API_ASSET_URL}" || true)
+    if [ -n "${CHECKSUM_URL}" ] && [ "${PREFER_API_ASSET_URL}" = "1" ]; then
+        CHECKSUM_URL_IS_API=1
+    fi
+    if [ -z "${CHECKSUM_URL}" ]; then
+        CHECKSUM_URL=$(printf '%s' "${RELEASE_JSON}" \
+            | grep 'browser_download_url.*checksums\.sha256"' \
+            | head -1 \
+            | cut -d '"' -f 4 || true)
+    fi
+    if [ -z "${CHECKSUM_URL}" ]; then
+        echo "Release ${VERSION_LABEL} has no checksums.sha256 asset; refusing an unverified install." >&2
+        exit 1
+    fi
 fi
 
 DEST="${INSTALL_DIR}/${BINARY_NAME}"
 STAGED_DEST="${INSTALL_DIR}/.${BINARY_NAME}.install.$$"
-trap 'rm -f "${STAGED_DEST:-}"' EXIT
+DOWNLOAD_TMP_DIR=""
+cleanup_install() {
+    rm -f "${STAGED_DEST:-}"
+    if [ -n "${DOWNLOAD_TMP_DIR}" ] && [ -d "${DOWNLOAD_TMP_DIR}" ]; then
+        rm -rf "${DOWNLOAD_TMP_DIR}"
+    fi
+}
+trap cleanup_install EXIT
 if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" = "1" ]; then
     if [ ! -f "${DEST}" ]; then
         echo "SHIPYARD_SKIP_DOWNLOAD=1 but ${DEST} does not exist." >&2
         exit 1
     fi
     cp "${DEST}" "${STAGED_DEST}"
-elif [ -n "${DMG_URL}" ]; then
-    echo "Downloading ${ARTIFACT}.dmg (${VERSION_LABEL})..."
-    DMG_TMP="$(mktemp -d)/shipyard.dmg"
+else
+    DOWNLOAD_TMP_DIR="$(mktemp -d)"
+    CHECKSUMS_TMP="${DOWNLOAD_TMP_DIR}/checksums.sha256"
+    download_asset "${CHECKSUM_URL}" "${CHECKSUMS_TMP}" "${CHECKSUM_URL_IS_API}"
+fi
+if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ] && [ -n "${DMG_URL}" ]; then
+    ASSET_NAME="${ARTIFACT}.dmg"
+    echo "Downloading ${ASSET_NAME} (${VERSION_LABEL})..."
+    DMG_TMP="${DOWNLOAD_TMP_DIR}/${ASSET_NAME}"
     download_asset "${DMG_URL}" "${DMG_TMP}" "${DMG_URL_IS_API}"
+    verify_release_asset "${DMG_TMP}" "${ASSET_NAME}" "${CHECKSUMS_TMP}"
     MOUNT_POINT="$(mktemp -d)/mnt"
     if ! hdiutil attach -nobrowse -readonly \
             -mountpoint "${MOUNT_POINT}" "${DMG_TMP}" >/dev/null 2>&1; then
@@ -290,9 +387,11 @@ elif [ -n "${DMG_URL}" ]; then
     cp "${MOUNT_POINT}/${BINARY_NAME}" "${STAGED_DEST}"
     hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || true
     rm -f "${DMG_TMP}"
-else
+elif [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
+    ASSET_NAME="${ARTIFACT}"
     echo "Downloading ${ARTIFACT} (${VERSION_LABEL})..."
     download_asset "${RELEASE_URL}" "${STAGED_DEST}" "${RELEASE_URL_IS_API}"
+    verify_release_asset "${STAGED_DEST}" "${ASSET_NAME}" "${CHECKSUMS_TMP}"
 fi
 chmod +x "${STAGED_DEST}"
 

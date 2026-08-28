@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +44,14 @@ class ReleaseConfig:
     install_sh: Path = ROOT / "install.sh"
 
 
+@dataclass(frozen=True)
+class ReleaseSource:
+    tag: str
+    version: str
+    head: str
+    tree: str
+
+
 class CommandRunner:
     def run(
         self,
@@ -64,7 +73,13 @@ class CommandRunner:
             capture_output=capture,
         )
         if result.returncode != 0:
-            detail = f"command failed ({result.returncode}): {' '.join(args)}"
+            safe_args = [
+                "Authorization: Bearer <redacted>"
+                if value.startswith("Authorization: Bearer ")
+                else value
+                for value in args
+            ]
+            detail = f"command failed ({result.returncode}): {' '.join(safe_args)}"
             if result.stderr:
                 detail = f"{detail}\n{result.stderr.strip()}"
             raise SystemExit(detail)
@@ -145,6 +160,72 @@ def resolve_tag(tag: str | None, runner: CommandRunner) -> str:
             "--tag is required when the current commit is not an exact release tag"
         )
     return discovered
+
+
+def cargo_package_version(source_root: Path) -> str:
+    cargo_toml = source_root / "Cargo.toml"
+    try:
+        payload = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
+        version = payload["package"]["version"]
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as error:
+        raise SystemExit(f"could not read package.version from {cargo_toml}: {error}") from error
+    if not isinstance(version, str) or not version:
+        raise SystemExit(f"invalid package.version in {cargo_toml}")
+    return version
+
+
+def verify_release_source(
+    tag: str,
+    runner: CommandRunner,
+    *,
+    source_root: Path = ROOT,
+) -> ReleaseSource:
+    version = cargo_package_version(source_root)
+    expected_tag = f"v{version}"
+    if tag != expected_tag:
+        raise SystemExit(
+            f"release tag {tag!r} does not match Cargo package version {version!r}; "
+            f"expected {expected_tag!r}"
+        )
+
+    dirty = runner.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        capture=True,
+        cwd=source_root,
+    )
+    if dirty:
+        raise SystemExit("release source checkout is not clean; refusing to package")
+
+    head = runner.run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        capture=True,
+        cwd=source_root,
+    )
+    tree = runner.run(
+        ["git", "rev-parse", "--verify", "HEAD^{tree}"],
+        capture=True,
+        cwd=source_root,
+    )
+    tag_ref = f"refs/tags/{tag}"
+    tag_commit = runner.run(
+        ["git", "rev-parse", "--verify", f"{tag_ref}^{{commit}}"],
+        capture=True,
+        cwd=source_root,
+    )
+    tag_tree = runner.run(
+        ["git", "rev-parse", "--verify", f"{tag_ref}^{{tree}}"],
+        capture=True,
+        cwd=source_root,
+    )
+    if tag_commit != head:
+        raise SystemExit(
+            f"release tag {tag!r} peels to {tag_commit}, but checkout HEAD is {head}"
+        )
+    if tag_tree != tree:
+        raise SystemExit(
+            f"release tag {tag!r} has tree {tag_tree}, but checkout tree is {tree}"
+        )
+    return ReleaseSource(tag=tag, version=version, head=head, tree=tree)
 
 
 def require_arm64(arch: str) -> None:
@@ -478,6 +559,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"unattended release authentication ready: notarization={mode}")
         return 0
     tag = resolve_tag(args.tag, runner)
+    verify_release_source(tag, runner)
     config = ReleaseConfig(
         tag=tag,
         repo=args.repo,

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -55,6 +57,28 @@ class FakeRunner(release_macos_local.CommandRunner):
 
 
 class ReleaseMacosLocalTests(unittest.TestCase):
+    def make_release_repo(self, root: Path, version: str = "1.2.3") -> None:
+        (root / "Cargo.toml").write_text(
+            f'[package]\nname = "shipyard"\nversion = "{version}"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(
+            ["git", "config", "user.name", "Shipyard Test"], cwd=root, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "shipyard@example.invalid"],
+            cwd=root,
+            check=True,
+        )
+        subprocess.run(["git", "add", "Cargo.toml"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "release source"], cwd=root, check=True)
+        subprocess.run(
+            ["git", "tag", "-a", f"v{version}", "-m", f"Release v{version}"],
+            cwd=root,
+            check=True,
+        )
+
     def test_shell_wrapper_matches_mainline_entrypoint(self) -> None:
         wrapper = release_macos_local.ROOT / "scripts" / "release-macos-local.sh"
         content = wrapper.read_text(encoding="utf-8")
@@ -85,6 +109,89 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             release_macos_local.require_arm64("x64")
         self.assertIn("arm64", str(ctx.exception))
+
+    def test_release_source_binds_clean_head_tree_version_and_tag_peel(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_release_repo(root)
+
+            source = release_macos_local.verify_release_source(
+                "v1.2.3", release_macos_local.CommandRunner(), source_root=root
+            )
+            expected_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            expected_tree = subprocess.run(
+                ["git", "rev-parse", "HEAD^{tree}"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        self.assertEqual(source.version, "1.2.3")
+        self.assertEqual(source.tag, "v1.2.3")
+        self.assertEqual(source.head, expected_head)
+        self.assertEqual(source.tree, expected_tree)
+
+    def test_release_source_refuses_dirty_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_release_repo(root)
+            (root / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.verify_release_source(
+                    "v1.2.3", release_macos_local.CommandRunner(), source_root=root
+                )
+
+        self.assertIn("not clean", str(ctx.exception))
+
+    def test_release_source_refuses_tag_at_different_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_release_repo(root)
+            (root / "tracked.txt").write_text("new commit\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "after tag"], cwd=root, check=True)
+
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.verify_release_source(
+                    "v1.2.3", release_macos_local.CommandRunner(), source_root=root
+                )
+
+        self.assertIn("checkout HEAD", str(ctx.exception))
+
+    def test_release_source_refuses_version_tag_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.make_release_repo(root)
+
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.verify_release_source(
+                    "v9.9.9", release_macos_local.CommandRunner(), source_root=root
+                )
+
+        self.assertIn("expected 'v1.2.3'", str(ctx.exception))
+
+    def test_command_failure_redacts_bearer_token(self) -> None:
+        secret = "release-token-must-not-print"
+        with self.assertRaises(SystemExit) as ctx:
+            release_macos_local.CommandRunner().run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.exit(7)",
+                    f"Authorization: Bearer {secret}",
+                ]
+            )
+
+        self.assertNotIn(secret, str(ctx.exception))
+        self.assertIn("Authorization: Bearer <redacted>", str(ctx.exception))
 
     def test_release_environment_file_must_be_private(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
