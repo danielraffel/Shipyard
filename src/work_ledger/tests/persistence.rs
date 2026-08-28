@@ -406,6 +406,7 @@ fn failed_v1_registry_rebuild_rolls_back_schema_and_rows() {
     assert!(!old_schema.contains("'agent'"));
 }
 
+#[cfg(unix)]
 #[test]
 fn canonical_snapshot_apis_preserve_dry_run_and_idempotent_apply_boundaries() {
     let temp = TempDir::new().expect("temp");
@@ -425,6 +426,28 @@ fn canonical_snapshot_apis_preserve_dry_run_and_idempotent_apply_boundaries() {
     assert!(second.applied);
     assert_eq!(second.inserted, 0);
     assert_eq!(second.plan_digest, first.plan_digest);
+}
+
+#[cfg(not(unix))]
+#[test]
+fn canonical_snapshot_apis_refuse_without_side_effects_on_unsupported_hosts() {
+    let temp = TempDir::new().expect("temp");
+    let state_dir = temp.path().join("state");
+    let expected_reason = "work-ledger legacy import is currently supported only on Unix hosts";
+
+    let plan_error = plan_legacy_snapshot(&state_dir).expect_err("plan must refuse");
+    assert!(
+        matches!(plan_error, WorkLedgerError::Refused(ref reason) if reason == expected_reason),
+        "unexpected plan refusal: {plan_error}"
+    );
+    assert!(!state_dir.exists());
+
+    let apply_error = apply_legacy_snapshot(&state_dir).expect_err("apply must refuse");
+    assert!(
+        matches!(apply_error, WorkLedgerError::Refused(ref reason) if reason == expected_reason),
+        "unexpected apply refusal: {apply_error}"
+    );
+    assert!(!state_dir.exists());
 }
 
 #[test]
