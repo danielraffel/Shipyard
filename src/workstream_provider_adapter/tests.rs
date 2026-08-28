@@ -15,6 +15,8 @@ use crate::work_ledger::{
 
 const UUID: &str = "123E4567-E89B-12D3-A456-426614174000";
 const OTHER_WINDOW_UUID: &str = "923E4567-E89B-12D3-A456-426614174000";
+const SURFACE_UUID: &str = "223E4567-E89B-12D3-A456-426614174000";
+const SESSION_UUID: &str = "323E4567-E89B-12D3-A456-426614174000";
 
 #[derive(Default)]
 struct FakeRunner {
@@ -66,7 +68,37 @@ fn created() -> Result<CommandResult, RunnerFailure> {
     successful_json(serde_json::json!({
         "window_id": UUID,
         "workspace_id": UUID,
-        "surface_id": "223E4567-E89B-12D3-A456-426614174000"
+        "surface_id": SURFACE_UUID
+    }))
+}
+
+fn surface_health(surface_ids: &[&str]) -> Result<CommandResult, RunnerFailure> {
+    successful_json(serde_json::json!({
+        "window_id": OTHER_WINDOW_UUID,
+        "workspace_id": UUID,
+        "surfaces": surface_ids.iter().map(|id| serde_json::json!({
+            "id": id,
+            "in_window": true,
+            "index": 0,
+            "type": "terminal"
+        })).collect::<Vec<_>>()
+    }))
+}
+
+fn session_evidence(provider: Option<&str>) -> Result<CommandResult, RunnerFailure> {
+    successful_json(serde_json::json!({
+        "window_id": OTHER_WINDOW_UUID,
+        "workspace_id": UUID,
+        "pane_id": "423E4567-E89B-12D3-A456-426614174000",
+        "surface_id": SURFACE_UUID,
+        "cleared": false,
+        "restore_record": null,
+        "resume_binding": provider.map(|kind| serde_json::json!({
+            "checkpoint_id": SESSION_UUID,
+            "kind": kind,
+            "source": "agent-hook",
+            "cwd": "/tmp/shipyard-gen43"
+        }))
     }))
 }
 
@@ -137,7 +169,7 @@ fn assert_delivered(response: &ProviderWrapperResponseV1, provider: &str) {
     };
     assert_eq!(
         provider_session_ref,
-        &format!("session:{provider}:{}", UUID.to_ascii_lowercase())
+        &format!("session:{provider}:{}", SESSION_UUID.to_ascii_lowercase())
     );
     assert_eq!(receipt_digest.len(), 64);
 }
@@ -149,6 +181,8 @@ fn exact_replay_returns_existing_workspace_without_create() {
         results: VecDeque::from([
             windows(&[UUID]),
             list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(Some("codex")),
         ]),
         ..FakeRunner::default()
     };
@@ -156,9 +190,34 @@ fn exact_replay_returns_existing_workspace_without_create() {
     let response = handle_request(&request, &mut runner);
 
     assert_delivered(&response, "codex");
-    assert_eq!(runner.calls.len(), 2);
+    assert_eq!(runner.calls.len(), 4);
     assert_eq!(runner.calls[0], cmux_prefix(["list-windows"]));
     assert_eq!(runner.calls[1][3..5], ["workspace", "list"]);
+}
+
+#[test]
+fn workspace_created_before_agent_hook_session_is_not_accepted() {
+    let request = request("codex", ProviderWrapperOperationV1::Reconcile);
+    let mut runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&request))])),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(None),
+        ]),
+        ..FakeRunner::default()
+    };
+
+    let response = handle_request(&request, &mut runner);
+
+    assert!(matches!(
+        response.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(runner.calls.len(), 4);
+    assert!(runner.calls.iter().all(|call| {
+        call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+    }));
 }
 
 #[test]
@@ -190,12 +249,14 @@ fn lost_create_response_reconciles_without_second_create() {
                 OTHER_WINDOW_UUID,
                 serde_json::json!([workspace(&description(&reconcile))]),
             ),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(Some("codex")),
         ]),
         ..FakeRunner::default()
     };
     let reconciled = handle_request(&reconcile, &mut reconcile_runner);
     assert_delivered(&reconciled, "codex");
-    assert_eq!(reconcile_runner.calls.len(), 3);
+    assert_eq!(reconcile_runner.calls.len(), 5);
     assert!(reconcile_runner.calls.iter().all(|call| {
         call.get(3..5) != Some(["workspace".to_owned(), "create".to_owned()].as_slice())
     }));
@@ -252,6 +313,8 @@ fn delayed_workspace_visibility_keeps_one_fence_and_never_creates_again() {
         results: VecDeque::from([
             windows(&[UUID]),
             list(serde_json::json!([workspace(&description(&reconcile))])),
+            surface_health(&[SURFACE_UUID]),
+            session_evidence(Some("codex")),
         ]),
         ..FakeRunner::default()
     };
@@ -281,12 +344,13 @@ fn same_title_with_wrong_description_does_not_replay() {
                 "shipyard-workstream-delivery:wrong"
             )])),
             created(),
+            session_evidence(Some("codex")),
         ]),
         ..FakeRunner::default()
     };
     let response = handle_request(&request, &mut runner);
     assert_delivered(&response, "codex");
-    assert_eq!(runner.calls.len(), 3);
+    assert_eq!(runner.calls.len(), 4);
     let create = &runner.calls[2];
     assert_eq!(create[3..5], ["workspace", "create"]);
     let description_index = create
@@ -303,7 +367,12 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
     request.resume_expectation.context_url =
         Some("https://linear.app/generous/private-secret'raw".to_owned());
     let mut runner = FakeRunner {
-        results: VecDeque::from([windows(&[UUID]), list(serde_json::json!([])), created()]),
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            created(),
+            session_evidence(Some("codex")),
+        ]),
         ..FakeRunner::default()
     };
     let response = handle_request(&request, &mut runner);

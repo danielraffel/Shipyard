@@ -193,7 +193,12 @@ fn handle_request(
         }
     };
     match listed.as_slice() {
-        [workspace_id] => return response(request, delivered(request, workspace_id, &description)),
+        [workspace_id] => {
+            return response(
+                request,
+                reconcile_existing_workspace(request, runner, workspace_id, &description),
+            );
+        }
         [] => {}
         _ => return response(request, uncertain("multiple-idempotency-workspaces")),
     }
@@ -211,10 +216,38 @@ fn handle_request(
         Ok(result) if result.success => result,
         Ok(_) | Err(_) => return response(request, uncertain("cmux-create-outcome-unknown")),
     };
-    let Ok(workspace_id) = parse_created_workspace(&created.stdout) else {
+    let Ok(created) = parse_created_workspace(&created.stdout) else {
         return response(request, uncertain("cmux-create-response-invalid"));
     };
-    response(request, delivered(request, &workspace_id, &description))
+    response(
+        request,
+        match session_binding_for_surface(
+            runner,
+            &created.workspace_id,
+            &created.surface_id,
+            &request.provider_id,
+        ) {
+            Ok(Some(binding)) => delivered(request, &created.workspace_id, &description, &binding),
+            Ok(None) => uncertain("cmux-session-binding-not-yet-visible"),
+            Err(code) => uncertain(code),
+        },
+    )
+}
+
+fn reconcile_existing_workspace(
+    request: &ProviderWrapperRequestV1,
+    runner: &mut impl CmuxRunner,
+    workspace_id: &str,
+    description: &str,
+) -> ProviderWrapperOutcomeV1 {
+    match session_bindings_for_workspace(runner, workspace_id, &request.provider_id) {
+        Ok(bindings) if bindings.len() == 1 => {
+            delivered(request, workspace_id, description, &bindings[0])
+        }
+        Ok(bindings) if bindings.is_empty() => uncertain("cmux-session-binding-not-yet-visible"),
+        Ok(_) => uncertain("multiple-provider-session-bindings"),
+        Err(code) => uncertain(code),
+    }
 }
 
 fn validate_adapter_request(request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
@@ -399,14 +432,125 @@ struct ListedWorkspace {
 #[allow(clippy::struct_field_names)]
 struct CreatedWorkspace {
     workspace_id: String,
-    surface_id: Option<String>,
+    surface_id: String,
     window_id: Option<String>,
 }
 
-fn parse_created_workspace(bytes: &[u8]) -> Result<String, ()> {
+struct CreatedWorkspaceIds {
+    workspace_id: String,
+    surface_id: String,
+}
+
+fn parse_created_workspace(bytes: &[u8]) -> Result<CreatedWorkspaceIds, ()> {
     let created: CreatedWorkspace = serde_json::from_slice(bytes).map_err(|_| ())?;
-    let _ = (created.surface_id, created.window_id);
-    canonical_uuid(&created.workspace_id).ok_or(())
+    let _ = created.window_id;
+    Ok(CreatedWorkspaceIds {
+        workspace_id: canonical_uuid(&created.workspace_id).ok_or(())?,
+        surface_id: canonical_uuid(&created.surface_id).ok_or(())?,
+    })
+}
+
+#[derive(Deserialize)]
+struct SurfaceHealth {
+    workspace_id: String,
+    surfaces: Vec<SurfaceHealthEntry>,
+}
+
+#[derive(Deserialize)]
+struct SurfaceHealthEntry {
+    id: String,
+    #[serde(rename = "type")]
+    surface_type: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct AgentSessionBinding {
+    checkpoint_id: String,
+    kind: String,
+    source: String,
+}
+
+#[derive(Deserialize)]
+struct SurfaceResumeEvidence {
+    workspace_id: String,
+    surface_id: String,
+    resume_binding: Option<AgentSessionBinding>,
+}
+
+fn session_bindings_for_workspace(
+    runner: &mut impl CmuxRunner,
+    workspace_id: &str,
+    provider_id: &str,
+) -> Result<Vec<AgentSessionBinding>, &'static str> {
+    let mut args = cmux_prefix(["surface-health"]);
+    args.extend(["--workspace".to_owned(), workspace_id.to_owned()]);
+    let result = runner
+        .run(&args)
+        .map_err(|_| "cmux-surface-list-unavailable")?;
+    if !result.success {
+        return Err("cmux-surface-list-refused");
+    }
+    let health: SurfaceHealth =
+        serde_json::from_slice(&result.stdout).map_err(|_| "cmux-surface-list-response-invalid")?;
+    if canonical_uuid(&health.workspace_id).as_deref() != Some(workspace_id) {
+        return Err("cmux-surface-list-workspace-mismatch");
+    }
+    let mut surface_ids = health
+        .surfaces
+        .into_iter()
+        .filter(|surface| surface.surface_type == "terminal")
+        .map(|surface| canonical_uuid(&surface.id).ok_or("cmux-surface-id-invalid"))
+        .collect::<Result<Vec<_>, _>>()?;
+    surface_ids.sort();
+    if surface_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("cmux-surface-id-duplicated");
+    }
+    let mut bindings = Vec::new();
+    for surface_id in surface_ids {
+        if let Some(binding) =
+            session_binding_for_surface(runner, workspace_id, &surface_id, provider_id)?
+        {
+            bindings.push(binding);
+        }
+    }
+    Ok(bindings)
+}
+
+fn session_binding_for_surface(
+    runner: &mut impl CmuxRunner,
+    workspace_id: &str,
+    surface_id: &str,
+    provider_id: &str,
+) -> Result<Option<AgentSessionBinding>, &'static str> {
+    let mut args = cmux_prefix(["surface", "resume", "show"]);
+    args.extend([
+        "--workspace".to_owned(),
+        workspace_id.to_owned(),
+        "--surface".to_owned(),
+        surface_id.to_owned(),
+    ]);
+    let result = runner
+        .run(&args)
+        .map_err(|_| "cmux-session-evidence-unavailable")?;
+    if !result.success {
+        return Err("cmux-session-evidence-refused");
+    }
+    let evidence: SurfaceResumeEvidence = serde_json::from_slice(&result.stdout)
+        .map_err(|_| "cmux-session-evidence-response-invalid")?;
+    if canonical_uuid(&evidence.workspace_id).as_deref() != Some(workspace_id)
+        || canonical_uuid(&evidence.surface_id).as_deref() != Some(surface_id)
+    {
+        return Err("cmux-session-evidence-target-mismatch");
+    }
+    let Some(mut binding) = evidence.resume_binding else {
+        return Ok(None);
+    };
+    if binding.kind != provider_id || binding.source != "agent-hook" {
+        return Err("cmux-session-evidence-provider-mismatch");
+    }
+    binding.checkpoint_id =
+        canonical_uuid(&binding.checkpoint_id).ok_or("cmux-session-evidence-checkpoint-invalid")?;
+    Ok(Some(binding))
 }
 
 fn canonical_uuid(value: &str) -> Option<String> {
@@ -429,6 +573,7 @@ fn delivered(
     request: &ProviderWrapperRequestV1,
     workspace_id: &str,
     description: &str,
+    binding: &AgentSessionBinding,
 ) -> ProviderWrapperOutcomeV1 {
     #[derive(Serialize)]
     struct Receipt<'a> {
@@ -437,6 +582,7 @@ fn delivered(
         idempotency_key: &'a str,
         workspace_id: &'a str,
         description: &'a str,
+        session_checkpoint_id: &'a str,
     }
     let receipt = serde_json::to_vec(&Receipt {
         domain: "shipyard-cmux-provider-receipt-v1",
@@ -444,11 +590,12 @@ fn delivered(
         idempotency_key: &request.delivery_fence.idempotency_key,
         workspace_id,
         description,
+        session_checkpoint_id: &binding.checkpoint_id,
     })
     .expect("fixed receipt serialization cannot fail");
     ProviderWrapperOutcomeV1::Delivered {
         acceptance: ProviderAcceptanceV1::ProviderSessionAccepted,
-        provider_session_ref: format!("session:{}:{workspace_id}", request.provider_id),
+        provider_session_ref: format!("session:{}:{}", request.provider_id, binding.checkpoint_id),
         receipt_digest: hex::encode(Sha256::digest(receipt)),
     }
 }
