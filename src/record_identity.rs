@@ -33,6 +33,7 @@ pub(crate) fn is_exact_lower_hex_sha1(value: &str) -> bool {
 }
 
 /// Whether `value` is an exact lowercase SHA-1 or SHA-256 object identity.
+#[cfg(any(unix, test))]
 pub(crate) fn is_exact_lower_hex_git_sha(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && is_lower_hex(value)
 }

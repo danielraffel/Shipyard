@@ -3,32 +3,48 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[cfg(any(unix, test))]
 use serde::Deserialize;
+#[cfg(any(unix, test))]
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+use crate::queue_absent_recovery::recovery_record_path;
+#[cfg(any(unix, test))]
 use crate::queue_absent_recovery::{
     QueueAbsentRecoveryRecord, RECOVERY_SCHEMA_VERSION as QUEUE_ABSENT_RECOVERY_SCHEMA_VERSION,
-    recovery_record_path, validate_recovery_record,
+    validate_recovery_record,
 };
+#[cfg(any(unix, test))]
 use crate::queue_request::{
     QUEUED_EXECUTION_SCHEMA_VERSION, QueuedExecutionEnvelope, QueuedExecutionOutcome,
     validate_queued_execution_envelope, validate_queued_execution_outcome,
 };
+#[cfg(any(unix, test))]
 use crate::recovery_worker::{RECOVERY_SCHEMA_VERSION, RecoveryRecord, validate_record};
-use crate::ship_state::{SHIP_STATE_SCHEMA_VERSION, ShipState, repository_key};
+#[cfg(unix)]
+use crate::ship_state::repository_key;
+#[cfg(any(unix, test))]
+use crate::ship_state::{SHIP_STATE_SCHEMA_VERSION, ShipState};
 
 mod projection;
+#[cfg(any(unix, test))]
 mod validation;
 
+#[cfg(any(unix, test))]
+pub(super) use projection::candidate;
+pub(super) use projection::import_report;
+#[cfg(unix)]
 use projection::legacy_is_newer;
-pub(super) use projection::{candidate, import_report};
+#[cfg(any(unix, test))]
 pub(super) use validation::validate_legacy_record;
 
-use super::{
-    ImportCandidate, ImportReport, WorkLedgerError, WorkLedgerResult, digest, opaque_path_ref,
-    opaque_ref, validate_candidate,
-};
+#[cfg(any(unix, test))]
+use super::opaque_ref;
+use super::{ImportCandidate, ImportReport, WorkLedgerError, WorkLedgerResult};
+#[cfg(unix)]
+use super::{digest, opaque_path_ref, validate_candidate};
 
 /// Scan known legacy stores without writing anything.
 #[cfg(unix)]
@@ -141,6 +157,7 @@ fn scan_queue_records(
     Ok(())
 }
 
+#[cfg(unix)]
 fn deduplicate_and_validate(
     mut candidates: Vec<ImportCandidate>,
 ) -> WorkLedgerResult<Vec<ImportCandidate>> {
@@ -323,6 +340,7 @@ fn scan_pinned_tree(
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_authoritative_filename(
     state_dir: &Path,
     kind: &str,
@@ -365,6 +383,7 @@ fn validate_authoritative_filename(
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_ship_state_path(
     state_dir: &Path,
     path: &Path,
@@ -398,6 +417,7 @@ fn validate_ship_state_path(
     Ok(())
 }
 
+#[cfg(unix)]
 fn valid_ship_archive_filename(filename: &str, pr: u64) -> bool {
     let Some(stamp) = filename
         .strip_prefix(&format!("{pr}-"))
@@ -482,6 +502,7 @@ fn scan_canonical_recovery_archive(
     Ok(archived)
 }
 
+#[cfg(unix)]
 fn validate_recovery_storage_path(
     state_dir: &Path,
     path: &Path,

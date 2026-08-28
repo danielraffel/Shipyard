@@ -30,9 +30,14 @@ use crate::executor::local::{LocalTargetConfig, LocalValidationConfig};
 use crate::executor::ssh::{SshTargetConfig, SshValidation};
 use crate::executor::ssh_windows::{WindowsTargetConfig, WindowsValidation};
 use crate::job::{Priority, ValidationMode};
-use crate::record_identity::{is_exact_lower_hex_git_sha, is_valid_repository_slug};
+#[cfg(any(unix, test))]
+use crate::record_identity::is_exact_lower_hex_git_sha;
+#[cfg(any(unix, test))]
+use crate::record_identity::is_valid_repository_slug;
 use crate::ship::{RunExecutionRequest, ShipExecutionRequest};
-use crate::ship_state::{SHIP_STATE_SCHEMA_VERSION, ShipState};
+#[cfg(any(unix, test))]
+use crate::ship_state::SHIP_STATE_SCHEMA_VERSION;
+use crate::ship_state::ShipState;
 use crate::warm_pool::{is_backend_eligible, warm_host_key};
 
 /// Current queued-execution schema.
@@ -1545,6 +1550,7 @@ impl QueuedExecutionOutcome {
 }
 
 /// Apply the identity and nested-schema checks required before projection.
+#[cfg(any(unix, test))]
 pub(crate) fn validate_queued_execution_outcome(
     outcome: &QueuedExecutionOutcome,
 ) -> QueueRequestResult<()> {
@@ -2018,6 +2024,7 @@ fn upgrade_legacy_request(
     Ok(envelope)
 }
 
+#[cfg(any(unix, test))]
 fn validate_current_envelope(envelope: &QueuedExecutionEnvelope) -> QueueRequestResult<()> {
     validate_job_id(&envelope.job_id)?;
     match (&envelope.kind, &envelope.request) {
@@ -2045,6 +2052,7 @@ fn validate_current_envelope(envelope: &QueuedExecutionEnvelope) -> QueueRequest
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn validate_job_id(job_id: &str) -> QueueRequestResult<()> {
     if job_id.is_empty()
         || job_id.len() > 255
@@ -2059,6 +2067,7 @@ fn validate_job_id(job_id: &str) -> QueueRequestResult<()> {
 }
 
 /// Apply the same schema and authority checks as the durable request reader.
+#[cfg(any(unix, test))]
 pub(crate) fn validate_queued_execution_envelope(
     envelope: QueuedExecutionEnvelope,
 ) -> QueueRequestResult<()> {

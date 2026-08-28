@@ -1,11 +1,12 @@
 //! Conservative projection from validated legacy records into shadow candidates.
 
-use super::{
-    BTreeMap, Digest, ImportCandidate, ImportReport, Sha256, Value, WorkLedgerError,
-    WorkLedgerResult, opaque_ref,
-};
+use super::{BTreeMap, Digest, ImportCandidate, ImportReport, Sha256};
+#[cfg(any(unix, test))]
+use super::{Value, WorkLedgerError, WorkLedgerResult, opaque_ref};
+#[cfg(any(unix, test))]
 use crate::record_identity::canonical_repository_slug;
 
+#[cfg(any(unix, test))]
 pub(in crate::work_ledger) fn candidate(
     kind: &str,
     source_ref: String,
@@ -91,6 +92,7 @@ pub(in crate::work_ledger) fn candidate(
     }
 }
 
+#[cfg(unix)]
 pub(super) fn legacy_is_newer(
     legacy: &ImportCandidate,
     scoped: &ImportCandidate,
@@ -109,6 +111,7 @@ pub(super) fn legacy_is_newer(
     Ok(parse(legacy)? > parse(scoped)?)
 }
 
+#[cfg(any(unix, test))]
 fn durable_id(value: &Value) -> Option<String> {
     text(value, &["resume_id", "dedupe_key", "job_id", "id"]).or_else(|| {
         value
@@ -118,6 +121,7 @@ fn durable_id(value: &Value) -> Option<String> {
     })
 }
 
+#[cfg(any(unix, test))]
 fn repair_route_ref(value: &Value) -> Option<String> {
     text(value, &["owner_route_id"])
         .or_else(|| pointer_text(value, "/agent_adapter/route_id"))
@@ -125,6 +129,7 @@ fn repair_route_ref(value: &Value) -> Option<String> {
         .map(|route| opaque_ref("route", &route))
 }
 
+#[cfg(any(unix, test))]
 fn pointer_text(value: &Value, pointer: &str) -> Option<String> {
     value
         .pointer(pointer)
@@ -132,6 +137,7 @@ fn pointer_text(value: &Value, pointer: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(any(unix, test))]
 fn text(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
@@ -139,6 +145,7 @@ fn text(value: &Value, keys: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(any(unix, test))]
 fn number(value: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_u64))

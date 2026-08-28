@@ -119,6 +119,7 @@ pub(super) fn validate_protected_storage(
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep one fallible storage API across platforms.
 pub(super) fn validate_protected_storage(
     _directory: &Path,
     _database: &Path,
@@ -127,6 +128,7 @@ pub(super) fn validate_protected_storage(
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep one fallible storage API across platforms.
 pub(super) fn protect_ledger_directory(_path: &Path) -> WorkLedgerResult<()> {
     Ok(())
 }
@@ -395,6 +397,7 @@ pub(super) fn protect_database_file(path: &Path) -> WorkLedgerResult<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep one fallible storage API across platforms.
 pub(super) fn protect_database_file(_path: &Path) -> WorkLedgerResult<()> {
     Ok(())
 }
