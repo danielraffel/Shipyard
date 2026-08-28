@@ -1114,6 +1114,7 @@ mod tests {
             registered_repos: Vec::new(),
             configured_repos: Vec::new(),
             rate_limit: None,
+            shadow_observer: None,
             last_error: None,
         }
     }

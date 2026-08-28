@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,11 @@ use crate::reconcile::{
 };
 use crate::work_ledger::ShadowPrTarget;
 use crate::work_ledger::WorkLedger;
+
+mod health;
+
+pub use health::ShadowObserverHealth;
+use health::{load as load_observer_health, save as save_observer_health};
 
 /// Delay used to coalesce a burst of webhook events for the same PR.
 pub const SHADOW_WEBHOOK_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -49,7 +54,6 @@ pub const SHADOW_HOURLY_API_CEILING: usize = 240;
 pub const SHADOW_MAX_REQUESTS_PER_TARGET: usize = 10;
 /// Maximum pending webhook scopes retained before periodic catch-up takes over.
 pub const SHADOW_PENDING_SCOPE_LIMIT: usize = 1_024;
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ShadowBudgetEntry {
     epoch_seconds: u64,
@@ -57,7 +61,7 @@ struct ShadowBudgetEntry {
 }
 
 /// Why one bounded observation pass was scheduled.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShadowTrigger {
     /// A webhook delivery accelerated exact matching work.
@@ -189,6 +193,8 @@ pub struct ShadowObservationReport {
     pub failures: Vec<ShadowFetchFailure>,
     /// Failed read requests. No retry occurs inside the same pass.
     pub fetch_errors: usize,
+    /// Stable lane-level failure class when the pass could not perform reads.
+    pub observer_failure_class: Option<String>,
     /// Wall-clock cost of the bounded pass.
     pub elapsed_ms: u64,
     /// Activation remains impossible in this phase.
@@ -233,6 +239,8 @@ pub struct ShadowDaemonLane {
     budget_path: PathBuf,
     budget_entries: Vec<ShadowBudgetEntry>,
     reserved_requests: Option<usize>,
+    health_path: PathBuf,
+    health: Arc<Mutex<ShadowObserverHealth>>,
 }
 
 impl ShadowDaemonLane {
@@ -247,6 +255,7 @@ impl ShadowDaemonLane {
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let budget_path = state_dir.join("shadow-observer-budget.json");
+        let health_path = state_dir.join("shadow-observer-health.json");
         let (budget_entries, restored_requests) = match load_request_budget(&budget_path) {
             Ok(entries) => {
                 let requests = entries.iter().map(|entry| entry.api_requests).sum();
@@ -257,13 +266,31 @@ impl ShadowDaemonLane {
                 (Vec::new(), SHADOW_HOURLY_API_CEILING)
             }
         };
+        let mut health = load_observer_health(&health_path).unwrap_or_else(|_| {
+            let mut health = ShadowObserverHealth::default();
+            health.last_failure_at = Some(epoch_seconds());
+            health.last_failure_class = Some("health_state_unavailable".to_owned());
+            health
+        });
+        health.normalize_schema();
+        if health.in_flight_since.take().is_some() {
+            health.last_failure_at = Some(epoch_seconds());
+            health.last_failure_class = Some("daemon_restarted_during_pass".to_owned());
+        }
+        health.reserved_requests = 0;
+        health.rolling_hour_requests = restored_requests;
         let mut scheduler = ShadowScheduler::new(now);
-        if restored_requests > 0 {
+        scheduler.periodic_cursor = health.periodic_cursor;
+        let wall_now = epoch_seconds();
+        for entry in &budget_entries {
+            let age = Duration::from_secs(wall_now.saturating_sub(entry.epoch_seconds));
+            let charged_at = now.checked_sub(age).unwrap_or(now);
             scheduler
                 .api_window
-                .push_back((now, restored_requests.min(SHADOW_HOURLY_API_CEILING)));
+                .push_back((charged_at, entry.api_requests));
         }
-        Self {
+        let health = Arc::new(Mutex::new(health));
+        let mut lane = Self {
             mode,
             global_dir,
             state_dir,
@@ -276,16 +303,29 @@ impl ShadowDaemonLane {
             budget_path,
             budget_entries,
             reserved_requests: None,
-        }
+            health_path,
+            health,
+        };
+        lane.refresh_schedule_health(now);
+        lane
+    }
+
+    /// Return the short-held in-memory snapshot used by daemon status.
+    #[must_use]
+    pub fn health_handle(&self) -> Arc<Mutex<ShadowObserverHealth>> {
+        Arc::clone(&self.health)
     }
 
     /// Coalesce a relevant webhook independently of daemon IPC subscribers.
     pub fn note_webhook(&mut self, event: &Value, now: Instant) {
-        self.scheduler.note_webhook(event, now);
+        if self.scheduler.note_webhook(event, now) {
+            self.refresh_schedule_health(now);
+        }
     }
 
     /// Drain completed evidence and start at most one due bounded pass.
     pub fn tick(&mut self, now: Instant) -> Vec<ShadowTransitionEvidence> {
+        self.refresh_budget_health(now);
         let mut evidence = Vec::new();
         while let Ok(report) = self.receiver.try_recv() {
             evidence.extend(self.finish_report(&report, now));
@@ -294,25 +334,39 @@ impl ShadowDaemonLane {
             return evidence;
         };
         if self.next_ledger_retry_at.is_some_and(|retry| now < retry) {
+            self.refresh_schedule_health(now);
             return evidence;
         }
         let Some(targets) = self.targets(now) else {
+            self.refresh_schedule_health(now);
             return evidence;
         };
+        self.update_health(|health| health.exact_target_count = targets.len());
         self.scheduler.retain_targets(&targets);
         let selected = self.scheduler.begin_pass(trigger, &targets, now);
+        let selected_count = selected.len();
+        let cursor = self.scheduler.periodic_cursor;
+        let wall_now = epoch_seconds();
+        self.update_health(|health| {
+            health.periodic_cursor = cursor;
+            health.in_flight_since = Some(wall_now);
+            health.last_trigger = Some(trigger);
+            health.last_selected_targets = selected_count;
+        });
+        self.refresh_schedule_health(now);
         if selected.is_empty() {
             let report = empty_report(trigger);
             evidence.extend(self.finish_report(&report, now));
             return evidence;
         }
         let reservation = selected.len() * SHADOW_MAX_REQUESTS_PER_TARGET;
-        if let Err(error) = self.reserve_requests(reservation) {
+        if let Err(error) = self.reserve_requests(reservation, now) {
             eprintln!("shipyard daemon: shadow request reservation failed: {error}");
             self.scheduler
                 .api_window
                 .push_back((now, SHADOW_HOURLY_API_CEILING));
-            let report = empty_report(trigger);
+            let mut report = empty_report(trigger);
+            report.observer_failure_class = Some("budget_reservation".to_owned());
             evidence.extend(self.finish_report(&report, now));
             return evidence;
         }
@@ -362,9 +416,11 @@ impl ShadowDaemonLane {
         report: &ShadowObservationReport,
         now: Instant,
     ) -> Vec<ShadowTransitionEvidence> {
-        let had_reservation = self.reserved_requests.take().is_some();
+        let reserved = self.reserved_requests.take().unwrap_or(0);
+        let had_reservation = reserved > 0;
         if had_reservation {
             self.budget_entries.pop();
+            self.scheduler.api_window.pop_back();
         }
         if report.api_requests > 0 {
             self.budget_entries.push(ShadowBudgetEntry {
@@ -372,6 +428,7 @@ impl ShadowDaemonLane {
                 api_requests: report.api_requests,
             });
         }
+        let mut budget_persistence_failed = false;
         if had_reservation || report.api_requests > 0 {
             prune_budget_entries(&mut self.budget_entries, epoch_seconds());
             if let Err(error) = save_request_budget(&self.budget_path, &self.budget_entries) {
@@ -379,10 +436,40 @@ impl ShadowDaemonLane {
                 self.scheduler
                     .api_window
                     .push_back((now, SHADOW_HOURLY_API_CEILING));
+                budget_persistence_failed = true;
             }
         }
-        self.scheduler
-            .finish_pass_at(report, now)
+        let rolling_hour_requests =
+            reported_rolling_requests(&self.budget_entries, budget_persistence_failed)
+                .max(self.scheduler.current_request_usage());
+        let completed_at = epoch_seconds();
+        let failure_class = report
+            .observer_failure_class
+            .clone()
+            .or_else(|| budget_persistence_failed.then(|| "budget_persistence".to_owned()))
+            .or_else(|| {
+                report
+                    .failures
+                    .first()
+                    .map(|failure| failure.failure_class.clone())
+            });
+        self.update_health(|health| {
+            health.in_flight_since = None;
+            health.reserved_requests = 0;
+            health.last_reserved_requests = reserved;
+            health.last_actual_requests = report.api_requests;
+            health.rolling_hour_requests = rolling_hour_requests;
+            if report.fetch_errors == 0 && failure_class.is_none() {
+                health.last_success_at = Some(completed_at);
+            } else {
+                health.last_failure_at = Some(completed_at);
+                health.last_failure_class =
+                    failure_class.or_else(|| Some("fetch_failed".to_owned()));
+            }
+        });
+        let transitions = self.scheduler.finish_pass_at(report, now);
+        self.refresh_schedule_health(now);
+        transitions
             .into_iter()
             .map(|transition| ShadowTransitionEvidence {
                 transition,
@@ -394,7 +481,7 @@ impl ShadowDaemonLane {
             .collect()
     }
 
-    fn reserve_requests(&mut self, requests: usize) -> Result<(), String> {
+    fn reserve_requests(&mut self, requests: usize, now: Instant) -> Result<(), String> {
         self.budget_entries.push(ShadowBudgetEntry {
             epoch_seconds: epoch_seconds(),
             api_requests: requests,
@@ -404,6 +491,17 @@ impl ShadowDaemonLane {
             return Err(error);
         }
         self.reserved_requests = Some(requests);
+        self.scheduler.api_window.push_back((now, requests));
+        let rolling_hour_requests = self
+            .budget_entries
+            .iter()
+            .map(|entry| entry.api_requests)
+            .sum();
+        self.update_health(|health| {
+            health.reserved_requests = requests;
+            health.rolling_hour_requests = rolling_hour_requests;
+        });
+        self.refresh_schedule_health(now);
         Ok(())
     }
 
@@ -412,12 +510,82 @@ impl ShadowDaemonLane {
         if self.ledger_error.as_deref() != Some(&message) {
             eprintln!("shipyard daemon: shadow ledger observation unavailable: {message}");
             self.ledger_error = Some(message);
+            let failed_at = epoch_seconds();
+            self.update_health(|health| {
+                health.last_failure_at = Some(failed_at);
+                health.last_failure_class = Some("ledger".to_owned());
+            });
         }
     }
 
     fn log_recovery(&mut self) {
         if self.ledger_error.take().is_some() {
             eprintln!("shipyard daemon: shadow ledger observation recovered");
+        }
+    }
+
+    fn refresh_budget_health(&mut self, now: Instant) {
+        self.scheduler.prune_request_budget(now);
+        let before = self.budget_entries.len();
+        prune_budget_entries(&mut self.budget_entries, epoch_seconds());
+        let persistence_failed = if self.budget_entries.len() == before {
+            false
+        } else if let Err(error) = save_request_budget(&self.budget_path, &self.budget_entries) {
+            eprintln!("shipyard daemon: shadow request budget persistence failed: {error}");
+            true
+        } else {
+            false
+        };
+        let rolling_hour_requests =
+            reported_rolling_requests(&self.budget_entries, persistence_failed)
+                .max(self.scheduler.current_request_usage());
+        let failed_at = epoch_seconds();
+        let health_changed = self.health.lock().is_ok_and(|health| {
+            health.rolling_hour_requests != rolling_hour_requests || persistence_failed
+        });
+        if !health_changed {
+            return;
+        }
+        self.update_health(|health| {
+            health.rolling_hour_requests = rolling_hour_requests;
+            if persistence_failed {
+                health.last_failure_at = Some(failed_at);
+                health.last_failure_class = Some("budget_persistence".to_owned());
+            }
+        });
+    }
+
+    fn refresh_schedule_health(&mut self, now: Instant) {
+        let retry_after = self
+            .next_ledger_retry_at
+            .map_or(Duration::ZERO, |retry| retry.saturating_duration_since(now));
+        let next_due = self
+            .scheduler
+            .next_due_after(now)
+            .max(retry_after)
+            .as_secs();
+        let next_due_at = epoch_seconds().saturating_add(next_due);
+        self.update_health(|health| health.next_due_at = Some(next_due_at));
+    }
+
+    fn update_health(&mut self, update: impl FnOnce(&mut ShadowObserverHealth)) {
+        if let Ok(mut health) = self.health.lock() {
+            update(&mut health);
+        }
+        self.persist_health();
+    }
+
+    fn persist_health(&mut self) {
+        let snapshot = self.health.lock().ok().map(|health| health.clone());
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        if let Err(error) = save_observer_health(&self.health_path, &snapshot) {
+            eprintln!("shipyard daemon: shadow health persistence failed: {error}");
+            if let Ok(mut health) = self.health.lock() {
+                health.last_failure_at = Some(epoch_seconds());
+                health.last_failure_class = Some("health_persistence".to_owned());
+            }
         }
     }
 }
@@ -441,9 +609,9 @@ impl ShadowScheduler {
     }
 
     /// Coalesce a relevant webhook without requiring an IPC subscriber.
-    pub fn note_webhook(&mut self, event: &Value, now: Instant) {
+    pub fn note_webhook(&mut self, event: &Value, now: Instant) -> bool {
         let Some(scope) = webhook_scope(event) else {
-            return;
+            return false;
         };
         self.pending_webhooks.insert(scope);
         while self.pending_webhooks.len() > SHADOW_PENDING_SCOPE_LIMIT {
@@ -452,18 +620,13 @@ impl ShadowScheduler {
         let first = *self.webhook_first_at.get_or_insert(now);
         self.webhook_due_at =
             Some((now + SHADOW_WEBHOOK_DEBOUNCE).min(first + SHADOW_WEBHOOK_MAX_COALESCE));
+        true
     }
 
     /// Select a due trigger. A running pass is never duplicated.
     #[must_use]
     pub fn due_trigger(&mut self, now: Instant) -> Option<ShadowTrigger> {
-        while self
-            .api_window
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) >= Duration::from_hours(1))
-        {
-            self.api_window.pop_front();
-        }
+        self.prune_request_budget(now);
         if self.in_flight {
             return None;
         }
@@ -476,6 +639,47 @@ impl ShadowScheduler {
         self.webhook_due_at
             .is_some_and(|due| now >= due)
             .then_some(ShadowTrigger::Webhook)
+    }
+
+    fn next_due_after(&self, now: Instant) -> Duration {
+        let scheduled = std::iter::once(self.next_catch_up_at)
+            .chain(self.webhook_due_at)
+            .map(|due| due.saturating_duration_since(now))
+            .min()
+            .unwrap_or(Duration::ZERO);
+        scheduled.max(self.request_budget_available_after(now))
+    }
+
+    fn request_budget_available_after(&self, now: Instant) -> Duration {
+        let mut used = self
+            .api_window
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        if used <= SHADOW_HOURLY_API_CEILING - SHADOW_MAX_REQUESTS_PER_TARGET {
+            return Duration::ZERO;
+        }
+        for (charged_at, count) in &self.api_window {
+            used = used.saturating_sub(*count);
+            if used <= SHADOW_HOURLY_API_CEILING - SHADOW_MAX_REQUESTS_PER_TARGET {
+                return (*charged_at + Duration::from_hours(1)).saturating_duration_since(now);
+            }
+        }
+        Duration::from_hours(1)
+    }
+
+    fn prune_request_budget(&mut self, now: Instant) {
+        while self
+            .api_window
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= Duration::from_hours(1))
+        {
+            self.api_window.pop_front();
+        }
+    }
+
+    fn current_request_usage(&self) -> usize {
+        self.api_window.iter().map(|(_, count)| count).sum()
     }
 
     /// Select bounded exact targets and fence one pass as in flight.
@@ -875,6 +1079,7 @@ fn observation_report(
         observations,
         fetch_errors: failures.len(),
         failures,
+        observer_failure_class: None,
         elapsed_ms,
         activation_enabled: false,
         dispatch_enabled: false,
@@ -890,6 +1095,7 @@ fn empty_report(trigger: ShadowTrigger) -> ShadowObservationReport {
         observations: Vec::new(),
         failures: Vec::new(),
         fetch_errors: 0,
+        observer_failure_class: None,
         elapsed_ms: 0,
         activation_enabled: false,
         dispatch_enabled: false,
@@ -897,7 +1103,7 @@ fn empty_report(trigger: ShadowTrigger) -> ShadowObservationReport {
     }
 }
 
-fn epoch_seconds() -> u64 {
+pub(crate) fn epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -906,6 +1112,18 @@ fn epoch_seconds() -> u64 {
 
 fn prune_budget_entries(entries: &mut Vec<ShadowBudgetEntry>, now: u64) {
     entries.retain(|entry| now.saturating_sub(entry.epoch_seconds) < 3_600);
+}
+
+fn reported_rolling_requests(entries: &[ShadowBudgetEntry], persistence_failed: bool) -> usize {
+    let accounted = entries
+        .iter()
+        .map(|entry| entry.api_requests)
+        .sum::<usize>();
+    if persistence_failed {
+        accounted.max(SHADOW_HOURLY_API_CEILING)
+    } else {
+        accounted
+    }
 }
 
 fn load_request_budget(path: &Path) -> Result<Vec<ShadowBudgetEntry>, String> {
@@ -943,7 +1161,7 @@ fn worker_panic_report(
     trigger: ShadowTrigger,
     targets: &[ShadowPrTarget],
 ) -> ShadowObservationReport {
-    observation_report(
+    let mut report = observation_report(
         trigger,
         targets,
         targets
@@ -956,7 +1174,9 @@ fn worker_panic_report(
             })
             .collect(),
         Duration::ZERO,
-    )
+    );
+    report.observer_failure_class = Some("worker_panic".to_owned());
+    report
 }
 
 fn fetch_failure_class(error: &ReconcileFetchError) -> &'static str {
@@ -1656,6 +1876,40 @@ mod tests {
                 .len(),
             2
         );
+
+        scheduler.api_window.clear();
+        scheduler.api_window.push_back((now, 231));
+        assert_eq!(
+            scheduler.next_due_after(now),
+            Duration::from_hours(1),
+            "status due time must include the budget-release deadline"
+        );
+
+        scheduler.api_window.clear();
+        scheduler.api_window.push_back((
+            now.checked_sub(Duration::from_mins(30))
+                .expect("test instant has history"),
+            5,
+        ));
+        scheduler.api_window.push_back((now, 230));
+        assert_eq!(
+            scheduler.next_due_after(now),
+            Duration::from_mins(30),
+            "the earliest expiring charge should reopen one target slot"
+        );
+    }
+
+    #[test]
+    fn failed_budget_persistence_reports_the_conservative_effective_charge() {
+        let entries = vec![ShadowBudgetEntry {
+            epoch_seconds: epoch_seconds(),
+            api_requests: 3,
+        }];
+        assert_eq!(reported_rolling_requests(&entries, false), 3);
+        assert_eq!(
+            reported_rolling_requests(&entries, true),
+            SHADOW_HOURLY_API_CEILING
+        );
     }
 
     #[test]
@@ -1693,7 +1947,7 @@ mod tests {
             state.path().to_path_buf(),
             now,
         );
-        lane.reserve_requests(80).expect("reserve");
+        lane.reserve_requests(80, now).expect("reserve");
         assert_eq!(
             load_request_budget(&lane.budget_path)
                 .expect("reserved budget")
@@ -1712,6 +1966,285 @@ mod tests {
                 .map(|entry| entry.api_requests)
                 .sum::<usize>(),
             3
+        );
+        let health = lane.health.lock().expect("health").clone();
+        assert_eq!(health.reserved_requests, 0);
+        assert_eq!(health.last_reserved_requests, 80);
+        assert_eq!(health.last_actual_requests, 3);
+        assert_eq!(health.rolling_hour_requests, 3);
+    }
+
+    #[test]
+    fn webhook_deadline_is_published_without_changing_unrelated_event_status() {
+        let state = tempfile::tempdir().expect("state");
+        let now = Instant::now();
+        let mut lane = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            now,
+        );
+        assert!(lane.tick(now).is_empty());
+        let periodic_due = lane
+            .health
+            .lock()
+            .expect("health")
+            .next_due_at
+            .expect("periodic due");
+
+        lane.note_webhook(
+            &serde_json::json!({
+                "kind": "check_run",
+                "payload": {
+                    "repo": "generous-corp/pulp",
+                    "pull_request_numbers": [42],
+                    "head_sha": "b".repeat(40)
+                }
+            }),
+            now + Duration::from_secs(1),
+        );
+        let webhook_due = lane
+            .health
+            .lock()
+            .expect("health")
+            .next_due_at
+            .expect("webhook due");
+        assert!(webhook_due < periodic_due);
+        assert!(webhook_due <= epoch_seconds().saturating_add(3));
+
+        let before_unrelated = lane.health.lock().expect("health").clone();
+        lane.note_webhook(
+            &serde_json::json!({"kind": "installation", "payload": {}}),
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(
+            *lane.health.lock().expect("health"),
+            before_unrelated,
+            "unrelated webhook stays status-silent"
+        );
+    }
+
+    #[test]
+    fn durable_reservation_budget_gates_published_next_due() {
+        let state = tempfile::tempdir().expect("state");
+        let wall_now = epoch_seconds();
+        save_request_budget(
+            &state.path().join("shadow-observer-budget.json"),
+            &[ShadowBudgetEntry {
+                epoch_seconds: wall_now,
+                api_requests: 160,
+            }],
+        )
+        .expect("existing budget");
+        let now = Instant::now();
+        let mut lane = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            now,
+        );
+
+        lane.reserve_requests(80, now).expect("reserve");
+        let health = lane.health.lock().expect("health").clone();
+        assert_eq!(health.reserved_requests, 80);
+        assert_eq!(health.rolling_hour_requests, 240);
+        assert!(
+            health.next_due_at.expect("budget release due")
+                >= wall_now.saturating_add(Duration::from_hours(1).as_secs() - 1)
+        );
+    }
+
+    #[test]
+    fn tick_ages_expired_request_charges_out_of_durable_health() {
+        let state = tempfile::tempdir().expect("state");
+        let now = Instant::now();
+        let mut lane = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            now,
+        );
+        let expired_at = epoch_seconds().saturating_sub(3_601);
+        lane.budget_entries.push(ShadowBudgetEntry {
+            epoch_seconds: expired_at,
+            api_requests: 17,
+        });
+        save_request_budget(&lane.budget_path, &lane.budget_entries).expect("expired budget");
+        lane.scheduler.api_window.push_back((
+            now.checked_sub(Duration::from_secs(3_601))
+                .expect("test instant has history"),
+            17,
+        ));
+        lane.scheduler.next_catch_up_at = now + SHADOW_CATCH_UP_INTERVAL;
+        lane.update_health(|health| health.rolling_hour_requests = 17);
+
+        assert!(lane.tick(now).is_empty());
+        assert_eq!(lane.health.lock().expect("health").rolling_hour_requests, 0);
+        assert!(
+            load_request_budget(&lane.budget_path)
+                .expect("pruned budget")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_reservation_reports_and_expires_conservative_scheduler_charge() {
+        let state = tempfile::tempdir().expect("state");
+        let now = Instant::now();
+        let mut lane = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            now,
+        );
+        lane.budget_path = state.path().join("missing-parent/budget.json");
+        assert!(lane.reserve_requests(80, now).is_err());
+        lane.scheduler
+            .api_window
+            .push_back((now, SHADOW_HOURLY_API_CEILING));
+        let mut report = empty_report(ShadowTrigger::PeriodicCatchUp);
+        report.observer_failure_class = Some("budget_reservation".to_owned());
+        lane.finish_report(&report, now);
+        assert_eq!(
+            lane.health.lock().expect("health").rolling_hour_requests,
+            SHADOW_HOURLY_API_CEILING
+        );
+
+        lane.scheduler.next_catch_up_at = now + Duration::from_hours(2);
+        assert!(
+            lane.tick(now + Duration::from_hours(1) + Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(lane.health.lock().expect("health").rolling_hour_requests, 0);
+    }
+
+    #[test]
+    fn ledger_failure_publishes_retry_gate_instead_of_past_due_schedule() {
+        let state = tempfile::tempdir().expect("state");
+        let ledger = WorkLedger::open(state.path()).expect("ledger");
+        let length = fs::metadata(ledger.path()).expect("ledger metadata").len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(ledger.path())
+            .expect("open ledger")
+            .set_len(length / 2)
+            .expect("truncate ledger");
+        let now = Instant::now();
+        let wall_now = epoch_seconds();
+        let mut lane = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            now,
+        );
+
+        assert!(lane.tick(now).is_empty());
+        let first_due = lane
+            .health
+            .lock()
+            .expect("health")
+            .next_due_at
+            .expect("retry due");
+        assert!(first_due >= wall_now.saturating_add(4));
+        assert_eq!(
+            lane.health
+                .lock()
+                .expect("health")
+                .last_failure_class
+                .as_deref(),
+            Some("ledger")
+        );
+
+        assert!(lane.tick(now + Duration::from_secs(1)).is_empty());
+        let gated_due = lane
+            .health
+            .lock()
+            .expect("health")
+            .next_due_at
+            .expect("gated retry due");
+        assert!(gated_due <= first_due);
+        assert!(gated_due >= epoch_seconds().saturating_add(3));
+    }
+
+    #[test]
+    fn quiet_success_health_is_durable_and_restart_visible() {
+        let state = tempfile::tempdir().expect("state");
+        let now = Instant::now();
+        let mut lane = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            now,
+        );
+
+        assert!(lane.tick(now).is_empty(), "empty baseline stays silent");
+        let before_restart = lane.health.lock().expect("health").clone();
+        assert!(before_restart.last_success_at.is_some());
+        assert_eq!(before_restart.exact_target_count, 0);
+        assert_eq!(before_restart.in_flight_since, None);
+        assert!(!before_restart.activation_enabled);
+        assert!(!before_restart.dispatch_enabled);
+        assert_eq!(before_restart.model_calls, 0);
+        assert_eq!(
+            before_restart.status_value(epoch_seconds())["stalled"],
+            false
+        );
+
+        let restarted = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            now + Duration::from_secs(1),
+        );
+        let after_restart = restarted.health.lock().expect("health").clone();
+        assert_eq!(
+            after_restart.last_success_at,
+            before_restart.last_success_at
+        );
+        assert_eq!(after_restart.last_actual_requests, 0);
+        assert!(after_restart.next_due_at.is_some());
+    }
+
+    #[test]
+    fn stalled_pass_is_visible_and_restart_becomes_a_durable_failure() {
+        let state = tempfile::tempdir().expect("state");
+        let path = state.path().join("shadow-observer-health.json");
+        let now = epoch_seconds();
+        let mut health = ShadowObserverHealth::default();
+        health.in_flight_since = Some(now.saturating_sub(SHADOW_PASS_TIMEOUT.as_secs() + 1));
+        health.reserved_requests = 20;
+        health.periodic_cursor = 7;
+        save_observer_health(&path, &health).expect("health receipt");
+        assert_eq!(health.status_value(now)["stalled"], true);
+
+        let restarted = ShadowDaemonLane::new(
+            RuntimeMode::Shipyard,
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            state.path().to_path_buf(),
+            Instant::now(),
+        );
+        let recovered = restarted.health.lock().expect("health").clone();
+        assert_eq!(recovered.in_flight_since, None);
+        assert_eq!(recovered.reserved_requests, 0);
+        assert_eq!(restarted.scheduler.periodic_cursor, 7);
+        assert_eq!(
+            recovered.last_failure_class.as_deref(),
+            Some("daemon_restarted_during_pass")
+        );
+        assert_eq!(
+            load_observer_health(&path)
+                .expect("restart-visible health")
+                .last_failure_class
+                .as_deref(),
+            Some("daemon_restarted_during_pass")
         );
     }
 }

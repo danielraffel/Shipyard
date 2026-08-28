@@ -1259,6 +1259,12 @@ cooldown, no more than four reads run concurrently, and a rolling-hour
 240-request ceiling reserves worst-case pagination before target selection.
 Worst-case cost is reserved durably before a pass and reconciled to actual cost
 afterward; in-flight and recent usage is conservatively restored on restart. A
+private atomic health receipt preserves the last success/failure, redacted
+failure class, exact target count, round-robin cursor, next due time, in-flight
+age, and reserved/actual rolling-hour request accounting. Read it under
+`shadow_observer` in `shipyard daemon status --json`; `stalled=true` means the
+recorded in-flight age exceeded the complete-pass deadline. Status is local and
+free of GitHub/model calls, and unchanged passes still emit no event.
 shared one-minute deadline covers auth preparation and reads so a slow endpoint
 cannot starve later triggers.
 Multiple ledger records for one

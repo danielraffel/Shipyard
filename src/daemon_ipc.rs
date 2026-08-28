@@ -101,6 +101,8 @@ pub struct IpcState {
     pub configured_repos: Vec<String>,
     /// Rate-limit snapshot if known.
     pub rate_limit: Option<Value>,
+    /// Restart-visible health for the zero-model shadow observer.
+    pub shadow_observer: Option<Value>,
     /// Last recoverable daemon warning/error, if any. Doubles as the
     /// menu-bar app's pause-reason channel: an auth-degraded pause is encoded
     /// here via [`github_auth_degraded_message`].
@@ -438,6 +440,7 @@ fn status_frame(state: &IpcState) -> Value {
         "registered_repos": state.registered_repos,
         "configured_repos": state.configured_repos,
         "rate_limit": state.rate_limit,
+        "shadow_observer": state.shadow_observer,
         "last_error": state.last_error,
         "shipyard_version": env!("CARGO_PKG_VERSION"),
         "protocol": IPC_PROTOCOL_VERSION,
@@ -603,6 +606,7 @@ mod tests {
             registered_repos: vec!["org/repo".to_owned()],
             configured_repos: vec!["org/repo".to_owned(), "org/pending".to_owned()],
             rate_limit: None,
+            shadow_observer: None,
             last_error: None,
         }
     }

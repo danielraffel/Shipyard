@@ -222,6 +222,13 @@ cooldown, at most four reads run concurrently, and a rolling-hour 240-request
 ceiling bounds passive cost by reserving each selected target's worst-case page
 budget durably before a pass, reconciling it to actual cost afterward, and
 conservatively restoring in-flight or recent usage after restart.
+A private, atomically published `shadow-observer-health.json` receipt makes the
+otherwise silent lane observable across restart. `shipyard daemon status
+--json` exposes it as `shadow_observer`, including last successful and failed
+pass timestamps, a redacted failure class, exact target count, durable
+round-robin cursor, next due time, in-flight age/stalled verdict, and current plus
+last reserved/actual rolling-hour request cost. Status reads do not run GitHub
+commands, and healthy unchanged passes remain absent from the event stream.
 A shared one-minute deadline covers auth preparation and reads so one slow batch
 cannot starve later triggers. Each target uses a read-only, producer-
 provenanced head/check snapshot through its exact repository App route and the

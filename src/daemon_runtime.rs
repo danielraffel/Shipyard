@@ -42,7 +42,9 @@ use crate::reconcile::{
 #[cfg(unix)]
 use crate::registrar::{Registrar, RegistrarError, WEBHOOK_SCOPE_COMMAND};
 #[cfg(unix)]
-use crate::shadow_scheduler::{ShadowDaemonLane, ShadowTransitionEvidence};
+use crate::shadow_scheduler::{
+    ShadowDaemonLane, ShadowObserverHealth, ShadowTransitionEvidence, epoch_seconds,
+};
 #[cfg(unix)]
 use crate::ship_resume::{AbandonReport, AbandonedShipState, sweep_orphaned_ship_states};
 use crate::ship_state::ShipStateStore;
@@ -193,6 +195,14 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let execution_error = Arc::new(Mutex::new(None::<String>));
     let ship_dir = config.state_dir.join("ship");
     let ship_dir_for_list = ship_dir.clone();
+    let mut shadow_lane = ShadowDaemonLane::new(
+        config.mode,
+        config.global_dir.clone(),
+        config.state_dir.clone(),
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        Instant::now(),
+    );
+    let shadow_health = shadow_lane.health_handle();
 
     let status_provider = daemon_status_provider(
         Arc::clone(&registration),
@@ -201,6 +211,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         Arc::clone(&execution_error),
         Arc::clone(&last_event_at),
         Arc::clone(&tunnel_runtime.snapshot),
+        shadow_health,
     );
     let mut server = IpcServer::new(daemon_dir.join("daemon.sock"), status_provider)
         .with_stop_request(move || {
@@ -219,13 +230,6 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let mut previous_states = ship_state_map(&ship_dir);
     let mut next_ship_state_scan_at = Instant::now() + SHIP_STATE_SCAN_INTERVAL;
     let mut registration_sync = RegistrationSyncState::default();
-    let mut shadow_lane = ShadowDaemonLane::new(
-        config.mode,
-        config.global_dir.clone(),
-        config.state_dir.clone(),
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        Instant::now(),
-    );
     let mut execution_supervisor = ExecutionSupervisor::new(
         std::env::current_exe()?,
         config.mode,
@@ -351,6 +355,7 @@ fn daemon_status_provider(
     execution_error: Arc<Mutex<Option<String>>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
     tunnel_snapshot: Arc<Mutex<TunnelSnapshot>>,
+    shadow_health: Arc<Mutex<ShadowObserverHealth>>,
 ) -> impl Fn() -> IpcState + Send + Sync + 'static {
     move || {
         let tunnel = tunnel_snapshot
@@ -365,6 +370,10 @@ fn daemon_status_provider(
             registered_repos: registration.published_repos(),
             configured_repos: configured_repos.clone(),
             rate_limit: None,
+            shadow_observer: shadow_health
+                .lock()
+                .ok()
+                .map(|health| health.status_value(epoch_seconds())),
             last_error: registration_error
                 .lock()
                 .ok()
@@ -1720,6 +1729,8 @@ mod tests {
     #[cfg(unix)]
     use crate::registrar::Registrar;
     #[cfg(unix)]
+    use crate::shadow_scheduler::ShadowObserverHealth;
+    #[cfg(unix)]
     use crate::ship_state::DispatchedRun;
     use crate::ship_state::{ShipState, ShipStateStore};
     #[cfg(unix)]
@@ -1880,6 +1891,10 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("state dir");
         let registration = Arc::new(RegistrationState::new(Registrar::new(state_dir.path())));
         registration.publish(vec!["owner/repo".to_owned()]);
+        let mut shadow_health = ShadowObserverHealth::default();
+        shadow_health.exact_target_count = 3;
+        shadow_health.in_flight_since = Some(1);
+        shadow_health.reserved_requests = 20;
         let provider = daemon_status_provider(
             Arc::clone(&registration),
             vec!["owner/repo".to_owned(), "owner/pending".to_owned()],
@@ -1887,6 +1902,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(TunnelSnapshot::inactive())),
+            Arc::new(Mutex::new(shadow_health)),
         );
 
         let registrar_io = registration.registrar.lock().expect("registrar lock");
@@ -1899,6 +1915,17 @@ mod tests {
 
         assert_eq!(status.registered_repos, vec!["owner/repo"]);
         assert_eq!(status.configured_repos, vec!["owner/repo", "owner/pending"]);
+        assert_eq!(
+            status
+                .shadow_observer
+                .as_ref()
+                .and_then(|value| value["model_calls"].as_u64()),
+            Some(0)
+        );
+        let observer = status.shadow_observer.expect("shadow observer status");
+        assert_eq!(observer["exact_target_count"], 3);
+        assert_eq!(observer["reserved_requests"], 20);
+        assert_eq!(observer["stalled"], true);
     }
 
     #[cfg(unix)]
