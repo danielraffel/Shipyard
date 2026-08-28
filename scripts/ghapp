@@ -1,0 +1,838 @@
+#!/usr/bin/env bash
+# Dual-mode GitHub App wrapper: an audited privileged gh command surface plus
+# a JSON-emitting `token` mode for Shipyard's token_command.
+set -euo pipefail
+
+helper="${SHIPYARD_GITHUB_APP_TOKEN_HELPER:-$HOME/.config/shipyard/bin/shipyard-github-app-token}"
+cache_dir="${SHIPYARD_GITHUB_APP_CACHE_DIR:-}"
+guards="${SHIPYARD_GHAPP_GUARDS_DIR:-$HOME/.config/shipyard/guards}"
+trusted_path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+if [[ "$helper" != /* || ! -f "$helper" || ! -x "$helper" ]]; then
+    echo "ghapp: configured GitHub App token helper is unavailable" >&2
+    exit 1
+fi
+
+python_binary="${SHIPYARD_GHAPP_PYTHON_BINARY:-}"
+if [[ -z "$python_binary" ]]; then
+    for candidate in /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        if [[ -x "$candidate" ]]; then
+            python_binary="$candidate"
+            break
+        fi
+    done
+fi
+if [[ -z "$python_binary" || "$python_binary" != /* || ! -x "$python_binary" ]]; then
+    echo "ghapp: set SHIPYARD_GHAPP_PYTHON_BINARY to an absolute Python 3 executable" >&2
+    exit 1
+fi
+
+mint_token_json() {
+    if [[ -n "$cache_dir" ]]; then
+        env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+            "$python_binary" -I "$helper" --cache-dir "$cache_dir" "$@"
+    else
+        env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+            "$python_binary" -I "$helper" "$@"
+    fi
+}
+
+route_host="github.com"
+route_host_explicit=0
+
+set_route_host() {
+    local candidate="$1"
+    if [[ ! "$candidate" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ || "$candidate" == *..* ]]; then
+        echo "ghapp: repository host provenance is malformed" >&2
+        exit 1
+    fi
+    if [[ "$candidate" =~ ^[Gg][Ii][Tt][Hh][Uu][Bb]\.[Cc][Oo][Mm]$ ]]; then
+        candidate="github.com"
+    else
+        echo "ghapp: repository host is not trusted by this GitHub Cloud App wrapper" >&2
+        exit 1
+    fi
+    if [[ "$route_host_explicit" == 1 && "$route_host" != "$candidate" ]]; then
+        echo "ghapp: conflicting repository host provenance" >&2
+        exit 1
+    fi
+    route_host="$candidate"
+    route_host_explicit=1
+}
+
+normalize_repo_target() {
+    local value="$1"
+    local candidate_host=""
+    local transport_url=0
+    if [[ "$value" =~ ^git@([^:]+):(.+)$ ]]; then
+        candidate_host="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        transport_url=1
+    elif [[ "$value" =~ ^ssh://git@([^/]+)/(.+)$ ]]; then
+        candidate_host="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        transport_url=1
+    elif [[ "$value" =~ ^[Hh][Tt][Tt][Pp][Ss]?://([^/]+)/(.+)$ ]]; then
+        candidate_host="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        transport_url=1
+    elif [[ "$value" =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
+        candidate_host="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+    fi
+    if [[ -n "$candidate_host" ]]; then
+        set_route_host "$candidate_host"
+    fi
+    value="${value%%\?*}"
+    value="${value%%\#*}"
+    value="${value%/}"
+    if [[ "$transport_url" == 1 ]]; then
+        value="${value%.git}"
+    fi
+    repo="$value"
+}
+
+api_url_for_host() {
+    printf '%s' "https://api.github.com"
+}
+
+checkout_repo_target() {
+    local resolved_remote=""
+    local remote_name=""
+    local remote_url=""
+    local -a remotes=()
+    local remote_count=0
+    while IFS= read -r remote_name; do
+        if [[ -n "$remote_name" ]]; then
+            remotes+=("$remote_name")
+            remote_count=$((remote_count + 1))
+        fi
+    done < <(PATH="$trusted_path" git remote 2>/dev/null || true)
+
+    if [[ "$remote_count" -gt 0 ]]; then
+        for remote_name in "${remotes[@]}"; do
+            if [[ "$(PATH="$trusted_path" git config --get "remote.$remote_name.gh-resolved" 2>/dev/null || true)" == "base" ]]; then
+                if [[ -n "$resolved_remote" ]]; then
+                    echo "ghapp: checkout has multiple gh default remotes; use --repo OWNER/REPO" >&2
+                    exit 1
+                fi
+                resolved_remote="$remote_name"
+            fi
+        done
+    fi
+    if [[ -n "$resolved_remote" ]]; then
+        remote_url="$(PATH="$trusted_path" git config --get "remote.$resolved_remote.url" 2>/dev/null || true)"
+    elif [[ "$remote_count" == 1 ]]; then
+        remote_url="$(PATH="$trusted_path" git config --get "remote.${remotes[0]}.url" 2>/dev/null || true)"
+    elif [[ "$remote_count" -gt 1 ]]; then
+        echo "ghapp: checkout repository is ambiguous across remotes; use --repo OWNER/REPO or gh repo set-default" >&2
+        exit 1
+    fi
+    repo="$remote_url"
+}
+
+set_target_url_repo() {
+    local value="$1"
+    local kind="$2"
+    local host=""
+    local path=""
+    if [[ "$value" =~ ^[Hh][Tt][Tt][Pp][Ss]://([^/]+)/(.+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        path="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+    path="${path%%\?*}"
+    path="${path%%\#*}"
+    path="${path%/}"
+    if [[ "$kind" == "pr" && "$path" =~ ^([^/]+)/([^/]+)/pull/([1-9][0-9]*)$ ]]; then
+        local target_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        set_route_host "$host"
+        repo="$target_repo"
+        return 0
+    fi
+    if [[ "$kind" == "issue" && "$path" =~ ^([^/]+)/([^/]+)/issues/([1-9][0-9]*)$ ]]; then
+        local target_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        set_route_host "$host"
+        repo="$target_repo"
+        return 0
+    fi
+    return 1
+}
+
+# This is the complete privileged command grammar reviewed against fleet native
+# gh 2.93.0 and 2.96.0. Extend it with a routing regression and security review.
+GHAPP_COMMAND_GRAMMAR_VERSION="shipyard-v1"
+GHAPP_COMMAND_GRAMMAR='surface|api|*
+surface|auth|status
+surface|auth|token
+surface|issue|list
+surface|issue|view
+surface|pr|checks
+surface|pr|close
+surface|pr|create
+surface|pr|list
+surface|pr|merge
+surface|pr|update-branch
+surface|pr|view
+surface|release|edit
+surface|release|list
+surface|release|view
+surface|repo|view
+surface|run|cancel
+surface|run|list
+surface|run|rerun
+surface|run|view
+surface|run|watch
+surface|secret|list
+surface|secret|set
+surface|variable|set
+surface|workflow|list
+surface|workflow|run
+surface|workflow|view
+boolean|*|*|--help
+boolean|api|*|-i --include --paginate --silent --slurp --verbose
+value|api|*|--cache -F --field -H --header --hostname --input -q --jq -X --method -p --preview -f --raw-field -t --template
+boolean|auth|status|-a --active -t --show-token
+value|auth|status|-h --hostname --jq --json --template
+value|auth|token|-h --hostname -u --user
+boolean|issue|list|-w --web
+value|issue|list|--app -a --assignee -A --author -q --jq --json -l --label -L --limit --mention -m --milestone -S --search -s --state -t --template
+boolean|issue|view|-c --comments -w --web
+value|issue|view|-q --jq --json -t --template
+boolean|pr|checks|--fail-fast --required --watch -w --web
+value|pr|checks|-i --interval -q --jq --json -t --template
+boolean|pr|close|-d --delete-branch
+value|pr|close|-c --comment
+boolean|pr|create|-d --draft --dry-run -e --editor -f --fill --fill-first --fill-verbose --no-maintainer-edit -w --web
+value|pr|create|-a --assignee -B --base -b --body -F --body-file -H --head -l --label -m --milestone -p --project --recover -r --reviewer -T --template -t --title
+boolean|pr|list|-d --draft -w --web
+value|pr|list|--app -a --assignee -A --author -B --base -H --head -q --jq --json -l --label -L --limit -S --search -s --state -t --template
+boolean|pr|merge|--admin --auto -d --delete-branch --disable-auto -m --merge -r --rebase -s --squash
+value|pr|merge|-A --author-email -b --body -F --body-file --match-head-commit -t --subject
+boolean|pr|update-branch|--rebase
+boolean|pr|view|-c --comments -w --web
+value|pr|view|-q --jq --json -t --template
+boolean|release|edit|--draft --latest --prerelease --verify-tag
+value|release|edit|--discussion-category -n --notes -F --notes-file --tag --target -t --title
+boolean|release|list|--exclude-drafts --exclude-pre-releases
+value|release|list|-q --jq --json -L --limit -O --order -t --template
+boolean|release|view|-w --web
+value|release|view|-q --jq --json -t --template
+boolean|repo|view|-w --web
+value|repo|view|-b --branch -q --jq --json -t --template
+boolean|run|cancel|--force
+boolean|run|list|-a --all
+value|run|list|-b --branch -c --commit --created -e --event -q --jq --json -L --limit -s --status -t --template -u --user -w --workflow
+boolean|run|rerun|-d --debug --failed
+value|run|rerun|-j --job
+boolean|run|view|--exit-status --log --log-failed -v --verbose -w --web
+value|run|view|-a --attempt -j --job -q --jq --json -t --template
+boolean|run|watch|--compact --exit-status
+value|run|watch|-i --interval
+boolean|secret|list|-u --user
+value|secret|list|-a --app -e --env -q --jq --json -o --org -t --template
+boolean|secret|set|--no-repos-selected --no-store -u --user
+value|secret|set|-a --app -b --body -e --env -f --env-file -o --org -r --repos -v --visibility
+value|variable|set|-b --body -e --env -f --env-file -o --org -r --repos -v --visibility
+boolean|workflow|list|-a --all
+value|workflow|list|-q --jq --json -L --limit -t --template
+boolean|workflow|run|--json
+value|workflow|run|-F --field -f --raw-field -r --ref
+boolean|workflow|view|-w --web -y --yaml
+value|workflow|view|-r --ref'
+
+grammar_subcommand() {
+    if [[ "$1" == "api" ]]; then
+        printf '*'
+    else
+        printf '%s' "$2"
+    fi
+}
+
+grammar_has() {
+    local wanted_kind="$1"
+    local wanted_command="$2"
+    local wanted_subcommand="$3"
+    local wanted_option="${4:-}"
+    local kind command subcommand options option
+    while IFS='|' read -r kind command subcommand options; do
+        [[ "$kind" == "$wanted_kind" && "$command" == "$wanted_command" && \
+            "$subcommand" == "$wanted_subcommand" ]] || continue
+        if [[ "$wanted_kind" == "surface" ]]; then
+            return 0
+        fi
+        for option in $options; do
+            [[ "$option" == "$wanted_option" ]] && return 0
+        done
+    done <<< "$GHAPP_COMMAND_GRAMMAR"
+    return 1
+}
+
+cli_command_boolean() {
+    local subcommand
+    subcommand="$(grammar_subcommand "$1" "$2")"
+    grammar_has boolean '*' '*' "$3" || grammar_has boolean "$1" "$subcommand" "$3"
+}
+
+cli_option_takes_value() {
+    local command="$1"
+    local subcommand="$2"
+    local option="$3"
+    local normalized_subcommand
+    normalized_subcommand="$(grammar_subcommand "$command" "$subcommand")"
+    grammar_has value "$command" "$normalized_subcommand" "$option"
+}
+
+cli_boolean_option() {
+    local command="$1"
+    local subcommand="$2"
+    local option="$3"
+    cli_command_boolean "$command" "$subcommand" "$option"
+}
+
+cli_attached_value_option() {
+    local command="$1"
+    local subcommand="$2"
+    local argument="$3"
+    if [[ "$argument" == --*=* ]]; then
+        cli_option_takes_value "$command" "$subcommand" "${argument%%=*}" || \
+            cli_boolean_option "$command" "$subcommand" "${argument%%=*}"
+        return
+    fi
+    if [[ "$argument" == -?* && "$argument" != --* && "${#argument}" -gt 2 ]]; then
+        cli_option_takes_value "$command" "$subcommand" "${argument:0:2}"
+        return
+    fi
+    return 1
+}
+
+repo_option_takes_value() {
+    local command="$1"
+    local option="$2"
+    case "$command:$option" in
+        clone:-u|clone:--upstream-remote-name|\
+        edit:--add-topic|edit:--default-branch|edit:-d|edit:--description|\
+        edit:-h|edit:--homepage|edit:--remove-topic|\
+        edit:--squash-merge-commit-message|edit:--visibility|\
+        fork:--fork-name|fork:--org|fork:--remote-name|\
+        sync:-b|sync:--branch|sync:-s|sync:--source|\
+        view:-b|view:--branch|view:-q|view:--jq|view:--json|\
+        view:-t|view:--template)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+repo_boolean_option() {
+    local command="$1"
+    local option="$2"
+    case "$command:$option" in
+        archive:-y|archive:--yes|clone:--no-upstream|delete:--yes|\
+        edit:--accept-visibility-change-consequences|edit:--allow-forking|\
+        edit:--allow-update-branch|edit:--delete-branch-on-merge|\
+        edit:--enable-advanced-security|edit:--enable-auto-merge|\
+        edit:--enable-discussions|edit:--enable-issues|\
+        edit:--enable-merge-commit|edit:--enable-projects|\
+        edit:--enable-rebase-merge|edit:--enable-secret-scanning|\
+        edit:--enable-secret-scanning-push-protection|\
+        edit:--enable-squash-merge|edit:--enable-wiki|edit:--template|\
+        fork:--clone|fork:--default-branch-only|fork:--remote|sync:--force|\
+        unarchive:-y|unarchive:--yes|view:-w|view:--web|*:--help)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+repo_attached_value_option() {
+    local command="$1"
+    local option="$2"
+    case "$command:$option" in
+        clone:-u?*|edit:-d?*|edit:-h?*|sync:-b?*|sync:-s?*|\
+        view:-b?*|view:-q?*|view:-t?*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+if [[ "${1:-}" == "token" ]]; then
+    shift
+    token_repo_count=0
+    token_repo_pending=0
+    for argument in "$@"; do
+        if [[ "$token_repo_pending" == 1 ]]; then
+            token_repo_pending=0
+            continue
+        fi
+        case "$argument" in
+            --api-u*)
+                echo "ghapp: token mode API host is pinned to https://api.github.com" >&2
+                exit 1
+                ;;
+            --repo)
+                token_repo_count=$((token_repo_count + 1))
+                token_repo_pending=1
+                ;;
+            --repo=*) token_repo_count=$((token_repo_count + 1)) ;;
+        esac
+    done
+    if [[ "$token_repo_pending" == 1 || "$token_repo_count" != 1 ]]; then
+        echo "ghapp: token mode requires exactly one --repo OWNER/REPO selector" >&2
+        exit 1
+    fi
+    if [[ -n "$cache_dir" ]]; then
+        exec env -u GITHUB_API_URL -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+            "$python_binary" -I "$helper" --api-url https://api.github.com \
+            --cache-dir "$cache_dir" "$@"
+    else
+        exec env -u GITHUB_API_URL -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" \
+            "$python_binary" -I "$helper" --api-url https://api.github.com "$@"
+    fi
+fi
+
+case "${1:-}" in
+    alias|extension)
+        echo "ghapp: aliases and extensions are not permitted in the privileged App wrapper" >&2
+        exit 1
+        ;;
+esac
+
+command_name="${1:-}"
+subcommand_name="$(grammar_subcommand "$command_name" "${2:-}")"
+if ! grammar_has surface "$command_name" "$subcommand_name"; then
+    echo "ghapp: command is outside privileged grammar $GHAPP_COMMAND_GRAMMAR_VERSION" >&2
+    exit 1
+fi
+
+# Validate every option before repository routing or token minting. Unknown
+# flags and missing values fail closed instead of shifting a later --repo into
+# a payload position or changing native gh's target after installation lookup.
+if [[ "$command_name" == "api" ]]; then
+    grammar_arguments=("${@:2}")
+else
+    grammar_arguments=("${@:3}")
+fi
+grammar_pending_option=""
+grammar_options_ended=0
+grammar_argument_count="${#grammar_arguments[@]}"
+grammar_argument_index=0
+while [[ "$grammar_argument_index" -lt "$grammar_argument_count" ]]; do
+    argument="${grammar_arguments[$grammar_argument_index]}"
+    grammar_argument_index=$((grammar_argument_index + 1))
+    if [[ -n "$grammar_pending_option" ]]; then
+        if [[ "$argument" == --repo || "$argument" == -R ]] || \
+            cli_boolean_option "$command_name" "${2:-}" "$argument" || \
+            cli_option_takes_value "$command_name" "${2:-}" "$argument"; then
+            echo "ghapp: $grammar_pending_option requires a value before $argument" >&2
+            exit 1
+        fi
+        grammar_pending_option=""
+        continue
+    fi
+    if [[ "$grammar_options_ended" == 1 ]]; then
+        continue
+    fi
+    if [[ "$argument" == "--" ]]; then
+        grammar_options_ended=1
+        continue
+    fi
+    case "$argument" in
+        --repo=|-R=)
+            echo "ghapp: $argument requires an exact OWNER/REPO value" >&2
+            exit 1
+            ;;
+        --repo|-R)
+            grammar_pending_option="$argument"
+            continue
+            ;;
+        --repo=*|-R=*|-R?*)
+            continue
+            ;;
+    esac
+    if cli_boolean_option "$command_name" "${2:-}" "$argument"; then
+        continue
+    fi
+    if cli_option_takes_value "$command_name" "${2:-}" "$argument"; then
+        grammar_pending_option="$argument"
+        continue
+    fi
+    if [[ "$argument" == --*=* ]]; then
+        option_name="${argument%%=*}"
+        if cli_boolean_option "$command_name" "${2:-}" "$option_name" || \
+            cli_option_takes_value "$command_name" "${2:-}" "$option_name"; then
+            continue
+        fi
+    elif [[ "$argument" == -?* && "$argument" != --* && "${#argument}" -gt 2 ]]; then
+        option_name="${argument:0:2}"
+        if cli_option_takes_value "$command_name" "${2:-}" "$option_name"; then
+            continue
+        fi
+    fi
+    if [[ "$argument" == -* ]]; then
+        echo "ghapp: option $argument is outside privileged grammar $GHAPP_COMMAND_GRAMMAR_VERSION" >&2
+        exit 1
+    fi
+done
+if [[ -n "$grammar_pending_option" ]]; then
+    echo "ghapp: $grammar_pending_option requires a value" >&2
+    exit 1
+fi
+
+if [[ -n "${GH_HOST:-}" ]]; then
+    set_route_host "$GH_HOST"
+fi
+
+hostname_pending=0
+for argument in "$@"; do
+    if [[ "$hostname_pending" == 1 ]]; then
+        if [[ "$argument" != "github.com" ]]; then
+            echo "ghapp: explicit --hostname must be github.com" >&2
+            exit 1
+        fi
+        hostname_pending=0
+        continue
+    fi
+    case "$argument" in
+        --hostname) hostname_pending=1 ;;
+        --hostname=github.com) ;;
+        --hostname=*)
+            echo "ghapp: explicit --hostname must be github.com" >&2
+            exit 1
+            ;;
+    esac
+done
+if [[ "$hostname_pending" == 1 ]]; then
+    echo "ghapp: --hostname requires github.com" >&2
+    exit 1
+fi
+
+auth_hostname_command=0
+if [[ "${1:-}" == "auth" ]]; then
+    case "${2:-}" in
+        login|logout|refresh|setup-git|status|switch|token) auth_hostname_command=1 ;;
+    esac
+fi
+if [[ "$auth_hostname_command" == 1 ]]; then
+    short_hostname_pending=0
+    for argument in "${@:3}"; do
+        if [[ "$short_hostname_pending" == 1 ]]; then
+            if [[ "$argument" != "github.com" ]]; then
+                echo "ghapp: auth -h host must be github.com" >&2
+                exit 1
+            fi
+            short_hostname_pending=0
+            continue
+        fi
+        case "$argument" in
+            -h) short_hostname_pending=1 ;;
+            -h=github.com|-hgithub.com) ;;
+            -h=*)
+                echo "ghapp: auth -h host must be github.com" >&2
+                exit 1
+                ;;
+            -h?*)
+                echo "ghapp: auth -h host must be github.com" >&2
+                exit 1
+                ;;
+        esac
+    done
+    if [[ "$short_hostname_pending" == 1 ]]; then
+        echo "ghapp: auth -h requires github.com" >&2
+        exit 1
+    fi
+fi
+
+repo="${SHIPYARD_GHAPP_REPO:-${GH_REPO:-}}"
+url_repo_routed=0
+if [[ "${1:-}" == "pr" || "${1:-}" == "issue" ]]; then
+    if [[ "${2:-}" == -* ]]; then
+        echo "ghapp: put inherited repository flags after the pr/issue subcommand" >&2
+        exit 1
+    fi
+    url_option_value=0
+    for argument in "${@:3}"; do
+        if [[ "$url_option_value" == 1 ]]; then
+            url_option_value=0
+            continue
+        fi
+        if cli_option_takes_value "${1:-}" "${2:-}" "$argument"; then
+            url_option_value=1
+            continue
+        fi
+        case "$argument" in
+            [Hh][Tt][Tt][Pp]://*)
+                echo "ghapp: plain-HTTP PR and issue URLs are not permitted" >&2
+                exit 1
+                ;;
+        esac
+        case "$argument" in
+            --*=*|-?*) continue ;;
+        esac
+        if set_target_url_repo "$argument" "$1"; then
+            url_repo_routed=1
+            break
+        fi
+    done
+fi
+if [[ "${1:-}" == "repo" ]]; then
+    case "${2:-}" in
+        archive|clone|delete|edit|fork|sync|unarchive|view)
+            repo_subcommand="$2"
+            repo_option_value=0
+            repo_options_ended=0
+            for argument in "${@:3}"; do
+                if [[ "$repo_option_value" == 1 ]]; then
+                    repo_option_value=0
+                    continue
+                fi
+                if [[ "$repo_options_ended" == 0 ]]; then
+                    if [[ "$argument" == "--" ]]; then
+                        repo_options_ended=1
+                        continue
+                    fi
+                    if repo_option_takes_value "$repo_subcommand" "$argument"; then
+                        repo_option_value=1
+                        continue
+                    fi
+                    case "$argument" in
+                        --*=*) continue ;;
+                    esac
+                    if repo_boolean_option "$repo_subcommand" "$argument"; then
+                        continue
+                    fi
+                    if repo_attached_value_option "$repo_subcommand" "$argument"; then
+                        continue
+                    fi
+                    case "$argument" in
+                        -*) break ;;
+                    esac
+                fi
+                if [[ "$argument" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]+$ ]]; then
+                    repo="$argument"
+                    break
+                fi
+                # The first real positional value is the repository target.
+                # A malformed slug must fail in the helper, not be skipped in
+                # favor of a later destination/argument.
+                repo="$argument"
+                break
+            done
+            ;;
+    esac
+fi
+
+if [[ "${1:-}" == "api" ]]; then
+    for argument in "${@:2}"; do
+        case "$argument" in
+            [Hh][Tt][Tt][Pp]://*|[Hh][Tt][Tt][Pp][Ss]://*)
+                echo "ghapp: fully qualified API endpoints are not permitted; use a relative repos/OWNER/REPO path" >&2
+                exit 1
+                ;;
+        esac
+    done
+    api_endpoint=""
+    api_option_value=""
+    for argument in "${@:2}"; do
+        if [[ -n "$api_option_value" ]]; then
+            if [[ "$api_option_value" == "--hostname" ]]; then
+                set_route_host "$argument"
+            fi
+            api_option_value=""
+            continue
+        fi
+        case "$argument" in
+            --cache|-F|--field|-H|--header|--hostname|--input|-q|--jq|-X|--method|-p|--preview|-f|--raw-field|-t|--template)
+                api_option_value="$argument"
+                ;;
+            --hostname=*) set_route_host "${argument#--hostname=}" ;;
+            --cache=*|-F*|--field=*|-H*|--header=*|--input=*|-q*|--jq=*|-X*|--method=*|-p*|--preview=*|-f*|--raw-field=*|-t*|--template=*|-i|--include|--paginate|--silent|--slurp|--verbose|--help) ;;
+            --)
+                ;;
+            -*)
+                # Do not guess whether an unknown option consumes the next
+                # argument; native gh will report it after repo routing falls
+                # back to an explicit environment or checkout.
+                break
+                ;;
+            *)
+                api_endpoint="$argument"
+                break
+                ;;
+        esac
+    done
+    case "$api_endpoint" in
+        [Hh][Tt][Tt][Pp]://*|[Hh][Tt][Tt][Pp][Ss]://*)
+            echo "ghapp: fully qualified API endpoints are not permitted; use a relative repos/OWNER/REPO path" >&2
+            exit 1
+            ;;
+    esac
+    case "$api_endpoint" in
+        repos/*/*|/repos/*/*)
+            path="${api_endpoint#/}"
+            path="${path#repos/}"
+            owner="${path%%/*}"
+            remainder="${path#*/}"
+            name="${remainder%%/*}"
+            name="${name%%\?*}"
+            name="${name%%\#*}"
+            if [[ "$owner" != *'{'* && "$owner" != *'}'* && "$name" != *'{'* && "$name" != *'}'* ]]; then
+                repo="$owner/$name"
+            fi
+            ;;
+    esac
+fi
+
+repo_flag_pending=0
+cli_option_value=0
+ambiguous_repo_flag=0
+repo_selector_count=0
+previous_argument=""
+for argument in "$@"; do
+    if [[ "$cli_option_value" == 1 ]]; then
+        cli_option_value=0
+        previous_argument=""
+        continue
+    fi
+    if [[ "$repo_flag_pending" == 1 ]]; then
+        repo="$argument"
+        repo_flag_pending=0
+        previous_argument="$argument"
+        continue
+    fi
+    case "$argument" in
+        --repo|-R|--repo=*|-R=*|-R?*)
+            if [[ "$previous_argument" == -* && "$previous_argument" != "--" ]] && \
+                ! cli_boolean_option "${1:-}" "${2:-}" "$previous_argument" && \
+                ! cli_attached_value_option "${1:-}" "${2:-}" "$previous_argument"; then
+                ambiguous_repo_flag=1
+                previous_argument="$argument"
+                continue
+            fi
+            ;;
+    esac
+    case "$argument" in
+        --repo|-R) repo_flag_pending=1; repo_selector_count=$((repo_selector_count + 1)) ;;
+        --repo=*) repo="${argument#--repo=}"; repo_selector_count=$((repo_selector_count + 1)) ;;
+        -R=*) repo="${argument#-R=}"; repo_selector_count=$((repo_selector_count + 1)) ;;
+        -R?*) repo="${argument#-R}"; repo_selector_count=$((repo_selector_count + 1)) ;;
+        *)
+            if cli_option_takes_value "${1:-}" "${2:-}" "$argument"; then
+                cli_option_value=1
+            fi
+            ;;
+    esac
+    previous_argument="$argument"
+done
+if [[ "$repo_flag_pending" == 1 ]]; then
+    echo "ghapp: --repo requires an exact OWNER/REPO value" >&2
+    exit 1
+fi
+if [[ "$ambiguous_repo_flag" == 1 ]]; then
+    echo "ghapp: repository-looking option payload is ambiguous; put --repo OWNER/REPO after command payloads" >&2
+    exit 1
+fi
+if [[ "$repo_selector_count" -gt 1 ]]; then
+    echo "ghapp: multiple repository selectors cannot share one installation token" >&2
+    exit 1
+fi
+if [[ "$url_repo_routed" == 1 && "$repo_selector_count" -gt 0 ]]; then
+    echo "ghapp: URL targets cannot be combined with a repository selector" >&2
+    exit 1
+fi
+
+if [[ -z "$repo" ]]; then
+    checkout_repo_target
+fi
+
+normalize_repo_target "$repo"
+
+if [[ -z "$repo" ]]; then
+    echo "ghapp: exact repository provenance is required; use --repo OWNER/REPO" >&2
+    exit 1
+fi
+
+# Bind native gh and every guard to the same normalized repository used for
+# installation lookup, even when provenance came from Shipyard or checkout
+# metadata rather than a native --repo flag.
+export GH_REPO="$repo"
+
+gh_binary="${SHIPYARD_GHAPP_GH_BINARY:-}"
+if [[ -z "$gh_binary" ]]; then
+    for candidate in /opt/homebrew/bin/gh /usr/local/bin/gh; do
+        if [[ -x "$candidate" ]]; then
+            gh_binary="$candidate"
+            break
+        fi
+    done
+fi
+if [[ -z "$gh_binary" || "$gh_binary" != /* || ! -x "$gh_binary" ]]; then
+    echo "ghapp: set SHIPYARD_GHAPP_GH_BINARY to an absolute native gh executable" >&2
+    exit 1
+fi
+
+token_json="$(mint_token_json --api-url "$(api_url_for_host)" --repo "$repo")"
+token="$(env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" "$python_binary" -I -c '
+import json, sys
+value = json.load(sys.stdin)
+token = value.get("token") if isinstance(value, dict) else None
+if not isinstance(token, str) or not token or any(ord(ch) <= 32 or ord(ch) == 127 for ch in token):
+    raise SystemExit("ghapp: token helper returned malformed JSON")
+sys.stdout.write(token)
+' <<<"$token_json")"
+unset token_json
+
+export GODEBUG="${GODEBUG:-netdns=go}"
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+export GH_TOKEN="$token"
+unset GH_HOST
+export GHAPP_REAL_GH="$gh_binary"
+export MERGE_GUARD_GH="$gh_binary"
+unset token
+
+guard_arguments=("$@")
+if [[ ( "${1:-}" == "pr" || "${1:-}" == "issue" ) && "${2:-}" == "close" ]]; then
+    close_option_value=0
+    close_target=""
+    for argument in "${@:3}"; do
+        if [[ "$close_option_value" == 1 ]]; then
+            close_option_value=0
+            continue
+        fi
+        case "$argument" in
+            -c|--comment|--duplicate-of|-r|--reason|-R|--repo)
+                close_option_value=1
+                continue
+                ;;
+            --comment=*|--duplicate-of=*|--reason=*|--repo=*|-c?*|-r?*|-R?*|--help)
+                continue
+                ;;
+            -*) continue ;;
+        esac
+        close_target="$argument"
+        break
+    done
+    if [[ "$close_target" =~ /((pull)|(issues))/([1-9][0-9]*)/?$ ]]; then
+        close_target="${BASH_REMATCH[4]}"
+    fi
+    if [[ "$close_target" =~ ^[1-9][0-9]*$ ]]; then
+        guard_repo="$repo"
+        guard_arguments=("$1" "close" "$close_target" "--repo" "$guard_repo")
+    fi
+fi
+
+# Guards must prove live state with the exact App token that will execute the
+# command. They still run before native gh, so a refusal remains authoritative.
+if [[ "${1:-}" == "pr" && "${2:-}" == "merge" && -x "$guards/merge-guard" ]]; then
+    PATH="$trusted_path" "$guards/merge-guard" "$@" || exit 1
+fi
+if [[ -x "$guards/pr-close-guard" ]]; then
+    PATH="$trusted_path" "$guards/pr-close-guard" "${guard_arguments[@]}" || exit 1
+fi
+if [[ -x "$guards/queue-removal-guard" ]]; then
+    PATH="$trusted_path" "$guards/queue-removal-guard" "$@" || exit 1
+fi
+
+exec "$gh_binary" "$@"

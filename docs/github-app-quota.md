@@ -187,11 +187,10 @@ Example:
 [github.auth]
 source = "command"
 token_command = [
-  "/Users/you/Code/shipyard/scripts/shipyard-github-app-token",
+  "/Users/you/.local/bin/ghapp",
+  "token",
   "--app-id",
   "123456",
-  "--installation-id",
-  "987654",
   "--private-key",
   "/Users/you/.config/shipyard/github-apps/shipyard-local.private-key.pem",
   "--repo",
@@ -203,8 +202,103 @@ privileged_gh_binary = "/absolute/trusted/path/to/gh"
 privileged_git_binary = "/absolute/trusted/path/to/git"
 ```
 
-Use an absolute helper path. That keeps `shipyard auth export` portable when you
-import the config into another repository.
+Use the wrapper's absolute path. That keeps `shipyard auth export` explicit and
+preserves tartci's separately configured `ghapp` command name.
+
+The first `token_command` element may remain the fleet's configured `ghapp`
+wrapper path; tartci and host policy can continue referring to that same path.
+Update the wrapper in place on M1/M3/M5 so it forwards `--repo` to this helper
+without injecting a fixed installation id. Do not replace it with whichever
+`gh` happens to be on `PATH`.
+
+Normal CLI calls must also carry repository provenance: use `--repo`, a
+`repos/OWNER/REPO/...` REST endpoint, `ghapp repo view OWNER/REPO`, a GitHub
+checkout, `GH_REPO`, or an explicit `SHIPYARD_GHAPP_REPO`. Repo-less
+organization or GraphQL calls should set `SHIPYARD_GHAPP_REPO` to a repository
+owned by the intended installation; the wrapper otherwise fails closed.
+This wrapper is intentionally bound to `github.com`: repository-controlled
+remotes and URLs cannot redirect the App JWT to another host. A GHES or
+`*.ghe.com` deployment needs a separately reviewed wrapper and host-specific
+App credentials; setting `GH_HOST` is not sufficient and fails closed here.
+In a checkout with multiple remotes, run `gh repo set-default` or pass
+`--repo`; Shipyard honors the resulting `remote.<name>.gh-resolved=base` marker
+and otherwise refuses to guess between installations.
+
+The privileged CLI is not a general `gh` drop-in. Its versioned
+`shipyard-v1` grammar admits only the repository-aware automation surface
+audited against the fleet's native `gh` 2.93 and 2.96 binaries:
+
+| Command | Allowed subcommands |
+| --- | --- |
+| `api` | relative GitHub Cloud REST and GraphQL endpoints |
+| `auth` | `status`, `token` |
+| `issue` | `list`, `view` |
+| `pr` | `checks`, `close`, `create`, `list`, `merge`, `update-branch`, `view` |
+| `release` | `edit`, `list`, `view` |
+| `repo` | `view` |
+| `run` | `cancel`, `list`, `rerun`, `view`, `watch` |
+| `secret` | `list`, `set` |
+| `variable` | `set` |
+| `workflow` | `list`, `run`, `view` |
+
+The wrapper also declares the boolean and value-taking flags for this exact
+surface in the same grammar table. An unknown command, subcommand, flag,
+missing value, alias, or extension fails before token mint. Extend that table
+only with a routing regression and security review; use ambient native `gh`
+for interactive operator commands outside it.
+
+For an App installed on more than one account, the exact repository slug is the
+routing authority. Do not put `--installation-id` in shared config and do not
+export `SHIPYARD_GITHUB_APP_INSTALLATION_ID` in the wrapper. The helper looks up
+`GET /repos/OWNER/REPO/installation` before minting, Shipyard caches the result
+under the expanded repo-specific command, and missing or malformed repository
+provenance fails closed. A deliberately repo-less administrative helper may
+still use an installation id, but it must be a separate configuration.
+
+### Migrate an existing multi-installation fleet wrapper
+
+Use the same sequence on M1, M3, and M5; absolute paths may differ by username,
+but `token_command[0]` must remain the host's configured `ghapp` wrapper path:
+
+1. Record `shipyard paths` and the current sanitized `[github.auth]` shape with
+   `shipyard auth export`. Do not copy or print a token or private key.
+2. Stage both `scripts/ghapp` and `scripts/shipyard-github-app-token`, compare
+   them with the reviewed release copies, then replace the helper first and the
+   wrapper second at their existing paths, using an atomic rename for each
+   file. Installing the wrapper first would send its new `--cache-dir` protocol
+   to an old helper. The dual-mode
+   wrapper preserves the audited guarded `ghapp ...` automation surface
+   (including merge, queue-removal, and PR-close guards when installed) and
+   adds the `ghapp token ...` helper protocol. It intentionally rejects other
+   native commands, aliases, extensions, and unknown flags before minting.
+   Live-evidence guards receive the same repo-routed App token
+   and the same absolute native `gh` binary that the command will use, but still
+   execute before the guarded command. Install the PR-close guard as an
+   all-command inspector; it recognizes `pr close`, issue aliases, REST, and
+   GraphQL closure shapes itself.
+   Keep both executable; keep the config and
+   cache directories `0700` and App key/cache files `0600`; all must be owned
+   by the unattended account. The wrapper invokes the paired helper with an
+   absolute trusted Python interpreter and exports the minted token directly to
+   native `gh`, keeping token material out of process argv.
+3. Remove the fixed installation id and old single cache file from the wrapper.
+   Configure `token_command = ["/absolute/path/to/ghapp", "token", "--repo",
+   "{repo_slug}"]`. Do not replace
+   `token_command[0]` with a PATH-discovered command.
+4. From a checkout of one repository in each installation, run `shipyard auth
+   doctor` and `shipyard doctor --rate-limit`. This resolves the exact checkout
+   remote without displaying the token. A missing/non-GitHub or ambiguous
+   multi-remote checkout must fail;
+   it must not reuse the previous repository's token.
+5. Restart the daemon only after both installation probes pass, then repeat the
+   probes through the daemon-served repository configuration. Roll back by
+   restoring the staged wrapper copy at the same path; do not restore the fixed
+   installation id as a multi-repository fallback.
+
+This migration changes routing, not App permissions. A repository whose
+installation already has the required Webhooks permission does not need a
+permission update merely because the old wrapper selected another account's
+installation.
 
 `ambient_gh_binary` is optional and machine-specific. It supplies the direct
 native GitHub CLI for the narrowly allowed personal-keyring fallback when an
@@ -230,7 +324,6 @@ You can also use environment variables:
 
 ```bash
 export SHIPYARD_GITHUB_APP_ID=123456
-export SHIPYARD_GITHUB_APP_INSTALLATION_ID=987654
 export SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$HOME/.config/shipyard/github-apps/shipyard-local.private-key.pem"
 ```
 
@@ -246,6 +339,10 @@ token_command = [
 ]
 refresh_skew_seconds = 60
 ```
+
+Set `SHIPYARD_GITHUB_APP_INSTALLATION_ID` only for a separate, intentionally
+repo-less helper configuration. It is a compatibility fallback and is ignored
+whenever `--repo` is present.
 
 ## Validate the quota
 
