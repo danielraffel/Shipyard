@@ -7,10 +7,10 @@ on GitHub is true." Three truth conditions:
 - **`wait pr <N> --state {green|merged|closed}`** — PR reached a state.
 - **`wait run <id> [--success]`** — workflow run reached terminal.
 
-It replaces hand-rolled `gh`-polling loops. When a shipyard daemon is
-running, waits wake in seconds on real webhook events instead of
-polling cadence. When the daemon isn't running, it falls back to `gh`
-polling — same result, just slower. Always safe to use.
+It replaces hand-rolled `gh`-polling loops. With a running daemon, relevant
+webhook events trigger immediate authoritative snapshots, and periodic
+reconciliation heals missed events. When the daemon isn't running or
+disconnects, it falls back to `gh` polling — same truth condition, just slower.
 
 ## Invocation
 
@@ -26,7 +26,7 @@ All three subcommands accept:
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--timeout SECONDS` | 600 (release), 1800 (pr/run) | Hard deadline. |
-| `--poll-interval SECONDS` | 2 (release), 30 (pr), 15 (run) | Polling cadence when daemon unreachable. |
+| `--poll-interval SECONDS` | 2 (release), 30 (pr), 15 (run) | Authoritative snapshot reconciliation cadence. |
 | `--no-fallback` | off | Exit 6 if the daemon isn't available and the snapshot doesn't already match. |
 | `--json` | off | Emit a structured envelope. |
 
@@ -65,11 +65,11 @@ artifacts = [
 ]
 ```
 
-Event source: the `release.published` webhook wakes the waiter.
-GitHub emits no dedicated asset-upload event, so after the wake the
-waiter re-evaluates on `--poll-interval` until every manifested asset
-is `uploaded` or `--timeout` expires. The only time budget is
-`--timeout` — there's no hidden asset-watch sub-timeout.
+The `release.published` webhook can trigger an immediate refresh. GitHub emits
+no dedicated asset-upload event, so the waiter also re-evaluates on
+`--poll-interval` until every manifested asset is `uploaded` or `--timeout`
+expires. The same cadence heals a missed publication event. The only time
+budget is `--timeout` — there's no hidden asset-watch sub-timeout.
 
 ### `wait pr <N> --state green`
 
@@ -86,8 +86,9 @@ Conclusion mapping:
   could still flip the lane)
 - `QUEUED`, `IN_PROGRESS`, `PENDING` → still waiting
 
-Re-evaluated on every `check_run` / `check_suite` / `workflow_run` /
-`reconcile_healed` event that pertains to this PR.
+Re-evaluated immediately on every `check_run` / `check_suite` /
+`workflow_run` / `reconcile_healed` event that pertains to this PR, and
+periodically on `--poll-interval` if no relevant event arrives.
 
 **Classic branch protection only.** Rulesets and merge-queue required
 status detection exits 7. If you're on rulesets, either wait via
@@ -117,8 +118,8 @@ The subscription-open / snapshot / fallback order is fixed:
    `{"type":"subscribe"}`. Start buffering every incoming event. Do
    *not* evaluate yet. If the daemon is unreachable, skip this step
    and record `transport: "polling"`.
-2. **Authoritative snapshot.** One `gh` call to evaluate the truth
-   condition. Always runs, regardless of daemon state or
+2. **Initial authoritative snapshot.** Fetch GitHub state to evaluate the truth
+   condition. This always runs, regardless of daemon state or
    `--no-fallback`. A transient token-helper/network preparation failure is
    retried inside the same process with bounded backoff and the same overall
    `--timeout`; permanent configuration or credential errors still fail
@@ -126,9 +127,10 @@ The subscription-open / snapshot / fallback order is fixed:
 3. **Matched?** Exit 0 with the observed snapshot. Drain and discard
    the event queue; close the subscription cleanly.
 4. **Not matched + daemon available:** process buffered events in
-   arrival order, then live events. Each event triggers a fresh
-   authoritative `gh` re-evaluation. Ring-buffer replays and live
-   events are indistinguishable by design.
+   arrival order, then live events. Each relevant event triggers an immediate
+   authoritative `gh` re-evaluation. If no relevant event arrives, reconcile
+   from an authoritative snapshot every `--poll-interval`; this heals missed
+   webhooks without leaving daemon transport or counting as fallback.
 5. **Not matched + daemon unavailable + fallback allowed:** poll `gh`
    on `--poll-interval`.
 6. **Not matched + daemon unavailable + `--no-fallback`:** exit 6.
@@ -173,12 +175,16 @@ Fields:
 - `condition` — echo of the inputs (normalized).
 - `observed` — shape varies per subcommand. See truth-condition
   sections above.
-- `transport` — `"daemon"` when a subscription was open,
-  `"polling"` when the daemon was unreachable.
+- `transport` — `"daemon"` when the daemon subscription remained available;
+  this is transport evidence, not proof that an event caused the match.
+  `"polling"` means the daemon was unavailable or disconnected and fallback
+  polling was used.
 - `fallback_used` — `true` if the waiter started on the daemon and
   fell through to polling mid-wait (e.g. daemon exited).
-- `events_received` — count of events that triggered a re-evaluation.
-  Zero on pure-polling transport.
+- `events_received` — count of relevant events that triggered an immediate
+  re-evaluation. A value greater than zero is event evidence; zero on daemon
+  transport means the initial or periodic authoritative snapshot may have
+  produced the result. It is also zero on pure-polling transport.
 - `transient_errors` — count of recoverable snapshot/auth failures retried
   without dropping the waiter. Permanent auth/configuration failures are not
   counted because they terminate immediately. The count is preserved when
@@ -191,12 +197,13 @@ snapshot subprocess that consumes the remaining budget is terminated.
 
 ## MVP tradeoffs
 
-- Multiple waiters on the same PR each do their own authoritative
-  `gh` re-fetch per event. Practical max ~5–10 per machine; within
-  the reconcile budget shipyard already assumes.
+- Multiple waiters on the same condition each do their own authoritative `gh`
+  fetch for every relevant event and every `--poll-interval`. This periodic
+  per-waiter REST/GraphQL cost is the correctness tradeoff that heals missed
+  events; use a practical interval and avoid redundant waiters.
 - The daemon's ring buffer holds 100 events. A waiter that reconnects
   after a long gap may miss history older than a few minutes. Not a
-  correctness issue — the snapshot still runs.
+  correctness issue — periodic authoritative reconciliation still runs.
 - Rulesets / merge-queue governance → exit 7. Classic branch
   protection only.
 - No cross-invocation singleton. Each `shipyard wait` is its own

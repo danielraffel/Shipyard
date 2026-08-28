@@ -664,12 +664,45 @@ fn invoke_install_script(
     install_dir: &Path,
     json: bool,
 ) -> Result<(), CliFailure> {
+    invoke_install_script_with_commands(
+        InstallerCommands {
+            curl_bin,
+            curl: Command::new(curl_bin),
+            shell: Command::new(shell_bin),
+        },
+        install_script_url,
+        target_tag,
+        token,
+        install_dir,
+        json,
+    )
+}
+
+struct InstallerCommands<'a> {
+    curl_bin: &'a Path,
+    curl: Command,
+    shell: Command,
+}
+
+fn invoke_install_script_with_commands(
+    commands: InstallerCommands<'_>,
+    install_script_url: &str,
+    target_tag: &str,
+    token: Option<&str>,
+    install_dir: &Path,
+    json: bool,
+) -> Result<(), CliFailure> {
+    let InstallerCommands {
+        curl_bin,
+        mut curl,
+        mut shell,
+    } = commands;
     // Fetch the entire tagged installer before executing any of it. Streaming
     // curl into a shell allowed a truncated response to run far enough to
     // mutate the install before curl's failure was known.
     let installer = tempfile::NamedTempFile::new()
         .map_err(|error| CliFailure::new(1, format!("failed to stage installer: {error}")))?;
-    let curl_status = Command::new(curl_bin)
+    let curl_status = curl
         .args(["-fsSL", "--output"])
         .arg(installer.path())
         .arg(install_script_url)
@@ -723,8 +756,7 @@ fn invoke_install_script(
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
 
     let env_tag = target_tag.strip_prefix('v').unwrap_or(target_tag);
-    let mut sh_command = Command::new(shell_bin);
-    sh_command
+    shell
         .arg(installer.path())
         .env("PATH", unattended_tool_path())
         .env("SHIPYARD_VERSION", env_tag)
@@ -734,17 +766,16 @@ fn invoke_install_script(
     // lookup; pass the discovered token through so its API calls are also
     // authenticated (and not rate-limited) when one is available.
     if let Some(token) = token {
-        sh_command.env("SHIPYARD_GITHUB_TOKEN", token);
+        shell.env("SHIPYARD_GITHUB_TOKEN", token);
     }
     let mut guarded;
     let command = if writer_domain.is_some() {
-        guarded = crate::writer_domain_lease::guarded_child_command(&sh_command, install_dir)
-            .map_err(|error| {
-                CliFailure::new(1, format!("failed to prepare installer guardian: {error}"))
-            })?;
+        guarded = crate::writer_domain_lease::guarded_child_command(&shell, install_dir).map_err(
+            |error| CliFailure::new(1, format!("failed to prepare installer guardian: {error}")),
+        )?;
         &mut guarded
     } else {
-        &mut sh_command
+        &mut shell
     };
     // The guardian owns the child transaction directly. Release the parent
     // lease before it attempts acquisition so an arriving exclusive audit can
@@ -884,21 +915,30 @@ mod tests {
     #[test]
     fn failed_installer_download_never_executes_partial_script() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let curl = temp.path().join("curl");
-        let shell = temp.path().join("shell");
+        let curl_fixture = temp.path().join("curl-fixture.sh");
+        let shell_fixture = temp.path().join("shell-fixture.sh");
         let marker = temp.path().join("shell-ran");
-        write_executable(
-            &curl,
+        std::fs::write(
+            &curl_fixture,
             "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then shift; printf partial > \"$1\"; fi\n  shift\ndone\nexit 22\n",
-        );
-        write_executable(
-            &shell,
-            &format!("#!/bin/sh\n/usr/bin/touch {}\n", shlex_quote_path(&marker)),
-        );
+        )
+        .expect("write curl fixture");
+        std::fs::write(
+            &shell_fixture,
+            format!("#!/bin/sh\n/usr/bin/touch {}\n", shlex_quote_path(&marker)),
+        )
+        .expect("write shell fixture");
+        let mut curl_command = Command::new("/bin/sh");
+        curl_command.arg(&curl_fixture);
+        let mut shell_command = Command::new("/bin/sh");
+        shell_command.arg(&shell_fixture);
 
-        let error = invoke_install_script(
-            &curl,
-            &shell,
+        let error = invoke_install_script_with_commands(
+            InstallerCommands {
+                curl_bin: Path::new("/bin/sh"),
+                curl: curl_command,
+                shell: shell_command,
+            },
             "https://example.invalid/install.sh",
             "v0.98.1",
             Some("governed-test-token"),
@@ -907,9 +947,21 @@ mod tests {
         )
         .expect_err("curl failure");
 
-        assert!(error.message.contains("installer was not executed"));
-        assert!(!marker.exists());
-        assert!(!error.message.contains("governed-test-token"));
+        assert!(
+            !error.message.contains("governed-test-token"),
+            "failed download exposed the governed token"
+        );
+        assert!(
+            error.message.contains("curl exited 22")
+                && error.message.contains("installer was not executed"),
+            "failed download did not report the expected safe refusal: {}",
+            error.message
+        );
+        assert!(
+            !marker.exists(),
+            "shell fixture ran after a partial installer download: {}",
+            marker.display()
+        );
     }
 
     #[cfg(unix)]

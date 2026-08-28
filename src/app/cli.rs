@@ -1979,7 +1979,7 @@ pub(super) enum WaitCommand {
         /// Give up after N seconds.
         #[arg(long, default_value_t = 600.0)]
         timeout: f64,
-        /// Polling cadence when no live daemon transport exists.
+        /// Authoritative snapshot reconciliation cadence.
         #[arg(long = "poll-interval", default_value_t = 2.0)]
         poll_interval: f64,
         /// Fail with exit 6 rather than polling after the first snapshot miss.
@@ -2002,7 +2002,7 @@ pub(super) enum WaitCommand {
         /// Give up after N seconds.
         #[arg(long, default_value_t = 1800.0)]
         timeout: f64,
-        /// Polling cadence when no live daemon transport exists.
+        /// Authoritative snapshot reconciliation cadence.
         #[arg(long = "poll-interval", default_value_t = 30.0)]
         poll_interval: f64,
         /// Fail with exit 6 rather than polling after the first snapshot miss.
@@ -2025,7 +2025,7 @@ pub(super) enum WaitCommand {
         /// Give up after N seconds.
         #[arg(long, default_value_t = 1800.0)]
         timeout: f64,
-        /// Polling cadence when no live daemon transport exists.
+        /// Authoritative snapshot reconciliation cadence.
         #[arg(long = "poll-interval", default_value_t = 15.0)]
         poll_interval: f64,
         /// Fail with exit 6 rather than polling after the first snapshot miss.

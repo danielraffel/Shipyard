@@ -240,7 +240,7 @@ impl DaemonConnection {
 /// The transport mirrors the Python contract:
 /// 1. best-effort daemon subscribe
 /// 2. authoritative first snapshot
-/// 3. daemon-driven re-evaluation when available
+/// 3. daemon-driven re-evaluation plus periodic authoritative reconciliation
 /// 4. polling fallback only when the daemon is unavailable or disconnects
 pub fn wait_for_condition<F, E, P>(
     evaluator: E,
@@ -322,30 +322,11 @@ where
                 return Ok(outcome);
             }
 
-            match connection.read_next_relevant_event(&event_filter, remaining) {
+            match connection.read_next_relevant_event(&event_filter, remaining.min(poll_interval)) {
                 DaemonEventOutcome::Event(_event) => {
                     outcome.events_received += 1;
-                    let Some(result) = fetch_and_evaluate(
-                        &mut fetch_snapshot,
-                        &mut evaluator,
-                        &start,
-                        timeout,
-                        poll_interval,
-                        &mut outcome.transient_errors,
-                    )?
-                    else {
-                        mark_timed_out(&mut outcome, &start);
-                        return Ok(outcome);
-                    };
-                    if record_evaluation(&mut outcome, result, &start) {
-                        return Ok(outcome);
-                    }
                 }
-                DaemonEventOutcome::Timeout => {
-                    outcome.timed_out = true;
-                    outcome.elapsed_seconds = start.elapsed().as_secs_f64();
-                    return Ok(outcome);
-                }
+                DaemonEventOutcome::Timeout => {}
                 DaemonEventOutcome::Disconnect => {
                     outcome.daemon_unavailable = true;
                     if no_fallback {
@@ -358,6 +339,22 @@ where
                     outcome.fallback_used = true;
                     break;
                 }
+            }
+
+            let Some(result) = fetch_and_evaluate(
+                &mut fetch_snapshot,
+                &mut evaluator,
+                &start,
+                timeout,
+                poll_interval,
+                &mut outcome.transient_errors,
+            )?
+            else {
+                mark_timed_out(&mut outcome, &start);
+                return Ok(outcome);
+            };
+            if record_evaluation(&mut outcome, result, &start) {
+                return Ok(outcome);
             }
         }
     }
@@ -1518,6 +1515,50 @@ mod tests {
         assert_eq!(outcome.transport, "daemon");
         assert_eq!(outcome.events_received, 1);
         assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_reconciles_snapshot_when_matching_event_is_missed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state);
+        server.start().expect("start");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let outcome = wait_for_condition_with_timeout(
+            |snapshot| {
+                Ok(TruthResult {
+                    matched: snapshot
+                        .and_then(|snapshot| snapshot.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("completed"),
+                    observed: std::collections::BTreeMap::new(),
+                })
+            },
+            move |_| {
+                let count = counter.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(json!({
+                    "status": if count == 0 { "pending" } else { "completed" }
+                })))
+            },
+            pr_event_filter(42, "o/r"),
+            2.0,
+            0.02,
+            true,
+            &socket_path,
+        )
+        .expect("wait");
+        server.stop().expect("stop");
+
+        assert!(outcome.matched);
+        assert_eq!(outcome.transport, "daemon");
+        assert!(!outcome.fallback_used);
+        assert!(!outcome.daemon_unavailable);
+        assert!(!outcome.fallback_disabled_hit);
+        assert_eq!(outcome.events_received, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(unix)]

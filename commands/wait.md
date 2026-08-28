@@ -6,9 +6,10 @@ description: Wait for a GitHub condition (release uploaded, PR green/merged/clos
 Use `shipyard wait` any time you'd otherwise write a polling loop
 around `gh` — dispatching a workflow and waiting for it, watching a
 release for its artifacts to upload, or waiting for a PR's required
-checks to go green. When the user runs `shipyard daemon start` the
-waiter wakes in seconds on real webhook events; without a daemon it
-falls back to polling, so this is always safe to use.
+checks to go green. With a running daemon, a relevant webhook event triggers
+an immediate authoritative snapshot; the connected waiter also reconciles on
+`--poll-interval` so a missed event cannot strand it. Without a daemon it falls
+back to polling; a mid-wait daemon disconnect does the same.
 
 ## Detection gate
 
@@ -63,7 +64,7 @@ shipyard wait run 22345678 --success --timeout 1200 --json
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--timeout SECONDS` | 600 / 1800 | Hard timeout. Always set one explicitly in agent workflows. |
-| `--poll-interval SECONDS` | varies | Fallback polling cadence when no daemon is running. |
+| `--poll-interval SECONDS` | varies | Authoritative snapshot reconciliation cadence, including while daemon-connected. |
 | `--no-fallback` | off | Exit 6 rather than poll if the daemon isn't reachable. |
 | `--json` | off | Emit an `OutputEnvelope` with `matched`, `observed`, `transport`, `elapsed_seconds`. |
 
@@ -98,9 +99,13 @@ shipyard wait run 22345678 --success --timeout 1200 --json
 }
 ```
 
-Agents should branch on `matched` + `transport`. `transport == "daemon"`
-tells you the wait was webhook-driven (fast); `transport == "polling"`
-tells you the daemon wasn't running and you got the fallback.
+Agents should branch on `matched` and the condition-specific `observed` fields.
+`transport == "daemon"` means the daemon subscription remained available; it
+does not prove a webhook caused the match. Use `events_received > 0` only as
+evidence that at least one relevant event triggered a refresh. A daemon wait
+with `events_received == 0` may have matched through its initial or periodic
+authoritative snapshot. `transport == "polling"` means the daemon was
+unavailable or disconnected and polling fallback was used.
 
 ## When NOT to use
 
