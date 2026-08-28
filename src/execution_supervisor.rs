@@ -20,9 +20,12 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
+use crate::execution_termination::{TerminationAction, TerminationPhase, TerminationStore};
 use crate::host_pool::{HostPoolLeaseError, HostPoolLeaseStore, default_lease_path};
 use crate::identity::RuntimeMode;
-use crate::job::{DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus};
+use crate::job::{
+    CancellationCause, CancellationProof, DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus,
+};
 use crate::queue::{Queue, QueueDeferredRequeue, QueueError, QueuePendingCancellation};
 use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope,
@@ -186,8 +189,10 @@ impl ExecutionSupervisor {
         crate::writer_domain_lease::ensure_protected_dir_all(&self.worker_dir())?;
         self.observe_merged_ship_jobs()?;
         self.reconcile_terminal_outcomes()?;
+        self.reconcile_finalized_termination_transactions()?;
         self.terminate_cancelled_workers()?;
         self.terminate_deferred_workers()?;
+        self.reconcile_finalized_termination_transactions()?;
         // Drop exited children from the in-memory ownership map before queue-
         // absence recovery checks receipts. Otherwise a stale child-map entry
         // preserves its dead receipt during the recovery preflight and can
@@ -344,6 +349,12 @@ impl ExecutionSupervisor {
                 .map(|item| QueuePendingCancellation {
                     job_id: item.job_id,
                     reason: crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned(),
+                    proof: Some(CancellationProof {
+                        cause: CancellationCause::AlreadyMerged,
+                        repository: item.repository,
+                        pull_request: item.pr,
+                        head_sha: item.head_sha,
+                    }),
                 })
                 .collect::<Vec<_>>();
             let cancelled = queue.cancel_pending_jobs_for_drain(&lock, &pending)?;
@@ -352,9 +363,15 @@ impl ExecutionSupervisor {
             }
         }
         for item in running {
-            let _ = queue.request_cancel(
+            let _ = queue.request_cancel_with_proof(
                 &item.job_id,
                 Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(CancellationProof {
+                    cause: CancellationCause::AlreadyMerged,
+                    repository: item.repository,
+                    pull_request: item.pr,
+                    head_sha: item.head_sha,
+                }),
             )?;
         }
         Ok(())
@@ -497,25 +514,10 @@ impl ExecutionSupervisor {
             .map(|job| job.id.clone())
             .collect::<BTreeSet<_>>();
         for job_id in &requested {
-            if let Some(mut child) = self.children.remove(job_id) {
-                if terminate_child_tree(&mut child)? {
-                    self.release_host_pool_leases(job_id)?;
-                    self.acknowledge_cancelled_job(&mut queue, job_id)?;
-                    self.remove_receipt_if_present(job_id)?;
-                } else {
-                    self.children.insert(job_id.clone(), child);
-                }
-                continue;
-            }
-            match self.observe_cancellation_receipt(job_id)? {
-                WorkerObservation::Alive(receipt) if terminate_adopted_worker_tree(&receipt) => {
-                    self.release_host_pool_leases(job_id)?;
-                    self.acknowledge_cancelled_job(&mut queue, job_id)?;
-                    self.remove_receipt_if_present(job_id)?;
-                }
-                WorkerObservation::Alive(_)
-                | WorkerObservation::Dead
-                | WorkerObservation::Unknown => {}
+            if self.complete_worker_termination(job_id, TerminationAction::Cancel)? {
+                self.acknowledge_cancelled_job(&mut queue, job_id)?;
+                self.remove_receipt_if_present(job_id)?;
+                TerminationStore::new(&self.state_dir).remove(job_id)?;
             }
         }
 
@@ -527,23 +529,9 @@ impl ExecutionSupervisor {
             .map(|job| job.id.clone())
             .collect::<BTreeSet<_>>();
         for job_id in &cancelled {
-            if let Some(mut child) = self.children.remove(job_id) {
-                if terminate_child_tree(&mut child)? {
-                    self.release_host_pool_leases(job_id)?;
-                    self.remove_receipt_if_present(job_id)?;
-                } else {
-                    self.children.insert(job_id.clone(), child);
-                }
-                continue;
-            }
-            match self.observe_cancellation_receipt(job_id)? {
-                WorkerObservation::Alive(receipt) if terminate_adopted_worker_tree(&receipt) => {
-                    self.release_host_pool_leases(job_id)?;
-                    self.remove_receipt_if_present(job_id)?;
-                }
-                WorkerObservation::Alive(_)
-                | WorkerObservation::Dead
-                | WorkerObservation::Unknown => {}
+            if self.complete_worker_termination(job_id, TerminationAction::Cancel)? {
+                self.remove_receipt_if_present(job_id)?;
+                TerminationStore::new(&self.state_dir).remove(job_id)?;
             }
         }
         Ok(())
@@ -558,23 +546,11 @@ impl ExecutionSupervisor {
             .map(|job| job.id)
             .collect::<Vec<_>>();
         for job_id in deferred {
-            let tree_dead = if let Some(mut child) = self.children.remove(&job_id) {
-                if terminate_child_tree(&mut child)? {
-                    true
-                } else {
-                    self.children.insert(job_id.clone(), child);
-                    false
-                }
-            } else if let WorkerObservation::Alive(receipt) = self.observe_receipt(&job_id)? {
-                terminate_adopted_worker_tree(&receipt)
-            } else {
-                false
-            };
-            if tree_dead {
-                self.release_host_pool_leases(&job_id)?;
+            if self.complete_worker_termination(&job_id, TerminationAction::Defer)? {
                 let finalized = queue.finalize_deferred_daemon_worker(&job_id)?;
                 if finalized.is_some() {
                     self.remove_receipt_if_present(&job_id)?;
+                    TerminationStore::new(&self.state_dir).remove(&job_id)?;
                 } else if queue.get(&job_id)?.is_some_and(|job| {
                     job.status == JobStatus::Running && job.cancel_requested_at.is_some()
                 }) {
@@ -584,8 +560,33 @@ impl ExecutionSupervisor {
                         .is_none_or(|job| job.status != JobStatus::Running)
                     {
                         self.remove_receipt_if_present(&job_id)?;
+                        TerminationStore::new(&self.state_dir).remove(&job_id)?;
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_finalized_termination_transactions(&self) -> Result<(), SupervisorError> {
+        let store = TerminationStore::new(&self.state_dir);
+        let mut queue = Queue::new(&self.state_dir)?;
+        for transaction in store.list()? {
+            if transaction.phase != TerminationPhase::LeasesReleased {
+                continue;
+            }
+            let Some(job) = queue.get(&transaction.job_id)? else {
+                continue;
+            };
+            let finalized = match transaction.action {
+                TerminationAction::Cancel => job.status == JobStatus::Cancelled,
+                TerminationAction::Defer => {
+                    job.status == JobStatus::Pending && job.scheduler_defer_reason.is_some()
+                }
+            };
+            if finalized {
+                self.remove_receipt_if_present(&transaction.job_id)?;
+                store.remove(&transaction.job_id)?;
             }
         }
         Ok(())
@@ -603,7 +604,10 @@ impl ExecutionSupervisor {
             return Ok(());
         }
         let cancelled = job
-            .cancel_with_reason(job.cancellation_reason.clone())
+            .cancel_with_reason_and_proof(
+                job.cancellation_reason.clone(),
+                job.cancellation_proof.clone(),
+            )
             .map_err(|error| SupervisorError::Outcome(error.to_string()))?;
         queue.update(&cancelled)?;
         persist_terminal_outcome(&cancelled, &self.state_dir)
@@ -685,6 +689,7 @@ impl ExecutionSupervisor {
                         job_id: job.id,
                         reason: "queued execution request belongs to a different job; automatic execution is forbidden"
                             .to_owned(),
+                        proof: None,
                     });
                     continue;
                 }
@@ -701,6 +706,7 @@ impl ExecutionSupervisor {
                         job_id: job.id,
                         reason: "legacy request lacks unattended-execution provenance; resubmit it or use --foreground"
                             .to_owned(),
+                        proof: None,
                     });
                     continue;
                 }
@@ -710,6 +716,7 @@ impl ExecutionSupervisor {
                         reason:
                             "queued execution request is missing; automatic execution is forbidden"
                                 .to_owned(),
+                        proof: None,
                     });
                     continue;
                 }
@@ -719,6 +726,7 @@ impl ExecutionSupervisor {
                         reason: format!(
                             "queued execution request is invalid; automatic execution is forbidden: {error}"
                         ),
+                        proof: None,
                     });
                     continue;
                 }
@@ -892,9 +900,95 @@ impl ExecutionSupervisor {
         })
     }
 
+    fn read_exact_receipt(&self, job_id: &str) -> io::Result<Option<WorkerReceipt>> {
+        let _receipt_lock = acquire_worker_receipt_ownership_lock(&self.state_dir)?;
+        let bytes = match fs::read(self.receipt_path(job_id)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let receipt = serde_json::from_slice::<WorkerReceipt>(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if receipt.job_id != job_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker receipt job identity changed",
+            ));
+        }
+        Ok(Some(receipt))
+    }
+
     fn release_host_pool_leases(&self, job_id: &str) -> Result<(), SupervisorError> {
         HostPoolLeaseStore::new(default_lease_path(&self.state_dir)).release_for_job(job_id)?;
         Ok(())
+    }
+
+    fn complete_worker_termination(
+        &mut self,
+        job_id: &str,
+        action: TerminationAction,
+    ) -> Result<bool, SupervisorError> {
+        let store = TerminationStore::new(&self.state_dir);
+        let mut child = self.children.remove(job_id);
+        let mut transaction = if let Some(transaction) = store.load(job_id)? {
+            let mut transaction = transaction;
+            let Some(receipt) = self.read_exact_receipt(job_id)? else {
+                if let Some(child) = child {
+                    self.children.insert(job_id.to_owned(), child);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "durable termination transaction lost its exact worker receipt",
+                )
+                .into());
+            };
+            if !transaction.matches_receipt(&receipt) {
+                if let Some(child) = child {
+                    self.children.insert(job_id.to_owned(), child);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable termination transaction receipt generation changed",
+                )
+                .into());
+            }
+            if transaction.action == TerminationAction::Defer && action == TerminationAction::Cancel
+            {
+                store.promote_to_cancel(&mut transaction)?;
+            } else if transaction.action != action {
+                if let Some(child) = child {
+                    self.children.insert(job_id.to_owned(), child);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker termination action changed",
+                )
+                .into());
+            }
+            transaction
+        } else {
+            let receipt = match self.observe_cancellation_receipt(job_id)? {
+                WorkerObservation::Alive(receipt) => receipt,
+                WorkerObservation::Dead | WorkerObservation::Unknown => {
+                    if let Some(child) = child {
+                        self.children.insert(job_id.to_owned(), child);
+                    }
+                    return Ok(false);
+                }
+            };
+            store.begin(&receipt, action)?
+        };
+        if !store.prove_tree_dead(&mut transaction, child.as_mut())? {
+            if let Some(child) = child {
+                self.children.insert(job_id.to_owned(), child);
+            }
+            return Ok(false);
+        }
+        if transaction.phase < TerminationPhase::LeasesReleased {
+            self.release_host_pool_leases(job_id)?;
+            store.mark_leases_released(&mut transaction)?;
+        }
+        Ok(true)
     }
 
     fn observe_receipt_with_probe(
@@ -1111,32 +1205,6 @@ fn verify_exited_worker_group_dead(process_group: u32) -> io::Result<bool> {
         }
         thread::sleep(StdDuration::from_millis(10));
     }
-}
-
-fn terminate_adopted_worker_tree(receipt: &WorkerReceipt) -> bool {
-    #[cfg_attr(
-        windows,
-        expect(
-            unused_variables,
-            reason = "Windows taskkill confirms the tree without exposing descendant PIDs"
-        )
-    )]
-    let Ok(descendants) = signal_process_tree(receipt.pid) else {
-        return false;
-    };
-    let deadline = Instant::now() + StdDuration::from_secs(5);
-    while process_liveness(receipt) == ProcessLiveness::Alive && Instant::now() < deadline {
-        thread::sleep(StdDuration::from_millis(10));
-    }
-    if process_liveness(receipt) != ProcessLiveness::Dead {
-        return false;
-    }
-    #[cfg(unix)]
-    return descendants
-        .iter()
-        .all(|pid| process_id_liveness(*pid) == ProcessLiveness::Dead);
-    #[cfg(windows)]
-    true
 }
 
 #[cfg(unix)]
@@ -2160,6 +2228,241 @@ mod tests {
             Some(crate::queue::ALREADY_MERGED_CANCEL_REASON)
         );
         assert_eq!(lease_store.leases().expect("leases").len(), 1);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TerminationCrashBoundary {
+        TreeDeadBeforeLeaseRelease,
+        LeaseReleasedBeforeMarker,
+        MarkerBeforeQueueFinalization,
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gen42_issue_437_cancel_restart_completes_every_durable_crash_boundary() {
+        for boundary in [
+            TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
+            TerminationCrashBoundary::LeaseReleasedBeforeMarker,
+            TerminationCrashBoundary::MarkerBeforeQueueFinalization,
+        ] {
+            assert_termination_crash_recovers(TerminationAction::Cancel, boundary);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gen42_issue_437_defer_restart_completes_every_durable_crash_boundary() {
+        for boundary in [
+            TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
+            TerminationCrashBoundary::LeaseReleasedBeforeMarker,
+            TerminationCrashBoundary::MarkerBeforeQueueFinalization,
+        ] {
+            assert_termination_crash_recovers(TerminationAction::Defer, boundary);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gen42_issue_437_cancel_promotes_released_defer_transaction_on_restart() {
+        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_job(temp.path(), "defer-then-cancel");
+        let mut original = ExecutionSupervisor::new(
+            fake_worker_tree(temp.path()),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        original.tick().expect("start worker");
+        wait_for_live_descendant(&temp.path().join("descendant.pid"));
+        let lease_store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        lease_store
+            .acquire(&host_pool_lease_request("defer-then-cancel"))
+            .expect("acquire lease")
+            .expect("lease");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        queue
+            .requeue_deferred_daemon_worker(QueueDeferredRequeue {
+                job_id: "defer-then-cancel".to_owned(),
+                reason: "capacity unavailable".to_owned(),
+                defer_until: Some(Utc::now() + Duration::minutes(1)),
+            })
+            .expect("defer")
+            .expect("running job");
+        let WorkerObservation::Alive(receipt) = original
+            .observe_cancellation_receipt("defer-then-cancel")
+            .expect("observe")
+        else {
+            panic!("expected exact worker");
+        };
+        let store = TerminationStore::new(temp.path());
+        let mut transaction = store
+            .begin(&receipt, TerminationAction::Defer)
+            .expect("freeze");
+        let mut child = original
+            .children
+            .remove("defer-then-cancel")
+            .expect("child");
+        assert!(
+            store
+                .prove_tree_dead(&mut transaction, Some(&mut child))
+                .expect("tree dead")
+        );
+        lease_store
+            .release_for_job("defer-then-cancel")
+            .expect("release");
+        store
+            .mark_leases_released(&mut transaction)
+            .expect("released marker");
+        queue
+            .request_cancel("defer-then-cancel", Some("operator cancel".to_owned()))
+            .expect("cancel")
+            .expect("running cancellation");
+        drop(original);
+
+        let mut restarted = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        restarted.tick().expect("promote and finalize cancellation");
+
+        assert_eq!(
+            queue
+                .get("defer-then-cancel")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Cancelled
+        );
+        assert!(store.list().expect("transactions").is_empty());
+        assert!(lease_store.leases().expect("leases").is_empty());
+    }
+
+    #[cfg(unix)]
+    fn assert_termination_crash_recovers(
+        action: TerminationAction,
+        boundary: TerminationCrashBoundary,
+    ) {
+        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let job_id = match action {
+            TerminationAction::Cancel => {
+                queued_ship_job(temp.path(), "crash-cancel", "exact-head");
+                "crash-cancel"
+            }
+            TerminationAction::Defer => {
+                queued_job(temp.path(), "crash-defer");
+                "crash-defer"
+            }
+        };
+        let binary = fake_worker_tree(temp.path());
+        let mut original = ExecutionSupervisor::new(
+            binary,
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        original.tick().expect("start worker");
+        wait_for_live_descendant(&temp.path().join("descendant.pid"));
+        let lease_store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
+        lease_store
+            .acquire(&host_pool_lease_request(job_id))
+            .expect("acquire worker lease")
+            .expect("worker lease");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        match action {
+            TerminationAction::Cancel => {
+                queue
+                    .request_cancel_with_proof(
+                        job_id,
+                        Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                        Some(CancellationProof {
+                            cause: CancellationCause::AlreadyMerged,
+                            repository: "owner/repo".to_owned(),
+                            pull_request: 438,
+                            head_sha: "exact-head".to_owned(),
+                        }),
+                    )
+                    .expect("request cancellation")
+                    .expect("running job");
+            }
+            TerminationAction::Defer => {
+                queue
+                    .requeue_deferred_daemon_worker(QueueDeferredRequeue {
+                        job_id: job_id.to_owned(),
+                        reason: "capacity unavailable".to_owned(),
+                        defer_until: Some(Utc::now() + Duration::minutes(1)),
+                    })
+                    .expect("request deferral")
+                    .expect("running job");
+            }
+        }
+        let WorkerObservation::Alive(receipt) = original
+            .observe_cancellation_receipt(job_id)
+            .expect("observe exact worker")
+        else {
+            panic!("expected live exact worker receipt");
+        };
+        let store = TerminationStore::new(temp.path());
+        let mut transaction = store.begin(&receipt, action).expect("freeze tree");
+        let mut child = original.children.remove(job_id).expect("owned child");
+        assert!(
+            store
+                .prove_tree_dead(&mut transaction, Some(&mut child))
+                .expect("prove tree dead")
+        );
+        if matches!(
+            boundary,
+            TerminationCrashBoundary::LeaseReleasedBeforeMarker
+                | TerminationCrashBoundary::MarkerBeforeQueueFinalization
+        ) {
+            assert_eq!(
+                lease_store.release_for_job(job_id).expect("release lease"),
+                1
+            );
+        }
+        if matches!(
+            boundary,
+            TerminationCrashBoundary::MarkerBeforeQueueFinalization
+        ) {
+            store
+                .mark_leases_released(&mut transaction)
+                .expect("released marker");
+        }
+        drop(original);
+
+        let mut restarted = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        restarted.tick().expect("restart completes transaction");
+
+        assert!(lease_store.leases().expect("leases").is_empty());
+        assert!(store.list().expect("transactions").is_empty());
+        let job = queue.get(job_id).expect("read").expect("job");
+        match action {
+            TerminationAction::Cancel => {
+                assert_eq!(job.status, JobStatus::Cancelled);
+                let outcome = QueueOutcomeStore::new(temp.path())
+                    .expect("outcomes")
+                    .load(job_id)
+                    .expect("load")
+                    .expect("outcome");
+                let QueuedExecutionOutcome::Ship {
+                    post_validation: Some(disposition),
+                    ..
+                } = outcome
+                else {
+                    panic!("expected ship outcome");
+                };
+                assert_eq!(disposition.kind, QueuedShipDispositionKind::AlreadyMerged);
+            }
+            TerminationAction::Defer => assert_eq!(job.status, JobStatus::Pending),
+        }
     }
 
     #[test]

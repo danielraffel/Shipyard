@@ -14,7 +14,7 @@ use fs2::FileExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::job::{Job, JobKind, JobStatus, TargetResult, TargetStatus};
+use crate::job::{CancellationProof, Job, JobKind, JobStatus, TargetResult, TargetStatus};
 use crate::queue_request::{
     QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest,
 };
@@ -50,6 +50,8 @@ pub struct QueuePendingCancellation {
     pub job_id: String,
     /// Cancellation reason persisted on the job.
     pub reason: String,
+    /// Authenticated typed cancellation authority, when one exists.
+    pub proof: Option<CancellationProof>,
 }
 
 /// Drain-owned request to return a transiently deferred running job to pending.
@@ -243,7 +245,8 @@ impl Queue {
         if queued.status == JobStatus::Running
             && queued.cancel_requested_at.is_some()
             && (job.cancel_requested_at != queued.cancel_requested_at
-                || job.cancellation_reason != queued.cancellation_reason)
+                || job.cancellation_reason != queued.cancellation_reason
+                || job.cancellation_proof != queued.cancellation_proof)
         {
             return Err(QueueError::StateConflict(format!(
                 "job {} has a newer cancellation request",
@@ -306,12 +309,21 @@ impl Queue {
         job_id: &str,
         reason: Option<String>,
     ) -> QueueResult<Option<Job>> {
+        self.request_cancel_with_proof(job_id, reason, None)
+    }
+
+    pub(crate) fn request_cancel_with_proof(
+        &mut self,
+        job_id: &str,
+        reason: Option<String>,
+        proof: Option<CancellationProof>,
+    ) -> QueueResult<Option<Job>> {
         self.with_jobs_locked(|jobs| {
             let Some(job) = jobs.iter_mut().find(|job| job.id == job_id) else {
                 return Ok(None);
             };
             let requested = job
-                .request_cancel_with_reason(reason)
+                .request_cancel_with_reason_and_proof(reason, proof)
                 .map_err(|error| QueueError::StateConflict(error.to_string()))?;
             *job = requested.clone();
             let _ = trim_terminal(jobs);
@@ -512,7 +524,10 @@ impl Queue {
                 else {
                     continue;
                 };
-                if let Ok(cancelled) = job.cancel_with_reason(Some(cancellation.reason.clone())) {
+                if let Ok(cancelled) = job.cancel_with_reason_and_proof(
+                    Some(cancellation.reason.clone()),
+                    cancellation.proof.clone(),
+                ) {
                     *job = cancelled.clone();
                     cancelled_jobs.push(cancelled);
                 }
@@ -1941,14 +1956,17 @@ mod tests {
                     QueuePendingCancellation {
                         job_id: cancel_id.clone(),
                         reason: "same PR superseded".to_owned(),
+                        proof: None,
                     },
                     QueuePendingCancellation {
                         job_id: cancel_id.clone(),
                         reason: "duplicate ignored".to_owned(),
+                        proof: None,
                     },
                     QueuePendingCancellation {
                         job_id: running_id.clone(),
                         reason: "running ignored".to_owned(),
+                        proof: None,
                     },
                 ],
             )

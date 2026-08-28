@@ -6,8 +6,9 @@
 
 use std::path::Path;
 
+use crate::evidence::canonical_repository;
 use crate::executor::dispatch::ResolvedTarget;
-use crate::job::{Job, JobStatus, ValidationMode};
+use crate::job::{CancellationCause, Job, JobStatus, ValidationMode};
 use crate::queue::{ALREADY_MERGED_CANCEL_REASON, Queue, QueueError};
 use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionKind,
@@ -59,8 +60,11 @@ pub(crate) fn persist_terminal_outcome(
     persist_recovered_outcomes(std::slice::from_ref(job), state_dir, &ship_state)
 }
 
-pub(super) fn completed_validation_disposition(job: &Job) -> QueuedShipDisposition {
-    if let Some(disposition) = exact_head_already_merged_disposition(job) {
+pub(super) fn completed_validation_disposition(
+    request: &ShipExecutionRequest,
+    job: &Job,
+) -> QueuedShipDisposition {
+    if let Some(disposition) = exact_head_already_merged_disposition(request, job) {
         disposition
     } else if job.passed() {
         QueuedShipDisposition::new(
@@ -88,7 +92,8 @@ fn recovered_ship_outcome(
         .as_ref()
         .is_some_and(|state| validation_proof_metadata_matches(request, job, state));
     let state = validation_proof_state(request, job, existing);
-    let disposition = if let Some(disposition) = exact_head_already_merged_disposition(job) {
+    let disposition = if let Some(disposition) = exact_head_already_merged_disposition(request, job)
+    {
         disposition
     } else if job.passed() {
         QueuedShipDisposition::new(
@@ -116,16 +121,24 @@ fn recovered_ship_outcome(
     )
 }
 
-fn exact_head_already_merged_disposition(job: &Job) -> Option<QueuedShipDisposition> {
+fn exact_head_already_merged_disposition(
+    request: &ShipExecutionRequest,
+    job: &Job,
+) -> Option<QueuedShipDisposition> {
+    let proof = job.cancellation_proof.as_ref()?;
     (job.status == JobStatus::Cancelled
-        && job.cancellation_reason.as_deref() == Some(ALREADY_MERGED_CANCEL_REASON))
-    .then(|| {
-        QueuedShipDisposition::new(
-            QueuedShipDispositionKind::AlreadyMerged,
-            0,
-            Some("the exact submitted pull-request head merged while validation was running"),
-        )
-    })
+        && job.cancellation_reason.as_deref() == Some(ALREADY_MERGED_CANCEL_REASON)
+        && proof.cause == CancellationCause::AlreadyMerged
+        && proof.repository == canonical_repository(&request.repo)
+        && proof.pull_request == request.pr
+        && proof.head_sha == request.sha)
+        .then(|| {
+            QueuedShipDisposition::new(
+                QueuedShipDispositionKind::AlreadyMerged,
+                0,
+                Some("the exact submitted pull-request head merged while validation was running"),
+            )
+        })
 }
 
 /// Build the immutable validation-proof snapshot for a completed ship job.
@@ -242,6 +255,26 @@ mod tests {
 
     #[test]
     fn gen42_issue_436_only_exact_merge_cancellation_is_already_merged() {
+        let request = ShipExecutionRequest {
+            pr: 438,
+            repo: "owner/repo".to_owned(),
+            branch: "feature/durable".to_owned(),
+            base_branch: "main".to_owned(),
+            sha: "exact-head".to_owned(),
+            commit_subject: "merged".to_owned(),
+            pr_url: None,
+            pr_title: None,
+            mode: ValidationMode::Full,
+            priority: Priority::Normal,
+            warm_disabled: false,
+            fail_fast: false,
+            resume_from: None,
+            advisory_targets: BTreeSet::new(),
+            adopt_head: false,
+            pr_snapshot_file: None,
+            metadata_authority_receipt: None,
+            targets: Vec::new(),
+        };
         let pending = Job::create(
             "exact-head",
             "feature/durable",
@@ -251,17 +284,53 @@ mod tests {
         )
         .with_kind(JobKind::Ship);
         let already_merged = pending
-            .cancel_with_reason(Some(ALREADY_MERGED_CANCEL_REASON.to_owned()))
+            .cancel_with_reason_and_proof(
+                Some(ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(crate::job::CancellationProof {
+                    cause: CancellationCause::AlreadyMerged,
+                    repository: "owner/repo".to_owned(),
+                    pull_request: 438,
+                    head_sha: "exact-head".to_owned(),
+                }),
+            )
             .expect("exact merged cancellation");
+        let forged_reason = pending
+            .cancel_with_reason(Some(ALREADY_MERGED_CANCEL_REASON.to_owned()))
+            .expect("manual same-string cancellation");
+        let mut wrong_head = already_merged.clone();
+        wrong_head
+            .cancellation_proof
+            .as_mut()
+            .expect("proof")
+            .head_sha = "different-head".to_owned();
+        let mut legacy_json = serde_json::to_value(&already_merged).expect("serialize job");
+        legacy_json
+            .as_object_mut()
+            .expect("job object")
+            .remove("cancellation_proof");
+        let legacy_same_string: Job =
+            serde_json::from_value(legacy_json).expect("legacy job without proof");
         let operator_cancelled = pending
             .cancel_with_reason(Some("operator cancel".to_owned()))
             .expect("operator cancellation");
 
-        let disposition = completed_validation_disposition(&already_merged);
+        let disposition = completed_validation_disposition(&request, &already_merged);
         assert_eq!(disposition.kind, QueuedShipDispositionKind::AlreadyMerged);
         assert_eq!(disposition.exit_code, 0);
         assert_eq!(
-            completed_validation_disposition(&operator_cancelled).kind,
+            completed_validation_disposition(&request, &operator_cancelled).kind,
+            QueuedShipDispositionKind::ValidationFailed
+        );
+        assert_eq!(
+            completed_validation_disposition(&request, &forged_reason).kind,
+            QueuedShipDispositionKind::ValidationFailed
+        );
+        assert_eq!(
+            completed_validation_disposition(&request, &wrong_head).kind,
+            QueuedShipDispositionKind::ValidationFailed
+        );
+        assert_eq!(
+            completed_validation_disposition(&request, &legacy_same_string).kind,
             QueuedShipDispositionKind::ValidationFailed
         );
     }

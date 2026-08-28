@@ -13,7 +13,9 @@ use crate::config::LoadedConfig;
 use crate::evidence::canonical_repository;
 use crate::gh::{self, GhClient};
 use crate::host_pool::{HostPoolConfig, HostPoolLease};
-use crate::job::{DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus};
+use crate::job::{
+    CancellationCause, CancellationProof, DEFAULT_RUNNING_JOB_STALE_SECONDS, Job, JobStatus,
+};
 use crate::queue::{
     DrainLock, Queue, QueueError, QueuePendingCancellation, STALE_RUNNING_CANCEL_REASON,
 };
@@ -122,6 +124,10 @@ pub struct AlreadyMergedCancellation {
     pub job_id: String,
     /// Pull request number that was merged.
     pub pr: u64,
+    /// Canonical repository identity authenticated by the observer.
+    pub repository: String,
+    /// Exact merged head matching the immutable queued request.
+    pub head_sha: String,
 }
 
 /// Bounded, repository-aware observer for pending ships whose PR may have
@@ -239,8 +245,12 @@ impl AlreadyMergedObserver {
             };
             cancellations.extend(observed_jobs.into_iter().filter_map(
                 |(job_id, expected_head)| {
-                    (merged_head == expected_head)
-                        .then_some(AlreadyMergedCancellation { job_id, pr })
+                    (merged_head == expected_head).then_some(AlreadyMergedCancellation {
+                        job_id,
+                        pr,
+                        repository: repo.clone(),
+                        head_sha: merged_head.clone(),
+                    })
                 },
             ));
         }
@@ -628,6 +638,7 @@ fn admit_pass_cancellations(pass: &RequestBackedAdmitPass) -> Vec<QueuePendingCa
         .map(|orphan| QueuePendingCancellation {
             job_id: orphan.job_id.clone(),
             reason: orphan.reason.clone(),
+            proof: None,
         })
         .chain(
             pass.same_pr_ship_admission
@@ -636,6 +647,7 @@ fn admit_pass_cancellations(pass: &RequestBackedAdmitPass) -> Vec<QueuePendingCa
                 .map(|cancellation| QueuePendingCancellation {
                     job_id: cancellation.job_id.clone(),
                     reason: cancellation.reason.clone(),
+                    proof: None,
                 }),
         )
         .chain(
@@ -644,6 +656,12 @@ fn admit_pass_cancellations(pass: &RequestBackedAdmitPass) -> Vec<QueuePendingCa
                 .map(|cancellation| QueuePendingCancellation {
                     job_id: cancellation.job_id.clone(),
                     reason: crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned(),
+                    proof: Some(CancellationProof {
+                        cause: CancellationCause::AlreadyMerged,
+                        repository: cancellation.repository.clone(),
+                        pull_request: cancellation.pr,
+                        head_sha: cancellation.head_sha.clone(),
+                    }),
                 }),
         )
         .collect()
@@ -1236,6 +1254,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             cancellation_reason: None,
+            cancellation_proof: None,
             cancel_requested_at: None,
             scheduler_defer_reason: None,
             scheduler_defer_count: 0,
@@ -2133,11 +2152,10 @@ mod tests {
 
         // Both jobs' PRs report merged, so both should appear.
         assert_eq!(cancellations.len(), 2);
-        assert!(
-            cancellations
-                .iter()
-                .any(|c| c.job_id == "one" && c.pr == 99)
-        );
+        assert!(cancellations.iter().any(|c| c.job_id == "one"
+            && c.pr == 99
+            && c.repository == "generous-corp/pulp"
+            && c.head_sha == "abc123"));
         assert!(
             cancellations
                 .iter()
