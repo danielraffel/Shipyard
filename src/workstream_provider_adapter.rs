@@ -1,0 +1,480 @@
+//! Digest-pinnable cmux adapter for one fresh workstream continuation session.
+//!
+//! The adapter owns no delivery or lifecycle state. It maps one strict wrapper
+//! request to one strict response while using the delivery idempotency key as
+//! cmux's durable lookup surface. Cargo registers the binary, but the current
+//! release workflows and installer still package only `shipyard`; a production
+//! follow-up must build, sign, install, and digest-pin this second executable.
+
+#[cfg(target_os = "macos")]
+use std::ffi::OsStr;
+#[cfg(target_os = "macos")]
+use std::fs;
+use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::process::run_output_until;
+use crate::provider_wrapper::{
+    NotAcceptedV1, ProviderAcceptanceV1, ProviderReasoningEffortV1, ProviderWrapperOperationV1,
+    ProviderWrapperOutcomeV1, ProviderWrapperRequestV1, ProviderWrapperResponseV1, UnknownV1,
+    validate_request,
+};
+use crate::workstream_continuation_config::ProviderWrapperConfig;
+
+const SCHEMA_VERSION: u32 = 1;
+const ADAPTER_ID: &str = "cmux-workstream-v1";
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "macos")]
+const CMUX_APP: &str = "/Applications/cmux.app";
+const CMUX_CLI: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux";
+const CODEX_WRAPPER: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux-codex-wrapper";
+const CLAUDE_WRAPPER: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux-claude-wrapper";
+#[cfg(target_os = "macos")]
+const CODESIGN: &str = "/usr/bin/codesign";
+#[cfg(target_os = "macos")]
+const MANAFLOW_TEAM_ID: &str = "7WLXT3NR37";
+const COMMAND_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Read one strict request from stdin and emit exactly one strict response.
+pub fn run_stdio() -> Result<(), String> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(MAX_REQUEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "request input is unreadable".to_owned())?;
+    if bytes.len() as u64 > MAX_REQUEST_BYTES {
+        return Err("request exceeds the bounded input limit".to_owned());
+    }
+    let request: ProviderWrapperRequestV1 =
+        serde_json::from_slice(&bytes).map_err(|_| "request is not strict v1 JSON".to_owned())?;
+    let response = handle_request(&request, &mut ProductionCmuxRunner);
+    let canonical =
+        serde_json::to_vec(&response).map_err(|_| "response cannot be serialized".to_owned())?;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&canonical)
+        .and_then(|()| stdout.write_all(b"\n"))
+        .map_err(|_| "response output is unwritable".to_owned())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommandResult {
+    success: bool,
+    stdout: Vec<u8>,
+}
+
+trait CmuxRunner {
+    fn verify(&mut self) -> Result<(), RunnerFailure>;
+    fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerFailure {
+    Unavailable,
+    Untrusted,
+}
+
+struct ProductionCmuxRunner;
+
+impl CmuxRunner for ProductionCmuxRunner {
+    fn verify(&mut self) -> Result<(), RunnerFailure> {
+        verify_bundled_cmux()
+    }
+
+    fn run(&mut self, args: &[String]) -> Result<CommandResult, RunnerFailure> {
+        let mut command = Command::new(CMUX_CLI);
+        command.args(args).env_clear();
+        let output = run_output_until(
+            &mut command,
+            Instant::now() + COMMAND_DEADLINE,
+            "cmux workstream provider",
+        )
+        .map_err(|_| RunnerFailure::Unavailable)?;
+        Ok(CommandResult {
+            success: output.status.success(),
+            stdout: output.stdout,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_bundled_cmux() -> Result<(), RunnerFailure> {
+    let app = Path::new(CMUX_APP);
+    let cli = Path::new(CMUX_CLI);
+    let app_metadata = fs::metadata(app).map_err(|_| RunnerFailure::Unavailable)?;
+    let cli_metadata = fs::metadata(cli).map_err(|_| RunnerFailure::Unavailable)?;
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    for metadata in [&app_metadata, &cli_metadata] {
+        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o022 != 0 {
+            return Err(RunnerFailure::Untrusted);
+        }
+    }
+    if !cli_metadata.is_file() || cli_metadata.permissions().mode() & 0o111 == 0 {
+        return Err(RunnerFailure::Untrusted);
+    }
+    for path in [app, cli] {
+        let requirement = format!(
+            "=anchor apple generic and certificate leaf[subject.OU] = \"{MANAFLOW_TEAM_ID}\""
+        );
+        let output = Command::new(CODESIGN)
+            .args([
+                OsStr::new("--verify"),
+                OsStr::new("--strict"),
+                OsStr::new("-R"),
+            ])
+            .arg(requirement)
+            .arg(path)
+            .output()
+            .map_err(|_| RunnerFailure::Unavailable)?;
+        if !output.status.success() {
+            return Err(RunnerFailure::Untrusted);
+        }
+    }
+    // Darwin cannot execute a previously verified descriptor. The remaining
+    // path race is inside Shipyard's explicit trusted-same-UID boundary, the
+    // same authority that owns cmux.app and Shipyard's machine policy.
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_bundled_cmux() -> Result<(), RunnerFailure> {
+    Err(RunnerFailure::Unavailable)
+}
+
+fn handle_request(
+    request: &ProviderWrapperRequestV1,
+    runner: &mut impl CmuxRunner,
+) -> ProviderWrapperResponseV1 {
+    if let Err(code) = validate_adapter_request(request) {
+        return response(request, rejected(code));
+    }
+    match runner.verify() {
+        Err(RunnerFailure::Untrusted) => return response(request, rejected("cmux-untrusted")),
+        Err(RunnerFailure::Unavailable) => {
+            return response(request, retryable("cmux-unavailable-before-create"));
+        }
+        Ok(()) => {}
+    }
+    let description = format!(
+        "shipyard-workstream-delivery:{}",
+        request.delivery_fence.idempotency_key
+    );
+    let listed = match list_matching_workspaces(runner, &description) {
+        Ok(listed) => listed,
+        Err(code) => {
+            let outcome = match request.operation {
+                ProviderWrapperOperationV1::Submit => retryable(code),
+                ProviderWrapperOperationV1::Reconcile => uncertain(code),
+            };
+            return response(request, outcome);
+        }
+    };
+    match listed.as_slice() {
+        [workspace_id] => return response(request, delivered(request, workspace_id, &description)),
+        [] => {}
+        _ => return response(request, uncertain("multiple-idempotency-workspaces")),
+    }
+    if request.operation == ProviderWrapperOperationV1::Reconcile {
+        return response(request, retryable("reconcile-proved-not-accepted"));
+    }
+
+    let args = match create_args(request, &description) {
+        Ok(args) => args,
+        Err(code) => return response(request, rejected(code)),
+    };
+    // cmux creates the workspace before it sends `--command` to the surface.
+    // From this invocation onward every failure is an ambiguous acceptance.
+    let created = match runner.run(&args) {
+        Ok(result) if result.success => result,
+        Ok(_) | Err(_) => return response(request, uncertain("cmux-create-outcome-unknown")),
+    };
+    let Ok(workspace_id) = parse_created_workspace(&created.stdout) else {
+        return response(request, uncertain("cmux-create-response-invalid"));
+    };
+    response(request, delivered(request, &workspace_id, &description))
+}
+
+fn validate_adapter_request(request: &ProviderWrapperRequestV1) -> Result<(), &'static str> {
+    if request.adapter_id != ADAPTER_ID
+        || !matches!(request.provider_id.as_str(), "codex" | "claude")
+    {
+        return Err("unsupported-provider-or-adapter");
+    }
+    let config = ProviderWrapperConfig {
+        executable_path: PathBuf::from("/adapter-validation-only"),
+        executable_sha256: "0".repeat(64),
+        provider_id: request.provider_id.clone(),
+        adapter_id: ADAPTER_ID.to_owned(),
+        deadline_seconds: 1,
+        max_stdout_bytes: 1,
+        max_stderr_bytes: 1,
+    };
+    validate_request(&config, request).map_err(|_| "invalid-provider-request")?;
+    if request.provider_id == "claude"
+        && request.launch_options.reasoning_effort == Some(ProviderReasoningEffortV1::Ultra)
+    {
+        return Err("claude-ultra-effort-unsupported");
+    }
+    Ok(())
+}
+
+fn list_matching_workspaces(
+    runner: &mut impl CmuxRunner,
+    description: &str,
+) -> Result<Vec<String>, &'static str> {
+    let windows_result = runner
+        .run(&cmux_prefix(["list-windows"]))
+        .map_err(|_| "cmux-window-list-unavailable")?;
+    if !windows_result.success {
+        return Err("cmux-window-list-refused");
+    }
+    let mut windows: Vec<ListedWindow> = serde_json::from_slice(&windows_result.stdout)
+        .map_err(|_| "cmux-window-list-response-invalid")?;
+    if windows.is_empty() {
+        return Err("cmux-window-list-empty");
+    }
+    let mut window_ids = Vec::with_capacity(windows.len());
+    for window in windows.drain(..) {
+        window_ids.push(canonical_uuid(&window.id).ok_or("cmux-window-id-invalid")?);
+    }
+    window_ids.sort();
+    if window_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("cmux-window-id-duplicated");
+    }
+
+    let mut matches = Vec::new();
+    for window_id in window_ids {
+        let mut args = cmux_prefix(["workspace", "list"]);
+        args.extend(["--window".to_owned(), window_id.clone()]);
+        let result = runner
+            .run(&args)
+            .map_err(|_| "cmux-workspace-list-unavailable")?;
+        if !result.success {
+            return Err("cmux-workspace-list-refused");
+        }
+        let listed: WorkspaceList = serde_json::from_slice(&result.stdout)
+            .map_err(|_| "cmux-workspace-list-response-invalid")?;
+        if canonical_uuid(&listed.window_id).as_deref() != Some(window_id.as_str()) {
+            return Err("cmux-workspace-list-window-mismatch");
+        }
+        for workspace in listed.workspaces {
+            if workspace.description.as_deref() == Some(description) {
+                matches
+                    .push(canonical_uuid(&workspace.id).ok_or("cmux-list-workspace-id-invalid")?);
+            }
+        }
+    }
+    matches.sort();
+    Ok(matches)
+}
+
+#[derive(Deserialize)]
+struct ListedWindow {
+    id: String,
+}
+
+fn cmux_prefix<const N: usize>(tail: [&str; N]) -> Vec<String> {
+    ["--json", "--id-format", "uuids"]
+        .into_iter()
+        .chain(tail)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn create_args(
+    request: &ProviderWrapperRequestV1,
+    description: &str,
+) -> Result<Vec<String>, &'static str> {
+    let command = launch_command(request)?;
+    let mut args = cmux_prefix(["workspace", "create"]);
+    args.extend([
+        "--name".to_owned(),
+        format!(
+            "{} — tracked workstream",
+            request.resume_expectation.workstream_handle
+        ),
+        "--description".to_owned(),
+        description.to_owned(),
+        "--cwd".to_owned(),
+        request.resume_expectation.worktree_path.clone(),
+        "--focus".to_owned(),
+        "false".to_owned(),
+        "--command".to_owned(),
+        command,
+    ]);
+    Ok(args)
+}
+
+fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static str> {
+    let prompt = format!(
+        "Resume tracked workstream {}. Restore and validate its durable context, then acknowledge wake {} through Shipyard. Complete the remaining work, keep Linear current, and return ownership through Shipyard.",
+        request.resume_expectation.workstream_handle, request.delivery_fence.wake_id
+    );
+    let wrapper = match request.provider_id.as_str() {
+        "codex" => CODEX_WRAPPER,
+        "claude" => CLAUDE_WRAPPER,
+        _ => return Err("unsupported-provider"),
+    };
+    let mut words = vec![shell_word(wrapper)?];
+    if let Some(model) = &request.launch_options.model_id {
+        words.push("--model".to_owned());
+        words.push(shell_word(model)?);
+    }
+    if let Some(effort) = request.launch_options.reasoning_effort {
+        let effort = effort_name(effort);
+        if request.provider_id == "codex" {
+            words.push("-c".to_owned());
+            words.push(shell_word(&format!("model_reasoning_effort=\"{effort}\""))?);
+        } else {
+            words.push("--effort".to_owned());
+            words.push(effort.to_owned());
+        }
+    }
+    words.push(shell_word(&prompt)?);
+    Ok(words.join(" "))
+}
+
+fn shell_word(value: &str) -> Result<String, &'static str> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character == '\0' || character.is_control())
+    {
+        return Err("launch-value-is-not-shell-safe");
+    }
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+}
+
+const fn effort_name(effort: ProviderReasoningEffortV1) -> &'static str {
+    match effort {
+        ProviderReasoningEffortV1::Low => "low",
+        ProviderReasoningEffortV1::Medium => "medium",
+        ProviderReasoningEffortV1::High => "high",
+        ProviderReasoningEffortV1::Xhigh => "xhigh",
+        ProviderReasoningEffortV1::Max => "max",
+        ProviderReasoningEffortV1::Ultra => "ultra",
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceList {
+    window_id: String,
+    workspaces: Vec<ListedWorkspace>,
+}
+
+#[derive(Deserialize)]
+struct ListedWorkspace {
+    id: String,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
+struct CreatedWorkspace {
+    workspace_id: String,
+    surface_id: Option<String>,
+    window_id: Option<String>,
+}
+
+fn parse_created_workspace(bytes: &[u8]) -> Result<String, ()> {
+    let created: CreatedWorkspace = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let _ = (created.surface_id, created.window_id);
+    canonical_uuid(&created.workspace_id).ok_or(())
+}
+
+fn canonical_uuid(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36
+        || ![8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| ![8, 13, 18, 23].contains(&index) && !byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
+fn delivered(
+    request: &ProviderWrapperRequestV1,
+    workspace_id: &str,
+    description: &str,
+) -> ProviderWrapperOutcomeV1 {
+    #[derive(Serialize)]
+    struct Receipt<'a> {
+        domain: &'static str,
+        provider_id: &'a str,
+        idempotency_key: &'a str,
+        workspace_id: &'a str,
+        description: &'a str,
+    }
+    let receipt = serde_json::to_vec(&Receipt {
+        domain: "shipyard-cmux-provider-receipt-v1",
+        provider_id: &request.provider_id,
+        idempotency_key: &request.delivery_fence.idempotency_key,
+        workspace_id,
+        description,
+    })
+    .expect("fixed receipt serialization cannot fail");
+    ProviderWrapperOutcomeV1::Delivered {
+        acceptance: ProviderAcceptanceV1::ProviderSessionAccepted,
+        provider_session_ref: format!("session:{}:{workspace_id}", request.provider_id),
+        receipt_digest: hex::encode(Sha256::digest(receipt)),
+    }
+}
+
+fn retryable(code: &str) -> ProviderWrapperOutcomeV1 {
+    ProviderWrapperOutcomeV1::Retryable {
+        launch_state: NotAcceptedV1::NotAccepted,
+        error_digest: evidence_digest("retryable", code),
+    }
+}
+
+fn rejected(code: &str) -> ProviderWrapperOutcomeV1 {
+    ProviderWrapperOutcomeV1::Rejected {
+        launch_state: NotAcceptedV1::NotAccepted,
+        error_digest: evidence_digest("rejected", code),
+    }
+}
+
+fn uncertain(code: &str) -> ProviderWrapperOutcomeV1 {
+    ProviderWrapperOutcomeV1::Uncertain {
+        launch_state: UnknownV1::Unknown,
+        evidence_digest: evidence_digest("uncertain", code),
+    }
+}
+
+fn evidence_digest(class: &str, code: &str) -> String {
+    hex::encode(Sha256::digest(
+        format!("shipyard-cmux-provider-{class}-v1\0{code}").as_bytes(),
+    ))
+}
+
+fn response(
+    request: &ProviderWrapperRequestV1,
+    outcome: ProviderWrapperOutcomeV1,
+) -> ProviderWrapperResponseV1 {
+    ProviderWrapperResponseV1 {
+        schema_version: SCHEMA_VERSION,
+        operation: request.operation,
+        provider_id: request.provider_id.clone(),
+        adapter_id: request.adapter_id.clone(),
+        idempotency_key: request.delivery_fence.idempotency_key.clone(),
+        outcome,
+    }
+}
+
+#[cfg(test)]
+mod tests;

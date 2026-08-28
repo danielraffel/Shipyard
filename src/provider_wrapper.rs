@@ -345,7 +345,7 @@ pub(crate) fn run_provider_wrapper(
     run_provider_wrapper_unix(config, environment, request, &request_bytes)
 }
 
-fn validate_request(
+pub(crate) fn validate_request(
     config: &ProviderWrapperConfig,
     request: &ProviderWrapperRequestV1,
 ) -> Result<(), ProviderWrapperRefusal> {

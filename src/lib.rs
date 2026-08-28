@@ -178,6 +178,8 @@ pub mod workflow_cancellation;
 pub(crate) mod workstream_activation_loader;
 /// Trusted machine-global policy for future workstream continuation dispatch.
 pub mod workstream_continuation_config;
+/// Digest-pinnable cmux adapter for fresh workstream continuation sessions.
+pub mod workstream_provider_adapter;
 /// Host-global production-writer coordination for sandbox E2E isolation.
 mod writer_domain_lease;
 
