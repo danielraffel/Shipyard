@@ -145,6 +145,9 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     if version == SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 4 {
+        return migrate_v4_to_v5(connection);
+    }
     let ledger_incarnation_ref = random_opaque_ref("ledger")?;
     if version == 1 {
         return migrate_v1_to_v4(connection, &ledger_incarnation_ref);
@@ -344,6 +347,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
          PRAGMA user_version = 3;",
     )?;
     upgrade_v3_incarnation(&transaction, &ledger_incarnation_ref)?;
+    upgrade_v4_clock(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -359,6 +363,7 @@ fn migrate_v2_to_v4(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     upgrade_v2_outbox(&transaction)?;
     upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
+    upgrade_v4_clock(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -482,6 +487,7 @@ fn migrate_v1_to_v4(
     upgrade_v1_registry(&transaction)?;
     upgrade_v2_outbox(&transaction)?;
     upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
+    upgrade_v4_clock(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -493,6 +499,7 @@ fn migrate_v3_to_v4(
 ) -> WorkLedgerResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
+    upgrade_v4_clock(&transaction)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -585,7 +592,198 @@ fn upgrade_v3_incarnation(
                    ((NEW.delivery_started_at IS NULL) != (NEW.delivery_start_digest IS NULL))))
          BEGIN SELECT RAISE(ABORT, 'outbox incarnation shape is invalid'); END;",
     )?;
+    transaction.pragma_update(None, "user_version", 4)?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    upgrade_v4_clock(&transaction)?;
+    verify_migration_foreign_keys(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(super) const CLOCK_TIMESTAMP_TABLES: &[(&str, &[(&str, bool)])] = &[
+    (
+        "work_items",
+        &[("created_at", false), ("updated_at", false)],
+    ),
+    (
+        "continuation_contracts",
+        &[("created_at", false), ("updated_at", false)],
+    ),
+    (
+        "route_records",
+        &[("created_at", false), ("updated_at", false)],
+    ),
+    (
+        "adapter_registry",
+        &[("created_at", false), ("updated_at", false)],
+    ),
+    ("events", &[("created_at", false)]),
+    (
+        "outbox",
+        &[
+            ("created_at", false),
+            ("updated_at", false),
+            ("claimed_at", true),
+            ("delivery_started_at", true),
+            ("completed_at", true),
+        ],
+    ),
+    ("imports", &[("imported_at", false)]),
+    ("repo_policies", &[("updated_at", false)]),
+];
+
+const CLOCK_GUARD_TRIGGERS: &[(&str, &str)] = &[
+    (
+        "ledger_clock_no_delete",
+        "CREATE TRIGGER ledger_clock_no_delete
+         BEFORE DELETE ON ledger_clock
+         BEGIN SELECT RAISE(ABORT, 'ledger clock is durable'); END",
+    ),
+    (
+        "ledger_clock_no_second_insert",
+        "CREATE TRIGGER ledger_clock_no_second_insert
+         BEFORE INSERT ON ledger_clock
+         WHEN EXISTS (SELECT 1 FROM ledger_clock)
+         BEGIN SELECT RAISE(ABORT, 'ledger clock is a singleton'); END",
+    ),
+    (
+        "ledger_clock_guard_update",
+        "CREATE TRIGGER ledger_clock_guard_update
+         BEFORE UPDATE ON ledger_clock
+         WHEN NEW.singleton != OLD.singleton
+           OR NEW.writer_revision < OLD.writer_revision
+           OR NEW.floor_revision < OLD.floor_revision
+           OR (NEW.writer_revision - OLD.writer_revision) !=
+              (NEW.floor_revision - OLD.floor_revision)
+           OR (NEW.observed_floor IS NOT OLD.observed_floor AND
+               NEW.writer_revision = OLD.writer_revision)
+           OR (OLD.observed_floor IS NOT NULL AND
+               (NEW.observed_floor IS NULL OR NEW.observed_floor < OLD.observed_floor))
+         BEGIN SELECT RAISE(ABORT, 'ledger clock update is invalid'); END",
+    ),
+];
+
+fn clock_timestamp_trigger(
+    table: &str,
+    event: &str,
+    column: &str,
+    nullable: bool,
+) -> (String, String) {
+    let name = format!("ledger_clock_{table}_{event}_{column}");
+    let when = if nullable {
+        format!(" WHEN NEW.{column} IS NOT NULL")
+    } else {
+        String::new()
+    };
+    let operation = if event == "update" {
+        format!("UPDATE OF {column}")
+    } else {
+        "INSERT".to_owned()
+    };
+    let normalized = format!(
+        "CASE WHEN substr(NEW.{column}, -1) = 'Z'
+           THEN substr(NEW.{column}, 1, length(NEW.{column}) - 1) || '+00:00'
+           ELSE NEW.{column} END"
+    );
+    let normalized_length = format!("length({normalized})");
+    let fraction = format!("substr({normalized}, 21, {normalized_length} - 26)");
+    let sql = format!(
+        "CREATE TRIGGER {name}
+         AFTER {operation} ON {table}{when}
+         BEGIN
+           SELECT CASE WHEN strftime('%Y-%m-%dT%H:%M:%S', NEW.{column}) IS NULL
+               OR strftime('%Y-%m-%dT%H:%M:%S', NEW.{column}) != substr(NEW.{column}, 1, 19)
+               OR date(substr(NEW.{column}, 1, 10)) != substr(NEW.{column}, 1, 10)
+               OR substr(NEW.{column}, 12, 2) GLOB '*[^0-9]*'
+               OR CAST(substr(NEW.{column}, 12, 2) AS INTEGER) > 23
+               OR substr(NEW.{column}, 15, 2) GLOB '*[^0-9]*'
+               OR CAST(substr(NEW.{column}, 15, 2) AS INTEGER) > 59
+               OR substr(NEW.{column}, 18, 2) GLOB '*[^0-9]*'
+               OR CAST(substr(NEW.{column}, 18, 2) AS INTEGER) > 59
+               OR (substr(NEW.{column}, -1) != 'Z'
+                   AND substr(NEW.{column}, -6) != '+00:00')
+               OR ({normalized_length} != 25 AND
+                   ({normalized_length} < 27 OR {normalized_length} > 35))
+               OR ({normalized_length} > 25 AND
+                   (substr({normalized}, 20, 1) != '.'
+                    OR {fraction} = ''
+                    OR {fraction} GLOB '*[^0-9]*'))
+             THEN RAISE(ABORT, 'invalid observed timestamp') END;
+           SELECT CASE WHEN
+             (SELECT writer_revision FROM ledger_clock WHERE singleton = 1)
+               = 9223372036854775807
+             THEN RAISE(ABORT, 'ledger clock revision is exhausted') END;
+           UPDATE ledger_clock
+           SET observed_floor = CASE
+                 WHEN observed_floor IS NULL OR observed_floor < {normalized}
+                 THEN {normalized} ELSE observed_floor END,
+               writer_revision = writer_revision + 1,
+               floor_revision = floor_revision + 1
+           WHERE singleton = 1;
+         END"
+    );
+    (name, sql)
+}
+
+fn expected_clock_triggers() -> Vec<(String, String)> {
+    let mut expected = CLOCK_GUARD_TRIGGERS
+        .iter()
+        .map(|(name, sql)| ((*name).to_owned(), (*sql).to_owned()))
+        .collect::<Vec<_>>();
+    for (table, columns) in CLOCK_TIMESTAMP_TABLES {
+        for event in ["insert", "update"] {
+            for (column, nullable) in *columns {
+                expected.push(clock_timestamp_trigger(table, event, column, *nullable));
+            }
+        }
+    }
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    expected
+}
+
+fn upgrade_v4_clock(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
+    let floor = super::clock::derive_legacy_floor(transaction)?.map(|value| value.to_rfc3339());
+    transaction.execute_batch(
+        "CREATE TABLE ledger_clock (
+           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+           observed_floor TEXT,
+           writer_revision INTEGER NOT NULL CHECK(writer_revision >= 0),
+           floor_revision INTEGER NOT NULL CHECK(floor_revision >= 0 AND floor_revision <= writer_revision)
+         );",
+    )?;
+    for (_, sql) in expected_clock_triggers() {
+        transaction.execute_batch(&format!("{sql};"))?;
+    }
+    transaction.execute(
+        "INSERT INTO ledger_clock
+         (singleton, observed_floor, writer_revision, floor_revision)
+         VALUES (1, ?1, 0, 0)",
+        [floor],
+    )?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn verify_clock_schema(connection: &Connection) -> WorkLedgerResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT name, sql FROM sqlite_schema
+         WHERE type = 'trigger' AND name LIKE 'ledger_clock_%'
+         ORDER BY name",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if actual != expected_clock_triggers() {
+        return Err(WorkLedgerError::Refused(
+            "ledger clock trigger schema is incomplete or altered".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -677,7 +875,7 @@ pub(super) fn verify_supported_schema(connection: &Connection) -> WorkLedgerResu
     if version != SCHEMA_VERSION {
         return Err(WorkLedgerError::UnsupportedSchema(version));
     }
-    Ok(())
+    verify_clock_schema(connection)
 }
 
 pub(super) fn schema_version(connection: &Connection) -> WorkLedgerResult<i64> {

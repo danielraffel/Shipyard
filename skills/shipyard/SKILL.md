@@ -1328,6 +1328,19 @@ Schema migration refuses active legacy rows because it never invents missing
 dispatcher provenance. This API remains inert and must not be treated as a
 consumer or dispatch activation.
 Delivery is claimed with a bounded lease and exact adapter-generation fence.
+The lease is a positive duration of at most five minutes; callers do not supply
+claim, start, receipt, failure, or reconciliation timestamps. The ledger samples
+its shared monotonic clock only after it holds the writer-domain lease and an
+immediate transaction. Schema v5 derives the initial durable floor once under
+its exclusive migration, then an exact timestamp-trigger inventory advances
+one canonical UTC floor and paired writer/floor revisions transactionally for
+clock-owned, legacy, and ad-hoc writers. Revision mismatch fails closed;
+every connection also verifies the exact trigger definitions. Ordinary mutation
+and restart reads remain O(1). In-process wall correction clamps to
+the process floor without expiring leases; new external work waits while wall
+time trails the durable floor. Restart wall-clock rollback immediately requeues
+an unstarted claim and contains a started claim as uncertain without retry.
+Terminal or containment evidence commits at the durable floor.
 Only an unstarted expired claim may requeue; a started delivery expires to an
 uncertain terminal receipt and must never be retried automatically. Accepted,
 uncertain, definitive pre-delivery failure, and reconciled non-delivery

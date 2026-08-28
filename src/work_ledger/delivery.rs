@@ -5,6 +5,8 @@
 //! confuse an unstarted claim with an ambiguously delivered wake.
 #![allow(dead_code)] // Activated only after host-adapter canaries.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +23,10 @@ use super::{
 };
 
 const DELIVERY_SCHEMA_VERSION: u32 = 1;
-const MAX_CLAIM_LEASE: ChronoDuration = ChronoDuration::minutes(5);
+// Keep `rust-version = 1.92`; newer Clippy suggests `from_mins`, which is
+// unavailable on the declared MSRV.
+#[allow(unknown_lints, clippy::duration_suboptimal_units)]
+const MAX_CLAIM_LEASE: Duration = Duration::from_secs(5 * 60);
 
 /// Opaque, exact route identity required by a transport adapter.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -415,8 +420,7 @@ impl WorkLedger {
         dispatcher_epoch: &DispatcherEpoch,
         wake_id: &str,
         claimant_ref: &str,
-        claimed_at: DateTime<Utc>,
-        claim_expires_at: DateTime<Utc>,
+        lease: Duration,
     ) -> WorkLedgerResult<DeliveryClaim> {
         validate_opaque_ref("wake_id", wake_id, "wake")?;
         if dispatcher_epoch.ledger_incarnation_ref != self.ledger_incarnation_ref {
@@ -425,8 +429,7 @@ impl WorkLedger {
             ));
         }
         validate_opaque_ref("claimant_ref", claimant_ref, "machine")?;
-        let lease = claim_expires_at.signed_duration_since(claimed_at);
-        if lease <= ChronoDuration::zero() || lease > MAX_CLAIM_LEASE {
+        if lease.is_zero() || lease > MAX_CLAIM_LEASE {
             return Err(WorkLedgerError::Refused(
                 "delivery claim lease must be positive and no longer than five minutes".to_owned(),
             ));
@@ -435,6 +438,7 @@ impl WorkLedger {
             crate::writer_domain_lease::acquire_for_protected_path(self.writer_parent()?)?;
         let mut connection = self.delivery_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (claimed_at, claim_expires_at) = self.claim_window(&transaction, lease)?;
         let pending = pending_wake(&transaction, wake_id)?;
         let attempt = pending.claim_attempt.checked_add(1).ok_or_else(|| {
             WorkLedgerError::Refused("delivery claim attempt is exhausted".to_owned())
@@ -511,45 +515,56 @@ impl WorkLedger {
             &claim.identity_digest,
             &claim.claimed_at.to_rfc3339(),
         )?;
+        super::clock::LedgerClock::finalize(&transaction)?;
         transaction.commit()?;
         claim.validate_identity()?;
         Ok(claim)
     }
 
-    #[cfg(test)]
-    pub(super) fn claim_wake(
+    fn claim_window(
         &self,
-        wake_id: &str,
-        claimant_ref: &str,
-        claimed_at: DateTime<Utc>,
-        claim_expires_at: DateTime<Utc>,
-    ) -> WorkLedgerResult<DeliveryClaim> {
-        let dispatcher_epoch = self.dispatcher_epoch()?;
-        self.claim_wake_in_epoch(
-            &dispatcher_epoch,
-            wake_id,
-            claimant_ref,
-            claimed_at,
-            claim_expires_at,
-        )
+        transaction: &Transaction<'_>,
+        lease: Duration,
+    ) -> WorkLedgerResult<(DateTime<Utc>, DateTime<Utc>)> {
+        let clock = self.clock.observe(transaction)?;
+        if clock.durable_wall_regressed {
+            return Err(WorkLedgerError::Refused(
+                "wall clock regressed below the durable ledger floor; new delivery claims are refused"
+                    .to_owned(),
+            ));
+        }
+        let expires_at = clock
+            .timestamp
+            .checked_add_signed(ChronoDuration::from_std(lease).map_err(|_| {
+                WorkLedgerError::Refused("delivery claim lease is unsupported".to_owned())
+            })?)
+            .ok_or_else(|| WorkLedgerError::Refused("delivery claim expiry overflow".to_owned()))?;
+        Ok((clock.timestamp, expires_at))
     }
 
     /// Commit the no-return boundary immediately before an external adapter call.
     pub(super) fn mark_delivery_started(
         &self,
         claim: &DeliveryClaim,
-        started_at: DateTime<Utc>,
     ) -> WorkLedgerResult<StartedDelivery> {
         claim.validate_identity()?;
+        let _writer_domain =
+            crate::writer_domain_lease::acquire_for_protected_path(self.writer_parent()?)?;
+        let mut connection = self.delivery_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let clock = self.clock.observe(&transaction)?;
+        if clock.durable_wall_regressed {
+            return Err(WorkLedgerError::Refused(
+                "wall clock regressed below the durable ledger floor; new delivery starts are refused"
+                    .to_owned(),
+            ));
+        }
+        let started_at = clock.timestamp;
         if started_at < claim.claimed_at || started_at > claim.claim_expires_at {
             return Err(WorkLedgerError::Refused(
                 "delivery start is outside its claim lease".to_owned(),
             ));
         }
-        let _writer_domain =
-            crate::writer_domain_lease::acquire_for_protected_path(self.writer_parent()?)?;
-        let mut connection = self.delivery_connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_claim(&transaction, claim, "claimed")?;
         let pending = stored_wake_for_claim(claim);
         let (_, route) = validated_delivery_route(&transaction, &pending)?;
@@ -595,6 +610,7 @@ impl WorkLedger {
             &started.start_identity_digest,
             &started_at.to_rfc3339(),
         )?;
+        super::clock::LedgerClock::finalize(&transaction)?;
         transaction.commit()?;
         Ok(started)
     }
@@ -604,25 +620,19 @@ impl WorkLedger {
         &self,
         started: &StartedDelivery,
         receipt: &DeliveryReceipt,
-        acknowledged_at: DateTime<Utc>,
     ) -> WorkLedgerResult<()> {
         started.claim.validate_identity()?;
         receipt.validate_for_started(started)?;
-        if acknowledged_at < started.started_at {
-            return Err(WorkLedgerError::Refused(
-                "delivery acknowledgment predates delivery start".to_owned(),
-            ));
-        }
         let _writer_domain =
             crate::writer_domain_lease::acquire_for_protected_path(self.writer_parent()?)?;
         let mut connection = self.delivery_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = self.clock.observe(&transaction)?.timestamp.to_rfc3339();
         verify_started(&transaction, started)?;
         // Exact route and adapter bindings were fenced immediately before the
         // external call. Later registry retirement cannot erase an accepted
         // delivery; the receipt binds the immutable claim while the work update
         // below still fences the exact head and generations.
-        let now = acknowledged_at.to_rfc3339();
         let changed = transaction.execute(
             "UPDATE outbox SET state = 'acknowledged', receipt_kind = 'accepted',
                     receipt_digest = ?1, completed_at = ?2, updated_at = ?2
@@ -672,6 +682,7 @@ impl WorkLedger {
             &receipt.receipt_integrity,
             &now,
         )?;
+        super::clock::LedgerClock::finalize(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -681,15 +692,9 @@ impl WorkLedger {
         &self,
         started: &StartedDelivery,
         uncertainty_digest: &str,
-        observed_at: DateTime<Utc>,
     ) -> WorkLedgerResult<()> {
         validate_digest("uncertainty evidence", uncertainty_digest)?;
         started.validate_identity()?;
-        if observed_at < started.started_at {
-            return Err(WorkLedgerError::Refused(
-                "uncertainty evidence predates delivery start".to_owned(),
-            ));
-        }
         let receipt = DeliveryReceipt::outcome(
             &started.claim,
             Some(&started.start_identity_digest),
@@ -700,13 +705,14 @@ impl WorkLedger {
             crate::writer_domain_lease::acquire_for_protected_path(self.writer_parent()?)?;
         let mut connection = self.delivery_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = self.clock.observe(&transaction)?.timestamp.to_rfc3339();
         verify_started(&transaction, started)?;
         update_uncertain(
             &transaction,
             &started.claim.wake_id,
             &started.claim.claim_id,
             &receipt.receipt_integrity,
-            &observed_at.to_rfc3339(),
+            &now,
         )?;
         record_event(
             &transaction,
@@ -719,8 +725,9 @@ impl WorkLedger {
             Some(LifecycleState::Dispatching),
             LifecycleState::Dispatching,
             &receipt.receipt_integrity,
-            &observed_at.to_rfc3339(),
+            &now,
         )?;
+        super::clock::LedgerClock::finalize(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -732,7 +739,6 @@ impl WorkLedger {
         &self,
         claim: &DeliveryClaim,
         receipt: &DeliveryReceipt,
-        resolved_at: DateTime<Utc>,
     ) -> WorkLedgerResult<()> {
         claim.validate_identity()?;
         if receipt.receipt_kind != DeliveryReceiptKind::Accepted
@@ -747,24 +753,19 @@ impl WorkLedger {
             crate::writer_domain_lease::acquire_for_protected_path(self.writer_parent()?)?;
         let mut connection = self.delivery_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = self.clock.observe(&transaction)?.timestamp.to_rfc3339();
         verify_claim(&transaction, claim, "uncertain")?;
-        let (uncertain_at, stored_start_digest): (String, String) = transaction.query_row(
-            "SELECT completed_at, delivery_start_digest FROM outbox
+        let stored_start_digest: String = transaction.query_row(
+            "SELECT delivery_start_digest FROM outbox
              WHERE wake_id = ?1 AND state = 'uncertain'",
             [&claim.wake_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )?;
         if receipt.delivery_start_digest.as_deref() != Some(stored_start_digest.as_str()) {
             return Err(WorkLedgerError::Refused(
                 "uncertain delivery receipt does not match the durable start".to_owned(),
             ));
         }
-        if resolved_at < parse_timestamp("uncertain completion", &uncertain_at)? {
-            return Err(WorkLedgerError::Refused(
-                "delivery resolution predates the uncertain outcome".to_owned(),
-            ));
-        }
-
         let (outbox_state, work_phase, event_kind) = match receipt.receipt_kind {
             DeliveryReceiptKind::Accepted => (
                 "acknowledged",
@@ -778,7 +779,6 @@ impl WorkLedger {
             ),
             _ => unreachable!("receipt kind checked above"),
         };
-        let now = resolved_at.to_rfc3339();
         let changed = transaction.execute(
             "UPDATE outbox SET state = ?1, receipt_kind = ?2,
                     receipt_digest = ?3, completed_at = ?4, updated_at = ?4
@@ -830,6 +830,7 @@ impl WorkLedger {
             &receipt.receipt_integrity,
             &now,
         )?;
+        super::clock::LedgerClock::finalize(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -883,15 +884,9 @@ impl WorkLedger {
         &self,
         claim: &DeliveryClaim,
         failure_digest: &str,
-        observed_at: DateTime<Utc>,
     ) -> WorkLedgerResult<()> {
         validate_digest("delivery failure evidence", failure_digest)?;
         claim.validate_identity()?;
-        if observed_at < claim.claimed_at || observed_at > claim.claim_expires_at {
-            return Err(WorkLedgerError::Refused(
-                "definitive delivery failure is outside its claim lease".to_owned(),
-            ));
-        }
         let receipt = DeliveryReceipt::outcome(
             claim,
             None,
@@ -902,8 +897,14 @@ impl WorkLedger {
             crate::writer_domain_lease::acquire_for_protected_path(self.writer_parent()?)?;
         let mut connection = self.delivery_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let clock = self.clock.observe(&transaction)?;
+        if !clock.restart_wall_regressed && clock.timestamp > claim.claim_expires_at {
+            return Err(WorkLedgerError::Refused(
+                "definitive delivery failure is outside its claim lease".to_owned(),
+            ));
+        }
         verify_claim(&transaction, claim, "claimed")?;
-        let now = observed_at.to_rfc3339();
+        let now = clock.timestamp.to_rfc3339();
         let changed = transaction.execute(
             "UPDATE outbox SET state = 'failed',
                     receipt_kind = 'definitive_pre_delivery_failure',
@@ -953,6 +954,7 @@ impl WorkLedger {
             &receipt.receipt_integrity,
             &now,
         )?;
+        super::clock::LedgerClock::finalize(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -961,7 +963,6 @@ impl WorkLedger {
     pub(super) fn reconcile_expired_claim(
         &self,
         wake_id: &str,
-        observed_at: DateTime<Utc>,
         uncertainty_digest: &str,
     ) -> WorkLedgerResult<ExpiredClaimDisposition> {
         validate_opaque_ref("wake_id", wake_id, "wake")?;
@@ -970,13 +971,14 @@ impl WorkLedger {
             crate::writer_domain_lease::acquire_for_protected_path(self.writer_parent()?)?;
         let mut connection = self.delivery_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let clock = self.clock.observe(&transaction)?;
         let claim = expired_claim(&transaction, wake_id)?;
-        if observed_at < claim.expires_at {
+        if !clock.restart_wall_regressed && clock.timestamp < claim.expires_at {
             return Err(WorkLedgerError::Refused(
                 "delivery claim has not expired".to_owned(),
             ));
         }
-        let now = observed_at.to_rfc3339();
+        let now = clock.timestamp.to_rfc3339();
         let disposition = if claim.state == "claimed" && claim.started_at.is_none() {
             requeue_expired_unstarted(&transaction, wake_id, &claim, &now)?;
             ExpiredClaimDisposition::RequeuedUnstarted
@@ -993,6 +995,7 @@ impl WorkLedger {
             mark_expired_started_uncertain(&transaction, wake_id, &claim, &receipt_digest, &now)?;
             ExpiredClaimDisposition::MarkedUncertain
         };
+        super::clock::LedgerClock::finalize(&transaction)?;
         transaction.commit()?;
         Ok(disposition)
     }

@@ -59,6 +59,7 @@ pub(super) fn install_exact_v1_registry_schema(
 }
 
 pub(super) fn strip_v4_incarnation_schema(ledger: &WorkLedger) {
+    strip_v5_clock_schema(ledger);
     let connection = ledger.connect_read_write().expect("v4 connection");
     if schema_version(&connection).expect("schema version") != 4 {
         return;
@@ -95,6 +96,34 @@ pub(super) fn strip_v4_incarnation_schema(ledger: &WorkLedger) {
         .expect("strip v4 incarnation fixture");
 }
 
+pub(super) fn strip_v5_clock_schema(ledger: &WorkLedger) {
+    let connection = ledger.connect_read_write().expect("v5 connection");
+    if schema_version(&connection).expect("schema version") != 5 {
+        return;
+    }
+    let trigger_names = {
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'trigger' AND name LIKE 'ledger_clock_%'",
+            )
+            .expect("clock triggers");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("clock trigger rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("clock trigger names")
+    };
+    for trigger_name in trigger_names {
+        connection
+            .execute_batch(&format!("DROP TRIGGER \"{trigger_name}\";"))
+            .expect("drop clock trigger");
+    }
+    connection
+        .execute_batch("DROP TABLE ledger_clock; PRAGMA user_version = 4;")
+        .expect("strip v5 clock fixture");
+}
+
 #[test]
 fn fresh_ledger_creates_one_stable_incarnation_and_verifies_every_open() {
     let temp = TempDir::new().expect("temp");
@@ -118,6 +147,317 @@ fn fresh_ledger_creates_one_stable_incarnation_and_verifies_every_open() {
             )
             .is_err(),
         "the once-created incarnation must be immutable"
+    );
+}
+
+#[test]
+fn fresh_v5_clock_has_exact_timestamp_writer_trigger_inventory() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("fresh ledger");
+    let connection = ledger.connect_read_only().expect("connection");
+    let mut actual = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'trigger' AND name LIKE 'ledger_clock_%' ORDER BY name",
+        )
+        .expect("clock triggers")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("clock trigger rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("clock trigger names");
+    let mut expected = vec![
+        "ledger_clock_guard_update".to_owned(),
+        "ledger_clock_no_delete".to_owned(),
+        "ledger_clock_no_second_insert".to_owned(),
+    ];
+    for (table, columns) in super::storage::CLOCK_TIMESTAMP_TABLES {
+        for event in ["insert", "update"] {
+            for (column, _) in *columns {
+                expected.push(format!("ledger_clock_{table}_{event}_{column}"));
+            }
+        }
+    }
+    expected.sort();
+    actual.sort();
+    assert_eq!(actual, expected);
+    assert_eq!(schema_version(&connection).expect("schema version"), 5);
+    assert!(
+        super::clock::load_durable_floor(&connection)
+            .expect("clock floor")
+            .is_none()
+    );
+}
+
+#[test]
+fn missing_or_altered_clock_trigger_fails_existing_handle_closed() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("fresh ledger");
+    let connection = ledger.connect_read_write().expect("connection");
+    connection
+        .execute_batch("DROP TRIGGER ledger_clock_work_items_update_updated_at;")
+        .expect("damage clock trigger inventory");
+    drop(connection);
+
+    assert!(matches!(
+        ledger.status(),
+        Err(WorkLedgerError::Refused(reason))
+            if reason.contains("clock trigger schema is incomplete or altered")
+    ));
+    assert!(matches!(
+        WorkLedger::open_existing(temp.path()),
+        Err(WorkLedgerError::Refused(reason))
+            if reason.contains("clock trigger schema is incomplete or altered")
+    ));
+}
+
+#[test]
+fn v4_to_v5_migration_derives_exact_floor_and_is_idempotent() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("fresh ledger");
+    ledger
+        .import(&[sample_candidate()])
+        .expect("legacy fixture");
+    strip_v5_clock_schema(&ledger);
+    let connection = ledger.connect_read_write().expect("v4 connection");
+    connection
+        .execute(
+            "UPDATE work_items SET updated_at = '2035-08-28T12:00:00Z'",
+            [],
+        )
+        .expect("future legacy observation");
+    drop(connection);
+    drop(ledger);
+
+    let migrated = WorkLedger::open(temp.path()).expect("migrate v4");
+    let connection = migrated.connect_read_only().expect("v5 connection");
+    assert_eq!(schema_version(&connection).expect("schema version"), 5);
+    assert_eq!(
+        super::clock::load_durable_floor(&connection)
+            .expect("clock floor")
+            .expect("present floor")
+            .to_rfc3339(),
+        "2035-08-28T12:00:00+00:00"
+    );
+    drop(connection);
+    drop(migrated);
+    WorkLedger::open(temp.path()).expect("idempotent v5 reopen");
+}
+
+#[test]
+fn failed_v4_to_v5_clock_creation_rolls_back_version_and_schema() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("fresh ledger");
+    strip_v5_clock_schema(&ledger);
+    let connection = ledger.connect_read_write().expect("v4 connection");
+    connection
+        .execute_batch("CREATE TABLE ledger_clock (collision TEXT);")
+        .expect("migration collision");
+    drop(connection);
+    drop(ledger);
+
+    assert!(WorkLedger::open(temp.path()).is_err());
+    let connection = Connection::open(WorkLedger::path_at(temp.path())).expect("inspect v4");
+    assert_eq!(schema_version(&connection).expect("schema version"), 4);
+    let columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('ledger_clock') WHERE name = 'collision'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("collision table");
+    assert_eq!(columns, 1);
+    let clock_triggers: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'trigger' AND name LIKE 'ledger_clock_%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("clock triggers");
+    assert_eq!(clock_triggers, 0);
+}
+
+#[test]
+fn v4_to_v5_migration_waits_for_concurrent_writer_and_includes_its_commit() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("fresh ledger");
+    ledger
+        .import(&[sample_candidate()])
+        .expect("legacy fixture");
+    strip_v5_clock_schema(&ledger);
+    let mut connection = ledger.connect_read_write().expect("v4 connection");
+    let writer = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("active v4 writer");
+    writer
+        .execute(
+            "UPDATE work_items SET updated_at = '2038-08-28T12:00:00Z'",
+            [],
+        )
+        .expect("uncommitted v4 timestamp");
+
+    let state_dir = temp.path().to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let migrator = std::thread::spawn(move || {
+        sender
+            .send(WorkLedger::open(&state_dir).map(|_| ()))
+            .expect("send migration result");
+    });
+    assert!(matches!(
+        receiver.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    writer.commit().expect("commit concurrent v4 writer");
+    receiver
+        .recv_timeout(Duration::from_secs(6))
+        .expect("migration result")
+        .expect("migration succeeds");
+    migrator.join().expect("migrator thread");
+
+    let migrated = WorkLedger::open(temp.path()).expect("migrated ledger");
+    let connection = migrated.connect_read_only().expect("v5 connection");
+    assert_eq!(
+        super::clock::load_durable_floor(&connection)
+            .expect("clock floor")
+            .expect("present floor")
+            .to_rfc3339(),
+        "2038-08-28T12:00:00+00:00"
+    );
+}
+
+#[test]
+fn ad_hoc_timestamp_writes_advance_floor_immediately_and_rollback_with_their_transaction() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("fresh ledger");
+    ledger
+        .import(&[sample_candidate()])
+        .expect("legacy fixture");
+    let mut connection = ledger.connect_read_write().expect("connection");
+    connection
+        .execute(
+            "UPDATE work_items SET updated_at = '2036-08-28T12:00:00Z'",
+            [],
+        )
+        .expect("ad hoc timestamp writer");
+    let (stored_floor, writer_revision, floor_revision): (String, i64, i64) = connection
+        .query_row(
+            "SELECT observed_floor, writer_revision, floor_revision
+             FROM ledger_clock WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("advanced clock floor");
+    assert_eq!(stored_floor, "2036-08-28T12:00:00+00:00");
+    assert_eq!(writer_revision, floor_revision);
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("transaction");
+    transaction
+        .execute("UPDATE events SET created_at = '2037-08-28T12:00:00Z'", [])
+        .expect("transactional timestamp writer");
+    let advanced_in_transaction: (String, i64, i64) = transaction
+        .query_row(
+            "SELECT observed_floor, writer_revision, floor_revision
+             FROM ledger_clock WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("transaction clock revisions");
+    assert_eq!(advanced_in_transaction.0, "2037-08-28T12:00:00+00:00");
+    assert!(advanced_in_transaction.1 > writer_revision);
+    assert_eq!(advanced_in_transaction.1, advanced_in_transaction.2);
+    transaction.rollback().expect("rollback");
+    let rolled_back: (String, i64, i64) = connection
+        .query_row(
+            "SELECT observed_floor, writer_revision, floor_revision
+             FROM ledger_clock WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("rolled-back clock revisions");
+    assert_eq!(rolled_back.0, stored_floor);
+    assert_eq!(rolled_back.1, writer_revision);
+    assert_eq!(rolled_back.2, floor_revision);
+    assert!(
+        connection
+            .execute("UPDATE work_items SET updated_at = 'not-a-time'", [])
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE ledger_clock
+             SET observed_floor = '2035-08-28T12:00:00+00:00'",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE ledger_clock
+             SET observed_floor = '2999-08-28T12:00:00+00:00'",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE ledger_clock SET writer_revision = writer_revision + 1",
+                [],
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn timestamp_triggers_preserve_exact_submillisecond_utc_ordering() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("fresh ledger");
+    ledger
+        .import(&[sample_candidate()])
+        .expect("timestamp fixture");
+    let connection = ledger.connect_read_write().expect("connection");
+    for timestamp in [
+        "2036-08-28T12:00:00.1Z",
+        "2036-08-28T12:00:00.09+00:00",
+        "2036-08-28T12:00:00.100000001+00:00",
+    ] {
+        connection
+            .execute("UPDATE work_items SET updated_at = ?1", [timestamp])
+            .expect("exact UTC timestamp");
+    }
+    assert_eq!(
+        super::clock::load_durable_floor(&connection)
+            .expect("clock floor")
+            .expect("present floor")
+            .to_rfc3339(),
+        "2036-08-28T12:00:00.100000001+00:00"
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE work_items SET updated_at = '2036-08-28T13:00:00+01:00'",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE work_items SET updated_at = '2036-08-28T24:00:00+00:00'",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE work_items SET updated_at = '2036-02-30T12:00:00+00:00'",
+                [],
+            )
+            .is_err()
     );
 }
 
@@ -254,7 +594,7 @@ fn v1_registry_migrates_transactionally_and_accepts_exact_agent_binding() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate exact v1 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 4);
+    assert_eq!(schema_version(&connection).expect("schema version"), 5);
     let preserved: Vec<(String, String, String)> = {
         let mut statement = connection
             .prepare(

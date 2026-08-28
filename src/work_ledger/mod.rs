@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -49,6 +49,7 @@ macro_rules! candidate_params {
     };
 }
 
+mod clock;
 mod delivery;
 mod importer;
 mod lifecycle;
@@ -246,6 +247,7 @@ pub struct ImportReport {
 pub struct WorkLedger {
     path: PathBuf,
     ledger_incarnation_ref: String,
+    clock: clock::LedgerClock,
 }
 
 pub(super) fn validate_candidate(candidate: &ImportCandidate) -> WorkLedgerResult<()> {

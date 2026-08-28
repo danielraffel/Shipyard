@@ -728,6 +728,23 @@ pending legacy wakes; any v1, v2, or v3 non-pending row requires explicit
 reconciliation because its process provenance cannot be inferred. This fencing
 does not activate a consumer: `dispatch_enabled=false` remains invariant.
 
+All supported delivery and lifecycle mutations use one ledger-owned clock
+shared across cloned handles; callers never provide event timestamps. The clock
+is sampled only after the writer-domain lease and immediate transaction are
+held. Schema v5 derives the initial floor once in the exclusive migration, then
+an exact trigger inventory advances one canonical UTC floor and paired
+writer/floor revisions in the same transaction as every timestamp write,
+including legacy and ad-hoc writers. A revision mismatch fails closed. This
+clock trigger schema is verified on every connection. This keeps ordinary
+mutations and restart reads O(1), without a history scan. Claims accept a positive duration
+of at most five minutes. New claims and starts refuse whenever wall time trails
+the durable floor. If that condition was present at restart, reconciliation
+ignores the future lease deadline: unstarted work returns to pending
+immediately, while started delivery becomes uncertain and can never be retried
+automatically.
+Terminal and containment writes use the durable floor so their audit time never
+moves backward.
+
 The schema deliberately keeps logical goal, owner, terminal runtime,
 agent/session adapter, and provider-routing adapter identities separate. PR,
 product-acceptance, and continuation terminal truth are separate columns;

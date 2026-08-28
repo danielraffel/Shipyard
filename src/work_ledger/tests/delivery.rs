@@ -1,11 +1,112 @@
 use super::*;
 use chrono::{Duration as ChronoDuration, TimeZone};
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 fn at(second: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 28, 12, 0, second)
+    Utc.with_ymd_and_hms(2030, 8, 28, 12, 0, second)
         .single()
         .expect("timestamp")
+}
+
+fn regressed_wall() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2029, 8, 28, 12, 0, 0)
+        .single()
+        .expect("regressed timestamp")
+}
+
+fn set_time(ledger: &WorkLedger, now: chrono::DateTime<Utc>) {
+    ledger.set_manual_time(now).expect("manual ledger clock");
+}
+
+fn lease_between(claimed_at: chrono::DateTime<Utc>, expires_at: chrono::DateTime<Utc>) -> Duration {
+    expires_at
+        .signed_duration_since(claimed_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+}
+
+fn claim_at(
+    ledger: &WorkLedger,
+    wake_id: &str,
+    claimant_ref: &str,
+    claimed_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+) -> WorkLedgerResult<DeliveryClaim> {
+    set_time(ledger, claimed_at);
+    let dispatcher = ledger.dispatcher_epoch()?;
+    ledger.claim_wake_in_epoch(
+        &dispatcher,
+        wake_id,
+        claimant_ref,
+        lease_between(claimed_at, expires_at),
+    )
+}
+
+fn claim_in_epoch_at(
+    ledger: &WorkLedger,
+    dispatcher: &DispatcherEpoch,
+    wake_id: &str,
+    claimant_ref: &str,
+    claimed_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+) -> WorkLedgerResult<DeliveryClaim> {
+    set_time(ledger, claimed_at);
+    ledger.claim_wake_in_epoch(
+        dispatcher,
+        wake_id,
+        claimant_ref,
+        lease_between(claimed_at, expires_at),
+    )
+}
+
+fn start_at(
+    ledger: &WorkLedger,
+    claim: &DeliveryClaim,
+    started_at: chrono::DateTime<Utc>,
+) -> WorkLedgerResult<StartedDelivery> {
+    set_time(ledger, started_at);
+    ledger.mark_delivery_started(claim)
+}
+
+fn reconcile_expired_at(
+    ledger: &WorkLedger,
+    wake_id: &str,
+    observed_at: chrono::DateTime<Utc>,
+    receipt_digest: &str,
+) -> WorkLedgerResult<ExpiredClaimDisposition> {
+    set_time(ledger, observed_at);
+    ledger.reconcile_expired_claim(wake_id, receipt_digest)
+}
+
+fn acknowledge_at(
+    ledger: &WorkLedger,
+    started: &StartedDelivery,
+    receipt: &DeliveryReceipt,
+    acknowledged_at: chrono::DateTime<Utc>,
+) -> WorkLedgerResult<()> {
+    set_time(ledger, acknowledged_at);
+    ledger.acknowledge_delivery(started, receipt)
+}
+
+fn reconcile_uncertain_at(
+    ledger: &WorkLedger,
+    claim: &DeliveryClaim,
+    receipt: &DeliveryReceipt,
+    reconciled_at: chrono::DateTime<Utc>,
+) -> WorkLedgerResult<()> {
+    set_time(ledger, reconciled_at);
+    ledger.reconcile_uncertain_delivery(claim, receipt)
+}
+
+fn fail_unstarted_at(
+    ledger: &WorkLedger,
+    claim: &DeliveryClaim,
+    receipt_digest: &str,
+    failed_at: chrono::DateTime<Utc>,
+) -> WorkLedgerResult<()> {
+    set_time(ledger, failed_at);
+    ledger.fail_unstarted_claim(claim, receipt_digest)
 }
 
 fn pending_delivery() -> (TempDir, WorkLedger, String, String, AdapterBindingRecord) {
@@ -42,15 +143,21 @@ fn pending_delivery() -> (TempDir, WorkLedger, String, String, AdapterBindingRec
     ledger
         .transition_with_wake(&work_id, 5, 3, LifecycleState::Dispatching, Some(&wake))
         .expect("dispatching");
+    set_time(&ledger, at(0));
     (temp, ledger, work_id, wake_id, adapter)
 }
 
 #[test]
 fn exact_route_generation_precedes_wake_and_claim_by_one() {
     let (_temp, ledger, _work_id, wake_id, adapter) = pending_delivery();
-    let claim = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(30))
-        .expect("claim route N for work and wake N+1");
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim route N for work and wake N+1");
 
     assert_eq!(claim.work_generation, 6);
     assert_eq!(claim.route.terminal_kind, "cmux");
@@ -123,16 +230,22 @@ fn generic_terminal_transition_cannot_strand_an_active_wake() {
 
 #[test]
 fn concurrent_claim_is_singleton() {
-    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
     let barrier = Arc::new(Barrier::new(3));
     let mut workers = Vec::new();
     for machine in ["m1", "m5"] {
-        let ledger = ledger.clone();
+        let ledger = WorkLedger::open(temp.path()).expect("independent ledger handle");
         let wake_id = wake_id.clone();
         let barrier = Arc::clone(&barrier);
         workers.push(std::thread::spawn(move || {
             barrier.wait();
-            ledger.claim_wake(&wake_id, &opaque_ref("machine", machine), at(0), at(30))
+            claim_at(
+                &ledger,
+                &wake_id,
+                &opaque_ref("machine", machine),
+                at(0),
+                at(30),
+            )
         }));
     }
     barrier.wait();
@@ -152,18 +265,26 @@ fn concurrent_claim_is_singleton() {
 #[test]
 fn expired_unstarted_claim_requeues_with_monotonic_attempt() {
     let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
-    let first = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m1"), at(0), at(10))
-        .expect("first claim");
+    let first = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m1"),
+        at(0),
+        at(10),
+    )
+    .expect("first claim");
     assert_eq!(
-        ledger
-            .reconcile_expired_claim(&wake_id, at(11), &digest(b"restart"))
-            .expect("requeue"),
+        reconcile_expired_at(&ledger, &wake_id, at(11), &digest(b"restart")).expect("requeue"),
         ExpiredClaimDisposition::RequeuedUnstarted
     );
-    let second = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m5"), at(12), at(22))
-        .expect("second claim");
+    let second = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m5"),
+        at(12),
+        at(22),
+    )
+    .expect("second claim");
     assert_eq!(first.claim_attempt, 1);
     assert_eq!(second.claim_attempt, 2);
     assert_ne!(first.claim_id, second.claim_id);
@@ -173,22 +294,29 @@ fn expired_unstarted_claim_requeues_with_monotonic_attempt() {
 #[test]
 fn started_expiry_is_uncertain_and_never_requeued() {
     let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
-    let claim = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(10))
-        .expect("claim");
-    ledger
-        .mark_delivery_started(&claim, at(1))
-        .expect("started boundary");
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(10),
+    )
+    .expect("claim");
+    start_at(&ledger, &claim, at(1)).expect("started boundary");
     assert_eq!(
-        ledger
-            .reconcile_expired_claim(&wake_id, at(11), &digest(b"restart ambiguity"))
+        reconcile_expired_at(&ledger, &wake_id, at(11), &digest(b"restart ambiguity"),)
             .expect("uncertain"),
         ExpiredClaimDisposition::MarkedUncertain
     );
     assert!(
-        ledger
-            .claim_wake(&wake_id, &opaque_ref("machine", "m1"), at(12), at(22),)
-            .is_err()
+        claim_at(
+            &ledger,
+            &wake_id,
+            &opaque_ref("machine", "m1"),
+            at(12),
+            at(22),
+        )
+        .is_err()
     );
     let connection = ledger.connect_read_only().expect("connection");
     let row: (String, String, String) = connection
@@ -206,15 +334,17 @@ fn started_expiry_is_uncertain_and_never_requeued() {
 #[test]
 fn uncertain_delivery_acceptance_transfers_ownership_without_retry() {
     let (temp, ledger, work_id, wake_id, _adapter) = pending_delivery();
-    let claim = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(10))
-        .expect("claim");
-    let started = ledger
-        .mark_delivery_started(&claim, at(1))
-        .expect("started boundary");
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(10),
+    )
+    .expect("claim");
+    let started = start_at(&ledger, &claim, at(1)).expect("started boundary");
     let delivery_start_digest = started.start_identity_digest;
-    ledger
-        .reconcile_expired_claim(&wake_id, at(11), &digest(b"restart ambiguity"))
+    reconcile_expired_at(&ledger, &wake_id, at(11), &digest(b"restart ambiguity"))
         .expect("uncertain");
     drop(claim);
     drop(ledger);
@@ -230,9 +360,7 @@ fn uncertain_delivery_acceptance_transfers_ownership_without_retry() {
     )
     .expect("accepted receipt");
 
-    ledger
-        .reconcile_uncertain_delivery(&claim, &receipt, at(12))
-        .expect("resolve accepted");
+    reconcile_uncertain_at(&ledger, &claim, &receipt, at(12)).expect("resolve accepted");
 
     let connection = ledger.connect_read_only().expect("connection");
     let row: (String, String) = connection
@@ -256,14 +384,16 @@ fn uncertain_delivery_acceptance_transfers_ownership_without_retry() {
 #[test]
 fn uncertain_non_delivery_returns_actionable_but_never_pending() {
     let (_temp, ledger, work_id, wake_id, _adapter) = pending_delivery();
-    let claim = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(10))
-        .expect("claim");
-    let started = ledger
-        .mark_delivery_started(&claim, at(1))
-        .expect("started boundary");
-    ledger
-        .reconcile_expired_claim(&wake_id, at(11), &digest(b"restart ambiguity"))
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(10),
+    )
+    .expect("claim");
+    let started = start_at(&ledger, &claim, at(1)).expect("started boundary");
+    reconcile_expired_at(&ledger, &wake_id, at(11), &digest(b"restart ambiguity"))
         .expect("uncertain");
     let receipt = DeliveryReceipt::not_delivered_after_uncertainty(
         &claim,
@@ -272,9 +402,7 @@ fn uncertain_non_delivery_returns_actionable_but_never_pending() {
     )
     .expect("not-delivered receipt");
 
-    ledger
-        .reconcile_uncertain_delivery(&claim, &receipt, at(12))
-        .expect("resolve not delivered");
+    reconcile_uncertain_at(&ledger, &claim, &receipt, at(12)).expect("resolve not delivered");
 
     let connection = ledger.connect_read_only().expect("connection");
     let row: (String, String) = connection
@@ -305,12 +433,15 @@ fn uncertain_non_delivery_returns_actionable_but_never_pending() {
 #[test]
 fn exact_receipt_acknowledges_and_transfers_repair_ownership_atomically() {
     let (_temp, ledger, work_id, wake_id, adapter) = pending_delivery();
-    let claim = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(30))
-        .expect("claim");
-    let started = ledger
-        .mark_delivery_started(&claim, at(1))
-        .expect("started");
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    let started = start_at(&ledger, &claim, at(1)).expect("started");
     assert!(
         DeliveryReceipt::new(
             &started,
@@ -328,11 +459,7 @@ fn exact_receipt_acknowledges_and_transfers_repair_ownership_atomically() {
     .expect("receipt");
     let mut wrong_started = started.clone();
     wrong_started.claim.claim_attempt += 1;
-    assert!(
-        ledger
-            .acknowledge_delivery(&wrong_started, &receipt, at(2))
-            .is_err()
-    );
+    assert!(acknowledge_at(&ledger, &wrong_started, &receipt, at(2)).is_err());
     let connection = ledger.connect_read_write().expect("connection");
     connection
         .execute(
@@ -341,9 +468,7 @@ fn exact_receipt_acknowledges_and_transfers_repair_ownership_atomically() {
         )
         .expect("retire after accepted delivery");
     drop(connection);
-    ledger
-        .acknowledge_delivery(&started, &receipt, at(2))
-        .expect("acknowledge exact receipt");
+    acknowledge_at(&ledger, &started, &receipt, at(2)).expect("acknowledge exact receipt");
     let connection = ledger.connect_read_only().expect("connection");
     let work: (String, u64) = connection
         .query_row(
@@ -366,17 +491,21 @@ fn exact_receipt_acknowledges_and_transfers_repair_ownership_atomically() {
 #[test]
 fn definitive_pre_delivery_failure_returns_to_actionable_with_receipt() {
     let (_temp, ledger, work_id, wake_id, _adapter) = pending_delivery();
-    let claim = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(30))
-        .expect("claim");
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
     assert!(
         ledger
             .transition_with_wake(&work_id, 6, 3, LifecycleState::Actionable, None)
             .is_err(),
         "generic lifecycle mutation must not bypass the definitive receipt"
     );
-    ledger
-        .fail_unstarted_claim(&claim, &digest(b"quota unavailable"), at(1))
+    fail_unstarted_at(&ledger, &claim, &digest(b"quota unavailable"), at(1))
         .expect("definitive failure");
     let connection = ledger.connect_read_only().expect("connection");
     let work: (String, u64) = connection
@@ -402,9 +531,14 @@ fn definitive_pre_delivery_failure_returns_to_actionable_with_receipt() {
 #[test]
 fn adapter_drift_after_claim_refuses_delivery_start() {
     let (_temp, ledger, _work_id, wake_id, adapter) = pending_delivery();
-    let claim = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(30))
-        .expect("claim");
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
     let connection = ledger.connect_read_write().expect("connection");
     connection
         .execute(
@@ -417,7 +551,7 @@ fn adapter_drift_after_claim_refuses_delivery_start() {
         )
         .expect("drift adapter");
     drop(connection);
-    assert!(ledger.mark_delivery_started(&claim, at(1)).is_err());
+    assert!(start_at(&ledger, &claim, at(1)).is_err());
     let connection = ledger.connect_read_only().expect("connection");
     let state: String = connection
         .query_row(
@@ -432,10 +566,15 @@ fn adapter_drift_after_claim_refuses_delivery_start() {
 #[test]
 fn acknowledgment_event_failure_rolls_back_receipt_and_work_transition() {
     let (_temp, ledger, work_id, wake_id, _adapter) = pending_delivery();
-    let claim = ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(30))
-        .expect("claim");
-    let started = ledger.mark_delivery_started(&claim, at(1)).expect("start");
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    let started = start_at(&ledger, &claim, at(1)).expect("start");
     let receipt = DeliveryReceipt::new(
         &started,
         started.claim.route.native_session_ref.clone(),
@@ -451,11 +590,7 @@ fn acknowledgment_event_failure_rolls_back_receipt_and_work_transition() {
         )
         .expect("trigger");
     drop(connection);
-    assert!(
-        ledger
-            .acknowledge_delivery(&started, &receipt, at(2))
-            .is_err()
-    );
+    assert!(acknowledge_at(&ledger, &started, &receipt, at(2)).is_err());
     let connection = ledger.connect_read_only().expect("connection");
     let state: String = connection
         .query_row(
@@ -570,47 +705,46 @@ fn wake_identity_changes_across_ledger_incarnations() {
 fn dispatcher_restart_changes_epoch_and_stale_claim_cannot_cross() {
     let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
     let first_epoch = ledger.dispatcher_epoch().expect("first epoch");
-    let first = ledger
-        .claim_wake_in_epoch(
-            &first_epoch,
-            &wake_id,
-            &opaque_ref("machine", "m1"),
-            at(0),
-            at(10),
-        )
-        .expect("first claim");
-    ledger
-        .reconcile_expired_claim(&wake_id, at(11), &digest(b"restart"))
+    let first = claim_in_epoch_at(
+        &ledger,
+        &first_epoch,
+        &wake_id,
+        &opaque_ref("machine", "m1"),
+        at(0),
+        at(10),
+    )
+    .expect("first claim");
+    reconcile_expired_at(&ledger, &wake_id, at(11), &digest(b"restart"))
         .expect("requeue unstarted claim");
     let second_epoch = ledger.dispatcher_epoch().expect("second epoch");
-    let second = ledger
-        .claim_wake_in_epoch(
-            &second_epoch,
-            &wake_id,
-            &opaque_ref("machine", "m1"),
-            at(12),
-            at(22),
-        )
-        .expect("second claim");
+    let second = claim_in_epoch_at(
+        &ledger,
+        &second_epoch,
+        &wake_id,
+        &opaque_ref("machine", "m1"),
+        at(12),
+        at(22),
+    )
+    .expect("second claim");
     assert_ne!(first.dispatcher_epoch_ref, second.dispatcher_epoch_ref);
     assert_ne!(first.claim_id, second.claim_id);
-    assert!(ledger.mark_delivery_started(&first, at(13)).is_err());
+    assert!(start_at(&ledger, &first, at(13)).is_err());
 }
 
 #[test]
 fn start_receipt_outbox_and_events_bind_both_incarnations() {
     let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
     let dispatcher = ledger.dispatcher_epoch().expect("dispatcher epoch");
-    let claim = ledger
-        .claim_wake_in_epoch(
-            &dispatcher,
-            &wake_id,
-            &opaque_ref("machine", "m3"),
-            at(0),
-            at(30),
-        )
-        .expect("claim");
-    let started = ledger.mark_delivery_started(&claim, at(1)).expect("start");
+    let claim = claim_in_epoch_at(
+        &ledger,
+        &dispatcher,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    let started = start_at(&ledger, &claim, at(1)).expect("start");
     let receipt = DeliveryReceipt::new(
         &started,
         claim.route.native_session_ref.clone(),
@@ -654,9 +788,14 @@ fn start_receipt_outbox_and_events_bind_both_incarnations() {
 #[test]
 fn v3_active_outbox_refuses_incarnation_migration_without_mutation() {
     let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
-    ledger
-        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(30))
-        .expect("active legacy-shaped claim");
+    claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("active legacy-shaped claim");
     super::persistence::strip_v4_incarnation_schema(&ledger);
     drop(ledger);
 
@@ -748,7 +887,7 @@ fn v2_pending_outbox_migrates_to_v4_without_losing_wake() {
     drop(ledger);
     let migrated = WorkLedger::open(temp.path()).expect("migrate v2");
     let connection = migrated.connect_read_only().expect("connection");
-    assert_eq!(schema_version(&connection).expect("version"), 4);
+    assert_eq!(schema_version(&connection).expect("version"), 5);
     let row: (String, u64, Option<String>, String) = connection
         .query_row(
             "SELECT state, claim_attempt, claim_id, ledger_incarnation_ref
@@ -778,7 +917,7 @@ fn full_v1_pending_outbox_migrates_to_v4_with_terminal_receipt_constraints() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate full v1 ledger");
     let connection = migrated.connect_read_only().expect("connection");
-    assert_eq!(schema_version(&connection).expect("version"), 4);
+    assert_eq!(schema_version(&connection).expect("version"), 5);
     let row: (String, u64, Option<String>, String) = connection
         .query_row(
             "SELECT state, claim_attempt, claim_id, ledger_incarnation_ref
@@ -886,14 +1025,14 @@ fn failed_second_stage_v1_to_v3_upgrade_rolls_back_registry_and_version() {
 #[test]
 fn delivery_records_only_opaque_identity_and_uses_no_external_callback() {
     let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
-    let claim = ledger
-        .claim_wake(
-            &wake_id,
-            &opaque_ref("machine", "raw-machine-secret"),
-            at(0),
-            at(30),
-        )
-        .expect("pure ledger claim");
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "raw-machine-secret"),
+        at(0),
+        at(30),
+    )
+    .expect("pure ledger claim");
     let encoded = serde_json::to_string(&claim).expect("claim JSON");
     for forbidden in [
         "raw-machine-secret",
@@ -919,13 +1058,299 @@ fn delivery_records_only_opaque_identity_and_uses_no_external_callback() {
 fn claim_lease_is_bounded() {
     let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
     assert!(
+        claim_at(
+            &ledger,
+            &wake_id,
+            &opaque_ref("machine", "m3"),
+            at(0),
+            at(0) + ChronoDuration::minutes(6),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn zero_and_over_five_minute_leases_refuse_before_clock_consumption() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let dispatcher = ledger.dispatcher_epoch().expect("dispatcher epoch");
+    set_time(&ledger, at(0));
+    assert!(
         ledger
-            .claim_wake(
+            .claim_wake_in_epoch(
+                &dispatcher,
                 &wake_id,
                 &opaque_ref("machine", "m3"),
-                at(0),
-                at(0) + ChronoDuration::minutes(6),
+                Duration::ZERO,
             )
             .is_err()
+    );
+    assert!(
+        ledger
+            .claim_wake_in_epoch(
+                &dispatcher,
+                &wake_id,
+                &opaque_ref("machine", "m3"),
+                Duration::from_secs(301),
+            )
+            .is_err()
+    );
+
+    set_time(&ledger, regressed_wall());
+    let claim = ledger
+        .claim_wake_in_epoch(
+            &dispatcher,
+            &wake_id,
+            &opaque_ref("machine", "m3"),
+            Duration::from_secs(30),
+        )
+        .expect("invalid leases must not advance the owned clock");
+    assert_eq!(claim.claimed_at, regressed_wall());
+}
+
+#[test]
+fn clock_is_shared_monotonic_across_cloned_ledger_handles() {
+    let (_temp, ledger, _work_id, _wake_id, _adapter) = pending_delivery();
+    let clone = ledger.clone();
+    set_time(&ledger, at(10));
+    let mut connection = ledger.connect_read_write().expect("connection");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("transaction");
+    let first = ledger
+        .clock
+        .observe(&transaction)
+        .expect("first observation");
+    set_time(&clone, at(9));
+    let second = clone
+        .clock
+        .observe(&transaction)
+        .expect("second observation");
+
+    assert_eq!(first.timestamp, at(10));
+    assert_eq!(second.timestamp, at(10));
+    assert!(!second.restart_wall_regressed);
+    transaction.rollback().expect("test rollback");
+}
+
+#[test]
+fn in_process_wall_correction_clamps_without_premature_reconciliation() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+
+    set_time(&ledger, regressed_wall());
+    assert!(
+        ledger
+            .reconcile_expired_claim(&wake_id, &digest(b"not a restart"))
+            .is_err(),
+        "an in-process correction must not bypass the live lease"
+    );
+    assert!(
+        ledger.mark_delivery_started(&claim).is_err(),
+        "new external work remains refused while wall time trails durable time"
+    );
+    let connection = ledger.connect_read_only().expect("connection");
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM outbox WHERE wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("claim state");
+    assert_eq!(state, "claimed");
+}
+
+#[test]
+fn independent_handle_refreshes_durable_floor_before_delivery_start() {
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let stale_handle = WorkLedger::open(temp.path()).expect("second handle before claim");
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim through first handle");
+
+    set_time(&stale_handle, regressed_wall());
+    assert!(
+        stale_handle.mark_delivery_started(&claim).is_err(),
+        "storage drift must refresh the durable floor before mutation"
+    );
+}
+
+#[test]
+fn restart_wall_regression_refuses_new_claim_and_delivery_start() {
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    drop(ledger);
+
+    let restarted = WorkLedger::open(temp.path()).expect("restart ledger");
+    set_time(&restarted, regressed_wall());
+    assert!(restarted.mark_delivery_started(&claim).is_err());
+    let connection = restarted.connect_read_only().expect("connection");
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM outbox WHERE wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("claim state");
+    assert_eq!(state, "claimed");
+
+    drop(connection);
+    reconcile_expired_at(
+        &restarted,
+        &wake_id,
+        regressed_wall(),
+        &digest(b"restart regression"),
+    )
+    .expect("contain unstarted claim");
+    assert!(
+        claim_at(
+            &restarted,
+            &wake_id,
+            &opaque_ref("machine", "m5"),
+            regressed_wall(),
+            regressed_wall() + ChronoDuration::seconds(30),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn restart_wall_regression_requeues_unstarted_before_lease_expiry() {
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    drop(ledger);
+
+    let restarted = WorkLedger::open(temp.path()).expect("restart ledger");
+    assert_eq!(
+        reconcile_expired_at(
+            &restarted,
+            &wake_id,
+            regressed_wall(),
+            &digest(b"restart regression"),
+        )
+        .expect("immediate containment"),
+        ExpiredClaimDisposition::RequeuedUnstarted
+    );
+    let connection = restarted.connect_read_only().expect("connection");
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM outbox WHERE wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("outbox state");
+    assert_eq!(state, "pending");
+}
+
+#[test]
+fn restart_wall_regression_marks_started_uncertain_before_lease_expiry() {
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    start_at(&ledger, &claim, at(1)).expect("start");
+    drop(ledger);
+
+    let restarted = WorkLedger::open(temp.path()).expect("restart ledger");
+    assert_eq!(
+        reconcile_expired_at(
+            &restarted,
+            &wake_id,
+            regressed_wall(),
+            &digest(b"restart ambiguity"),
+        )
+        .expect("immediate containment"),
+        ExpiredClaimDisposition::MarkedUncertain
+    );
+    assert!(
+        claim_at(
+            &restarted,
+            &wake_id,
+            &opaque_ref("machine", "m5"),
+            regressed_wall(),
+            regressed_wall() + ChronoDuration::seconds(30),
+        )
+        .is_err()
+    );
+    let connection = restarted.connect_read_only().expect("connection");
+    assert_eq!(
+        count_where(&connection, "outbox", "state", "uncertain").expect("uncertain"),
+        1
+    );
+    assert_eq!(
+        count_where(&connection, "outbox", "state", "pending").expect("pending"),
+        0
+    );
+}
+
+#[test]
+fn terminal_containment_commits_at_durable_floor_during_regression() {
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let claim = claim_at(
+        &ledger,
+        &wake_id,
+        &opaque_ref("machine", "m3"),
+        at(0),
+        at(30),
+    )
+    .expect("claim");
+    let started = start_at(&ledger, &claim, at(1)).expect("start");
+    let receipt = DeliveryReceipt::new(
+        &started,
+        started.claim.route.native_session_ref.clone(),
+        digest(b"accepted during regression"),
+    )
+    .expect("receipt");
+    drop(ledger);
+
+    let restarted = WorkLedger::open(temp.path()).expect("restart ledger");
+    set_time(&restarted, regressed_wall());
+    restarted
+        .acknowledge_delivery(&started, &receipt)
+        .expect("terminal containment at durable floor");
+    let connection = restarted.connect_read_only().expect("connection");
+    let (state, completed_at): (String, String) = connection
+        .query_row(
+            "SELECT state, completed_at FROM outbox WHERE wake_id = ?1",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("completed outbox");
+    assert_eq!(state, "acknowledged");
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&completed_at)
+            .expect("timestamp")
+            .with_timezone(&Utc),
+        started.started_at
     );
 }

@@ -1685,6 +1685,19 @@ process lifetime. Wake, claim, delivery-start, receipt, outbox, and event
 integrity must preserve the applicable identities, and migration must refuse
 active legacy rows whose dispatcher provenance cannot be reconstructed. These
 fences do not by themselves enable a consumer or set `dispatch_enabled=true`.
+Delivery/lifecycle mutation time is ledger-owned, shared across cloned handles,
+and sampled only after the writer-domain lease and immediate transaction are
+held. Claims accept a positive duration no longer than five minutes, never
+caller timestamps. Schema v5 derives the initial durable floor once under its
+exclusive migration, then an exact timestamp-trigger inventory advances one
+canonical UTC floor plus paired writer/floor revisions transactionally for
+clock-owned, legacy, and ad-hoc writers. Refuse revision mismatch; ordinary
+connections must also verify the exact trigger definitions. Ordinary mutations
+and restart reads must remain O(1). Refuse new
+claims and starts while wall time is below the greatest durable observed
+timestamp. Only when that condition was present at restart, immediately requeue
+unstarted claims and contain started claims as uncertain without retry. Record
+terminal evidence at the durable floor.
 
 **Detached daemon temp roots must not depend on the launching shell.** A daemon
 started from launchd or a minimal SSH environment may inherit no `TMPDIR`.

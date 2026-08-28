@@ -211,6 +211,21 @@ Schema v4 creates one random, immutable `ledger_incarnation_ref` for the
 database lifetime and verifies it on every connection. Wake, event, claim,
 delivery-start, and receipt identities retain that fence; each future daemon
 process must also create one `dispatcher_epoch_ref` and pass it when claiming.
+Schema v5 derives the initial greatest observed timestamp once, inside the
+exclusive migration transaction. Thereafter an exact trigger inventory for
+every timestamp column advances one canonical UTC floor transactionally,
+including legacy and ad-hoc writers; paired writer/floor revisions detect an
+incomplete clock fail-closed, and every connection verifies the exact trigger
+definitions before use. Normal mutations and restart reads are
+O(1), with no history scan. Delivery and lifecycle mutations take time only
+after the writer-domain lease and immediate SQLite transaction are held. A ledger-owned
+clock is shared by cloned handles, advances monotonically from that restart
+floor and the current wall clock, and accepts a claim lease only as a
+positive `Duration` no longer than five minutes. A wall clock below that durable
+floor refuses new claims and delivery starts. When the condition was present at
+restart, reconciliation immediately requeues an unstarted claim, contains a
+started claim as uncertain without retry, and may commit terminal evidence at
+the durable floor.
 These records are still inert: no work-ledger consumer or dispatcher is
 enabled.
 Dry-run is byte-stable and creates no database. Apply is idempotent and leaves

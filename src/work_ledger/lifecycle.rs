@@ -3,7 +3,7 @@
 
 use super::registry::validated_route_exists;
 use super::{
-    OptionalExtension, Transaction, TransactionBehavior, Utc, WorkLedger, WorkLedgerError,
+    OptionalExtension, Transaction, TransactionBehavior, WorkLedger, WorkLedgerError,
     WorkLedgerResult, configure_durable, digest, opaque_ref, params, validate_digest,
     validate_opaque_ref, validate_token, verify_integrity, verify_supported_schema,
 };
@@ -212,7 +212,7 @@ impl WorkLedger {
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = Utc::now().to_rfc3339();
+        let now = self.clock.observe(&transaction)?.timestamp.to_rfc3339();
         let current = validate_transition(
             &transaction,
             work_id,
@@ -266,6 +266,7 @@ impl WorkLedger {
             &event_payload,
             &now,
         )?;
+        super::clock::LedgerClock::finalize(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -293,7 +294,7 @@ impl WorkLedger {
         configure_durable(&connection)?;
         verify_supported_schema(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = Utc::now().to_rfc3339();
+        let now = self.clock.observe(&transaction)?.timestamp.to_rfc3339();
         let next_revision = expected_revision + 1;
         let changed = if expected_revision == 0 {
             transaction.execute(
@@ -336,6 +337,7 @@ impl WorkLedger {
                 "continuation revision no longer matches".to_owned(),
             ));
         }
+        super::clock::LedgerClock::finalize(&transaction)?;
         transaction.commit()?;
         Ok(next_revision)
     }

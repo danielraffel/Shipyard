@@ -45,9 +45,11 @@ impl WorkLedger {
         migrate(&mut connection)?;
         verify_integrity(&connection)?;
         let ledger_incarnation_ref = load_ledger_incarnation(&connection)?;
+        let clock = super::clock::LedgerClock::open(&connection)?;
         let ledger = Self {
             path,
             ledger_incarnation_ref,
+            clock,
         };
         Ok(ledger)
     }
@@ -67,9 +69,12 @@ impl WorkLedger {
         let connection = connect_read_only_raw(&path)?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
+        let ledger_incarnation_ref = load_ledger_incarnation(&connection)?;
+        let clock = super::clock::LedgerClock::open(&connection)?;
         let ledger = Self {
             path,
-            ledger_incarnation_ref: load_ledger_incarnation(&connection)?,
+            ledger_incarnation_ref,
+            clock,
         };
         Ok(Some(ledger))
     }
