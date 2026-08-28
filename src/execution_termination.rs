@@ -520,14 +520,19 @@ fn exact_worker_is_stopped(
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
+    use std::os::unix::process::CommandExt;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
     use chrono::Utc;
 
     use super::*;
+
+    const FIXTURE_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(15);
 
     #[test]
     fn durable_transaction_is_bound_to_exact_worker_generation() {
@@ -617,6 +622,74 @@ mod tests {
         }
     }
 
+    struct FixtureProcess {
+        child: Child,
+        root_pid: u32,
+        recorded_pids: BTreeSet<u32>,
+    }
+
+    impl FixtureProcess {
+        fn spawn(script: &Path, args: &[&str]) -> Self {
+            let mut command = Command::new(script);
+            command.args(args).process_group(0).stdin(Stdio::null());
+            let child = command.spawn().expect("worker fixture");
+            Self {
+                root_pid: child.id(),
+                child,
+                recorded_pids: BTreeSet::new(),
+            }
+        }
+
+        fn child(&self) -> &Child {
+            &self.child
+        }
+
+        fn child_mut(&mut self) -> &mut Child {
+            &mut self.child
+        }
+
+        fn wait_for_recorded_pid(&mut self, path: &Path) -> u32 {
+            let pid = wait_for_pid(path);
+            self.recorded_pids.insert(pid);
+            pid
+        }
+    }
+
+    impl Drop for FixtureProcess {
+        fn drop(&mut self) {
+            let mut exact_pids = self.recorded_pids.clone();
+            exact_pids.insert(self.root_pid);
+            if let Ok(processes) = process_snapshot() {
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for process in processes.values() {
+                        if exact_pids.contains(&process.parent) && exact_pids.insert(process.pid) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            // Every fixture gets its own process group. Kill both that group and
+            // the observed tree so detached descendants and stopped processes
+            // cannot retain the test harness output descriptors after a panic.
+            let process_group = format!("-{}", self.root_pid);
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", "--", &process_group])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            for pid in exact_pids.into_iter().rev() {
+                let _ = signal(pid, "-KILL");
+            }
+            let _ = self.child.wait_timeout(Duration::from_secs(2));
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
     #[test]
     fn frozen_fixed_point_captures_detached_process_group() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -628,35 +701,33 @@ mod tests {
                 detached_pid.display()
             ),
         );
-        let mut child = Command::new(script)
-            .args([
+        let mut fixture = FixtureProcess::spawn(
+            &script,
+            &[
                 "execution-worker",
                 "--job-id",
                 "detached",
                 "--generation",
                 "g-detached",
-            ])
-            .spawn()
-            .expect("worker fixture");
-        wait_for_file(&detached_pid);
-        let receipt = receipt_for(&child, "detached", "g-detached");
+            ],
+        );
+        let detached = fixture.wait_for_recorded_pid(&detached_pid);
+        let receipt = receipt_for(fixture.child(), "detached", "g-detached");
         let store = TerminationStore::new(temp.path());
 
         let mut transaction = store
             .begin(&receipt, TerminationAction::Cancel)
             .expect("freeze detached tree");
         assert!(
-            transaction.descendants.iter().any(|identity| {
-                fs::read_to_string(&detached_pid)
-                    .ok()
-                    .and_then(|pid| pid.trim().parse::<u32>().ok())
-                    == Some(identity.pid)
-            }),
+            transaction
+                .descendants
+                .iter()
+                .any(|identity| { identity.pid == detached }),
             "a child in a detached process group remains part of the frozen parent tree"
         );
         assert!(
             store
-                .prove_tree_dead(&mut transaction, Some(&mut child))
+                .prove_tree_dead(&mut transaction, Some(fixture.child_mut()))
                 .expect("kill detached tree")
         );
     }
@@ -670,39 +741,37 @@ mod tests {
         let script = executable_script(
             temp.path(),
             &format!(
-                "/usr/bin/perl -e 'open(my $ready, \">\", q{{{}}}); print $ready q{{ready}}; close($ready); while (!-e q{{{}}}) {{ select undef, undef, undef, 0.001 }}; my $pid = fork(); if ($pid == 0) {{ exec q{{/bin/sleep}}, q{{300}} }} open(my $fh, \">\", q{{{}}}); print $fh $pid; close($fh); wait' &\nwait",
+                "/usr/bin/perl -e 'open(my $ready, \">\", q{{{}}}); print $ready q{{ready}}; close($ready); while (!-e q{{{}}}) {{ select undef, undef, undef, 0.001 }}; my $pid = fork(); if ($pid == 0) {{ exec q{{/bin/sleep}}, q{{300}} }} my $tmp = q{{{}}} . q{{.tmp.}} . $$; open(my $fh, \">\", $tmp) or die $!; print $fh $pid; close($fh) or die $!; rename($tmp, q{{{}}}) or die $!; wait' &\nwait",
                 ready.display(),
                 trigger.display(),
+                forked_pid.display(),
                 forked_pid.display()
             ),
         );
-        let mut child = Command::new(script)
-            .args([
+        let mut fixture = FixtureProcess::spawn(
+            &script,
+            &[
                 "execution-worker",
                 "--job-id",
                 "fork-race",
                 "--generation",
                 "g-fork",
-            ])
-            .spawn()
-            .expect("worker fixture");
+            ],
+        );
         wait_for_file(&ready);
-        let receipt = receipt_for(&child, "fork-race", "g-fork");
+        let receipt = receipt_for(fixture.child(), "fork-race", "g-fork");
         let mut triggered = false;
+        let mut published_fork = None;
         let (root_command, root_start_identity, descendants) =
             freeze_complete_tree_with_hook(&receipt, |scan| {
                 if scan == 0 && !triggered {
                     fs::write(&trigger, b"go").expect("fork trigger");
-                    wait_for_file(&forked_pid);
+                    published_fork = Some(fixture.wait_for_recorded_pid(&forked_pid));
                     triggered = true;
                 }
             })
             .expect("freeze racing fork tree");
-        let forked = fs::read_to_string(&forked_pid)
-            .expect("forked pid")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric pid");
+        let forked = published_fork.expect("fork hook published a PID");
         assert!(descendants.iter().any(|identity| identity.pid == forked));
         let store = TerminationStore::new(temp.path());
         let mut transaction = TerminationTransaction {
@@ -719,16 +788,87 @@ mod tests {
         store.save(&transaction).expect("save frozen transaction");
         assert!(
             store
-                .prove_tree_dead(&mut transaction, Some(&mut child))
+                .prove_tree_dead(&mut transaction, Some(fixture.child_mut()))
                 .expect("kill complete fork tree")
         );
     }
 
     fn wait_for_file(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + FIXTURE_PUBLICATION_TIMEOUT;
         while !path.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(path.exists(), "fixture did not publish {}", path.display());
+    }
+
+    fn wait_for_pid(path: &Path) -> u32 {
+        let deadline = Instant::now() + FIXTURE_PUBLICATION_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(contents) = fs::read_to_string(path)
+                && let Ok(pid) = contents.trim().parse::<u32>()
+                && pid != 0
+            {
+                return pid;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "fixture did not publish a nonempty numeric PID to {}",
+            path.display()
+        );
+    }
+
+    fn wait_for_process_exit(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if signal(pid, "-0").is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("fixture process {pid} survived bounded cleanup");
+    }
+
+    #[test]
+    fn pid_wait_ignores_an_existing_empty_file_until_contents_are_parseable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("forked.pid");
+        fs::write(&path, b"").expect("empty publication window");
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            fs::write(writer_path, b"4242\n").expect("publish numeric PID");
+        });
+
+        assert_eq!(wait_for_pid(&path), 4242);
+        writer.join().expect("PID writer");
+    }
+
+    #[test]
+    fn fixture_guard_reaps_process_group_during_panic_unwind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let script = executable_script(
+            temp.path(),
+            &format!(
+                "/bin/sleep 300 &\nprintf '%s\\n' $! > '{}'\nwait",
+                descendant_pid_path.display()
+            ),
+        );
+        let mut root_pid = 0;
+        let mut descendant_pid = 0;
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let mut fixture = FixtureProcess::spawn(&script, &["execution-worker"]);
+            root_pid = fixture.root_pid;
+            descendant_pid = fixture.wait_for_recorded_pid(&descendant_pid_path);
+            panic!("exercise panic-safe fixture cleanup");
+        }));
+
+        assert!(panic.is_err());
+        assert_ne!(root_pid, 0);
+        assert_ne!(descendant_pid, 0);
+        wait_for_process_exit(root_pid);
+        wait_for_process_exit(descendant_pid);
     }
 }
