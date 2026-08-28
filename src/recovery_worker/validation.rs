@@ -376,7 +376,7 @@ pub(super) fn validate_text(name: &str, value: &str, min: usize, max: usize) -> 
     Ok(())
 }
 
-pub(super) fn validate_record(record: &RecoveryRecord) -> RecoveryResult<()> {
+pub(crate) fn validate_record(record: &RecoveryRecord) -> RecoveryResult<()> {
     if record.schema_version != RECOVERY_SCHEMA_VERSION {
         return Err(RecoveryError::SchemaVersion {
             surface: "record",

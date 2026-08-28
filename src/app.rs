@@ -58,6 +58,7 @@ mod update_cmd;
 mod wait_cmd;
 mod watch_cmd;
 mod watch_local_cmd;
+mod work_ledger_cmd;
 
 use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
@@ -110,6 +111,7 @@ use self::update_cmd::update_command;
 use self::wait_cmd::wait_command;
 use self::watch_cmd::{WatchCommandContext, WatchCommandOptions, watch};
 use self::watch_local_cmd::watch_local_command;
+use self::work_ledger_cmd::work_ledger_command;
 
 #[derive(Debug)]
 pub(super) struct CliFailure {
@@ -440,6 +442,9 @@ where
                 stdout,
             );
         }
+        Command::WorkLedger { command } => {
+            return work_ledger_command(&command, &runtime_paths.state_dir, cli.json, stdout);
+        }
         Command::Wait { command } => {
             return handle_wait_command(
                 command,
@@ -532,6 +537,7 @@ fn handle_operational_variant<W: Write>(
         | Command::QueueObserve { .. }
         | Command::ChangedSurfacePlan { .. }
         | Command::ChangedSurfaceTrialStatus { .. }
+        | Command::WorkLedger { .. }
         | Command::Cleanup { .. }
         | Command::Targets { .. }
         | Command::Quarantine { .. }

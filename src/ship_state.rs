@@ -926,7 +926,7 @@ fn insert_newest_state(states: &mut BTreeMap<(String, u64), ShipState>, state: S
     }
 }
 
-fn repository_key(repository: &str) -> String {
+pub(crate) fn repository_key(repository: &str) -> String {
     let canonical = canonical_repository(repository);
     let readable = canonical
         .chars()

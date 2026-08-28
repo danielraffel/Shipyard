@@ -30,8 +30,9 @@ use crate::executor::local::{LocalTargetConfig, LocalValidationConfig};
 use crate::executor::ssh::{SshTargetConfig, SshValidation};
 use crate::executor::ssh_windows::{WindowsTargetConfig, WindowsValidation};
 use crate::job::{Priority, ValidationMode};
+use crate::record_identity::{is_exact_lower_hex_git_sha, is_valid_repository_slug};
 use crate::ship::{RunExecutionRequest, ShipExecutionRequest};
-use crate::ship_state::ShipState;
+use crate::ship_state::{SHIP_STATE_SCHEMA_VERSION, ShipState};
 use crate::warm_pool::{is_backend_eligible, warm_host_key};
 
 /// Current queued-execution schema.
@@ -1543,6 +1544,33 @@ impl QueuedExecutionOutcome {
     }
 }
 
+/// Apply the identity and nested-schema checks required before projection.
+pub(crate) fn validate_queued_execution_outcome(
+    outcome: &QueuedExecutionOutcome,
+) -> QueueRequestResult<()> {
+    if !(LEGACY_QUEUED_EXECUTION_SCHEMA_VERSION..=QUEUED_EXECUTION_SCHEMA_VERSION)
+        .contains(&outcome.schema_version())
+    {
+        return Err(QueueRequestError::UnsupportedSchema {
+            version: outcome.schema_version(),
+        });
+    }
+    validate_job_id(outcome.job_id())?;
+    if let QueuedExecutionOutcome::Ship { pr, ship_state, .. } = outcome
+        && (*pr == 0
+            || ship_state.schema_version != SHIP_STATE_SCHEMA_VERSION
+            || ship_state.pr != *pr
+            || !is_valid_repository_slug(&ship_state.repo)
+            || !is_exact_lower_hex_git_sha(&ship_state.head_sha)
+            || ship_state.base_branch.is_empty())
+    {
+        return Err(invalid_snapshot(
+            "queued ship outcome has invalid nested ship identity",
+        ));
+    }
+    Ok(())
+}
+
 fn snapshot_targets(targets: &[ResolvedTarget]) -> Vec<QueuedResolvedTarget> {
     targets.iter().map(QueuedResolvedTarget::from).collect()
 }
@@ -1990,6 +2018,54 @@ fn upgrade_legacy_request(
     Ok(envelope)
 }
 
+fn validate_current_envelope(envelope: &QueuedExecutionEnvelope) -> QueueRequestResult<()> {
+    validate_job_id(&envelope.job_id)?;
+    match (&envelope.kind, &envelope.request) {
+        (QueuedExecutionKind::Run, QueuedExecutionRequest::Run(request)) => {
+            if request.branch.is_empty() || !is_exact_lower_hex_git_sha(&request.sha) {
+                return Err(invalid_snapshot("queued run request has invalid identity"));
+            }
+        }
+        (QueuedExecutionKind::Ship, QueuedExecutionRequest::Ship(request)) => {
+            if request.pr == 0
+                || !is_valid_repository_slug(&request.repo)
+                || request.branch.is_empty()
+                || request.base_branch.is_empty()
+                || !is_exact_lower_hex_git_sha(&request.sha)
+            {
+                return Err(invalid_snapshot("queued ship request has invalid identity"));
+            }
+        }
+        _ => {
+            return Err(invalid_snapshot(
+                "queued request kind disagrees with payload",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_job_id(job_id: &str) -> QueueRequestResult<()> {
+    if job_id.is_empty()
+        || job_id.len() > 255
+        || matches!(job_id, "." | "..")
+        || job_id
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+    {
+        return Err(invalid_snapshot("queued record has an invalid job id"));
+    }
+    Ok(())
+}
+
+/// Apply the same schema and authority checks as the durable request reader.
+pub(crate) fn validate_queued_execution_envelope(
+    envelope: QueuedExecutionEnvelope,
+) -> QueueRequestResult<()> {
+    let upgraded = upgrade_legacy_request(envelope)?;
+    validate_current_envelope(&upgraded)
+}
+
 fn target_has_trusted_environment(target: &QueuedResolvedTarget) -> bool {
     if matches!(
         &target.validation,
@@ -2070,6 +2146,7 @@ mod tests {
         QueueRequestError, QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind,
         QueuedExecutionOutcome, QueuedExecutionOwner, QueuedExecutionRequest,
         QueuedShipDisposition, QueuedShipDispositionKind, VmSlotDemand, parse_repo_slug,
+        validate_queued_execution_envelope,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::{evidence_resource_claim, run_evidence_scope, ship_evidence_scope};
@@ -2317,7 +2394,7 @@ mod tests {
     fn run_request() -> RunExecutionRequest {
         RunExecutionRequest {
             branch: "feat/run".to_owned(),
-            sha: "abc123".to_owned(),
+            sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             mode: ValidationMode::Full,
             priority: Priority::Normal,
             warm_disabled: false,
@@ -2333,7 +2410,7 @@ mod tests {
             repo: "danielraffel/shipyard".to_owned(),
             branch: "feat/ship".to_owned(),
             base_branch: "main".to_owned(),
-            sha: "def456".to_owned(),
+            sha: "dddddddddddddddddddddddddddddddddddddddd".to_owned(),
             commit_subject: "queue request store".to_owned(),
             pr_url: Some("https://github.com/danielraffel/shipyard/pull/42".to_owned()),
             pr_title: Some("Queue request store".to_owned()),
@@ -3095,5 +3172,44 @@ mod tests {
                 .exclusive_claims
                 .contains(&"ssh-repo:mac-b:/repo-b".to_owned())
         );
+    }
+
+    #[test]
+    fn current_queue_envelopes_fail_closed_on_identity_or_kind_drift() {
+        let mut envelope =
+            QueuedExecutionEnvelope::from_ship_request("job-42", "/work/repo", &ship_request());
+        validate_queued_execution_envelope(envelope.clone()).expect("valid envelope");
+        if let QueuedExecutionRequest::Ship(request) = &mut envelope.request {
+            request.repo = "DanielRaffel/Shipyard".to_owned();
+        }
+        validate_queued_execution_envelope(envelope.clone()).expect("case-normalized repository");
+        if let QueuedExecutionRequest::Ship(request) = &mut envelope.request {
+            request.sha = "a".repeat(64);
+        }
+        validate_queued_execution_envelope(envelope.clone()).expect("full SHA-256 identity");
+        if let QueuedExecutionRequest::Ship(request) = &mut envelope.request {
+            request.sha = "A".repeat(40);
+        }
+        assert!(validate_queued_execution_envelope(envelope.clone()).is_err());
+        if let QueuedExecutionRequest::Ship(request) = &mut envelope.request {
+            request.sha = "a".repeat(40);
+            request.repo = "owner/repo/extra".to_owned();
+        }
+        assert!(validate_queued_execution_envelope(envelope.clone()).is_err());
+        if let QueuedExecutionRequest::Ship(request) = &mut envelope.request {
+            request.repo = "DanielRaffel/Shipyard".to_owned();
+        }
+
+        envelope.job_id = "../escape".to_owned();
+        assert!(validate_queued_execution_envelope(envelope.clone()).is_err());
+        envelope.job_id = "job-42".to_owned();
+        envelope.kind = QueuedExecutionKind::Run;
+        assert!(validate_queued_execution_envelope(envelope.clone()).is_err());
+        envelope.kind = QueuedExecutionKind::Ship;
+        let QueuedExecutionRequest::Ship(request) = &mut envelope.request else {
+            panic!("ship request");
+        };
+        request.pr = 0;
+        assert!(validate_queued_execution_envelope(envelope).is_err());
     }
 }

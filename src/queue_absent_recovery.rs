@@ -25,11 +25,12 @@ use crate::queue_request::{
     JobResourcePlan, QueueOutcomeStore, QueueRequestError, QueueRequestStore,
     QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest,
 };
+use crate::record_identity::{is_exact_lower_hex_sha1, is_valid_repository_slug};
 use crate::ship_liveness::{queue_absent_recovery_enabled, queue_absent_repo_path};
 use crate::ship_state::{ShipState, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
 
-const RECOVERY_SCHEMA_VERSION: u32 = 1;
+pub(crate) const RECOVERY_SCHEMA_VERSION: u32 = 1;
 
 /// Request envelopes that remain authoritative for active ship recovery.
 ///
@@ -887,7 +888,7 @@ fn record_matches_state(record: &QueueAbsentRecoveryRecord, state: &ShipState) -
         && source_matches
 }
 
-fn recovery_record_path(state_dir: &Path, repo: &str, pr: u64) -> PathBuf {
+pub(crate) fn recovery_record_path(state_dir: &Path, repo: &str, pr: u64) -> PathBuf {
     let key = format!(
         "{:x}",
         Sha256::digest(canonical_repository(repo).as_bytes())
@@ -898,6 +899,38 @@ fn recovery_record_path(state_dir: &Path, repo: &str, pr: u64) -> PathBuf {
         .join(format!("{}-{pr}.json", &key[..16]))
 }
 
+pub(crate) fn validate_recovery_record(record: &QueueAbsentRecoveryRecord) -> Result<(), String> {
+    if record.schema_version != RECOVERY_SCHEMA_VERSION
+        || !is_valid_repository_slug(&record.repo)
+        || record.pr == 0
+        || record.attempt == 0
+        || record.branch.is_empty()
+        || record.base_branch.is_empty()
+        || !is_exact_lower_hex_sha1(&record.head_sha)
+    {
+        return Err("invalid recovery claim identity".to_owned());
+    }
+    if matches!(
+        record.status,
+        QueueAbsentRecoveryStatus::Claimed | QueueAbsentRecoveryStatus::Enqueued
+    ) && (record.source_job_id.is_empty()
+        || record.replacement_job_id.is_empty()
+        || record.generation.is_empty())
+    {
+        return Err("active recovery claim lacks fencing identity".to_owned());
+    }
+    for value in [
+        &record.source_job_id,
+        &record.replacement_job_id,
+        &record.generation,
+    ] {
+        if value.len() > 512 || value.chars().any(char::is_control) {
+            return Err("invalid recovery claim fencing identity".to_owned());
+        }
+    }
+    Ok(())
+}
+
 fn load_record(path: &Path) -> Result<Option<QueueAbsentRecoveryRecord>, String> {
     if !path.exists() {
         return Ok(None);
@@ -905,13 +938,12 @@ fn load_record(path: &Path) -> Result<Option<QueueAbsentRecoveryRecord>, String>
     let record: QueueAbsentRecoveryRecord =
         serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("malformed recovery claim: {error}"))?;
-    if record.schema_version != RECOVERY_SCHEMA_VERSION {
-        return Err("unsupported recovery claim schema".to_owned());
-    }
+    validate_recovery_record(&record)?;
     Ok(Some(record))
 }
 
 fn save_record(path: &Path, record: &QueueAbsentRecoveryRecord) -> Result<(), String> {
+    validate_recovery_record(record)?;
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
         .map_err(|error| error.to_string())?;
     let parent = path
@@ -2367,5 +2399,49 @@ mod tests {
         assert_eq!(current.status, QueueAbsentRecoveryStatus::NeedsAgent);
         assert_eq!(current.attempt, state.attempt);
         assert!(record_matches_state(&current, &state));
+    }
+
+    #[test]
+    fn live_recovery_record_load_uses_complete_canonical_identity_validation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("claim.json");
+        let mut record = QueueAbsentRecoveryRecord {
+            schema_version: RECOVERY_SCHEMA_VERSION,
+            repo: "Generous-Corp/Pulp".to_owned(),
+            pr: 42,
+            attempt: 1,
+            branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            head_sha: SHA.to_owned(),
+            source_job_id: "source".to_owned(),
+            replacement_job_id: "replacement".to_owned(),
+            generation: "generation".to_owned(),
+            status: QueueAbsentRecoveryStatus::Claimed,
+            detail: None,
+            updated_at: Utc::now(),
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec(&record).expect("serialize valid claim"),
+        )
+        .expect("write valid claim");
+        load_record(&path).expect("historical repository case remains valid");
+
+        record.head_sha = "A".repeat(40);
+        fs::write(
+            &path,
+            serde_json::to_vec(&record).expect("serialize invalid claim"),
+        )
+        .expect("write invalid claim");
+        assert!(load_record(&path).is_err());
+
+        record.head_sha = SHA.to_owned();
+        record.repo = "owner/repo/extra".to_owned();
+        fs::write(
+            &path,
+            serde_json::to_vec(&record).expect("serialize invalid repo"),
+        )
+        .expect("write invalid repo");
+        assert!(load_record(&path).is_err());
     }
 }
