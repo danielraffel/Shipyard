@@ -68,8 +68,33 @@ fn created() -> Result<CommandResult, RunnerFailure> {
     successful_json(serde_json::json!({
         "window_id": UUID,
         "workspace_id": UUID,
-        "surface_id": SURFACE_UUID
+        "surface_id": SURFACE_UUID,
+        "group_id": null
     }))
+}
+
+#[test]
+fn live_create_shape_accepts_additive_metadata_and_requires_uuid_ids() {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "window_id": OTHER_WINDOW_UUID,
+        "workspace_id": UUID,
+        "surface_id": SURFACE_UUID,
+        "group_id": null,
+        "future_additive_field": {"ignored": true}
+    }))
+    .unwrap();
+
+    let parsed = parse_created_workspace(&bytes).expect("live cmux create shape");
+    assert_eq!(parsed.workspace_id, UUID.to_ascii_lowercase());
+    assert_eq!(parsed.surface_id, SURFACE_UUID.to_ascii_lowercase());
+
+    let invalid = serde_json::to_vec(&serde_json::json!({
+        "workspace_id": "workspace:1",
+        "surface_id": SURFACE_UUID,
+        "group_id": null
+    }))
+    .unwrap();
+    assert!(parse_created_workspace(&invalid).is_err());
 }
 
 fn surface_health(surface_ids: &[&str]) -> Result<CommandResult, RunnerFailure> {
@@ -378,6 +403,7 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
     let response = handle_request(&request, &mut runner);
     assert_delivered(&response, "codex");
     let create = &runner.calls[2];
+    assert_eq!(create[..3], ["--json", "--id-format", "uuids"]);
     let cwd_index = create.iter().position(|arg| arg == "--cwd").unwrap();
     assert_eq!(create[cwd_index + 1], "/tmp/work tree'quoted");
     let command_index = create.iter().position(|arg| arg == "--command").unwrap();

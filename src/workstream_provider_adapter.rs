@@ -428,12 +428,9 @@ struct ListedWorkspace {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(clippy::struct_field_names)]
 struct CreatedWorkspace {
     workspace_id: String,
     surface_id: String,
-    window_id: Option<String>,
 }
 
 struct CreatedWorkspaceIds {
@@ -443,7 +440,9 @@ struct CreatedWorkspaceIds {
 
 fn parse_created_workspace(bytes: &[u8]) -> Result<CreatedWorkspaceIds, ()> {
     let created: CreatedWorkspace = serde_json::from_slice(bytes).map_err(|_| ())?;
-    let _ = created.window_id;
+    // cmux adds informational fields (currently `window_id` and `group_id`) to
+    // this response. Acceptance depends only on the two required UUIDs, so
+    // tolerate additive metadata while validating those identifiers strictly.
     Ok(CreatedWorkspaceIds {
         workspace_id: canonical_uuid(&created.workspace_id).ok_or(())?,
         surface_id: canonical_uuid(&created.surface_id).ok_or(())?,
