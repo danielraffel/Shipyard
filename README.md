@@ -81,8 +81,10 @@ shipyard changelog init    # opt in to post-release CHANGELOG auto-sync
   upgrade path (no curl-pipe to remember); it uses the trusted machine-global
   GitHub auth helper and a tag-matched installer, and `--check` reports
   installed-vs-available, `--to v0.55.0` pins a specific tag for
-  rollback. `shipyard runner fleet-update --to vX.Y.Z` plans one governed
-  rollout; add `--apply` to update and refresh every configured daemon.
+  rollback. `shipyard runner fleet-update --to vX.Y.Z --host-class <class>`
+  plans one governed host rollout; add `--apply` after review. Repeat the
+  selector for an ordered subset or use explicit `--all-hosts`; apply stops at
+  the first failed host and records installed SHA-256 plus daemon identity.
 - **Graceful GraphQL rate-limit degradation.** `shipyard auto-merge`
   and `shipyard wait pr` fall back to REST automatically when
   GraphQL exhausts (separate 5000/hr bucket). `shipyard doctor

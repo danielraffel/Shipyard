@@ -353,9 +353,15 @@ Queue writes are serialized process-wide and recorded in machine-global
 `merge_queue/mutations.jsonl`.
 
 For release rollout, configure absolute `shipyard_bin` and `github_cli` paths plus explicit `shipyard_mode`, `shipyard_global_dir`, and `shipyard_state_dir` on every remote
-`[host_class.<name>]`. Review `shipyard runner fleet-update --to vX.Y.Z` and
-then use the same command with `--apply`; do not assemble per-host SSH/install
-pipelines. Fleet rollout requires a self-contained machine-global command auth
+`[host_class.<name>]`. Review `shipyard runner fleet-update --to vX.Y.Z
+--host-class <class>` and then use the same command with `--apply`; do not
+assemble per-host SSH/install pipelines. Repeat `--host-class` only for a
+reviewed ordered subset, or use explicit `--all-hosts` for the compatibility
+fleet shape. Missing, unknown, and duplicate selection fails closed; apply
+stops before later hosts after the first failure. A successful typed host
+receipt includes installed SHA-256, CLI/daemon identity, the configured runtime
+paths, and configured-repository preservation. The same selector handles a
+rollback tag at or above `v0.100.0`. Fleet rollout requires a self-contained machine-global command auth
 helper because inherited secrets are deliberately stripped. The updater stages
 the entire exact-tag installer before execution (including when the old remote
 binary predates fleet-update), refreshes daemons only after

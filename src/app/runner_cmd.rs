@@ -207,8 +207,18 @@ pub(super) fn runner_command<W: Write>(
             json,
             stdout,
         ),
-        RunnerCommand::FleetUpdate { to, apply } => super::fleet_update_cmd::fleet_update_command(
-            &super::fleet_update_cmd::FleetUpdateArgs { to, apply },
+        RunnerCommand::FleetUpdate {
+            to,
+            host_classes,
+            all_hosts,
+            apply,
+        } => super::fleet_update_cmd::fleet_update_command(
+            &super::fleet_update_cmd::FleetUpdateArgs {
+                to,
+                host_classes,
+                all_hosts,
+                apply,
+            },
             mode,
             runtime_paths,
             json,

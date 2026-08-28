@@ -257,12 +257,18 @@ shipyard_global_dir = "/Users/you/Library/Application Support/shipyard"
 shipyard_state_dir = "/Users/you/Library/Application Support/shipyard"
 ```
 
-Then review and apply the same immutable release plan:
+Then review and apply one immutable host plan at a time:
 
 ```sh
-shipyard runner fleet-update --to v0.100.0 --json
-shipyard runner fleet-update --to v0.100.0 --apply --json
+shipyard runner fleet-update --to v0.100.0 --host-class m5 --json
+shipyard runner fleet-update --to v0.100.0 --host-class m5 --apply --json
 ```
+
+Repeat `--host-class` only for an explicitly reviewed ordered subset.
+`--all-hosts` is the explicit compatibility path for the previous whole-fleet
+shape. Omitting both selectors fails closed, and apply stops before every later
+selected host after the first update, timeout, or evidence failure. The same
+selector works for a rollback tag at or above `v0.100.0`.
 
 The command uses a stripped remote environment deliberately, invokes the
 configured absolute binary, bounds each host attempt to ten minutes, and
@@ -281,6 +287,15 @@ environment drift, not as evidence that Homebrew, Tart, or Shipyard is
 uninstalled. Fleet rollout rejects targets older than v0.100.0 before mutation;
 use an older release's documented manual procedure when rollback crosses that
 bootstrap boundary.
+
+Each successful JSON host receipt binds the exact release tag to the installed
+CLI version and SHA-256, refreshed daemon PID and version, absolute configured
+binary/runtime paths, and configured-repository preservation verdict. A host
+without a prior daemon reports repository preservation as `null` rather than
+inventing a comparison. Version, daemon, digest-shape, or repository drift is a
+failed host result and prevents every later selected host from starting. Keep
+the per-host receipts and compare `executable_sha256` across M1/M3/M5 before
+treating the fleet as identical.
 
 Runner-group access is valuable when Shipyard coordinates multiple local
 providers because an App-backed policy verifier can compare selected

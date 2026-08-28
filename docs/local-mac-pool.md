@@ -177,8 +177,14 @@ For unattended Shipyard rollout, set `shipyard_bin` to an absolute path on
 every remote host class and make its existing `github_cli` an absolute governed
 helper path. Also declare `shipyard_mode`, `shipyard_global_dir`, and
 `shipyard_state_dir`; rollout fails closed without that exact daemon context.
-Use `shipyard runner fleet-update --to vX.Y.Z` to
-inspect the plan and add `--apply` only for the exact release being deployed.
+Use `shipyard runner fleet-update --to vX.Y.Z --host-class <class>` to inspect
+one host plan and add `--apply` only for the exact release being deployed.
+Repeat the selector for an intentionally ordered subset, or use the explicit
+`--all-hosts` compatibility selector; an implicit whole-fleet rollout is
+refused. Apply stops after the first host failure, so its typed version,
+installed SHA-256, daemon PID/version, and configured-repository preservation
+receipt can be accepted before the next host. The same selection path installs
+a known-good rollback tag at or above `v0.100.0`.
 Each remote invocation starts from `env -i`, restores Shipyard's canonical
 automation PATH internally, requires a self-contained machine-global
 `github.auth.source = "command"` helper, installs the exact tag, and refreshes

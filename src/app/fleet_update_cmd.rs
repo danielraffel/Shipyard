@@ -1,12 +1,18 @@
 //! Governed exact-version rollout for configured Shipyard host classes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::process::ExitCode;
 use std::time::Duration;
 
 use serde_json::Value;
+
+mod evidence;
+
+#[cfg(test)]
+use evidence::execute_plan_with_timeout;
+use evidence::{HostUpdateEvidence, PlanExecutionError, execute_plan, validate_evidence};
 
 use super::CliFailure;
 use crate::capacity::{HostClassConfig, parse_host_classes};
@@ -21,6 +27,11 @@ const REMOTE_MINIMAL_PATH: &str =
 const HOST_UPDATE_TIMEOUT: Duration = Duration::from_mins(10);
 const REMOTE_UPDATE_TIMEOUT: Duration = Duration::from_mins(9);
 const MIN_FLEET_UPDATE_TARGET: [u64; 3] = [0, 100, 0];
+const REMOTE_SHA256_PREFIX: &str = "SHIPYARD_FLEET_SHA256=";
+const REMOTE_CLI_VERSION_PREFIX: &str = "SHIPYARD_FLEET_CLI_VERSION=";
+const REMOTE_BEFORE_STATUS_PREFIX: &str = "SHIPYARD_FLEET_BEFORE_STATUS=";
+const REMOTE_REFRESH_PREFIX: &str = "SHIPYARD_FLEET_REFRESH=";
+const REMOTE_AFTER_STATUS_PREFIX: &str = "SHIPYARD_FLEET_AFTER_STATUS=";
 const REMOTE_SUPERVISOR: &str = r#"use strict;
 use warnings;
 use POSIX qw(WNOHANG setsid);
@@ -58,6 +69,8 @@ exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
 
 pub(super) struct FleetUpdateArgs {
     pub(super) to: String,
+    pub(super) host_classes: Vec<String>,
+    pub(super) all_hosts: bool,
     pub(super) apply: bool,
 }
 
@@ -92,66 +105,124 @@ pub(super) fn fleet_update_command<W: Write>(
             "No [host_class.<name>] configured — fleet-update has no rollout targets.",
         ));
     }
-    let plans = classes
+    let selected_classes = select_host_classes(&classes, &args.host_classes, args.all_hosts)?;
+    let plans = selected_classes
         .iter()
         .map(|class| host_update_plan(class, &target))
         .collect::<Result<Vec<_>, _>>()?;
 
     if !args.apply {
-        render_plan(stdout, json, &target, &plans)?;
+        render_plan(stdout, json, &target, &plans, args.all_hosts)?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mut failures = Vec::new();
-    for plan in &plans {
-        let result = execute_plan(plan);
-        match result {
-            Ok(PlanExecution::Completed(status)) if status.success() => {
-                render_host_result(stdout, json, &target, plan, true, None)?;
+    apply_plans(&plans, &target, json, stdout, execute_plan)
+}
+
+fn select_host_classes<'a>(
+    classes: &'a [HostClassConfig],
+    requested: &[String],
+    all_hosts: bool,
+) -> Result<Vec<&'a HostClassConfig>, CliFailure> {
+    if all_hosts && !requested.is_empty() {
+        return Err(CliFailure::new(
+            2,
+            "fleet-update accepts either --host-class or --all-hosts, not both",
+        ));
+    }
+    if !all_hosts && requested.is_empty() {
+        return Err(CliFailure::new(
+            2,
+            "fleet-update requires at least one --host-class or explicit --all-hosts",
+        ));
+    }
+    if all_hosts {
+        return Ok(classes.iter().collect());
+    }
+
+    let mut seen = BTreeSet::new();
+    for class in requested {
+        if !seen.insert(class.as_str()) {
+            return Err(CliFailure::new(
+                2,
+                format!("fleet-update host class {class:?} was selected more than once"),
+            ));
+        }
+    }
+    let by_name = classes
+        .iter()
+        .map(|class| (class.class.as_str(), class))
+        .collect::<BTreeMap<_, _>>();
+    requested
+        .iter()
+        .map(|name| {
+            by_name.get(name.as_str()).copied().ok_or_else(|| {
+                let available = by_name.keys().copied().collect::<Vec<_>>().join(", ");
+                CliFailure::new(
+                    2,
+                    format!(
+                        "unknown fleet-update host class {name:?}; configured classes: {available}"
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+fn apply_plans<W, F>(
+    plans: &[HostUpdatePlan],
+    target: &str,
+    json: bool,
+    stdout: &mut W,
+    mut execute: F,
+) -> Result<ExitCode, CliFailure>
+where
+    W: Write,
+    F: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, PlanExecutionError>,
+{
+    for plan in plans {
+        match execute(plan) {
+            Ok(evidence) => {
+                if let Err(error) = validate_evidence(plan, &evidence) {
+                    render_host_result(
+                        stdout,
+                        json,
+                        target,
+                        plan,
+                        false,
+                        Some(&evidence),
+                        Some(&error),
+                    )?;
+                    return Err(CliFailure::new(
+                        1,
+                        format!(
+                            "fleet update stopped after {} evidence failed: {error}",
+                            plan.class
+                        ),
+                    ));
+                }
+                render_host_result(stdout, json, target, plan, true, Some(&evidence), None)?;
             }
-            Ok(PlanExecution::Completed(status)) => {
-                let code = status.code().unwrap_or(-1);
-                failures.push(format!("{} exited {code}", plan.class));
-                render_host_result(
-                    stdout,
-                    json,
-                    &target,
-                    plan,
-                    false,
-                    Some(&format!("update command exited {code}")),
-                )?;
-            }
-            Ok(PlanExecution::TimedOut) => {
-                failures.push(format!(
-                    "{} timed out after {}s",
-                    plan.class,
-                    HOST_UPDATE_TIMEOUT.as_secs()
+            Err(PlanExecutionError::TimedOut(error)) => {
+                render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
+                return Err(CliFailure::new(
+                    1,
+                    format!(
+                        "fleet update stopped after {} timed out: {error}",
+                        plan.class
+                    ),
                 ));
-                render_host_result(
-                    stdout,
-                    json,
-                    &target,
-                    plan,
-                    false,
-                    Some(&format!(
-                        "update timed out after {}s; supervised process tree terminated",
-                        HOST_UPDATE_TIMEOUT.as_secs()
-                    )),
-                )?;
             }
-            Err(error) => {
-                failures.push(format!("{}: {error}", plan.class));
-                render_host_result(stdout, json, &target, plan, false, Some(&error.to_string()))?;
+            Err(PlanExecutionError::Failed(error)) => {
+                render_host_result(stdout, json, target, plan, false, None, Some(&error))?;
+                return Err(CliFailure::new(
+                    1,
+                    format!("fleet update stopped after {} failed: {error}", plan.class),
+                ));
             }
         }
     }
-    if failures.is_empty() {
-        return Ok(ExitCode::SUCCESS);
-    }
-    Err(CliFailure::new(
-        1,
-        format!("fleet update incomplete: {}", failures.join("; ")),
-    ))
+    Ok(ExitCode::SUCCESS)
 }
 
 fn normalize_exact_tag(raw: &str) -> Result<String, CliFailure> {
@@ -377,22 +448,34 @@ fn remote_update_command(
         format!("https://raw.githubusercontent.com/danielraffel/Shipyard/{target}/install.sh");
     let script = format!(
         "set -euo pipefail\n\
+         before_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
          token=\"$({} auth token)\"\n\
          installer=\"$(/usr/bin/mktemp)\"\n\
          staging_dir=\"$(/usr/bin/mktemp -d)\"\n\
          trap '/bin/rm -f \"$installer\"; /bin/rm -rf \"$staging_dir\"' EXIT\n\
          /usr/bin/curl -fsSL --output \"$installer\" {}\n\
-         SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$staging_dir\" SHIPYARD_CURL_BIN=/usr/bin/curl /bin/bash \"$installer\"\n\
+         SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR=\"$staging_dir\" SHIPYARD_CURL_BIN=/usr/bin/curl /bin/bash \"$installer\" >/dev/null\n\
          staged_binary=\"$staging_dir/shipyard\"\n\
          staged_version=\"$(\"$staged_binary\" --version)\"\n\
          test \"$staged_version\" = {}\n\
          \"$staged_binary\" --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
-         SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR={} SHIPYARD_CURL_BIN=/usr/bin/curl /bin/bash \"$installer\"\n\
+         SHIPYARD_GITHUB_TOKEN=\"$token\" SHIPYARD_VERSION={} SHIPYARD_INSTALL_DIR={} SHIPYARD_CURL_BIN=/usr/bin/curl /bin/bash \"$installer\" >/dev/null\n\
          unset token\n\
          actual_version=\"$({} --version)\"\n\
          test \"$actual_version\" = {}\n\
          {} --mode {} --global-dir {} --state-dir {} update --to {} --check --unattended-fleet >/dev/null\n\
-         {} --mode {} --global-dir {} --state-dir {} daemon refresh",
+         refresh_receipt=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon refresh | /usr/bin/tr -d '\\n')\"\n\
+         after_status=\"$({} --mode {} --global-dir {} --state-dir {} --json daemon status | /usr/bin/tr -d '\\n')\"\n\
+         installed_sha256=\"$(/usr/bin/shasum -a 256 {} | /usr/bin/awk '{{print $1}}')\"\n\
+         printf '%s%s\\n' {} \"$installed_sha256\"\n\
+         printf '%s%s\\n' {} \"$actual_version\"\n\
+         printf '%s%s\\n' {} \"$before_status\"\n\
+         printf '%s%s\\n' {} \"$refresh_receipt\"\n\
+         printf '%s%s\\n' {} \"$after_status\"",
+        shlex_quote(&binary.display().to_string()),
+        shlex_quote(mode),
+        shlex_quote(&global_dir.display().to_string()),
+        shlex_quote(&state_dir.display().to_string()),
         shlex_quote(&auth_helper.display().to_string()),
         shlex_quote(&installer_url),
         shlex_quote(version),
@@ -414,6 +497,16 @@ fn remote_update_command(
         shlex_quote(mode),
         shlex_quote(&global_dir.display().to_string()),
         shlex_quote(&state_dir.display().to_string()),
+        shlex_quote(&binary.display().to_string()),
+        shlex_quote(mode),
+        shlex_quote(&global_dir.display().to_string()),
+        shlex_quote(&state_dir.display().to_string()),
+        shlex_quote(&binary.display().to_string()),
+        shlex_quote(REMOTE_SHA256_PREFIX),
+        shlex_quote(REMOTE_CLI_VERSION_PREFIX),
+        shlex_quote(REMOTE_BEFORE_STATUS_PREFIX),
+        shlex_quote(REMOTE_REFRESH_PREFIX),
+        shlex_quote(REMOTE_AFTER_STATUS_PREFIX),
     );
     format!(
         "/usr/bin/env -i HOME=\"$HOME\" PATH={} /usr/bin/perl -e {} {} /bin/bash -c {}",
@@ -426,7 +519,7 @@ fn remote_update_command(
 
 fn local_update_command(plan: &HostUpdatePlan) -> String {
     format!(
-        "/usr/bin/env -i HOME={} PATH={} {} --mode {} --global-dir {} --state-dir {} update --to {} --refresh-daemon --unattended-fleet",
+        "/usr/bin/env -i HOME={} PATH={} {} --mode {} --global-dir {} --state-dir {} --json update --to {} --refresh-daemon --unattended-fleet",
         shlex_quote(&home_dir().display().to_string()),
         shlex_quote(&unattended_tool_path().to_string_lossy()),
         shlex_quote(&plan.binary.display().to_string()),
@@ -437,81 +530,24 @@ fn local_update_command(plan: &HostUpdatePlan) -> String {
     )
 }
 
-#[derive(Debug)]
-enum PlanExecution {
-    Completed(ExitStatus),
-    TimedOut,
-}
-
-fn execute_plan(plan: &HostUpdatePlan) -> std::io::Result<PlanExecution> {
-    execute_plan_with_timeout(plan, HOST_UPDATE_TIMEOUT)
-}
-
-fn execute_plan_with_timeout(
-    plan: &HostUpdatePlan,
-    timeout: Duration,
-) -> std::io::Result<PlanExecution> {
-    let mut command = if let Some(host) = &plan.ssh {
-        let mut command = Command::new(ssh_binary());
-        command.args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=8",
-            "-o",
-            "StrictHostKeyChecking=yes",
-        ]);
-        command.arg(host).arg(&plan.command);
-        command
-    } else {
-        let mut command = Command::new(&plan.binary);
-        command
-            .args(["--mode", plan.runtime_mode.as_str(), "--global-dir"])
-            .arg(&plan.global_dir)
-            .arg("--state-dir")
-            .arg(&plan.state_dir)
-            .args([
-                "update",
-                "--to",
-                &plan.target,
-                "--refresh-daemon",
-                "--unattended-fleet",
-            ])
-            .env_clear()
-            .env("HOME", home_dir())
-            .env("PATH", unattended_tool_path());
-        command
-    };
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut process = crate::process::ProcessTree::spawn(&mut command)?;
-    if process.wait_timeout(timeout)?.is_none() {
-        process.terminate();
-        return Ok(PlanExecution::TimedOut);
-    }
-    process.wait().map(PlanExecution::Completed)
-}
-
-fn ssh_binary() -> PathBuf {
-    [PathBuf::from("/usr/bin/ssh"), PathBuf::from("/bin/ssh")]
-        .into_iter()
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from("ssh"))
-}
-
 fn render_plan<W: Write>(
     stdout: &mut W,
     json: bool,
     target: &str,
     plans: &[HostUpdatePlan],
+    all_hosts: bool,
 ) -> Result<(), CliFailure> {
     if json {
         let mut data = BTreeMap::new();
         data.insert("event".to_owned(), Value::from("plan"));
         data.insert("target".to_owned(), Value::from(target));
         data.insert("apply".to_owned(), Value::Bool(false));
+        data.insert("all_hosts".to_owned(), Value::Bool(all_hosts));
+        data.insert(
+            "selected_host_classes".to_owned(),
+            serde_json::to_value(plans.iter().map(|plan| &plan.class).collect::<Vec<_>>())
+                .map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
         data.insert(
             "hosts".to_owned(),
             Value::Array(
@@ -531,8 +567,16 @@ fn render_plan<W: Write>(
         write_json_envelope(stdout, "runner.fleet-update", data)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     } else {
-        writeln!(stdout, "Fleet update plan for {target}:")
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        writeln!(
+            stdout,
+            "Fleet update plan for {target} ({}):",
+            if all_hosts {
+                "explicit all-host selection"
+            } else {
+                "explicit host-class selection"
+            }
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
         for plan in plans {
             let route = plan.ssh.as_deref().unwrap_or("local");
             writeln!(stdout, "  {} ({route}): {}", plan.class, plan.command)
@@ -550,6 +594,7 @@ fn render_host_result<W: Write>(
     target: &str,
     plan: &HostUpdatePlan,
     ok: bool,
+    evidence: Option<&HostUpdateEvidence>,
     error: Option<&str>,
 ) -> Result<(), CliFailure> {
     if json {
@@ -558,6 +603,52 @@ fn render_host_result<W: Write>(
         data.insert("target".to_owned(), Value::from(target));
         data.insert("host_class".to_owned(), Value::from(plan.class.clone()));
         data.insert("ok".to_owned(), Value::Bool(ok));
+        data.insert(
+            "binary".to_owned(),
+            Value::from(plan.binary.display().to_string()),
+        );
+        data.insert(
+            "daemon_mode".to_owned(),
+            Value::from(plan.runtime_mode.as_str()),
+        );
+        data.insert(
+            "daemon_global_dir".to_owned(),
+            Value::from(plan.global_dir.display().to_string()),
+        );
+        data.insert(
+            "daemon_state_dir".to_owned(),
+            Value::from(plan.state_dir.display().to_string()),
+        );
+        if let Some(evidence) = evidence {
+            data.insert(
+                "executable_sha256".to_owned(),
+                Value::from(evidence.executable_sha256.clone()),
+            );
+            data.insert(
+                "cli_version".to_owned(),
+                Value::from(evidence.cli_version.clone()),
+            );
+            data.insert(
+                "daemon_version".to_owned(),
+                Value::from(evidence.daemon_version.clone()),
+            );
+            data.insert("daemon_pid".to_owned(), Value::from(evidence.daemon_pid));
+            data.insert(
+                "configured_repos_before".to_owned(),
+                serde_json::to_value(&evidence.configured_repos_before)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
+            );
+            data.insert(
+                "configured_repos_after".to_owned(),
+                serde_json::to_value(&evidence.configured_repos_after)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
+            );
+            data.insert(
+                "configured_repos_preserved".to_owned(),
+                serde_json::to_value(evidence.configured_repos_preserved)
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?,
+            );
+        }
         if let Some(error) = error {
             data.insert("error".to_owned(), Value::from(error));
         }
@@ -566,8 +657,14 @@ fn render_host_result<W: Write>(
     } else if ok {
         writeln!(
             stdout,
-            "{}: updated to {target}; daemon refreshed",
-            plan.class
+            "{}: updated to {target}; sha256={}; daemon pid={} version={}; configured repos preserved={}",
+            plan.class,
+            evidence.map_or("unavailable", |value| value.executable_sha256.as_str()),
+            evidence.map_or(0, |value| value.daemon_pid),
+            evidence.map_or("unavailable", |value| value.daemon_version.as_str()),
+            evidence
+                .and_then(|value| value.configured_repos_preserved)
+                .map_or("not-applicable", |preserved| if preserved { "true" } else { "false" }),
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     } else {
@@ -584,6 +681,8 @@ fn render_host_result<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
 
     fn host(ssh: Option<&str>, shipyard_bin: Option<&str>) -> HostClassConfig {
@@ -632,6 +731,17 @@ mod tests {
             plan.command
                 .contains("update --to v0.98.1 --check --unattended-fleet")
         );
+        assert!(plan.command.contains("/usr/bin/shasum -a 256"));
+        assert!(plan.command.contains(REMOTE_BEFORE_STATUS_PREFIX));
+        assert!(plan.command.contains(REMOTE_REFRESH_PREFIX));
+        assert!(plan.command.contains(REMOTE_AFTER_STATUS_PREFIX));
+        let status_probe = plan.command.find("before_status=").expect("status probe");
+        let auth = plan.command.find("token=").expect("auth boundary");
+        assert!(
+            status_probe < auth,
+            "status must fail before auth and install"
+        );
+        assert!(!plan.command.contains("observed_before="));
         let preflight = plan
             .command
             .find("staged_binary")
@@ -733,53 +843,18 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp dir");
         let binary = temp.path().join("shipyard");
-        std::fs::write(&binary, "#!/bin/sh\nsleep 60\n").expect("fixture");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\ncase \"$*\" in *\"daemon status\"*) printf '%s\\n' '{\"command\":\"daemon:status\",\"running\":false}' ;; *) sleep 60 ;; esac\n",
+        )
+        .expect("fixture");
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
             .expect("executable");
         let plan = host_update_plan(&host(None, binary.to_str()), "v0.98.1").expect("plan");
         assert!(matches!(
-            execute_plan_with_timeout(&plan, Duration::from_millis(50)).expect("execution"),
-            PlanExecution::TimedOut
+            execute_plan_with_timeout(&plan, Duration::from_millis(50)),
+            Err(PlanExecutionError::TimedOut(_))
         ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remote_supervisor_kills_term_ignoring_descendants_after_leader_exits() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let pid_file = temp.path().join("descendant.pid");
-        let worker = format!(
-            "(trap '' TERM; echo $$ > {}; while :; do sleep 1; done) & wait $!",
-            shlex_quote(&pid_file.display().to_string())
-        );
-        let status = Command::new("/usr/bin/perl")
-            .args(["-e", REMOTE_SUPERVISOR, "1", "/bin/bash", "-c", &worker])
-            .status()
-            .expect("remote supervisor fixture");
-        assert_eq!(status.code(), Some(124));
-
-        let pid = std::fs::read_to_string(pid_file)
-            .expect("descendant pid")
-            .trim()
-            .to_owned();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < deadline
-            && Command::new("/bin/kill")
-                .args(["-0", &pid])
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        {
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        assert!(
-            !Command::new("/bin/kill")
-                .args(["-0", &pid])
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success()),
-            "TERM-ignoring descendant survived the remote timeout boundary"
-        );
     }
 
     #[cfg(unix)]
@@ -832,5 +907,89 @@ mod tests {
         assert!(normalize_exact_tag("v0.98").is_err());
         assert!(normalize_exact_tag("v0.98.1-rc1").is_err());
         assert!(normalize_exact_tag("v18446744073709551616.0.0").is_err());
+    }
+
+    fn named_host(name: &str) -> HostClassConfig {
+        let mut class = host(None, Some("/Users/ci/.local/bin/shipyard"));
+        class.class = name.to_owned();
+        class
+    }
+
+    fn evidence(version: &str) -> HostUpdateEvidence {
+        HostUpdateEvidence {
+            executable_sha256: "a".repeat(64),
+            cli_version: format!("shipyard {version}"),
+            daemon_version: version.to_owned(),
+            daemon_pid: 42,
+            configured_repos_before: Some(vec!["owner/repo".to_owned()]),
+            configured_repos_after: vec!["owner/repo".to_owned()],
+            configured_repos_preserved: Some(true),
+        }
+    }
+
+    #[test]
+    fn host_selection_is_explicit_ordered_and_fail_closed() {
+        let classes = vec![named_host("m1"), named_host("m3"), named_host("m5")];
+        let error = select_host_classes(&classes, &[], false).expect_err("implicit fleet");
+        assert!(error.message.contains("explicit --all-hosts"));
+
+        let selected = select_host_classes(&classes, &["m5".to_owned(), "m1".to_owned()], false)
+            .expect("selected subset");
+        assert_eq!(
+            selected
+                .iter()
+                .map(|class| class.class.as_str())
+                .collect::<Vec<_>>(),
+            ["m5", "m1"]
+        );
+
+        let duplicate = select_host_classes(&classes, &["m1".to_owned(), "m1".to_owned()], false)
+            .expect_err("duplicate");
+        assert!(duplicate.message.contains("more than once"));
+        let unknown =
+            select_host_classes(&classes, &["studio".to_owned()], false).expect_err("unknown");
+        assert!(unknown.message.contains("configured classes: m1, m3, m5"));
+        assert!(select_host_classes(&classes, &["m1".to_owned()], true).is_err());
+        assert_eq!(
+            select_host_classes(&classes, &[], true)
+                .expect("explicit all")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn apply_stops_before_every_later_host_after_first_failure() {
+        let plans = ["m1", "m3", "m5"]
+            .iter()
+            .map(|name| host_update_plan(&named_host(name), "v0.100.0").expect("plan"))
+            .collect::<Vec<_>>();
+        let mut attempted = Vec::new();
+        let mut output = Vec::new();
+        let error = apply_plans(&plans, "v0.100.0", true, &mut output, |plan| {
+            attempted.push(plan.class.clone());
+            if plan.class == "m3" {
+                Err(PlanExecutionError::Failed("controlled failure".to_owned()))
+            } else {
+                Ok(evidence("0.100.0"))
+            }
+        })
+        .expect_err("apply stops");
+        assert_eq!(attempted, ["m1", "m3"]);
+        assert!(error.message.contains("stopped after m3"));
+        let rendered = String::from_utf8(output).expect("UTF-8");
+        let receipts = serde_json::Deserializer::from_str(&rendered)
+            .into_iter::<Value>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("typed receipts");
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0]["host_class"], "m1");
+        assert_eq!(receipts[0]["target"], "v0.100.0");
+        assert_eq!(receipts[0]["executable_sha256"], "a".repeat(64));
+        assert_eq!(receipts[0]["daemon_pid"], 42);
+        assert_eq!(receipts[0]["configured_repos_preserved"], true);
+        assert_eq!(receipts[1]["host_class"], "m3");
+        assert_eq!(receipts[1]["ok"], false);
+        assert!(!rendered.contains("\"host_class\": \"m5\""));
     }
 }

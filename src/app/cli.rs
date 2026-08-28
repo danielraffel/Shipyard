@@ -1140,13 +1140,20 @@ pub(super) enum RunnerCommand {
         #[arg(long = "release-stale-threshold-secs", default_value_t = 86400)]
         release_stale_threshold_secs: i64,
     },
-    /// Roll one exact Shipyard release across configured host classes and
-    /// refresh each daemon. Plans only unless `--apply` is supplied.
+    /// Roll one exact Shipyard release across explicitly selected host classes
+    /// and refresh each daemon. Plans only unless `--apply` is supplied.
     #[command(name = "fleet-update")]
     FleetUpdate {
-        /// Exact release tag to install on every host, for example v0.100.0.
+        /// Exact release or rollback tag to install, for example v0.100.0.
         #[arg(long = "to")]
         to: String,
+        /// Exact configured host class to update. Repeat to select an ordered
+        /// subset. Conflicts with `--all-hosts`.
+        #[arg(long = "host-class", value_name = "CLASS", action = ArgAction::Append)]
+        host_classes: Vec<String>,
+        /// Explicitly select every configured host class.
+        #[arg(long, conflicts_with = "host_classes")]
+        all_hosts: bool,
         /// Execute the rollout. Without this flag, emit the exact host plan.
         #[arg(long)]
         apply: bool,
