@@ -256,6 +256,15 @@ fn structured_launch_quotes_cwd_and_excludes_raw_context() {
     assert!(!command.contains("context_url"));
     assert!(command.contains("GEN-43"));
     assert!(command.contains("wake:gen43:1"));
+    for command_name in [
+        "context-challenge",
+        "acknowledge-context",
+        "return-challenge",
+        "return-ownership",
+    ] {
+        assert!(command.contains(command_name));
+    }
+    assert!(command.contains("Never put receipt JSON or secrets in argv"));
 }
 
 #[test]

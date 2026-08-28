@@ -83,6 +83,27 @@ pub(crate) struct AgentOwnershipReceipt {
     pub(crate) receipt_digest: String,
 }
 
+/// Redacted immutable authority a fresh session must reconstruct and echo.
+/// Its JSON shape is intentionally the exact `AgentContextReceipt` shape.
+pub(crate) type AgentContextChallenge = AgentContextReceipt;
+
+/// Current acknowledged ownership plus the checkpoint it must advance beyond.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct AgentReturnChallenge {
+    pub(crate) schema_version: u32,
+    pub(crate) work_item_id: String,
+    pub(crate) ownership_id: String,
+    pub(crate) delivery_id: String,
+    pub(crate) work_generation: u64,
+    pub(crate) owner_generation: u64,
+    pub(crate) context_receipt_digest: String,
+    pub(crate) checkpoint_id: String,
+    pub(crate) checkpoint_generation: u64,
+    pub(crate) checkpoint_digest: String,
+    pub(crate) repository: String,
+    pub(crate) head_sha: String,
+}
+
 #[derive(Clone, Debug)]
 struct DeliveredAuthority {
     wake_id: String,
@@ -98,6 +119,120 @@ struct DeliveredAuthority {
 }
 
 impl WorkLedger {
+    pub(crate) fn agent_context_challenge(
+        &self,
+        wake_id: &str,
+        authorized_repositories: &[String],
+    ) -> WorkLedgerResult<AgentContextChallenge> {
+        let authority = self.delivered_authority(wake_id)?;
+        let (_, request_bytes) = self.open_protected_object(&authority.request_object_ref)?;
+        let request: StoredProviderRequest =
+            serde_json::from_slice(&request_bytes).map_err(|_| {
+                WorkLedgerError::Refused("provider request authority is malformed".to_owned())
+            })?;
+        if authorized_repositories
+            .binary_search(&request.resume.repository)
+            .is_err()
+        {
+            return Err(WorkLedgerError::Refused(
+                "delivered context repository is not authorized".to_owned(),
+            ));
+        }
+        Ok(AgentContextReceipt {
+            schema_version: 1,
+            wake_id: authority.wake_id,
+            work_item_id: authority.work_item_id,
+            work_generation: authority.work_generation,
+            owner_generation: authority.owner_generation,
+            delivery_id: authority.delivery_id,
+            idempotency_key: authority.idempotency_key,
+            provider_receipt_digest: authority.provider_receipt_digest,
+            workstream_handle: request.resume.workstream_handle,
+            context_url: request.resume.context_url,
+            plan_sha256: request.resume.plan_sha256,
+            root_revision: request.resume.root_revision,
+            issue_revision: request.resume.issue_revision,
+            material_event_revision: request.resume.material_event_revision,
+            projection_revision: request.resume.projection_revision,
+            checkpoint_id: request.resume.checkpoint_id,
+            checkpoint_generation: request.resume.checkpoint_generation,
+            checkpoint_digest: request.resume.checkpoint_digest,
+            repository: request.resume.repository,
+            head_sha: request.resume.head_sha,
+            resume_context_digest: request.resume.expected_resume_context_digest,
+            success_continuation_digest: request.resume.success_continuation_digest,
+            failure_continuation_digest: request.resume.failure_continuation_digest,
+        })
+    }
+
+    pub(crate) fn agent_return_challenge(
+        &self,
+        ownership_id: &str,
+        authorized_repositories: &[String],
+    ) -> WorkLedgerResult<AgentReturnChallenge> {
+        let connection = self.connect_read_only()?;
+        verify_supported_schema(&connection)?;
+        verify_integrity(&connection)?;
+        let authority: (String, String, u64, u64, String, String) = connection
+            .query_row(
+                "SELECT ownership.work_item_id, ownership.delivery_id,
+                        ownership.work_generation, ownership.owner_generation,
+                        ownership.context_receipt_digest, delivery.request_object_ref
+                   FROM agent_ownership ownership
+                   JOIN provider_deliveries delivery
+                     ON delivery.delivery_id = ownership.delivery_id
+                   JOIN work_items work ON work.id = ownership.work_item_id
+                  WHERE ownership.ownership_id = ?1
+                    AND ownership.state = 'acknowledged'
+                    AND work.phase = 'agent_owned_repair'
+                    AND work.work_generation = ownership.work_generation + 1
+                    AND work.owner_generation = ownership.owner_generation",
+                [ownership_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| WorkLedgerError::Refused("agent ownership is missing".to_owned()))?;
+        let (_, request_bytes) = self.open_protected_object(&authority.5)?;
+        let request: StoredProviderRequest =
+            serde_json::from_slice(&request_bytes).map_err(|_| {
+                WorkLedgerError::Refused("provider request authority is malformed".to_owned())
+            })?;
+        if authorized_repositories
+            .binary_search(&request.resume.repository)
+            .is_err()
+        {
+            return Err(WorkLedgerError::Refused(
+                "agent ownership repository is not authorized".to_owned(),
+            ));
+        }
+        let work_generation = authority.2.checked_add(1).ok_or_else(|| {
+            WorkLedgerError::Refused("agent ownership generation overflow".to_owned())
+        })?;
+        Ok(AgentReturnChallenge {
+            schema_version: 1,
+            work_item_id: authority.0,
+            ownership_id: ownership_id.to_owned(),
+            delivery_id: authority.1,
+            work_generation,
+            owner_generation: authority.3,
+            context_receipt_digest: authority.4,
+            checkpoint_id: request.resume.checkpoint_id,
+            checkpoint_generation: request.resume.checkpoint_generation,
+            checkpoint_digest: request.resume.checkpoint_digest,
+            repository: request.resume.repository,
+            head_sha: request.resume.head_sha,
+        })
+    }
+
     pub(crate) fn acknowledge_agent_context(
         &self,
         wake_id: &str,

@@ -466,18 +466,40 @@ fn repository_allowlist_skips_unauthorized_wake_without_mutation_or_starvation()
 
 #[test]
 fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
-    let (_temp, ledger, profile, work_id, _wake_id) = setup_wake();
+    let (temp, ledger, profile, work_id, _wake_id) = setup_wake();
     let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
-    let context_bytes =
-        serde_json::to_vec(&context_receipt(&ledger, &wake_id)).expect("context receipt");
+    let context = context_receipt(&ledger, &wake_id);
+    assert_eq!(
+        ledger
+            .agent_context_challenge(&wake_id, &["danielraffel/pulp".to_owned()])
+            .expect("context challenge"),
+        context
+    );
+    assert!(
+        ledger
+            .agent_context_challenge(&wake_id, &["attacker/private".to_owned()])
+            .is_err()
+    );
+    let context_bytes = serde_json::to_vec(&context).expect("context receipt");
     let ownership = ledger
         .acknowledge_agent_context(&wake_id, &context_bytes)
         .expect("context acknowledgement");
     assert_eq!(outbox_state(&ledger, &wake_id), "acknowledged");
-    let replay = ledger
+    let restarted = WorkLedger::open_existing(temp.path())
+        .expect("reopen")
+        .expect("persisted ledger");
+    let replay = restarted
         .acknowledge_agent_context(&wake_id, &context_bytes)
-        .expect("ack replay");
+        .expect("ack replay after restart");
     assert_eq!(replay, ownership);
+
+    let challenge = restarted
+        .agent_return_challenge(&ownership.ownership_id, &["danielraffel/pulp".to_owned()])
+        .expect("return challenge");
+    assert_eq!(challenge.work_item_id, work_id);
+    assert_eq!(challenge.delivery_id, delivery_id);
+    assert_eq!(challenge.work_generation, 7);
+    assert_eq!(challenge.checkpoint_generation, 1);
 
     let expected = return_expectation(
         &work_id,
@@ -486,7 +508,7 @@ fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
         &delivery_id,
     );
     let return_bytes = serde_json::to_vec(&return_receipt(&expected)).expect("return receipt");
-    let returned = ledger
+    let returned = restarted
         .return_agent_ownership(
             &ownership.ownership_id,
             &delivery_id,
@@ -495,7 +517,9 @@ fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
             &return_bytes,
         )
         .expect("ownership return");
-    let return_replay = ledger
+    let return_replay = WorkLedger::open_existing(temp.path())
+        .expect("reopen returned")
+        .expect("persisted returned ledger")
         .return_agent_ownership(
             &ownership.ownership_id,
             &delivery_id,
@@ -505,7 +529,22 @@ fn delivered_context_ack_and_return_are_separate_exact_replayable_cas_steps() {
         )
         .expect("return replay");
     assert_eq!(return_replay, returned);
-    let work: (String, u64) = ledger
+    let mut other_expected = expected.clone();
+    other_expected.evidence_digest = "9".repeat(64);
+    let other_receipt = serde_json::to_vec(&return_receipt(&other_expected)).expect("other return");
+    assert!(
+        restarted
+            .return_agent_ownership(
+                &ownership.ownership_id,
+                &delivery_id,
+                7,
+                &other_expected,
+                &other_receipt,
+            )
+            .is_err(),
+        "a different receipt cannot replay an already returned ownership"
+    );
+    let work: (String, u64) = restarted
         .connect_read_only()
         .expect("connection")
         .query_row(

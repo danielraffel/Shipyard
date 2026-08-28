@@ -314,8 +314,10 @@ fn create_args(
 
 fn launch_command(request: &ProviderWrapperRequestV1) -> Result<String, &'static str> {
     let prompt = format!(
-        "Resume tracked workstream {}. Restore and validate its durable context, then acknowledge wake {} through Shipyard. Complete the remaining work, keep Linear current, and return ownership through Shipyard.",
-        request.resume_expectation.workstream_handle, request.delivery_fence.wake_id
+        "Resume tracked workstream {}. First run `shipyard --json work-ledger context-challenge --wake {}` and reconstruct that exact durable context. Write the matching receipt to a private file, then run `shipyard --json work-ledger acknowledge-context --wake {} --receipt <private-path>`. Complete the remaining work and keep Linear current. Before handoff, run `shipyard --json work-ledger return-challenge --ownership <ownership-id>`, write separate reviewed expectation and receipt files proving a newer checkpoint, evidence, and remote acknowledgement, then run `shipyard --json work-ledger return-ownership --ownership <ownership-id> --expectation <private-path> --receipt <private-path>`. Never put receipt JSON or secrets in argv.",
+        request.resume_expectation.workstream_handle,
+        request.delivery_fence.wake_id,
+        request.delivery_fence.wake_id,
     );
     let wrapper = match request.provider_id.as_str() {
         "codex" => CODEX_WRAPPER,

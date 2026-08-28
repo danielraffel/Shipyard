@@ -56,7 +56,8 @@ mod dispatch;
 mod importer;
 #[allow(unused_imports)] // Consumed by the later daemon/provider integration slice.
 pub(crate) use delivery_ownership::{
-    AgentContextReceipt, AgentReturnExpectation, AgentReturnReceipt,
+    AgentContextChallenge, AgentContextReceipt, AgentOwnershipReceipt, AgentReturnChallenge,
+    AgentReturnExpectation, AgentReturnReceipt,
 };
 pub(crate) use dispatch::{
     DeliveryFence, FreshAgentLaunchProfile, FreshAgentResumeExpectation, ProviderAdapter,

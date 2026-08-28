@@ -1,18 +1,21 @@
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
 use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
 use crate::work_ledger::{
-    NativePublicationReport, RepoPolicy, WorkLedger, absent_status, apply_legacy_snapshot,
-    plan_legacy_snapshot, validate_repo_policy,
+    AgentReturnExpectation, NativePublicationReport, RepoPolicy, WorkLedger, absent_status,
+    apply_legacy_snapshot, plan_legacy_snapshot, validate_repo_policy,
 };
 use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 
 use super::CliFailure;
 use super::cli::{WorkLedgerCommand, WorkLedgerPolicyCommand};
 use super::merge_steward_cmd::native_publication_request;
+
+const MAX_AGENT_RECEIPT_BYTES: u64 = 64 * 1024;
 
 pub(super) fn work_ledger_command<W: Write>(
     command: &WorkLedgerCommand,
@@ -123,11 +126,240 @@ pub(super) fn work_ledger_command<W: Write>(
             .map_err(failure)?;
             write_publication_report(stdout, &report, json)?;
         }
+        WorkLedgerCommand::ContextChallenge { wake } => {
+            let ready = ready_production_activation(runtime_paths)?;
+            let ledger = required_ledger(state_dir)?;
+            let challenge = ledger
+                .agent_context_challenge(wake, &ready.config.repositories)
+                .map_err(failure)?;
+            if json {
+                write_pretty_json(stdout, &challenge).map_err(failure)?;
+            } else {
+                writeln!(stdout, "Context challenge: ready").map_err(failure)?;
+                writeln!(stdout, "Wake: {}", challenge.wake_id).map_err(failure)?;
+                writeln!(stdout, "Workstream: {}", challenge.workstream_handle).map_err(failure)?;
+                writeln!(stdout, "Repository: {}", challenge.repository).map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Checkpoint generation: {}",
+                    challenge.checkpoint_generation
+                )
+                .map_err(failure)?;
+            }
+        }
+        WorkLedgerCommand::AcknowledgeContext { wake, receipt } => {
+            let ready = ready_production_activation(runtime_paths)?;
+            let bytes = read_private_input(receipt)?;
+            let ledger = required_ledger(state_dir)?;
+            // Authorize this wake before accepting caller-supplied receipt bytes.
+            ledger
+                .agent_context_challenge(wake, &ready.config.repositories)
+                .map_err(failure)?;
+            let ownership = ledger
+                .acknowledge_agent_context(wake, &bytes)
+                .map_err(failure)?;
+            let return_challenge = ledger
+                .agent_return_challenge(&ownership.ownership_id, &ready.config.repositories)
+                .map_err(failure)?;
+            write_agent_transition(
+                stdout,
+                json,
+                "context_acknowledged",
+                &ownership,
+                Some(&return_challenge),
+            )?;
+        }
+        WorkLedgerCommand::ReturnChallenge { ownership } => {
+            let ready = ready_production_activation(runtime_paths)?;
+            let ledger = required_ledger(state_dir)?;
+            let challenge = ledger
+                .agent_return_challenge(ownership, &ready.config.repositories)
+                .map_err(failure)?;
+            if json {
+                write_pretty_json(stdout, &challenge).map_err(failure)?;
+            } else {
+                writeln!(stdout, "Return challenge: ready").map_err(failure)?;
+                writeln!(stdout, "Ownership: {}", challenge.ownership_id).map_err(failure)?;
+                writeln!(stdout, "Repository: {}", challenge.repository).map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Checkpoint floor: {}",
+                    challenge.checkpoint_generation
+                )
+                .map_err(failure)?;
+            }
+        }
+        WorkLedgerCommand::ReturnOwnership {
+            ownership,
+            expectation,
+            receipt,
+        } => {
+            if expectation == Path::new("-") && receipt == Path::new("-") {
+                return Err(CliFailure::new(
+                    1,
+                    "expectation and receipt cannot both read from stdin",
+                ));
+            }
+            let ready = ready_production_activation(runtime_paths)?;
+            let expectation_bytes = read_private_input(expectation)?;
+            let receipt_bytes = read_private_input(receipt)?;
+            let expected: AgentReturnExpectation = serde_json::from_slice(&expectation_bytes)
+                .map_err(|_| {
+                    CliFailure::new(1, "return expectation is not exact schema-v1 JSON")
+                })?;
+            if expected.ownership_id != *ownership {
+                return Err(CliFailure::new(
+                    1,
+                    "return expectation belongs to a different ownership",
+                ));
+            }
+            let ledger = required_ledger(state_dir)?;
+            ledger
+                .agent_return_challenge(ownership, &ready.config.repositories)
+                .map_err(failure)?;
+            let returned = ledger
+                .return_agent_ownership(
+                    ownership,
+                    &expected.delivery_id,
+                    expected.work_generation,
+                    &expected,
+                    &receipt_bytes,
+                )
+                .map_err(failure)?;
+            write_agent_transition(stdout, json, "ownership_returned", &returned, None)?;
+        }
         WorkLedgerCommand::Policy { command } => {
             policy_command(command, state_dir, json, stdout)?;
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn ready_production_activation(
+    runtime_paths: &RuntimePaths,
+) -> Result<crate::workstream_activation_loader::ReadyWorkstreamActivation, CliFailure> {
+    let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+    if runtime_paths != &production_paths {
+        return Err(CliFailure::new(
+            1,
+            "agent handshake is available only against canonical production roots",
+        ));
+    }
+    let mut loader = WorkstreamActivationLoader::production();
+    match loader.revalidate_for_tick() {
+        WorkstreamActivationState::Ready(ready) => Ok(ready),
+        WorkstreamActivationState::Disabled => Err(CliFailure::new(
+            1,
+            "workstream continuation activation is disabled",
+        )),
+        WorkstreamActivationState::Refused(reason) => Err(CliFailure::new(
+            1,
+            format!(
+                "workstream continuation activation refused: {}",
+                reason.code()
+            ),
+        )),
+    }
+}
+
+fn required_ledger(state_dir: &Path) -> Result<WorkLedger, CliFailure> {
+    WorkLedger::open_existing(state_dir)
+        .map_err(failure)?
+        .ok_or_else(|| CliFailure::new(1, "work ledger is absent"))
+}
+
+fn read_private_input(path: &Path) -> Result<Vec<u8>, CliFailure> {
+    if path == Path::new("-") {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(MAX_AGENT_RECEIPT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| CliFailure::new(1, "stdin receipt is unreadable"))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_AGENT_RECEIPT_BYTES {
+            return Err(CliFailure::new(1, "stdin receipt exceeds 64 KiB"));
+        }
+        return Ok(bytes);
+    }
+    read_private_file(path)
+}
+
+fn read_private_file(path: &Path) -> Result<Vec<u8>, CliFailure> {
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|_| CliFailure::new(1, "receipt file is unreadable"))?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(CliFailure::new(1, "receipt path is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if before.permissions().mode() & 0o077 != 0 {
+            return Err(CliFailure::new(
+                1,
+                "receipt file must be private (mode 0600)",
+            ));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| CliFailure::new(1, "receipt file is unreadable"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| CliFailure::new(1, "receipt file is unreadable"))?;
+    if !opened.is_file() || opened.len() > MAX_AGENT_RECEIPT_BYTES {
+        return Err(CliFailure::new(1, "receipt file exceeds 64 KiB"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.dev() != opened.dev() || before.ino() != opened.ino() {
+            return Err(CliFailure::new(1, "receipt file changed while opening"));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_AGENT_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CliFailure::new(1, "receipt file is unreadable"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_AGENT_RECEIPT_BYTES {
+        return Err(CliFailure::new(1, "receipt file exceeds 64 KiB"));
+    }
+    Ok(bytes)
+}
+
+fn write_agent_transition<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    state: &str,
+    ownership: &crate::work_ledger::AgentOwnershipReceipt,
+    return_challenge: Option<&crate::work_ledger::AgentReturnChallenge>,
+) -> Result<(), CliFailure> {
+    if json {
+        write_pretty_json(
+            stdout,
+            &serde_json::json!({
+                "state": state,
+                "ownership_id": ownership.ownership_id,
+                "receipt_digest": ownership.receipt_digest,
+                "return_challenge": return_challenge,
+            }),
+        )
+        .map_err(failure)
+    } else {
+        writeln!(stdout, "Agent ownership: {state}").map_err(failure)?;
+        writeln!(stdout, "Ownership: {}", ownership.ownership_id).map_err(failure)?;
+        writeln!(stdout, "Receipt digest: {}", ownership.receipt_digest).map_err(failure)
+    }
 }
 
 fn write_publication_report<W: Write>(
@@ -353,5 +585,51 @@ mod tests {
         assert_eq!(value["work_id"], "wi:test");
         assert!(value.get("protected_profile_bytes").is_none());
         assert!(value.get("agent_session_id").is_none());
+    }
+
+    #[test]
+    fn agent_transition_json_omits_protected_object_location() {
+        let ownership = crate::work_ledger::AgentOwnershipReceipt {
+            ownership_id: "ao:test".to_owned(),
+            receipt_object_ref: "secret-object-location".to_owned(),
+            receipt_digest: "a".repeat(64),
+        };
+        let mut output = Vec::new();
+        write_agent_transition(&mut output, true, "context_acknowledged", &ownership, None)
+            .expect("transition JSON");
+        let value: Value = serde_json::from_slice(&output).expect("valid JSON");
+        assert_eq!(value["ownership_id"], "ao:test");
+        assert!(value.get("receipt_object_ref").is_none());
+        assert!(
+            !String::from_utf8(output)
+                .expect("UTF-8")
+                .contains("secret-object-location")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_reader_requires_private_regular_no_follow_file() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = TempDir::new().expect("temp");
+        let receipt = temp.path().join("receipt.json");
+        std::fs::write(&receipt, br#"{"schema_version":1}"#).expect("write");
+        let mut permissions = std::fs::metadata(&receipt).expect("metadata").permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&receipt, permissions).expect("public mode");
+        assert!(read_private_file(&receipt).is_err());
+
+        let mut permissions = std::fs::metadata(&receipt).expect("metadata").permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&receipt, permissions).expect("private mode");
+        assert_eq!(
+            read_private_file(&receipt).expect("private receipt"),
+            br#"{"schema_version":1}"#
+        );
+
+        let link = temp.path().join("receipt-link.json");
+        symlink(&receipt, &link).expect("symlink");
+        assert!(read_private_file(&link).is_err());
     }
 }
