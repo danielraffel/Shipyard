@@ -1,6 +1,6 @@
 use super::*;
 
-fn install_exact_v1_registry_schema(
+pub(super) fn install_exact_v1_registry_schema(
     ledger: &WorkLedger,
     fixtures: &[(&AdapterBindingRecord, &str)],
 ) {
@@ -174,7 +174,7 @@ fn v1_registry_migrates_transactionally_and_accepts_exact_agent_binding() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate exact v1 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 2);
+    assert_eq!(schema_version(&connection).expect("schema version"), 3);
     let preserved: Vec<(String, String, String)> = {
         let mut statement = connection
             .prepare(

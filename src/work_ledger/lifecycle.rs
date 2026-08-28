@@ -123,7 +123,10 @@ impl LifecycleState {
                 )
                 | (Self::Waiting, Self::Actionable | Self::Terminal)
                 | (Self::Actionable, Self::Dispatching | Self::Terminal)
-                | (Self::Dispatching, Self::AgentOwnedRepair | Self::Terminal)
+                | (
+                    Self::Dispatching,
+                    Self::Actionable | Self::AgentOwnedRepair | Self::Terminal
+                )
                 | (Self::AgentOwnedRepair, Self::Returned | Self::Terminal)
                 | (Self::Returned, Self::Managed | Self::Terminal)
         )
@@ -333,6 +336,21 @@ fn validate_transition(
     if !current.permits(next) {
         return Err(WorkLedgerError::Refused(
             "illegal lifecycle transition".to_owned(),
+        ));
+    }
+    if current == LifecycleState::Dispatching && next == LifecycleState::Actionable {
+        return Err(WorkLedgerError::Refused(
+            "dispatch failure rollback requires a definitive typed delivery receipt".to_owned(),
+        ));
+    }
+    if current == LifecycleState::Dispatching && next == LifecycleState::AgentOwnedRepair {
+        return Err(WorkLedgerError::Refused(
+            "agent ownership requires an accepted typed delivery receipt".to_owned(),
+        ));
+    }
+    if current == LifecycleState::Dispatching && next == LifecycleState::Terminal {
+        return Err(WorkLedgerError::Refused(
+            "terminating an active dispatch requires a typed delivery outcome".to_owned(),
         ));
     }
     if current == LifecycleState::ShadowImported {

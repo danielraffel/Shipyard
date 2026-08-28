@@ -143,7 +143,10 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
         return Ok(());
     }
     if version == 1 {
-        return migrate_v1_to_v2(connection);
+        return migrate_v1_to_v3(connection);
+    }
+    if version == 2 {
+        return migrate_v2_to_v3(connection);
     }
     if version != 0 {
         return Err(WorkLedgerError::UnsupportedSchema(version));
@@ -238,13 +241,76 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
            work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
            work_generation INTEGER NOT NULL,
            owner_generation INTEGER NOT NULL,
-           state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'acknowledged', 'uncertain', 'failed')),
+           state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'delivery_started', 'acknowledged', 'uncertain', 'failed')),
            route_ref TEXT NOT NULL,
            payload_digest TEXT NOT NULL,
-           transport_receipt_digest TEXT,
+           claim_id TEXT,
+           claimant_ref TEXT,
+           claim_attempt INTEGER NOT NULL DEFAULT 0 CHECK(claim_attempt >= 0),
+           claim_identity_digest TEXT,
+           claim_payload_json BLOB,
+           claimed_at TEXT,
+           lease_expires_at TEXT,
+           delivery_started_at TEXT,
+           receipt_kind TEXT CHECK(receipt_kind IN ('accepted', 'definitive_pre_delivery_failure', 'reconciled_not_delivered', 'uncertain')),
+           receipt_digest TEXT,
            created_at TEXT NOT NULL,
            updated_at TEXT NOT NULL,
-           acknowledged_at TEXT
+           completed_at TEXT,
+           CHECK(
+             (state = 'pending'
+               AND claim_id IS NULL AND claimant_ref IS NULL
+               AND claim_identity_digest IS NULL AND claim_payload_json IS NULL
+               AND claimed_at IS NULL AND lease_expires_at IS NULL
+               AND delivery_started_at IS NULL
+               AND receipt_kind IS NULL AND receipt_digest IS NULL
+               AND completed_at IS NULL)
+             OR
+             (state = 'claimed'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND delivery_started_at IS NULL
+               AND receipt_kind IS NULL AND receipt_digest IS NULL
+               AND completed_at IS NULL)
+             OR
+             (state = 'delivery_started'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND delivery_started_at IS NOT NULL
+               AND receipt_kind IS NULL AND receipt_digest IS NULL
+               AND completed_at IS NULL)
+             OR
+             (state = 'acknowledged'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND delivery_started_at IS NOT NULL AND receipt_kind = 'accepted'
+               AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
+             OR
+             (state = 'uncertain'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND delivery_started_at IS NOT NULL AND receipt_kind = 'uncertain'
+               AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
+             OR
+             (state = 'failed'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND ((delivery_started_at IS NULL
+                     AND receipt_kind = 'definitive_pre_delivery_failure')
+                    OR (delivery_started_at IS NOT NULL
+                        AND receipt_kind = 'reconciled_not_delivered'))
+               AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
+           )
          );
          CREATE TABLE imports (
            source_ref TEXT NOT NULL,
@@ -265,16 +331,141 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
          );
          CREATE INDEX work_items_nonterminal ON work_items(phase, updated_at, id);
          CREATE INDEX outbox_delivery ON outbox(state, created_at, wake_id);
-         PRAGMA user_version = 2;",
+         PRAGMA user_version = 3;",
     )?;
     transaction.commit()?;
     Ok(())
 }
 
-/// Rebuild the only v1 table whose closed constraint changed. `SQLite` cannot
-/// alter a `CHECK` constraint in place, so the entire copy occurs atomically.
-fn migrate_v1_to_v2(connection: &mut Connection) -> WorkLedgerResult<()> {
+/// Upgrade the inert v2 intent outbox into the typed delivery state machine.
+/// v2 had no legal consumer, so a non-pending row has no claim provenance that
+/// can be inferred safely and must be reconciled explicitly before upgrading.
+fn migrate_v2_to_v3(connection: &mut Connection) -> WorkLedgerResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    upgrade_v2_outbox(&transaction)?;
+    verify_migration_foreign_keys(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Keep the table rebuild auditable as one DDL unit.
+fn upgrade_v2_outbox(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
+    let non_pending: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM outbox WHERE state != 'pending'",
+        [],
+        |row| row.get(0),
+    )?;
+    if non_pending != 0 {
+        return Err(WorkLedgerError::Refused(
+            "schema v2 contains non-pending wakes without exact claim provenance; explicit outbox reconciliation is required before v3 migration"
+                .to_owned(),
+        ));
+    }
+    transaction.execute_batch(
+        "ALTER TABLE outbox RENAME TO outbox_v2;
+         CREATE TABLE outbox (
+           wake_id TEXT PRIMARY KEY,
+           work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+           work_generation INTEGER NOT NULL,
+           owner_generation INTEGER NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'delivery_started', 'acknowledged', 'uncertain', 'failed')),
+           route_ref TEXT NOT NULL,
+           payload_digest TEXT NOT NULL,
+           claim_id TEXT,
+           claimant_ref TEXT,
+           claim_attempt INTEGER NOT NULL DEFAULT 0 CHECK(claim_attempt >= 0),
+           claim_identity_digest TEXT,
+           claim_payload_json BLOB,
+           claimed_at TEXT,
+           lease_expires_at TEXT,
+           delivery_started_at TEXT,
+           receipt_kind TEXT CHECK(receipt_kind IN ('accepted', 'definitive_pre_delivery_failure', 'reconciled_not_delivered', 'uncertain')),
+           receipt_digest TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           completed_at TEXT,
+           CHECK(
+             (state = 'pending'
+               AND claim_id IS NULL AND claimant_ref IS NULL
+               AND claim_identity_digest IS NULL AND claim_payload_json IS NULL
+               AND claimed_at IS NULL AND lease_expires_at IS NULL
+               AND delivery_started_at IS NULL
+               AND receipt_kind IS NULL AND receipt_digest IS NULL
+               AND completed_at IS NULL)
+             OR
+             (state = 'claimed'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND delivery_started_at IS NULL
+               AND receipt_kind IS NULL AND receipt_digest IS NULL
+               AND completed_at IS NULL)
+             OR
+             (state = 'delivery_started'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND delivery_started_at IS NOT NULL
+               AND receipt_kind IS NULL AND receipt_digest IS NULL
+               AND completed_at IS NULL)
+             OR
+             (state = 'acknowledged'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND delivery_started_at IS NOT NULL AND receipt_kind = 'accepted'
+               AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
+             OR
+             (state = 'uncertain'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND delivery_started_at IS NOT NULL AND receipt_kind = 'uncertain'
+               AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
+             OR
+             (state = 'failed'
+               AND claim_id IS NOT NULL AND claimant_ref IS NOT NULL
+               AND claim_attempt > 0 AND claim_identity_digest IS NOT NULL
+               AND claim_payload_json IS NOT NULL
+               AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL
+               AND ((delivery_started_at IS NULL
+                     AND receipt_kind = 'definitive_pre_delivery_failure')
+                    OR (delivery_started_at IS NOT NULL
+                        AND receipt_kind = 'reconciled_not_delivered'))
+               AND receipt_digest IS NOT NULL AND completed_at IS NOT NULL)
+           )
+         );
+         INSERT INTO outbox
+           (wake_id, work_item_id, work_generation, owner_generation, state,
+            route_ref, payload_digest, created_at, updated_at)
+         SELECT wake_id, work_item_id, work_generation, owner_generation, state,
+                route_ref, payload_digest, created_at, updated_at
+           FROM outbox_v2;
+         DROP TABLE outbox_v2;
+         CREATE INDEX outbox_delivery ON outbox(state, created_at, wake_id);
+         PRAGMA user_version = 3;",
+    )?;
+    Ok(())
+}
+
+/// Upgrade both v1 tables under one exclusive transaction. Committing v2 before
+/// rebuilding the outbox would leave a partially upgraded database after a
+/// crash or second-stage failure.
+fn migrate_v1_to_v3(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    upgrade_v1_registry(&transaction)?;
+    upgrade_v2_outbox(&transaction)?;
+    verify_migration_foreign_keys(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Rebuild the v1 registry whose closed axis constraint changed.
+fn upgrade_v1_registry(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
     let route_count: i64 =
         transaction.query_row("SELECT COUNT(*) FROM route_records", [], |row| row.get(0))?;
     if route_count != 0 {
@@ -310,6 +501,10 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> WorkLedgerResult<()> {
          DROP TABLE adapter_registry_v1;
          PRAGMA user_version = 2;",
     )?;
+    Ok(())
+}
+
+fn verify_migration_foreign_keys(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResult<()> {
     let foreign_key_violation: i64 =
         transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
@@ -319,7 +514,6 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> WorkLedgerResult<()> {
             "work ledger migration would violate foreign keys".to_owned(),
         ));
     }
-    transaction.commit()?;
     Ok(())
 }
 

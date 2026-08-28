@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -49,6 +49,7 @@ macro_rules! candidate_params {
     };
 }
 
+mod delivery;
 mod importer;
 mod lifecycle;
 mod observation;

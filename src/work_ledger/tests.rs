@@ -1,3 +1,4 @@
+use super::delivery::*;
 use super::route::{
     AdapterAxis, AdapterBindingRecord, AgentName, AgentRoute, AgentRouteRecord,
     LaunchProfileRecord, NativeSessionRoute, OpaqueRef, ProviderRoute, ProviderRouteRecord,
@@ -151,6 +152,7 @@ fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, Adap
     (route, agent_adapter)
 }
 
+mod delivery;
 mod importer;
 mod lifecycle;
 mod persistence;
