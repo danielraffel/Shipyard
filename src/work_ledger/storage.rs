@@ -140,6 +140,9 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     if version == SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 1 {
+        return migrate_v1_to_v2(connection);
+    }
     if version != 0 {
         return Err(WorkLedgerError::UnsupportedSchema(version));
     }
@@ -205,7 +208,7 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
          );
          CREATE TABLE adapter_registry (
            registry_ref TEXT PRIMARY KEY,
-           axis TEXT NOT NULL CHECK(axis IN ('terminal', 'provider')),
+           axis TEXT NOT NULL CHECK(axis IN ('terminal', 'agent', 'provider')),
            name TEXT NOT NULL,
            generation INTEGER NOT NULL CHECK(generation > 0),
            revision INTEGER NOT NULL CHECK(revision > 0),
@@ -260,8 +263,60 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
          );
          CREATE INDEX work_items_nonterminal ON work_items(phase, updated_at, id);
          CREATE INDEX outbox_delivery ON outbox(state, created_at, wake_id);
-         PRAGMA user_version = 1;",
+         PRAGMA user_version = 2;",
     )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Rebuild the only v1 table whose closed constraint changed. `SQLite` cannot
+/// alter a `CHECK` constraint in place, so the entire copy occurs atomically.
+fn migrate_v1_to_v2(connection: &mut Connection) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    let route_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM route_records", [], |row| row.get(0))?;
+    if route_count != 0 {
+        return Err(WorkLedgerError::Refused(
+            "schema v1 contains route records whose exact agent adapter binding cannot be inferred; explicit route reconciliation is required before v2 migration"
+                .to_owned(),
+        ));
+    }
+    transaction.execute_batch(
+        "ALTER TABLE adapter_registry RENAME TO adapter_registry_v1;
+         CREATE TABLE adapter_registry (
+           registry_ref TEXT PRIMARY KEY,
+           axis TEXT NOT NULL CHECK(axis IN ('terminal', 'agent', 'provider')),
+           name TEXT NOT NULL,
+           generation INTEGER NOT NULL CHECK(generation > 0),
+           revision INTEGER NOT NULL CHECK(revision > 0),
+           implementation_digest TEXT NOT NULL,
+           configuration_digest TEXT NOT NULL,
+           capabilities_digest TEXT NOT NULL,
+           state TEXT NOT NULL CHECK(state IN ('active', 'retired')),
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           UNIQUE(axis, name, generation, revision)
+         );
+         INSERT INTO adapter_registry
+           (registry_ref, axis, name, generation, revision,
+            implementation_digest, configuration_digest, capabilities_digest,
+            state, created_at, updated_at)
+         SELECT registry_ref, axis, name, generation, revision,
+                implementation_digest, configuration_digest, capabilities_digest,
+                state, created_at, updated_at
+           FROM adapter_registry_v1;
+         DROP TABLE adapter_registry_v1;
+         PRAGMA user_version = 2;",
+    )?;
+    let foreign_key_violation: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_violation != 0 {
+        return Err(WorkLedgerError::Refused(
+            "work ledger migration would violate foreign keys".to_owned(),
+        ));
+    }
     transaction.commit()?;
     Ok(())
 }

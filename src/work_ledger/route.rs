@@ -154,6 +154,78 @@ impl<'de> Deserialize<'de> for AgentName {
     }
 }
 
+/// Independently registered adapter axis.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AdapterAxis {
+    Terminal,
+    Agent,
+    Provider,
+}
+
+impl AdapterAxis {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Agent => "agent",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+/// Exact immutable binding to one protected adapter-registry object.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdapterBindingRecord {
+    pub axis: AdapterAxis,
+    pub name: String,
+    pub registry_ref: OpaqueRef,
+    pub generation: u64,
+    pub revision: u64,
+    pub implementation_sha256: Sha256Digest,
+    pub configuration_sha256: Sha256Digest,
+    pub capabilities_sha256: Sha256Digest,
+}
+
+impl AdapterBindingRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        axis: AdapterAxis,
+        name: impl Into<String>,
+        registry_ref: OpaqueRef,
+        generation: u64,
+        revision: u64,
+        implementation_sha256: Sha256Digest,
+        configuration_sha256: Sha256Digest,
+        capabilities_sha256: Sha256Digest,
+    ) -> Result<Self, RouteProvenanceError> {
+        let binding = Self {
+            axis,
+            name: name.into(),
+            registry_ref,
+            generation,
+            revision,
+            implementation_sha256,
+            configuration_sha256,
+            capabilities_sha256,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub(super) fn validate(&self) -> Result<(), RouteProvenanceError> {
+        if !is_registry_name(&self.name) {
+            return Err(RouteProvenanceError::InvalidAgentName);
+        }
+        if self.generation == 0 || self.revision == 0 {
+            return Err(RouteProvenanceError::InvalidGeneration(
+                "adapter binding generation or revision",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Terminal runtime is independent from agent and provider routing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -170,13 +242,7 @@ pub(super) enum TerminalRoute {
         pane_ref: OpaqueRef,
     },
     Registered {
-        name: AgentName,
-        registry_ref: OpaqueRef,
-        generation: u64,
-        revision: u64,
-        implementation_sha256: Sha256Digest,
-        configuration_sha256: Sha256Digest,
-        capabilities_sha256: Sha256Digest,
+        adapter: AdapterBindingRecord,
         route_ref: OpaqueRef,
     },
 }
@@ -236,19 +302,36 @@ pub(super) enum AgentRoute {
 #[serde(deny_unknown_fields)]
 pub(super) struct AgentRouteRecord {
     pub schema_version: u32,
+    pub adapter: AdapterBindingRecord,
     pub route: AgentRoute,
 }
 
 impl AgentRouteRecord {
-    pub(super) fn new(route: AgentRoute) -> Self {
-        Self {
+    pub(super) fn new(
+        adapter: AdapterBindingRecord,
+        route: AgentRoute,
+    ) -> Result<Self, RouteProvenanceError> {
+        let record = Self {
             schema_version: ROUTE_SCHEMA_VERSION,
+            adapter,
             route,
-        }
+        };
+        record.validate()?;
+        Ok(record)
     }
 
     fn validate(&self) -> Result<(), RouteProvenanceError> {
-        validate_version("agent route", self.schema_version)
+        validate_version("agent route", self.schema_version)?;
+        self.adapter.validate()?;
+        let expected_name = match &self.route {
+            AgentRoute::Codex { .. } => "codex",
+            AgentRoute::Claude { .. } => "claude",
+            AgentRoute::Named { name, .. } => name.as_str(),
+        };
+        if self.adapter.axis != AdapterAxis::Agent || self.adapter.name != expected_name {
+            return Err(RouteProvenanceError::IntegrityMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -268,13 +351,7 @@ pub(super) enum ProviderRoute {
         route_ref: OpaqueRef,
     },
     Registered {
-        name: AgentName,
-        registry_ref: OpaqueRef,
-        generation: u64,
-        revision: u64,
-        implementation_sha256: Sha256Digest,
-        configuration_sha256: Sha256Digest,
-        capabilities_sha256: Sha256Digest,
+        adapter: AdapterBindingRecord,
         route_ref: OpaqueRef,
     },
 }
@@ -429,7 +506,7 @@ impl RouteProvenanceRecord {
         match &self.terminal.route {
             TerminalRoute::Cmux { .. } => "cmux",
             TerminalRoute::HerdR { .. } => "herdr",
-            TerminalRoute::Registered { name, .. } => name.as_str(),
+            TerminalRoute::Registered { adapter, .. } => adapter.name.as_str(),
         }
     }
 
@@ -446,7 +523,7 @@ impl RouteProvenanceRecord {
             ProviderRoute::Direct { .. } => "direct",
             ProviderRoute::Subrouter { .. } => "subrouter",
             ProviderRoute::CliProxyApi { .. } => "cliproxyapi",
-            ProviderRoute::Registered { name, .. } => name.as_str(),
+            ProviderRoute::Registered { adapter, .. } => adapter.name.as_str(),
         }
     }
 
@@ -458,51 +535,14 @@ impl RouteProvenanceRecord {
         self.integrity_sha256.as_str()
     }
 
-    pub(super) fn registered_adapters(&self) -> Vec<RegisteredAdapterBinding<'_>> {
-        let mut bindings = Vec::new();
-        if let TerminalRoute::Registered {
-            name,
-            registry_ref,
-            generation,
-            revision,
-            implementation_sha256,
-            configuration_sha256,
-            capabilities_sha256,
-            ..
-        } = &self.terminal.route
-        {
-            bindings.push(RegisteredAdapterBinding {
-                axis: "terminal",
-                name: name.as_str(),
-                registry_ref: registry_ref.as_str(),
-                generation: *generation,
-                revision: *revision,
-                implementation_sha256: implementation_sha256.as_str(),
-                configuration_sha256: configuration_sha256.as_str(),
-                capabilities_sha256: capabilities_sha256.as_str(),
-            });
+    pub(super) fn adapter_bindings(&self) -> Vec<&AdapterBindingRecord> {
+        let mut bindings = Vec::with_capacity(3);
+        if let TerminalRoute::Registered { adapter, .. } = &self.terminal.route {
+            bindings.push(adapter);
         }
-        if let ProviderRoute::Registered {
-            name,
-            registry_ref,
-            generation,
-            revision,
-            implementation_sha256,
-            configuration_sha256,
-            capabilities_sha256,
-            ..
-        } = &self.provider.route
-        {
-            bindings.push(RegisteredAdapterBinding {
-                axis: "provider",
-                name: name.as_str(),
-                registry_ref: registry_ref.as_str(),
-                generation: *generation,
-                revision: *revision,
-                implementation_sha256: implementation_sha256.as_str(),
-                configuration_sha256: configuration_sha256.as_str(),
-                capabilities_sha256: capabilities_sha256.as_str(),
-            });
+        bindings.push(&self.agent.adapter);
+        if let ProviderRoute::Registered { adapter, .. } = &self.provider.route {
+            bindings.push(adapter);
         }
         bindings
     }
@@ -513,19 +553,17 @@ impl RouteProvenanceRecord {
         self.agent.validate()?;
         self.provider.validate()?;
         self.launch_profile.validate()?;
-        if matches!(&self.terminal.route, TerminalRoute::Registered { name, .. }
-            if matches!(name.as_str(), "cmux" | "herdr"))
-            || matches!(&self.provider.route, ProviderRoute::Registered { name, .. }
-                if matches!(name.as_str(), "direct" | "subrouter" | "cliproxyapi"))
+        if matches!(&self.terminal.route, TerminalRoute::Registered { adapter, .. }
+            if adapter.axis != AdapterAxis::Terminal
+                || matches!(adapter.name.as_str(), "cmux" | "herdr"))
+            || matches!(&self.provider.route, ProviderRoute::Registered { adapter, .. }
+                if adapter.axis != AdapterAxis::Provider
+                    || matches!(adapter.name.as_str(), "direct" | "subrouter" | "cliproxyapi"))
         {
             return Err(RouteProvenanceError::IntegrityMismatch);
         }
-        for binding in self.registered_adapters() {
-            if binding.generation == 0 || binding.revision == 0 {
-                return Err(RouteProvenanceError::InvalidGeneration(
-                    "registered adapter generation or revision",
-                ));
-            }
+        for binding in self.adapter_bindings() {
+            binding.validate()?;
         }
         if self.provider_kind() != self.launch_profile.provider_kind {
             return Err(RouteProvenanceError::IntegrityMismatch);
@@ -540,17 +578,6 @@ impl RouteProvenanceRecord {
         }
         Ok(())
     }
-}
-
-pub(super) struct RegisteredAdapterBinding<'a> {
-    pub axis: &'a str,
-    pub name: &'a str,
-    pub registry_ref: &'a str,
-    pub generation: u64,
-    pub revision: u64,
-    pub implementation_sha256: &'a str,
-    pub configuration_sha256: &'a str,
-    pub capabilities_sha256: &'a str,
 }
 
 fn validate_version(record: &'static str, version: u32) -> Result<(), RouteProvenanceError> {
@@ -598,6 +625,20 @@ mod tests {
         }
     }
 
+    fn adapter(axis: AdapterAxis, name: &str, label: &str) -> AdapterBindingRecord {
+        AdapterBindingRecord::new(
+            axis,
+            name,
+            opaque(&format!("{label} registry")),
+            3,
+            7,
+            Sha256Digest::of_bytes(format!("{label} implementation").as_bytes()),
+            Sha256Digest::of_bytes(format!("{label} configuration").as_bytes()),
+            Sha256Digest::of_bytes(format!("{label} capabilities").as_bytes()),
+        )
+        .expect("adapter binding")
+    }
+
     fn launch_profile() -> LaunchProfileRecord {
         LaunchProfileRecord::new(
             opaque("launch-profile"),
@@ -619,7 +660,11 @@ mod tests {
                 tab_ref: opaque("herdr-tab"),
                 pane_ref: opaque("herdr-pane"),
             }),
-            AgentRouteRecord::new(AgentRoute::Codex { session: session() }),
+            AgentRouteRecord::new(
+                adapter(AdapterAxis::Agent, "codex", "codex"),
+                AgentRoute::Codex { session: session() },
+            )
+            .expect("Codex route"),
             ProviderRouteRecord::new(ProviderRoute::Subrouter {
                 server_ref: opaque("subrouter-server"),
                 route_ref: opaque("subrouter-route"),
@@ -649,7 +694,11 @@ mod tests {
         });
         let direct = RouteProvenanceRecord::new(
             terminal.clone(),
-            AgentRouteRecord::new(AgentRoute::Claude { session: session() }),
+            AgentRouteRecord::new(
+                adapter(AdapterAxis::Agent, "claude", "claude"),
+                AgentRoute::Claude { session: session() },
+            )
+            .expect("Claude route"),
             ProviderRouteRecord::new(ProviderRoute::Direct {
                 endpoint_ref: opaque("direct-endpoint"),
             }),
@@ -669,10 +718,14 @@ mod tests {
 
         let named = RouteProvenanceRecord::new(
             terminal,
-            AgentRouteRecord::new(AgentRoute::Named {
-                name: AgentName::parse("qwen").expect("named adapter"),
-                session: session(),
-            }),
+            AgentRouteRecord::new(
+                adapter(AdapterAxis::Agent, "qwen", "qwen"),
+                AgentRoute::Named {
+                    name: AgentName::parse("qwen").expect("named adapter"),
+                    session: session(),
+                },
+            )
+            .expect("Qwen route"),
             ProviderRouteRecord::new(ProviderRoute::CliProxyApi {
                 endpoint_ref: opaque("proxy-endpoint"),
                 route_ref: opaque("proxy-route"),
@@ -732,30 +785,40 @@ mod tests {
     }
 
     #[test]
+    fn agent_binding_axis_and_name_must_match_the_exact_agent_route() {
+        assert_eq!(
+            AgentRouteRecord::new(
+                adapter(AdapterAxis::Provider, "codex", "wrong-axis"),
+                AgentRoute::Codex { session: session() },
+            ),
+            Err(RouteProvenanceError::IntegrityMismatch)
+        );
+        assert_eq!(
+            AgentRouteRecord::new(
+                adapter(AdapterAxis::Agent, "qwen", "wrong-name"),
+                AgentRoute::Claude { session: session() },
+            ),
+            Err(RouteProvenanceError::IntegrityMismatch)
+        );
+    }
+
+    #[test]
     fn registered_adapters_are_open_and_wrapper_drift_fails_closed() {
         let registered = RouteProvenanceRecord::new(
             TerminalRouteRecord::new(TerminalRoute::Registered {
-                name: AgentName::parse("wezterm").expect("terminal name"),
-                registry_ref: opaque("wezterm registry"),
-                generation: 2,
-                revision: 4,
-                implementation_sha256: Sha256Digest::of_bytes(b"wezterm implementation"),
-                configuration_sha256: Sha256Digest::of_bytes(b"wezterm configuration"),
-                capabilities_sha256: Sha256Digest::of_bytes(b"wezterm capabilities"),
+                adapter: adapter(AdapterAxis::Terminal, "wezterm", "wezterm"),
                 route_ref: opaque("wezterm route"),
             }),
-            AgentRouteRecord::new(AgentRoute::Named {
-                name: AgentName::parse("kimi").expect("agent name"),
-                session: session(),
-            }),
+            AgentRouteRecord::new(
+                adapter(AdapterAxis::Agent, "kimi", "kimi"),
+                AgentRoute::Named {
+                    name: AgentName::parse("kimi").expect("agent name"),
+                    session: session(),
+                },
+            )
+            .expect("Kimi route"),
             ProviderRouteRecord::new(ProviderRoute::Registered {
-                name: AgentName::parse("future-router").expect("provider name"),
-                registry_ref: opaque("future registry"),
-                generation: 3,
-                revision: 8,
-                implementation_sha256: Sha256Digest::of_bytes(b"future implementation"),
-                configuration_sha256: Sha256Digest::of_bytes(b"future configuration"),
-                capabilities_sha256: Sha256Digest::of_bytes(b"future capabilities"),
+                adapter: adapter(AdapterAxis::Provider, "future-router", "future-router"),
                 route_ref: opaque("future route"),
             }),
             LaunchProfileRecord::new(

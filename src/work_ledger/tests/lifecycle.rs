@@ -90,11 +90,15 @@ fn transition_and_wake_commit_together_with_generation_fence() {
             .transition_with_wake(&work_id, generation, 3, state, None)
             .expect("legal transition");
     }
-    let route = sample_route(&work_id, 5);
+    let (route, agent_adapter) = sample_route(&work_id, 5);
     let mut wrong_owner = route.clone();
     wrong_owner.owner_ref = opaque_ref("owner", "different-owner");
     wrong_owner.envelope_integrity = wrong_owner.compute_envelope_integrity();
     assert!(ledger.register_route(&wrong_owner).is_err());
+    assert!(ledger.register_route(&route).is_err());
+    ledger
+        .register_adapter(&agent_adapter)
+        .expect("register Codex adapter policy");
     ledger.register_route(&route).expect("register route");
     let bad = WakeIntent::new(&work_id, 99, 3, route.route_ref.clone(), digest(b"payload"))
         .expect("bad generation wake");
@@ -158,18 +162,32 @@ fn registered_route_requires_exact_active_adapter_registry_record() {
     let candidate = sample_candidate();
     let work_id = candidate.work_id.clone();
     ledger.import(&[candidate]).expect("import");
-    let (route, adapter) = sample_registered_route(&work_id);
+    let (route, adapters) = sample_registered_route(&work_id);
+    let terminal_adapter = &adapters[0];
+    let agent_adapter = &adapters[1];
     assert!(ledger.register_route(&route).is_err());
-    ledger.register_adapter(&adapter).expect("register adapter");
+    ledger
+        .register_adapter(terminal_adapter)
+        .expect("register terminal adapter");
+    assert!(
+        ledger.register_route(&route).is_err(),
+        "named Qwen must not register without its exact active agent adapter"
+    );
+    ledger
+        .register_adapter(agent_adapter)
+        .expect("register Qwen agent adapter");
     ledger.register_route(&route).expect("register route");
 
     let connection = ledger.connect_read_write().expect("connection");
     connection
         .execute(
-            "UPDATE adapter_registry SET state = 'retired' WHERE registry_ref = ?1",
-            [&adapter.registry_ref],
+            "UPDATE adapter_registry SET implementation_digest = ?1 WHERE registry_ref = ?2",
+            params![
+                digest(b"drifted Qwen implementation"),
+                agent_adapter.registry_ref.as_str()
+            ],
         )
-        .expect("retire adapter");
+        .expect("drift adapter");
     let transaction = connection
         .unchecked_transaction()
         .expect("read transaction");
@@ -183,6 +201,57 @@ fn registered_route_requires_exact_active_adapter_registry_record() {
         )
         .is_err()
     );
+    transaction
+        .execute(
+            "UPDATE adapter_registry SET implementation_digest = ?1, state = 'retired'
+             WHERE registry_ref = ?2",
+            params![
+                agent_adapter.implementation_sha256.as_str(),
+                agent_adapter.registry_ref.as_str()
+            ],
+        )
+        .expect("retire exact agent adapter");
+    assert!(
+        validated_route_exists(
+            &transaction,
+            &route.route_ref,
+            &work_id,
+            route.work_generation,
+            route.owner_generation,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn claude_route_requires_an_explicit_active_agent_policy_record() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("ledger");
+    let candidate = sample_candidate();
+    let work_id = candidate.work_id.clone();
+    ledger.import(&[candidate]).expect("import");
+    let (mut route, _) = sample_route(&work_id, 1);
+    let session = match &route.provenance.agent.route {
+        AgentRoute::Codex { session } => session.clone(),
+        _ => panic!("Codex fixture"),
+    };
+    let claude_adapter = adapter_binding(AdapterAxis::Agent, "claude", "claude");
+    route.provenance.agent =
+        AgentRouteRecord::new(claude_adapter.clone(), AgentRoute::Claude { session })
+            .expect("Claude route");
+    route.provenance.integrity_sha256 = route
+        .provenance
+        .recompute_integrity()
+        .expect("route integrity");
+    route.envelope_integrity = route.compute_envelope_integrity();
+
+    assert!(ledger.register_route(&route).is_err());
+    ledger
+        .register_adapter(&claude_adapter)
+        .expect("register explicit Claude policy");
+    ledger
+        .register_route(&route)
+        .expect("register exact Claude route");
 }
 
 #[test]

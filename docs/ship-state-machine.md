@@ -710,18 +710,26 @@ The schema deliberately keeps logical goal, owner, terminal runtime,
 agent/session adapter, and provider-routing adapter identities separate. PR,
 product-acceptance, and continuation terminal truth are separate columns;
 legacy lifecycle completion is recorded as `unknown` rather than promoted to a
-stronger terminal claim. Terminal and provider adapter kinds are strings so
-cmux/HerdR and Codex/Claude/agy/Qwen/Kimi/Subrouter additions do not require a
-lifecycle redesign. Private owner, goal, source, and route values are stored as
+stronger terminal claim. Terminal, agent, and provider adapter kinds are strings
+so cmux/HerdR, Codex/Claude/agy/Qwen/Kimi, and Subrouter additions do not require
+a lifecycle redesign. Private owner, goal, source, and route values are stored as
 opaque SHA-256 references; raw prompts, terminal text, credentials, tokens,
 provider accounts, and route identifiers are not imported. Native repair routes
 use a separate integrity-bound protected registry. cmux and HerdR terminal
 runtime provenance is independent of Codex/Claude/named agent sessions and
-explicit Direct/Subrouter/CLIProxyAPI provider routing. Versioned registered
-terminal and provider variants allow future adapters without changing lifecycle
-truth or the database schema. A registered route remains nondispatchable unless
-its separately protected adapter record is active and exactly matches axis,
-name, generation, revision, and implementation/configuration/capability digests.
+explicit Direct/Subrouter/CLIProxyAPI provider routing. Every agent/session
+route, including Codex, Claude, Qwen, agy, Kimi, and future named agents, binds
+an independently registered agent-adapter object. Versioned registered terminal
+and provider variants allow future adapters without changing lifecycle truth or
+the database schema. Route registration and wake resolution remain
+nondispatchable unless every referenced adapter record is active and exactly
+matches axis, name, generation, revision, and
+implementation/configuration/capability digests.
+Automatic work-ledger v1-to-v2 migration is limited to route-free ledgers.
+Existing v1 route payloads do not contain the mandatory exact agent-adapter
+binding, so a route-bearing v1 ledger is preserved unchanged and refused until
+its routes receive explicit reconciliation; the migration never invents that
+provenance.
 The registry preserves
 the native resume identity, HerdR session/workspace/tab/pane tuple, account and
 model references, one canonical wrapper reference, protected session-header

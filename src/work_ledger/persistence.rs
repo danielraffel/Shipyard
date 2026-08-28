@@ -33,7 +33,7 @@ impl WorkLedger {
             validate_protected_storage(&dir, &ledger.path)?;
             let connection = ledger.connect_read_only()?;
             let version = schema_version(&connection)?;
-            if !matches!(version, 0 | SCHEMA_VERSION) {
+            if !(0..=SCHEMA_VERSION).contains(&version) {
                 return Err(WorkLedgerError::UnsupportedSchema(version));
             }
         } else {

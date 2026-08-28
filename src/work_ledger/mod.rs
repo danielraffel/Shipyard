@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -65,8 +65,8 @@ pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
 pub use policy::RepoPolicy;
 pub(crate) use policy::validate_repo_policy;
 #[cfg(test)]
-use registry::{AdapterRegistryEntry, RouteRegistration, validated_route_exists};
-use route::{OpaqueRef, RouteProvenanceRecord};
+use registry::{RouteRegistration, validated_route_exists};
+use route::{AdapterBindingRecord, RouteProvenanceRecord};
 pub use storage::absent_status;
 use storage::{
     configure_durable, count, count_where, create_database_file_no_follow, migrate,

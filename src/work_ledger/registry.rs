@@ -2,9 +2,9 @@
 #![allow(dead_code)] // Native registry writers activate after shadow cutover.
 
 use super::{
-    OpaqueRef, OptionalExtension, RouteProvenanceRecord, Transaction, TransactionBehavior, Utc,
-    WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable, digest, is_lower_hex, params,
-    validate_digest, validate_opaque_ref, verify_supported_schema,
+    AdapterBindingRecord, OptionalExtension, RouteProvenanceRecord, Transaction,
+    TransactionBehavior, Utc, WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable,
+    digest, is_lower_hex, params, validate_opaque_ref, verify_supported_schema,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,19 +19,6 @@ pub(super) struct RouteRegistration {
     pub(super) origin_machine_ref: String,
     pub(super) provenance: RouteProvenanceRecord,
     pub(super) envelope_integrity: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Populated by trusted adapter installers after shadow cutover.
-pub(super) struct AdapterRegistryEntry {
-    pub(super) registry_ref: String,
-    pub(super) axis: String,
-    pub(super) name: String,
-    pub(super) generation: u64,
-    pub(super) revision: u64,
-    pub(super) implementation_digest: String,
-    pub(super) configuration_digest: String,
-    pub(super) capabilities_digest: String,
 }
 
 #[allow(dead_code)] // Native route writers are activated after shadow cutover.
@@ -106,27 +93,10 @@ impl RouteRegistration {
 }
 
 impl WorkLedger {
-    pub(super) fn register_adapter(&self, adapter: &AdapterRegistryEntry) -> WorkLedgerResult<()> {
-        OpaqueRef::parse(adapter.registry_ref.clone()).map_err(|_| {
-            WorkLedgerError::Refused("adapter registry reference is invalid".to_owned())
+    pub(super) fn register_adapter(&self, adapter: &AdapterBindingRecord) -> WorkLedgerResult<()> {
+        adapter.validate().map_err(|_| {
+            WorkLedgerError::Refused("adapter registry identity is invalid".to_owned())
         })?;
-        if !matches!(adapter.axis.as_str(), "terminal" | "provider")
-            || adapter.name.is_empty()
-            || adapter.name.len() > 64
-            || adapter.generation == 0
-            || adapter.revision == 0
-        {
-            return Err(WorkLedgerError::Refused(
-                "adapter registry identity is invalid".to_owned(),
-            ));
-        }
-        for digest_value in [
-            &adapter.implementation_digest,
-            &adapter.configuration_digest,
-            &adapter.capabilities_digest,
-        ] {
-            validate_digest("adapter registry digest", digest_value)?;
-        }
         let parent = self
             .path
             .parent()
@@ -142,14 +112,14 @@ impl WorkLedger {
               configuration_digest, capabilities_digest, state, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?9)",
             params![
-                adapter.registry_ref,
-                adapter.axis,
+                adapter.registry_ref.as_str(),
+                adapter.axis.as_str(),
                 adapter.name,
                 adapter.generation,
                 adapter.revision,
-                adapter.implementation_digest,
-                adapter.configuration_digest,
-                adapter.capabilities_digest,
+                adapter.implementation_sha256.as_str(),
+                adapter.configuration_sha256.as_str(),
+                adapter.capabilities_sha256.as_str(),
                 now,
             ],
         )?;
@@ -357,7 +327,7 @@ fn registered_adapters_present(
     transaction: &Transaction<'_>,
     provenance: &RouteProvenanceRecord,
 ) -> WorkLedgerResult<bool> {
-    for binding in provenance.registered_adapters() {
+    for binding in provenance.adapter_bindings() {
         let exact: Option<bool> = transaction
             .query_row(
                 "SELECT axis = ?2 AND name = ?3 AND generation = ?4 AND revision = ?5
@@ -365,14 +335,14 @@ fn registered_adapters_present(
                         AND capabilities_digest = ?8 AND state = 'active'
                  FROM adapter_registry WHERE registry_ref = ?1",
                 params![
-                    binding.registry_ref,
-                    binding.axis,
+                    binding.registry_ref.as_str(),
+                    binding.axis.as_str(),
                     binding.name,
                     binding.generation,
                     binding.revision,
-                    binding.implementation_sha256,
-                    binding.configuration_sha256,
-                    binding.capabilities_sha256,
+                    binding.implementation_sha256.as_str(),
+                    binding.configuration_sha256.as_str(),
+                    binding.capabilities_sha256.as_str(),
                 ],
                 |row| row.get(0),
             )

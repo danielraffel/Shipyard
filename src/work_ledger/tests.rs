@@ -1,7 +1,7 @@
 use super::route::{
-    AgentName, AgentRoute, AgentRouteRecord, LaunchProfileRecord, NativeSessionRoute, OpaqueRef,
-    ProviderRoute, ProviderRouteRecord, RouteProvenanceRecord, Sha256Digest, TerminalRoute,
-    TerminalRouteRecord,
+    AdapterAxis, AdapterBindingRecord, AgentName, AgentRoute, AgentRouteRecord,
+    LaunchProfileRecord, NativeSessionRoute, OpaqueRef, ProviderRoute, ProviderRouteRecord,
+    RouteProvenanceRecord, Sha256Digest, TerminalRoute, TerminalRouteRecord,
 };
 use super::*;
 use tempfile::TempDir;
@@ -25,34 +25,46 @@ fn sample_candidate() -> ImportCandidate {
     )
 }
 
-fn sample_registered_route(work_id: &str) -> (RouteRegistration, AdapterRegistryEntry) {
+fn adapter_binding(axis: AdapterAxis, name: &str, label: &str) -> AdapterBindingRecord {
+    let opaque = |value: &str| OpaqueRef::derive("test", value.as_bytes());
+    AdapterBindingRecord::new(
+        axis,
+        name,
+        opaque(&format!("{label} registry")),
+        2,
+        4,
+        Sha256Digest::of_bytes(format!("{label} implementation").as_bytes()),
+        Sha256Digest::of_bytes(format!("{label} configuration").as_bytes()),
+        Sha256Digest::of_bytes(format!("{label} capabilities").as_bytes()),
+    )
+    .expect("adapter binding")
+}
+
+fn sample_registered_route(work_id: &str) -> (RouteRegistration, Vec<AdapterBindingRecord>) {
     let opaque = |label: &str| OpaqueRef::derive("test", label.as_bytes());
-    let registry_ref = opaque("wezterm registry");
-    let implementation = Sha256Digest::of_bytes(b"wezterm implementation");
-    let configuration = Sha256Digest::of_bytes(b"wezterm configuration");
-    let capabilities = Sha256Digest::of_bytes(b"wezterm capabilities");
+    let terminal_adapter = adapter_binding(AdapterAxis::Terminal, "wezterm", "wezterm");
+    let agent_adapter = adapter_binding(AdapterAxis::Agent, "qwen", "qwen");
     let provenance = RouteProvenanceRecord::new(
         TerminalRouteRecord::new(TerminalRoute::Registered {
-            name: AgentName::parse("wezterm").expect("adapter name"),
-            registry_ref: registry_ref.clone(),
-            generation: 2,
-            revision: 4,
-            implementation_sha256: implementation.clone(),
-            configuration_sha256: configuration.clone(),
-            capabilities_sha256: capabilities.clone(),
+            adapter: terminal_adapter.clone(),
             route_ref: opaque("wezterm route"),
         }),
-        AgentRouteRecord::new(AgentRoute::Codex {
-            session: NativeSessionRoute {
-                native_session_ref: opaque("session"),
-                native_resume_ref: opaque("resume"),
-                account_ref: opaque("account"),
-                model_ref: opaque("model"),
-                wrapper_ref: opaque("wrapper"),
-                session_headers_ref: opaque("headers"),
-                session_headers_sha256: Sha256Digest::of_bytes(b"headers"),
+        AgentRouteRecord::new(
+            agent_adapter.clone(),
+            AgentRoute::Named {
+                name: AgentName::parse("qwen").expect("qwen adapter"),
+                session: NativeSessionRoute {
+                    native_session_ref: opaque("session"),
+                    native_resume_ref: opaque("resume"),
+                    account_ref: opaque("account"),
+                    model_ref: opaque("model"),
+                    wrapper_ref: opaque("wrapper"),
+                    session_headers_ref: opaque("headers"),
+                    session_headers_sha256: Sha256Digest::of_bytes(b"headers"),
+                },
             },
-        }),
+        )
+        .expect("agent route"),
         ProviderRouteRecord::new(ProviderRoute::Subrouter {
             server_ref: opaque("server"),
             route_ref: opaque("subrouter route"),
@@ -81,38 +93,33 @@ fn sample_registered_route(work_id: &str) -> (RouteRegistration, AdapterRegistry
         provenance,
     )
     .expect("route registration");
-    let adapter = AdapterRegistryEntry {
-        registry_ref: registry_ref.as_str().to_owned(),
-        axis: "terminal".to_owned(),
-        name: "wezterm".to_owned(),
-        generation: 2,
-        revision: 4,
-        implementation_digest: implementation.as_str().to_owned(),
-        configuration_digest: configuration.as_str().to_owned(),
-        capabilities_digest: capabilities.as_str().to_owned(),
-    };
-    (route, adapter)
+    (route, vec![terminal_adapter, agent_adapter])
 }
 
-fn sample_route(work_id: &str, work_generation: u64) -> RouteRegistration {
+fn sample_route(work_id: &str, work_generation: u64) -> (RouteRegistration, AdapterBindingRecord) {
     let opaque = |label: &str| OpaqueRef::derive("test", label.as_bytes());
+    let agent_adapter = adapter_binding(AdapterAxis::Agent, "codex", "codex");
     let provenance = RouteProvenanceRecord::new(
         TerminalRouteRecord::new(TerminalRoute::Cmux {
             workspace_ref: opaque("workspace"),
             pane_ref: opaque("pane"),
             surface_ref: opaque("surface"),
         }),
-        AgentRouteRecord::new(AgentRoute::Codex {
-            session: NativeSessionRoute {
-                native_session_ref: opaque("session"),
-                native_resume_ref: opaque("resume"),
-                account_ref: opaque("account"),
-                model_ref: opaque("model"),
-                wrapper_ref: opaque("wrapper"),
-                session_headers_ref: opaque("headers"),
-                session_headers_sha256: Sha256Digest::of_bytes(b"headers"),
+        AgentRouteRecord::new(
+            agent_adapter.clone(),
+            AgentRoute::Codex {
+                session: NativeSessionRoute {
+                    native_session_ref: opaque("session"),
+                    native_resume_ref: opaque("resume"),
+                    account_ref: opaque("account"),
+                    model_ref: opaque("model"),
+                    wrapper_ref: opaque("wrapper"),
+                    session_headers_ref: opaque("headers"),
+                    session_headers_sha256: Sha256Digest::of_bytes(b"headers"),
+                },
             },
-        }),
+        )
+        .expect("agent route"),
         ProviderRouteRecord::new(ProviderRoute::Subrouter {
             server_ref: opaque("server"),
             route_ref: opaque("subrouter route"),
@@ -129,7 +136,7 @@ fn sample_route(work_id: &str, work_generation: u64) -> RouteRegistration {
         .expect("profile"),
     )
     .expect("provenance");
-    RouteRegistration::new(
+    let route = RouteRegistration::new(
         opaque_ref("route", "registered"),
         work_id.to_owned(),
         "0123456789012345678901234567890123456789".to_owned(),
@@ -140,7 +147,8 @@ fn sample_route(work_id: &str, work_generation: u64) -> RouteRegistration {
         opaque_ref("machine", "m3"),
         provenance,
     )
-    .expect("route registration")
+    .expect("route registration");
+    (route, agent_adapter)
 }
 
 mod importer;
