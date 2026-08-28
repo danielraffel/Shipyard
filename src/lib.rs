@@ -174,6 +174,8 @@ pub mod webhook;
 pub mod work_ledger;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;
+/// Trusted machine-global policy for future workstream continuation dispatch.
+pub mod workstream_continuation_config;
 /// Host-global production-writer coordination for sandbox E2E isolation.
 mod writer_domain_lease;
 
