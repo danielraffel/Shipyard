@@ -689,6 +689,78 @@ invalid output, policy/config drift, and quota/provider exhaustion terminalize
 as typed failure evidence; valid classifications always terminalize as escalation so
 other repositories and PRs continue through deterministic stewardship.
 
+## Canonical work-ledger shadow (no authority yet)
+
+`shipyard work-ledger import` scans the legacy `ShipState`, queue request and
+outcome, recovery, terminal-handoff, and resume-record lifecycles into one
+selected, redacted projection. The default is a deterministic dry run and does
+not create storage. `--apply` writes the projection idempotently to the
+machine-global `work-ledger/work-items.sqlite3`; it does not edit or delete a
+legacy record, schedule work, dispatch a wake, call a model, mutate GitHub, or
+project to Linear.
+
+Every imported record starts in the closed `shadow_imported` lifecycle state;
+legacy status text is evidence, not native authority. Promotion requires one
+structurally complete continuation contract containing both success and failure
+outcomes. Native transitions use a closed legal graph, fence work and owner
+generations, and insert a deterministic audit event in the same transaction as
+the state change and optional outbox wake.
+
+The schema deliberately keeps logical goal, owner, terminal runtime,
+agent/session adapter, and provider-routing adapter identities separate. PR,
+product-acceptance, and continuation terminal truth are separate columns;
+legacy lifecycle completion is recorded as `unknown` rather than promoted to a
+stronger terminal claim. Terminal, agent, and provider adapter kinds are strings
+so cmux/HerdR, Codex/Claude/agy/Qwen/Kimi, and Subrouter additions do not require
+a lifecycle redesign. Private owner, goal, source, and route values are stored as
+opaque SHA-256 references; raw prompts, terminal text, credentials, tokens,
+provider accounts, and route identifiers are not imported. Native repair routes
+use a separate integrity-bound protected registry. cmux and HerdR terminal
+runtime provenance is independent of Codex/Claude/named agent sessions and
+explicit Direct/Subrouter/CLIProxyAPI provider routing. Every agent/session
+route, including Codex, Claude, Qwen, agy, Kimi, and future named agents, binds
+an independently registered agent-adapter object. Versioned registered terminal
+and provider variants allow future adapters without changing lifecycle truth or
+the database schema. Route registration and wake resolution remain
+nondispatchable unless every referenced adapter record is active and exactly
+matches axis, name, generation, revision, and
+implementation/configuration/capability digests.
+Automatic work-ledger v1-to-v2 migration is limited to route-free ledgers.
+Existing v1 route payloads do not contain the mandatory exact agent-adapter
+binding, so a route-bearing v1 ledger is preserved unchanged and refused until
+its routes receive explicit reconciliation; the migration never invents that
+provenance.
+The registry preserves
+the native resume identity, HerdR session/workspace/tab/pane tuple, account and
+model references, one canonical wrapper reference, protected session-header
+reference plus digest, executable/configuration
+digests, generations, revisions, and exact head. Missing, stale, malformed, or
+integrity-mismatched provenance is nondispatchable and is never treated as
+Direct or silently converted to a fresh-agent route.
+
+The database opens fail-closed with `WAL`, `synchronous=FULL`, foreign keys,
+integrity checking, protected filesystem permissions, and the host-global
+writer-domain fence. Apply upgrades that fence to an exclusive bounded snapshot
+barrier from legacy scan through SQLite commit. Schema versions newer than the binary, malformed legacy
+JSON, symlinked legacy sources, corruption, truncation, and failed writes abort
+the whole operation. The future transition API fences work and owner
+generations and commits a state change, deterministic audit event, and optional
+wake intent in one SQLite transaction. A rejected wake or event therefore rolls
+back the state transition.
+Wake identity is derived from the work ID, transitioned work generation, owner
+generation, protected route reference, and payload digest; callers cannot
+substitute an arbitrary retry identity without failing the transaction.
+`activation_enabled=false` and `dispatch_enabled=false` are invariant CLI
+outputs until later scheduler, adapter, and physical canary gates land.
+The adjacent `work-ledger policy` surface stores per-repository primary-platform
+and compatibility-blocking policy behind an exact revision fence. It requires
+every repository's primary platform explicitly (Pulp, Forge, and
+Vellum use macOS), defaults to independent compatibility lanes, and records the
+complete compatibility-lane inventory and the subset with declared artifact
+dependencies. Unknown lanes fail closed. Other cross-lane
+blocking requires evidenced shared-integrity fault. The
+shadow scheduler does not consume the policy in this phase.
+
 ## External dependency matrix
 
 | External                               | Transitions         | Failure class               | Symptom + audit note                                                                                                 |

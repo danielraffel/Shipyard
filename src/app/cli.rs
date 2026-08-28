@@ -474,11 +474,69 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: ShipStateCommand,
     },
+    /// Inspect or import the shadow-only canonical work-item ledger.
+    #[command(name = "work-ledger")]
+    WorkLedger {
+        /// Work-ledger subcommand.
+        #[command(subcommand)]
+        command: WorkLedgerCommand,
+    },
     /// Self-hosted runner watchdog: detect and recover stuck runner state.
     Runner {
         /// Runner subcommand.
         #[command(subcommand)]
         command: RunnerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum WorkLedgerCommand {
+    /// Show schema, integrity, and redacted lifecycle counts without creating storage.
+    Status,
+    /// Plan or apply an idempotent legacy-state import. Dry-run is the default.
+    Import {
+        /// Commit selected redacted projections to the shadow ledger.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Inspect or revise repository lane policy in the shadow ledger.
+    Policy {
+        /// Policy subcommand.
+        #[command(subcommand)]
+        command: WorkLedgerPolicyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum WorkLedgerPolicyCommand {
+    /// List repository policies. Does not create storage when the ledger is absent.
+    List,
+    /// Plan or apply one exact revision-fenced repository policy.
+    Set {
+        /// Lowercase owner/repository slug.
+        #[arg(long)]
+        repo: String,
+        /// Preferred platform lane.
+        #[arg(long = "primary-platform")]
+        primary_platform: String,
+        /// Whether compatibility lanes are independent or globally blocking.
+        #[arg(long = "compatibility-mode", value_parser = ["independent", "blocking"], default_value = "independent")]
+        compatibility_mode: String,
+        /// Known compatibility lane; repeat to declare the full inventory.
+        #[arg(long = "compatibility-lane")]
+        compatibility_lanes: Vec<String>,
+        /// When compatibility work may block another lane.
+        #[arg(long = "blocking-rule", value_parser = ["declared_dependency_or_shared_integrity", "all"], default_value = "declared_dependency_or_shared_integrity")]
+        blocking_rule: String,
+        /// Compatibility lane with a declared artifact dependency; repeat as needed.
+        #[arg(long = "declared-dependency-lane")]
+        declared_dependency_lanes: Vec<String>,
+        /// Exact current revision; use zero only when creating a policy.
+        #[arg(long = "expected-revision", default_value_t = 0)]
+        expected_revision: u64,
+        /// Commit the revision-fenced policy to the shadow ledger.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -2050,7 +2108,10 @@ impl From<PathMode> for RuntimeMode {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, DependencyCommand, PulpDependencyCommand, RunnerCommand};
+    use super::{
+        Cli, Command, DependencyCommand, PulpDependencyCommand, RunnerCommand, WorkLedgerCommand,
+        WorkLedgerPolicyCommand,
+    };
 
     #[test]
     fn dependency_pulp_commands_have_an_explicit_operation() {
@@ -2151,5 +2212,59 @@ mod tests {
             Cli::try_parse_from(["shipyard", "runner", "recovery-worker", "--once", "--drain",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn work_ledger_import_is_dry_run_unless_apply_is_explicit() {
+        let cli = Cli::try_parse_from(["shipyard", "work-ledger", "import"])
+            .expect("work-ledger dry run");
+        assert!(matches!(
+            cli.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::Import { apply: false }
+            }
+        ));
+        let cli = Cli::try_parse_from(["shipyard", "work-ledger", "import", "--apply"])
+            .expect("work-ledger apply");
+        assert!(matches!(
+            cli.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::Import { apply: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn work_ledger_policy_requires_explicit_macos_and_defaults_independent_shadow() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "policy",
+            "set",
+            "--repo",
+            "generous-corp/forge",
+            "--primary-platform",
+            "macos",
+            "--compatibility-lane",
+            "linux",
+        ])
+        .expect("policy plan");
+        assert!(matches!(
+            cli.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::Policy {
+                    command: WorkLedgerPolicyCommand::Set {
+                        primary_platform,
+                        compatibility_mode,
+                        blocking_rule,
+                        expected_revision: 0,
+                        apply: false,
+                        ..
+                    }
+                }
+            } if primary_platform == "macos"
+                && compatibility_mode == "independent"
+                && blocking_rule == "declared_dependency_or_shared_integrity"
+        ));
     }
 }

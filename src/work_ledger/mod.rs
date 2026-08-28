@@ -1,0 +1,401 @@
+//! Shadow-only canonical work-item persistence.
+//!
+//! This module is deliberately not wired into scheduling or dispatch. It gives
+//! migrations a crash-consistent target while legacy stores remain authoritative.
+
+use std::collections::BTreeMap;
+use std::fmt::{self, Display, Formatter};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use chrono::Utc;
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+const SCHEMA_VERSION: i64 = 2;
+const DATABASE_NAME: &str = "work-items.sqlite3";
+
+macro_rules! candidate_params {
+    ($candidate:expr, $now:expr) => {
+        params![
+            $candidate.work_id,
+            $candidate.kind,
+            $candidate.repo,
+            $candidate.pr,
+            $candidate.head_sha,
+            $candidate.base_ref,
+            $candidate.goal_id,
+            $candidate.goal_generation,
+            $candidate.lane,
+            $candidate.role,
+            $candidate.owner_id,
+            $candidate.owner_generation,
+            $candidate.terminal_adapter,
+            $candidate.agent_adapter,
+            $candidate.provider_adapter,
+            $candidate.coordinator_route_ref,
+            $candidate.repair_route_ref,
+            $candidate.pr_truth,
+            $candidate.acceptance_truth,
+            $candidate.continuation_truth,
+            $candidate.phase,
+            $candidate.content_digest,
+            $now,
+        ]
+    };
+}
+
+mod importer;
+mod lifecycle;
+mod persistence;
+mod policy;
+mod registry;
+#[allow(dead_code)] // Activated through the protected registry in a later phase.
+mod route;
+mod storage;
+use importer::import_report;
+#[cfg(test)]
+use importer::{candidate, dry_run_report, scan_legacy, validate_legacy_record};
+pub use lifecycle::{ContinuationSet, LifecycleState, WakeIntent};
+pub use persistence::{apply_legacy_snapshot, plan_legacy_snapshot};
+pub use policy::RepoPolicy;
+pub(crate) use policy::validate_repo_policy;
+#[cfg(test)]
+use registry::{RouteRegistration, validated_route_exists};
+use route::{AdapterBindingRecord, RouteProvenanceRecord};
+pub use storage::absent_status;
+use storage::{
+    configure_durable, count, count_where, create_database_file_no_follow, migrate,
+    protect_database_file, protect_ledger_directory, schema_version, synchronous_name,
+    validate_protected_storage, verify_integrity, verify_supported_schema,
+};
+
+/// Error returned by a fail-closed work-ledger operation.
+#[derive(Debug)]
+pub enum WorkLedgerError {
+    /// Filesystem access failed.
+    Io(std::io::Error),
+    /// `SQLite` rejected an operation or found malformed storage.
+    Sql(rusqlite::Error),
+    /// A legacy JSON record is malformed.
+    Json {
+        /// Opaque digest of the source path; raw paths are not exposed.
+        source: String,
+        /// Parser error.
+        error: serde_json::Error,
+    },
+    /// The database was written by a newer, unsupported implementation.
+    UnsupportedSchema(i64),
+    /// An invariant or generation fence refused a mutation.
+    Refused(String),
+}
+
+impl Display for WorkLedgerError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "work ledger I/O failed: {error}"),
+            Self::Sql(error) => write!(formatter, "work ledger SQLite failed: {error}"),
+            Self::Json { source, error } => {
+                write!(formatter, "legacy source {source} is invalid JSON: {error}")
+            }
+            Self::UnsupportedSchema(version) => {
+                write!(
+                    formatter,
+                    "unsupported work ledger schema version {version}"
+                )
+            }
+            Self::Refused(reason) => write!(formatter, "work ledger refused mutation: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkLedgerError {}
+
+impl From<std::io::Error> for WorkLedgerError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<rusqlite::Error> for WorkLedgerError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sql(error)
+    }
+}
+
+/// Result type for work-ledger operations.
+pub type WorkLedgerResult<T> = Result<T, WorkLedgerError>;
+
+/// A selected, redacted projection of one legacy lifecycle record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportCandidate {
+    /// Opaque deterministic work identity.
+    work_id: String,
+    /// Legacy lifecycle family.
+    kind: String,
+    /// Canonical repository when present.
+    repo: Option<String>,
+    /// Pull-request number when present.
+    pr: Option<u64>,
+    /// Exact head when present.
+    head_sha: Option<String>,
+    /// Base ref when present.
+    base_ref: Option<String>,
+    /// Logical goal identity when present.
+    goal_id: Option<String>,
+    /// Current goal generation.
+    goal_generation: u64,
+    /// Lane identity, independent of platform policy.
+    lane: Option<String>,
+    /// Root, coordinator, or child.
+    role: String,
+    /// Opaque owner identity when present.
+    owner_id: Option<String>,
+    /// Current owner generation.
+    owner_generation: u64,
+    /// Terminal runtime adapter kind only; route is stored separately as a digest.
+    terminal_adapter: Option<String>,
+    /// Agent/session adapter kind only.
+    agent_adapter: Option<String>,
+    /// Provider-routing adapter kind only.
+    provider_adapter: Option<String>,
+    /// Opaque coordinator route reference.
+    coordinator_route_ref: Option<String>,
+    /// Opaque repair route reference.
+    repair_route_ref: Option<String>,
+    /// Independent pull-request terminal truth.
+    pr_truth: String,
+    /// Independent product acceptance truth.
+    acceptance_truth: String,
+    /// Independent continuation terminal truth.
+    continuation_truth: String,
+    /// Lifecycle phase.
+    phase: String,
+    /// Opaque digest of the source path and map key.
+    source_ref: String,
+    /// Digest of the exact legacy bytes or selected map value.
+    content_digest: String,
+    /// Legacy lifecycle timestamp used only to reconcile compatibility mirrors.
+    pub(crate) source_updated_at: Option<String>,
+}
+
+/// Stable, non-sensitive ledger summary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LedgerStatus {
+    /// Whether the database exists.
+    pub exists: bool,
+    /// Schema version, or zero when absent.
+    pub schema_version: i64,
+    /// `SQLite` journal mode.
+    pub journal_mode: String,
+    /// Durability setting on the inspected connection.
+    pub synchronous: String,
+    /// Whether foreign-key enforcement is active on the inspected connection.
+    pub foreign_keys: String,
+    /// Integrity verdict.
+    pub integrity: String,
+    /// Canonical work-item count.
+    pub work_items: u64,
+    /// Pending outbox count.
+    pub pending_wakes: u64,
+    /// Ambiguous outbox count, which requires reconciliation rather than retry.
+    pub uncertain_wakes: u64,
+    /// Imported source count.
+    pub imports: u64,
+    /// Activation is deliberately unavailable in this phase.
+    pub activation_enabled: bool,
+    /// Dispatch is deliberately unavailable in this phase.
+    pub dispatch_enabled: bool,
+}
+
+/// Deterministic import report.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImportReport {
+    /// Whether records were committed.
+    pub applied: bool,
+    /// Operating mode; this phase always reports `shadow`.
+    pub mode: String,
+    /// Total recognized candidates.
+    pub candidates: usize,
+    /// Newly inserted candidates.
+    pub inserted: usize,
+    /// Existing work items refreshed from a changed legacy source.
+    pub updated: usize,
+    /// Exact prior imports left unchanged.
+    pub unchanged: usize,
+    /// Counts by lifecycle family.
+    pub by_kind: BTreeMap<String, usize>,
+    /// Digest of the sorted candidate identities and content digests.
+    pub plan_digest: String,
+    /// Activation remains false.
+    pub activation_enabled: bool,
+    /// Dispatch remains false.
+    pub dispatch_enabled: bool,
+}
+
+/// Machine-global SQLite/WAL work-item ledger.
+#[derive(Clone, Debug)]
+pub struct WorkLedger {
+    path: PathBuf,
+}
+
+pub(super) fn validate_candidate(candidate: &ImportCandidate) -> WorkLedgerResult<()> {
+    validate_opaque_ref("work_id", &candidate.work_id, "wi")?;
+    validate_opaque_ref("source_ref", &candidate.source_ref, "src")?;
+    validate_digest("content_digest", &candidate.content_digest)?;
+    if !matches!(
+        candidate.kind.as_str(),
+        "ship_state"
+            | "queue_request"
+            | "queue_outcome"
+            | "recovery"
+            | "terminal_handoff"
+            | "resume_record"
+    ) {
+        return Err(WorkLedgerError::Refused(
+            "unsupported imported lifecycle kind".to_owned(),
+        ));
+    }
+    if !matches!(candidate.role.as_str(), "root" | "coordinator" | "child") {
+        return Err(WorkLedgerError::Refused("unsupported work role".to_owned()));
+    }
+    if candidate.phase != LifecycleState::ShadowImported.as_str() {
+        return Err(WorkLedgerError::Refused(
+            "legacy imports must remain shadow imported".to_owned(),
+        ));
+    }
+    if candidate.goal_generation == 0 || candidate.owner_generation == 0 {
+        return Err(WorkLedgerError::Refused(
+            "goal and owner generations must be positive".to_owned(),
+        ));
+    }
+    for (name, value, prefix) in [
+        ("goal_id", candidate.goal_id.as_deref(), "goal"),
+        ("owner_id", candidate.owner_id.as_deref(), "owner"),
+        (
+            "coordinator_route_ref",
+            candidate.coordinator_route_ref.as_deref(),
+            "route",
+        ),
+        (
+            "repair_route_ref",
+            candidate.repair_route_ref.as_deref(),
+            "route",
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_opaque_ref(name, value, prefix)?;
+        }
+    }
+    if let Some(repo) = &candidate.repo
+        && !is_canonical_repo_slug(repo)
+    {
+        return Err(WorkLedgerError::Refused(
+            "imported repository is not canonical owner/repo".to_owned(),
+        ));
+    }
+    if let Some(head) = &candidate.head_sha
+        && !is_lower_hex(head, 40)
+        && !is_lower_hex(head, 64)
+    {
+        return Err(WorkLedgerError::Refused(
+            "imported head is not a full lowercase object ID".to_owned(),
+        ));
+    }
+    for truth in [
+        candidate.pr_truth.as_str(),
+        candidate.acceptance_truth.as_str(),
+        candidate.continuation_truth.as_str(),
+    ] {
+        if !matches!(truth, "pending" | "succeeded" | "failed" | "unknown") {
+            return Err(WorkLedgerError::Refused(
+                "imported terminal truth is unsupported".to_owned(),
+            ));
+        }
+    }
+    for (name, value) in [
+        ("base_ref", candidate.base_ref.as_deref()),
+        ("lane", candidate.lane.as_deref()),
+        ("terminal_adapter", candidate.terminal_adapter.as_deref()),
+        ("agent_adapter", candidate.agent_adapter.as_deref()),
+        ("provider_adapter", candidate.provider_adapter.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_token(name, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_token(name: &str, value: &str) -> WorkLedgerResult<()> {
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(WorkLedgerError::Refused(format!("invalid {name}")));
+    }
+    Ok(())
+}
+
+fn is_canonical_repo_slug(value: &str) -> bool {
+    let Some((owner, repo)) = value.split_once('/') else {
+        return false;
+    };
+    value == value.to_ascii_lowercase()
+        && !repo.contains('/')
+        && !owner.is_empty()
+        && !repo.is_empty()
+        && owner.trim() == owner
+        && repo.trim() == repo
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && repo.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+fn validate_opaque_ref(name: &str, value: &str, prefix: &str) -> WorkLedgerResult<()> {
+    let expected = format!("{prefix}_");
+    let Some(hash) = value.strip_prefix(&expected) else {
+        return Err(WorkLedgerError::Refused(format!("invalid {name}")));
+    };
+    if !is_lower_hex(hash, 64) {
+        return Err(WorkLedgerError::Refused(format!("invalid {name}")));
+    }
+    Ok(())
+}
+
+fn validate_digest(name: &str, value: &str) -> WorkLedgerResult<()> {
+    if !is_lower_hex(value, 64) {
+        return Err(WorkLedgerError::Refused(format!("invalid {name}")));
+    }
+    Ok(())
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn opaque_path_ref(state_dir: &Path, path: &Path, key: Option<&str>) -> String {
+    let relative = path.strip_prefix(state_dir).unwrap_or(path);
+    opaque_ref(
+        "src",
+        &format!("{}#{}", relative.to_string_lossy(), key.unwrap_or("")),
+    )
+}
+
+fn opaque_ref(prefix: &str, value: &str) -> String {
+    format!("{prefix}_{}", digest(value.as_bytes()))
+}
+
+fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests;

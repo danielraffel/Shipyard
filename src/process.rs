@@ -478,13 +478,19 @@ mod tests {
         .expect("leader should finish without waiting on inherited stdout");
         assert_eq!(output.stdout, b"ok");
         let pid = std::fs::read_to_string(pid_path).expect("descendant pid");
-        let alive = Command::new("kill")
-            .args(["-0", "--", pid.trim()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        let process_is_running = || {
+            Command::new("kill")
+                .args(["-0", "--", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_is_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
-            !alive,
+            !process_is_running(),
             "descendant retaining stdout survived probe teardown"
         );
     }

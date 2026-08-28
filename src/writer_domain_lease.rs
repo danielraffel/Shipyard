@@ -96,6 +96,32 @@ pub(crate) fn acquire_for_protected_path(
     acquire_thread_lease_at(&runtime_paths.state_dir, DEFAULT_ACQUIRE_TIMEOUT).map(Some)
 }
 
+/// Acquire an exclusive production snapshot barrier for a bounded migration.
+/// Nested writers on this thread reuse the exclusive lease; all other
+/// production writers wait at the normal shared-domain acquisition point.
+pub(crate) fn acquire_exclusive_for_protected_path(
+    path: &Path,
+) -> io::Result<Option<ProductionWriterDomainLease>> {
+    if !is_current_protected_path(path)? {
+        return Ok(None);
+    }
+    let already_held = THREAD_WRITER_DOMAIN.with(|slot| slot.borrow().is_some());
+    if already_held {
+        return Err(io::Error::other(
+            "cannot upgrade an active writer-domain lease to an exclusive snapshot",
+        ));
+    }
+    let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
+    let domain = acquire_exclusive_at(&runtime_paths.state_dir, DEFAULT_ACQUIRE_TIMEOUT)?;
+    THREAD_WRITER_DOMAIN.with(|slot| {
+        let previous = slot.replace(Some(ThreadWriterDomainLease { domain, depth: 1 }));
+        debug_assert!(previous.is_none());
+    });
+    Ok(Some(ProductionWriterDomainLease {
+        _thread_bound: PhantomData,
+    }))
+}
+
 /// Report whether a path belongs to the current machine's production writer
 /// domain without acquiring its lease.
 pub(crate) fn is_current_protected_path(path: &Path) -> io::Result<bool> {
@@ -333,6 +359,21 @@ fn acquire_at(state_dir: &Path, timeout: Duration) -> io::Result<File> {
     Ok(domain)
 }
 
+fn acquire_exclusive_at(state_dir: &Path, timeout: Duration) -> io::Result<File> {
+    fs::create_dir_all(state_dir)?;
+    let deadline = Instant::now() + timeout;
+    let turnstile_path = state_dir.join(WRITER_DOMAIN_TURNSTILE_NAME);
+    let turnstile = open_lock_file(&turnstile_path)?;
+    acquire_lock(&turnstile, LockKind::Exclusive, deadline, &turnstile_path)?;
+
+    let domain_path = state_dir.join(WRITER_DOMAIN_LOCK_NAME);
+    let domain = open_lock_file(&domain_path)?;
+    let result = acquire_lock(&domain, LockKind::Exclusive, deadline, &domain_path);
+    let _ = FileExt::unlock(&turnstile);
+    result?;
+    Ok(domain)
+}
+
 #[derive(Clone, Copy)]
 enum LockKind {
     Shared,
@@ -537,6 +578,18 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(is_writer_domain_overlap(&error.to_string()));
         FileExt::unlock(&exclusive).expect("unlock exclusive");
+    }
+
+    #[test]
+    fn exclusive_migration_snapshot_blocks_production_writers_until_release() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exclusive =
+            acquire_exclusive_at(temp.path(), Duration::from_millis(50)).expect("exclusive");
+        let error = acquire_at(temp.path(), Duration::from_millis(30))
+            .expect_err("writer must wait behind migration snapshot");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(exclusive);
+        drop(acquire_at(temp.path(), Duration::from_millis(50)).expect("writer after snapshot"));
     }
 
     #[test]

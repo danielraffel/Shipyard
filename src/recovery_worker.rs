@@ -909,9 +909,10 @@ pub type RecoveryResult<T> = Result<T, RecoveryError>;
 
 mod validation;
 pub use validation::recovery_id;
+pub(crate) use validation::validate_record;
 use validation::{
-    ensure_config, invalid_transition, same_recovery_identity, validate_id, validate_record,
-    validate_repo, validate_request, validate_request_fields, validate_signature, validate_text,
+    ensure_config, invalid_transition, same_recovery_identity, validate_id, validate_repo,
+    validate_request, validate_request_fields, validate_signature, validate_text,
 };
 #[path = "recovery_worker/archive.rs"]
 mod archive;

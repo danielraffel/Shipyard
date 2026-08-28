@@ -109,6 +109,12 @@ shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --works
 shipyard runner recovery-worker                     # inspect/revalidate one pending exception; no model launch
 shipyard runner recovery-worker --apply             # run one bounded read-only triage attempt
 shipyard runner recovery-worker --drain --apply     # process one bounded pending snapshot (maximum 32)
+shipyard work-ledger status                         # inspect canonical shadow storage; does not create it
+shipyard work-ledger import                         # deterministic redacted legacy-import plan; no writes
+shipyard work-ledger import --apply                 # idempotently populate shadow storage; no activation/dispatch
+shipyard work-ledger policy list                    # list revision-fenced per-repository lane policy
+shipyard work-ledger policy set --repo generous-corp/forge --primary-platform macos --compatibility-lane linux --compatibility-lane windows
+shipyard work-ledger policy set --repo generous-corp/forge --primary-platform macos --compatibility-lane linux --declared-dependency-lane linux --expected-revision 0 --apply
 
 # On the protected base branch, make every `shipyard pr` submission durable
 # immediately after PR creation. A PR branch cannot opt itself in.
@@ -189,6 +195,39 @@ while the attempt gate is stricter: a repository/PR/exact-head tuple receives
 at most one model call even if normalized evidence changes. A retarget, newer
 head, recovered check, or changed merge state supersedes the old request
 instead of spending an attempt on stale evidence.
+
+`work-ledger` is a migration and inspection surface, not a scheduler switch.
+Its versioned SQLite database uses WAL, full synchronous durability, foreign
+keys, integrity checks, protected permissions, and the machine writer-domain
+fence. Import selects canonical lifecycle fields and opaque digests from the
+legacy ship, queue, recovery, and steward stores; it never copies raw prompts,
+terminal text, credentials, provider tokens, or private route identifiers.
+Imported work remains explicitly `shadow_imported` and lacks an activation-
+eligible continuation contract. Native route records keep terminal, agent, and
+provider axes separate and integrity-bound; missing provider provenance never
+means Direct and cannot dispatch. Native transitions are closed/typed and
+commit their deterministic event with any outbox wake.
+Dry-run is byte-stable and creates no database. Apply is idempotent and leaves
+every legacy record authoritative and untouched. Apply holds a bounded
+exclusive production-writer snapshot barrier from legacy scan through the
+SQLite commit, so it cannot materialize a mixed live-state snapshot. Both
+`activation_enabled` and
+`dispatch_enabled` remain false in this phase.
+Legacy import is currently supported only on Unix hosts, where the configured
+state directory and every relative component are opened through pinned
+no-follow handles. Windows import is explicitly deferred and does not block
+the macOS stewardship rollout; status and policy surfaces remain available.
+Repository policy is independently revision-fenced. `policy set` requires an
+explicit primary lane (Pulp, Forge, and Vellum use `macos`), an explicit
+repeatable compatibility-lane inventory, and defaults to `independent`
+compatibility scheduling; Linux/Windows may
+block another lane only through the default
+`declared_dependency_or_shared_integrity` rule. Repeat
+`--declared-dependency-lane` only for a real artifact dependency; otherwise a
+compatibility lane can block only with evidenced shared-integrity failure.
+Dry-run is the default and an
+apply with a stale expected revision refuses rather than overwriting a newer
+decision. This policy is inspectable but not consumed by the scheduler yet.
 An apply-mode repository or GitHub preflight error remains pending without
 spending the attempt, but is durably moved behind untouched pending work so a
 persistently unavailable repository cannot block the machine-global queue.

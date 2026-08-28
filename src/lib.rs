@@ -121,6 +121,7 @@ pub mod queue_request;
 pub mod queue_scheduler;
 /// Best-effort reconciliation of durable ship-state against GitHub truth.
 pub mod reconcile;
+mod record_identity;
 /// Durable, fail-closed requests for bounded model-assisted recovery.
 pub mod recovery_worker;
 /// GitHub webhook registration through the user's existing `gh` auth.
@@ -166,6 +167,8 @@ pub mod warm_pool;
 pub mod watch;
 /// GitHub webhook signature validation and event decoding.
 pub mod webhook;
+/// Shadow-only canonical work-item ledger and legacy-state importer.
+pub mod work_ledger;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;
 /// Host-global production-writer coordination for sandbox E2E isolation.

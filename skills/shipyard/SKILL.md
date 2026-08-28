@@ -1205,6 +1205,36 @@ rather than blocking unrelated stewardship.
 See [references/merge-steward.md](references/merge-steward.md) for the config,
 schema, limits, and exact authority boundary.
 
+Use `shipyard work-ledger status --json` to inspect whether the canonical
+lifecycle shadow exists without creating it. Use `shipyard work-ledger import
+--json` for the deterministic no-write plan, then `--apply` only when a shadow
+import is intended. Import is idempotent, redacted, and fail-closed: it selects
+canonical fields and opaque digests from legacy stores, leaves those stores
+authoritative and untouched, and cannot schedule, wake, call a model, mutate
+GitHub, or project to Linear. Both activation and dispatch remain disabled.
+The future transactional wake API derives a deterministic wake ID from the
+complete work/owner generation and delivery fence; a caller-supplied identity
+that does not match that derivation is rejected before commit.
+The route must also resolve to a protected, integrity-valid record for the same
+exact head and generations. Terminal runtime (cmux or opted-in HerdR), agent
+session, and provider routing (explicit Direct, Subrouter, or CLIProxyAPI) are
+separate. Missing provenance fails closed without direct-provider or fresh-agent
+fallback. Protected session-header material has both a resolvable opaque
+reference and a digest, and the native session and launch profile must agree on
+one wrapper reference. Registered future terminal/provider adapters preserve
+the same versioned lifecycle boundary and require an active protected adapter
+record with exact generation, revision, and implementation/configuration/
+capability digests. Imported records remain inert until both continuation outcomes exist
+and a legal typed transition records its audit event transactionally.
+Use `shipyard work-ledger policy set` to plan a per-repository platform policy;
+apply requires the exact current revision. The primary platform is explicit
+(use macOS for Pulp, Forge, and Vellum), with a complete repeatable
+`--compatibility-lane` inventory and independent compatibility scheduling.
+Repeat `--declared-dependency-lane` only for an inventoried lane with a real
+artifact dependency; unknown lanes fail closed and other
+cross-lane blocking requires evidenced shared-integrity fault. This remains an
+inspectable shadow and cannot influence scheduling in the current phase.
+
 The preferred unattended credential has Commit statuses and Issues read/write.
 A local read-oriented GitHub App that receives the exact integration-permission
 403 falls back, with a visible warning, to ambient `gh` for these low-volume
