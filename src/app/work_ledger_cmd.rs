@@ -3,6 +3,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+use serde_json::Value;
+
+use crate::daemon_ipc::read_daemon_status;
 use crate::output::write_pretty_json;
 use crate::paths::RuntimePaths;
 use crate::work_ledger::{
@@ -30,8 +33,10 @@ pub(super) fn work_ledger_command<W: Write>(
                 .map_err(failure)?
                 .map_or_else(|| Ok(absent_status()), |ledger| ledger.status())
                 .map_err(failure)?;
+            let operational = work_ledger_operational_status(runtime_paths);
             if json {
-                write_pretty_json(stdout, &status).map_err(failure)?;
+                let rendered = work_ledger_status_json(&status, &operational)?;
+                write_pretty_json(stdout, &rendered).map_err(failure)?;
             } else {
                 writeln!(
                     stdout,
@@ -47,8 +52,18 @@ pub(super) fn work_ledger_command<W: Write>(
                 writeln!(stdout, "Work items: {}", status.work_items).map_err(failure)?;
                 writeln!(stdout, "Pending wakes: {}", status.pending_wakes).map_err(failure)?;
                 writeln!(stdout, "Uncertain wakes: {}", status.uncertain_wakes).map_err(failure)?;
-                writeln!(stdout, "Activation: disabled (shadow only)").map_err(failure)?;
-                writeln!(stdout, "Dispatch: disabled (shadow only)").map_err(failure)?;
+                writeln!(stdout, "Activation: {}", operational.activation_state)
+                    .map_err(failure)?;
+                writeln!(stdout, "Dispatch: {}", operational.dispatch_state).map_err(failure)?;
+                writeln!(
+                    stdout,
+                    "Continuation runtime: {}",
+                    operational.continuation_runtime
+                )
+                .map_err(failure)?;
+                if let Some(reason_code) = &operational.reason_code {
+                    writeln!(stdout, "Continuation reason: {reason_code}").map_err(failure)?;
+                }
             }
         }
         WorkLedgerCommand::Import { apply } => {
@@ -250,6 +265,116 @@ pub(super) fn work_ledger_command<W: Write>(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkLedgerOperationalStatus {
+    activation_enabled: bool,
+    dispatch_enabled: bool,
+    activation_state: String,
+    dispatch_state: String,
+    continuation_runtime: String,
+    reason_code: Option<String>,
+}
+
+fn work_ledger_operational_status(runtime_paths: &RuntimePaths) -> WorkLedgerOperationalStatus {
+    let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+    if runtime_paths != &production_paths {
+        return operational_status(
+            WorkstreamActivationState::Refused(
+                crate::workstream_activation_loader::WorkstreamActivationRefusal::NonProductionRuntime,
+            ),
+            read_daemon_status(&runtime_paths.state_dir),
+        );
+    }
+    let mut loader = WorkstreamActivationLoader::production();
+    operational_status(
+        loader.revalidate_for_tick(),
+        read_daemon_status(&runtime_paths.state_dir),
+    )
+}
+
+fn operational_status(
+    activation: WorkstreamActivationState,
+    daemon_status: Option<Value>,
+) -> WorkLedgerOperationalStatus {
+    let runtime_state = daemon_status
+        .as_ref()
+        .and_then(|status| status.get("workstream_continuation"))
+        .and_then(|continuation| continuation.get("state"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let runtime_reason = daemon_status
+        .as_ref()
+        .and_then(|status| status.get("workstream_continuation"))
+        .and_then(|continuation| continuation.get("reason_code"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let continuation_runtime = runtime_state.unwrap_or_else(|| "daemon_not_running".to_owned());
+
+    match activation {
+        WorkstreamActivationState::Ready(_) => WorkLedgerOperationalStatus {
+            activation_enabled: true,
+            dispatch_enabled: true,
+            activation_state: "enabled".to_owned(),
+            dispatch_state: "enabled".to_owned(),
+            continuation_runtime,
+            reason_code: runtime_reason,
+        },
+        WorkstreamActivationState::Disabled => WorkLedgerOperationalStatus {
+            activation_enabled: false,
+            dispatch_enabled: false,
+            activation_state: "disabled".to_owned(),
+            dispatch_state: "disabled".to_owned(),
+            continuation_runtime,
+            reason_code: runtime_reason,
+        },
+        WorkstreamActivationState::Refused(reason) => WorkLedgerOperationalStatus {
+            activation_enabled: false,
+            dispatch_enabled: false,
+            activation_state: "refused".to_owned(),
+            dispatch_state: "refused".to_owned(),
+            continuation_runtime,
+            reason_code: Some(reason.code().to_owned()),
+        },
+    }
+}
+
+fn work_ledger_status_json(
+    ledger: &crate::work_ledger::LedgerStatus,
+    operational: &WorkLedgerOperationalStatus,
+) -> Result<Value, CliFailure> {
+    let mut rendered = serde_json::to_value(ledger).map_err(failure)?;
+    let Value::Object(fields) = &mut rendered else {
+        return Err(CliFailure::new(1, "work ledger status must be an object"));
+    };
+    fields.insert(
+        "activation_enabled".to_owned(),
+        Value::Bool(operational.activation_enabled),
+    );
+    fields.insert(
+        "dispatch_enabled".to_owned(),
+        Value::Bool(operational.dispatch_enabled),
+    );
+    fields.insert(
+        "activation_state".to_owned(),
+        Value::String(operational.activation_state.clone()),
+    );
+    fields.insert(
+        "dispatch_state".to_owned(),
+        Value::String(operational.dispatch_state.clone()),
+    );
+    fields.insert(
+        "continuation_runtime".to_owned(),
+        Value::String(operational.continuation_runtime.clone()),
+    );
+    if let Some(reason_code) = &operational.reason_code {
+        fields.insert(
+            "continuation_reason_code".to_owned(),
+            Value::String(reason_code.clone()),
+        );
+    }
+    Ok(rendered)
 }
 
 trait HandshakeActivation {
@@ -633,6 +758,79 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn status_reports_enabled_configuration_and_redacted_runtime_truth() {
+        let operational = operational_status(
+            WorkstreamActivationState::Ready(ready_activation()),
+            Some(serde_json::json!({
+                "workstream_continuation": {
+                    "state": "idle",
+                    "reason_code": "provider_waiting",
+                    "route_ref": "private-route",
+                    "wake_id": "private-wake"
+                }
+            })),
+        );
+        assert!(operational.activation_enabled);
+        assert!(operational.dispatch_enabled);
+        assert_eq!(operational.activation_state, "enabled");
+        assert_eq!(operational.dispatch_state, "enabled");
+        assert_eq!(operational.continuation_runtime, "idle");
+        assert_eq!(operational.reason_code.as_deref(), Some("provider_waiting"));
+
+        let rendered = work_ledger_status_json(&absent_status(), &operational)
+            .expect("render operational status");
+        assert_eq!(rendered["activation_enabled"], true);
+        assert_eq!(rendered["dispatch_enabled"], true);
+        assert_eq!(rendered["activation_state"], "enabled");
+        assert_eq!(rendered["dispatch_state"], "enabled");
+        assert_eq!(rendered["continuation_runtime"], "idle");
+        assert_eq!(rendered["continuation_reason_code"], "provider_waiting");
+        let bytes = serde_json::to_vec(&rendered).expect("serialize rendered status");
+        assert!(
+            !bytes
+                .windows(b"private-route".len())
+                .any(|part| part == b"private-route")
+        );
+        assert!(
+            !bytes
+                .windows(b"private-wake".len())
+                .any(|part| part == b"private-wake")
+        );
+    }
+
+    #[test]
+    fn status_distinguishes_disabled_refused_and_stopped_daemon() {
+        let disabled = operational_status(WorkstreamActivationState::Disabled, None);
+        assert!(!disabled.activation_enabled);
+        assert!(!disabled.dispatch_enabled);
+        assert_eq!(disabled.activation_state, "disabled");
+        assert_eq!(disabled.dispatch_state, "disabled");
+        assert_eq!(disabled.continuation_runtime, "daemon_not_running");
+        assert_eq!(disabled.reason_code, None);
+
+        let refused = operational_status(
+            WorkstreamActivationState::Refused(
+                crate::workstream_activation_loader::WorkstreamActivationRefusal::InvalidMachinePolicy,
+            ),
+            Some(serde_json::json!({
+                "workstream_continuation": {
+                    "state": "refused",
+                    "reason_code": "stale_daemon_reason"
+                }
+            })),
+        );
+        assert!(!refused.activation_enabled);
+        assert!(!refused.dispatch_enabled);
+        assert_eq!(refused.activation_state, "refused");
+        assert_eq!(refused.dispatch_state, "refused");
+        assert_eq!(refused.continuation_runtime, "refused");
+        assert_eq!(
+            refused.reason_code.as_deref(),
+            Some("invalid_machine_policy")
+        );
     }
 
     #[test]
