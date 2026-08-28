@@ -896,6 +896,7 @@ pub(crate) fn native_publication_request(
             "handoff route, launch profile, and continuation authority disagree",
         ));
     }
+    profile.validate_native_fresh_agent_grammar()?;
     let protected_profile_bytes = profile
         .protected_profile_bytes()
         .map_err(|error| CliFailure::new(1, error.to_string()))?;

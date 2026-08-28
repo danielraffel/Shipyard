@@ -144,6 +144,20 @@ fn profile(resume_flag: &str) -> LaunchProfileV1 {
     }
 }
 
+fn native_profile() -> LaunchProfileV1 {
+    let mut profile = profile("-r");
+    profile.provider.provider = "codex".into();
+    profile.launch_argv = vec!["codex".into(), "--model".into(), "model-tier-a".into()];
+    profile.resume_argv = vec![
+        "codex".into(),
+        "resume".into(),
+        "--model".into(),
+        "model-tier-a".into(),
+        "provider-session-7".into(),
+    ];
+    profile
+}
+
 fn route(args: &StewardHandoffArgs) -> AgentRouteReference {
     route_at(args, "m3")
 }
@@ -222,7 +236,7 @@ fn superseded_worktree_provenance_fails_before_publication() {
 fn exact_launch_profile_survives_receipt_restart_without_translation() {
     let temp = tempfile::tempdir().expect("temp");
     let args = handoff_args();
-    let profile = prepare_launch_profile_candidate(profile("-r"), "owner/repo", &args.head)
+    let profile = prepare_launch_profile_candidate(native_profile(), "owner/repo", &args.head)
         .expect("valid profile");
     let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
         .expect("resolve agent")
@@ -268,7 +282,13 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
             .expect("profile")
             .profile
             .resume_argv,
-        vec!["/opt/provider-router", "agent", "-r", "provider-session-7"]
+        vec![
+            "codex",
+            "resume",
+            "--model",
+            "model-tier-a",
+            "provider-session-7"
+        ]
     );
     assert!(!restarted.wake_consumer_available);
     let paths = RuntimePaths::current_with_overrides(
@@ -283,7 +303,7 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
     assert_eq!(publication.origin_machine, "m3");
     assert_eq!(publication.agent_provider, "codex");
     assert_eq!(publication.agent_session_id, "provider-session-7");
-    assert_eq!(publication.profile_provider, "opaque-provider");
+    assert_eq!(publication.profile_provider, "codex");
     assert_eq!(publication.profile_digest, stored.profile_digest);
     assert_eq!(
         hex::encode(Sha256::digest(&publication.protected_profile_bytes)),
@@ -297,7 +317,7 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
     assert_eq!(provider_route.integrity_hash, stored.integrity_hash);
     assert_eq!(provider_route.generation, 1);
     assert_eq!(provider_route.revision, 1);
-    assert_eq!(provider_route.provider, "opaque-provider");
+    assert_eq!(provider_route.provider, "codex");
     assert_eq!(provider_route.account.as_deref(), Some("subscription-a"));
     assert_eq!(provider_route.model.as_deref(), Some("model-tier-a"));
 
@@ -320,11 +340,58 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
             integrity_hash: stored.integrity_hash.clone(),
             generation: stored.generation,
             revision: stored.revision,
-            provider: "opaque-provider".to_owned(),
+            provider: "codex".to_owned(),
             account: Some("subscription-a".to_owned()),
             model: Some("model-tier-a".to_owned()),
         })
     );
+}
+
+#[test]
+fn native_publication_rejects_prompt_bearing_launch_profile() {
+    let temp = tempfile::tempdir().expect("temp");
+    let args = handoff_args();
+    let mut unsafe_profile = native_profile();
+    unsafe_profile
+        .launch_argv
+        .push("raw prompt containing a secret".into());
+    let profile = prepare_launch_profile_candidate(unsafe_profile, "owner/repo", &args.head)
+        .expect("legacy profile storage remains supported");
+    let agent = resolve_agent_context_with_environment(&args, &AgentEnvironment::default())
+        .expect("resolve agent")
+        .expect("agent route");
+    let route = agent_route_reference(&agent, "m3");
+    let route_path = temp
+        .path()
+        .join("merge-steward")
+        .join("agent-routes")
+        .join(format!("{}.json", route.route_id));
+    persist_agent_route(&route_path, &route, &agent).expect("persist private route");
+    let receipt = prepare_handoff_receipt_with_profile(
+        None,
+        &args,
+        "owner/repo",
+        "m3",
+        Some(route),
+        Some(profile),
+    )
+    .expect("receipt");
+    let path = temp
+        .path()
+        .join("merge-steward")
+        .join("handoffs")
+        .join(encode_path_segment("owner/repo"))
+        .join(format!("pr-{}", args.pr))
+        .join(format!("{}.json", args.head));
+    persist_handoff(&path, receipt, HandoffPhase::Managed).expect("durable receipt");
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().to_path_buf()),
+    );
+    let error = native_publication_request(&paths, "owner/repo", args.pr, &args.head)
+        .expect_err("native publication must reject raw prompts");
+    assert!(error.message().contains("prompt"));
 }
 
 #[test]

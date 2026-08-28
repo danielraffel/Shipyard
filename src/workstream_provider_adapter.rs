@@ -182,7 +182,7 @@ fn handle_request(
         _ => return response(request, uncertain("multiple-idempotency-workspaces")),
     }
     if request.operation == ProviderWrapperOperationV1::Reconcile {
-        return response(request, retryable("reconcile-proved-not-accepted"));
+        return response(request, uncertain("reconcile-visibility-not-yet-proven"));
     }
 
     let args = match create_args(request, &description) {

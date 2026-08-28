@@ -60,9 +60,9 @@ pub(crate) use delivery_ownership::{
     AgentReturnExpectation, AgentReturnReceipt,
 };
 pub(crate) use dispatch::{
-    DeliveryFence, FreshAgentLaunchProfile, FreshAgentResumeExpectation, ProviderAdapter,
-    ProviderCapability, ProviderLaunchRequest, ProviderOutcome, StoredProviderRequest,
-    WakeConsumerPolicy, WakeDeliveryResult,
+    DeliveryFence, FreshAgentLaunchProfile, FreshAgentProviderLaunchOptions,
+    FreshAgentResumeExpectation, ProviderAdapter, ProviderCapability, ProviderLaunchRequest,
+    ProviderOutcome, StoredProviderRequest, WakeConsumerPolicy, WakeDeliveryResult,
 };
 mod lifecycle;
 mod native_publication;

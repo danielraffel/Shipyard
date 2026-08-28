@@ -205,9 +205,64 @@ fn reconcile_with_no_match_never_creates() {
     let response = handle_request(&request, &mut runner);
     assert!(matches!(
         response.outcome,
-        ProviderWrapperOutcomeV1::Retryable { .. }
+        ProviderWrapperOutcomeV1::Uncertain { .. }
     ));
     assert_eq!(runner.calls.len(), 2);
+}
+
+#[test]
+fn delayed_workspace_visibility_keeps_one_fence_and_never_creates_again() {
+    let submit = request("codex", ProviderWrapperOperationV1::Submit);
+    let original_key = submit.delivery_fence.idempotency_key.clone();
+    let mut submit_runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([])),
+            Err(RunnerFailure::Unavailable),
+        ]),
+        ..FakeRunner::default()
+    };
+    let submitted = handle_request(&submit, &mut submit_runner);
+    assert!(matches!(
+        submitted.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(submitted.idempotency_key, original_key);
+
+    let mut reconcile = submit.clone();
+    reconcile.operation = ProviderWrapperOperationV1::Reconcile;
+    let mut hidden_runner = FakeRunner {
+        results: VecDeque::from([windows(&[UUID]), list(serde_json::json!([]))]),
+        ..FakeRunner::default()
+    };
+    let hidden = handle_request(&reconcile, &mut hidden_runner);
+    assert!(matches!(
+        hidden.outcome,
+        ProviderWrapperOutcomeV1::Uncertain { .. }
+    ));
+    assert_eq!(hidden.idempotency_key, original_key);
+
+    let mut visible_runner = FakeRunner {
+        results: VecDeque::from([
+            windows(&[UUID]),
+            list(serde_json::json!([workspace(&description(&reconcile))])),
+        ]),
+        ..FakeRunner::default()
+    };
+    let visible = handle_request(&reconcile, &mut visible_runner);
+    assert_delivered(&visible, "codex");
+    assert_eq!(visible.idempotency_key, original_key);
+    assert_eq!(reconcile.delivery_fence.idempotency_key, original_key);
+    let create_count = submit_runner
+        .calls
+        .iter()
+        .chain(&hidden_runner.calls)
+        .chain(&visible_runner.calls)
+        .filter(|call| {
+            call.get(3..5) == Some(["workspace".to_owned(), "create".to_owned()].as_slice())
+        })
+        .count();
+    assert_eq!(create_count, 1);
 }
 
 #[test]

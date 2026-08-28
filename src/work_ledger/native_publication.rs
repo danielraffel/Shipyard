@@ -707,8 +707,8 @@ mod tests {
             "provider"
         }
 
-        fn launch_argv(&self) -> &[String] {
-            &[]
+        fn provider_launch_options(&self) -> crate::work_ledger::FreshAgentProviderLaunchOptions {
+            crate::work_ledger::FreshAgentProviderLaunchOptions::default()
         }
 
         fn profile_digest(&self) -> WorkLedgerResult<String> {

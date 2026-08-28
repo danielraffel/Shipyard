@@ -35,9 +35,6 @@ pub(crate) struct WakeConsumerPolicy {
 }
 
 /// The exact launch-profile surface used by the provider boundary.
-///
-/// Implementations must return the stored arrays directly. The consumer never
-/// joins them into a shell command or reconstructs provider flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FreshAgentResumeExpectation<'a> {
     pub(crate) workstream_handle: &'a str,
@@ -59,7 +56,7 @@ pub(crate) struct FreshAgentResumeExpectation<'a> {
 
 pub(crate) trait FreshAgentLaunchProfile {
     fn provider_id(&self) -> &str;
-    fn launch_argv(&self) -> &[String];
+    fn provider_launch_options(&self) -> FreshAgentProviderLaunchOptions;
     fn profile_digest(&self) -> WorkLedgerResult<String>;
     fn permits_fresh_agent(&self) -> bool;
 
@@ -81,6 +78,14 @@ pub(crate) trait FreshAgentLaunchProfile {
                 .to_owned(),
         )
     }
+}
+
+/// Minimal provider-owned launch choices copied from validated profile metadata.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FreshAgentProviderLaunchOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model_id: Option<String>,
 }
 
 /// Protected profile lookup, kept separate from provider execution.
@@ -143,11 +148,10 @@ fn active_consumer_locks() -> &'static Mutex<BTreeSet<PathBuf>> {
     ACTIVE_CONSUMER_LOCKS.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
-/// Launch request passed to an adapter without shell translation.
+/// Launch request passed to an adapter without shell translation or argv.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProviderLaunchRequest<'a> {
     pub(crate) fence: &'a DeliveryFence,
-    pub(crate) argv: &'a [String],
 }
 
 /// Typed provider outcome. Digests refer to protected receipts or diagnostics.
@@ -222,7 +226,7 @@ pub(crate) struct StoredProviderRequest {
     pub(crate) profile_ref: String,
     pub(crate) profile_object_ref: String,
     pub(crate) profile_digest: String,
-    pub(crate) argv: Vec<String>,
+    pub(crate) launch_options: FreshAgentProviderLaunchOptions,
     pub(crate) resume: StoredResumeExpectation,
 }
 
@@ -245,14 +249,14 @@ fn stored_resume_expectation(
     )?;
     if value.projection_revision == 0
         || value.checkpoint_generation == 0
-        || value.workstream_handle.is_empty()
-        || value.workstream_handle.len() > 128
+        || !is_canonical_workstream_handle(value.workstream_handle)
         || value.checkpoint_id.is_empty()
         || value.checkpoint_id.len() > 128
-        || value.repository.is_empty()
-        || value.repository.len() > 512
+        || crate::evidence::canonical_repository(value.repository) != value.repository
         || !is_exact_git_sha(value.head_sha)
-        || value.context_url.is_some_and(|url| url.len() > 4096)
+        || value
+            .context_url
+            .is_some_and(|url| !is_secret_free_context_url(url))
     {
         return Err(WorkLedgerError::Refused(
             "fresh-agent resume authority is incomplete or malformed".to_owned(),
@@ -275,6 +279,31 @@ fn stored_resume_expectation(
         success_continuation_digest: value.success_continuation_digest.to_owned(),
         failure_continuation_digest: value.failure_continuation_digest.to_owned(),
     })
+}
+
+fn is_canonical_workstream_handle(value: &str) -> bool {
+    let Some((team, number)) = value.split_once('-') else {
+        return false;
+    };
+    !team.is_empty()
+        && team.len() <= 16
+        && team.bytes().all(|byte| byte.is_ascii_uppercase())
+        && !number.is_empty()
+        && !number.starts_with('0')
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_secret_free_context_url(value: &str) -> bool {
+    let Some(remainder) = value.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = remainder.split('/').next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.contains('@')
+        && value.len() <= 4096
+        && !value.contains(['?', '#'])
+        && !value.chars().any(char::is_control)
+        && !value.chars().any(char::is_whitespace)
 }
 
 fn is_exact_git_sha(value: &str) -> bool {
@@ -353,6 +382,7 @@ impl WorkLedger {
                 "fresh-agent launch profile lacks immutable resume authority".to_owned(),
             )
         })?)?;
+        let launch_options = profile.provider_launch_options();
         if crate::evidence::canonical_repository(&resume.repository) != wake.repository {
             return Err(WorkLedgerError::Refused(
                 "launch profile repository does not match selected work".to_owned(),
@@ -377,7 +407,7 @@ impl WorkLedger {
             claim_fence,
             &capability,
             profile.provider_id(),
-            profile.launch_argv(),
+            launch_options,
             resume,
             &profile_object.object_ref,
         )?;
@@ -395,10 +425,7 @@ impl WorkLedger {
             }
         } else {
             self.mark_delivery_launched(&fence)?;
-            adapter.launch(ProviderLaunchRequest {
-                fence: &fence,
-                argv: profile.launch_argv(),
-            })
+            adapter.launch(ProviderLaunchRequest { fence: &fence })
         };
         self.finalize_wake(&fence, outcome)
     }
@@ -815,7 +842,7 @@ impl WorkLedger {
         mut fence: DeliveryFence,
         capability: &ProviderCapability,
         provider_id: &str,
-        argv: &[String],
+        launch_options: FreshAgentProviderLaunchOptions,
         resume: StoredResumeExpectation,
         profile_object_ref: &str,
     ) -> WorkLedgerResult<DeliveryFence> {
@@ -846,7 +873,7 @@ impl WorkLedger {
             .as_bytes(),
         );
         let request = StoredProviderRequest {
-            schema_version: 1,
+            schema_version: 2,
             wake_id: fence.wake_id.clone(),
             attempt: fence.attempt,
             adapter_id: capability.adapter_id.clone(),
@@ -855,7 +882,7 @@ impl WorkLedger {
             profile_ref: fence.profile_ref.clone(),
             profile_object_ref: profile_object_ref.to_owned(),
             profile_digest: fence.payload_digest.clone(),
-            argv: argv.to_vec(),
+            launch_options,
             resume,
         };
         let request_bytes = serde_json::to_vec(&request).map_err(|error| {

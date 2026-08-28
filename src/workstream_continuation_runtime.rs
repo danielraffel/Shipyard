@@ -11,9 +11,8 @@ use crate::app::{LaunchProfileV1, decode_protected_launch_profile};
 use crate::identity::RuntimeMode;
 use crate::provider_wrapper::{
     FreshResumeExpectationV1, ProviderDeliveryFenceV1, ProviderLaunchOptionsV1,
-    ProviderReasoningEffortV1, ProviderWrapperEnvironment, ProviderWrapperOperationV1,
-    ProviderWrapperRequestV1, ProviderWrapperRunResult, provider_wrapper_execution_supported,
-    run_provider_wrapper,
+    ProviderWrapperEnvironment, ProviderWrapperOperationV1, ProviderWrapperRequestV1,
+    ProviderWrapperRunResult, provider_wrapper_execution_supported, run_provider_wrapper,
 };
 use crate::work_ledger::{
     DeliveryFence, ExactProtectedProfileResolver, FreshAgentLaunchProfile, ProviderAdapter,
@@ -285,7 +284,7 @@ impl WorkLedgerProviderAdapter<'_> {
             return Err(());
         }
         let stored: StoredProviderRequest = serde_json::from_slice(&bytes).map_err(|_| ())?;
-        if stored.schema_version != 1
+        if stored.schema_version != 2
             || stored.wake_id != fence.wake_id
             || stored.attempt != fence.attempt
             || stored.adapter_id != fence.adapter_id
@@ -301,7 +300,9 @@ impl WorkLedgerProviderAdapter<'_> {
         let profile: LaunchProfileV1 = resolver
             .resolve_exact(&fence.work_item_id, &fence.payload_digest)
             .map_err(|_| ())?;
-        if profile.provider_id() != fence.provider_id || profile.launch_argv() != stored.argv {
+        if profile.provider_id() != fence.provider_id
+            || profile.provider_launch_options() != stored.launch_options
+        {
             return Err(());
         }
         let mut delivery_fence = ProviderDeliveryFenceV1 {
@@ -342,8 +343,8 @@ impl WorkLedgerProviderAdapter<'_> {
                 failure_continuation_digest: stored.resume.failure_continuation_digest,
             },
             launch_options: ProviderLaunchOptionsV1 {
-                model_id: profile.model_id().map(ToOwned::to_owned),
-                reasoning_effort: profile.reasoning_effort().and_then(parse_reasoning_effort),
+                model_id: stored.launch_options.model_id,
+                reasoning_effort: None,
             },
         })
     }
@@ -360,18 +361,6 @@ fn preflight_refusal(operation: ProviderWrapperOperationV1) -> ProviderOutcome {
     }
 }
 
-fn parse_reasoning_effort(value: &str) -> Option<ProviderReasoningEffortV1> {
-    match value {
-        "low" => Some(ProviderReasoningEffortV1::Low),
-        "medium" => Some(ProviderReasoningEffortV1::Medium),
-        "high" => Some(ProviderReasoningEffortV1::High),
-        "xhigh" => Some(ProviderReasoningEffortV1::Xhigh),
-        "max" => Some(ProviderReasoningEffortV1::Max),
-        "ultra" => Some(ProviderReasoningEffortV1::Ultra),
-        _ => None,
-    }
-}
-
 struct WorkerResult {
     executor: Box<dyn ContinuationExecutor>,
     result: Result<ContinuationTickResult, ContinuationTickError>,
@@ -384,8 +373,8 @@ pub(crate) struct WorkstreamContinuationRuntime {
     executor: Option<Box<dyn ContinuationExecutor>>,
     worker: Option<Receiver<WorkerResult>>,
     status: ContinuationRuntimeStatus,
-    retry_not_before: Option<Instant>,
-    retry_cooldown: Duration,
+    action_not_before: Option<Instant>,
+    action_cooldown: Duration,
 }
 
 impl WorkstreamContinuationRuntime {
@@ -410,14 +399,14 @@ impl WorkstreamContinuationRuntime {
         activation: Box<dyn ActivationAuthority>,
         executor: Box<dyn ContinuationExecutor>,
     ) -> Self {
-        Self::new_with_retry_cooldown(state_dir, activation, executor, Duration::from_secs(30))
+        Self::new_with_action_cooldown(state_dir, activation, executor, Duration::from_secs(30))
     }
 
-    fn new_with_retry_cooldown(
+    fn new_with_action_cooldown(
         state_dir: PathBuf,
         activation: Box<dyn ActivationAuthority>,
         executor: Box<dyn ContinuationExecutor>,
-        retry_cooldown: Duration,
+        action_cooldown: Duration,
     ) -> Self {
         Self {
             state_dir,
@@ -425,8 +414,8 @@ impl WorkstreamContinuationRuntime {
             executor: Some(executor),
             worker: None,
             status: ContinuationRuntimeStatus::default(),
-            retry_not_before: None,
-            retry_cooldown,
+            action_not_before: None,
+            action_cooldown,
         }
     }
 
@@ -458,13 +447,15 @@ impl WorkstreamContinuationRuntime {
             return;
         }
         if self
-            .retry_not_before
+            .action_not_before
             .is_some_and(|deadline| Instant::now() < deadline)
         {
-            self.set_status(ContinuationRuntimeState::Retrying, None);
+            if self.status.state != ContinuationRuntimeState::Uncertain {
+                self.set_status(ContinuationRuntimeState::Retrying, None);
+            }
             return;
         }
-        self.retry_not_before = None;
+        self.action_not_before = None;
         let action = match executor.next_uncertain(&self.state_dir, &config) {
             Ok(Some(wake_id)) => ContinuationAction::ReconcileUncertain(wake_id),
             Ok(None) => match executor.has_pending(&self.state_dir, &config) {
@@ -543,10 +534,11 @@ impl WorkstreamContinuationRuntime {
                 self.set_status(ContinuationRuntimeState::Delivered, None)
             }
             Ok(ContinuationTickResult::Retrying) => {
-                self.retry_not_before = Some(Instant::now() + self.retry_cooldown);
+                self.action_not_before = Some(Instant::now() + self.action_cooldown);
                 self.set_status(ContinuationRuntimeState::Retrying, None)
             }
             Ok(ContinuationTickResult::Uncertain) => {
+                self.action_not_before = Some(Instant::now() + self.action_cooldown);
                 self.set_status(ContinuationRuntimeState::Uncertain, None)
             }
             Ok(ContinuationTickResult::Failed) => {
@@ -792,7 +784,7 @@ mod tests {
         let selections = Arc::new(AtomicUsize::new(0));
         let executions = Arc::new(AtomicUsize::new(0));
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let mut runtime = WorkstreamContinuationRuntime::new_with_retry_cooldown(
+        let mut runtime = WorkstreamContinuationRuntime::new_with_action_cooldown(
             PathBuf::from("/unused"),
             Box::new(SequenceActivation(Mutex::new(
                 std::iter::repeat_with(ready).take(32).collect(),
@@ -816,6 +808,43 @@ mod tests {
         }
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert_eq!(selections.load(Ordering::SeqCst), selections_after_retry);
+        assert_eq!(observed.lock().expect("observed").len(), 1);
+    }
+
+    #[test]
+    fn uncertain_cooldown_prevents_repeated_hundred_millisecond_actions() {
+        let selections = Arc::new(AtomicUsize::new(0));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = WorkstreamContinuationRuntime::new_with_action_cooldown(
+            PathBuf::from("/unused"),
+            Box::new(SequenceActivation(Mutex::new(
+                std::iter::repeat_with(ready).take(32).collect(),
+            ))),
+            Box::new(RecordingExecutor {
+                selections: Arc::clone(&selections),
+                executions: Arc::clone(&executions),
+                uncertain: Some("wake:redacted".to_owned()),
+                pending: false,
+                block: None,
+                observed: Arc::clone(&observed),
+                result: ContinuationTickResult::Uncertain,
+            }),
+            Duration::from_secs(2),
+        );
+        runtime.tick();
+        wait_for(&mut runtime, ContinuationRuntimeState::Uncertain);
+        let selections_after_uncertain = selections.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            thread::sleep(Duration::from_millis(100));
+            runtime.tick();
+        }
+        assert_eq!(runtime.status().state, ContinuationRuntimeState::Uncertain);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            selections.load(Ordering::SeqCst),
+            selections_after_uncertain
+        );
         assert_eq!(observed.lock().expect("observed").len(), 1);
     }
 }

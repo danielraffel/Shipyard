@@ -247,6 +247,11 @@ impl WorkLedger {
             serde_json::from_slice(&request_bytes).map_err(|_| {
                 WorkLedgerError::Refused("provider request authority is malformed".to_owned())
             })?;
+        if request.schema_version != 2 {
+            return Err(WorkLedgerError::Refused(
+                "provider request authority has an unsupported schema".to_owned(),
+            ));
+        }
         let receipt: AgentContextReceipt = serde_json::from_slice(receipt_bytes).map_err(|_| {
             WorkLedgerError::Refused("agent context receipt is malformed".to_owned())
         })?;
@@ -474,6 +479,11 @@ impl WorkLedger {
             serde_json::from_slice(&request_bytes).map_err(|_| {
                 WorkLedgerError::Refused("provider request authority is malformed".to_owned())
             })?;
+        if request.schema_version != 2 {
+            return Err(WorkLedgerError::Refused(
+                "provider request authority has an unsupported schema".to_owned(),
+            ));
+        }
         if expected.checkpoint_generation <= request.resume.checkpoint_generation
             || expected.checkpoint_digest == request.resume.checkpoint_digest
             || expected.repository != request.resume.repository

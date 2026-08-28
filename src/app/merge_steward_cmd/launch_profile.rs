@@ -15,9 +15,9 @@ const PROTECTED_PROFILE_PREFIX: &[u8] = b"shipyard-launch-profile-v1\0";
 
 /// Private, provider- and terminal-neutral process restoration contract.
 ///
-/// Shipyard persists this data but does not interpret or execute it. A trusted
-/// executor must bind the exact profile and work-item generation to its own
-/// process-launch contract before using either argv.
+/// Generic handoff storage does not interpret or execute this data. The native
+/// fresh-agent publication path separately accepts only a strict prompt-free
+/// grammar before projecting typed metadata into its provider request.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LaunchProfileV1 {
@@ -42,34 +42,12 @@ impl LaunchProfileV1 {
         &self.worktree.path
     }
 
-    pub(crate) fn model_id(&self) -> Option<&str> {
-        self.provider.model.as_deref()
-    }
-
-    /// Preserve only reasoning settings already expressed in a recognized
-    /// provider grammar. Missing or unfamiliar forms never acquire a default.
-    pub(crate) fn reasoning_effort(&self) -> Option<&str> {
-        match self.provider.provider.as_str() {
-            "codex" => self.launch_argv.windows(2).find_map(|pair| {
-                (pair[0] == "-c")
-                    .then(|| pair[1].strip_prefix("model_reasoning_effort="))
-                    .flatten()
-                    .and_then(|value| {
-                        if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-                            Some(&value[1..value.len() - 1])
-                        } else if !value.contains('"') {
-                            Some(value)
-                        } else {
-                            None
-                        }
-                    })
-            }),
-            "claude" => self
-                .launch_argv
-                .windows(2)
-                .find_map(|pair| (pair[0] == "--effort").then_some(pair[1].as_str())),
-            _ => None,
+    pub(crate) fn validate_native_fresh_agent_grammar(&self) -> Result<(), CliFailure> {
+        if let Some(model_id) = self.provider.model.as_deref() {
+            validate_provider_option("model ID", model_id)?;
         }
+        validate_native_argv(self, &self.launch_argv, false)?;
+        validate_native_argv(self, &self.resume_argv, true)
     }
 }
 
@@ -147,8 +125,10 @@ impl crate::work_ledger::FreshAgentLaunchProfile for LaunchProfileV1 {
         &self.provider.provider
     }
 
-    fn launch_argv(&self) -> &[String] {
-        &self.launch_argv
+    fn provider_launch_options(&self) -> crate::work_ledger::FreshAgentProviderLaunchOptions {
+        crate::work_ledger::FreshAgentProviderLaunchOptions {
+            model_id: self.provider.model.clone(),
+        }
     }
 
     fn profile_digest(&self) -> crate::work_ledger::WorkLedgerResult<String> {
@@ -263,6 +243,93 @@ pub(super) fn validate_launch_profile(profile: &LaunchProfileV1) -> Result<(), C
     validate_metadata("worktree lineage ID", &profile.worktree.lineage_id)?;
     if let Some(bootstrap) = profile.continuation_bootstrap.as_ref() {
         validate_continuation_bootstrap(profile, bootstrap)?;
+    }
+    Ok(())
+}
+
+fn validate_native_argv(
+    profile: &LaunchProfileV1,
+    argv: &[String],
+    resume: bool,
+) -> Result<(), CliFailure> {
+    let executable = argv
+        .first()
+        .map(String::as_str)
+        .map(Path::new)
+        .and_then(|path| path.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let provider = profile.provider.provider.as_str();
+    if executable != provider || !matches!(provider, "codex" | "claude") {
+        return Err(CliFailure::new(
+            1,
+            "native fresh-agent argv uses an unrecognized provider executable",
+        ));
+    }
+    let expected_session = profile
+        .session
+        .as_ref()
+        .map(|session| session.provider_session_id.as_str());
+    let mut index = 1;
+    if resume && provider == "codex" {
+        if argv.get(index).map(String::as_str) != Some("resume") {
+            return Err(CliFailure::new(1, "native codex resume grammar is invalid"));
+        }
+        index += 1;
+    }
+    let mut model = None;
+    let mut session = None;
+    while index < argv.len() {
+        match (provider, argv[index].as_str()) {
+            (_, "--model") if model.is_none() => {
+                model = Some(argv.get(index + 1).map(String::as_str).ok_or_else(|| {
+                    CliFailure::new(1, "native fresh-agent model flag has no value")
+                })?);
+                index += 2;
+            }
+            ("claude", "--resume") if resume && session.is_none() => {
+                session = Some(argv.get(index + 1).map(String::as_str).ok_or_else(|| {
+                    CliFailure::new(1, "native claude resume flag has no session")
+                })?);
+                index += 2;
+            }
+            ("codex", value) if resume && session.is_none() => {
+                session = Some(value);
+                index += 1;
+            }
+            _ => {
+                return Err(CliFailure::new(
+                    1,
+                    "native fresh-agent argv contains a prompt, secret-bearing, or unrecognized argument",
+                ));
+            }
+        }
+    }
+    if model != profile.provider.model.as_deref()
+        || (resume && session != expected_session)
+        || (!resume && session.is_some())
+    {
+        return Err(CliFailure::new(
+            1,
+            "native fresh-agent argv does not exactly match validated provider metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_option(label: &str, value: &str) -> Result<(), CliFailure> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-' | b':')
+        })
+    {
+        return Err(CliFailure::new(
+            1,
+            format!("{label} must be a bounded canonical provider token"),
+        ));
     }
     Ok(())
 }
@@ -599,13 +666,13 @@ mod tests {
     }
 
     #[test]
-    fn wake_consumer_reads_the_exact_launch_array_without_translation() {
+    fn wake_consumer_projects_only_validated_provider_metadata() {
         use crate::work_ledger::FreshAgentLaunchProfile;
 
         let profile = profile();
         assert_eq!(
-            FreshAgentLaunchProfile::launch_argv(&profile),
-            profile.launch_argv.as_slice()
+            FreshAgentLaunchProfile::provider_launch_options(&profile).model_id,
+            Some("model-x".to_owned())
         );
         assert_eq!(
             FreshAgentLaunchProfile::profile_digest(&profile).expect("consumer digest"),
@@ -615,24 +682,47 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_options_preserve_only_recognized_exact_provider_grammar() {
+    fn native_grammar_is_prompt_free_and_exactly_matches_metadata() {
         let mut codex = profile();
         codex.provider.provider = "codex".into();
-        codex.launch_argv = vec![
+        codex.launch_argv = vec!["codex".into(), "--model".into(), "model-x".into()];
+        codex.resume_argv = vec![
             "codex".into(),
-            "-c".into(),
-            "model_reasoning_effort=medium".into(),
+            "resume".into(),
+            "--model".into(),
+            "model-x".into(),
+            "session-7".into(),
         ];
-        assert_eq!(codex.reasoning_effort(), Some("medium"));
+        codex
+            .validate_native_fresh_agent_grammar()
+            .expect("codex grammar");
 
         let mut claude = profile();
         claude.provider.provider = "claude".into();
-        claude.launch_argv = vec!["claude".into(), "--effort".into(), "high".into()];
-        assert_eq!(claude.reasoning_effort(), Some("high"));
+        claude.launch_argv = vec!["claude".into(), "--model".into(), "model-x".into()];
+        claude.resume_argv = vec![
+            "claude".into(),
+            "--model".into(),
+            "model-x".into(),
+            "--resume".into(),
+            "session-7".into(),
+        ];
+        claude
+            .validate_native_fresh_agent_grammar()
+            .expect("claude grammar");
 
-        codex.launch_argv = vec!["codex".into(), "--effort".into(), "ultra".into()];
-        assert_eq!(codex.reasoning_effort(), None);
-        assert_eq!(codex.model_id(), Some("model-x"));
+        let mut unrecognized_effort = codex.clone();
+        unrecognized_effort
+            .launch_argv
+            .extend(["-c".into(), "model_reasoning_effort=\"medium\"".into()]);
+        assert!(
+            unrecognized_effort
+                .validate_native_fresh_agent_grammar()
+                .is_err()
+        );
+        codex.launch_argv.push("raw prompt with a secret".into());
+        assert!(codex.validate_native_fresh_agent_grammar().is_err());
+        assert_eq!(codex.provider.model.as_deref(), Some("model-x"));
         assert!(Path::new(codex.worktree_path()).is_absolute());
     }
 

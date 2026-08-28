@@ -93,13 +93,18 @@ opaque account identifiers instead.
 ## Inert executor boundary
 
 Shipyard now contains an internal, default-off wake-consumer contract. It
-selects the canonical outbox, durably claims a generation-fenced wake, passes
-the stored `launch_argv` array directly to a capability-matched provider
-adapter, and durably records acknowledgement, retry, failure, or uncertainty.
-It never joins argv through a shell. Restart reconciliation may inspect an
-idempotent claim; an unproven non-idempotent claim becomes `uncertain` and is
-never blindly relaunched. A successful acknowledgement advances the same
-canonical work item to agent-owned repair in the final transaction.
+selects the canonical outbox, durably claims a generation-fenced wake, and
+projects only typed launch choices from validated profile metadata
+into a capability-matched provider request. The provider adapter owns its
+launch grammar; arbitrary launch or resume argv is never copied into the
+durable provider request. Native fresh-agent publication accepts retained
+legacy argv only when it is a recognized prompt-free codex/claude grammar.
+The durable provider-request object is schema v2; argv-bearing schema-v1
+objects are not migrated into executable authority and fail closed.
+Restart reconciliation inspects the same idempotency fence; an unproven outcome
+remains `uncertain` and is never blindly relaunched. A successful
+acknowledgement advances the same canonical work item to agent-owned repair in
+the final transaction.
 
 This is an implementation and deterministic-test seam, not an enabled daemon
 feature. No CLI or schedule can set its internal activation policy. A future

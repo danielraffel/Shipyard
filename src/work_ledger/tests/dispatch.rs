@@ -8,7 +8,7 @@ use crate::work_ledger::dispatch::{
 #[derive(Clone)]
 struct TestProfile {
     provider: String,
-    argv: Vec<String>,
+    launch_options: FreshAgentProviderLaunchOptions,
     digest: String,
     repository: String,
     permits_fresh: bool,
@@ -20,8 +20,8 @@ impl FreshAgentLaunchProfile for TestProfile {
         &self.provider
     }
 
-    fn launch_argv(&self) -> &[String] {
-        &self.argv
+    fn provider_launch_options(&self) -> FreshAgentProviderLaunchOptions {
+        self.launch_options.clone()
     }
 
     fn profile_digest(&self) -> WorkLedgerResult<String> {
@@ -86,7 +86,7 @@ struct Adapter {
     capability: Option<ProviderCapability>,
     launch_outcomes: Vec<ProviderOutcome>,
     reconcile_outcome: ProviderOutcome,
-    launched_argv: Vec<Vec<String>>,
+    launch_count: usize,
     launch_fences: Vec<DeliveryFence>,
     reconcile_fences: Vec<DeliveryFence>,
     panic_after_claim: bool,
@@ -106,7 +106,7 @@ impl Adapter {
             reconcile_outcome: ProviderOutcome::Delivered {
                 receipt: b"reconciled receipt".to_vec(),
             },
-            launched_argv: Vec::new(),
+            launch_count: 0,
             launch_fences: Vec::new(),
             reconcile_fences: Vec::new(),
             panic_after_claim: false,
@@ -122,7 +122,7 @@ impl ProviderAdapter for Adapter {
     }
 
     fn launch(&mut self, request: ProviderLaunchRequest<'_>) -> ProviderOutcome {
-        self.launched_argv.push(request.argv.to_vec());
+        self.launch_count += 1;
         self.launch_fences.push(request.fence.clone());
         assert!(
             !self.panic_after_claim,
@@ -216,11 +216,9 @@ fn add_wake_labeled(
     ledger.register_route(&route).expect("route");
     let profile = TestProfile {
         provider: "subrouter".to_owned(),
-        argv: vec![
-            "/absolute/provider-wrapper".to_owned(),
-            "agent".to_owned(),
-            "--prompt=value with spaces;$(never-a-shell)".to_owned(),
-        ],
+        launch_options: FreshAgentProviderLaunchOptions {
+            model_id: Some("model-tier-a".to_owned()),
+        },
         digest: digest(b"profile"),
         repository: "danielraffel/pulp".to_owned(),
         permits_fresh: true,
@@ -363,7 +361,7 @@ fn deliver_wake(ledger: &WorkLedger, profile: TestProfile) -> (String, String) {
 }
 
 #[test]
-fn success_passes_exact_argv_and_persists_delivery_without_claiming_agent_ownership() {
+fn success_persists_only_typed_launch_options_without_claiming_agent_ownership() {
     let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
     let mut resolver = Resolver {
         profile: profile.clone(),
@@ -376,7 +374,7 @@ fn success_passes_exact_argv_and_persists_delivery_without_claiming_agent_owners
             .expect("consume"),
         WakeDeliveryResult::Delivered
     );
-    assert_eq!(adapter.launched_argv, vec![profile.argv]);
+    assert_eq!(adapter.launch_count, 1);
     assert_eq!(adapter.launch_fences.len(), 1);
     assert_eq!(outbox_state(&ledger, &wake_id), "delivered");
     let connection = ledger.connect_read_only().expect("connection");
@@ -412,6 +410,29 @@ fn success_passes_exact_argv_and_persists_delivery_without_claiming_agent_owners
         ("delivered".to_owned(), "released".to_owned(), 64)
     );
     assert_eq!(ledger.status().expect("status").protected_objects, 3);
+    let (_, request_bytes) = ledger
+        .open_protected_object(&adapter.launch_fences[0].request_object_ref)
+        .expect("stored provider request");
+    let stored: serde_json::Value = serde_json::from_slice(&request_bytes).expect("request JSON");
+    assert_eq!(stored["schema_version"], 2);
+    assert!(stored.get("argv").is_none());
+    assert!(stored.get("launch_argv").is_none());
+    assert!(stored.get("resume_argv").is_none());
+    assert_eq!(stored["launch_options"]["model_id"], "model-tier-a");
+    let decoded: StoredProviderRequest =
+        serde_json::from_value(stored.clone()).expect("schema-v2 request");
+    assert_eq!(decoded.schema_version, 2);
+    let mut legacy = stored;
+    legacy["schema_version"] = serde_json::json!(1);
+    legacy
+        .as_object_mut()
+        .expect("request object")
+        .remove("launch_options");
+    legacy["argv"] = serde_json::json!(["provider", "raw prompt secret"]);
+    assert!(
+        serde_json::from_value::<StoredProviderRequest>(legacy).is_err(),
+        "legacy argv-bearing requests must fail closed"
+    );
 }
 
 #[test]
@@ -895,7 +916,7 @@ fn restart_reconciles_idempotent_claim_without_duplicate_launch() {
             .expect("reconcile"),
         WakeDeliveryResult::Delivered
     );
-    assert!(restarted.launched_argv.is_empty());
+    assert_eq!(restarted.launch_count, 0);
     assert_eq!(restarted.reconcile_fences.len(), 1);
     assert_eq!(
         ledger
@@ -926,7 +947,7 @@ fn non_idempotent_restart_becomes_uncertain_without_launch_or_reconcile() {
             .expect("uncertain"),
         WakeDeliveryResult::Uncertain
     );
-    assert!(restarted.launched_argv.is_empty());
+    assert_eq!(restarted.launch_count, 0);
     assert!(restarted.reconcile_fences.is_empty());
     assert_eq!(outbox_state(&ledger, &wake_id), "uncertain");
     assert_eq!(
@@ -959,7 +980,7 @@ fn non_idempotent_restart_becomes_uncertain_without_launch_or_reconcile() {
             .expect("evidence reconciliation"),
         WakeDeliveryResult::Delivered
     );
-    assert!(restarted.launched_argv.is_empty());
+    assert_eq!(restarted.launch_count, 0);
     assert_eq!(restarted.reconcile_fences.len(), 1);
     assert_eq!(
         restarted.reconcile_fences[0].idempotency_key,
@@ -1031,6 +1052,7 @@ fn provider_observation_history_is_append_only_ordered_and_survives_reopen() {
             .expect("observation A"),
         WakeDeliveryResult::Uncertain
     );
+    let original_key = adapter.launch_fences[0].idempotency_key.clone();
     adapter.reconcile_outcome = ProviderOutcome::Uncertain {
         evidence: b"observation B".to_vec(),
     };
@@ -1040,6 +1062,19 @@ fn provider_observation_history_is_append_only_ordered_and_survives_reopen() {
             .expect("observation B"),
         WakeDeliveryResult::Uncertain
     );
+    assert_eq!(adapter.launch_count, 1);
+    assert_eq!(adapter.reconcile_fences[0].idempotency_key, original_key);
+    let attempt_count: u64 = ledger
+        .connect_read_only()
+        .expect("connection")
+        .query_row(
+            "SELECT count(*) FROM wake_attempts WHERE wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("attempt count");
+    assert_eq!(attempt_count, 1);
+    assert_eq!(outbox_state(&ledger, &wake_id), "uncertain");
 
     let reopened = WorkLedger::open(temp.path()).expect("reopen after uncertainty");
     adapter.reconcile_outcome = ProviderOutcome::Delivered {
@@ -1051,6 +1086,8 @@ fn provider_observation_history_is_append_only_ordered_and_survives_reopen() {
             .expect("observation C"),
         WakeDeliveryResult::Delivered
     );
+    assert_eq!(adapter.launch_count, 1);
+    assert_eq!(adapter.reconcile_fences[1].idempotency_key, original_key);
     let reopened = WorkLedger::open(temp.path()).expect("reopen after delivery");
     let rows: Vec<(u64, String, String, String, String)> = {
         let connection = reopened.connect_read_only().expect("connection");
@@ -1126,7 +1163,7 @@ fn pre_v3_claim_without_attempt_proof_becomes_uncertain() {
             .expect("conservative recovery"),
         WakeDeliveryResult::Uncertain
     );
-    assert!(adapter.launched_argv.is_empty());
+    assert_eq!(adapter.launch_count, 0);
     assert!(adapter.reconcile_fences.is_empty());
     assert_eq!(outbox_state(&ledger, &wake_id), "uncertain");
 }
@@ -1148,7 +1185,7 @@ fn stale_generation_refuses_before_provider_launch() {
         .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
         .expect_err("stale generation");
     assert!(error.to_string().contains("generation is stale"));
-    assert!(adapter.launched_argv.is_empty());
+    assert_eq!(adapter.launch_count, 0);
     assert_eq!(outbox_state(&ledger, &wake_id), "pending");
 }
 
@@ -1164,7 +1201,7 @@ fn missing_provider_capability_fails_durably_without_launch() {
             .expect("missing capability"),
         WakeDeliveryResult::Failed
     );
-    assert!(adapter.launched_argv.is_empty());
+    assert_eq!(adapter.launch_count, 0);
     assert_eq!(outbox_state(&ledger, &wake_id), "failed");
     let phase: String = ledger
         .connect_read_only()
@@ -1192,7 +1229,7 @@ fn route_profile_identity_mismatch_refuses_before_claim_or_launch() {
         .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
         .expect_err("route/profile mismatch");
     assert!(error.to_string().contains("wake route is missing, stale"));
-    assert!(adapter.launched_argv.is_empty());
+    assert_eq!(adapter.launch_count, 0);
     assert_eq!(outbox_state(&ledger, &wake_id), "pending");
 }
 
@@ -1206,7 +1243,7 @@ fn route_provider_identity_mismatch_refuses_before_claim_or_launch() {
         .consume_one_wake(active_policy(), &mut resolver, &mut adapter)
         .expect_err("route/provider mismatch");
     assert!(error.to_string().contains("wake route is missing, stale"));
-    assert!(adapter.launched_argv.is_empty());
+    assert_eq!(adapter.launch_count, 0);
     assert_eq!(outbox_state(&ledger, &wake_id), "pending");
 }
 
@@ -1270,7 +1307,7 @@ fn live_consumer_lease_fences_second_and_third_consumers_during_provider_call() 
             .expect_err("live consumer owns wake");
         assert!(error.to_string().contains("another live wake consumer"));
         assert_eq!(resolver.calls, 0);
-        assert!(adapter.launched_argv.is_empty());
+        assert_eq!(adapter.launch_count, 0);
     }
     assert_eq!(outbox_state(&ledger, &wake_id), "claimed");
     release_tx.send(()).expect("release launch");
@@ -1303,7 +1340,7 @@ fn default_off_policy_refuses_before_profile_lookup_or_mutation() {
         .expect_err("activation remains off");
     assert!(error.to_string().contains("explicitly enabled"));
     assert_eq!(resolver.calls, 0);
-    assert!(adapter.launched_argv.is_empty());
+    assert_eq!(adapter.launch_count, 0);
     assert_eq!(outbox_state(&ledger, &wake_id), "pending");
     assert!(!temp.path().join("wake-consumer.lock").exists());
 }
