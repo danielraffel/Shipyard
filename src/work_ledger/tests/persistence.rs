@@ -4,6 +4,7 @@ pub(super) fn install_exact_v1_registry_schema(
     ledger: &WorkLedger,
     fixtures: &[(&AdapterBindingRecord, &str)],
 ) {
+    strip_v4_incarnation_schema(ledger);
     let mut connection = ledger.connect_read_write().expect("connection");
     let transaction = connection.transaction().expect("v1 transaction");
     transaction
@@ -55,6 +56,85 @@ pub(super) fn install_exact_v1_registry_schema(
         )
         .expect("finish v1 fixture");
     transaction.commit().expect("commit v1 fixture");
+}
+
+pub(super) fn strip_v4_incarnation_schema(ledger: &WorkLedger) {
+    let connection = ledger.connect_read_write().expect("v4 connection");
+    if schema_version(&connection).expect("schema version") != 4 {
+        return;
+    }
+    connection
+        .execute_batch(
+            "DROP TRIGGER events_incarnation_insert;
+             DROP TRIGGER events_incarnation_update;
+             DROP TRIGGER outbox_incarnation_insert;
+             DROP TRIGGER outbox_incarnation_update;
+             DROP TRIGGER ledger_incarnation_update;
+             DROP TRIGGER ledger_incarnation_delete;
+             ALTER TABLE events RENAME TO events_v4;
+             CREATE TABLE events (
+               event_id TEXT PRIMARY KEY,
+               work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE RESTRICT,
+               work_generation INTEGER NOT NULL,
+               owner_generation INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               from_state TEXT,
+               to_state TEXT NOT NULL,
+               payload_digest TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             INSERT INTO events
+               (event_id, work_item_id, work_generation, owner_generation, kind,
+                from_state, to_state, payload_digest, created_at)
+             SELECT event_id, work_item_id, work_generation, owner_generation, kind,
+                    from_state, to_state, payload_digest, created_at FROM events_v4;
+             DROP TABLE events_v4;
+             DROP TABLE ledger_metadata;
+             PRAGMA user_version = 3;",
+        )
+        .expect("strip v4 incarnation fixture");
+}
+
+#[test]
+fn fresh_ledger_creates_one_stable_incarnation_and_verifies_every_open() {
+    let temp = TempDir::new().expect("temp");
+    let ledger = WorkLedger::open(temp.path()).expect("fresh ledger");
+    validate_opaque_ref(
+        "ledger incarnation",
+        ledger.ledger_incarnation_ref(),
+        "ledger",
+    )
+    .expect("opaque incarnation");
+    let first = ledger.ledger_incarnation_ref().to_owned();
+    let reopened = WorkLedger::open(temp.path()).expect("reopened ledger");
+    assert_eq!(reopened.ledger_incarnation_ref(), first);
+
+    let connection = reopened.connect_read_write().expect("verified connection");
+    assert!(
+        connection
+            .execute(
+                "UPDATE ledger_metadata SET ledger_incarnation_ref = ?1 WHERE singleton = 1",
+                [opaque_ref("ledger", "forged")],
+            )
+            .is_err(),
+        "the once-created incarnation must be immutable"
+    );
+}
+
+#[test]
+fn replaced_ledger_incarnation_is_refused_by_existing_handle() {
+    let temp = TempDir::new().expect("temp");
+    let stale = WorkLedger::open(temp.path()).expect("first ledger");
+    let first = stale.ledger_incarnation_ref().to_owned();
+    let original_path = WorkLedger::path_at(temp.path());
+    let archived_path = temp.path().join("replaced-work-items.sqlite3");
+    std::fs::rename(&original_path, archived_path).expect("archive exact database");
+    let replacement = WorkLedger::open(temp.path()).expect("replacement ledger");
+    assert_ne!(replacement.ledger_incarnation_ref(), first);
+    assert!(matches!(
+        stale.status(),
+        Err(WorkLedgerError::Refused(reason)) if reason.contains("incarnation changed")
+    ));
 }
 
 #[derive(serde::Serialize)]
@@ -174,7 +254,7 @@ fn v1_registry_migrates_transactionally_and_accepts_exact_agent_binding() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate exact v1 ledger");
     let connection = migrated.connect_read_only().expect("inspect migration");
-    assert_eq!(schema_version(&connection).expect("schema version"), 3);
+    assert_eq!(schema_version(&connection).expect("schema version"), 4);
     let preserved: Vec<(String, String, String)> = {
         let mut statement = connection
             .prepare(
@@ -247,8 +327,8 @@ fn route_bearing_v1_ledger_is_preserved_for_explicit_reconciliation() {
     ledger.import(&[candidate]).expect("v1 work fixture");
     let (route, _) = sample_route(&work_id, 1);
     let terminal_adapter = adapter_binding(AdapterAxis::Terminal, "wezterm", "wezterm");
-    let legacy_payload = insert_v1_route_and_wake(&ledger, &work_id, &route);
     install_exact_v1_registry_schema(&ledger, &[(&terminal_adapter, "active")]);
+    let legacy_payload = insert_v1_route_and_wake(&ledger, &work_id, &route);
     drop(ledger);
 
     match WorkLedger::open(temp.path()) {

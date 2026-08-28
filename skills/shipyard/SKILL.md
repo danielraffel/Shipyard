@@ -1303,8 +1303,14 @@ revision-fenced per-repository ceiling, and refuse when closure is unknown or
 exceeds the classified failed-job set. Shadow observation must not invent that
 graph or cost evidence from check names.
 The future transactional wake API derives a deterministic wake ID from the
-complete work/owner generation and delivery fence; a caller-supplied identity
-that does not match that derivation is rejected before commit.
+complete work/owner generation, route, payload, and immutable database
+`ledger_incarnation_ref`; a caller-supplied identity that does not match that
+derivation is rejected before commit. Every daemon process creates one
+`dispatcher_epoch_ref` and must supply it to the claim API. Delivery claims,
+start tokens, receipts, outbox rows, and audit events bind both identities.
+Schema migration refuses active legacy rows because it never invents missing
+dispatcher provenance. This API remains inert and must not be treated as a
+consumer or dispatch activation.
 Delivery is claimed with a bounded lease and exact adapter-generation fence.
 Only an unstarted expired claim may requeue; a started delivery expires to an
 uncertain terminal receipt and must never be retried automatically. Accepted,

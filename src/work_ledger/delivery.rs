@@ -54,6 +54,8 @@ pub(super) struct DeliveryRouteIdentity {
 #[serde(deny_unknown_fields)]
 pub(super) struct DeliveryClaim {
     pub(super) schema_version: u32,
+    pub(super) ledger_incarnation_ref: String,
+    pub(super) dispatcher_epoch_ref: String,
     pub(super) wake_id: String,
     pub(super) claim_id: String,
     pub(super) claimant_ref: String,
@@ -71,10 +73,20 @@ pub(super) struct DeliveryClaim {
 }
 
 /// Token proving Shipyard committed the possible-external-delivery boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct StartedDelivery {
     pub(super) claim: DeliveryClaim,
     pub(super) started_at: DateTime<Utc>,
+    pub(super) start_identity_digest: String,
+}
+
+/// One process-lifetime dispatcher identity. Creating this token is inert; it
+/// does not start a consumer or perform external delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DispatcherEpoch {
+    pub(super) ledger_incarnation_ref: String,
+    pub(super) dispatcher_epoch_ref: String,
 }
 
 /// Exact, opaque receipt returned only after an adapter accepted a wake.
@@ -85,6 +97,7 @@ pub(super) struct DeliveryReceipt {
     wake_id: String,
     claim_id: String,
     delivery_identity_digest: String,
+    pub(super) delivery_start_digest: Option<String>,
     receipt_kind: DeliveryReceiptKind,
     observed_native_session_ref: Option<String>,
     transport_evidence_digest: String,
@@ -123,6 +136,7 @@ pub(super) enum ExpiredClaimDisposition {
 #[derive(Clone, Debug)]
 struct PendingWake {
     wake_id: String,
+    ledger_incarnation_ref: String,
     work_id: String,
     work_generation: u64,
     owner_generation: u64,
@@ -140,6 +154,9 @@ struct ExpiredClaimRecord {
     work_id: String,
     work_generation: u64,
     owner_generation: u64,
+    ledger_incarnation_ref: String,
+    dispatcher_epoch_ref: String,
+    delivery_start_digest: Option<String>,
 }
 
 struct StoredRouteRow {
@@ -170,10 +187,41 @@ impl DeliveryClaim {
                 "unsupported delivery claim schema".to_owned(),
             ));
         }
+        validate_opaque_ref(
+            "ledger_incarnation_ref",
+            &self.ledger_incarnation_ref,
+            "ledger",
+        )?;
+        validate_opaque_ref(
+            "dispatcher_epoch_ref",
+            &self.dispatcher_epoch_ref,
+            "dispatcher",
+        )?;
         let expected = self.clone().finalize()?.identity_digest;
         if expected != self.identity_digest {
             return Err(WorkLedgerError::Refused(
                 "delivery claim identity is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl StartedDelivery {
+    fn finalize(mut self) -> WorkLedgerResult<Self> {
+        self.start_identity_digest.clear();
+        let encoded = serde_json::to_vec(&self).map_err(|_| {
+            WorkLedgerError::Refused("delivery start cannot be serialized".to_owned())
+        })?;
+        self.start_identity_digest = digest(&encoded);
+        Ok(self)
+    }
+
+    fn validate_identity(&self) -> WorkLedgerResult<()> {
+        self.claim.validate_identity()?;
+        if self.clone().finalize()?.start_identity_digest != self.start_identity_digest {
+            return Err(WorkLedgerError::Refused(
+                "delivery start identity is invalid".to_owned(),
             ));
         }
         Ok(())
@@ -188,6 +236,7 @@ impl DeliveryReceipt {
     ) -> WorkLedgerResult<Self> {
         Self::accepted_for_claim(
             &started.claim,
+            Some(&started.start_identity_digest),
             observed_native_session_ref,
             transport_evidence_digest,
         )
@@ -196,11 +245,13 @@ impl DeliveryReceipt {
     /// Build exact acceptance evidence recovered after an uncertain restart.
     pub(super) fn accepted_after_uncertainty(
         claim: &DeliveryClaim,
+        delivery_start_digest: &str,
         observed_native_session_ref: String,
         transport_evidence_digest: String,
     ) -> WorkLedgerResult<Self> {
         Self::accepted_for_claim(
             claim,
+            Some(delivery_start_digest),
             observed_native_session_ref,
             transport_evidence_digest,
         )
@@ -209,10 +260,12 @@ impl DeliveryReceipt {
     /// Build proof that an uncertain external attempt was definitively not delivered.
     pub(super) fn not_delivered_after_uncertainty(
         claim: &DeliveryClaim,
+        delivery_start_digest: &str,
         transport_evidence_digest: &str,
     ) -> WorkLedgerResult<Self> {
         Self::outcome(
             claim,
+            Some(delivery_start_digest),
             DeliveryReceiptKind::ReconciledNotDelivered,
             transport_evidence_digest,
         )
@@ -220,6 +273,7 @@ impl DeliveryReceipt {
 
     fn accepted_for_claim(
         claim: &DeliveryClaim,
+        delivery_start_digest: Option<&str>,
         observed_native_session_ref: String,
         transport_evidence_digest: String,
     ) -> WorkLedgerResult<Self> {
@@ -235,6 +289,7 @@ impl DeliveryReceipt {
             wake_id: claim.wake_id.clone(),
             claim_id: claim.claim_id.clone(),
             delivery_identity_digest: claim.identity_digest.clone(),
+            delivery_start_digest: delivery_start_digest.map(str::to_owned),
             receipt_kind: DeliveryReceiptKind::Accepted,
             observed_native_session_ref: Some(observed_native_session_ref),
             transport_evidence_digest,
@@ -246,6 +301,7 @@ impl DeliveryReceipt {
 
     fn outcome(
         claim: &DeliveryClaim,
+        delivery_start_digest: Option<&str>,
         receipt_kind: DeliveryReceiptKind,
         evidence_digest: &str,
     ) -> WorkLedgerResult<Self> {
@@ -261,6 +317,7 @@ impl DeliveryReceipt {
             wake_id: claim.wake_id.clone(),
             claim_id: claim.claim_id.clone(),
             delivery_identity_digest: claim.identity_digest.clone(),
+            delivery_start_digest: delivery_start_digest.map(str::to_owned),
             receipt_kind,
             observed_native_session_ref: None,
             transport_evidence_digest: evidence_digest.to_owned(),
@@ -277,6 +334,7 @@ impl DeliveryReceipt {
             wake_id: &'a str,
             claim_id: &'a str,
             delivery_identity_digest: &'a str,
+            delivery_start_digest: Option<&'a str>,
             receipt_kind: DeliveryReceiptKind,
             observed_native_session_ref: Option<&'a str>,
             transport_evidence_digest: &'a str,
@@ -286,6 +344,7 @@ impl DeliveryReceipt {
             wake_id: &self.wake_id,
             claim_id: &self.claim_id,
             delivery_identity_digest: &self.delivery_identity_digest,
+            delivery_start_digest: self.delivery_start_digest.as_deref(),
             receipt_kind: self.receipt_kind,
             observed_native_session_ref: self.observed_native_session_ref.as_deref(),
             transport_evidence_digest: &self.transport_evidence_digest,
@@ -297,6 +356,12 @@ impl DeliveryReceipt {
     }
 
     fn validate_for_started(&self, started: &StartedDelivery) -> WorkLedgerResult<()> {
+        started.validate_identity()?;
+        if self.delivery_start_digest.as_deref() != Some(&started.start_identity_digest) {
+            return Err(WorkLedgerError::Refused(
+                "delivery receipt does not match its exact start".to_owned(),
+            ));
+        }
         self.validate_for_claim(&started.claim, DeliveryReceiptKind::Accepted)
     }
 
@@ -312,9 +377,16 @@ impl DeliveryReceipt {
             }
             _ => self.observed_native_session_ref.is_none(),
         };
+        let start_shape_is_valid = match expected_kind {
+            DeliveryReceiptKind::DefinitivePreDeliveryFailure => {
+                self.delivery_start_digest.is_none()
+            }
+            _ => self.delivery_start_digest.is_some(),
+        };
         if self.schema_version != DELIVERY_SCHEMA_VERSION
             || self.receipt_kind != expected_kind
             || !observed_session_is_valid
+            || !start_shape_is_valid
             || self.wake_id != claim.wake_id
             || self.claim_id != claim.claim_id
             || self.delivery_identity_digest != claim.identity_digest
@@ -329,15 +401,29 @@ impl DeliveryReceipt {
 }
 
 impl WorkLedger {
+    /// Create an inert, process-lifetime dispatcher epoch for this ledger.
+    pub(super) fn dispatcher_epoch(&self) -> WorkLedgerResult<DispatcherEpoch> {
+        Ok(DispatcherEpoch {
+            ledger_incarnation_ref: self.ledger_incarnation_ref.clone(),
+            dispatcher_epoch_ref: super::random_opaque_ref("dispatcher")?,
+        })
+    }
+
     /// Atomically claim one exact pending wake without contacting its adapter.
-    pub(super) fn claim_wake(
+    pub(super) fn claim_wake_in_epoch(
         &self,
+        dispatcher_epoch: &DispatcherEpoch,
         wake_id: &str,
         claimant_ref: &str,
         claimed_at: DateTime<Utc>,
         claim_expires_at: DateTime<Utc>,
     ) -> WorkLedgerResult<DeliveryClaim> {
         validate_opaque_ref("wake_id", wake_id, "wake")?;
+        if dispatcher_epoch.ledger_incarnation_ref != self.ledger_incarnation_ref {
+            return Err(WorkLedgerError::Refused(
+                "dispatcher epoch belongs to a different ledger incarnation".to_owned(),
+            ));
+        }
         validate_opaque_ref("claimant_ref", claimant_ref, "machine")?;
         let lease = claim_expires_at.signed_duration_since(claimed_at);
         if lease <= ChronoDuration::zero() || lease > MAX_CLAIM_LEASE {
@@ -356,10 +442,17 @@ impl WorkLedger {
         let route = validated_delivery_route(&transaction, &pending)?;
         let claim_id = opaque_ref(
             "claim",
-            &format!("{}\n{attempt}\n{claimant_ref}", pending.wake_id),
+            &format!(
+                "{}\n{}\n{}\n{attempt}\n{claimant_ref}",
+                pending.ledger_incarnation_ref,
+                dispatcher_epoch.dispatcher_epoch_ref,
+                pending.wake_id
+            ),
         );
         let claim = DeliveryClaim {
             schema_version: DELIVERY_SCHEMA_VERSION,
+            ledger_incarnation_ref: pending.ledger_incarnation_ref,
+            dispatcher_epoch_ref: dispatcher_epoch.dispatcher_epoch_ref.clone(),
             wake_id: pending.wake_id,
             claim_id,
             claimant_ref: claimant_ref.to_owned(),
@@ -382,8 +475,10 @@ impl WorkLedger {
         let changed = transaction.execute(
             "UPDATE outbox SET state = 'claimed', claim_id = ?1, claimant_ref = ?2,
                     claim_attempt = ?3, claim_identity_digest = ?4, claimed_at = ?5,
-                    lease_expires_at = ?6, claim_payload_json = ?7, updated_at = ?5
-             WHERE wake_id = ?8 AND state = 'pending' AND claim_attempt = ?9",
+                    lease_expires_at = ?6, claim_payload_json = ?7,
+                    dispatcher_epoch_ref = ?8, updated_at = ?5
+             WHERE wake_id = ?9 AND state = 'pending' AND claim_attempt = ?10
+               AND ledger_incarnation_ref = ?11",
             params![
                 claim.claim_id,
                 claim.claimant_ref,
@@ -392,8 +487,10 @@ impl WorkLedger {
                 claim.claimed_at.to_rfc3339(),
                 claim.claim_expires_at.to_rfc3339(),
                 claim_payload,
+                claim.dispatcher_epoch_ref,
                 claim.wake_id,
                 pending.claim_attempt,
+                claim.ledger_incarnation_ref,
             ],
         )?;
         if changed != 1 {
@@ -403,6 +500,8 @@ impl WorkLedger {
         }
         record_event(
             &transaction,
+            &claim.ledger_incarnation_ref,
+            Some(&claim.dispatcher_epoch_ref),
             &claim.work_id,
             claim.work_generation,
             claim.owner_generation,
@@ -415,6 +514,24 @@ impl WorkLedger {
         transaction.commit()?;
         claim.validate_identity()?;
         Ok(claim)
+    }
+
+    #[cfg(test)]
+    pub(super) fn claim_wake(
+        &self,
+        wake_id: &str,
+        claimant_ref: &str,
+        claimed_at: DateTime<Utc>,
+        claim_expires_at: DateTime<Utc>,
+    ) -> WorkLedgerResult<DeliveryClaim> {
+        let dispatcher_epoch = self.dispatcher_epoch()?;
+        self.claim_wake_in_epoch(
+            &dispatcher_epoch,
+            wake_id,
+            claimant_ref,
+            claimed_at,
+            claim_expires_at,
+        )
     }
 
     /// Commit the no-return boundary immediately before an external adapter call.
@@ -441,12 +558,24 @@ impl WorkLedger {
                 "delivery route changed after claim".to_owned(),
             ));
         }
+        let started = StartedDelivery {
+            claim: claim.clone(),
+            started_at,
+            start_identity_digest: String::new(),
+        }
+        .finalize()?;
         let changed = transaction.execute(
             "UPDATE outbox SET state = 'delivery_started', delivery_started_at = ?1,
-                    updated_at = ?1
-             WHERE wake_id = ?2 AND state = 'claimed' AND claim_id = ?3
-               AND delivery_started_at IS NULL",
-            params![started_at.to_rfc3339(), claim.wake_id, claim.claim_id],
+                    delivery_start_digest = ?2, updated_at = ?1
+             WHERE wake_id = ?3 AND state = 'claimed' AND claim_id = ?4
+               AND delivery_started_at IS NULL AND dispatcher_epoch_ref = ?5",
+            params![
+                started_at.to_rfc3339(),
+                started.start_identity_digest,
+                claim.wake_id,
+                claim.claim_id,
+                claim.dispatcher_epoch_ref,
+            ],
         )?;
         if changed != 1 {
             return Err(WorkLedgerError::Refused(
@@ -455,20 +584,19 @@ impl WorkLedger {
         }
         record_event(
             &transaction,
+            &claim.ledger_incarnation_ref,
+            Some(&claim.dispatcher_epoch_ref),
             &claim.work_id,
             claim.work_generation,
             claim.owner_generation,
             "wake_delivery_started",
             Some(LifecycleState::Dispatching),
             LifecycleState::Dispatching,
-            &claim.identity_digest,
+            &started.start_identity_digest,
             &started_at.to_rfc3339(),
         )?;
         transaction.commit()?;
-        Ok(StartedDelivery {
-            claim: claim.clone(),
-            started_at,
-        })
+        Ok(started)
     }
 
     /// Atomically acknowledge exact adapter acceptance and transfer repair ownership.
@@ -533,6 +661,8 @@ impl WorkLedger {
         }
         record_event(
             &transaction,
+            &started.claim.ledger_incarnation_ref,
+            Some(&started.claim.dispatcher_epoch_ref),
             &started.claim.work_id,
             started.claim.work_generation + 1,
             started.claim.owner_generation,
@@ -554,7 +684,7 @@ impl WorkLedger {
         observed_at: DateTime<Utc>,
     ) -> WorkLedgerResult<()> {
         validate_digest("uncertainty evidence", uncertainty_digest)?;
-        started.claim.validate_identity()?;
+        started.validate_identity()?;
         if observed_at < started.started_at {
             return Err(WorkLedgerError::Refused(
                 "uncertainty evidence predates delivery start".to_owned(),
@@ -562,6 +692,7 @@ impl WorkLedger {
         }
         let receipt = DeliveryReceipt::outcome(
             &started.claim,
+            Some(&started.start_identity_digest),
             DeliveryReceiptKind::Uncertain,
             uncertainty_digest,
         )?;
@@ -579,6 +710,8 @@ impl WorkLedger {
         )?;
         record_event(
             &transaction,
+            &started.claim.ledger_incarnation_ref,
+            Some(&started.claim.dispatcher_epoch_ref),
             &started.claim.work_id,
             started.claim.work_generation,
             started.claim.owner_generation,
@@ -615,11 +748,17 @@ impl WorkLedger {
         let mut connection = self.delivery_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_claim(&transaction, claim, "uncertain")?;
-        let uncertain_at: String = transaction.query_row(
-            "SELECT completed_at FROM outbox WHERE wake_id = ?1 AND state = 'uncertain'",
+        let (uncertain_at, stored_start_digest): (String, String) = transaction.query_row(
+            "SELECT completed_at, delivery_start_digest FROM outbox
+             WHERE wake_id = ?1 AND state = 'uncertain'",
             [&claim.wake_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if receipt.delivery_start_digest.as_deref() != Some(stored_start_digest.as_str()) {
+            return Err(WorkLedgerError::Refused(
+                "uncertain delivery receipt does not match the durable start".to_owned(),
+            ));
+        }
         if resolved_at < parse_timestamp("uncertain completion", &uncertain_at)? {
             return Err(WorkLedgerError::Refused(
                 "delivery resolution predates the uncertain outcome".to_owned(),
@@ -680,6 +819,8 @@ impl WorkLedger {
         }
         record_event(
             &transaction,
+            &claim.ledger_incarnation_ref,
+            Some(&claim.dispatcher_epoch_ref),
             &claim.work_id,
             claim.work_generation + 1,
             claim.owner_generation,
@@ -753,6 +894,7 @@ impl WorkLedger {
         }
         let receipt = DeliveryReceipt::outcome(
             claim,
+            None,
             DeliveryReceiptKind::DefinitivePreDeliveryFailure,
             failure_digest,
         )?;
@@ -800,6 +942,8 @@ impl WorkLedger {
         }
         record_event(
             &transaction,
+            &claim.ledger_incarnation_ref,
+            Some(&claim.dispatcher_epoch_ref),
             &claim.work_id,
             claim.work_generation + 1,
             claim.owner_generation,
@@ -842,6 +986,7 @@ impl WorkLedger {
                 wake_id,
                 &claim.claim_id,
                 &claim.claim_identity,
+                claim.delivery_start_digest.as_deref(),
                 None,
                 uncertainty_digest,
             )?;
@@ -870,19 +1015,20 @@ impl WorkLedger {
 fn pending_wake(transaction: &Transaction<'_>, wake_id: &str) -> WorkLedgerResult<PendingWake> {
     let pending = transaction
         .query_row(
-            "SELECT wake_id, work_item_id, work_generation, owner_generation,
+            "SELECT wake_id, ledger_incarnation_ref, work_item_id, work_generation, owner_generation,
                     route_ref, payload_digest, claim_attempt
              FROM outbox WHERE wake_id = ?1 AND state = 'pending'",
             [wake_id],
             |row| {
                 Ok(PendingWake {
                     wake_id: row.get(0)?,
-                    work_id: row.get(1)?,
-                    work_generation: row.get(2)?,
-                    owner_generation: row.get(3)?,
-                    route_ref: row.get(4)?,
-                    payload_digest: row.get(5)?,
-                    claim_attempt: row.get(6)?,
+                    ledger_incarnation_ref: row.get(1)?,
+                    work_id: row.get(2)?,
+                    work_generation: row.get(3)?,
+                    owner_generation: row.get(4)?,
+                    route_ref: row.get(5)?,
+                    payload_digest: row.get(6)?,
+                    claim_attempt: row.get(7)?,
                 })
             },
         )
@@ -899,7 +1045,8 @@ fn expired_claim(
         .query_row(
             "SELECT claim_id, claim_identity_digest, lease_expires_at,
                     state, delivery_started_at, work_item_id,
-                    work_generation, owner_generation
+                    work_generation, owner_generation, ledger_incarnation_ref,
+                    dispatcher_epoch_ref, delivery_start_digest
              FROM outbox WHERE wake_id = ?1
                AND state IN ('claimed', 'delivery_started')",
             [wake_id],
@@ -914,6 +1061,9 @@ fn expired_claim(
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )
@@ -929,6 +1079,9 @@ fn expired_claim(
                 work_id,
                 work_generation,
                 owner_generation,
+                ledger_incarnation_ref,
+                dispatcher_epoch_ref,
+                delivery_start_digest,
             )| {
                 Ok(ExpiredClaimRecord {
                     claim_id,
@@ -939,6 +1092,9 @@ fn expired_claim(
                     work_id,
                     work_generation,
                     owner_generation,
+                    ledger_incarnation_ref,
+                    dispatcher_epoch_ref,
+                    delivery_start_digest,
                 })
             },
         )
@@ -954,7 +1110,8 @@ fn requeue_expired_unstarted(
         "UPDATE outbox SET state = 'pending', claim_id = NULL,
                 claimant_ref = NULL, claimed_at = NULL,
                 claim_identity_digest = NULL, lease_expires_at = NULL,
-                claim_payload_json = NULL, delivery_started_at = NULL, updated_at = ?1
+                claim_payload_json = NULL, delivery_started_at = NULL,
+                dispatcher_epoch_ref = NULL, delivery_start_digest = NULL, updated_at = ?1
          WHERE wake_id = ?2 AND state = 'claimed' AND claim_id = ?3
            AND delivery_started_at IS NULL",
         params![observed_at, wake_id, claim.claim_id],
@@ -966,6 +1123,8 @@ fn requeue_expired_unstarted(
     }
     record_event(
         transaction,
+        &claim.ledger_incarnation_ref,
+        Some(&claim.dispatcher_epoch_ref),
         &claim.work_id,
         claim.work_generation,
         claim.owner_generation,
@@ -993,6 +1152,8 @@ fn mark_expired_started_uncertain(
     )?;
     record_event(
         transaction,
+        &claim.ledger_incarnation_ref,
+        Some(&claim.dispatcher_epoch_ref),
         &claim.work_id,
         claim.work_generation,
         claim.owner_generation,
@@ -1007,6 +1168,7 @@ fn mark_expired_started_uncertain(
 fn stored_wake_for_claim(claim: &DeliveryClaim) -> PendingWake {
     PendingWake {
         wake_id: claim.wake_id.clone(),
+        ledger_incarnation_ref: claim.ledger_incarnation_ref.clone(),
         work_id: claim.work_id.clone(),
         work_generation: claim.work_generation,
         owner_generation: claim.owner_generation,
@@ -1157,11 +1319,22 @@ fn verify_claim(
     claim: &DeliveryClaim,
     expected_state: &str,
 ) -> WorkLedgerResult<()> {
-    type StoredClaim = (String, String, u64, String, String, String, Option<String>);
+    type StoredClaim = (
+        String,
+        String,
+        u64,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+    );
     let stored: Option<StoredClaim> = transaction
         .query_row(
             "SELECT claim_id, claimant_ref, claim_attempt, claim_identity_digest,
-                    claimed_at, lease_expires_at, delivery_started_at
+                    claimed_at, lease_expires_at, delivery_started_at,
+                    ledger_incarnation_ref, dispatcher_epoch_ref
              FROM outbox WHERE wake_id = ?1 AND state = ?2",
             params![claim.wake_id, expected_state],
             |row| {
@@ -1173,11 +1346,23 @@ fn verify_claim(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )
         .optional()?;
-    let Some((claim_id, claimant, attempt, identity, claimed_at, expires_at, started_at)) = stored
+    let Some((
+        claim_id,
+        claimant,
+        attempt,
+        identity,
+        claimed_at,
+        expires_at,
+        started_at,
+        ledger_incarnation_ref,
+        dispatcher_epoch_ref,
+    )) = stored
     else {
         return Err(WorkLedgerError::Refused(
             "delivery claim is not active".to_owned(),
@@ -1187,6 +1372,8 @@ fn verify_claim(
         || claimant != claim.claimant_ref
         || attempt != claim.claim_attempt
         || identity != claim.identity_digest
+        || ledger_incarnation_ref != claim.ledger_incarnation_ref
+        || dispatcher_epoch_ref != claim.dispatcher_epoch_ref
         || parse_timestamp("claimed at", &claimed_at)? != claim.claimed_at
         || parse_timestamp("claim expiry", &expires_at)? != claim.claim_expires_at
         || matches!(expected_state, "delivery_started" | "uncertain") != started_at.is_some()
@@ -1203,12 +1390,15 @@ fn verify_started(
     started: &StartedDelivery,
 ) -> WorkLedgerResult<()> {
     verify_claim(transaction, &started.claim, "delivery_started")?;
-    let stored: String = transaction.query_row(
-        "SELECT delivery_started_at FROM outbox WHERE wake_id = ?1",
+    started.validate_identity()?;
+    let stored: (String, String) = transaction.query_row(
+        "SELECT delivery_started_at, delivery_start_digest FROM outbox WHERE wake_id = ?1",
         [&started.claim.wake_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if parse_timestamp("delivery started at", &stored)? != started.started_at {
+    if parse_timestamp("delivery started at", &stored.0)? != started.started_at
+        || stored.1 != started.start_identity_digest
+    {
         return Err(WorkLedgerError::Refused(
             "stored delivery start disagrees with its token".to_owned(),
         ));
@@ -1243,6 +1433,7 @@ fn receipt_integrity(
     wake_id: &str,
     claim_id: &str,
     delivery_identity_digest: &str,
+    delivery_start_digest: Option<&str>,
     observed_native_session_ref: Option<&str>,
     transport_evidence_digest: &str,
 ) -> WorkLedgerResult<String> {
@@ -1255,6 +1446,7 @@ fn receipt_integrity(
         wake_id: wake_id.to_owned(),
         claim_id: claim_id.to_owned(),
         delivery_identity_digest: delivery_identity_digest.to_owned(),
+        delivery_start_digest: delivery_start_digest.map(str::to_owned),
         receipt_kind,
         observed_native_session_ref: observed_native_session_ref.map(str::to_owned),
         transport_evidence_digest: transport_evidence_digest.to_owned(),

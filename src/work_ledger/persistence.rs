@@ -5,9 +5,10 @@ use super::{
     Connection, DATABASE_NAME, Duration, ImportCandidate, ImportReport, LedgerStatus,
     LifecycleState, OpenFlags, OptionalExtension, Path, PathBuf, SCHEMA_VERSION,
     TransactionBehavior, Utc, WorkLedger, WorkLedgerError, WorkLedgerResult, configure_durable,
-    count, count_where, create_database_file_no_follow, fs, import_report, importer, migrate,
-    opaque_path_ref, params, protect_database_file, protect_ledger_directory, schema_version,
-    synchronous_name, validate_candidate, validate_protected_storage, verify_integrity,
+    count, count_where, create_database_file_no_follow, fs, import_report, importer,
+    load_ledger_incarnation, migrate, opaque_path_ref, params, protect_database_file,
+    protect_ledger_directory, schema_version, synchronous_name, validate_candidate,
+    validate_protected_storage, verify_integrity, verify_ledger_incarnation,
     verify_supported_schema,
 };
 
@@ -24,27 +25,30 @@ impl WorkLedger {
         reject_symlink_if_present(state_dir, &dir, "ledger directory")?;
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&dir)?;
         crate::writer_domain_lease::ensure_protected_dir_all(&dir)?;
-        let ledger = Self {
-            path: dir.join(DATABASE_NAME),
-        };
-        validate_ledger_path(state_dir, &ledger.path, false)?;
-        let existing = ledger.path.exists();
+        let path = dir.join(DATABASE_NAME);
+        validate_ledger_path(state_dir, &path, false)?;
+        let existing = path.exists();
         if existing {
-            validate_protected_storage(&dir, &ledger.path)?;
-            let connection = ledger.connect_read_only()?;
+            validate_protected_storage(&dir, &path)?;
+            let connection = connect_read_only_raw(&path)?;
             let version = schema_version(&connection)?;
             if !(0..=SCHEMA_VERSION).contains(&version) {
                 return Err(WorkLedgerError::UnsupportedSchema(version));
             }
         } else {
             protect_ledger_directory(&dir)?;
-            create_database_file_no_follow(&ledger.path)?;
-            protect_database_file(&ledger.path)?;
+            create_database_file_no_follow(&path)?;
+            protect_database_file(&path)?;
         }
-        let mut connection = ledger.connect_read_write()?;
+        let mut connection = connect_read_write_raw(&path)?;
         configure_durable(&connection)?;
         migrate(&mut connection)?;
         verify_integrity(&connection)?;
+        let ledger_incarnation_ref = load_ledger_incarnation(&connection)?;
+        let ledger = Self {
+            path,
+            ledger_incarnation_ref,
+        };
         Ok(ledger)
     }
 
@@ -60,10 +64,13 @@ impl WorkLedger {
         }
         validate_ledger_path(state_dir, &path, true)?;
         validate_protected_storage(&dir, &path)?;
-        let ledger = Self { path };
-        let connection = ledger.connect_read_only()?;
+        let connection = connect_read_only_raw(&path)?;
         verify_supported_schema(&connection)?;
         verify_integrity(&connection)?;
+        let ledger = Self {
+            path,
+            ledger_incarnation_ref: load_ledger_incarnation(&connection)?,
+        };
         Ok(Some(ledger))
     }
 
@@ -71,6 +78,12 @@ impl WorkLedger {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Opaque identity of the exact database lifetime opened by this handle.
+    #[must_use]
+    pub fn ledger_incarnation_ref(&self) -> &str {
+        &self.ledger_incarnation_ref
     }
 
     /// Return redacted operational status.
@@ -191,6 +204,8 @@ impl WorkLedger {
             )?;
             record_event(
                 &transaction,
+                &self.ledger_incarnation_ref,
+                None,
                 &candidate.work_id,
                 1,
                 candidate.owner_generation,
@@ -261,28 +276,50 @@ impl WorkLedger {
     /// Register one complete route under exact work, owner, and revision fences.
     #[allow(dead_code)] // Trusted adapter installation is activated after shadow cutover.
     pub(super) fn connect_read_write(&self) -> WorkLedgerResult<Connection> {
-        let sqlite_path = sqlite_path_with_pinned_final_component(&self.path)?;
-        let connection = Connection::open_with_flags(
-            sqlite_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        let connection = connect_read_write_raw(&self.path)?;
+        #[cfg(not(test))]
+        verify_ledger_incarnation(&connection, &self.ledger_incarnation_ref)?;
+        #[cfg(test)]
+        if schema_version(&connection)? == SCHEMA_VERSION {
+            verify_ledger_incarnation(&connection, &self.ledger_incarnation_ref)?;
+        }
         Ok(connection)
     }
 
     pub(super) fn connect_read_only(&self) -> WorkLedgerResult<Connection> {
-        let sqlite_path = sqlite_path_with_pinned_final_component(&self.path)?;
-        let connection = Connection::open_with_flags(
-            sqlite_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA synchronous = FULL;",
-        )?;
+        let connection = connect_read_only_raw(&self.path)?;
+        #[cfg(not(test))]
+        verify_ledger_incarnation(&connection, &self.ledger_incarnation_ref)?;
+        #[cfg(test)]
+        if schema_version(&connection)? == SCHEMA_VERSION {
+            verify_ledger_incarnation(&connection, &self.ledger_incarnation_ref)?;
+        }
         Ok(connection)
     }
+}
+
+fn connect_read_write_raw(path: &Path) -> WorkLedgerResult<Connection> {
+    let sqlite_path = sqlite_path_with_pinned_final_component(path)?;
+    let connection = Connection::open_with_flags(
+        sqlite_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    Ok(connection)
+}
+
+fn connect_read_only_raw(path: &Path) -> WorkLedgerResult<Connection> {
+    let sqlite_path = sqlite_path_with_pinned_final_component(path)?;
+    let connection = Connection::open_with_flags(
+        sqlite_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA synchronous = FULL;",
+    )?;
+    Ok(connection)
 }
 
 fn sqlite_path_with_pinned_final_component(path: &Path) -> WorkLedgerResult<PathBuf> {

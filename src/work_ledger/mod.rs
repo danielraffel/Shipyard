@@ -16,7 +16,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const DATABASE_NAME: &str = "work-items.sqlite3";
 
 macro_rules! candidate_params {
@@ -72,9 +72,10 @@ use registry::{RouteRegistration, validated_route_exists};
 use route::{AdapterBindingRecord, RouteProvenanceRecord};
 pub use storage::absent_status;
 use storage::{
-    configure_durable, count, count_where, create_database_file_no_follow, migrate,
-    protect_database_file, protect_ledger_directory, schema_version, synchronous_name,
-    validate_protected_storage, verify_integrity, verify_supported_schema,
+    configure_durable, count, count_where, create_database_file_no_follow, load_ledger_incarnation,
+    migrate, protect_database_file, protect_ledger_directory, schema_version, synchronous_name,
+    validate_protected_storage, verify_integrity, verify_ledger_incarnation,
+    verify_supported_schema,
 };
 
 /// Error returned by a fail-closed work-ledger operation.
@@ -244,6 +245,7 @@ pub struct ImportReport {
 #[derive(Clone, Debug)]
 pub struct WorkLedger {
     path: PathBuf,
+    ledger_incarnation_ref: String,
 }
 
 pub(super) fn validate_candidate(candidate: &ImportCandidate) -> WorkLedgerResult<()> {
@@ -394,6 +396,14 @@ fn opaque_path_ref(state_dir: &Path, path: &Path, key: Option<&str>) -> String {
 
 fn opaque_ref(prefix: &str, value: &str) -> String {
     format!("{prefix}_{}", digest(value.as_bytes()))
+}
+
+fn random_opaque_ref(prefix: &str) -> WorkLedgerResult<String> {
+    let random = tempfile::Builder::new()
+        .prefix("shipyard-incarnation-")
+        .rand_bytes(32)
+        .tempfile()?;
+    Ok(opaque_ref(prefix, &random.path().to_string_lossy()))
 }
 
 fn digest(bytes: &[u8]) -> String {

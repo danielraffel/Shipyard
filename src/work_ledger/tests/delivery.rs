@@ -35,8 +35,9 @@ fn pending_delivery() -> (TempDir, WorkLedger, String, String, AdapterBindingRec
     let (route, adapter) = sample_route(&work_id, 5);
     ledger.register_adapter(&adapter).expect("adapter");
     ledger.register_route(&route).expect("route");
-    let wake =
-        WakeIntent::new(&work_id, 6, 3, route.route_ref.clone(), digest(b"payload")).expect("wake");
+    let wake = ledger
+        .wake_intent(&work_id, 6, 3, route.route_ref.clone(), digest(b"payload"))
+        .expect("wake");
     let wake_id = wake.wake_id.clone();
     ledger
         .transition_with_wake(&work_id, 5, 3, LifecycleState::Dispatching, Some(&wake))
@@ -208,9 +209,10 @@ fn uncertain_delivery_acceptance_transfers_ownership_without_retry() {
     let claim = ledger
         .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(10))
         .expect("claim");
-    ledger
+    let started = ledger
         .mark_delivery_started(&claim, at(1))
         .expect("started boundary");
+    let delivery_start_digest = started.start_identity_digest;
     ledger
         .reconcile_expired_claim(&wake_id, at(11), &digest(b"restart ambiguity"))
         .expect("uncertain");
@@ -222,6 +224,7 @@ fn uncertain_delivery_acceptance_transfers_ownership_without_retry() {
         .expect("recover exact durable claim");
     let receipt = DeliveryReceipt::accepted_after_uncertainty(
         &claim,
+        &delivery_start_digest,
         claim.route.native_session_ref.clone(),
         digest(b"late exact acceptance"),
     )
@@ -256,7 +259,7 @@ fn uncertain_non_delivery_returns_actionable_but_never_pending() {
     let claim = ledger
         .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(10))
         .expect("claim");
-    ledger
+    let started = ledger
         .mark_delivery_started(&claim, at(1))
         .expect("started boundary");
     ledger
@@ -264,6 +267,7 @@ fn uncertain_non_delivery_returns_actionable_but_never_pending() {
         .expect("uncertain");
     let receipt = DeliveryReceipt::not_delivered_after_uncertainty(
         &claim,
+        &started.start_identity_digest,
         &digest(b"provider proves no delivery"),
     )
     .expect("not-delivered receipt");
@@ -501,6 +505,7 @@ fn assert_terminal_receipt_kind_is_required(ledger: &WorkLedger, wake_id: &str) 
         ("failed", None),
         ("failed", Some("2026-08-28T12:00:01Z")),
     ] {
+        let delivery_start_digest = delivery_started_at.map(|_| digest(b"start"));
         let result = connection.execute(
             "UPDATE outbox SET state = ?1,
                     claim_id = 'claim', claimant_ref = 'opaque:sha256:claimant',
@@ -508,11 +513,18 @@ fn assert_terminal_receipt_kind_is_required(ledger: &WorkLedger, wake_id: &str) 
                     claim_payload_json = x'7b7d',
                     claimed_at = '2026-08-28T12:00:00Z',
                     lease_expires_at = '2026-08-28T12:00:30Z',
-                    delivery_started_at = ?2, receipt_kind = NULL,
+                    dispatcher_epoch_ref = ?2, delivery_started_at = ?3,
+                    delivery_start_digest = ?4, receipt_kind = NULL,
                     receipt_digest = 'receipt',
                     completed_at = '2026-08-28T12:00:02Z'
-              WHERE wake_id = ?3",
-            params![state, delivery_started_at, wake_id],
+              WHERE wake_id = ?5",
+            params![
+                state,
+                opaque_ref("dispatcher", "terminal shape"),
+                delivery_started_at,
+                delivery_start_digest,
+                wake_id,
+            ],
         );
         assert!(result.is_err(), "{state} must reject a NULL receipt kind");
     }
@@ -527,12 +539,178 @@ fn assert_terminal_receipt_kind_is_required(ledger: &WorkLedger, wake_id: &str) 
 }
 
 #[test]
-fn fresh_v3_outbox_rejects_null_receipt_kind_for_every_terminal_state() {
+fn fresh_v4_outbox_rejects_null_receipt_kind_for_every_terminal_state() {
     let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
     assert_terminal_receipt_kind_is_required(&ledger, &wake_id);
 }
 
+#[test]
+fn wake_identity_changes_across_ledger_incarnations() {
+    let first_temp = TempDir::new().expect("first temp");
+    let second_temp = TempDir::new().expect("second temp");
+    let first = WorkLedger::open(first_temp.path()).expect("first ledger");
+    let second = WorkLedger::open(second_temp.path()).expect("second ledger");
+    let work_id = opaque_ref("wi", "same work");
+    let route_ref = opaque_ref("route", "same route");
+    let payload = digest(b"same payload");
+    let first_wake = first
+        .wake_intent(&work_id, 6, 3, route_ref.clone(), payload.clone())
+        .expect("first wake");
+    let second_wake = second
+        .wake_intent(&work_id, 6, 3, route_ref, payload)
+        .expect("second wake");
+    assert_ne!(
+        first_wake.ledger_incarnation_ref,
+        second_wake.ledger_incarnation_ref
+    );
+    assert_ne!(first_wake.wake_id, second_wake.wake_id);
+}
+
+#[test]
+fn dispatcher_restart_changes_epoch_and_stale_claim_cannot_cross() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let first_epoch = ledger.dispatcher_epoch().expect("first epoch");
+    let first = ledger
+        .claim_wake_in_epoch(
+            &first_epoch,
+            &wake_id,
+            &opaque_ref("machine", "m1"),
+            at(0),
+            at(10),
+        )
+        .expect("first claim");
+    ledger
+        .reconcile_expired_claim(&wake_id, at(11), &digest(b"restart"))
+        .expect("requeue unstarted claim");
+    let second_epoch = ledger.dispatcher_epoch().expect("second epoch");
+    let second = ledger
+        .claim_wake_in_epoch(
+            &second_epoch,
+            &wake_id,
+            &opaque_ref("machine", "m1"),
+            at(12),
+            at(22),
+        )
+        .expect("second claim");
+    assert_ne!(first.dispatcher_epoch_ref, second.dispatcher_epoch_ref);
+    assert_ne!(first.claim_id, second.claim_id);
+    assert!(ledger.mark_delivery_started(&first, at(13)).is_err());
+}
+
+#[test]
+fn start_receipt_outbox_and_events_bind_both_incarnations() {
+    let (_temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    let dispatcher = ledger.dispatcher_epoch().expect("dispatcher epoch");
+    let claim = ledger
+        .claim_wake_in_epoch(
+            &dispatcher,
+            &wake_id,
+            &opaque_ref("machine", "m3"),
+            at(0),
+            at(30),
+        )
+        .expect("claim");
+    let started = ledger.mark_delivery_started(&claim, at(1)).expect("start");
+    let receipt = DeliveryReceipt::new(
+        &started,
+        claim.route.native_session_ref.clone(),
+        digest(b"accepted"),
+    )
+    .expect("receipt");
+    assert_eq!(
+        claim.ledger_incarnation_ref,
+        ledger.ledger_incarnation_ref()
+    );
+    assert_eq!(claim.dispatcher_epoch_ref, dispatcher.dispatcher_epoch_ref);
+    assert_eq!(
+        receipt.delivery_start_digest.as_deref(),
+        Some(started.start_identity_digest.as_str())
+    );
+
+    let connection = ledger.connect_read_only().expect("connection");
+    let stored: (String, String, String) = connection
+        .query_row(
+            "SELECT ledger_incarnation_ref, dispatcher_epoch_ref, delivery_start_digest
+             FROM outbox WHERE wake_id = ?1",
+            [&wake_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("stored incarnation fences");
+    assert_eq!(stored.0, claim.ledger_incarnation_ref);
+    assert_eq!(stored.1, claim.dispatcher_epoch_ref);
+    assert_eq!(stored.2, started.start_identity_digest);
+    let event_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE ledger_incarnation_ref = ?1 AND dispatcher_epoch_ref = ?2
+               AND kind IN ('wake_claimed', 'wake_delivery_started')",
+            params![claim.ledger_incarnation_ref, claim.dispatcher_epoch_ref],
+            |row| row.get(0),
+        )
+        .expect("event fences");
+    assert_eq!(event_count, 2);
+}
+
+#[test]
+fn v3_active_outbox_refuses_incarnation_migration_without_mutation() {
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    ledger
+        .claim_wake(&wake_id, &opaque_ref("machine", "m3"), at(0), at(30))
+        .expect("active legacy-shaped claim");
+    super::persistence::strip_v4_incarnation_schema(&ledger);
+    drop(ledger);
+
+    assert!(matches!(
+        WorkLedger::open(temp.path()),
+        Err(WorkLedgerError::Refused(reason))
+            if reason.contains("dispatcher epoch provenance")
+    ));
+    let connection = Connection::open(WorkLedger::path_at(temp.path())).expect("inspect v3");
+    assert_eq!(schema_version(&connection).expect("version"), 3);
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM outbox WHERE wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("preserved active wake");
+    assert_eq!(state, "claimed");
+    let metadata_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'ledger_metadata')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("metadata absence");
+    assert!(!metadata_exists);
+}
+
+#[test]
+fn failed_v3_incarnation_upgrade_rolls_back_schema_and_pending_wake() {
+    let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
+    super::persistence::strip_v4_incarnation_schema(&ledger);
+    let connection = ledger.connect_read_write().expect("v3 connection");
+    connection
+        .execute_batch("CREATE TABLE ledger_metadata (collision TEXT);")
+        .expect("migration collision");
+    drop(connection);
+    drop(ledger);
+
+    assert!(WorkLedger::open(temp.path()).is_err());
+    let connection = Connection::open(WorkLedger::path_at(temp.path())).expect("inspect v3");
+    assert_eq!(schema_version(&connection).expect("version"), 3);
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM outbox WHERE wake_id = ?1",
+            [&wake_id],
+            |row| row.get(0),
+        )
+        .expect("preserved pending wake");
+    assert_eq!(state, "pending");
+}
+
 fn install_exact_v2_outbox(ledger: &WorkLedger) {
+    super::persistence::strip_v4_incarnation_schema(ledger);
     let connection = ledger.connect_read_write().expect("connection");
     connection
         .execute_batch(
@@ -564,26 +742,30 @@ fn install_exact_v2_outbox(ledger: &WorkLedger) {
 }
 
 #[test]
-fn v2_pending_outbox_migrates_to_v3_without_losing_wake() {
+fn v2_pending_outbox_migrates_to_v4_without_losing_wake() {
     let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
     install_exact_v2_outbox(&ledger);
     drop(ledger);
     let migrated = WorkLedger::open(temp.path()).expect("migrate v2");
     let connection = migrated.connect_read_only().expect("connection");
-    assert_eq!(schema_version(&connection).expect("version"), 3);
-    let row: (String, u64, Option<String>) = connection
+    assert_eq!(schema_version(&connection).expect("version"), 4);
+    let row: (String, u64, Option<String>, String) = connection
         .query_row(
-            "SELECT state, claim_attempt, claim_id FROM outbox WHERE wake_id = ?1",
+            "SELECT state, claim_attempt, claim_id, ledger_incarnation_ref
+             FROM outbox WHERE wake_id = ?1",
             [&wake_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("preserved wake");
-    assert_eq!(row, ("pending".to_owned(), 0, None));
+    assert_eq!(row.0, "pending");
+    assert_eq!(row.1, 0);
+    assert_eq!(row.2, None);
+    assert_eq!(row.3, migrated.ledger_incarnation_ref());
     assert_terminal_receipt_kind_is_required(&migrated, &wake_id);
 }
 
 #[test]
-fn full_v1_pending_outbox_migrates_to_v3_with_terminal_receipt_constraints() {
+fn full_v1_pending_outbox_migrates_to_v4_with_terminal_receipt_constraints() {
     let (temp, ledger, _work_id, wake_id, _adapter) = pending_delivery();
     install_exact_v2_outbox(&ledger);
     let connection = ledger.connect_read_write().expect("connection");
@@ -596,15 +778,19 @@ fn full_v1_pending_outbox_migrates_to_v3_with_terminal_receipt_constraints() {
 
     let migrated = WorkLedger::open(temp.path()).expect("migrate full v1 ledger");
     let connection = migrated.connect_read_only().expect("connection");
-    assert_eq!(schema_version(&connection).expect("version"), 3);
-    let row: (String, u64, Option<String>) = connection
+    assert_eq!(schema_version(&connection).expect("version"), 4);
+    let row: (String, u64, Option<String>, String) = connection
         .query_row(
-            "SELECT state, claim_attempt, claim_id FROM outbox WHERE wake_id = ?1",
+            "SELECT state, claim_attempt, claim_id, ledger_incarnation_ref
+             FROM outbox WHERE wake_id = ?1",
             [&wake_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .expect("preserved v1 wake");
-    assert_eq!(row, ("pending".to_owned(), 0, None));
+    assert_eq!(row.0, "pending");
+    assert_eq!(row.1, 0);
+    assert_eq!(row.2, None);
+    assert_eq!(row.3, migrated.ledger_incarnation_ref());
     drop(connection);
     assert_terminal_receipt_kind_is_required(&migrated, &wake_id);
 }

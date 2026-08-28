@@ -13,6 +13,8 @@ use super::{
 pub struct WakeIntent {
     /// Deterministic opaque wake identity.
     pub(super) wake_id: String,
+    /// Exact ledger lifetime that published this wake.
+    pub(super) ledger_incarnation_ref: String,
     /// Work generation fenced by the receiver.
     pub(super) work_generation: u64,
     /// Owner generation fenced by the receiver.
@@ -25,7 +27,8 @@ pub struct WakeIntent {
 
 impl WakeIntent {
     /// Build a wake whose identity is derived from its complete delivery fence.
-    pub fn new(
+    pub(super) fn new(
+        ledger_incarnation_ref: String,
         work_id: &str,
         work_generation: u64,
         owner_generation: u64,
@@ -33,9 +36,11 @@ impl WakeIntent {
         payload_digest: String,
     ) -> WorkLedgerResult<Self> {
         validate_opaque_ref("work_id", work_id, "wi")?;
+        validate_opaque_ref("ledger_incarnation_ref", &ledger_incarnation_ref, "ledger")?;
         validate_opaque_ref("route_ref", &route_ref, "route")?;
         validate_digest("payload_digest", &payload_digest)?;
         let wake_id = deterministic_wake_id(
+            &ledger_incarnation_ref,
             work_id,
             work_generation,
             owner_generation,
@@ -44,6 +49,7 @@ impl WakeIntent {
         );
         Ok(Self {
             wake_id,
+            ledger_incarnation_ref,
             work_generation,
             owner_generation,
             route_ref,
@@ -168,6 +174,25 @@ impl ContinuationSet {
 }
 
 impl WorkLedger {
+    /// Construct a wake fenced to this exact durable ledger lifetime.
+    pub fn wake_intent(
+        &self,
+        work_id: &str,
+        work_generation: u64,
+        owner_generation: u64,
+        route_ref: String,
+        payload_digest: String,
+    ) -> WorkLedgerResult<WakeIntent> {
+        WakeIntent::new(
+            self.ledger_incarnation_ref.clone(),
+            work_id,
+            work_generation,
+            owner_generation,
+            route_ref,
+            payload_digest,
+        )
+    }
+
     pub(super) fn transition_with_wake(
         &self,
         work_id: &str,
@@ -216,6 +241,7 @@ impl WorkLedger {
         if let Some(wake) = wake {
             enqueue_wake(
                 &transaction,
+                &self.ledger_incarnation_ref,
                 work_id,
                 expected_work_generation,
                 expected_owner_generation,
@@ -229,6 +255,8 @@ impl WorkLedger {
         );
         record_event(
             &transaction,
+            &self.ledger_incarnation_ref,
+            None,
             work_id,
             expected_work_generation + 1,
             expected_owner_generation,
@@ -375,13 +403,20 @@ fn validate_transition(
 
 fn enqueue_wake(
     transaction: &Transaction<'_>,
+    ledger_incarnation_ref: &str,
     work_id: &str,
     work_generation: u64,
     owner_generation: u64,
     wake: &WakeIntent,
     now: &str,
 ) -> WorkLedgerResult<()> {
-    validate_wake(work_id, wake, work_generation + 1, owner_generation)?;
+    validate_wake(
+        ledger_incarnation_ref,
+        work_id,
+        wake,
+        work_generation + 1,
+        owner_generation,
+    )?;
     let route_matches = validated_route_exists(
         transaction,
         &wake.route_ref,
@@ -396,11 +431,12 @@ fn enqueue_wake(
     }
     transaction.execute(
         "INSERT INTO outbox (
-           wake_id, work_item_id, work_generation, owner_generation, state,
+           wake_id, ledger_incarnation_ref, work_item_id, work_generation, owner_generation, state,
            route_ref, payload_digest, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?7)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?8)",
         params![
             wake.wake_id,
+            ledger_incarnation_ref,
             work_id,
             wake.work_generation,
             wake.owner_generation,
@@ -413,6 +449,7 @@ fn enqueue_wake(
 }
 
 fn validate_wake(
+    ledger_incarnation_ref: &str,
     work_id: &str,
     wake: &WakeIntent,
     expected_work_generation: u64,
@@ -425,7 +462,8 @@ fn validate_wake(
     ] {
         validate_token(name, value)?;
     }
-    if wake.work_generation != expected_work_generation
+    if wake.ledger_incarnation_ref != ledger_incarnation_ref
+        || wake.work_generation != expected_work_generation
         || wake.owner_generation != expected_owner_generation
     {
         return Err(WorkLedgerError::Refused(
@@ -433,6 +471,7 @@ fn validate_wake(
         ));
     }
     let expected_wake_id = deterministic_wake_id(
+        ledger_incarnation_ref,
         work_id,
         wake.work_generation,
         wake.owner_generation,
@@ -448,6 +487,7 @@ fn validate_wake(
 }
 
 fn deterministic_wake_id(
+    ledger_incarnation_ref: &str,
     work_id: &str,
     work_generation: u64,
     owner_generation: u64,
@@ -456,13 +496,17 @@ fn deterministic_wake_id(
 ) -> String {
     opaque_ref(
         "wake",
-        &format!("{work_id}\n{work_generation}\n{owner_generation}\n{route_ref}\n{payload_digest}"),
+        &format!(
+            "{ledger_incarnation_ref}\n{work_id}\n{work_generation}\n{owner_generation}\n{route_ref}\n{payload_digest}"
+        ),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_event(
     transaction: &Transaction<'_>,
+    ledger_incarnation_ref: &str,
+    dispatcher_epoch_ref: Option<&str>,
     work_id: &str,
     work_generation: u64,
     owner_generation: u64,
@@ -473,21 +517,28 @@ pub(super) fn record_event(
     created_at: &str,
 ) -> WorkLedgerResult<()> {
     validate_opaque_ref("work_id", work_id, "wi")?;
+    validate_opaque_ref("ledger_incarnation_ref", ledger_incarnation_ref, "ledger")?;
+    if let Some(dispatcher_epoch_ref) = dispatcher_epoch_ref {
+        validate_opaque_ref("dispatcher_epoch_ref", dispatcher_epoch_ref, "dispatcher")?;
+    }
     validate_digest("event payload digest", payload_digest)?;
     let from_state = from.map(LifecycleState::as_str);
     let identity = format!(
-        "{work_id}\n{work_generation}\n{owner_generation}\n{kind}\n{}\n{}\n{payload_digest}",
+        "{ledger_incarnation_ref}\n{}\n{work_id}\n{work_generation}\n{owner_generation}\n{kind}\n{}\n{}\n{payload_digest}",
+        dispatcher_epoch_ref.unwrap_or(""),
         from_state.unwrap_or(""),
         to.as_str()
     );
     let event_id = opaque_ref("event", &identity);
     transaction.execute(
         "INSERT OR IGNORE INTO events
-         (event_id, work_item_id, work_generation, owner_generation, kind,
+         (event_id, ledger_incarnation_ref, dispatcher_epoch_ref, work_item_id, work_generation, owner_generation, kind,
           from_state, to_state, payload_digest, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             event_id,
+            ledger_incarnation_ref,
+            dispatcher_epoch_ref,
             work_id,
             work_generation,
             owner_generation,
@@ -499,12 +550,16 @@ pub(super) fn record_event(
         ],
     )?;
     let exact: bool = transaction.query_row(
-        "SELECT work_item_id = ?2 AND work_generation = ?3 AND owner_generation = ?4
-                AND kind = ?5 AND ifnull(from_state, '') = ifnull(?6, '')
-                AND to_state = ?7 AND payload_digest = ?8
+        "SELECT ledger_incarnation_ref = ?2
+                AND ifnull(dispatcher_epoch_ref, '') = ifnull(?3, '')
+                AND work_item_id = ?4 AND work_generation = ?5 AND owner_generation = ?6
+                AND kind = ?7 AND ifnull(from_state, '') = ifnull(?8, '')
+                AND to_state = ?9 AND payload_digest = ?10
          FROM events WHERE event_id = ?1",
         params![
             event_id,
+            ledger_incarnation_ref,
+            dispatcher_epoch_ref,
             work_id,
             work_generation,
             owner_generation,

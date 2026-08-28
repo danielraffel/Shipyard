@@ -100,7 +100,8 @@ fn transition_and_wake_commit_together_with_generation_fence() {
         .register_adapter(&agent_adapter)
         .expect("register Codex adapter policy");
     ledger.register_route(&route).expect("register route");
-    let bad = WakeIntent::new(&work_id, 99, 3, route.route_ref.clone(), digest(b"payload"))
+    let bad = ledger
+        .wake_intent(&work_id, 99, 3, route.route_ref.clone(), digest(b"payload"))
         .expect("bad generation wake");
     assert!(
         ledger
@@ -121,11 +122,13 @@ fn transition_and_wake_commit_together_with_generation_fence() {
         0
     );
 
-    let wake =
-        WakeIntent::new(&work_id, 6, 3, route.route_ref.clone(), digest(b"payload")).expect("wake");
+    let wake = ledger
+        .wake_intent(&work_id, 6, 3, route.route_ref.clone(), digest(b"payload"))
+        .expect("wake");
     assert_eq!(
         wake,
-        WakeIntent::new(&work_id, 6, 3, route.route_ref.clone(), digest(b"payload"),)
+        ledger
+            .wake_intent(&work_id, 6, 3, route.route_ref.clone(), digest(b"payload"))
             .expect("same wake")
     );
     let mut forged = wake.clone();
@@ -258,6 +261,7 @@ fn claude_route_requires_an_explicit_active_agent_policy_record() {
 fn opaque_boundaries_and_incomplete_continuations_fail_closed() {
     assert!(
         WakeIntent::new(
+            opaque_ref("ledger", "test"),
             "raw-work",
             1,
             1,

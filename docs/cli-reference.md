@@ -207,6 +207,12 @@ eligible continuation contract. Native route records keep terminal, agent, and
 provider axes separate and integrity-bound; missing provider provenance never
 means Direct and cannot dispatch. Native transitions are closed/typed and
 commit their deterministic event with any outbox wake.
+Schema v4 creates one random, immutable `ledger_incarnation_ref` for the
+database lifetime and verifies it on every connection. Wake, event, claim,
+delivery-start, and receipt identities retain that fence; each future daemon
+process must also create one `dispatcher_epoch_ref` and pass it when claiming.
+These records are still inert: no work-ledger consumer or dispatcher is
+enabled.
 Dry-run is byte-stable and creates no database. Apply is idempotent and leaves
 every legacy record authoritative and untouched. Apply holds a bounded
 exclusive production-writer snapshot barrier from legacy scan through the

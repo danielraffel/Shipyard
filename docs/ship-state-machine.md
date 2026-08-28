@@ -717,6 +717,17 @@ outcomes. Native transitions use a closed legal graph, fence work and owner
 generations, and insert a deterministic audit event in the same transaction as
 the state change and optional outbox wake.
 
+Schema v4 gives each database lifetime one random, immutable
+`ledger_incarnation_ref`, loaded and verified on every connection. Wake IDs and
+persisted events carry it. A future daemon creates one random
+`dispatcher_epoch_ref` per process lifetime and supplies it to the inert claim
+API; claims, delivery-start tokens, receipts, outbox rows, and delivery events
+bind both identities. Replacing a database beneath an open handle or presenting
+a dispatcher epoch from another ledger fails closed. Migration preserves only
+pending legacy wakes; any v1, v2, or v3 non-pending row requires explicit
+reconciliation because its process provenance cannot be inferred. This fencing
+does not activate a consumer: `dispatch_enabled=false` remains invariant.
+
 The schema deliberately keeps logical goal, owner, terminal runtime,
 agent/session adapter, and provider-routing adapter identities separate. PR,
 product-acceptance, and continuation terminal truth are separate columns;

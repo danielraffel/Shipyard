@@ -7,7 +7,10 @@ use std::path::Path;
 
 use rusqlite::{Connection, TransactionBehavior};
 
-use super::{LedgerStatus, SCHEMA_VERSION, WorkLedgerError, WorkLedgerResult};
+use super::{
+    LedgerStatus, SCHEMA_VERSION, WorkLedgerError, WorkLedgerResult, random_opaque_ref,
+    validate_opaque_ref,
+};
 
 /// Status for a ledger that has not been created yet.
 #[must_use]
@@ -142,11 +145,15 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
     if version == SCHEMA_VERSION {
         return Ok(());
     }
+    let ledger_incarnation_ref = random_opaque_ref("ledger")?;
     if version == 1 {
-        return migrate_v1_to_v3(connection);
+        return migrate_v1_to_v4(connection, &ledger_incarnation_ref);
     }
     if version == 2 {
-        return migrate_v2_to_v3(connection);
+        return migrate_v2_to_v4(connection, &ledger_incarnation_ref);
+    }
+    if version == 3 {
+        return migrate_v3_to_v4(connection, &ledger_incarnation_ref);
     }
     if version != 0 {
         return Err(WorkLedgerError::UnsupportedSchema(version));
@@ -336,6 +343,8 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
          CREATE INDEX outbox_delivery ON outbox(state, created_at, wake_id);
          PRAGMA user_version = 3;",
     )?;
+    upgrade_v3_incarnation(&transaction, &ledger_incarnation_ref)?;
+    verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -343,9 +352,13 @@ pub(super) fn migrate(connection: &mut Connection) -> WorkLedgerResult<()> {
 /// Upgrade the inert v2 intent outbox into the typed delivery state machine.
 /// v2 had no legal consumer, so a non-pending row has no claim provenance that
 /// can be inferred safely and must be reconciled explicitly before upgrading.
-fn migrate_v2_to_v3(connection: &mut Connection) -> WorkLedgerResult<()> {
+fn migrate_v2_to_v4(
+    connection: &mut Connection,
+    ledger_incarnation_ref: &str,
+) -> WorkLedgerResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     upgrade_v2_outbox(&transaction)?;
+    upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
@@ -461,12 +474,148 @@ fn upgrade_v2_outbox(transaction: &rusqlite::Transaction<'_>) -> WorkLedgerResul
 /// Upgrade both v1 tables under one exclusive transaction. Committing v2 before
 /// rebuilding the outbox would leave a partially upgraded database after a
 /// crash or second-stage failure.
-fn migrate_v1_to_v3(connection: &mut Connection) -> WorkLedgerResult<()> {
+fn migrate_v1_to_v4(
+    connection: &mut Connection,
+    ledger_incarnation_ref: &str,
+) -> WorkLedgerResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     upgrade_v1_registry(&transaction)?;
     upgrade_v2_outbox(&transaction)?;
+    upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
     verify_migration_foreign_keys(&transaction)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(
+    connection: &mut Connection,
+    ledger_incarnation_ref: &str,
+) -> WorkLedgerResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    upgrade_v3_incarnation(&transaction, ledger_incarnation_ref)?;
+    verify_migration_foreign_keys(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Bind all durable delivery evidence to one database incarnation. Active v3
+/// claims cannot be upgraded because their dispatcher process identity was not
+/// recorded and must never be guessed during migration.
+fn upgrade_v3_incarnation(
+    transaction: &rusqlite::Transaction<'_>,
+    ledger_incarnation_ref: &str,
+) -> WorkLedgerResult<()> {
+    validate_opaque_ref("ledger_incarnation_ref", ledger_incarnation_ref, "ledger")?;
+    let active: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM outbox WHERE state != 'pending'",
+        [],
+        |row| row.get(0),
+    )?;
+    if active != 0 {
+        return Err(WorkLedgerError::Refused(
+            "schema v3 contains active wakes without ledger incarnation or dispatcher epoch provenance; explicit outbox reconciliation is required before v4 migration"
+                .to_owned(),
+        ));
+    }
+    transaction.execute_batch(
+        "CREATE TABLE ledger_metadata (
+           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+           ledger_incarnation_ref TEXT NOT NULL UNIQUE
+         );
+         ALTER TABLE events ADD COLUMN ledger_incarnation_ref TEXT NOT NULL DEFAULT '';
+         ALTER TABLE events ADD COLUMN dispatcher_epoch_ref TEXT;
+         ALTER TABLE outbox ADD COLUMN ledger_incarnation_ref TEXT NOT NULL DEFAULT '';
+         ALTER TABLE outbox ADD COLUMN dispatcher_epoch_ref TEXT;
+         ALTER TABLE outbox ADD COLUMN delivery_start_digest TEXT;",
+    )?;
+    transaction.execute(
+        "INSERT INTO ledger_metadata (singleton, ledger_incarnation_ref) VALUES (1, ?1)",
+        [ledger_incarnation_ref],
+    )?;
+    transaction.execute(
+        "UPDATE events SET ledger_incarnation_ref = ?1",
+        [ledger_incarnation_ref],
+    )?;
+    transaction.execute(
+        "UPDATE outbox SET ledger_incarnation_ref = ?1",
+        [ledger_incarnation_ref],
+    )?;
+    transaction.execute_batch(
+        "CREATE TRIGGER ledger_incarnation_update
+         BEFORE UPDATE ON ledger_metadata
+         BEGIN SELECT RAISE(ABORT, 'ledger incarnation is immutable'); END;
+         CREATE TRIGGER ledger_incarnation_delete
+         BEFORE DELETE ON ledger_metadata
+         BEGIN SELECT RAISE(ABORT, 'ledger incarnation is immutable'); END;
+         CREATE TRIGGER events_incarnation_insert
+         BEFORE INSERT ON events
+         WHEN NEW.ledger_incarnation_ref !=
+                (SELECT ledger_incarnation_ref FROM ledger_metadata WHERE singleton = 1)
+         BEGIN SELECT RAISE(ABORT, 'event ledger incarnation mismatch'); END;
+         CREATE TRIGGER events_incarnation_update
+         BEFORE UPDATE ON events
+         WHEN NEW.ledger_incarnation_ref != OLD.ledger_incarnation_ref
+           OR ifnull(NEW.dispatcher_epoch_ref, '') != ifnull(OLD.dispatcher_epoch_ref, '')
+         BEGIN SELECT RAISE(ABORT, 'event incarnation fields are immutable'); END;
+         CREATE TRIGGER outbox_incarnation_insert
+         BEFORE INSERT ON outbox
+         WHEN NEW.ledger_incarnation_ref !=
+                (SELECT ledger_incarnation_ref FROM ledger_metadata WHERE singleton = 1)
+              OR NEW.dispatcher_epoch_ref IS NOT NULL
+              OR NEW.delivery_start_digest IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'pending wake incarnation shape is invalid'); END;
+         CREATE TRIGGER outbox_incarnation_update
+         BEFORE UPDATE ON outbox
+         WHEN NEW.ledger_incarnation_ref != OLD.ledger_incarnation_ref
+              OR NEW.ledger_incarnation_ref !=
+                 (SELECT ledger_incarnation_ref FROM ledger_metadata WHERE singleton = 1)
+              OR (OLD.state != 'pending' AND NEW.state != 'pending' AND
+                  ifnull(NEW.dispatcher_epoch_ref, '') !=
+                  ifnull(OLD.dispatcher_epoch_ref, ''))
+              OR (OLD.delivery_start_digest IS NOT NULL AND
+                  ifnull(NEW.delivery_start_digest, '') != OLD.delivery_start_digest)
+              OR (NEW.state = 'pending' AND
+                  (NEW.dispatcher_epoch_ref IS NOT NULL OR NEW.delivery_start_digest IS NOT NULL))
+              OR (NEW.state = 'claimed' AND
+                  (NEW.dispatcher_epoch_ref IS NULL OR NEW.delivery_start_digest IS NOT NULL))
+              OR (NEW.state IN ('delivery_started', 'acknowledged', 'uncertain') AND
+                  (NEW.dispatcher_epoch_ref IS NULL OR NEW.delivery_start_digest IS NULL))
+              OR (NEW.state = 'failed' AND
+                  (NEW.dispatcher_epoch_ref IS NULL OR
+                   ((NEW.delivery_started_at IS NULL) != (NEW.delivery_start_digest IS NULL))))
+         BEGIN SELECT RAISE(ABORT, 'outbox incarnation shape is invalid'); END;",
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+pub(super) fn load_ledger_incarnation(connection: &Connection) -> WorkLedgerResult<String> {
+    verify_supported_schema(connection)?;
+    let mut statement = connection
+        .prepare("SELECT ledger_incarnation_ref FROM ledger_metadata WHERE singleton = 1")?;
+    let mut rows = statement.query([])?;
+    let value: String = rows
+        .next()?
+        .ok_or_else(|| WorkLedgerError::Refused("ledger incarnation is missing".to_owned()))?
+        .get(0)?;
+    if rows.next()?.is_some() {
+        return Err(WorkLedgerError::Refused(
+            "ledger incarnation is not a singleton".to_owned(),
+        ));
+    }
+    validate_opaque_ref("ledger_incarnation_ref", &value, "ledger")?;
+    Ok(value)
+}
+
+pub(super) fn verify_ledger_incarnation(
+    connection: &Connection,
+    expected: &str,
+) -> WorkLedgerResult<()> {
+    if load_ledger_incarnation(connection)? != expected {
+        return Err(WorkLedgerError::Refused(
+            "ledger incarnation changed after open".to_owned(),
+        ));
+    }
     Ok(())
 }
 

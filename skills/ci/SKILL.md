@@ -1679,6 +1679,12 @@ kind on a fresh database and after every supported legacy migration. Do not
 rely on `receipt_kind = 'value'` alone inside a SQLite CHECK: NULL makes the
 expression pass. Only unstarted lease expiry may requeue; any delivery-started
 expiry becomes uncertain and requires reconciliation before another attempt.
+The database also owns one immutable random `ledger_incarnation_ref`, verified
+on every connection. A daemon owns one random `dispatcher_epoch_ref` per
+process lifetime. Wake, claim, delivery-start, receipt, outbox, and event
+integrity must preserve the applicable identities, and migration must refuse
+active legacy rows whose dispatcher provenance cannot be reconstructed. These
+fences do not by themselves enable a consumer or set `dispatch_enabled=true`.
 
 **Detached daemon temp roots must not depend on the launching shell.** A daemon
 started from launchd or a minimal SSH environment may inherit no `TMPDIR`.
