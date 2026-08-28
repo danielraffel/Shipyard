@@ -781,6 +781,15 @@ malformed or ambiguous responses are no-ops. Terminal queue records are
 immutable against stale worker progress, and a later daemon tick repairs a
 missing typed outcome from the winning terminal record.
 
+Once a matching termination transaction has durably frozen the exact worker
+tree, daemon restart must resume that transaction even if the separate worker
+receipt has disappeared. The transaction's job, generation, root PID, and
+phase are the recovery authority; a live mismatched replacement receipt remains
+a hard CAS fence. Do not generalize this to legacy `Running` rows that have
+neither a receipt nor a termination transaction: root-process absence cannot
+prove reparented descendants dead, so those rows require an audited one-time
+disposition and must continue to reserve capacity until then.
+
 Daemon-owned GitHub work requires `[github.auth] source = "command"`, so an
 existing daemon can refresh credentials independently of the submitting shell;
 `env` and ambient interactive `gh` auth are intentionally rejected. A
