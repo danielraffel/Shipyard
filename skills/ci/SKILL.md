@@ -403,6 +403,9 @@ must run both `--version` probes before publication.
 Publication also requires exact pair-version equality, every Linux/Windows
 companion asset and checksum entry, plus a public installer E2E; `--ci-mode`
 cannot bypass these closure gates, and failure must re-draft the release.
+On Windows the asset filenames retain `.exe`, but version output uses the
+logical names `shipyard` and `shipyard-workstream-provider`; pair comparison
+must not treat the suffix as part of the semantic-version authority.
 
 ### External contribution execution
 

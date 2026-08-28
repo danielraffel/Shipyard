@@ -99,7 +99,11 @@ MIN_CMP="${MIN_VERSION#v}"
 PAIR_PROBLEM=""
 if version_gte "$INSTALLED" "0.127.0"; then
   CLI_DIR="$(dirname "$CLI_PATH")"
-  PROVIDER_PATH="${CLI_DIR}/shipyard-workstream-provider"
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) PROVIDER_FILENAME="shipyard-workstream-provider.exe" ;;
+    *) PROVIDER_FILENAME="shipyard-workstream-provider" ;;
+  esac
+  PROVIDER_PATH="${CLI_DIR}/${PROVIDER_FILENAME}"
   if [ ! -x "$PROVIDER_PATH" ]; then
     PAIR_PROBLEM="same-directory executable shipyard-workstream-provider is missing"
   else

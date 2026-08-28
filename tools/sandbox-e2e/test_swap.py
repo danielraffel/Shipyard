@@ -373,6 +373,42 @@ def test_install_script_skip_download_preserves_production_binary_names(
 
 
 @pytest.mark.installer
+def test_install_script_accepts_windows_exe_pair_with_logical_version_names(
+    sandbox: Sandbox,
+) -> None:
+    install_dir = sandbox.home_dir / "install-bin-windows"
+    install_dir.mkdir()
+    binary = install_dir / "shipyard.exe"
+    provider = install_dir / "shipyard-workstream-provider.exe"
+    binary.write_text("#!/bin/sh\necho 'shipyard 0.127.1'\n", encoding="utf-8")
+    provider.write_text(
+        "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.1'\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    provider.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "install.sh")],
+        cwd=sandbox.work_dir,
+        env={
+            "HOME": str(sandbox.home_dir),
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_SKIP_DOWNLOAD": "1",
+            "SHIPYARD_INSTALL_TEST_UNAME_S": "MSYS_NT-10.0",
+            "SHIPYARD_INSTALL_TEST_UNAME_M": "x86_64",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "Installed shipyard.exe" in result.stdout
+    assert binary.exists() and provider.exists()
+
+
+@pytest.mark.installer
 def test_install_script_pre_provider_rollback_removes_newer_companion(
     sandbox: Sandbox,
 ) -> None:
@@ -562,6 +598,154 @@ def test_install_script_restores_pair_when_second_move_fails(
     assert result.returncode != 0
     assert binary.read_bytes() == original_binary
     assert provider.read_bytes() == original_provider
+    assert alias.is_symlink() and str(alias.readlink()) == "old-target"
+
+
+@pytest.mark.installer
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX command fakes")
+def test_install_script_preserves_backups_when_automatic_restore_fails(
+    sandbox: Sandbox,
+) -> None:
+    install_dir = sandbox.home_dir / "install-bin-restore-failure"
+    install_dir.mkdir()
+    binary = install_dir / BINARY_NAME
+    provider = install_dir / "shipyard-workstream-provider"
+    binary.write_text("#!/bin/sh\necho 'shipyard 0.127.1'\n# old\n", encoding="utf-8")
+    provider.write_text(
+        "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.1'\n# old\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    provider.chmod(0o755)
+    alias = install_dir / "sy"
+    alias.symlink_to("old-target")
+    marker = sandbox.work_dir / "second-move-failed"
+    fake_mv = sandbox.bin_dir / "mv"
+    fake_mv.write_text(
+        "#!/bin/sh\nolder=''\nprevious=''\n"
+        "for arg in \"$@\"; do older=\"$previous\"; previous=\"$arg\"; done\n"
+        f"if echo \"$older\" | grep -q 'workstream-provider.install' && [ ! -f '{marker}' ]; then touch '{marker}'; exit 73; fi\n"
+        "if echo \"$older\" | grep -q '/.shipyard.backup.'; then exit 75; fi\n"
+        "exec /bin/mv \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_mv.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "install.sh")],
+        cwd=sandbox.work_dir,
+        env={
+            "HOME": str(sandbox.home_dir),
+            "PATH": f"{sandbox.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_SKIP_DOWNLOAD": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    cli_backups = list(install_dir.glob(".shipyard.backup.*"))
+    journals = list(install_dir.glob(".shipyard-install-recovery.*"))
+    assert result.returncode != 0
+    assert len(cli_backups) == 1 and len(journals) == 1
+    assert str(cli_backups[0]) in result.stderr
+    assert str(journals[0]) in result.stderr
+    assert "automatic Shipyard install rollback was incomplete" in result.stderr
+    assert "CLI backup:" in journals[0].read_text(encoding="utf-8")
+
+
+@pytest.mark.installer
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX command fakes")
+def test_install_script_restores_pair_when_alias_backup_fails(
+    sandbox: Sandbox,
+) -> None:
+    install_dir = sandbox.home_dir / "install-bin-alias-backup-failure"
+    install_dir.mkdir()
+    binary = install_dir / BINARY_NAME
+    provider = install_dir / "shipyard-workstream-provider"
+    binary.write_text("#!/bin/sh\necho 'shipyard 0.127.1'\n# old\n", encoding="utf-8")
+    provider.write_text(
+        "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.1'\n# old\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    provider.chmod(0o755)
+    alias = install_dir / "sy"
+    alias.symlink_to("old-target")
+    old_binary = binary.read_bytes()
+    old_provider = provider.read_bytes()
+    fake_mv = sandbox.bin_dir / "mv"
+    fake_mv.write_text(
+        "#!/bin/sh\nolder=''\nprevious=''\n"
+        "for arg in \"$@\"; do older=\"$previous\"; previous=\"$arg\"; done\n"
+        f"if [ \"$older\" = '{alias}' ]; then exit 76; fi\n"
+        "exec /bin/mv \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_mv.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "install.sh")],
+        cwd=sandbox.work_dir,
+        env={
+            "HOME": str(sandbox.home_dir),
+            "PATH": f"{sandbox.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_SKIP_DOWNLOAD": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert binary.read_bytes() == old_binary
+    assert provider.read_bytes() == old_provider
+    assert alias.is_symlink() and str(alias.readlink()) == "old-target"
+
+
+@pytest.mark.installer
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX command fakes")
+def test_install_script_restores_pair_when_alias_link_fails(
+    sandbox: Sandbox,
+) -> None:
+    install_dir = sandbox.home_dir / "install-bin-alias-link-failure"
+    install_dir.mkdir()
+    binary = install_dir / BINARY_NAME
+    provider = install_dir / "shipyard-workstream-provider"
+    binary.write_text("#!/bin/sh\necho 'shipyard 0.127.1'\n# old\n", encoding="utf-8")
+    provider.write_text(
+        "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.1'\n# old\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    provider.chmod(0o755)
+    alias = install_dir / "sy"
+    alias.symlink_to("old-target")
+    old_binary = binary.read_bytes()
+    old_provider = provider.read_bytes()
+    fake_ln = sandbox.bin_dir / "ln"
+    fake_ln.write_text("#!/bin/sh\nexit 77\n", encoding="utf-8")
+    fake_ln.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "install.sh")],
+        cwd=sandbox.work_dir,
+        env={
+            "HOME": str(sandbox.home_dir),
+            "PATH": f"{sandbox.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_SKIP_DOWNLOAD": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert binary.read_bytes() == old_binary
+    assert provider.read_bytes() == old_provider
     assert alias.is_symlink() and str(alias.readlink()) == "old-target"
 
 

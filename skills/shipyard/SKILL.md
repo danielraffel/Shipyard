@@ -1444,6 +1444,9 @@ The pair is valid only when both launch from the same install directory and
 report the exact same parsed semantic version. Installer replacement and
 pre-provider rollback are transactions: preserve and restore both old binaries
 and the alias on any move, remove, or post-move smoke failure.
+If automatic restoration itself fails, never delete its backup. Preserve the
+pair/alias backups and `.shipyard-install-recovery.*` journal, print their exact
+source and destination paths, and fail for manual recovery.
 
 ### CI routing profiles
 

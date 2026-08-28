@@ -62,6 +62,8 @@ ARTIFACT_PREFIX="${SHIPYARD_ARTIFACT_PREFIX:-shipyard}"
 PROVIDER_ARTIFACT_PREFIX="${SHIPYARD_PROVIDER_ARTIFACT_PREFIX:-shipyard-workstream-provider}"
 BINARY_NAME="shipyard"
 PROVIDER_BINARY_NAME="shipyard-workstream-provider"
+BINARY_VERSION_NAME="shipyard"
+PROVIDER_VERSION_NAME="shipyard-workstream-provider"
 ALIAS_NAME="sy"
 
 UNAME_S="${SHIPYARD_INSTALL_TEST_UNAME_S:-$(uname -s)}"
@@ -330,6 +332,7 @@ STAGED_PROVIDER_DEST="${INSTALL_DIR}/.${PROVIDER_BINARY_NAME}.install.$$"
 BACKUP_DEST="${INSTALL_DIR}/.${BINARY_NAME}.backup.$$"
 BACKUP_PROVIDER_DEST="${INSTALL_DIR}/.${PROVIDER_BINARY_NAME}.backup.$$"
 BACKUP_ALIAS="${INSTALL_DIR}/.${ALIAS_NAME}.backup.$$"
+RECOVERY_JOURNAL="${INSTALL_DIR}/.shipyard-install-recovery.$$"
 TRANSACTION_ACTIVE=0
 HAD_DEST=0
 HAD_PROVIDER_DEST=0
@@ -338,28 +341,54 @@ HAD_ALIAS=0
 cleanup_install_transaction() {
     status=$?
     set +e
+    restore_failed=0
     if [ "${TRANSACTION_ACTIVE}" = "1" ]; then
         if [ -e "${BACKUP_DEST}" ] || [ -L "${BACKUP_DEST}" ]; then
-            rm -f "${DEST}"
-            mv -f "${BACKUP_DEST}" "${DEST}"
+            rm -f "${DEST}" || restore_failed=1
+            if [ "${restore_failed}" = "0" ]; then
+                mv -f "${BACKUP_DEST}" "${DEST}" || restore_failed=1
+            fi
         elif [ "${HAD_DEST}" = "0" ]; then
-            rm -f "${DEST}"
+            rm -f "${DEST}" || restore_failed=1
         fi
         if [ -e "${BACKUP_PROVIDER_DEST}" ] || [ -L "${BACKUP_PROVIDER_DEST}" ]; then
-            rm -f "${PROVIDER_DEST}"
-            mv -f "${BACKUP_PROVIDER_DEST}" "${PROVIDER_DEST}"
+            provider_restore_ready=1
+            rm -f "${PROVIDER_DEST}" || provider_restore_ready=0
+            if [ "${provider_restore_ready}" = "1" ]; then
+                mv -f "${BACKUP_PROVIDER_DEST}" "${PROVIDER_DEST}" \
+                    || restore_failed=1
+            else
+                restore_failed=1
+            fi
         elif [ "${HAD_PROVIDER_DEST}" = "0" ]; then
-            rm -f "${PROVIDER_DEST}"
+            rm -f "${PROVIDER_DEST}" || restore_failed=1
         fi
         if [ -e "${BACKUP_ALIAS}" ] || [ -L "${BACKUP_ALIAS}" ]; then
-            rm -f "${INSTALL_DIR}/${ALIAS_NAME}"
-            mv -f "${BACKUP_ALIAS}" "${INSTALL_DIR}/${ALIAS_NAME}"
+            alias_restore_ready=1
+            rm -f "${INSTALL_DIR}/${ALIAS_NAME}" || alias_restore_ready=0
+            if [ "${alias_restore_ready}" = "1" ]; then
+                mv -f "${BACKUP_ALIAS}" "${INSTALL_DIR}/${ALIAS_NAME}" \
+                    || restore_failed=1
+            else
+                restore_failed=1
+            fi
         elif [ "${HAD_ALIAS}" = "0" ]; then
-            rm -f "${INSTALL_DIR}/${ALIAS_NAME}"
+            rm -f "${INSTALL_DIR}/${ALIAS_NAME}" || restore_failed=1
         fi
+        if [ "${restore_failed}" = "1" ]; then
+            echo "ERROR: automatic Shipyard install rollback was incomplete." >&2
+            echo "Recovery journal: ${RECOVERY_JOURNAL}" >&2
+            echo "CLI backup: ${BACKUP_DEST} -> ${DEST}" >&2
+            echo "Provider backup: ${BACKUP_PROVIDER_DEST} -> ${PROVIDER_DEST}" >&2
+            echo "Alias backup: ${BACKUP_ALIAS} -> ${INSTALL_DIR}/${ALIAS_NAME}" >&2
+            echo "Preserve these paths and follow the journal for manual recovery." >&2
+            rm -f "${STAGED_DEST}" "${STAGED_PROVIDER_DEST}"
+            exit 1
+        fi
+        rm -f "${BACKUP_DEST}" "${BACKUP_PROVIDER_DEST}" \
+            "${BACKUP_ALIAS}" "${RECOVERY_JOURNAL}"
     fi
-    rm -f "${STAGED_DEST}" "${STAGED_PROVIDER_DEST}" \
-        "${BACKUP_DEST}" "${BACKUP_PROVIDER_DEST}" "${BACKUP_ALIAS}"
+    rm -f "${STAGED_DEST}" "${STAGED_PROVIDER_DEST}"
     exit "${status}"
 }
 trap cleanup_install_transaction EXIT
@@ -422,11 +451,11 @@ if [ "${REQUIRE_PROVIDER}" = "1" ]; then
 fi
 
 prepare_macos_binary "${STAGED_DEST}"
-STAGED_VERSION="$(smoke_binary_or_repair "${STAGED_DEST}" "${BINARY_NAME}")"
+STAGED_VERSION="$(smoke_binary_or_repair "${STAGED_DEST}" "${BINARY_VERSION_NAME}")"
 if [ "${REQUIRE_PROVIDER}" = "1" ]; then
     prepare_macos_binary "${STAGED_PROVIDER_DEST}"
     STAGED_PROVIDER_VERSION="$(smoke_binary_or_repair \
-        "${STAGED_PROVIDER_DEST}" "${PROVIDER_BINARY_NAME}")"
+        "${STAGED_PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}")"
     if [ "${STAGED_VERSION}" != "${STAGED_PROVIDER_VERSION}" ]; then
         echo "ERROR: release binary version mismatch: ${BINARY_NAME}=${STAGED_VERSION} ${PROVIDER_BINARY_NAME}=${STAGED_PROVIDER_VERSION}." >&2
         exit 1
@@ -437,6 +466,14 @@ if [ -e "${DEST}" ] || [ -L "${DEST}" ]; then HAD_DEST=1; fi
 if [ -e "${PROVIDER_DEST}" ] || [ -L "${PROVIDER_DEST}" ]; then HAD_PROVIDER_DEST=1; fi
 if [ -e "${INSTALL_DIR}/${ALIAS_NAME}" ] || [ -L "${INSTALL_DIR}/${ALIAS_NAME}" ]; then HAD_ALIAS=1; fi
 TRANSACTION_ACTIVE=1
+{
+    printf 'Shipyard install recovery journal\n'
+    printf 'CLI backup: %s -> %s\n' "${BACKUP_DEST}" "${DEST}"
+    printf 'Provider backup: %s -> %s\n' \
+        "${BACKUP_PROVIDER_DEST}" "${PROVIDER_DEST}"
+    printf 'Alias backup: %s -> %s\n' \
+        "${BACKUP_ALIAS}" "${INSTALL_DIR}/${ALIAS_NAME}"
+} > "${RECOVERY_JOURNAL}"
 if [ "${HAD_DEST}" = "1" ]; then mv -f "${DEST}" "${BACKUP_DEST}"; fi
 if [ "${HAD_PROVIDER_DEST}" = "1" ]; then
     mv -f "${PROVIDER_DEST}" "${BACKUP_PROVIDER_DEST}"
@@ -451,17 +488,18 @@ else
     rm -f "${PROVIDER_DEST}"
 fi
 ln -sf "${DEST}" "${INSTALL_DIR}/${ALIAS_NAME}"
-INSTALLED_VERSION="$(smoke_binary_or_repair "${DEST}" "${BINARY_NAME}")"
+INSTALLED_VERSION="$(smoke_binary_or_repair "${DEST}" "${BINARY_VERSION_NAME}")"
 if [ "${REQUIRE_PROVIDER}" = "1" ]; then
     INSTALLED_PROVIDER_VERSION="$(smoke_binary_or_repair \
-        "${PROVIDER_DEST}" "${PROVIDER_BINARY_NAME}")"
+        "${PROVIDER_DEST}" "${PROVIDER_VERSION_NAME}")"
     if [ "${INSTALLED_VERSION}" != "${INSTALLED_PROVIDER_VERSION}" ]; then
         echo "ERROR: installed binary version mismatch: ${BINARY_NAME}=${INSTALLED_VERSION} ${PROVIDER_BINARY_NAME}=${INSTALLED_PROVIDER_VERSION}." >&2
         exit 1
     fi
 fi
 TRANSACTION_ACTIVE=0
-rm -f "${BACKUP_DEST}" "${BACKUP_PROVIDER_DEST}" "${BACKUP_ALIAS}"
+rm -f "${BACKUP_DEST}" "${BACKUP_PROVIDER_DEST}" \
+    "${BACKUP_ALIAS}" "${RECOVERY_JOURNAL}"
 
 echo ""
 echo "Installed ${BINARY_NAME} to ${DEST}"

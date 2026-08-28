@@ -87,6 +87,40 @@ class CheckCliHookTests(unittest.TestCase):
 
             self.assertNotIn("Installation is incomplete", result.stdout)
 
+    def test_windows_hook_uses_same_directory_exe_companion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            shipyard = bin_dir / "shipyard"
+            shipyard.write_text(
+                "#!/bin/sh\necho 'shipyard 0.127.1'\n", encoding="utf-8"
+            )
+            shipyard.chmod(0o755)
+            provider = bin_dir / "shipyard-workstream-provider.exe"
+            provider.write_text(
+                "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.1'\n",
+                encoding="utf-8",
+            )
+            provider.chmod(0o755)
+            uname = bin_dir / "uname"
+            uname.write_text("#!/bin/sh\necho 'MSYS_NT-10.0'\n", encoding="utf-8")
+            uname.chmod(0o755)
+
+            result = subprocess.run(
+                ["bash", str(ROOT / "hooks" / "check-cli.sh")],
+                env={
+                    "HOME": str(root / "home"),
+                    "PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+                    "CLAUDE_PLUGIN_ROOT": str(ROOT),
+                },
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotIn("Installation is incomplete", result.stdout)
+
     def test_pre_provider_pin_is_not_reported_as_a_partial_install(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
