@@ -37,6 +37,42 @@ pub(crate) struct LaunchProfileV1 {
     pub(super) recovery_policy: RecoveryPolicyV1,
 }
 
+impl LaunchProfileV1 {
+    pub(crate) fn worktree_path(&self) -> &str {
+        &self.worktree.path
+    }
+
+    pub(crate) fn model_id(&self) -> Option<&str> {
+        self.provider.model.as_deref()
+    }
+
+    /// Preserve only reasoning settings already expressed in a recognized
+    /// provider grammar. Missing or unfamiliar forms never acquire a default.
+    pub(crate) fn reasoning_effort(&self) -> Option<&str> {
+        match self.provider.provider.as_str() {
+            "codex" => self.launch_argv.windows(2).find_map(|pair| {
+                (pair[0] == "-c")
+                    .then(|| pair[1].strip_prefix("model_reasoning_effort="))
+                    .flatten()
+                    .and_then(|value| {
+                        if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+                            Some(&value[1..value.len() - 1])
+                        } else if !value.contains('"') {
+                            Some(value)
+                        } else {
+                            None
+                        }
+                    })
+            }),
+            "claude" => self
+                .launch_argv
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--effort").then_some(pair[1].as_str())),
+            _ => None,
+        }
+    }
+}
+
 /// Exact, provider-neutral expectation for a handle-only fresh-agent resume.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -576,6 +612,28 @@ mod tests {
             launch_profile_digest(&profile).expect("stored digest")
         );
         assert!(FreshAgentLaunchProfile::permits_fresh_agent(&profile));
+    }
+
+    #[test]
+    fn wrapper_options_preserve_only_recognized_exact_provider_grammar() {
+        let mut codex = profile();
+        codex.provider.provider = "codex".into();
+        codex.launch_argv = vec![
+            "codex".into(),
+            "-c".into(),
+            "model_reasoning_effort=medium".into(),
+        ];
+        assert_eq!(codex.reasoning_effort(), Some("medium"));
+
+        let mut claude = profile();
+        claude.provider.provider = "claude".into();
+        claude.launch_argv = vec!["claude".into(), "--effort".into(), "high".into()];
+        assert_eq!(claude.reasoning_effort(), Some("high"));
+
+        codex.launch_argv = vec!["codex".into(), "--effort".into(), "ultra".into()];
+        assert_eq!(codex.reasoning_effort(), None);
+        assert_eq!(codex.model_id(), Some("model-x"));
+        assert!(Path::new(codex.worktree_path()).is_absolute());
     }
 
     #[test]

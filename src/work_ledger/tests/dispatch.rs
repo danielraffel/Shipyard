@@ -442,15 +442,26 @@ fn repository_allowlist_skips_unauthorized_wake_without_mutation_or_starvation()
     };
     let mut adapter = Adapter::successful(true);
 
+    assert!(
+        ledger
+            .has_authorized_pending_wake(&policy)
+            .expect("allowed wake is selectable")
+    );
+
     assert_eq!(
         ledger
-            .consume_one_wake(policy, &mut resolver, &mut adapter)
+            .consume_one_wake(policy.clone(), &mut resolver, &mut adapter)
             .expect("consume allowed wake"),
         WakeDeliveryResult::Delivered
     );
     assert_eq!(resolver.calls, 1);
     assert_eq!(outbox_state(&ledger, &allowed_wake), "delivered");
     assert_eq!(outbox_state(&ledger, &unauthorized_wake), "pending");
+    assert!(
+        !ledger
+            .has_authorized_pending_wake(&policy)
+            .expect("unauthorized-only queue is idle")
+    );
 }
 
 #[test]

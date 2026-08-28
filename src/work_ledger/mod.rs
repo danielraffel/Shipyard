@@ -58,7 +58,11 @@ mod importer;
 pub(crate) use delivery_ownership::{
     AgentContextReceipt, AgentReturnExpectation, AgentReturnReceipt,
 };
-pub(crate) use dispatch::{FreshAgentLaunchProfile, FreshAgentResumeExpectation};
+pub(crate) use dispatch::{
+    DeliveryFence, FreshAgentLaunchProfile, FreshAgentResumeExpectation, ProviderAdapter,
+    ProviderCapability, ProviderLaunchRequest, ProviderOutcome, StoredProviderRequest,
+    WakeConsumerPolicy, WakeDeliveryResult,
+};
 mod lifecycle;
 mod native_publication;
 mod observation;

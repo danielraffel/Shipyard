@@ -192,38 +192,38 @@ pub(crate) enum WakeDeliveryResult {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct StoredResumeExpectation {
-    pub(super) workstream_handle: String,
-    pub(super) context_url: Option<String>,
-    pub(super) plan_sha256: String,
-    pub(super) root_revision: u64,
-    pub(super) issue_revision: u64,
-    pub(super) material_event_revision: u64,
-    pub(super) projection_revision: u64,
-    pub(super) checkpoint_id: String,
-    pub(super) checkpoint_generation: u64,
-    pub(super) checkpoint_digest: String,
-    pub(super) repository: String,
-    pub(super) head_sha: String,
-    pub(super) expected_resume_context_digest: String,
-    pub(super) success_continuation_digest: String,
-    pub(super) failure_continuation_digest: String,
+pub(crate) struct StoredResumeExpectation {
+    pub(crate) workstream_handle: String,
+    pub(crate) context_url: Option<String>,
+    pub(crate) plan_sha256: String,
+    pub(crate) root_revision: u64,
+    pub(crate) issue_revision: u64,
+    pub(crate) material_event_revision: u64,
+    pub(crate) projection_revision: u64,
+    pub(crate) checkpoint_id: String,
+    pub(crate) checkpoint_generation: u64,
+    pub(crate) checkpoint_digest: String,
+    pub(crate) repository: String,
+    pub(crate) head_sha: String,
+    pub(crate) expected_resume_context_digest: String,
+    pub(crate) success_continuation_digest: String,
+    pub(crate) failure_continuation_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct StoredProviderRequest {
-    pub(super) schema_version: u32,
-    pub(super) wake_id: String,
-    pub(super) attempt: u64,
-    pub(super) adapter_id: String,
-    pub(super) provider_id: String,
-    pub(super) idempotency_key: String,
-    pub(super) profile_ref: String,
-    pub(super) profile_object_ref: String,
-    pub(super) profile_digest: String,
-    pub(super) argv: Vec<String>,
-    pub(super) resume: StoredResumeExpectation,
+pub(crate) struct StoredProviderRequest {
+    pub(crate) schema_version: u32,
+    pub(crate) wake_id: String,
+    pub(crate) attempt: u64,
+    pub(crate) adapter_id: String,
+    pub(crate) provider_id: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) profile_ref: String,
+    pub(crate) profile_object_ref: String,
+    pub(crate) profile_digest: String,
+    pub(crate) argv: Vec<String>,
+    pub(crate) resume: StoredResumeExpectation,
 }
 
 fn stored_resume_expectation(
@@ -507,6 +507,16 @@ impl WorkLedger {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Whether one claimed or pending wake belongs to this exact repository
+    /// allowlist. Unauthorized work must not keep the daemon lane spinning.
+    pub(crate) fn has_authorized_pending_wake(
+        &self,
+        policy: &WakeConsumerPolicy,
+    ) -> WorkLedgerResult<bool> {
+        validate_consumer_policy(policy)?;
+        self.next_wake(policy).map(|wake| wake.is_some())
     }
 
     fn uncertain_fence(&self, wake_id: &str) -> WorkLedgerResult<(DeliveryFence, String)> {

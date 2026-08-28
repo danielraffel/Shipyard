@@ -178,7 +178,7 @@ impl WorkLedger {
         Ok(report)
     }
 
-    fn protected_launch_profile_bytes(
+    pub(crate) fn protected_launch_profile_bytes(
         &self,
         work_id: &str,
         profile_digest: &str,

@@ -55,6 +55,10 @@ use crate::tunnel::{
 };
 #[cfg(unix)]
 use crate::webhook::{decode_webhook_event, is_valid_signature};
+#[cfg(unix)]
+use crate::workstream_continuation_runtime::{
+    ContinuationRuntimeStatus, WorkstreamContinuationRuntime,
+};
 
 #[cfg(unix)]
 const SHIP_STATE_SCAN_INTERVAL: Duration = Duration::from_secs(1);
@@ -191,6 +195,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let registration = Arc::new(RegistrationState::new(registrar));
     let registration_error = Arc::new(Mutex::new(None::<String>));
     let execution_error = Arc::new(Mutex::new(None::<String>));
+    let continuation_status = Arc::new(Mutex::new(ContinuationRuntimeStatus::default()));
     let ship_dir = config.state_dir.join("ship");
     let ship_dir_for_list = ship_dir.clone();
 
@@ -199,6 +204,7 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         repos.clone(),
         Arc::clone(&registration_error),
         Arc::clone(&execution_error),
+        Arc::clone(&continuation_status),
         Arc::clone(&last_event_at),
         Arc::clone(&tunnel_runtime.snapshot),
     );
@@ -232,6 +238,8 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
         config.global_dir.clone(),
         config.state_dir.clone(),
     );
+    let mut continuation_runtime =
+        WorkstreamContinuationRuntime::for_daemon(config.mode, config.state_dir.clone());
     while running.load(Ordering::Acquire) {
         let supervisor_error = execution_supervisor
             .tick()
@@ -239,6 +247,10 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
             .map(|error| format!("execution_supervisor: {error}"));
         if let Ok(mut last_error) = execution_error.lock() {
             *last_error = supervisor_error;
+        }
+        continuation_runtime.tick();
+        if let Ok(mut published) = continuation_status.lock() {
+            *published = continuation_runtime.status();
         }
         drain_webhook_events(
             &webhook_rx,
@@ -349,6 +361,7 @@ fn daemon_status_provider(
     configured_repos: Vec<String>,
     registration_error: Arc<Mutex<Option<String>>>,
     execution_error: Arc<Mutex<Option<String>>>,
+    continuation_status: Arc<Mutex<ContinuationRuntimeStatus>>,
     last_event_at: Arc<Mutex<Option<f64>>>,
     tunnel_snapshot: Arc<Mutex<TunnelSnapshot>>,
 ) -> impl Fn() -> IpcState + Send + Sync + 'static {
@@ -365,6 +378,10 @@ fn daemon_status_provider(
             registered_repos: registration.published_repos(),
             configured_repos: configured_repos.clone(),
             rate_limit: None,
+            workstream_continuation: continuation_status.lock().map_or_else(
+                |_| ContinuationRuntimeStatus::default(),
+                |guard| guard.clone(),
+            ),
             last_error: registration_error
                 .lock()
                 .ok()
@@ -1885,6 +1902,9 @@ mod tests {
             vec!["owner/repo".to_owned(), "owner/pending".to_owned()],
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(
+                crate::workstream_continuation_runtime::ContinuationRuntimeStatus::default(),
+            )),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(TunnelSnapshot::inactive())),
         );

@@ -355,7 +355,7 @@ mod handoff;
 pub(crate) use handoff::{StewardHandoffArgs, native_publication_request, steward_handoff_command};
 mod launch_profile;
 #[allow(unused_imports)] // Consumed by the daemon wake-loop integration slice.
-pub(crate) use launch_profile::decode_protected_launch_profile;
+pub(crate) use launch_profile::{LaunchProfileV1, decode_protected_launch_profile};
 mod recovery;
 use recovery::{reconcile_management_label, reconcile_recovery_signal};
 

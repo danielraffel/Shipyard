@@ -180,6 +180,7 @@ pub(crate) mod workstream_activation_loader;
 pub mod workstream_continuation_config;
 /// Digest-pinnable cmux adapter for fresh workstream continuation sessions.
 pub mod workstream_provider_adapter;
+pub(crate) mod workstream_continuation_runtime;
 /// Host-global production-writer coordination for sandbox E2E isolation.
 mod writer_domain_lease;
 
