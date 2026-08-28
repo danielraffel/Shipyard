@@ -814,6 +814,135 @@ fn rejected_alternate_receipt_replays_do_not_grow_protected_storage() {
 }
 
 #[test]
+fn concurrent_differing_receipts_publish_only_the_cas_winner() {
+    let (temp, ledger, profile, work_id, _wake_id) = setup_wake();
+    let (wake_id, delivery_id) = deliver_wake(&ledger, profile);
+    drop(ledger);
+    let context = context_receipt(
+        &WorkLedger::open_existing(temp.path())
+            .expect("open")
+            .expect("ledger"),
+        &wake_id,
+    );
+    let context_variants = [
+        serde_json::to_vec(&context).expect("compact context"),
+        serde_json::to_vec_pretty(&context).expect("pretty context"),
+    ];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let ack_threads = context_variants.clone().map(|bytes| {
+        let state_dir = temp.path().to_owned();
+        let wake_id = wake_id.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let ledger = WorkLedger::open_existing(&state_dir)
+                .expect("open racing ack")
+                .expect("ledger");
+            barrier.wait();
+            ledger.acknowledge_agent_context(&wake_id, &bytes).ok()
+        })
+    });
+    let ack_results = ack_threads.map(|thread| thread.join().expect("ack thread"));
+    assert_eq!(
+        ack_results.iter().filter(|result| result.is_some()).count(),
+        1
+    );
+    let ack_winner_index = ack_results
+        .iter()
+        .position(Option::is_some)
+        .expect("ack winner");
+    let ownership = ack_results[ack_winner_index]
+        .clone()
+        .expect("winning ownership");
+    let reopened = WorkLedger::open_existing(temp.path())
+        .expect("reopen after ack")
+        .expect("ledger");
+    assert_eq!(reopened.status().expect("ack status").protected_objects, 4);
+    assert_eq!(
+        reopened
+            .open_protected_object(&ownership.receipt_object_ref)
+            .expect("ack winner object")
+            .1,
+        context_variants[ack_winner_index]
+    );
+
+    let expected = return_expectation(
+        &work_id,
+        &ownership.ownership_id,
+        &ownership.receipt_digest,
+        &delivery_id,
+    );
+    let return_receipt = return_receipt(&expected);
+    let return_variants = [
+        serde_json::to_vec(&return_receipt).expect("compact return"),
+        serde_json::to_vec_pretty(&return_receipt).expect("pretty return"),
+    ];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let return_threads = return_variants.clone().map(|bytes| {
+        let state_dir = temp.path().to_owned();
+        let ownership_id = ownership.ownership_id.clone();
+        let delivery_id = delivery_id.clone();
+        let expected = expected.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let ledger = WorkLedger::open_existing(&state_dir)
+                .expect("open racing return")
+                .expect("ledger");
+            barrier.wait();
+            ledger
+                .return_agent_ownership(
+                    &ownership_id,
+                    &delivery_id,
+                    expected.work_generation,
+                    &expected,
+                    &bytes,
+                )
+                .ok()
+        })
+    });
+    let return_results = return_threads.map(|thread| thread.join().expect("return thread"));
+    assert_eq!(
+        return_results
+            .iter()
+            .filter(|result| result.is_some())
+            .count(),
+        1
+    );
+    let return_winner_index = return_results
+        .iter()
+        .position(Option::is_some)
+        .expect("return winner");
+    let returned = return_results[return_winner_index]
+        .clone()
+        .expect("winning return");
+    let reopened = WorkLedger::open_existing(temp.path())
+        .expect("reopen after return")
+        .expect("ledger");
+    assert_eq!(
+        reopened.status().expect("return status").protected_objects,
+        5
+    );
+    assert_eq!(
+        reopened
+            .open_protected_object(&returned.receipt_object_ref)
+            .expect("return winner object")
+            .1,
+        return_variants[return_winner_index]
+    );
+    assert_eq!(
+        reopened
+            .return_agent_ownership(
+                &ownership.ownership_id,
+                &delivery_id,
+                expected.work_generation,
+                &expected,
+                &return_variants[return_winner_index],
+            )
+            .expect("exact winner replay"),
+        returned
+    );
+}
+
+#[test]
 fn retry_is_durable_and_uses_a_new_attempt_without_changing_generation() {
     let (_temp, ledger, profile, work_id, wake_id) = setup_wake();
     let mut resolver = Resolver { profile, calls: 0 };

@@ -1,5 +1,9 @@
 //! Receipt-fenced transfer between provider delivery and agent ownership.
 
+use std::fs::{File, OpenOptions};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::dispatch::{StoredProviderRequest, StoredResumeExpectation};
@@ -116,6 +120,80 @@ struct DeliveredAuthority {
     profile_object_ref: String,
     idempotency_key: String,
     provider_receipt_digest: String,
+}
+
+const RECEIPT_PUBLICATION_LOCK: &str = "agent-receipt-publication.lock";
+static RECEIPT_PUBLICATION_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct ReceiptPublicationLease {
+    file: File,
+    _process: MutexGuard<'static, ()>,
+}
+
+impl Drop for ReceiptPublicationLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn acquire_receipt_publication_lease(
+    parent: &std::path::Path,
+) -> WorkLedgerResult<ReceiptPublicationLease> {
+    let process = RECEIPT_PUBLICATION_PROCESS_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| {
+            WorkLedgerError::Refused("receipt publication process lock is poisoned".to_owned())
+        })?;
+    let path = parent.join(RECEIPT_PUBLICATION_LOCK);
+    let _creation = crate::writer_domain_lease::acquire_for_protected_creation(&path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(&path).map_err(|_| {
+        WorkLedgerError::Refused("receipt publication lock is unavailable".to_owned())
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        WorkLedgerError::Refused("receipt publication lock is unreadable".to_owned())
+    })?;
+    if !metadata.is_file() {
+        return Err(WorkLedgerError::Refused(
+            "receipt publication lock is not a regular file".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let bound = std::fs::symlink_metadata(&path).map_err(|_| {
+            WorkLedgerError::Refused("receipt publication lock path is unreadable".to_owned())
+        })?;
+        if metadata.permissions().mode() & 0o077 != 0
+            || metadata.nlink() != 1
+            || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+            || bound.dev() != metadata.dev()
+            || bound.ino() != metadata.ino()
+        {
+            return Err(WorkLedgerError::Refused(
+                "receipt publication lock identity is not private and canonical".to_owned(),
+            ));
+        }
+    }
+    FileExt::lock_exclusive(&file).map_err(|_| {
+        WorkLedgerError::Refused("receipt publication lock cannot be acquired".to_owned())
+    })?;
+    Ok(ReceiptPublicationLease {
+        file,
+        _process: process,
+    })
 }
 
 impl WorkLedger {
@@ -270,6 +348,7 @@ impl WorkLedger {
             .parent()
             .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let _receipt_publication = acquire_receipt_publication_lease(parent)?;
         let mut preflight = self.connect_read_write()?;
         configure_durable(&preflight)?;
         verify_supported_schema(&preflight)?;
@@ -499,6 +578,7 @@ impl WorkLedger {
             .parent()
             .ok_or_else(|| WorkLedgerError::Refused("database has no parent".to_owned()))?;
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(parent)?;
+        let _receipt_publication = acquire_receipt_publication_lease(parent)?;
         let mut preflight = self.connect_read_write()?;
         configure_durable(&preflight)?;
         verify_supported_schema(&preflight)?;
