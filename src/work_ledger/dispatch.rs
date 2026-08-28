@@ -33,11 +33,30 @@ pub(crate) struct WakeConsumerPolicy {
 ///
 /// Implementations must return the stored arrays directly. The consumer never
 /// joins them into a shell command or reconstructs provider flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FreshAgentResumeExpectation<'a> {
+    pub(crate) workstream_handle: &'a str,
+    pub(crate) context_url: Option<&'a str>,
+    pub(crate) plan_revision: u64,
+    pub(crate) checkpoint_id: &'a str,
+    pub(crate) checkpoint_generation: u64,
+    pub(crate) checkpoint_digest: &'a str,
+    pub(crate) repository: &'a str,
+    pub(crate) head_sha: &'a str,
+    pub(crate) expected_resume_context_digest: &'a str,
+    pub(crate) success_continuation_digest: &'a str,
+    pub(crate) failure_continuation_digest: &'a str,
+}
+
 pub(crate) trait FreshAgentLaunchProfile {
     fn provider_id(&self) -> &str;
     fn launch_argv(&self) -> &[String];
     fn profile_digest(&self) -> WorkLedgerResult<String>;
     fn permits_fresh_agent(&self) -> bool;
+
+    fn resume_expectation(&self) -> Option<FreshAgentResumeExpectation<'_>> {
+        None
+    }
 
     fn route_profile_ref(&self) -> WorkLedgerResult<String> {
         Ok(

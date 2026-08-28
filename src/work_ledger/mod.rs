@@ -52,7 +52,7 @@ macro_rules! candidate_params {
 #[allow(dead_code)] // Activation remains false; this is the inert Phase 3 consumer contract.
 mod dispatch;
 mod importer;
-pub(crate) use dispatch::FreshAgentLaunchProfile;
+pub(crate) use dispatch::{FreshAgentLaunchProfile, FreshAgentResumeExpectation};
 mod lifecycle;
 mod observation;
 mod persistence;

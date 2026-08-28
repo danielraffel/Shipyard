@@ -10,6 +10,7 @@ const MAX_ARG_BYTES: usize = 4 * 1024;
 const MAX_ARGV_BYTES: usize = 16 * 1024;
 const MAX_METADATA_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4 * 1024;
+const MAX_CONTEXT_URL_BYTES: usize = 4 * 1024;
 
 /// Private, provider- and terminal-neutral process restoration contract.
 ///
@@ -27,7 +28,30 @@ pub(super) struct LaunchProfileV1 {
     pub(super) session: Option<SessionProvenanceV1>,
     pub(super) checkpoint: CheckpointProvenanceV1,
     pub(super) worktree: WorktreeProvenanceV1,
+    /// Immutable inputs a fresh process must reconstruct before it can accept
+    /// ownership. Older profiles decode without this field but cannot authorize
+    /// fresh-agent dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) continuation_bootstrap: Option<ContinuationBootstrapV1>,
     pub(super) recovery_policy: RecoveryPolicyV1,
+}
+
+/// Exact, provider-neutral expectation for a handle-only fresh-agent resume.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ContinuationBootstrapV1 {
+    pub(super) workstream_handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) context_url: Option<String>,
+    pub(super) plan_revision: u64,
+    pub(super) checkpoint_id: String,
+    pub(super) checkpoint_generation: u64,
+    pub(super) checkpoint_digest: String,
+    pub(super) repository: String,
+    pub(super) head_sha: String,
+    pub(super) expected_resume_context_digest: String,
+    pub(super) success_continuation_digest: String,
+    pub(super) failure_continuation_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -100,7 +124,30 @@ impl crate::work_ledger::FreshAgentLaunchProfile for LaunchProfileV1 {
             self.recovery_policy,
             RecoveryPolicyV1::ExactSessionThenFreshCheckpoint
                 | RecoveryPolicyV1::FreshCheckpointOnly
-        )
+        ) && self
+            .continuation_bootstrap
+            .as_ref()
+            .is_some_and(|bootstrap| validate_continuation_bootstrap(self, bootstrap).is_ok())
+    }
+
+    fn resume_expectation(&self) -> Option<crate::work_ledger::FreshAgentResumeExpectation<'_>> {
+        let bootstrap = self
+            .continuation_bootstrap
+            .as_ref()
+            .filter(|bootstrap| validate_continuation_bootstrap(self, bootstrap).is_ok())?;
+        Some(crate::work_ledger::FreshAgentResumeExpectation {
+            workstream_handle: &bootstrap.workstream_handle,
+            context_url: bootstrap.context_url.as_deref(),
+            plan_revision: bootstrap.plan_revision,
+            checkpoint_id: &bootstrap.checkpoint_id,
+            checkpoint_generation: bootstrap.checkpoint_generation,
+            checkpoint_digest: &bootstrap.checkpoint_digest,
+            repository: &bootstrap.repository,
+            head_sha: &bootstrap.head_sha,
+            expected_resume_context_digest: &bootstrap.expected_resume_context_digest,
+            success_continuation_digest: &bootstrap.success_continuation_digest,
+            failure_continuation_digest: &bootstrap.failure_continuation_digest,
+        })
     }
 }
 
@@ -160,6 +207,102 @@ pub(super) fn validate_launch_profile(profile: &LaunchProfileV1) -> Result<(), C
         ));
     }
     validate_metadata("worktree lineage ID", &profile.worktree.lineage_id)?;
+    if let Some(bootstrap) = profile.continuation_bootstrap.as_ref() {
+        validate_continuation_bootstrap(profile, bootstrap)?;
+    }
+    Ok(())
+}
+
+fn validate_continuation_bootstrap(
+    profile: &LaunchProfileV1,
+    bootstrap: &ContinuationBootstrapV1,
+) -> Result<(), CliFailure> {
+    if bootstrap.workstream_handle.is_empty()
+        || bootstrap.workstream_handle.len() > 124
+        || bootstrap.workstream_handle.chars().any(char::is_whitespace)
+        || bootstrap.workstream_handle.chars().any(char::is_control)
+    {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap workstream handle must be 1-124 non-whitespace characters",
+        ));
+    }
+    if let Some(context_url) = bootstrap.context_url.as_deref() {
+        validate_context_url(context_url)?;
+    }
+    if bootstrap.plan_revision == 0 {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap plan revision must be positive",
+        ));
+    }
+    validate_metadata("bootstrap checkpoint ID", &bootstrap.checkpoint_id)?;
+    if bootstrap.checkpoint_generation == 0 {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap checkpoint generation must be positive",
+        ));
+    }
+    for (label, digest) in [
+        ("bootstrap checkpoint digest", &bootstrap.checkpoint_digest),
+        (
+            "bootstrap expected resume-context digest",
+            &bootstrap.expected_resume_context_digest,
+        ),
+        (
+            "bootstrap success continuation digest",
+            &bootstrap.success_continuation_digest,
+        ),
+        (
+            "bootstrap failure continuation digest",
+            &bootstrap.failure_continuation_digest,
+        ),
+    ] {
+        validate_lower_sha256(label, digest)?;
+    }
+    validate_repository(&bootstrap.repository)?;
+    if !is_full_sha(&bootstrap.head_sha)
+        || !bootstrap
+            .head_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap head must be a full lowercase 40-character SHA-1",
+        ));
+    }
+    if bootstrap.checkpoint_id != profile.checkpoint.checkpoint_id
+        || bootstrap.checkpoint_generation != profile.checkpoint.generation
+        || bootstrap.checkpoint_digest != profile.checkpoint.digest
+        || bootstrap.repository != profile.worktree.repository
+        || bootstrap.head_sha != profile.worktree.head_sha
+    {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap checkpoint, repository, or head does not match launch provenance",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_context_url(value: &str) -> Result<(), CliFailure> {
+    let remainder = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"));
+    let authority = remainder.and_then(|remainder| remainder.split(['/', '?', '#']).next());
+    if value.len() > MAX_CONTEXT_URL_BYTES
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+        || authority.is_none_or(str::is_empty)
+        || authority.is_some_and(|authority| authority.contains('@'))
+        || value.contains('#')
+    {
+        return Err(CliFailure::new(
+            1,
+            "bootstrap context URL must be a bounded canonical HTTP(S) URL without userinfo or fragment",
+        ));
+    }
     Ok(())
 }
 
@@ -256,6 +399,21 @@ fn validate_sha256(label: &str, value: &str) -> Result<(), CliFailure> {
     }
 }
 
+fn validate_lower_sha256(label: &str, value: &str) -> Result<(), CliFailure> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(CliFailure::new(
+            1,
+            format!("{label} must be 64 lowercase hexadecimal characters"),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +452,19 @@ mod tests {
                 head_sha: "b".repeat(40),
                 lineage_id: "lineage-7".into(),
             },
+            continuation_bootstrap: Some(ContinuationBootstrapV1 {
+                workstream_handle: "GEN-43".into(),
+                context_url: Some("https://linear.example/GEN-43".into()),
+                plan_revision: 7,
+                checkpoint_id: "checkpoint-7".into(),
+                checkpoint_generation: 3,
+                checkpoint_digest: "a".repeat(64),
+                repository: "owner/repo".into(),
+                head_sha: "b".repeat(40),
+                expected_resume_context_digest: "c".repeat(64),
+                success_continuation_digest: "d".repeat(64),
+                failure_continuation_digest: "e".repeat(64),
+            }),
             recovery_policy: RecoveryPolicyV1::ExactSessionThenFreshCheckpoint,
         }
     }
@@ -352,5 +523,154 @@ mod tests {
         invalid = profile();
         invalid.worktree.path = "relative/path".into();
         assert!(validate_launch_profile(&invalid).is_err());
+    }
+
+    #[test]
+    fn legacy_profile_decodes_but_cannot_authorize_fresh_dispatch() {
+        use crate::work_ledger::FreshAgentLaunchProfile;
+
+        let mut value = serde_json::to_value(profile()).expect("value");
+        value
+            .as_object_mut()
+            .expect("profile object")
+            .remove("continuation_bootstrap");
+        let mut decoded: LaunchProfileV1 = serde_json::from_value(value).expect("legacy decode");
+        validate_launch_profile(&decoded).expect("legacy profile remains valid");
+        assert!(!FreshAgentLaunchProfile::permits_fresh_agent(&decoded));
+        decoded.recovery_policy = RecoveryPolicyV1::FreshCheckpointOnly;
+        assert!(!FreshAgentLaunchProfile::permits_fresh_agent(&decoded));
+    }
+
+    #[test]
+    fn fresh_checkpoint_dispatch_requires_and_exposes_exact_bootstrap() {
+        use crate::work_ledger::FreshAgentLaunchProfile;
+
+        let mut complete = profile();
+        complete.recovery_policy = RecoveryPolicyV1::FreshCheckpointOnly;
+        assert!(FreshAgentLaunchProfile::permits_fresh_agent(&complete));
+        let expectation = FreshAgentLaunchProfile::resume_expectation(&complete)
+            .expect("typed resume expectation");
+        assert_eq!(expectation.workstream_handle, "GEN-43");
+        assert_eq!(
+            expectation.context_url,
+            Some("https://linear.example/GEN-43")
+        );
+        assert_eq!(expectation.plan_revision, 7);
+        assert_eq!(expectation.checkpoint_id, "checkpoint-7");
+        assert_eq!(expectation.checkpoint_generation, 3);
+        assert_eq!(expectation.checkpoint_digest, "a".repeat(64));
+        assert_eq!(expectation.repository, "owner/repo");
+        assert_eq!(expectation.head_sha, "b".repeat(40));
+        assert_eq!(expectation.expected_resume_context_digest, "c".repeat(64));
+        assert_eq!(expectation.success_continuation_digest, "d".repeat(64));
+        assert_eq!(expectation.failure_continuation_digest, "e".repeat(64));
+
+        complete.continuation_bootstrap = None;
+        assert!(!FreshAgentLaunchProfile::permits_fresh_agent(&complete));
+        assert!(FreshAgentLaunchProfile::resume_expectation(&complete).is_none());
+    }
+
+    #[test]
+    fn bootstrap_is_strict_and_bound_to_exact_launch_provenance() {
+        let base = profile();
+        let mut invalid = base.clone();
+        invalid
+            .continuation_bootstrap
+            .as_mut()
+            .expect("bootstrap")
+            .workstream_handle = "GEN 43".into();
+        assert!(validate_launch_profile(&invalid).is_err());
+
+        let mutations: [fn(&mut ContinuationBootstrapV1); 8] = [
+            |bootstrap| bootstrap.plan_revision = 0,
+            |bootstrap| bootstrap.checkpoint_generation += 1,
+            |bootstrap| bootstrap.checkpoint_digest = "f".repeat(64),
+            |bootstrap| bootstrap.repository = "owner/other".into(),
+            |bootstrap| bootstrap.head_sha = "f".repeat(40),
+            |bootstrap| bootstrap.expected_resume_context_digest = "F".repeat(64),
+            |bootstrap| bootstrap.success_continuation_digest = "short".into(),
+            |bootstrap| bootstrap.failure_continuation_digest = "short".into(),
+        ];
+        for mutation in mutations {
+            let mut invalid = base.clone();
+            mutation(invalid.continuation_bootstrap.as_mut().expect("bootstrap"));
+            assert!(validate_launch_profile(&invalid).is_err());
+        }
+
+        let mut invalid_url = base.clone();
+        invalid_url
+            .continuation_bootstrap
+            .as_mut()
+            .expect("bootstrap")
+            .context_url = Some("file:///tmp/context".into());
+        assert!(validate_launch_profile(&invalid_url).is_err());
+        for url in [
+            "https://",
+            "https://user@example.test/GEN-43",
+            "https://linear.example/GEN-43#mutable-fragment",
+        ] {
+            let mut invalid = base.clone();
+            invalid
+                .continuation_bootstrap
+                .as_mut()
+                .expect("bootstrap")
+                .context_url = Some(url.into());
+            assert!(validate_launch_profile(&invalid).is_err());
+        }
+
+        let mut value = serde_json::to_value(base).expect("value");
+        value["continuation_bootstrap"]["forged"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<LaunchProfileV1>(value).is_err());
+
+        for required in [
+            "workstream_handle",
+            "plan_revision",
+            "checkpoint_id",
+            "checkpoint_generation",
+            "checkpoint_digest",
+            "repository",
+            "head_sha",
+            "expected_resume_context_digest",
+            "success_continuation_digest",
+            "failure_continuation_digest",
+        ] {
+            let mut value = serde_json::to_value(profile()).expect("value");
+            value["continuation_bootstrap"]
+                .as_object_mut()
+                .expect("bootstrap object")
+                .remove(required);
+            assert!(
+                serde_json::from_value::<LaunchProfileV1>(value).is_err(),
+                "missing bootstrap field {required} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_fields_are_exact_and_digest_bound() {
+        let profile = profile();
+        let bootstrap = profile.continuation_bootstrap.as_ref().expect("bootstrap");
+        assert_eq!(bootstrap.workstream_handle, "GEN-43");
+        assert_eq!(bootstrap.plan_revision, 7);
+        assert_eq!(bootstrap.checkpoint_id, profile.checkpoint.checkpoint_id);
+        assert_eq!(
+            bootstrap.checkpoint_generation,
+            profile.checkpoint.generation
+        );
+        assert_eq!(bootstrap.checkpoint_digest, profile.checkpoint.digest);
+        assert_eq!(bootstrap.repository, profile.worktree.repository);
+        assert_eq!(bootstrap.head_sha, profile.worktree.head_sha);
+
+        let original = launch_profile_digest(&profile).expect("original digest");
+        let mut changed = profile;
+        changed
+            .continuation_bootstrap
+            .as_mut()
+            .expect("bootstrap")
+            .plan_revision += 1;
+        assert_ne!(
+            original,
+            launch_profile_digest(&changed).expect("changed digest")
+        );
     }
 }

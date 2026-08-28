@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::merge_steward_cmd::launch_profile::{
-    CheckpointProvenanceV1, LaunchProfileV1, ProviderMetadataV1, RecoveryPolicyV1,
-    SessionProvenanceV1, WorktreeProvenanceV1,
+    CheckpointProvenanceV1, ContinuationBootstrapV1, LaunchProfileV1, ProviderMetadataV1,
+    RecoveryPolicyV1, SessionProvenanceV1, WorktreeProvenanceV1,
 };
 use std::process::Command;
 use std::sync::OnceLock;
@@ -123,6 +123,19 @@ fn profile(resume_flag: &str) -> LaunchProfileV1 {
             head_sha: fixture.head.clone(),
             lineage_id: fixture.branch.clone(),
         },
+        continuation_bootstrap: Some(ContinuationBootstrapV1 {
+            workstream_handle: "SY-LF-TEST".into(),
+            context_url: Some("https://linear.example/SY-LF-TEST".into()),
+            plan_revision: 1,
+            checkpoint_id: "checkpoint-7".into(),
+            checkpoint_generation: 4,
+            checkpoint_digest: "b".repeat(64),
+            repository: "owner/repo".into(),
+            head_sha: fixture.head.clone(),
+            expected_resume_context_digest: "c".repeat(64),
+            success_continuation_digest: "d".repeat(64),
+            failure_continuation_digest: "e".repeat(64),
+        }),
         recovery_policy: RecoveryPolicyV1::ExactSessionThenFreshCheckpoint,
     }
 }
