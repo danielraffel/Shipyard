@@ -268,7 +268,7 @@ impl ExecutionSupervisor {
         for job in queue
             .get_all()?
             .into_iter()
-            .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running))
+            .filter(requires_merged_ship_observation)
         {
             let Ok(Some(envelope)) = request_store.load(&job.id) else {
                 continue;
@@ -972,17 +972,16 @@ impl ExecutionSupervisor {
         let mut child = self.children.remove(job_id);
         let mut transaction = if let Some(transaction) = store.load(job_id)? {
             let mut transaction = transaction;
-            let Some(receipt) = self.read_exact_receipt(job_id)? else {
-                if let Some(child) = child {
-                    self.children.insert(job_id.to_owned(), child);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "durable termination transaction lost its exact worker receipt",
-                )
-                .into());
-            };
-            if !transaction.matches_receipt(&receipt) {
+            // Once `begin` has durably recorded the frozen process-tree
+            // snapshot, that transaction is the recovery authority. The
+            // separately published worker receipt may disappear in a crash
+            // after the transaction commit; requiring it here would strand a
+            // tree that we can still prove dead from the durable snapshot.
+            // A receipt that is present remains a generation CAS fence: never
+            // apply an old transaction to a replacement worker generation.
+            if let Some(receipt) = self.read_exact_receipt(job_id)?
+                && !transaction.matches_receipt(&receipt)
+            {
                 if let Some(child) = child {
                     self.children.insert(job_id.to_owned(), child);
                 }
@@ -1106,6 +1105,15 @@ fn running_resource_claims(
         }
     }
     Ok(RunningResourceClaims { claims, errors })
+}
+
+fn requires_merged_ship_observation(job: &Job) -> bool {
+    matches!(job.status, JobStatus::Pending | JobStatus::Running)
+        && !(job.cancel_requested_at.is_some()
+            && job
+                .cancellation_proof
+                .as_ref()
+                .is_some_and(|proof| proof.cause == CancellationCause::AlreadyMerged))
 }
 
 fn request_error_is_job_local(error: &QueueRequestError) -> bool {
@@ -2275,6 +2283,7 @@ mod tests {
     #[cfg(unix)]
     #[derive(Clone, Copy, Debug)]
     enum TerminationCrashBoundary {
+        FrozenBeforeTreeDeath,
         TreeDeadBeforeLeaseRelease,
         LeaseReleasedBeforeMarker,
         MarkerBeforeQueueFinalization,
@@ -2284,11 +2293,25 @@ mod tests {
     #[test]
     fn gen42_issue_437_cancel_restart_completes_every_durable_crash_boundary() {
         for boundary in [
+            TerminationCrashBoundary::FrozenBeforeTreeDeath,
             TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
             TerminationCrashBoundary::LeaseReleasedBeforeMarker,
             TerminationCrashBoundary::MarkerBeforeQueueFinalization,
         ] {
-            assert_termination_crash_recovers(TerminationAction::Cancel, boundary);
+            assert_termination_crash_recovers(TerminationAction::Cancel, boundary, true);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_cancel_restart_completes_every_durable_crash_boundary() {
+        for boundary in [
+            TerminationCrashBoundary::FrozenBeforeTreeDeath,
+            TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
+            TerminationCrashBoundary::LeaseReleasedBeforeMarker,
+            TerminationCrashBoundary::MarkerBeforeQueueFinalization,
+        ] {
+            assert_termination_crash_recovers(TerminationAction::Cancel, boundary, false);
         }
     }
 
@@ -2296,12 +2319,99 @@ mod tests {
     #[test]
     fn gen42_issue_437_defer_restart_completes_every_durable_crash_boundary() {
         for boundary in [
+            TerminationCrashBoundary::FrozenBeforeTreeDeath,
             TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
             TerminationCrashBoundary::LeaseReleasedBeforeMarker,
             TerminationCrashBoundary::MarkerBeforeQueueFinalization,
         ] {
-            assert_termination_crash_recovers(TerminationAction::Defer, boundary);
+            assert_termination_crash_recovers(TerminationAction::Defer, boundary, true);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_defer_restart_completes_every_durable_crash_boundary() {
+        for boundary in [
+            TerminationCrashBoundary::FrozenBeforeTreeDeath,
+            TerminationCrashBoundary::TreeDeadBeforeLeaseRelease,
+            TerminationCrashBoundary::LeaseReleasedBeforeMarker,
+            TerminationCrashBoundary::MarkerBeforeQueueFinalization,
+        ] {
+            assert_termination_crash_recovers(TerminationAction::Defer, boundary, false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_recovery_still_refuses_a_present_replacement_generation() {
+        let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let job_id = "replacement-generation";
+        queued_ship_job(temp.path(), job_id, "exact-head");
+        let mut supervisor = ExecutionSupervisor::new(
+            fake_worker_tree(temp.path()),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor.tick().expect("start exact worker");
+        wait_for_live_descendant(&temp.path().join("descendant.pid"));
+        Queue::new(temp.path())
+            .expect("queue")
+            .request_cancel(job_id, Some("operator cancel".to_owned()))
+            .expect("request cancel")
+            .expect("running job");
+        let WorkerObservation::Alive(exact_receipt) = supervisor
+            .observe_cancellation_receipt(job_id)
+            .expect("observe exact worker")
+        else {
+            panic!("expected live exact worker receipt");
+        };
+        TerminationStore::new(temp.path())
+            .begin(&exact_receipt, TerminationAction::Cancel)
+            .expect("freeze exact tree");
+        let replacement = WorkerReceipt {
+            job_id: job_id.to_owned(),
+            generation: "replacement-generation".to_owned(),
+            pid: std::process::id(),
+            started_at: Utc::now(),
+        };
+        write_json_atomic(&supervisor.receipt_path(job_id), &replacement)
+            .expect("publish replacement receipt");
+
+        let error = supervisor
+            .complete_worker_termination(job_id, TerminationAction::Cancel)
+            .expect_err("replacement generation must fail closed");
+        assert!(error.to_string().contains("receipt generation changed"));
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get(job_id)
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            serde_json::from_slice::<WorkerReceipt>(
+                &fs::read(supervisor.receipt_path(job_id)).expect("replacement retained")
+            )
+            .expect("receipt json"),
+            replacement
+        );
+
+        // Restore the exact receipt solely to finish the frozen test worker;
+        // production recovery must never erase or adopt the replacement.
+        write_json_atomic(&supervisor.receipt_path(job_id), &exact_receipt)
+            .expect("restore exact receipt for cleanup");
+        let transaction = supervisor
+            .complete_worker_termination(job_id, TerminationAction::Cancel)
+            .expect("finish exact transaction")
+            .expect("tree-death proof");
+        assert_eq!(transaction.phase, TerminationPhase::LeasesReleased);
+        supervisor
+            .cleanup_termination_transaction(&transaction)
+            .expect("cleanup transaction");
     }
 
     #[cfg(unix)]
@@ -2477,6 +2587,7 @@ mod tests {
     fn assert_termination_crash_recovers(
         action: TerminationAction,
         boundary: TerminationCrashBoundary,
+        retain_receipt: bool,
     ) {
         let _tree_test = PROCESS_TREE_TEST_LOCK.lock().expect("tree test lock");
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2540,12 +2651,14 @@ mod tests {
         };
         let store = TerminationStore::new(temp.path());
         let mut transaction = store.begin(&receipt, action).expect("freeze tree");
-        let mut child = original.children.remove(job_id).expect("owned child");
-        assert!(
-            store
-                .prove_tree_dead(&mut transaction, Some(&mut child))
-                .expect("prove tree dead")
-        );
+        if !matches!(boundary, TerminationCrashBoundary::FrozenBeforeTreeDeath) {
+            let mut child = original.children.remove(job_id).expect("owned child");
+            assert!(
+                store
+                    .prove_tree_dead(&mut transaction, Some(&mut child))
+                    .expect("prove tree dead")
+            );
+        }
         if matches!(
             boundary,
             TerminationCrashBoundary::LeaseReleasedBeforeMarker
@@ -2564,10 +2677,18 @@ mod tests {
                 .mark_leases_released(&mut transaction)
                 .expect("released marker");
         }
+        if !retain_receipt {
+            remove_if_present(&original.receipt_path(job_id)).expect("remove exact receipt");
+            queued_job(temp.path(), "replacement");
+        }
         drop(original);
 
         let mut restarted = ExecutionSupervisor::new(
-            PathBuf::from("/does/not/exist"),
+            if retain_receipt {
+                PathBuf::from("/does/not/exist")
+            } else {
+                fake_worker(temp.path())
+            },
             RuntimeMode::Isolated,
             temp.path().into(),
             temp.path().into(),
@@ -2596,6 +2717,32 @@ mod tests {
             }
             TerminationAction::Defer => assert_eq!(job.status, JobStatus::Pending),
         }
+        if !retain_receipt {
+            assert_eq!(
+                queue
+                    .get("replacement")
+                    .expect("read replacement")
+                    .expect("replacement job")
+                    .status,
+                JobStatus::Running
+            );
+            assert!(restarted.children.contains_key("replacement"));
+            restarted.tick().expect("idempotent second tick");
+            assert_eq!(
+                queue
+                    .get("replacement")
+                    .expect("read replacement")
+                    .expect("replacement job")
+                    .status,
+                JobStatus::Running
+            );
+            let mut replacement = restarted
+                .children
+                .remove("replacement")
+                .expect("replacement worker");
+            terminate_process_group(replacement.id());
+            let _ = replacement.wait();
+        }
     }
 
     #[test]
@@ -2610,6 +2757,35 @@ mod tests {
             let cancellations = merged_cancellations(temp.path(), JobStatus::Pending, observed);
             assert_eq!(!cancellations.is_empty(), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn exact_merged_cancellation_proof_stops_repeated_remote_observation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pending = queued_ship_job(temp.path(), "proven-merged", "exact-head");
+        assert!(requires_merged_ship_observation(&pending));
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, std::slice::from_ref(&pending.id))
+            .expect("start");
+        drop(lock);
+        let proven = queue
+            .request_cancel_with_proof(
+                &pending.id,
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(CancellationProof {
+                    cause: CancellationCause::AlreadyMerged,
+                    repository: "owner/repo".to_owned(),
+                    pull_request: 438,
+                    head_sha: "exact-head".to_owned(),
+                }),
+            )
+            .expect("request cancellation")
+            .expect("running job");
+
+        assert!(!requires_merged_ship_observation(&proven));
     }
 
     #[cfg(unix)]
