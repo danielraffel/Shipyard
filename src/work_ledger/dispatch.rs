@@ -37,7 +37,11 @@ pub(crate) struct WakeConsumerPolicy {
 pub(crate) struct FreshAgentResumeExpectation<'a> {
     pub(crate) workstream_handle: &'a str,
     pub(crate) context_url: Option<&'a str>,
-    pub(crate) plan_revision: u64,
+    pub(crate) plan_sha256: &'a str,
+    pub(crate) root_revision: u64,
+    pub(crate) issue_revision: u64,
+    pub(crate) projection_revision: u64,
+    pub(crate) material_event_revision: u64,
     pub(crate) checkpoint_id: &'a str,
     pub(crate) checkpoint_generation: u64,
     pub(crate) checkpoint_digest: &'a str,

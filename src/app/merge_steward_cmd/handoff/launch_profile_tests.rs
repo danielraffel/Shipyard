@@ -126,7 +126,11 @@ fn profile(resume_flag: &str) -> LaunchProfileV1 {
         continuation_bootstrap: Some(ContinuationBootstrapV1 {
             workstream_handle: "SY-LF-TEST".into(),
             context_url: Some("https://linear.example/SY-LF-TEST".into()),
-            plan_revision: 1,
+            plan_sha256: "a".repeat(64),
+            root_revision: 0,
+            issue_revision: 0,
+            projection_revision: 1,
+            material_event_revision: 0,
             checkpoint_id: "checkpoint-7".into(),
             checkpoint_generation: 4,
             checkpoint_digest: "b".repeat(64),

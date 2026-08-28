@@ -43,7 +43,11 @@ pub(super) struct ContinuationBootstrapV1 {
     pub(super) workstream_handle: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) context_url: Option<String>,
-    pub(super) plan_revision: u64,
+    pub(super) plan_sha256: String,
+    pub(super) root_revision: u64,
+    pub(super) issue_revision: u64,
+    pub(super) projection_revision: u64,
+    pub(super) material_event_revision: u64,
     pub(super) checkpoint_id: String,
     pub(super) checkpoint_generation: u64,
     pub(super) checkpoint_digest: String,
@@ -138,7 +142,11 @@ impl crate::work_ledger::FreshAgentLaunchProfile for LaunchProfileV1 {
         Some(crate::work_ledger::FreshAgentResumeExpectation {
             workstream_handle: &bootstrap.workstream_handle,
             context_url: bootstrap.context_url.as_deref(),
-            plan_revision: bootstrap.plan_revision,
+            plan_sha256: &bootstrap.plan_sha256,
+            root_revision: bootstrap.root_revision,
+            issue_revision: bootstrap.issue_revision,
+            projection_revision: bootstrap.projection_revision,
+            material_event_revision: bootstrap.material_event_revision,
             checkpoint_id: &bootstrap.checkpoint_id,
             checkpoint_generation: bootstrap.checkpoint_generation,
             checkpoint_digest: &bootstrap.checkpoint_digest,
@@ -230,10 +238,11 @@ fn validate_continuation_bootstrap(
     if let Some(context_url) = bootstrap.context_url.as_deref() {
         validate_context_url(context_url)?;
     }
-    if bootstrap.plan_revision == 0 {
+    validate_lower_sha256("bootstrap plan digest", &bootstrap.plan_sha256)?;
+    if bootstrap.projection_revision == 0 {
         return Err(CliFailure::new(
             1,
-            "bootstrap plan revision must be positive",
+            "bootstrap projection revision must be positive",
         ));
     }
     validate_metadata("bootstrap checkpoint ID", &bootstrap.checkpoint_id)?;
@@ -455,7 +464,11 @@ mod tests {
             continuation_bootstrap: Some(ContinuationBootstrapV1 {
                 workstream_handle: "GEN-43".into(),
                 context_url: Some("https://linear.example/GEN-43".into()),
-                plan_revision: 7,
+                plan_sha256: "f".repeat(64),
+                root_revision: 0,
+                issue_revision: 0,
+                projection_revision: 4,
+                material_event_revision: 0,
                 checkpoint_id: "checkpoint-7".into(),
                 checkpoint_generation: 3,
                 checkpoint_digest: "a".repeat(64),
@@ -555,7 +568,11 @@ mod tests {
             expectation.context_url,
             Some("https://linear.example/GEN-43")
         );
-        assert_eq!(expectation.plan_revision, 7);
+        assert_eq!(expectation.plan_sha256, "f".repeat(64));
+        assert_eq!(expectation.root_revision, 0);
+        assert_eq!(expectation.issue_revision, 0);
+        assert_eq!(expectation.projection_revision, 4);
+        assert_eq!(expectation.material_event_revision, 0);
         assert_eq!(expectation.checkpoint_id, "checkpoint-7");
         assert_eq!(expectation.checkpoint_generation, 3);
         assert_eq!(expectation.checkpoint_digest, "a".repeat(64));
@@ -581,8 +598,9 @@ mod tests {
             .workstream_handle = "GEN 43".into();
         assert!(validate_launch_profile(&invalid).is_err());
 
-        let mutations: [fn(&mut ContinuationBootstrapV1); 8] = [
-            |bootstrap| bootstrap.plan_revision = 0,
+        let mutations: [fn(&mut ContinuationBootstrapV1); 9] = [
+            |bootstrap| bootstrap.plan_sha256 = "F".repeat(64),
+            |bootstrap| bootstrap.projection_revision = 0,
             |bootstrap| bootstrap.checkpoint_generation += 1,
             |bootstrap| bootstrap.checkpoint_digest = "f".repeat(64),
             |bootstrap| bootstrap.repository = "owner/other".into(),
@@ -624,7 +642,11 @@ mod tests {
 
         for required in [
             "workstream_handle",
-            "plan_revision",
+            "plan_sha256",
+            "root_revision",
+            "issue_revision",
+            "projection_revision",
+            "material_event_revision",
             "checkpoint_id",
             "checkpoint_generation",
             "checkpoint_digest",
@@ -651,7 +673,11 @@ mod tests {
         let profile = profile();
         let bootstrap = profile.continuation_bootstrap.as_ref().expect("bootstrap");
         assert_eq!(bootstrap.workstream_handle, "GEN-43");
-        assert_eq!(bootstrap.plan_revision, 7);
+        assert_eq!(bootstrap.plan_sha256, "f".repeat(64));
+        assert_eq!(bootstrap.root_revision, 0);
+        assert_eq!(bootstrap.issue_revision, 0);
+        assert_eq!(bootstrap.projection_revision, 4);
+        assert_eq!(bootstrap.material_event_revision, 0);
         assert_eq!(bootstrap.checkpoint_id, profile.checkpoint.checkpoint_id);
         assert_eq!(
             bootstrap.checkpoint_generation,
@@ -662,15 +688,26 @@ mod tests {
         assert_eq!(bootstrap.head_sha, profile.worktree.head_sha);
 
         let original = launch_profile_digest(&profile).expect("original digest");
-        let mut changed = profile;
+        let mut changed = profile.clone();
         changed
             .continuation_bootstrap
             .as_mut()
             .expect("bootstrap")
-            .plan_revision += 1;
+            .projection_revision += 1;
         assert_ne!(
             original,
             launch_profile_digest(&changed).expect("changed digest")
+        );
+
+        let mut changed_plan = profile;
+        changed_plan
+            .continuation_bootstrap
+            .as_mut()
+            .expect("bootstrap")
+            .plan_sha256 = "0".repeat(64);
+        assert_ne!(
+            original,
+            launch_profile_digest(&changed_plan).expect("changed plan digest")
         );
     }
 }
