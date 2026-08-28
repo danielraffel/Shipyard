@@ -770,11 +770,16 @@ cannot release capacity into overlapping side effects.
 
 The daemon also observes queued and running ship PRs. It cancels only when the
 authoritative PR state is merged and GitHub reports the exact head SHA stored in
-the durable request. It writes the terminal queue record and typed outcome
-before terminating the process group. Open PRs, a different merged head, auth
-failure, timeout, and malformed or ambiguous responses are no-ops. Terminal
-queue records are immutable against stale worker progress, and a later daemon
-tick repairs a missing typed outcome from the winning terminal record.
+the durable request. For running work, the authenticated repository/PR/head
+proof drives a durable, restart-idempotent termination transaction: freeze the
+recursive process tree, prove it dead, then release leases and publish the typed
+terminal outcome. Deferred work returns to pending only after the same proof.
+Worker-receipt cleanup is generation-CAS fenced by job id, worker generation,
+and root PID, so recovery cannot delete a replacement worker's receipt. Open
+PRs, a different merged head, auth failure, timeout, legacy reason strings, and
+malformed or ambiguous responses are no-ops. Terminal queue records are
+immutable against stale worker progress, and a later daemon tick repairs a
+missing typed outcome from the winning terminal record.
 
 Daemon-owned GitHub work requires `[github.auth] source = "command"`, so an
 existing daemon can refresh credentials independently of the submitting shell;

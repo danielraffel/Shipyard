@@ -816,7 +816,7 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
     ship_state
         .save_scoped_locked(&state, &ship_state_lock)
         .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
-    let post_validation = completed_validation_disposition(&job);
+    let post_validation = completed_validation_disposition(request, &job);
     QueueOutcomeStore::new(state_dir)
         .map_err(QueueRequestError::from)?
         .save(&QueuedExecutionOutcome::ship_with_post_validation(

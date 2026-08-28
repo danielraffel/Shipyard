@@ -72,6 +72,27 @@ pub enum JobStatus {
     Cancelled,
 }
 
+/// Machine-readable authority for a cancellation disposition.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationCause {
+    /// An authenticated observer proved that the exact submitted PR head merged.
+    AlreadyMerged,
+}
+
+/// Authenticated identity bound to a typed cancellation cause.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CancellationProof {
+    /// Typed cause established by the trusted observer.
+    pub cause: CancellationCause,
+    /// Canonical repository slug observed by the provider client.
+    pub repository: String,
+    /// Pull-request number observed by the provider client.
+    pub pull_request: u64,
+    /// Exact merged head SHA matching the queued immutable request.
+    pub head_sha: String,
+}
+
 /// Target result state.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -317,6 +338,9 @@ pub struct Job {
     /// Optional reason when a job is cancelled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancellation_reason: Option<String>,
+    /// Typed authenticated cancellation authority. Legacy and manual cancels omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_proof: Option<CancellationProof>,
     /// Timestamp when cancellation was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_requested_at: Option<DateTime<Utc>>,
@@ -363,6 +387,7 @@ impl Job {
             started_at: None,
             completed_at: None,
             cancellation_reason: None,
+            cancellation_proof: None,
             cancel_requested_at: None,
             scheduler_defer_reason: None,
             scheduler_defer_count: 0,
@@ -405,6 +430,14 @@ impl Job {
 
     /// Cancel any non-terminal job with an optional reason.
     pub fn cancel_with_reason(&self, reason: Option<String>) -> Result<Self, JobTransitionError> {
+        self.cancel_with_reason_and_proof(reason, None)
+    }
+
+    pub(crate) fn cancel_with_reason_and_proof(
+        &self,
+        reason: Option<String>,
+        proof: Option<CancellationProof>,
+    ) -> Result<Self, JobTransitionError> {
         if matches!(self.status, JobStatus::Completed | JobStatus::Cancelled) {
             return Err(JobTransitionError::InvalidCancel(self.status));
         }
@@ -412,6 +445,7 @@ impl Job {
         next.status = JobStatus::Cancelled;
         next.completed_at = Some(Utc::now());
         next.cancellation_reason = reason;
+        next.cancellation_proof = proof;
         next.cancel_requested_at = self.cancel_requested_at.or(next.completed_at);
         Ok(next)
     }
@@ -424,14 +458,23 @@ impl Job {
         &self,
         reason: Option<String>,
     ) -> Result<Self, JobTransitionError> {
+        self.request_cancel_with_reason_and_proof(reason, None)
+    }
+
+    pub(crate) fn request_cancel_with_reason_and_proof(
+        &self,
+        reason: Option<String>,
+        proof: Option<CancellationProof>,
+    ) -> Result<Self, JobTransitionError> {
         if self.status == JobStatus::Pending {
-            return self.cancel_with_reason(reason);
+            return self.cancel_with_reason_and_proof(reason, proof);
         }
         if self.status != JobStatus::Running {
             return Err(JobTransitionError::InvalidCancel(self.status));
         }
         let mut next = self.clone();
         next.cancellation_reason = reason;
+        next.cancellation_proof = proof;
         next.cancel_requested_at = Some(Utc::now());
         Ok(next)
     }
