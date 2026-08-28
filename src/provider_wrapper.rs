@@ -14,9 +14,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -25,15 +22,24 @@ use sha2::{Digest, Sha256};
 use crate::process::ProcessTree;
 use crate::workstream_continuation_config::ProviderWrapperConfig;
 
+mod execution_sentinel;
+#[cfg(not(unix))]
+use execution_sentinel::SentinelCleanup;
+use execution_sentinel::terminate_sentinel_processes;
+
 const SCHEMA_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WRAPPER_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_ARGV_ITEMS: usize = 64;
-const MAX_ARG_BYTES: usize = 4 * 1024;
-const MAX_ARGV_BYTES: usize = 16 * 1024;
 const MAX_VALUE_BYTES: usize = 4 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
+#[cfg(target_os = "macos")]
+const SENTINEL_TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
+#[cfg(not(target_os = "macos"))]
+const SENTINEL_TEARDOWN_BUDGET: Duration = TEARDOWN_BUDGET;
+const EXECUTION_SENTINEL_FD_ENV: &str = "SHIPYARD_PROVIDER_SENTINEL_FD";
+#[cfg(test)]
+static PROVIDER_EXECUTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Exact operation requested from the protected wrapper.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -100,7 +106,8 @@ pub(crate) struct FreshResumeExpectationV1 {
     pub(crate) context_url: Option<String>,
     pub(crate) plan_sha256: String,
     pub(crate) root_revision: u64,
-    pub(crate) material_revision: u64,
+    pub(crate) issue_revision: u64,
+    pub(crate) material_event_revision: u64,
     pub(crate) projection_revision: u64,
     pub(crate) checkpoint_id: String,
     pub(crate) checkpoint_generation: u64,
@@ -123,7 +130,29 @@ pub(crate) struct ProviderWrapperRequestV1 {
     pub(crate) adapter_id: String,
     pub(crate) delivery_fence: ProviderDeliveryFenceV1,
     pub(crate) resume_expectation: FreshResumeExpectationV1,
-    pub(crate) launch_argv: Vec<String>,
+    pub(crate) launch_options: ProviderLaunchOptionsV1,
+}
+
+/// Narrow user intent that the digest-pinned provider adapter translates into
+/// its own command grammar. Arbitrary argv never crosses this boundary.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderLaunchOptionsV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_effort: Option<ProviderReasoningEffortV1>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderReasoningEffortV1 {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
 }
 
 /// The only success meaning exposed by this boundary.
@@ -254,12 +283,46 @@ pub(crate) const fn provider_wrapper_execution_supported() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
+/// The platform guarantee supplied after the configured bytes are verified.
+///
+/// Darwin has no public descriptor-based exec primitive. Its guarantee is
+/// therefore explicitly scoped to Shipyard's control-plane threat model: the
+/// machine account and other same-UID processes are trusted. This is the same
+/// boundary protecting Shipyard's machine-global policy and ledger database;
+/// an actively hostile same-UID process can replace either authority already.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderExecutableIdentityBoundary {
+    /// Linux executes a write/grow/shrink/seal-protected memfd.
+    KernelSealedSnapshot,
+    /// macOS executes a private, reverified snapshot with trusted same-UID code.
+    TrustedSameUidPrivateSnapshot,
+    /// The target cannot prove a supported execution identity.
+    Unsupported,
+}
+
+#[must_use]
+pub(crate) const fn provider_executable_identity_boundary() -> ProviderExecutableIdentityBoundary {
+    #[cfg(target_os = "linux")]
+    return ProviderExecutableIdentityBoundary::KernelSealedSnapshot;
+    #[cfg(target_os = "macos")]
+    return ProviderExecutableIdentityBoundary::TrustedSameUidPrivateSnapshot;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return ProviderExecutableIdentityBoundary::Unsupported;
+}
+
 /// Execute one request through the immutable configured wrapper.
 pub(crate) fn run_provider_wrapper(
     config: &ProviderWrapperConfig,
     environment: &ProviderWrapperEnvironment,
     request: &ProviderWrapperRequestV1,
 ) -> Result<ProviderWrapperRunResult, ProviderWrapperRefusal> {
+    // The subprocess fixtures share a deliberately tight deadline and invoke
+    // host-wide process observation. Serialize only tests so unrelated test
+    // threads cannot manufacture scheduler/lsof starvation failures.
+    #[cfg(test)]
+    let _test_execution = PROVIDER_EXECUTION_TEST_LOCK
+        .lock()
+        .map_err(|_| refusal("provider wrapper test execution lock is poisoned"))?;
     validate_request(config, request)?;
     if !provider_wrapper_execution_supported() {
         return Ok(uncertain("platform-cannot-prove-exact-wrapper-execution"));
@@ -361,9 +424,12 @@ fn validate_request(
     ] {
         validate_digest(digest)?;
     }
+    // Root, issue, and material-event revision zero are legitimate genesis
+    // values. Projection and checkpoint generations are the freshness fences
+    // and therefore must already exist before a fresh session can launch.
     if resume.projection_revision == 0 || resume.checkpoint_generation == 0 {
         return Err(refusal(
-            "fresh-resume projection revision and checkpoint generation must be nonzero",
+            "fresh-resume projection and checkpoint generations must be nonzero",
         ));
     }
     if resume.head_sha.len() != 40
@@ -376,7 +442,21 @@ fn validate_request(
             "fresh-resume head must be an exact lowercase 40-hex commit",
         ));
     }
-    validate_argv(&request.launch_argv)
+    if let Some(model_id) = &request.launch_options.model_id {
+        if model_id.is_empty()
+            || model_id.len() > 128
+            || !model_id.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-' | b':')
+            })
+        {
+            return Err(refusal(
+                "provider model ID must be a bounded canonical token",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_workstream_handle(value: &str) -> Result<(), ProviderWrapperRefusal> {
@@ -426,34 +506,6 @@ fn valid_repository_component(value: &str) -> bool {
             .is_some_and(u8::is_ascii_alphanumeric)
 }
 
-fn validate_argv(argv: &[String]) -> Result<(), ProviderWrapperRefusal> {
-    if argv.is_empty() || argv.len() > MAX_ARGV_ITEMS {
-        return Err(refusal("launch argv item count is invalid"));
-    }
-    let mut total = 0usize;
-    for arg in argv {
-        if arg.is_empty() || arg.len() > MAX_ARG_BYTES || arg.contains('\0') {
-            return Err(refusal("launch argv contains an invalid argument"));
-        }
-        let lowercase = arg.to_ascii_lowercase();
-        if lowercase.starts_with("--token")
-            || lowercase.starts_with("--api-key")
-            || lowercase.contains("authorization:")
-            || lowercase.contains("github_token=")
-            || lowercase.contains("api_key=")
-        {
-            return Err(refusal(
-                "launch argv must not carry provider credentials or secrets",
-            ));
-        }
-        total = total.saturating_add(arg.len());
-    }
-    if total > MAX_ARGV_BYTES {
-        return Err(refusal("launch argv exceeds its total byte limit"));
-    }
-    Ok(())
-}
-
 fn validate_token(value: &str) -> Result<(), ProviderWrapperRefusal> {
     if value.is_empty()
         || value.len() > 256
@@ -470,6 +522,37 @@ fn validate_value(value: &str) -> Result<(), ProviderWrapperRefusal> {
     if value.is_empty() || value.len() > MAX_VALUE_BYTES || value.chars().any(char::is_control) {
         return Err(refusal(
             "fresh-resume expectation contains an invalid value",
+        ));
+    }
+    Ok(())
+}
+
+/// Provider references cross a durable authority boundary, so they are opaque
+/// identifiers rather than arbitrary provider output. In particular, URLs,
+/// credentials, bearer values, and query-like key/value strings are refused
+/// before anything can persist them.
+fn validate_provider_session_ref(
+    value: &str,
+    expected_provider: &str,
+) -> Result<(), ProviderWrapperRefusal> {
+    let Some((provider, opaque_id)) = value
+        .strip_prefix("session:")
+        .and_then(|remainder| remainder.split_once(':'))
+    else {
+        return Err(refusal(
+            "provider session reference must use session:provider:opaque-id form",
+        ));
+    };
+    if provider != expected_provider
+        || opaque_id.is_empty()
+        || value.len() > 256
+        || value.contains("://")
+        || opaque_id.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+        })
+    {
+        return Err(refusal(
+            "provider session reference must be a bounded opaque identifier",
         ));
     }
     Ok(())
@@ -559,42 +642,53 @@ fn run_provider_wrapper_unix(
         .write_all(request_bytes)
         .and_then(|()| stdin.seek(SeekFrom::Start(0)).map(drop))
         .map_err(|_| refusal("provider wrapper input cannot be prepared"))?;
+    let mut stdout = tempfile::tempfile()
+        .map_err(|_| refusal("provider wrapper stdout capture cannot be created"))?;
+    let stderr = tempfile::tempfile()
+        .map_err(|_| refusal("provider wrapper stderr capture cannot be created"))?;
+    let execution_scope = tempfile::tempdir()
+        .map_err(|_| refusal("provider wrapper execution scope cannot be created"))?;
+    let sentinel_path = execution_scope.path().join("execution.sentinel");
+    let sentinel = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&sentinel_path)
+        .map_err(|_| refusal("provider wrapper execution sentinel cannot be created"))?;
+    #[cfg(unix)]
+    let sentinel_fd = {
+        use std::os::fd::AsRawFd;
+        rustix::io::fcntl_setfd(&sentinel, rustix::io::FdFlags::empty())
+            .map_err(|_| refusal("provider wrapper execution sentinel cannot be inherited"))?;
+        sentinel.as_raw_fd()
+    };
     let mut command = Command::new(&prepared.path);
+    command.env_clear().envs(environment.0.iter());
+    #[cfg(unix)]
+    command.env(EXECUTION_SENTINEL_FD_ENV, sentinel_fd.to_string());
     command
-        .env_clear()
-        .envs(environment.0.iter())
         .stdin(Stdio::from(stdin))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(stdout.try_clone().map_err(|_| {
+            refusal("provider wrapper stdout capture cannot be cloned")
+        })?))
+        .stderr(Stdio::from(stderr.try_clone().map_err(|_| {
+            refusal("provider wrapper stderr capture cannot be cloned")
+        })?));
 
     let deadline = Instant::now() + Duration::from_secs(config.deadline_seconds);
     let mut process = match ProcessTree::spawn(&mut command) {
         Ok(process) => process,
         Err(_) => return Ok(uncertain("verified-wrapper-launch-outcome-unknown")),
     };
-    let Some(stdout) = process.take_stdout() else {
-        process.terminate_until(Instant::now() + TEARDOWN_BUDGET);
-        return Ok(uncertain("provider-wrapper-stdout-state-unknown"));
-    };
-    let Some(stderr) = process.take_stderr() else {
-        process.terminate_until(Instant::now() + TEARDOWN_BUDGET);
-        return Ok(uncertain("provider-wrapper-stderr-state-unknown"));
-    };
-    let output_exceeded = Arc::new(AtomicBool::new(false));
-    let stdout_reader = bounded_reader(
-        stdout,
-        config.max_stdout_bytes,
-        Arc::clone(&output_exceeded),
-    );
-    let stderr_reader = bounded_reader(
-        stderr,
-        config.max_stderr_bytes,
-        Arc::clone(&output_exceeded),
-    );
+    #[cfg(unix)]
+    rustix::io::fcntl_setfd(&sentinel, rustix::io::FdFlags::CLOEXEC)
+        .map_err(|_| refusal("provider wrapper execution sentinel cannot be isolated"))?;
     let mut status = None;
     let mut uncertain_reason = None;
     loop {
-        if output_exceeded.load(Ordering::Acquire) {
+        if capture_exceeds(&stdout, config.max_stdout_bytes)
+            || capture_exceeds(&stderr, config.max_stderr_bytes)
+        {
             uncertain_reason = Some("provider-wrapper-output-limit");
             break;
         }
@@ -614,17 +708,29 @@ fn run_provider_wrapper_unix(
             }
         }
     }
-    process.terminate_until((Instant::now() + TEARDOWN_BUDGET).min(deadline + TEARDOWN_BUDGET));
-    let capture_deadline = Instant::now() + TEARDOWN_BUDGET;
-    let Some(stdout_bytes) = receive_capture(&stdout_reader, capture_deadline) else {
-        return Ok(uncertain("provider-wrapper-stdout-state-unknown"));
+    let tree_cleanup_deadline = Instant::now() + TEARDOWN_BUDGET;
+    process.terminate_until(tree_cleanup_deadline);
+    #[cfg(unix)]
+    let sentinel_cleanup = terminate_sentinel_processes(
+        &sentinel_path,
+        Instant::now() + SENTINEL_TEARDOWN_BUDGET,
+        POLL_INTERVAL,
+    );
+    #[cfg(not(unix))]
+    let sentinel_cleanup = SentinelCleanup {
+        proven: true,
+        residual_detected: false,
     };
-    let Some(_stderr_bytes) = receive_capture(&stderr_reader, capture_deadline) else {
-        return Ok(uncertain("provider-wrapper-stderr-state-unknown"));
-    };
-
-    if output_exceeded.load(Ordering::Acquire) {
+    if capture_exceeds(&stdout, config.max_stdout_bytes)
+        || capture_exceeds(&stderr, config.max_stderr_bytes)
+    {
         return Ok(uncertain("provider-wrapper-output-limit"));
+    }
+    if !sentinel_cleanup.proven {
+        return Ok(uncertain("provider-wrapper-cleanup-unproven"));
+    }
+    if sentinel_cleanup.residual_detected {
+        return Ok(uncertain("provider-wrapper-descendant-violation"));
     }
     if let Some(reason) = uncertain_reason {
         return Ok(uncertain(reason));
@@ -635,6 +741,8 @@ fn run_provider_wrapper_unix(
     if !status.success() {
         return Ok(uncertain("provider-wrapper-nonzero-post-launch"));
     }
+    let stdout_bytes = read_capture(&mut stdout, config.max_stdout_bytes)
+        .ok_or_else(|| refusal("provider wrapper stdout capture is unreadable"))?;
     map_response(request, &stdout_bytes)
 }
 
@@ -647,21 +755,55 @@ struct PreparedExecutable {
 
 #[cfg(all(unix, target_os = "linux"))]
 fn prepare_platform_executable(
-    executable: File,
-    _expected_sha256: &str,
+    mut executable: File,
+    expected_sha256: &str,
 ) -> Result<Option<PreparedExecutable>, ProviderWrapperRefusal> {
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
 
-    rustix::io::fcntl_setfd(&executable, rustix::io::FdFlags::empty()).map_err(|_| {
+    let descriptor = rustix::fs::memfd_create(
+        "shipyard-provider-wrapper",
+        rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::EXEC,
+    )
+    .map_err(|_| refusal("platform cannot create a sealable wrapper snapshot"))?;
+    let mut sealed = File::from(descriptor);
+    executable
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| std::io::copy(&mut executable, &mut sealed).map(drop))
+        .and_then(|()| sealed.set_permissions(std::fs::Permissions::from_mode(0o500)))
+        .and_then(|()| sealed.sync_all())
+        .map_err(|_| refusal("platform cannot populate the sealed wrapper snapshot"))?;
+    let required_seals = rustix::fs::SealFlags::WRITE
+        | rustix::fs::SealFlags::GROW
+        | rustix::fs::SealFlags::SHRINK
+        | rustix::fs::SealFlags::SEAL;
+    rustix::fs::fcntl_add_seals(&sealed, required_seals)
+        .map_err(|_| refusal("platform cannot seal the verified wrapper snapshot"))?;
+    let observed_seals = rustix::fs::fcntl_get_seals(&sealed)
+        .map_err(|_| refusal("platform cannot verify wrapper snapshot seals"))?;
+    if !observed_seals.contains(required_seals) {
+        return Err(refusal("verified wrapper snapshot is not fully sealed"));
+    }
+    sealed
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| refusal("sealed wrapper snapshot cannot be rewound"))?;
+    let mut sealed_hasher = Sha256::new();
+    std::io::copy(&mut sealed, &mut HashWriter(&mut sealed_hasher))
+        .map_err(|_| refusal("sealed wrapper snapshot cannot be rehashed"))?;
+    if hex::encode(sealed_hasher.finalize()) != expected_sha256 {
+        return Err(refusal("sealed wrapper snapshot digest changed"));
+    }
+
+    rustix::io::fcntl_setfd(&sealed, rustix::io::FdFlags::empty()).map_err(|_| {
         refusal("platform cannot preserve the verified wrapper descriptor across exec")
     })?;
-    let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+    let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", sealed.as_raw_fd()));
     if !path.exists() {
         return Ok(None);
     }
     Ok(Some(PreparedExecutable {
         path,
-        _file: executable,
+        _file: sealed,
         _private_directory: None,
     }))
 }
@@ -731,10 +873,8 @@ fn prepare_platform_executable(
     Ok(None)
 }
 
-#[cfg(all(unix, target_os = "macos"))]
 struct HashWriter<'a>(&'a mut Sha256);
 
-#[cfg(all(unix, target_os = "macos"))]
 impl Write for HashWriter<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.0.update(buffer);
@@ -746,37 +886,18 @@ impl Write for HashWriter<'_> {
     }
 }
 
-fn bounded_reader<R: Read + Send + 'static>(
-    reader: R,
-    limit: u64,
-    exceeded: Arc<AtomicBool>,
-) -> Receiver<std::io::Result<Vec<u8>>> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = reader
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map(|_| {
-                if bytes.len() as u64 > limit {
-                    exceeded.store(true, Ordering::Release);
-                }
-                bytes
-            });
-        let _ = sender.send(result);
-    });
-    receiver
+fn capture_exceeds(file: &File, limit: u64) -> bool {
+    file.metadata()
+        .map_or(true, |metadata| metadata.len() > limit)
 }
 
-fn receive_capture(
-    receiver: &Receiver<std::io::Result<Vec<u8>>>,
-    deadline: Instant,
-) -> Option<Vec<u8>> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(Ok(bytes)) => Some(bytes),
-        Ok(Err(_)) | Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => None,
-    }
+fn read_capture(file: &mut File, limit: u64) -> Option<Vec<u8>> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
 }
 
 fn map_response(
@@ -806,7 +927,7 @@ fn map_response(
             acceptance: ProviderAcceptanceV1::ProviderSessionAccepted,
             provider_session_ref,
             receipt_digest,
-        } if validate_value(&provider_session_ref).is_ok()
+        } if validate_provider_session_ref(&provider_session_ref, &request.provider_id).is_ok()
             && validate_digest(&receipt_digest).is_ok() =>
         {
             ProviderWrapperRunResult::Delivered {
@@ -889,7 +1010,8 @@ mod tests {
                 context_url: Some("https://linear.app/example/issue/GEN-43".into()),
                 plan_sha256: digest("plan"),
                 root_revision: 5,
-                material_revision: 11,
+                issue_revision: 7,
+                material_event_revision: 11,
                 projection_revision: 17,
                 checkpoint_id: "checkpoint-1".into(),
                 checkpoint_generation: 4,
@@ -901,7 +1023,10 @@ mod tests {
                 success_continuation_digest: digest("success"),
                 failure_continuation_digest: digest("failure"),
             },
-            launch_argv: vec!["codex".into(), "resume".into(), "GEN-43".into()],
+            launch_options: ProviderLaunchOptionsV1 {
+                model_id: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some(ProviderReasoningEffortV1::Medium),
+            },
         }
     }
 
@@ -973,9 +1098,6 @@ mod tests {
                 request.resume_expectation.context_url =
                     Some("https://linear.app/issue/GEN-43?token=secret".into());
             },
-            |request: &mut ProviderWrapperRequestV1| {
-                request.launch_argv.push("--api-key=secret".into());
-            },
         ] {
             let mut request = request(ProviderWrapperOperationV1::Submit);
             mutate(&mut request);
@@ -987,25 +1109,49 @@ mod tests {
     }
 
     #[test]
-    fn empty_root_and_material_history_are_valid_but_authority_revisions_are_nonzero() {
-        let config = config(Path::new("/does/not/matter"), digest("unused"));
-        let mut empty_material = request(ProviderWrapperOperationV1::Submit);
-        empty_material.resume_expectation.root_revision = 0;
-        empty_material.resume_expectation.material_revision = 0;
-        assert!(validate_request(&config, &empty_material).is_ok());
+    fn provider_owned_launch_contract_has_no_argv_or_secret_channel() {
+        let mut value = serde_json::to_value(request(ProviderWrapperOperationV1::Submit)).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "launch_argv".into(),
+            serde_json::json!(["codex", "--password", "secret"]),
+        );
+        assert!(serde_json::from_value::<ProviderWrapperRequestV1>(value).is_err());
 
-        for mutate in [
-            |request: &mut ProviderWrapperRequestV1| {
-                request.resume_expectation.projection_revision = 0;
-            },
-            |request: &mut ProviderWrapperRequestV1| {
-                request.resume_expectation.checkpoint_generation = 0;
-            },
+        let mut invalid_model = request(ProviderWrapperOperationV1::Submit);
+        invalid_model.launch_options.model_id = Some("gpt-5.6-sol --password=secret".into());
+        let config = config(Path::new("/does/not/matter"), digest("unused"));
+        assert!(validate_request(&config, &invalid_model).is_err());
+    }
+
+    #[test]
+    fn provider_session_reference_is_opaque_and_never_credential_bearing() {
+        for value in [
+            "https://provider.example/session?token=secret",
+            "session=secret",
+            "user@example.com",
+            "Bearer secret",
+            "session/child",
         ] {
-            let mut invalid = request(ProviderWrapperOperationV1::Submit);
-            mutate(&mut invalid);
-            assert!(validate_request(&config, &invalid).is_err());
+            assert!(
+                validate_provider_session_ref(value, "codex").is_err(),
+                "accepted {value:?}"
+            );
         }
+        assert!(validate_provider_session_ref("session:codex:01HZX_abc-9", "codex").is_ok());
+        assert!(validate_provider_session_ref("session:claude:01HZX_abc-9", "codex").is_err());
+    }
+
+    #[test]
+    fn genesis_authority_revisions_are_valid_but_freshness_fences_are_not() {
+        let config = config(Path::new("/does/not/matter"), digest("unused"));
+        let mut genesis = request(ProviderWrapperOperationV1::Submit);
+        genesis.resume_expectation.root_revision = 0;
+        genesis.resume_expectation.issue_revision = 0;
+        genesis.resume_expectation.material_event_revision = 0;
+        assert!(validate_request(&config, &genesis).is_ok());
+
+        genesis.resume_expectation.projection_revision = 0;
+        assert!(validate_request(&config, &genesis).is_err());
     }
 
     #[test]
@@ -1031,7 +1177,7 @@ mod tests {
             idempotency_key: request.delivery_fence.idempotency_key.clone(),
             outcome: ProviderWrapperOutcomeV1::Delivered {
                 acceptance: ProviderAcceptanceV1::ProviderSessionAccepted,
-                provider_session_ref: "session-1".into(),
+                provider_session_ref: "session:codex:session-1".into(),
                 receipt_digest: digest("receipt"),
             },
         };
@@ -1042,10 +1188,44 @@ mod tests {
                 provider_session_ref,
                 provider_receipt_digest,
                 response_receipt,
-            } if provider_session_ref == "session-1"
+            } if provider_session_ref == "session:codex:session-1"
                 && provider_receipt_digest == digest("receipt")
                 && response_receipt.response_digest == hex::encode(Sha256::digest(&response_receipt.canonical_bytes))
         ));
+    }
+
+    #[test]
+    fn protected_receipt_uses_canonical_response_not_provider_raw_bytes() {
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let response = ProviderWrapperResponseV1 {
+            schema_version: 1,
+            operation: request.operation,
+            provider_id: request.provider_id.clone(),
+            adapter_id: request.adapter_id.clone(),
+            idempotency_key: request.delivery_fence.idempotency_key.clone(),
+            outcome: ProviderWrapperOutcomeV1::Delivered {
+                acceptance: ProviderAcceptanceV1::ProviderSessionAccepted,
+                provider_session_ref: "session:codex:session-1".into(),
+                receipt_digest: digest("receipt"),
+            },
+        };
+        let canonical = serde_json::to_vec(&response).unwrap();
+        let mut raw = b" \n".to_vec();
+        raw.extend_from_slice(&canonical);
+        raw.extend_from_slice(b" \n");
+        let result = map_response(&request, &raw).unwrap();
+        let ProviderWrapperRunResult::Delivered {
+            response_receipt, ..
+        } = result
+        else {
+            panic!("strict response should map to delivered");
+        };
+        assert_eq!(response_receipt.canonical_bytes, canonical);
+        assert_ne!(response_receipt.canonical_bytes, raw);
+        assert_eq!(
+            response_receipt.response_digest,
+            hex::encode(Sha256::digest(&response_receipt.canonical_bytes))
+        );
     }
 
     fn config(path: &Path, executable_sha256: String) -> ProviderWrapperConfig {
@@ -1088,7 +1268,7 @@ mod tests {
         let outcome = match status {
             "delivered" => ProviderWrapperOutcomeV1::Delivered {
                 acceptance: ProviderAcceptanceV1::ProviderSessionAccepted,
-                provider_session_ref: "session-1".into(),
+                provider_session_ref: "session:codex:session-1".into(),
                 receipt_digest: digest("receipt"),
             },
             "retryable" => ProviderWrapperOutcomeV1::Retryable {
@@ -1131,7 +1311,10 @@ mod tests {
             &request,
         )
         .unwrap();
-        assert!(matches!(result, ProviderWrapperRunResult::Delivered { .. }));
+        assert!(
+            matches!(result, ProviderWrapperRunResult::Delivered { .. }),
+            "unexpected result: {result:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1150,6 +1333,64 @@ mod tests {
             ProviderWrapperRunResult::Retryable { error_digest, response_receipt }
                 if error_digest == digest("retry") && !response_receipt.canonical_bytes.is_empty()
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_submit_is_followed_by_same_key_reconcile_without_second_submit() {
+        let submit = request(ProviderWrapperOperationV1::Submit);
+        let reconcile = request(ProviderWrapperOperationV1::Reconcile);
+        let directory = tempfile::tempdir().unwrap();
+        let submit_count = directory.path().join("submit.count");
+        let reconcile_count = directory.path().join("reconcile.count");
+        let response = ProviderWrapperResponseV1 {
+            schema_version: 1,
+            operation: ProviderWrapperOperationV1::Reconcile,
+            provider_id: reconcile.provider_id.clone(),
+            adapter_id: reconcile.adapter_id.clone(),
+            idempotency_key: reconcile.delivery_fence.idempotency_key.clone(),
+            outcome: ProviderWrapperOutcomeV1::Retryable {
+                launch_state: NotAcceptedV1::NotAccepted,
+                error_digest: digest("retry"),
+            },
+        };
+        let response_bytes = serde_json::to_vec(&response)
+            .unwrap()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(
+            "char input[65537] = {{0}}; fread(input, 1, sizeof(input) - 1, stdin); \
+             if (strstr(input, \"\\\"operation\\\":\\\"submit\\\"\") != NULL) {{ \
+                 FILE *f = fopen(\"{}\", \"a\"); fputc('1', f); fclose(f); \
+                 fputs(\"lost-response\", stdout); return 0; \
+             }} \
+             FILE *s = fopen(\"{}\", \"r\"); if (s == NULL || fgetc(s) != '1' || fgetc(s) != EOF) return 92; fclose(s); \
+             FILE *r = fopen(\"{}\", \"a\"); fputc('1', r); fclose(r); \
+             unsigned char output[] = {{{}}}; return fwrite(output, 1, sizeof(output), stdout) == sizeof(output) ? 0 : 1;",
+            submit_count.display(),
+            submit_count.display(),
+            reconcile_count.display(),
+            response_bytes,
+        );
+        let (_wrapper_dir, path, sha) = wrapper_c(&body);
+        let config = config(&path, sha);
+        assert!(matches!(
+            run_provider_wrapper(&config, &ProviderWrapperEnvironment::default(), &submit).unwrap(),
+            ProviderWrapperRunResult::Uncertain { .. }
+        ));
+        assert!(matches!(
+            run_provider_wrapper(&config, &ProviderWrapperEnvironment::default(), &reconcile,)
+                .unwrap(),
+            ProviderWrapperRunResult::Retryable { .. }
+        ));
+        assert_eq!(fs::read(&submit_count).unwrap(), b"1");
+        assert_eq!(fs::read(&reconcile_count).unwrap(), b"1");
+        assert_eq!(
+            submit.delivery_fence.idempotency_key,
+            reconcile.delivery_fence.idempotency_key
+        );
     }
 
     #[cfg(unix)]
@@ -1207,7 +1448,7 @@ mod tests {
             "pid_t child = fork(); if (child == 0) { sleep(30); return 0; } const char *home = getenv(\"HOME\"); char path[4096]; snprintf(path, sizeof(path), \"%s/child.pid\", home); FILE *file = fopen(path, \"w\"); fprintf(file, \"%d\", child); fclose(file); waitpid(child, 0, 0); return 0;",
         );
         let mut timeout_config = config(&path, sha);
-        timeout_config.deadline_seconds = 1;
+        timeout_config.deadline_seconds = 5;
         let environment = ProviderWrapperEnvironment::new([(
             "HOME".into(),
             directory.path().as_os_str().to_owned(),
@@ -1242,7 +1483,79 @@ mod tests {
             .unwrap(),
             ProviderWrapperRunResult::Uncertain { .. }
         ));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "output-limit cleanup plus serialized fixture admission wedged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_reaps_setsid_descendant_without_pipe_reader_threads() {
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let (directory, path, sha) = wrapper_c(
+            "pid_t child = fork(); if (child == 0) { setsid(); const char *home = getenv(\"HOME\"); char path[4096]; snprintf(path, sizeof(path), \"%s/detached.pid\", home); FILE *file = fopen(path, \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; } waitpid(child, 0, 0); return 0;",
+        );
+        let mut timeout_config = config(&path, sha);
+        timeout_config.deadline_seconds = 5;
+        let environment = ProviderWrapperEnvironment::new([(
+            "HOME".into(),
+            directory.path().as_os_str().to_owned(),
+        )])
+        .unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            run_provider_wrapper(&timeout_config, &environment, &request).unwrap(),
+            ProviderWrapperRunResult::Uncertain { .. }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "timeout cleanup plus serialized fixture admission wedged"
+        );
+        let child_pid = fs::read_to_string(directory.path().join("detached.pid")).unwrap();
+        let status = Command::new("kill")
+            .args(["-0", "--", child_pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "setsid descendant survived timeout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_parent_exit_with_setsid_child_is_refused_and_reaped() {
+        let request = request(ProviderWrapperOperationV1::Submit);
+        let directory = tempfile::tempdir().unwrap();
+        let detached_pid = directory.path().join("detached-success.pid");
+        let body = format!(
+            "pid_t child = fork(); if (child == 0) {{ setsid(); FILE *file = fopen(\"{}\", \"w\"); fprintf(file, \"%d\", getpid()); fclose(file); sleep(30); return 0; }} \
+             for (int i = 0; i < 5000 && access(\"{}\", F_OK) != 0; ++i) usleep(1000); {}",
+            detached_pid.display(),
+            detached_pid.display(),
+            response_program(&request, "delivered"),
+        );
+        let (_wrapper_dir, path, sha) = wrapper_c(&body);
+        let mut wrapper_config = config(&path, sha);
+        wrapper_config.deadline_seconds = 10;
+        let result = run_provider_wrapper(
+            &wrapper_config,
+            &ProviderWrapperEnvironment::default(),
+            &request,
+        )
+        .unwrap();
+        assert!(matches!(result, ProviderWrapperRunResult::Uncertain { .. }));
+        let child_pid = fs::read_to_string(&detached_pid).unwrap();
+        let status = Command::new("kill")
+            .args(["-0", "--", child_pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "setsid child survived successful wrapper-parent exit"
+        );
     }
 
     #[cfg(unix)]
