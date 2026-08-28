@@ -11,6 +11,7 @@ const MAX_ARGV_BYTES: usize = 16 * 1024;
 const MAX_METADATA_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_CONTEXT_URL_BYTES: usize = 4 * 1024;
+const PROTECTED_PROFILE_PREFIX: &[u8] = b"shipyard-launch-profile-v1\0";
 
 /// Private, provider- and terminal-neutral process restoration contract.
 ///
@@ -19,7 +20,7 @@ const MAX_CONTEXT_URL_BYTES: usize = 4 * 1024;
 /// process-launch contract before using either argv.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct LaunchProfileV1 {
+pub(crate) struct LaunchProfileV1 {
     pub(super) schema_version: u32,
     pub(super) launch_argv: Vec<String>,
     pub(super) resume_argv: Vec<String>,
@@ -333,10 +334,52 @@ fn launch_profile_protected_bytes(profile: &LaunchProfileV1) -> Result<Vec<u8>, 
     validate_launch_profile(profile)?;
     let canonical = serde_json::to_vec(profile)
         .map_err(|error| CliFailure::new(1, format!("serialize launch profile: {error}")))?;
-    let mut bytes = Vec::with_capacity(b"shipyard-launch-profile-v1\0".len() + canonical.len());
-    bytes.extend_from_slice(b"shipyard-launch-profile-v1\0");
+    let mut bytes = Vec::with_capacity(PROTECTED_PROFILE_PREFIX.len() + canonical.len());
+    bytes.extend_from_slice(PROTECTED_PROFILE_PREFIX);
     bytes.extend_from_slice(&canonical);
     Ok(bytes)
+}
+
+/// Decode only the canonical domain-separated bytes protected by the ledger.
+#[allow(dead_code)] // Activated by the daemon wake-loop integration slice.
+pub(crate) fn decode_protected_launch_profile(
+    bytes: &[u8],
+) -> crate::work_ledger::WorkLedgerResult<LaunchProfileV1> {
+    let canonical = bytes
+        .strip_prefix(PROTECTED_PROFILE_PREFIX)
+        .ok_or_else(|| {
+            crate::work_ledger::WorkLedgerError::Refused(
+                "protected launch profile has the wrong domain".to_owned(),
+            )
+        })?;
+    if canonical.starts_with(PROTECTED_PROFILE_PREFIX) {
+        return Err(crate::work_ledger::WorkLedgerError::Refused(
+            "protected launch profile has repeated domain separation".to_owned(),
+        ));
+    }
+    let profile: LaunchProfileV1 = serde_json::from_slice(canonical).map_err(|_| {
+        crate::work_ledger::WorkLedgerError::Refused(
+            "protected launch profile JSON is invalid".to_owned(),
+        )
+    })?;
+    validate_launch_profile(&profile).map_err(|error| {
+        crate::work_ledger::WorkLedgerError::Refused(format!(
+            "protected launch profile is invalid: {}",
+            error.message()
+        ))
+    })?;
+    let recomputed = launch_profile_protected_bytes(&profile).map_err(|error| {
+        crate::work_ledger::WorkLedgerError::Refused(format!(
+            "protected launch profile cannot be canonicalized: {}",
+            error.message()
+        ))
+    })?;
+    if recomputed != bytes {
+        return Err(crate::work_ledger::WorkLedgerError::Refused(
+            "protected launch profile bytes are not canonical".to_owned(),
+        ));
+    }
+    Ok(profile)
 }
 
 pub(super) fn launch_profile_integrity_hash(
@@ -533,6 +576,29 @@ mod tests {
             launch_profile_digest(&profile).expect("stored digest")
         );
         assert!(FreshAgentLaunchProfile::permits_fresh_agent(&profile));
+    }
+
+    #[test]
+    fn protected_decoder_requires_one_exact_domain_and_canonical_json() {
+        let profile = profile();
+        let bytes = launch_profile_protected_bytes(&profile).expect("protected bytes");
+        assert_eq!(
+            decode_protected_launch_profile(&bytes).expect("strict decode"),
+            profile
+        );
+        assert!(decode_protected_launch_profile(&bytes[PROTECTED_PROFILE_PREFIX.len()..]).is_err());
+
+        let mut doubled = PROTECTED_PROFILE_PREFIX.to_vec();
+        doubled.extend_from_slice(&bytes);
+        assert!(decode_protected_launch_profile(&doubled).is_err());
+
+        let mut noncanonical = PROTECTED_PROFILE_PREFIX.to_vec();
+        noncanonical.extend_from_slice(
+            serde_json::to_string_pretty(&profile)
+                .expect("pretty profile")
+                .as_bytes(),
+        );
+        assert!(decode_protected_launch_profile(&noncanonical).is_err());
     }
 
     #[test]

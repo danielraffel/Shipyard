@@ -271,6 +271,24 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
         vec!["/opt/provider-router", "agent", "-r", "provider-session-7"]
     );
     assert!(!restarted.wake_consumer_available);
+    let paths = RuntimePaths::current_with_overrides(
+        crate::identity::RuntimeMode::Isolated,
+        Some(temp.path().join("global")),
+        Some(temp.path().to_path_buf()),
+    );
+    let publication = native_publication_request(&paths, "owner/repo", args.pr, &args.head)
+        .expect("normalize native publication");
+    assert_eq!(publication.repository, "owner/repo");
+    assert_eq!(publication.workstream_handle, "SY-LF-TEST");
+    assert_eq!(publication.origin_machine, "m3");
+    assert_eq!(publication.agent_provider, "codex");
+    assert_eq!(publication.agent_session_id, "provider-session-7");
+    assert_eq!(publication.profile_provider, "opaque-provider");
+    assert_eq!(publication.profile_digest, stored.profile_digest);
+    assert_eq!(
+        hex::encode(Sha256::digest(&publication.protected_profile_bytes)),
+        publication.profile_digest
+    );
     let terminal = terminal_owner_route(temp.path(), "owner/repo", args.pr, &args.head)
         .expect("valid terminal owner")
         .expect("managed owner");
@@ -284,6 +302,10 @@ fn exact_launch_profile_survives_receipt_restart_without_translation() {
     assert_eq!(provider_route.model.as_deref(), Some("model-tier-a"));
 
     std::fs::remove_file(&route_path).expect("remove private agent route");
+    assert!(
+        native_publication_request(&paths, "owner/repo", args.pr, &args.head).is_err(),
+        "native publication must fail closed after private route loss"
+    );
     let unresolved =
         terminal_owner_route_or_unresolved(temp.path(), "owner/repo", args.pr, &args.head)
             .expect("validated public receipt remains an unresolved obligation");

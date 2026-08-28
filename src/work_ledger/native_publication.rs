@@ -56,6 +56,7 @@ pub(crate) struct ExactProtectedProfileResolver<'a, D> {
 }
 
 impl<'a, D> ExactProtectedProfileResolver<'a, D> {
+    #[allow(dead_code)] // Activated by the daemon wake-loop integration slice.
     pub(crate) fn new(ledger: &'a WorkLedger, decode: D) -> Self {
         Self { ledger, decode }
     }

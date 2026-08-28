@@ -499,6 +499,21 @@ pub(super) enum WorkLedgerCommand {
         #[arg(long)]
         apply: bool,
     },
+    /// Publish one exact managed handoff for daemon-owned continuation.
+    Publish {
+        /// Canonical lowercase owner/repository slug.
+        #[arg(long)]
+        repo: String,
+        /// Pull request number bound by the durable handoff.
+        #[arg(long)]
+        pr: u64,
+        /// Exact lowercase 40-character head SHA.
+        #[arg(long)]
+        head: String,
+        /// Commit the publication. Dry-run is the default.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Inspect or revise repository lane policy in the shadow ledger.
     Policy {
         /// Policy subcommand.
@@ -2230,6 +2245,54 @@ mod tests {
             cli.command,
             Command::WorkLedger {
                 command: WorkLedgerCommand::Import { apply: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn work_ledger_publish_is_exact_and_dry_run_by_default() {
+        let head = "a".repeat(40);
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "publish",
+            "--repo",
+            "generous-corp/shipyard",
+            "--pr",
+            "43",
+            "--head",
+            &head,
+        ])
+        .expect("publication plan");
+        assert!(matches!(
+            cli.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::Publish {
+                    repo,
+                    pr: 43,
+                    head: parsed_head,
+                    apply: false,
+                }
+            } if repo == "generous-corp/shipyard" && parsed_head == head
+        ));
+
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "work-ledger",
+            "publish",
+            "--repo",
+            "generous-corp/shipyard",
+            "--pr",
+            "43",
+            "--head",
+            &head,
+            "--apply",
+        ])
+        .expect("publication apply");
+        assert!(matches!(
+            cli.command,
+            Command::WorkLedger {
+                command: WorkLedgerCommand::Publish { apply: true, .. }
             }
         ));
     }

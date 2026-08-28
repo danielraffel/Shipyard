@@ -18,6 +18,7 @@ use std::process::{Command, ExitCode};
 
 use crate::paths::RuntimePaths;
 use crate::queue::replace_file_with_windows_retry;
+use crate::work_ledger::{FreshAgentLaunchProfile, NativePublicationRequest};
 
 #[derive(Clone)]
 pub(crate) struct StewardHandoffArgs {
@@ -815,6 +816,110 @@ fn handoff_directory(runtime_paths: &RuntimePaths, repo: &str, pr: u64) -> std::
 
 fn handoff_path(directory: &Path, head: &str) -> std::path::PathBuf {
     directory.join(format!("{}.json", head.to_ascii_lowercase()))
+}
+
+/// Load and normalize one exact managed handoff into native ledger authority.
+///
+/// This reader performs no mutation. Publication policy is intentionally
+/// applied later, before the ledger can create storage.
+pub(crate) fn native_publication_request(
+    runtime_paths: &RuntimePaths,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> Result<NativePublicationRequest, CliFailure> {
+    if repo != repo.to_ascii_lowercase()
+        || repo.trim() != repo
+        || pr == 0
+        || !is_full_sha(head)
+        || head != head.to_ascii_lowercase()
+    {
+        return Err(CliFailure::new(
+            1,
+            "native publication requires canonical repo, PR, and lowercase exact head",
+        ));
+    }
+    let path = handoff_path(&handoff_directory(runtime_paths, repo, pr), head);
+    let receipt = load_handoff(&path)?
+        .ok_or_else(|| CliFailure::new(1, "exact-head durable handoff receipt is unavailable"))?;
+    validate_handoff_receipt_integrity(&receipt, repo, pr, head)?;
+    if receipt.phase != HandoffPhase::Managed {
+        return Err(CliFailure::new(
+            1,
+            "native publication requires a managed durable handoff",
+        ));
+    }
+    let route = receipt.agent_route.as_ref().ok_or_else(|| {
+        CliFailure::new(
+            1,
+            "native publication requires an exact private agent route",
+        )
+    })?;
+    let private_route = load_agent_route(&agent_route_path(runtime_paths, &route.route_id))?
+        .ok_or_else(|| CliFailure::new(1, "managed handoff lost its private agent route"))?;
+    let recomputed_route =
+        agent_route_reference(&private_route.agent, &private_route.origin_machine);
+    if private_route.schema_version != 2
+        || private_route.revision == 0
+        || private_route.route_id != route.route_id
+        || private_route.owner_id != route.owner_id
+        || private_route.origin_machine != receipt.origin_machine
+        || recomputed_route != *route
+    {
+        return Err(CliFailure::new(
+            1,
+            "managed handoff and private agent route identity disagree",
+        ));
+    }
+    let stored = receipt
+        .launch_profile
+        .as_ref()
+        .ok_or_else(|| CliFailure::new(1, "native publication requires an exact launch profile"))?;
+    let profile = &stored.profile;
+    let session = profile.session.as_ref().ok_or_else(|| {
+        CliFailure::new(1, "native publication requires exact session provenance")
+    })?;
+    let bootstrap = profile.continuation_bootstrap.as_ref().ok_or_else(|| {
+        CliFailure::new(
+            1,
+            "native publication requires continuation bootstrap authority",
+        )
+    })?;
+    if !profile.permits_fresh_agent()
+        || route.provider != session.agent_provider
+        || private_route.agent.session_id != session.provider_session_id
+        || receipt.workstream_id != bootstrap.workstream_handle
+        || receipt.context_url != bootstrap.context_url
+    {
+        return Err(CliFailure::new(
+            1,
+            "handoff route, launch profile, and continuation authority disagree",
+        ));
+    }
+    let protected_profile_bytes = profile
+        .protected_profile_bytes()
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+
+    Ok(NativePublicationRequest {
+        repository: receipt.repo.to_ascii_lowercase(),
+        pull_request: receipt.pr,
+        head_sha: receipt.head_sha.to_ascii_lowercase(),
+        workstream_handle: bootstrap.workstream_handle.clone(),
+        context_url: bootstrap.context_url.clone(),
+        origin_machine: receipt.origin_machine.clone(),
+        owner_id: receipt.owner_id.clone(),
+        owner_generation: receipt.ownership_generation,
+        agent_provider: route.provider.clone(),
+        agent_session_id: private_route.agent.session_id,
+        route_id: route.route_id.clone(),
+        profile_generation: stored.generation,
+        profile_revision: stored.revision,
+        profile_provider: profile.provider.provider.clone(),
+        profile_digest: stored.profile_digest.clone(),
+        protected_profile_bytes,
+        success_continuation_digest: bootstrap.success_continuation_digest.clone(),
+        failure_continuation_digest: bootstrap.failure_continuation_digest.clone(),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

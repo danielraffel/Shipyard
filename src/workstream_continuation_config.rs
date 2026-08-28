@@ -5,9 +5,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
-use std::path::{Component, PathBuf};
 #[cfg(test)]
 use std::path::Path;
+use std::path::{Component, PathBuf};
 
 use serde::Deserialize;
 

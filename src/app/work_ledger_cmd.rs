@@ -3,20 +3,24 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::output::write_pretty_json;
+use crate::paths::RuntimePaths;
 use crate::work_ledger::{
-    RepoPolicy, WorkLedger, absent_status, apply_legacy_snapshot, plan_legacy_snapshot,
-    validate_repo_policy,
+    NativePublicationReport, RepoPolicy, WorkLedger, absent_status, apply_legacy_snapshot,
+    plan_legacy_snapshot, validate_repo_policy,
 };
+use crate::workstream_activation_loader::{WorkstreamActivationLoader, WorkstreamActivationState};
 
 use super::CliFailure;
 use super::cli::{WorkLedgerCommand, WorkLedgerPolicyCommand};
+use super::merge_steward_cmd::native_publication_request;
 
 pub(super) fn work_ledger_command<W: Write>(
     command: &WorkLedgerCommand,
-    state_dir: &Path,
+    runtime_paths: &RuntimePaths,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    let state_dir = &runtime_paths.state_dir;
     match command {
         WorkLedgerCommand::Status => {
             let status = WorkLedger::open_existing(state_dir)
@@ -71,11 +75,86 @@ pub(super) fn work_ledger_command<W: Write>(
                 writeln!(stdout, "Dispatch: disabled").map_err(failure)?;
             }
         }
+        WorkLedgerCommand::Publish {
+            repo,
+            pr,
+            head,
+            apply,
+        } => {
+            let production_paths = RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+            if runtime_paths != &production_paths {
+                return Err(CliFailure::new(
+                    1,
+                    "native publication is available only against canonical production roots",
+                ));
+            }
+            let request = native_publication_request(runtime_paths, repo, *pr, head)?;
+            let mut loader = WorkstreamActivationLoader::production();
+            let ready = match loader.revalidate_for_tick() {
+                WorkstreamActivationState::Ready(ready) => ready,
+                WorkstreamActivationState::Disabled => {
+                    return Err(CliFailure::new(
+                        1,
+                        "workstream continuation activation is disabled",
+                    ));
+                }
+                WorkstreamActivationState::Refused(reason) => {
+                    return Err(CliFailure::new(
+                        1,
+                        format!(
+                            "workstream continuation activation refused: {}",
+                            reason.code()
+                        ),
+                    ));
+                }
+            };
+            if ready.machine_tag != request.origin_machine {
+                return Err(CliFailure::new(
+                    1,
+                    "durable handoff belongs to a different origin machine",
+                ));
+            }
+            let report = WorkLedger::plan_or_apply_native_continuation(
+                state_dir,
+                &request,
+                &ready.config,
+                *apply,
+            )
+            .map_err(failure)?;
+            write_publication_report(stdout, &report, json)?;
+        }
         WorkLedgerCommand::Policy { command } => {
             policy_command(command, state_dir, json, stdout)?;
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn write_publication_report<W: Write>(
+    stdout: &mut W,
+    report: &NativePublicationReport,
+    json: bool,
+) -> Result<(), CliFailure> {
+    if json {
+        write_pretty_json(stdout, report).map_err(failure)
+    } else {
+        writeln!(
+            stdout,
+            "Native publication: {}",
+            if report.replay {
+                "exact replay"
+            } else if report.applied {
+                "applied"
+            } else {
+                "dry-run"
+            }
+        )
+        .map_err(failure)?;
+        writeln!(stdout, "Work item: {}", report.work_id).map_err(failure)?;
+        writeln!(stdout, "Route: {}", report.route_ref).map_err(failure)?;
+        writeln!(stdout, "Wake: {}", report.wake_id).map_err(failure)?;
+        writeln!(stdout, "Profile digest: {}", report.profile_digest).map_err(failure)
+    }
 }
 
 fn policy_command<W: Write>(
@@ -254,5 +333,25 @@ mod tests {
             assert_eq!(value["activation_enabled"], false);
             assert_eq!(value["dispatch_enabled"], false);
         }
+    }
+
+    #[test]
+    fn publication_json_is_stable_and_exposes_no_private_profile() {
+        let report = NativePublicationReport {
+            applied: false,
+            replay: false,
+            work_id: "wi:test".to_owned(),
+            route_ref: "route:test".to_owned(),
+            wake_id: "wake:test".to_owned(),
+            profile_digest: "a".repeat(64),
+        };
+        let mut output = Vec::new();
+        write_publication_report(&mut output, &report, true).expect("publication json");
+        let value: Value = serde_json::from_slice(&output).expect("valid json");
+        assert_eq!(value["applied"], false);
+        assert_eq!(value["replay"], false);
+        assert_eq!(value["work_id"], "wi:test");
+        assert!(value.get("protected_profile_bytes").is_none());
+        assert!(value.get("agent_session_id").is_none());
     }
 }
