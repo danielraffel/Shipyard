@@ -1436,6 +1436,11 @@ fails, do not continue after a failed probe, and never ask for a password.
 Restore the exact search-list snapshot before deleting the disposable
 keychain; preserve it and fail if restoration cannot be proven.
 
+The v0.127.0+ installer manages `shipyard` and
+`shipyard-workstream-provider` as one version-matched pair. A partial install
+must be reported without an implicit plugin upgrade, and rollback to an older
+tag must remove the provider introduced by the newer release.
+
 ### CI routing profiles
 
 Use `shipyard ci profile show <name>` and

@@ -265,6 +265,8 @@ def test_install_script_dry_run_defaults_to_production_names(sandbox: Sandbox) -
             "HOME": str(sandbox.home_dir),
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "SHIPYARD_DRY_RUN": "1",
+            "SHIPYARD_INSTALL_TEST_UNAME_S": "Linux",
+            "SHIPYARD_INSTALL_TEST_UNAME_M": "aarch64",
         },
         check=True,
         capture_output=True,
@@ -273,6 +275,9 @@ def test_install_script_dry_run_defaults_to_production_names(sandbox: Sandbox) -
 
     assert "ARTIFACT_PREFIX=shipyard" in result.stdout
     assert "BINARY_NAME=shipyard" in result.stdout
+    assert "PROVIDER_ARTIFACT=shipyard-workstream-provider-linux-arm64" in result.stdout
+    assert "PROVIDER_BINARY_NAME=shipyard-workstream-provider" in result.stdout
+    assert "REQUIRE_PROVIDER=1" in result.stdout
     assert "ALIAS_NAME=sy" in result.stdout
     assert "COMPAT_NAME=" not in result.stdout
 
@@ -337,6 +342,12 @@ def test_install_script_skip_download_preserves_production_binary_names(
     install_dir = sandbox.home_dir / "install-bin"
     install_dir.mkdir()
     shutil.copy2(sandbox.binary_path, install_dir / BINARY_NAME)
+    provider = install_dir / "shipyard-workstream-provider"
+    provider.write_text(
+        "#!/bin/sh\necho 'shipyard-workstream-provider 0.127.0'\n",
+        encoding="utf-8",
+    )
+    provider.chmod(0o755)
 
     result = subprocess.run(
         ["bash", str(REPO_ROOT / "install.sh")],
@@ -354,7 +365,37 @@ def test_install_script_skip_download_preserves_production_binary_names(
 
     assert f"Installed {BINARY_NAME}" in result.stdout
     assert (install_dir / BINARY_NAME).exists()
+    assert provider.exists()
     assert (install_dir / "sy").is_symlink()
+
+
+@pytest.mark.installer
+def test_install_script_pre_provider_rollback_removes_newer_companion(
+    sandbox: Sandbox,
+) -> None:
+    install_dir = sandbox.home_dir / "install-bin-rollback"
+    install_dir.mkdir()
+    shutil.copy2(sandbox.binary_path, install_dir / BINARY_NAME)
+    companion = install_dir / "shipyard-workstream-provider"
+    companion.write_text("newer companion", encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "install.sh")],
+        cwd=sandbox.work_dir,
+        env={
+            "HOME": str(sandbox.home_dir),
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHIPYARD_INSTALL_DIR": str(install_dir),
+            "SHIPYARD_SKIP_DOWNLOAD": "1",
+            "SHIPYARD_VERSION": "v0.126.2",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "Installed shipyard" in result.stdout
+    assert not companion.exists()
 
 
 @pytest.mark.installer
@@ -392,7 +433,7 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
         "  exit 0\n"
         "fi\n"
         "cat <<'JSON'\n"
-        "{\"assets\":[{\"name\":\"shipyard-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-linux-arm64\"}]}\n"
+        "{\"assets\":[{\"name\":\"shipyard-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-linux-arm64\"},{\"name\":\"shipyard-workstream-provider-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-workstream-provider-linux-arm64\"}]}\n"
         "JSON\n"
         "if [ \"$write_out\" -eq 1 ]; then printf '200\\n'; fi\n",
         encoding="utf-8",
@@ -423,6 +464,8 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
         == "shipyard 9.9.9"
     )
     assert not list(install_dir.glob(f".{BINARY_NAME}.install.*"))
+    assert (install_dir / "shipyard-workstream-provider").exists()
+    assert not list(install_dir.glob(".shipyard-workstream-provider.install.*"))
 
 
 @pytest.mark.installer
@@ -468,6 +511,7 @@ def test_install_script_adhoc_fallback_recovers_notarized_launch_failure(
             "PATH": f"{sandbox.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
             "SHIPYARD_INSTALL_DIR": str(install_dir),
             "SHIPYARD_SKIP_DOWNLOAD": "1",
+            "SHIPYARD_VERSION": "v0.126.2",
             "SHIPYARD_INSTALL_TEST_UNAME_S": "Darwin",
             "SHIPYARD_INSTALL_TEST_UNAME_M": "arm64",
             "SHIPYARD_FAKE_ADHOC_MARKER": str(marker),
@@ -520,6 +564,7 @@ def test_install_script_can_disable_adhoc_fallback(sandbox: Sandbox) -> None:
             "PATH": f"{sandbox.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
             "SHIPYARD_INSTALL_DIR": str(install_dir),
             "SHIPYARD_SKIP_DOWNLOAD": "1",
+            "SHIPYARD_VERSION": "v0.126.2",
             "SHIPYARD_INSTALL_TEST_UNAME_S": "Darwin",
             "SHIPYARD_INSTALL_TEST_UNAME_M": "arm64",
             "SHIPYARD_NO_ADHOC_FALLBACK": "1",

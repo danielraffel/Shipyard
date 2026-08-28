@@ -60,6 +60,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("linux-x64|windows-x64", text)
         self.assertNotIn("macos-x64", text)
 
+    def test_release_workflow_builds_and_packages_the_binary_pair(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "--bin shipyard --bin shipyard-workstream-provider",
+            text,
+        )
+        self.assertIn('--companion-binary "${{ matrix.companion_binary }}"', text)
+        self.assertIn("target/release/shipyard-workstream-provider --version", text)
+
     def test_auto_release_workflow_supports_doctor_release_chain(self) -> None:
         text = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("workflow_dispatch:", text)

@@ -78,6 +78,14 @@ version_gte() {
     [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]
 }
 
+if version_gte "$INSTALLED" "0.127.0" \
+    && ! command -v shipyard-workstream-provider &>/dev/null; then
+  echo ""
+  echo "[Shipyard] Installation is incomplete: shipyard-workstream-provider is missing."
+  echo "[Shipyard] Re-run your normal installer or project pin repair; the plugin will not surprise-upgrade an existing CLI."
+  echo ""
+fi
+
 if version_gte "$INSTALLED" "$MIN_CMP"; then
   exit 0
 fi

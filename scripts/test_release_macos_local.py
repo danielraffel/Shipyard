@@ -47,10 +47,14 @@ class FakeRunner(release_macos_local.CommandRunner):
             return ""
         if (
             args
-            and (args[0].endswith("shipyard") or args[0].endswith("shipyard"))
+            and (
+                args[0].endswith("shipyard")
+                or args[0].endswith("shipyard-workstream-provider")
+            )
             and args[1:] == ["--version"]
         ):
-            return "shipyard 0.1.0"
+            name = Path(args[0]).name
+            return f"{name} 0.1.0"
         return ""
 
 
@@ -85,6 +89,36 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             release_macos_local.require_arm64("x64")
         self.assertIn("arm64", str(ctx.exception))
+
+    def test_package_signed_dmg_forwards_both_existing_binaries(self) -> None:
+        config = release_macos_local.ReleaseConfig(
+            tag="v0.127.0",
+            repo="danielraffel/Shipyard",
+            artifact_prefix="shipyard",
+            dist_dir=Path("dist"),
+            upload=False,
+            ci_mode=False,
+            skip_build=True,
+            binary=Path("/tmp/shipyard"),
+            companion_binary=Path("/tmp/shipyard-workstream-provider"),
+            cargo_target=None,
+        )
+        artifact = Path("dist/v0.127.0/shipyard-macos-arm64.dmg")
+
+        with mock.patch.object(
+            release_macos_local.package_release,
+            "package",
+            return_value=[artifact],
+        ) as package:
+            result = release_macos_local.package_signed_dmg(config)
+
+        parsed = package.call_args.args[0]
+        self.assertEqual(parsed.binary, Path("/tmp/shipyard"))
+        self.assertEqual(
+            parsed.companion_binary,
+            Path("/tmp/shipyard-workstream-provider"),
+        )
+        self.assertEqual(result, artifact)
 
     def test_release_environment_file_must_be_private(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -247,7 +281,7 @@ class ReleaseMacosLocalTests(unittest.TestCase):
 
     def test_run_install_e2e_installs_current_tag_by_default(self) -> None:
         config = release_macos_local.ReleaseConfig(
-            tag="v0.2.0",
+            tag="v0.127.0",
             repo="danielraffel/Shipyard",
             artifact_prefix="shipyard",
             dist_dir=Path("dist"),
@@ -261,20 +295,21 @@ class ReleaseMacosLocalTests(unittest.TestCase):
 
         result = release_macos_local.run_install_e2e(config, runner)
 
-        self.assertIn("install:v0.2.0:shipyard 0.1.0", result)
+        self.assertIn("install:v0.127.0:shipyard 0.1.0", result)
+        self.assertIn("shipyard-workstream-provider 0.1.0", result)
         bash_envs = [
             env
                 for command, env in zip(runner.commands, runner.envs)
             if command and command[0] == "bash"
         ]
         self.assertEqual(len(bash_envs), 1)
-        self.assertEqual(bash_envs[0]["SHIPYARD_VERSION"], "v0.2.0")
+        self.assertEqual(bash_envs[0]["SHIPYARD_VERSION"], "v0.127.0")
         self.assertEqual(bash_envs[0]["SHIPYARD_ARTIFACT_PREFIX"], "shipyard")
         self.assertNotIn("SHIPYARD_RUST_COMPAT_NAME", bash_envs[0])
 
     def test_run_install_e2e_can_upgrade_and_rollback_between_tags(self) -> None:
         config = release_macos_local.ReleaseConfig(
-            tag="v0.2.0",
+            tag="v0.127.0",
             repo="danielraffel/Shipyard",
             artifact_prefix="shipyard",
             dist_dir=Path("dist"),
@@ -283,15 +318,15 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             skip_build=True,
             binary=None,
             cargo_target=None,
-            rollback_tag="v0.1.0",
+            rollback_tag="v0.126.2",
         )
         runner = FakeRunner(assets=[])
 
         result = release_macos_local.run_install_e2e(config, runner)
 
-        self.assertIn("baseline:v0.1.0:shipyard 0.1.0", result)
-        self.assertIn("upgrade:v0.2.0:shipyard 0.1.0", result)
-        self.assertIn("rollback:v0.1.0:shipyard 0.1.0", result)
+        self.assertIn("baseline:v0.126.2:shipyard 0.1.0:provider-absent", result)
+        self.assertIn("upgrade:v0.127.0:shipyard 0.1.0", result)
+        self.assertIn("rollback:v0.126.2:shipyard 0.1.0:provider-absent", result)
         bash_envs = [
             env
                 for command, env in zip(runner.commands, runner.envs)
@@ -299,7 +334,7 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         ]
         self.assertEqual(
             [env["SHIPYARD_VERSION"] for env in bash_envs],
-            ["v0.1.0", "v0.2.0", "v0.1.0"],
+            ["v0.126.2", "v0.127.0", "v0.126.2"],
         )
         self.assertTrue(all("SHIPYARD_RUST_COMPAT_NAME" not in env for env in bash_envs))
         self.assertTrue(all(env["SHIPYARD_ARTIFACT_PREFIX"] == "shipyard" for env in bash_envs))

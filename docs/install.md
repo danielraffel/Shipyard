@@ -2,11 +2,12 @@
 
 ## Canonical install location
 
-Every supported install path writes the `shipyard` binary to the same
-place by default:
+Every supported install path writes the `shipyard` CLI and its provider
+companion to the same directory by default:
 
 ```
 ~/.local/bin/shipyard
+~/.local/bin/shipyard-workstream-provider
 ```
 
 | Path | Lands at |
@@ -26,8 +27,9 @@ running" confusion.
 curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
 ```
 
-Downloads the right binary for your platform and installs it at
-`~/.local/bin/shipyard`.
+Downloads the matched CLI/provider pair for your platform and installs both in
+`~/.local/bin`. A rollback to a release before v0.127.0 removes the newer
+provider after the older CLI passes its smoke test.
 
 ## First-run auth
 
@@ -437,12 +439,12 @@ SHIPYARD_INSTALL_DIR="${HOME}/mytools/bin" bash install.sh
 
 ## Platform binaries
 
-| OS | Architecture | Binary |
+| OS | Architecture | Release assets |
 |----|-------------|--------|
-| macOS | Apple Silicon (ARM64) | `shipyard-macos-arm64.dmg` |
-| Windows | x64 | `shipyard-windows-x64.exe` |
-| Linux | x64 | `shipyard-linux-x64` |
-| Linux | ARM64 | `shipyard-linux-arm64` |
+| macOS | Apple Silicon (ARM64) | `shipyard-macos-arm64.dmg` (contains both binaries) |
+| Windows | x64 | `shipyard-windows-x64.exe`, `shipyard-workstream-provider-windows-x64.exe` |
+| Linux | x64 | `shipyard-linux-x64`, `shipyard-workstream-provider-linux-x64` |
+| Linux | ARM64 | `shipyard-linux-arm64`, `shipyard-workstream-provider-linux-arm64` |
 
 Intel Macs (x86_64) are not supported from v0.50.0 onward. Apple Silicon only. Older releases (v0.44.0–v0.49.0) that shipped Intel dmgs remain installable by pinning `SHIPYARD_VERSION`; `install.sh` on an Intel Mac surfaces a clear "unsupported" message instead of a 404 on v0.50.0+.
 
@@ -459,6 +461,7 @@ git clone https://github.com/danielraffel/Shipyard.git
 cd Shipyard
 cargo build --release --locked
 target/release/shipyard --version
+target/release/shipyard-workstream-provider --version
 ```
 
 Run the main local gates before relying on a source build:
@@ -478,6 +481,7 @@ release binary and refresh the `sy` symlink:
 ```bash
 mkdir -p ~/.local/bin
 cp target/release/shipyard ~/.local/bin/shipyard
+cp target/release/shipyard-workstream-provider ~/.local/bin/shipyard-workstream-provider
 ln -sf ~/.local/bin/shipyard ~/.local/bin/sy
 ```
 

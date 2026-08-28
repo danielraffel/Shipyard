@@ -60,7 +60,9 @@ download_asset() {
 }
 
 ARTIFACT_PREFIX="${SHIPYARD_ARTIFACT_PREFIX:-shipyard}"
+PROVIDER_ARTIFACT_PREFIX="${SHIPYARD_PROVIDER_ARTIFACT_PREFIX:-shipyard-workstream-provider}"
 BINARY_NAME="shipyard"
+PROVIDER_BINARY_NAME="shipyard-workstream-provider"
 ALIAS_NAME="sy"
 
 UNAME_S="${SHIPYARD_INSTALL_TEST_UNAME_S:-$(uname -s)}"
@@ -86,9 +88,12 @@ case "${UNAME_M}" in
 esac
 
 ARTIFACT="${ARTIFACT_PREFIX}-${OS}-${ARCH}"
+PROVIDER_ARTIFACT="${PROVIDER_ARTIFACT_PREFIX}-${OS}-${ARCH}"
 if [ "$OS" = "windows" ]; then
     ARTIFACT="${ARTIFACT}.exe"
+    PROVIDER_ARTIFACT="${PROVIDER_ARTIFACT}.exe"
     BINARY_NAME="${BINARY_NAME}.exe"
+    PROVIDER_BINARY_NAME="${PROVIDER_BINARY_NAME}.exe"
 fi
 
 if [ "${REQUESTED_VERSION}" = "latest" ] || [ -z "${REQUESTED_VERSION}" ]; then
@@ -102,6 +107,21 @@ else
     esac
     API_PATH="releases/tags/${TAG}"
     VERSION_LABEL="${TAG}"
+fi
+
+# v0.127.0 introduced the separately executable workstream provider. Older
+# pinned releases intentionally install only the historical CLI and remove a
+# newer companion after the old CLI has passed its smoke test.
+REQUIRE_PROVIDER=1
+if [ "${VERSION_LABEL}" != "latest" ]; then
+    ver="${VERSION_LABEL#v}"
+    major="${ver%%.*}"
+    rest="${ver#*.}"
+    minor="${rest%%.*}"
+    if [ "${major:-0}" -eq 0 ] 2>/dev/null \
+            && [ "${minor:-0}" -lt 127 ] 2>/dev/null; then
+        REQUIRE_PROVIDER=0
+    fi
 fi
 
 # Match current mainline policy: macOS x86_64 is unsupported from
@@ -136,7 +156,10 @@ if [ "${SHIPYARD_DRY_RUN:-0}" = "1" ]; then
     echo "ARCH=${ARCH}"
     echo "ARTIFACT_PREFIX=${ARTIFACT_PREFIX}"
     echo "ARTIFACT=${ARTIFACT}"
+    echo "PROVIDER_ARTIFACT=${PROVIDER_ARTIFACT}"
     echo "BINARY_NAME=${BINARY_NAME}"
+    echo "PROVIDER_BINARY_NAME=${PROVIDER_BINARY_NAME}"
+    echo "REQUIRE_PROVIDER=${REQUIRE_PROVIDER}"
     echo "ALIAS_NAME=${ALIAS_NAME}"
     echo "INSTALL_DIR=${INSTALL_DIR}"
     echo "VERSION_LABEL=${VERSION_LABEL}"
@@ -165,6 +188,7 @@ prepare_macos_binary() {
 
 smoke_binary_or_repair() {
     binary="$1"
+    binary_label="$2"
     if [ "${SHIPYARD_SKIP_SMOKE:-0}" = "1" ]; then
         return 0
     fi
@@ -190,7 +214,7 @@ smoke_binary_or_repair() {
         fi
     fi
     if ! "${binary}" --version >/dev/null 2>&1; then
-        echo "ERROR: ${BINARY_NAME} installed but failed post-install smoke." >&2
+        echo "ERROR: ${binary_label} installed but failed post-install smoke." >&2
         echo "Run '${binary} --version' manually for details." >&2
         exit 1
     fi
@@ -200,6 +224,8 @@ DMG_URL=""
 DMG_URL_IS_API=0
 RELEASE_URL=""
 RELEASE_URL_IS_API=0
+PROVIDER_RELEASE_URL=""
+PROVIDER_RELEASE_URL_IS_API=0
 if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
     echo "Resolving ${VERSION_LABEL} from ${REPO}..."
     if ! RELEASE_RESPONSE="$(curl_shipyard -sSL -w '\n%{http_code}' "https://api.github.com/repos/${REPO}/${API_PATH}")"; then
@@ -253,22 +279,49 @@ if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
             | cut -d '"' -f 4 || true)
         fi
     fi
+    if [ "${REQUIRE_PROVIDER}" = "1" ] && [ "$OS" != "macos" ]; then
+        PROVIDER_RELEASE_URL=$(printf '%s' "${RELEASE_JSON}" \
+            | select_asset_url "${PROVIDER_ARTIFACT}" "${PREFER_API_ASSET_URL}" || true)
+        if [ -n "${PROVIDER_RELEASE_URL}" ] && [ "${PREFER_API_ASSET_URL}" = "1" ]; then
+            PROVIDER_RELEASE_URL_IS_API=1
+        fi
+        if [ -z "${PROVIDER_RELEASE_URL}" ]; then
+            PROVIDER_RELEASE_URL=$(printf '%s' "${RELEASE_JSON}" \
+                | grep -E "browser_download_url.*${PROVIDER_ARTIFACT}\"" \
+                | head -1 \
+                | cut -d '"' -f 4 || true)
+        fi
+    fi
     if [ -z "${DMG_URL}" ] && [ -z "${RELEASE_URL}" ]; then
         echo "No binary found for ${ARTIFACT} in ${VERSION_LABEL}." >&2
         echo "Check https://github.com/${REPO}/releases for available builds." >&2
+        exit 1
+    fi
+    if [ "${REQUIRE_PROVIDER}" = "1" ] && [ "$OS" != "macos" ] \
+            && [ -z "${PROVIDER_RELEASE_URL}" ]; then
+        echo "No companion binary found for ${PROVIDER_ARTIFACT} in ${VERSION_LABEL}." >&2
         exit 1
     fi
 fi
 
 DEST="${INSTALL_DIR}/${BINARY_NAME}"
 STAGED_DEST="${INSTALL_DIR}/.${BINARY_NAME}.install.$$"
-trap 'rm -f "${STAGED_DEST:-}"' EXIT
+PROVIDER_DEST="${INSTALL_DIR}/${PROVIDER_BINARY_NAME}"
+STAGED_PROVIDER_DEST="${INSTALL_DIR}/.${PROVIDER_BINARY_NAME}.install.$$"
+trap 'rm -f "${STAGED_DEST:-}" "${STAGED_PROVIDER_DEST:-}"' EXIT
 if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" = "1" ]; then
     if [ ! -f "${DEST}" ]; then
         echo "SHIPYARD_SKIP_DOWNLOAD=1 but ${DEST} does not exist." >&2
         exit 1
     fi
     cp "${DEST}" "${STAGED_DEST}"
+    if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+        if [ ! -f "${PROVIDER_DEST}" ]; then
+            echo "SHIPYARD_SKIP_DOWNLOAD=1 but ${PROVIDER_DEST} does not exist." >&2
+            exit 1
+        fi
+        cp "${PROVIDER_DEST}" "${STAGED_PROVIDER_DEST}"
+    fi
 elif [ -n "${DMG_URL}" ]; then
     echo "Downloading ${ARTIFACT}.dmg (${VERSION_LABEL})..."
     DMG_TMP="$(mktemp -d)/shipyard.dmg"
@@ -287,23 +340,56 @@ elif [ -n "${DMG_URL}" ]; then
         rm -f "${DMG_TMP}"
         exit 1
     fi
+    if [ "${REQUIRE_PROVIDER}" = "1" ] \
+            && [ ! -f "${MOUNT_POINT}/${PROVIDER_BINARY_NAME}" ]; then
+        echo "DMG mounted but no '${PROVIDER_BINARY_NAME}' binary exists at ${MOUNT_POINT}." >&2
+        hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || true
+        rm -f "${DMG_TMP}"
+        exit 1
+    fi
     cp "${MOUNT_POINT}/${BINARY_NAME}" "${STAGED_DEST}"
+    if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+        cp "${MOUNT_POINT}/${PROVIDER_BINARY_NAME}" "${STAGED_PROVIDER_DEST}"
+    fi
     hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || true
     rm -f "${DMG_TMP}"
 else
     echo "Downloading ${ARTIFACT} (${VERSION_LABEL})..."
     download_asset "${RELEASE_URL}" "${STAGED_DEST}" "${RELEASE_URL_IS_API}"
+    if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+        echo "Downloading ${PROVIDER_ARTIFACT} (${VERSION_LABEL})..."
+        download_asset "${PROVIDER_RELEASE_URL}" "${STAGED_PROVIDER_DEST}" \
+            "${PROVIDER_RELEASE_URL_IS_API}"
+    fi
 fi
 chmod +x "${STAGED_DEST}"
+if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+    chmod +x "${STAGED_PROVIDER_DEST}"
+fi
 
 prepare_macos_binary "${STAGED_DEST}"
-smoke_binary_or_repair "${STAGED_DEST}"
+smoke_binary_or_repair "${STAGED_DEST}" "${BINARY_NAME}"
+if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+    prepare_macos_binary "${STAGED_PROVIDER_DEST}"
+    smoke_binary_or_repair "${STAGED_PROVIDER_DEST}" "${PROVIDER_BINARY_NAME}"
+fi
 mv -f "${STAGED_DEST}" "${DEST}"
+if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+    mv -f "${STAGED_PROVIDER_DEST}" "${PROVIDER_DEST}"
+else
+    rm -f "${PROVIDER_DEST}"
+fi
 ln -sf "${DEST}" "${INSTALL_DIR}/${ALIAS_NAME}"
-smoke_binary_or_repair "${DEST}"
+smoke_binary_or_repair "${DEST}" "${BINARY_NAME}"
+if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+    smoke_binary_or_repair "${PROVIDER_DEST}" "${PROVIDER_BINARY_NAME}"
+fi
 
 echo ""
 echo "Installed ${BINARY_NAME} to ${DEST}"
+if [ "${REQUIRE_PROVIDER}" = "1" ]; then
+    echo "Installed ${PROVIDER_BINARY_NAME} to ${PROVIDER_DEST}"
+fi
 echo "Symlink: ${INSTALL_DIR}/${ALIAS_NAME}"
 echo ""
 

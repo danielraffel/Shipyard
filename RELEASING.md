@@ -145,12 +145,12 @@ and cannot fall through to artifact signing.
 The script runs the full pipeline on the local Mac:
 
 1. Fails fast if any env var is missing (before the Rust release build).
-2. Builds `target/release/shipyard` unless `--skip-build --binary <path>` is supplied.
-3. Signs the Mach-O with `--options runtime --timestamp` (notarytool prerequisites).
-4. Packages the signed binary into a `.dmg`, signs the DMG, submits it via `xcrun notarytool submit --wait`, and staples the accepted ticket.
-5. **Runs `<binary> --version` from the mounted DMG locally.** If this fails, the script exits and does NOT upload. This is the whole point — the Mac running the script is the same Mac that will need to launch the binary tomorrow.
+2. Builds `target/release/shipyard` and `target/release/shipyard-workstream-provider` unless both are supplied with `--skip-build --binary <path> --companion-binary <path>`.
+3. Signs both Mach-O binaries with `--options runtime --timestamp` (notarytool prerequisites).
+4. Packages both signed binaries into one `.dmg`, signs the DMG, submits it via `xcrun notarytool submit --wait`, and staples the accepted ticket.
+5. **Runs both binaries' `--version` from the mounted DMG locally.** If either fails, the script exits and does NOT upload. This is the whole point — the Mac running the script is the same Mac that will need to launch the binaries tomorrow.
 6. On launch success: uploads via `gh release upload --clobber`, updates `checksums.sha256`, verifies public asset visibility, and runs the `install.sh` E2E.
-7. With `--rollback-tag`, verifies baseline install, upgrade to the new release, and rollback to the previous release in an isolated temp install directory.
+7. With `--rollback-tag`, verifies baseline install, pair upgrade, and rollback in an isolated temp install directory; rollback before v0.127.0 must remove the provider companion.
 
 Running without `--upload` is the diagnostic mode (used to confirm the local signing path actually works on a given Mac). Script-helper tests under `scripts/test_*.py` ensure missing creds / bad flags / bash syntax errors all surface before the expensive build step.
 
@@ -181,7 +181,7 @@ credentials.
 We shipped v0.42.0 and v0.43.0 with the same class of breakage because
 we declared "works" based on partial verification. The release script
 now enforces the actual success criterion: `install.sh` downloads the
-DMG, mounts it, extracts the binary, and `shipyard --version` launches.
+DMG, mounts it, extracts both binaries, and both `--version` probes launch.
 If any step in that chain fails, the release fails regardless of what
 `codesign --verify` or `spctl --assess` said earlier.
 

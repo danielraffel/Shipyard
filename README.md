@@ -254,16 +254,16 @@ release runbook.
 
 ## FAQ
 
-### Where does each install method put the `shipyard` binary?
+### Where does each install method put the Shipyard binaries?
 
-All three user-facing install paths write the binary to the same
-place:
+All three user-facing install paths write the CLI and its workstream-provider
+companion to the same directory:
 
 | Method | Target |
 |---|---|
-| `curl … install.sh` (manual) | `~/.local/bin/shipyard` |
-| Claude Code plugin (auto-installs via `SessionStart` hook if needed) | `~/.local/bin/shipyard` |
-| Codex one-liner (same `install.sh`) | `~/.local/bin/shipyard` |
+| `curl … install.sh` (manual) | `~/.local/bin/shipyard` and `~/.local/bin/shipyard-workstream-provider` |
+| Claude Code plugin (auto-installs via `SessionStart` hook if needed) | same pair |
+| Codex one-liner (same `install.sh`) | same pair |
 
 `~/.local/bin` is the canonical location. Make sure it's on your
 `PATH` and every install method reaches the same binary. `sy` is a
@@ -330,8 +330,8 @@ Shipyard doesn't leave much footprint, but here's the complete list:
 # 1. Stop + unregister the daemon (if running)
 shipyard daemon stop
 
-# 2. Uninstall the CLI binary (install.sh writes here regardless of source)
-rm -f ~/.local/bin/shipyard ~/.local/bin/sy
+# 2. Uninstall the CLI, provider companion, and CLI alias
+rm -f ~/.local/bin/shipyard ~/.local/bin/shipyard-workstream-provider ~/.local/bin/sy
 
 # 3. Remove state directory (ship-state, daemon config, webhook secret)
 #    macOS:

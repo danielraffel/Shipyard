@@ -395,6 +395,12 @@ password. Cleanup restores the exact prior search list before deleting the
 disposable keychain; if restoration cannot be proven, fail and preserve the
 keychain file rather than leave a dangling search-list reference.
 
+Shipyard releases from v0.127.0 onward are a binary pair. Keep the historical
+`shipyard-<platform>` asset names, add matching
+`shipyard-workstream-provider-<platform>` assets on Linux and Windows, and put
+both signed binaries in the single macOS DMG. Packaging and mounted-DMG smoke
+must run both `--version` probes before publication.
+
 ### External contribution execution
 
 Never route contributor-controlled revisions through Shipyard's normal local,
